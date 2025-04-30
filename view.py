@@ -10,7 +10,6 @@ from discord.ui import View, Item
 from typing import List, Optional, Union, Callable, Any, Type, TYPE_CHECKING
 from datetime import datetime
 
-# Import the logger
 from .utils.logger import AsyncLogger
 
 # Import type references
@@ -31,7 +30,11 @@ if TYPE_CHECKING:
 class CascadeView(View):
     """Base class for all CascadeUI views."""
 
-    __attrs__ = ("ephemeral", "embeds", "interaction")
+    # Expanded __attrs__ to include all supported message properties
+    __attrs__ = (
+        "content", "embeds", "embed", "file", "files", "tts", "ephemeral", "interaction",
+        "allowed_mentions", "suppress_embeds", "silent", "delete_after", "poll"
+    )
 
     # This will be set in __init__.py to avoid circular imports
     manager = None  # Type: Optional[UIManager]
@@ -52,14 +55,27 @@ class CascadeView(View):
         self.__session = None
         self.__interaction = None
         self.__message = None
-        self.__ephemeral = False
+
+        # Initialize message properties with None
+        self.__content = None
         self.__embeds = None
+        self.__embed = None
+        self.__file = None
+        self.__files = None
+        self.__tts = None
+        self.__ephemeral = False
+        self.__allowed_mentions = None
+        self.__suppress_embeds = None
+        self.__silent = None
+        self.__delete_after = None
+        self.__poll = None
+
         self._transition_in_progress = False
         self._is_duplicate = False
 
-        # Process standard attributes
-        self.ephemeral = custom_kwargs.get("ephemeral", False)
-        self.embeds = custom_kwargs.get("embeds", list())
+        # Process standard attributes from kwargs
+        for key, value in custom_kwargs.items():
+            setattr(self, key, value)
 
         # Handle interaction if provided
         interaction = custom_kwargs.get("interaction")
@@ -77,6 +93,7 @@ class CascadeView(View):
             # Now trigger the handler
             self.interaction = interaction
 
+    # Basic Properties
     @property
     def session(self) -> Optional[UISessionObj]:
         """Get the session associated with this view."""
@@ -85,7 +102,9 @@ class CascadeView(View):
     @session.setter
     def session(self, value: UISessionObj) -> None:
         """Set the session for this view."""
+        # Local import to avoid circular imports
         from .session import UISession
+
         if not isinstance(value, UISession) and value is not None:
             exception: str = \
                 f"Invalid attribute type '{type(value)}' provided. Attribute 'session' must be a valid UI session object."
@@ -159,25 +178,20 @@ class CascadeView(View):
             exception: str = \
                 f"Invalid attribute type '{type(value)}' provided. Attribute 'message' must be a discord message object."
             raise AttributeError(exception)
-
-        # Set the new message
         self.__message = value
         if value:
             logger.debug(f"Message '{value.id}' set for view '{self.name}'")
 
+    # Message content properties
     @property
-    def ephemeral(self) -> bool:
-        """Get whether this view is ephemeral."""
-        return self.__ephemeral
+    def content(self) -> Optional[str]:
+        """Get the content for this view's messages."""
+        return self.__content
 
-    @ephemeral.setter
-    def ephemeral(self, value: bool) -> None:
-        """Set whether this view is ephemeral."""
-        if not isinstance(value, bool):
-            exception: str = \
-                f"Invalid attribute type '{type(value)}' provided. Attribute 'ephemeral' must be a boolean."
-            raise AttributeError(exception)
-        self.__ephemeral = value
+    @content.setter
+    def content(self, value: Optional[str]) -> None:
+        """Set the content for this view's messages."""
+        self.__content = value
 
     @property
     def embeds(self) -> List[Optional[discord.Embed]]:
@@ -196,6 +210,229 @@ class CascadeView(View):
                 f"Invalid list {f'elements' if len(invalid) > 1 else f'element'} contained. The '{len(invalid)}' invalid elements must be a discord embed object."
             raise AttributeError(exception)
         self.__embeds = value
+
+    @property
+    def embed(self) -> Optional[discord.Embed]:
+        """Get the embed associated with this view."""
+        return self.__embed
+
+    @embed.setter
+    def embed(self, value: Optional[discord.Embed]) -> None:
+        """Set the embed for this view."""
+        if value is not None and not isinstance(value, discord.Embed):
+            exception: str = f"Invalid attribute type '{type(value)}' provided. Embed must be a discord embed object."
+            raise AttributeError(exception)
+        self.__embed = value
+
+    @property
+    def file(self) -> Optional[discord.File]:
+        """Get the file for this view's messages."""
+        return self.__file
+
+    @file.setter
+    def file(self, value: Optional[discord.File]) -> None:
+        """Set the file for this view's messages."""
+        if value is not None and not isinstance(value, discord.File):
+            exception: str = f"Invalid attribute type '{type(value)}' provided. File must be a discord.File object."
+            raise AttributeError(exception)
+        self.__file = value
+
+    @property
+    def files(self) -> Optional[List[discord.File]]:
+        """Get the files for this view's messages."""
+        return self.__files
+
+    @files.setter
+    def files(self, value: Optional[List[discord.File]]) -> None:
+        """Set the files for this view's messages."""
+        if value is not None:
+            if not isinstance(value, list):
+                exception: str = f"Invalid attribute type '{type(value)}' provided. Files must be a list of discord.File objects."
+                raise AttributeError(exception)
+            if invalid := [file for file in value if not isinstance(file, discord.File)]:
+                exception: str = f"Invalid list elements contained. All files must be discord.File objects."
+                raise AttributeError(exception)
+        self.__files = value
+
+    @property
+    def tts(self) -> Optional[bool]:
+        """Get whether text-to-speech is enabled for this view's messages."""
+        return self.__tts
+
+    @tts.setter
+    def tts(self, value: Optional[bool]) -> None:
+        """Set whether text-to-speech is enabled for this view's messages."""
+        if value is not None and not isinstance(value, bool):
+            exception: str = f"Invalid attribute type '{type(value)}' provided. TTS must be a boolean."
+            raise AttributeError(exception)
+        self.__tts = value
+
+    @property
+    def ephemeral(self) -> bool:
+        """Get whether this view is ephemeral."""
+        return self.__ephemeral
+
+    @ephemeral.setter
+    def ephemeral(self, value: bool) -> None:
+        """Set whether this view is ephemeral."""
+        if not isinstance(value, bool):
+            exception: str = \
+                f"Invalid attribute type '{type(value)}' provided. Attribute 'ephemeral' must be a boolean."
+            raise AttributeError(exception)
+        self.__ephemeral = value
+
+    @property
+    def allowed_mentions(self) -> Optional[discord.AllowedMentions]:
+        """Get the allowed mentions for this view's messages."""
+        return self.__allowed_mentions
+
+    @allowed_mentions.setter
+    def allowed_mentions(self, value: Optional[discord.AllowedMentions]) -> None:
+        """Set the allowed mentions for this view's messages."""
+        if value is not None and not isinstance(value, discord.AllowedMentions):
+            exception: str = f"Invalid attribute type '{type(value)}' provided. Allowed mentions must be a discord.AllowedMentions object."
+            raise AttributeError(exception)
+        self.__allowed_mentions = value
+
+    @property
+    def suppress_embeds(self) -> Optional[bool]:
+        """Get whether embeds are suppressed for this view's messages."""
+        return self.__suppress_embeds
+
+    @suppress_embeds.setter
+    def suppress_embeds(self, value: Optional[bool]) -> None:
+        """Set whether embeds are suppressed for this view's messages."""
+        if value is not None and not isinstance(value, bool):
+            exception: str = f"Invalid attribute type '{type(value)}' provided. Suppress embeds must be a boolean."
+            raise AttributeError(exception)
+        self.__suppress_embeds = value
+
+    @property
+    def silent(self) -> Optional[bool]:
+        """Get whether notifications are suppressed for this view's messages."""
+        return self.__silent
+
+    @silent.setter
+    def silent(self, value: Optional[bool]) -> None:
+        """Set whether notifications are suppressed for this view's messages."""
+        if value is not None and not isinstance(value, bool):
+            exception: str = f"Invalid attribute type '{type(value)}' provided. Silent must be a boolean."
+            raise AttributeError(exception)
+        self.__silent = value
+
+    @property
+    def delete_after(self) -> Optional[float]:
+        """Get the time after which this view's messages will be deleted."""
+        return self.__delete_after
+
+    @delete_after.setter
+    def delete_after(self, value: Optional[float]) -> None:
+        """Set the time after which this view's messages will be deleted."""
+        if value is not None and not isinstance(value, (int, float)):
+            exception: str = f"Invalid attribute type '{type(value)}' provided. Delete after must be a number."
+            raise AttributeError(exception)
+        self.__delete_after = value
+
+    @property
+    def poll(self) -> Optional[discord.Poll]:
+        """Get the poll for this view's messages."""
+        return self.__poll
+
+    @poll.setter
+    def poll(self, value: Optional[discord.Poll]) -> None:
+        """Set the poll for this view's messages."""
+        if value is not None:
+            try:
+                # Check if it's a discord.Poll object - this will vary based on discord.py version
+                if not hasattr(discord, 'Poll') or not isinstance(value, discord.Poll):
+                    exception: str = f"Invalid attribute type '{type(value)}' provided. Poll must be a discord.Poll object."
+                    raise AttributeError(exception)
+            except AttributeError:
+                # discord.Poll might not exist in older versions
+                pass
+        self.__poll = value
+
+    def get_message_kwargs(self) -> dict:
+        """
+        Get a dictionary of message properties for this view.
+
+        Returns:
+        --------
+        dict
+            A dictionary of message properties to use when creating/editing messages
+        """
+        kwargs = {'view': self}
+
+        # Add all non-None properties
+        if self.content is not None:
+            kwargs['content'] = self.content
+        if self.embeds is not None:
+            kwargs['embeds'] = self.embeds
+        if self.embed is not None:
+            kwargs['embed'] = self.embed
+        if self.tts is not None:
+            kwargs['tts'] = self.tts
+        if self.allowed_mentions is not None:
+            kwargs['allowed_mentions'] = self.allowed_mentions
+        if self.suppress_embeds is not None:
+            kwargs['suppress_embeds'] = self.suppress_embeds
+        if self.silent is not None:
+            kwargs['silent'] = self.silent
+
+        # These are only used in send, not in edit
+        if self.file is not None and hasattr(discord.Message,
+                                             'edit') and 'file' in discord.Message.edit.__annotations__:
+            kwargs['file'] = self.file
+        if self.files is not None and hasattr(discord.Message,
+                                              'edit') and 'files' in discord.Message.edit.__annotations__:
+            kwargs['files'] = self.files
+        if self.delete_after is not None and hasattr(discord.Message,
+                                                     'edit') and 'delete_after' in discord.Message.edit.__annotations__:
+            kwargs['delete_after'] = self.delete_after
+        if self.poll is not None and hasattr(discord.Message,
+                                             'edit') and 'poll' in discord.Message.edit.__annotations__:
+            kwargs['poll'] = self.poll
+
+        return kwargs
+
+    def get_followup_kwargs(self) -> dict:
+        """
+        Get a dictionary of message properties for followup messages.
+
+        Returns:
+        --------
+        dict
+            A dictionary of message properties to use when creating followup messages
+        """
+        kwargs = {'view': self}
+
+        # Add all non-None properties
+        if self.content is not None:
+            kwargs['content'] = self.content
+        if self.embeds is not None:
+            kwargs['embeds'] = self.embeds
+        if self.embed is not None:
+            kwargs['embed'] = self.embed
+        if self.file is not None:
+            kwargs['file'] = self.file
+        if self.files is not None:
+            kwargs['files'] = self.files
+        if self.tts is not None:
+            kwargs['tts'] = self.tts
+        if self.ephemeral:
+            kwargs['ephemeral'] = self.ephemeral
+        if self.allowed_mentions is not None:
+            kwargs['allowed_mentions'] = self.allowed_mentions
+        if self.suppress_embeds is not None:
+            kwargs['suppress_embeds'] = self.suppress_embeds
+        if self.silent is not None:
+            kwargs['silent'] = self.silent
+        if self.delete_after is not None:
+            kwargs['delete_after'] = self.delete_after
+        if self.poll is not None:
+            kwargs['poll'] = self.poll
+
+        return kwargs
 
     async def __handle_interaction(self) -> None:
         """Central method for handling interactions and message management."""
@@ -234,7 +471,12 @@ class CascadeView(View):
 
             # Create a new message
             new_message = await self.interaction.original_response()
-            await new_message.edit(view=self, embeds=self.embeds)
+
+            # Get message properties for edit
+            edit_kwargs = self.get_message_kwargs()
+
+            # Edit the message with all properties
+            await new_message.edit(**edit_kwargs)
 
             # Set the message property
             self.message = new_message
@@ -275,15 +517,14 @@ class CascadeView(View):
             logger.error(f"Error in interaction handling: {e}", exc_info=True)
             # Send fallback message
             try:
-                await self.interaction.followup.send(
-                    view=self,
-                    embeds=[discord.Embed(
+                fallback_kwargs = self.get_followup_kwargs()
+                if 'embeds' not in fallback_kwargs:
+                    fallback_kwargs['embeds'] = [discord.Embed(
                         title=f"{self.name}",
                         description="An error occurred",
                         color=0xE02B2B
-                    )],
-                    ephemeral=self.ephemeral
-                )
+                    )]
+                await self.interaction.followup.send(**fallback_kwargs)
             except Exception as follow_up_error:
                 logger.error(f"Failed to send followup message: {follow_up_error}")
         finally:
@@ -302,7 +543,9 @@ class CascadeView(View):
         user_id: int
             The user ID to get or create a session for
         """
+        # Local import to avoid circular imports
         from .session import UISession
+
         if not self.session:
             # Look up by user ID
             if cached_session := self.manager.get(session=user_id):
@@ -322,35 +565,24 @@ class CascadeView(View):
         if hasattr(self.session, 'add_to_history'):
             self.session.add_to_history(self)
 
-    async def __clear_old_message(self, old_message: discord.Message) -> None:
-        """Clear an old message from this view."""
-        try:
-            # Try to delete the message
-            try:
-                await old_message.delete()
-                logger.debug(f"Deleted old message '{old_message.id}' for view '{self.name}'")
-            except discord.Forbidden:
-                # If we can't delete (missing permissions), update with placeholder instead
-                await old_message.edit(
-                    view=None,
-                    embeds=[discord.Embed(
-                        title=f"{self.name}",
-                        description="This interface was initialized in another text channel.",
-                        color=0x808080  # Gray color
-                    )]
-                )
-                logger.debug(f"Cleared old message '{old_message.id}' for view '{self.name}'")
-            except discord.NotFound:
-                logger.debug(f"Old message '{old_message.id}' was already deleted")
-            except Exception as e:
-                logger.error(f"Error clearing old message '{old_message.id}': {e}")
-        except Exception as e:
-            logger.error(f"Error in old message cleanup: {e}")
-
     async def transition_to(self, view_class, interaction=None, **kwargs) -> CascadeViewObj:
         """
         Transition from this view to a new view class.
         This is the recommended way to create a new view from a button handler.
+
+        Parameters:
+        -----------
+        view_class: Type[CascadeViewObj]
+            The view class to create
+        interaction: Optional[discord.Interaction]
+            The interaction that triggered this transition
+        **kwargs:
+            Additional kwargs to pass to the view constructor
+
+        Returns:
+        --------
+        CascadeViewObj
+            The new view instance for method chaining
         """
         # Store the current interaction before we create the new view
         current_interaction = interaction or self.interaction
@@ -382,33 +614,66 @@ class CascadeView(View):
         # from being associated with us during cleanup scans
         self.clear_message_reference()
 
+        # Transfer message properties that weren't explicitly overridden
+        for attr in self.__class__.__attrs__:
+            if attr not in ('interaction', 'message') and attr not in kwargs:
+                prop_value = getattr(self, attr)
+                if prop_value is not None:
+                    kwargs[attr] = prop_value
+
         # Create the new view WITHOUT setting the interaction
         new_view = view_class(**kwargs)
 
         # Update the original message with the new view
         if current_message:
-            try:
-                if not new_view.embeds:
-                    new_view.embeds = self.embeds
-                await current_message.edit(view=new_view, embeds=new_view.embeds)
+            # Special handling for file attachments
+            has_files = 'file' in kwargs or 'files' in kwargs
 
-                # Set the message on the new view
-                new_view.message = current_message
+            try:
+                if has_files:
+                    # Can't edit with new files, must create new message
+                    followup_kwargs = new_view.get_followup_kwargs()
+                    followup_message = await current_interaction.followup.send(wait=True, **followup_kwargs)
+
+                    # Try to delete the old message
+                    try:
+                        await current_message.delete()
+                    except (discord.Forbidden, discord.NotFound):
+                        # If we can't delete, at least update it to show it's been moved
+                        await current_message.edit(
+                            view=None,
+                            embeds=[discord.Embed(
+                                title=f"{self.name}",
+                                description="This view has been moved to another message.",
+                                color=0x808080  # Gray color
+                            )]
+                        )
+
+                    # Set the new message
+                    new_view.message = followup_message
+
+                    logger.debug(f"Created new message for '{new_view.name}' with files during transition")
+                else:
+                    # No files, just edit the existing message
+                    edit_kwargs = new_view.get_message_kwargs()
+                    await current_message.edit(**edit_kwargs)
+
+                    # Set the message on the new view
+                    new_view.message = current_message
+
+                    logger.debug(
+                        f"Transitioned from '{self.name}' to '{new_view.name}' on message '{current_message.id}'")
 
                 # Add the new view to the session
                 if self.session:
                     new_view.session = self.session
                     self.session.set(view=new_view)
 
-                logger.debug(f"Transitioned from '{self.name}' to '{new_view.name}' on message '{current_message.id}'")
             except discord.errors.NotFound:
                 # If the message is gone, create a new one
-                followup_message = await current_interaction.followup.send(
-                    view=new_view,
-                    embeds=new_view.embeds,
-                    ephemeral=kwargs.get('ephemeral', False),
-                    wait=True
-                )
+                followup_kwargs = new_view.get_followup_kwargs()
+                followup_message = await current_interaction.followup.send(wait=True, **followup_kwargs)
+
                 new_view.message = followup_message
 
                 # Add the new view to the session
@@ -419,12 +684,9 @@ class CascadeView(View):
                 logger.debug(f"Created new message for '{new_view.name}' after transition failed")
         else:
             # If there's no original message, create a new one
-            followup_message = await current_interaction.followup.send(
-                view=new_view,
-                embeds=new_view.embeds,
-                ephemeral=kwargs.get('ephemeral', False),
-                wait=True
-            )
+            followup_kwargs = new_view.get_followup_kwargs()
+            followup_message = await current_interaction.followup.send(wait=True, **followup_kwargs)
+
             new_view.message = followup_message
 
             # Add the new view to the session
