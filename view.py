@@ -306,8 +306,7 @@ class CascadeView(View):
                         # Stop the old view to prevent it from processing further
                         view.stop()
                         view.clear_items()
-
-                        # Remove from session
+                        view.clear_message_reference()
                         if view in self.session.views:
                             self.session.views.remove(view)
 
@@ -430,11 +429,6 @@ class CascadeView(View):
 
         return new_view
 
-    def clear_message_reference(self):
-        """Clear the message reference."""
-        self.__message = None
-        logger.debug(f"Cleared message reference for view '{self.name}'")
-
     async def __cleanup_old_messages(self, old_messages):
         """Clean up old messages after a delay to ensure the new message is visible."""
         try:
@@ -460,6 +454,11 @@ class CascadeView(View):
                     logger.debug(f"Could not clean up message '{message.id}': {e}")
         except Exception as e:
             logger.error(f"Error in message cleanup: {e}", exc_info=True)
+
+    def clear_message_reference(self):
+        """Clear the message reference."""
+        self.__message = None
+        logger.debug(f"Cleared message reference for view '{self.name}'")
 
     async def on_timeout(self) -> None:
         """Handle view timeout."""
