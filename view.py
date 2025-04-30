@@ -452,7 +452,7 @@ class CascadeView(View):
             await self.__ensure_session(user_id)
 
             # Run session cleanup in the background
-            self.interaction.client.loop.create_task(self.manager.cleanup_old_sessions())
+            self.interaction.client.loop.create_task(self.manager.cleanup_old_sessions())  # NOQA
 
             # Defer early to prevent timeouts
             if not (hasattr(self.interaction, 'response') and self.interaction.response.is_done()):
@@ -462,13 +462,11 @@ class CascadeView(View):
                     # Interaction might already be acknowledged
                     pass
 
-            # Get all previously active messages for this user
-            prev_messages = []
-            if self.session:
-                for view in list(self.session.views):
-                    if view is not self and view.message is not None:
-                        prev_messages.append((view, view.message))
-                        logger.debug(f"Found existing message '{view.message.id}' for view '{view.name}'")
+            # Store current message reference
+            current_message = self.message
+
+            # Clear our own message reference - CRITICAL for proper cleanup
+            self.__message = None
 
             # Create a new message
             new_message = await self.interaction.original_response()
@@ -479,40 +477,29 @@ class CascadeView(View):
             # Edit the message with all properties
             await new_message.edit(**edit_kwargs)
 
-            # Set the message property
-            self.message = new_message
-            logger.debug(f"Created new message '{new_message.id}' for view '{self.name}'")
-
-            # Now clean up ALL previous messages
-            for view, old_message in prev_messages:
+            # Before setting our new message reference, clean up the old one
+            if current_message:
                 try:
-                    # Try to delete first
+                    await current_message.delete()
+                    logger.debug(f"Deleted previous message '{current_message.id}' for view '{self.name}'")
+                except (discord.Forbidden, discord.NotFound):
+                    # Fall back to updating
                     try:
-                        await old_message.delete()
-                        logger.debug(f"Deleted previous message '{old_message.id}' from view '{view.name}'")
-                    except (discord.Forbidden, discord.NotFound):
-                        # Fall back to updating the message with a placeholder
-                        await old_message.edit(
+                        await current_message.edit(
                             view=None,
                             embeds=[discord.Embed(
-                                title=f"{view.name}",
+                                title=f"{self.name}",
                                 description="This view has been moved to another channel.",
                                 color=0x808080  # Gray color
                             )]
                         )
-                        logger.debug(f"Updated previous message '{old_message.id}' from view '{view.name}'")
+                        logger.debug(f"Updated previous message '{current_message.id}' for view '{self.name}'")
+                    except Exception as e:
+                        logger.debug(f"Could not update previous message: {e}")
 
-                    # Clear old view's message reference and items
-                    view.clear_message_reference()
-                    view.clear_items()
-                    view.stop()
-
-                    # Remove the view from the session
-                    if view in self.session.views:
-                        self.session.views.remove(view)
-
-                except Exception as e:
-                    logger.error(f"Error cleaning up message '{old_message.id}': {e}")
+            # Now set the new message reference
+            self.message = new_message
+            logger.debug(f"Created new message '{new_message.id}' for view '{self.name}'")
 
         except Exception as e:
             logger.error(f"Error in interaction handling: {e}", exc_info=True)
