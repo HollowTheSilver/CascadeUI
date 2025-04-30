@@ -3,6 +3,7 @@
 # // ========================================( Modules )======================================== // #
 
 
+import asyncio
 import discord
 from discord import Interaction
 from discord.ui import View, Item
@@ -221,11 +222,10 @@ class CascadeView(View):
                     # Interaction might already be acknowledged
                     pass
 
-            # Try to reuse any message in the session
-            if await self.__reuse_message():
-                return  # Successfully reused a message
+            # Handle old message cleanup - this won't reuse messages anymore
+            await self.__reuse_message()
 
-            # Create a new message
+            # Always create a new message
             self.message = await self.interaction.original_response()
             await self.message.edit(view=self, embeds=self.embeds)
             logger.debug(f"Created new message '{self.message.id}' for view '{self.name}'")
@@ -283,120 +283,47 @@ class CascadeView(View):
 
     async def __reuse_message(self) -> bool:
         """
-        Find and reuse any valid message in the session.
-
-        This method handles both slash commands and component interactions differently:
-        - For slash commands, it skips message verification and attempts to edit directly
-        - For component interactions, it verifies message existence before attempting to edit
-
-        The method also:
-        - Finds the newest valid message in the session (including from the current view)
-        - Cleans up old views to prevent conflicts
-        - Preserves embeds from the original view if the new view doesn't have any
-        - Deletes duplicate responses to keep the chat clean
+        Rather than reusing an existing message, always create a new message
+        in the current channel and clean up old messages.
 
         Returns:
         --------
         bool
-            True if a message was successfully reused, False otherwise
+            False to indicate we should create a new message (old logic will be handled differently)
         """
         try:
-            # Check if this is a component interaction
-            if self.interaction.message:
-                # For component interactions, we already have the message
-                reusable_message = self.interaction.message
+            # Store reference to old messages for cleanup
+            old_messages = []
 
-                # Clean up other views using this message
+            # Find all existing messages in the session with the same view type
+            if self.session:
                 for view in list(self.session.views):
-                    if view is not self and view.message and view.message.id == reusable_message.id:
+                    if (view is not self and
+                            view.__class__.__name__ == self.__class__.__name__ and
+                            view.message):
+                        old_messages.append((view, view.message))
+
+                        # Stop the old view to prevent it from processing further
                         view.stop()
                         view.clear_items()
-                        view.clear_message_reference()
+
+                        # Remove from session
                         if view in self.session.views:
                             self.session.views.remove(view)
 
-                # Reuse the message with new view
-                if not self.embeds:
-                    # Find embeds from any view in the session
-                    for view in self.session.views:
-                        if view.embeds:
-                            self.embeds = view.embeds
-                            break
+                        logger.debug(f"Marked old view '{view.name}' for cleanup")
 
-                await reusable_message.edit(view=self, embeds=self.embeds)
-                self.message = reusable_message
-                logger.debug(f"Directly reused message '{reusable_message.id}' for view '{self.name}'")
-                return True
+            # We'll return False to let the caller create a new message
+            # Then we'll schedule cleanup of old messages after the new one is created
+            if old_messages:
+                # Schedule cleanup to happen after the new message is created
+                self.interaction.client.loop.create_task(  # NOQA
+                    self.__cleanup_old_messages(old_messages)
+                )
 
-            # If not a component interaction or direct reuse failed, try session messages
-            # Find ALL valid messages in the session, including our own
-            message_views = []
-            for v in self.session.views:
-                if v.message is not None:
-                    # For slash commands, SKIP message verification
-                    # We'll try to edit it directly instead of checking first
-                    if not self.interaction.message:
-                        message_views.append((v, v.message))
-                        continue
-
-                    try:
-                        # For component interactions, verify the message exists
-                        channel = self.interaction.channel
-                        await channel.fetch_message(v.message.id)
-                        message_views.append((v, v.message))
-                    except (discord.NotFound, discord.HTTPException) as e:
-                        # Only clear the reference if it's actually not found
-                        if isinstance(e, discord.NotFound):
-                            v.__message = None
-                            logger.warning(f"Message reference for view '{v.name}' is no longer valid, cleared")
-                        else:
-                            # For other HTTP errors, log but don't clear (might be temporary)
-                            logger.warning(f"Error verifying message for view '{v.name}': {e}")
-
-            if not message_views:
-                return False  # No valid message to reuse
-
-            # Use the newest message (highest ID)
-            message_views.sort(key=lambda x: int(x[1].id), reverse=True)
-            source_view, reusable_message = message_views[0]
-            logger.debug(f"Found message '{reusable_message.id}' to reuse from session")
-
-            # Clean up other views
-            for view in list(self.session.views):
-                if view is not self:
-                    view.stop()
-                    view.clear_items()
-                    view.clear_message_reference()
-                    if view in self.session.views:
-                        self.session.views.remove(view)
-                    logger.debug(f"Cleaned up old view '{view.name}'")
-
-            # Reuse the message
-            try:
-                if not self.embeds:
-                    self.embeds = source_view.embeds
-                await reusable_message.edit(view=self, embeds=self.embeds)
-
-                self.message = reusable_message
-                logger.debug(f"Reused message '{reusable_message.id}' for view '{self.name}'")
-
-                # Try to delete the original response if different
-                try:
-                    original_response = await self.interaction.original_response()
-                    if original_response.id != reusable_message.id:
-                        await original_response.delete()
-                        logger.debug(f"Deleted duplicate original response")
-                except Exception as e:
-                    logger.debug(f"Could not delete original response: {e}")
-
-                return True  # Successfully reused a message
-            except discord.NotFound:
-                # Only now do we clear the message reference - if the edit fails
-                logger.warning(f"Message '{reusable_message.id}' no longer exists, will create new message")
-                source_view.__message = None
-                return False  # Continue with normal handling
+            return False  # Always create a new message
         except Exception as e:
-            logger.error(f"Error reusing message: {e}", exc_info=True)
+            logger.error(f"Error in message handling: {e}", exc_info=True)
             return False
 
     async def transition_to(self, view_class, interaction=None, **kwargs) -> CascadeViewObj:
@@ -507,6 +434,32 @@ class CascadeView(View):
         """Clear the message reference."""
         self.__message = None
         logger.debug(f"Cleared message reference for view '{self.name}'")
+
+    async def __cleanup_old_messages(self, old_messages):
+        """Clean up old messages after a delay to ensure the new message is visible."""
+        try:
+            # Wait a short time to ensure the new message is created
+            await asyncio.sleep(0.5)
+
+            for view, message in old_messages:
+                try:
+                    # Edit to show it's been superseded
+                    await message.edit(
+                        view=None,  # Remove buttons
+                        embeds=[discord.Embed(
+                            title=f"{view.name}",
+                            description="This view has been moved to another channel.",
+                            color=0x808080  # Gray color
+                        )]
+                    )
+
+                    logger.debug(f"Cleaned up old message '{message.id}' for view '{view.name}'")
+                except discord.NotFound:
+                    logger.debug(f"Message '{message.id}' was already deleted")
+                except discord.HTTPException as e:
+                    logger.debug(f"Could not clean up message '{message.id}': {e}")
+        except Exception as e:
+            logger.error(f"Error in message cleanup: {e}", exc_info=True)
 
     async def on_timeout(self) -> None:
         """Handle view timeout."""
