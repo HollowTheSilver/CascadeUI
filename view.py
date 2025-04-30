@@ -452,7 +452,7 @@ class CascadeView(View):
             await self.__ensure_session(user_id)
 
             # Run session cleanup in the background
-            self.interaction.client.loop.create_task(self.manager.cleanup_old_sessions())  # NOQA
+            self.interaction.client.loop.create_task(self.manager.cleanup_old_sessions())
 
             # Defer early to prevent timeouts
             if not (hasattr(self.interaction, 'response') and self.interaction.response.is_done()):
@@ -462,11 +462,19 @@ class CascadeView(View):
                     # Interaction might already be acknowledged
                     pass
 
-            # Store current message reference
+            # Store current message reference (for this instance)
             current_message = self.message
 
             # Clear our own message reference - CRITICAL for proper cleanup
             self.__message = None
+
+            # Find ALL other active messages in the session (from other views)
+            other_messages = []
+            if self.session:
+                for view in list(self.session.views):
+                    if view is not self and view.message is not None:
+                        other_messages.append((view, view.message))
+                        logger.debug(f"Found message '{view.message.id}' from view '{view.name}' to clean up")
 
             # Create a new message
             new_message = await self.interaction.original_response()
@@ -477,14 +485,19 @@ class CascadeView(View):
             # Edit the message with all properties
             await new_message.edit(**edit_kwargs)
 
-            # Before setting our new message reference, clean up the old one
+            # Set the message property
+            self.message = new_message
+            logger.debug(f"Created new message '{new_message.id}' for view '{self.name}'")
+
+            # First, clean up our own previous message if it exists
             if current_message:
                 try:
-                    await current_message.delete()
-                    logger.debug(f"Deleted previous message '{current_message.id}' for view '{self.name}'")
-                except (discord.Forbidden, discord.NotFound):
-                    # Fall back to updating
+                    # Try to delete first
                     try:
+                        await current_message.delete()
+                        logger.debug(f"Deleted our own previous message '{current_message.id}'")
+                    except (discord.Forbidden, discord.NotFound):
+                        # Fall back to updating
                         await current_message.edit(
                             view=None,
                             embeds=[discord.Embed(
@@ -493,13 +506,41 @@ class CascadeView(View):
                                 color=0x808080  # Gray color
                             )]
                         )
-                        logger.debug(f"Updated previous message '{current_message.id}' for view '{self.name}'")
-                    except Exception as e:
-                        logger.debug(f"Could not update previous message: {e}")
+                        logger.debug(f"Updated our own previous message '{current_message.id}'")
+                except Exception as e:
+                    logger.debug(f"Could not clean up previous message: {e}")
 
-            # Now set the new message reference
-            self.message = new_message
-            logger.debug(f"Created new message '{new_message.id}' for view '{self.name}'")
+            # Then clean up ALL other messages in the session
+            for view, old_message in other_messages:
+                try:
+                    # Try to delete first
+                    try:
+                        await old_message.delete()
+                        logger.debug(f"Deleted other message '{old_message.id}' from view '{view.name}'")
+                    except (discord.Forbidden, discord.NotFound):
+                        # Fall back to updating
+                        await old_message.edit(
+                            view=None,
+                            embeds=[discord.Embed(
+                                title=f"{view.name}",
+                                description="This view has been moved to another channel.",
+                                color=0x808080  # Gray color
+                            )]
+                        )
+                        logger.debug(f"Updated other message '{old_message.id}' from view '{view.name}'")
+
+                    # Clear the view's message reference and items
+                    view.clear_message_reference()
+                    view.clear_items()
+                    view.stop()
+
+                    # Remove the view from the session
+                    if view in self.session.views:
+                        self.session.views.remove(view)
+                        logger.debug(f"Removed view '{view.name}' from session")
+
+                except Exception as e:
+                    logger.error(f"Error cleaning up message '{old_message.id}': {e}")
 
         except Exception as e:
             logger.error(f"Error in interaction handling: {e}", exc_info=True)
