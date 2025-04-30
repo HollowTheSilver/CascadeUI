@@ -73,12 +73,14 @@ class CascadeView(View):
         self._transition_in_progress = False
         self._is_duplicate = False
 
+        # Temporarily store interaction for later
+        interaction = custom_kwargs.pop("interaction", None)
+
         # Process standard attributes from kwargs
         for key, value in custom_kwargs.items():
             setattr(self, key, value)
 
         # Handle interaction if provided
-        interaction = custom_kwargs.get("interaction")
         if interaction is not None:
             # Set interaction without triggering handler
             self.__interaction = interaction
@@ -450,7 +452,7 @@ class CascadeView(View):
             await self.__ensure_session(user_id)
 
             # Run session cleanup in the background
-            self.interaction.client.loop.create_task(self.manager.cleanup_old_sessions())  # NOQA
+            self.interaction.client.loop.create_task(self.manager.cleanup_old_sessions())
 
             # Defer early to prevent timeouts
             if not (hasattr(self.interaction, 'response') and self.interaction.response.is_done()):
@@ -481,7 +483,7 @@ class CascadeView(View):
             self.message = new_message
             logger.debug(f"Created new message '{new_message.id}' for view '{self.name}'")
 
-            # Now clean up ALL previous messages, regardless of view type
+            # Now clean up ALL previous messages
             for view, old_message in prev_messages:
                 try:
                     # Try to delete first
