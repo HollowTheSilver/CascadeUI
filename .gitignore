@@ -1,0 +1,75 @@
+# Logging Directories
+logs/
+*.log
+log/
+
+# Release Directories
+release/
+releases/
+
+# Backup Directories
+backup/
+backups/
+
+# Python Bytecode and Compiled Files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / Packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Virtual Environments
+venv/
+env/
+.env/
+.venv/
+ENV/
+
+# IDE and Editor Directories
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Development and Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Sensitive Information
+.env
+*.secret
+secrets.json
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Temporary Files
+*.tmp
+*.bak
+
+# Dependency Directories
+node_modules/
+
+# Build and Compilation Artifacts
+*.so
+*.dll
+*.dylib
+
+# Debugging and Profiling
+*.prof
+*.out
+
+# Project-Specific Ignores
+# Add any additional project-specific ignore patterns below this line
