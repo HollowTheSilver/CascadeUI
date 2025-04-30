@@ -162,8 +162,17 @@ class CascadeView(View):
 
         # If we already have a message reference and it's different, clear it first
         if self.__message and value and self.__message.id != value.id:
-            self.interaction.client.loop.create_task(self.__clear_old_messages())
+            old_message = self.__message
+            logger.debug(f"Found old message '{old_message.id}' to clear for view '{self.name}'")
 
+            # Schedule cleanup of old message
+            try:
+                # Store a reference to the old message before updating the property
+                self.interaction.client.loop.create_task(self.__clear_old_message(old_message))
+            except Exception as e:
+                logger.error(f"Error scheduling message cleanup: {e}")
+
+        # Set the new message
         self.__message = value
         if value:
             logger.debug(f"Message '{value.id}' set for view '{self.name}'")
@@ -287,30 +296,30 @@ class CascadeView(View):
         if hasattr(self.session, 'add_to_history'):
             self.session.add_to_history(self)
 
-    async def __clear_old_messages(self) -> None:
-        """Find and clear old messages from this same instance."""
-        if not self.message:
-            return
-
+    async def __clear_old_message(self, old_message: discord.Message) -> None:
+        """Clear an old message from this view."""
         try:
-            # Store the current message for later
-            old_message = self.message
-
-            # Immediately clear our reference to prevent recursion issues
-            self.__message = None
-
-            # Update old message to show it's been moved
-            await old_message.edit(
-                view=None,
-                embeds=[discord.Embed(
-                    title=f"{self.name}",
-                    description="This view has been moved to another channel.",
-                    color=0x808080  # Gray color
-                )]
-            )
-            logger.debug(f"Cleared old message '{old_message.id}' for view '{self.name}'")
+            # Try to delete the message
+            try:
+                await old_message.delete()
+                logger.debug(f"Deleted old message '{old_message.id}' for view '{self.name}'")
+            except discord.Forbidden:
+                # If we can't delete (missing permissions), update with placeholder instead
+                await old_message.edit(
+                    view=None,
+                    embeds=[discord.Embed(
+                        title=f"{self.name}",
+                        description="This view has been moved to another channel.",
+                        color=0x808080  # Gray color
+                    )]
+                )
+                logger.debug(f"Cleared old message '{old_message.id}' for view '{self.name}'")
+            except discord.NotFound:
+                logger.debug(f"Old message '{old_message.id}' was already deleted")
+            except Exception as e:
+                logger.error(f"Error clearing old message '{old_message.id}': {e}")
         except Exception as e:
-            logger.debug(f"Could not clear old message: {e}")
+            logger.error(f"Error in old message cleanup: {e}")
 
     async def transition_to(self, view_class, interaction=None, **kwargs) -> CascadeViewObj:
         """
