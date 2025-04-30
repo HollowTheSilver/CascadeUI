@@ -160,18 +160,6 @@ class CascadeView(View):
                 f"Invalid attribute type '{type(value)}' provided. Attribute 'message' must be a discord message object."
             raise AttributeError(exception)
 
-        # If we already have a message reference and it's different, clear it first
-        if self.__message and value and self.__message.id != value.id:
-            old_message = self.__message
-            logger.debug(f"Found old message '{old_message.id}' to clear for view '{self.name}'")
-
-            # Schedule cleanup of old message
-            try:
-                # Store a reference to the old message before updating the property
-                self.interaction.client.loop.create_task(self.__clear_old_message(old_message))
-            except Exception as e:
-                logger.error(f"Error scheduling message cleanup: {e}")
-
         # Set the new message
         self.__message = value
         if value:
@@ -236,56 +224,52 @@ class CascadeView(View):
                     # Interaction might already be acknowledged
                     pass
 
-            # Search session for any existing views of the same type
-            # regardless of whether they came from transitions
+            # Get all previously active messages for this user
+            prev_messages = []
             if self.session:
                 for view in list(self.session.views):
-                    # Find views of same class but different instances
-                    if (view is not self and
-                            view.__class__.__name__ == self.__class__.__name__ and
-                            hasattr(view, 'message') and
-                            view.message):
-
-                        # Cleanup old message
-                        old_message = view.message
-                        try:
-                            await old_message.delete()
-                            logger.debug(
-                                f"Deleted old message '{old_message.id}' from view '{view.name}' (id: {id(view)})")
-                        except (discord.Forbidden, discord.HTTPException):
-                            try:
-                                await old_message.edit(
-                                    view=None,
-                                    embeds=[discord.Embed(
-                                        title=f"{view.name}",
-                                        description="This view has been moved to another channel.",
-                                        color=0x808080  # Gray color
-                                    )]
-                                )
-                                logger.debug(
-                                    f"Edited old message '{old_message.id}' from view '{view.name}' (id: {id(view)})")
-                            except Exception as e:
-                                logger.debug(f"Could not edit old message: {e}")
-
-                        # Stop and clean up the old view
-                        view.stop()
-                        view.clear_items()
-                        view.clear_message_reference()
-
-                        # Remove from session
-                        if view in self.session.views:
-                            self.session.views.remove(view)
-
-                        logger.debug(f"Cleaned up old view '{view.name}' (id: {id(view)})")
+                    if view is not self and view.message is not None:
+                        prev_messages.append((view, view.message))
+                        logger.debug(f"Found existing message '{view.message.id}' for view '{view.name}'")
 
             # Create a new message
             new_message = await self.interaction.original_response()
             await new_message.edit(view=self, embeds=self.embeds)
 
-            # Set the message
+            # Set the message property
             self.message = new_message
-
             logger.debug(f"Created new message '{new_message.id}' for view '{self.name}'")
+
+            # Now clean up ALL previous messages, regardless of view type
+            for view, old_message in prev_messages:
+                try:
+                    # Try to delete first
+                    try:
+                        await old_message.delete()
+                        logger.debug(f"Deleted previous message '{old_message.id}' from view '{view.name}'")
+                    except (discord.Forbidden, discord.NotFound):
+                        # Fall back to updating the message with a placeholder
+                        await old_message.edit(
+                            view=None,
+                            embeds=[discord.Embed(
+                                title=f"{view.name}",
+                                description="This view has been moved to another channel.",
+                                color=0x808080  # Gray color
+                            )]
+                        )
+                        logger.debug(f"Updated previous message '{old_message.id}' from view '{view.name}'")
+
+                    # Clear old view's message reference and items
+                    view.clear_message_reference()
+                    view.clear_items()
+                    view.stop()
+
+                    # Remove the view from the session
+                    if view in self.session.views:
+                        self.session.views.remove(view)
+
+                except Exception as e:
+                    logger.error(f"Error cleaning up message '{old_message.id}': {e}")
 
         except Exception as e:
             logger.error(f"Error in interaction handling: {e}", exc_info=True)
