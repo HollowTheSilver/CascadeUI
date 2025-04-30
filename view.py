@@ -159,6 +159,11 @@ class CascadeView(View):
             exception: str = \
                 f"Invalid attribute type '{type(value)}' provided. Attribute 'message' must be a discord message object."
             raise AttributeError(exception)
+
+        # If we already have a message reference and it's different, clear it first
+        if self.__message and value and self.__message.id != value.id:
+            self.interaction.client.loop.create_task(self.__clear_old_messages())
+
         self.__message = value
         if value:
             logger.debug(f"Message '{value.id}' set for view '{self.name}'")
@@ -222,54 +227,14 @@ class CascadeView(View):
                     # Interaction might already be acknowledged
                     pass
 
-            # Find old messages to clean up
-            old_messages = []
-            old_view_ids = []
-            old_views_to_remove = []
+            # Create a new message
+            new_message = await self.interaction.original_response()
+            await new_message.edit(view=self, embeds=self.embeds)
 
-            if self.session:
-                # Find all previous messages of the same view type (but not this instance)
-                for view in self.session.views:
-                    if (view is not self and
-                            view.__class__.__name__ == self.__class__.__name__ and
-                            hasattr(view, 'message') and
-                            view.message):
-                        old_messages.append(view.message)
-                        old_view_ids.append(id(view))
-                        old_views_to_remove.append(view)
+            # Set the message (this will trigger cleanup of old messages via the setter)
+            self.message = new_message
 
-                        # Mark the view as being replaced
-                        view.stop()
-
-                        logger.debug(
-                            f"Found old view '{view.name}' (id: {id(view)}) with message {view.message.id} to clean up")
-
-            # Create the new message
-            self.message = await self.interaction.original_response()
-            await self.message.edit(view=self, embeds=self.embeds)
-            logger.debug(f"Created new message '{self.message.id}' for view '{self.name}'")
-
-            # Now clean up old messages AFTER new one is created
-            for i, old_message in enumerate(old_messages):
-                try:
-                    await old_message.edit(
-                        view=None,  # Remove buttons
-                        embeds=[discord.Embed(
-                            title=f"{self.name}",
-                            description="This view has been moved to another channel.",
-                            color=0x808080  # Gray color
-                        )]
-                    )
-                    logger.debug(f"Cleaned up old message '{old_message.id}' for view with id: {old_view_ids[i]}")
-                except Exception as e:
-                    logger.debug(f"Could not clean up message '{old_message.id}': {e}")
-
-            # Remove old views from session
-            for view in old_views_to_remove:
-                if view in self.session.views:
-                    self.session.views.remove(view)
-                    view.clear_message_reference()
-                    logger.debug(f"Removed old view (id: {id(view)}) from session")
+            logger.debug(f"Created new message '{new_message.id}' for view '{self.name}'")
 
         except Exception as e:
             logger.error(f"Error in interaction handling: {e}", exc_info=True)
@@ -321,6 +286,31 @@ class CascadeView(View):
         # Add to navigation history
         if hasattr(self.session, 'add_to_history'):
             self.session.add_to_history(self)
+
+    async def __clear_old_messages(self) -> None:
+        """Find and clear old messages from this same instance."""
+        if not self.message:
+            return
+
+        try:
+            # Store the current message for later
+            old_message = self.message
+
+            # Immediately clear our reference to prevent recursion issues
+            self.__message = None
+
+            # Update old message to show it's been moved
+            await old_message.edit(
+                view=None,
+                embeds=[discord.Embed(
+                    title=f"{self.name}",
+                    description="This view has been moved to another channel.",
+                    color=0x808080  # Gray color
+                )]
+            )
+            logger.debug(f"Cleared old message '{old_message.id}' for view '{self.name}'")
+        except Exception as e:
+            logger.debug(f"Could not clear old message: {e}")
 
     async def transition_to(self, view_class, interaction=None, **kwargs) -> CascadeViewObj:
         """
