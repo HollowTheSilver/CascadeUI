@@ -236,11 +236,53 @@ class CascadeView(View):
                     # Interaction might already be acknowledged
                     pass
 
+            # Search session for any existing views of the same type
+            # regardless of whether they came from transitions
+            if self.session:
+                for view in list(self.session.views):
+                    # Find views of same class but different instances
+                    if (view is not self and
+                            view.__class__.__name__ == self.__class__.__name__ and
+                            hasattr(view, 'message') and
+                            view.message):
+
+                        # Cleanup old message
+                        old_message = view.message
+                        try:
+                            await old_message.delete()
+                            logger.debug(
+                                f"Deleted old message '{old_message.id}' from view '{view.name}' (id: {id(view)})")
+                        except (discord.Forbidden, discord.HTTPException):
+                            try:
+                                await old_message.edit(
+                                    view=None,
+                                    embeds=[discord.Embed(
+                                        title=f"{view.name}",
+                                        description="This view has been moved to another channel.",
+                                        color=0x808080  # Gray color
+                                    )]
+                                )
+                                logger.debug(
+                                    f"Edited old message '{old_message.id}' from view '{view.name}' (id: {id(view)})")
+                            except Exception as e:
+                                logger.debug(f"Could not edit old message: {e}")
+
+                        # Stop and clean up the old view
+                        view.stop()
+                        view.clear_items()
+                        view.clear_message_reference()
+
+                        # Remove from session
+                        if view in self.session.views:
+                            self.session.views.remove(view)
+
+                        logger.debug(f"Cleaned up old view '{view.name}' (id: {id(view)})")
+
             # Create a new message
             new_message = await self.interaction.original_response()
             await new_message.edit(view=self, embeds=self.embeds)
 
-            # Set the message (this will trigger cleanup of old messages via the setter)
+            # Set the message
             self.message = new_message
 
             logger.debug(f"Created new message '{new_message.id}' for view '{self.name}'")
@@ -309,7 +351,7 @@ class CascadeView(View):
                     view=None,
                     embeds=[discord.Embed(
                         title=f"{self.name}",
-                        description="This view has been moved to another channel.",
+                        description="This interface was initialized in another text channel.",
                         color=0x808080  # Gray color
                     )]
                 )
@@ -325,20 +367,6 @@ class CascadeView(View):
         """
         Transition from this view to a new view class.
         This is the recommended way to create a new view from a button handler.
-
-        Parameters:
-        -----------
-        view_class: Type[CascadeViewObj]
-            The view class to create
-        interaction: Optional[discord.Interaction]
-            The interaction that triggered this transition
-        **kwargs:
-            Additional kwargs to pass to the view constructor
-
-        Returns:
-        --------
-        CascadeViewObj
-            The new view instance for method chaining
         """
         # Store the current interaction before we create the new view
         current_interaction = interaction or self.interaction
@@ -363,25 +391,32 @@ class CascadeView(View):
             if self in self.session.views:
                 self.session.views.remove(self)
 
+        # Save current message reference
+        current_message = self.message
+
+        # Important: Clear our message reference to prevent the new view
+        # from being associated with us during cleanup scans
+        self.clear_message_reference()
+
         # Create the new view WITHOUT setting the interaction
         new_view = view_class(**kwargs)
 
         # Update the original message with the new view
-        if self.message:
+        if current_message:
             try:
                 if not new_view.embeds:
                     new_view.embeds = self.embeds
-                await self.message.edit(view=new_view, embeds=new_view.embeds)
+                await current_message.edit(view=new_view, embeds=new_view.embeds)
 
                 # Set the message on the new view
-                new_view.message = self.message
+                new_view.message = current_message
 
                 # Add the new view to the session
                 if self.session:
                     new_view.session = self.session
                     self.session.set(view=new_view)
 
-                logger.debug(f"Transitioned from '{self.name}' to '{new_view.name}' on message '{self.message.id}'")
+                logger.debug(f"Transitioned from '{self.name}' to '{new_view.name}' on message '{current_message.id}'")
             except discord.errors.NotFound:
                 # If the message is gone, create a new one
                 followup_message = await current_interaction.followup.send(
@@ -414,9 +449,6 @@ class CascadeView(View):
                 self.session.set(view=new_view)
 
             logger.debug(f"Created new message for '{new_view.name}' during transition")
-
-        # Clear reference to this message to prevent further processing
-        self.__message = None
 
         # Remove this interaction from processing to prevent duplicate responses
         interaction_id = current_interaction.id
