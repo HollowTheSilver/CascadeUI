@@ -334,22 +334,18 @@ class CascadeView(View):
         self.__delete_after = value
 
     @property
-    def poll(self) -> Optional[discord.Poll]:
+    def poll(self) -> Optional[object]:  # Changed from discord.Poll to object
         """Get the poll for this view's messages."""
         return self.__poll
 
     @poll.setter
-    def poll(self, value: Optional[discord.Poll]) -> None:
+    def poll(self, value: Optional[object]) -> None:  # Changed from discord.Poll to object
         """Set the poll for this view's messages."""
         if value is not None:
-            try:
-                # Check if it's a discord.Poll object - this will vary based on discord.py version
-                if not hasattr(discord, 'Poll') or not isinstance(value, discord.Poll):
-                    exception: str = f"Invalid attribute type '{type(value)}' provided. Poll must be a discord.Poll object."
-                    raise AttributeError(exception)
-            except AttributeError:
-                # discord.Poll might not exist in older versions
-                pass
+            # Just check if it has poll-like attributes or if discord has Poll
+            if not hasattr(discord, 'Poll'):
+                logger.warning("Poll feature not available in this discord.py version")
+            # Don't validate the type if discord.Poll doesn't exist
         self.__poll = value
 
     def get_message_kwargs(self) -> dict:
@@ -379,18 +375,19 @@ class CascadeView(View):
         if self.silent is not None:
             kwargs['silent'] = self.silent
 
-        # These are only used in send, not in edit
-        if self.file is not None and hasattr(discord.Message,
-                                             'edit') and 'file' in discord.Message.edit.__annotations__:
+        # These are only used in send, not in edit - check if they're supported
+        if self.file is not None and hasattr(discord.Message, 'edit') and hasattr(discord.Message.edit,
+                                                                                  '__annotations__') and 'file' in discord.Message.edit.__annotations__:
             kwargs['file'] = self.file
-        if self.files is not None and hasattr(discord.Message,
-                                              'edit') and 'files' in discord.Message.edit.__annotations__:
+        if self.files is not None and hasattr(discord.Message, 'edit') and hasattr(discord.Message.edit,
+                                                                                   '__annotations__') and 'files' in discord.Message.edit.__annotations__:
             kwargs['files'] = self.files
-        if self.delete_after is not None and hasattr(discord.Message,
-                                                     'edit') and 'delete_after' in discord.Message.edit.__annotations__:
+        if self.delete_after is not None and hasattr(discord.Message, 'edit') and hasattr(discord.Message.edit,
+                                                                                          '__annotations__') and 'delete_after' in discord.Message.edit.__annotations__:
             kwargs['delete_after'] = self.delete_after
-        if self.poll is not None and hasattr(discord.Message,
-                                             'edit') and 'poll' in discord.Message.edit.__annotations__:
+
+        # Only include poll if it exists in discord
+        if self.poll is not None and hasattr(discord, 'Poll'):
             kwargs['poll'] = self.poll
 
         return kwargs
@@ -429,7 +426,9 @@ class CascadeView(View):
             kwargs['silent'] = self.silent
         if self.delete_after is not None:
             kwargs['delete_after'] = self.delete_after
-        if self.poll is not None:
+
+        # Only include poll if it exists in discord
+        if self.poll is not None and hasattr(discord, 'Poll'):
             kwargs['poll'] = self.poll
 
         return kwargs
