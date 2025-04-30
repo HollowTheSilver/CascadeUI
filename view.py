@@ -283,13 +283,13 @@ class CascadeView(View):
 
     async def __reuse_message(self) -> bool:
         """
-        Rather than reusing an existing message, always create a new message
-        in the current channel and clean up old messages.
+        Find old messages from the same view class and mark them for cleanup,
+        then create a new message in the current channel.
 
         Returns:
         --------
         bool
-            False to indicate we should create a new message (old logic will be handled differently)
+            False to indicate we should always create a new message
         """
         try:
             # Store reference to old messages for cleanup
@@ -310,15 +310,13 @@ class CascadeView(View):
                         if view in self.session.views:
                             self.session.views.remove(view)
 
-                        logger.debug(f"Marked old view '{view.name}' for cleanup")
+                        logger.debug(f"Marked old view '{view.name}' (id: {id(view)}) for cleanup")
 
             # We'll return False to let the caller create a new message
             # Then we'll schedule cleanup of old messages after the new one is created
             if old_messages:
                 # Schedule cleanup to happen after the new message is created
-                self.interaction.client.loop.create_task(  # NOQA
-                    self.__cleanup_old_messages(old_messages)
-                )
+                asyncio.create_task(self.__cleanup_old_messages(old_messages))  # NOQA
 
             return False  # Always create a new message
         except Exception as e:
@@ -447,7 +445,7 @@ class CascadeView(View):
                         )]
                     )
 
-                    logger.debug(f"Cleaned up old message '{message.id}' for view '{view.name}'")
+                    logger.debug(f"Cleaned up old message '{message.id}' for view '{view.name}' (id: {id(view)})")
                 except discord.NotFound:
                     logger.debug(f"Message '{message.id}' was already deleted")
                 except discord.HTTPException as e:
