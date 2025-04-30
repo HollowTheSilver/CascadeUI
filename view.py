@@ -222,13 +222,54 @@ class CascadeView(View):
                     # Interaction might already be acknowledged
                     pass
 
-            # Handle old message cleanup - this won't reuse messages anymore
-            await self.__reuse_message()
+            # Find old messages to clean up
+            old_messages = []
+            old_view_ids = []
+            old_views_to_remove = []
 
-            # Always create a new message
+            if self.session:
+                # Find all previous messages of the same view type (but not this instance)
+                for view in self.session.views:
+                    if (view is not self and
+                            view.__class__.__name__ == self.__class__.__name__ and
+                            hasattr(view, 'message') and
+                            view.message):
+                        old_messages.append(view.message)
+                        old_view_ids.append(id(view))
+                        old_views_to_remove.append(view)
+
+                        # Mark the view as being replaced
+                        view.stop()
+
+                        logger.debug(
+                            f"Found old view '{view.name}' (id: {id(view)}) with message {view.message.id} to clean up")
+
+            # Create the new message
             self.message = await self.interaction.original_response()
             await self.message.edit(view=self, embeds=self.embeds)
             logger.debug(f"Created new message '{self.message.id}' for view '{self.name}'")
+
+            # Now clean up old messages AFTER new one is created
+            for i, old_message in enumerate(old_messages):
+                try:
+                    await old_message.edit(
+                        view=None,  # Remove buttons
+                        embeds=[discord.Embed(
+                            title=f"{self.name}",
+                            description="This view has been moved to another channel.",
+                            color=0x808080  # Gray color
+                        )]
+                    )
+                    logger.debug(f"Cleaned up old message '{old_message.id}' for view with id: {old_view_ids[i]}")
+                except Exception as e:
+                    logger.debug(f"Could not clean up message '{old_message.id}': {e}")
+
+            # Remove old views from session
+            for view in old_views_to_remove:
+                if view in self.session.views:
+                    self.session.views.remove(view)
+                    view.clear_message_reference()
+                    logger.debug(f"Removed old view (id: {id(view)}) from session")
 
         except Exception as e:
             logger.error(f"Error in interaction handling: {e}", exc_info=True)
@@ -280,48 +321,6 @@ class CascadeView(View):
         # Add to navigation history
         if hasattr(self.session, 'add_to_history'):
             self.session.add_to_history(self)
-
-    async def __reuse_message(self) -> bool:
-        """
-        Find old messages from the same view class and mark them for cleanup,
-        then create a new message in the current channel.
-
-        Returns:
-        --------
-        bool
-            False to indicate we should always create a new message
-        """
-        try:
-            # Store reference to old messages for cleanup
-            old_messages = []
-
-            # Find all existing messages in the session with the same view type
-            if self.session:
-                for view in list(self.session.views):
-                    if (view is not self and
-                            view.__class__.__name__ == self.__class__.__name__ and
-                            view.message):
-                        old_messages.append((view, view.message))
-
-                        # Stop the old view to prevent it from processing further
-                        view.stop()
-                        view.clear_items()
-                        view.clear_message_reference()
-                        if view in self.session.views:
-                            self.session.views.remove(view)
-
-                        logger.debug(f"Marked old view '{view.name}' (id: {id(view)}) for cleanup")
-
-            # We'll return False to let the caller create a new message
-            # Then we'll schedule cleanup of old messages after the new one is created
-            if old_messages:
-                # Schedule cleanup to happen after the new message is created
-                asyncio.create_task(self.__cleanup_old_messages(old_messages))  # NOQA
-
-            return False  # Always create a new message
-        except Exception as e:
-            logger.error(f"Error in message handling: {e}", exc_info=True)
-            return False
 
     async def transition_to(self, view_class, interaction=None, **kwargs) -> CascadeViewObj:
         """
@@ -426,32 +425,6 @@ class CascadeView(View):
             del self.__class__._processed_interactions[interaction_id]
 
         return new_view
-
-    async def __cleanup_old_messages(self, old_messages):
-        """Clean up old messages after a delay to ensure the new message is visible."""
-        try:
-            # Wait a short time to ensure the new message is created
-            await asyncio.sleep(0.5)
-
-            for view, message in old_messages:
-                try:
-                    # Edit to show it's been superseded
-                    await message.edit(
-                        view=None,  # Remove buttons
-                        embeds=[discord.Embed(
-                            title=f"{view.name}",
-                            description="This view has been moved to another channel.",
-                            color=0x808080  # Gray color
-                        )]
-                    )
-
-                    logger.debug(f"Cleaned up old message '{message.id}' for view '{view.name}' (id: {id(view)})")
-                except discord.NotFound:
-                    logger.debug(f"Message '{message.id}' was already deleted")
-                except discord.HTTPException as e:
-                    logger.debug(f"Could not clean up message '{message.id}': {e}")
-        except Exception as e:
-            logger.error(f"Error in message cleanup: {e}", exc_info=True)
 
     def clear_message_reference(self):
         """Clear the message reference."""
