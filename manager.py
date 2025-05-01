@@ -2,7 +2,7 @@
 
 # // ========================================( Modules )======================================== // #
 
-
+from asyncio import Lock
 from discord import Interaction
 from typing import Dict, Optional, Union, Callable, List, Self, TYPE_CHECKING
 from datetime import datetime
@@ -39,12 +39,31 @@ class UIManager(object):
         self.sessions.setdefault(None)
         self.middlewares: List[Callable] = []
         self._last_cleanup = datetime.now()
+        self._session_locks: Dict[int, Lock] = {}  # Add lock dictionary
 
     def __new__(cls, *args, **kwargs) -> UIManagerObj:
         if not cls.__instance:
             cls.__instance: UIManagerObj = super().__new__(cls)
             logger.info(msg="Instantiated successfully.")
         return cls.__instance
+
+    async def get_session_lock(self, user_id: int) -> Lock:
+        """
+        Get or create a lock for a specific user session.
+
+        Parameters:
+        -----------
+        user_id: int
+            The user ID to get a lock for
+
+        Returns:
+        --------
+        Lock
+            The lock for this user's session
+        """
+        if user_id not in self._session_locks:
+            self._session_locks[user_id] = Lock()
+        return self._session_locks[user_id]
 
     def get(self, session: Union[UISessionObj, int]) -> Optional[UISessionObj]:
         """
@@ -240,13 +259,27 @@ class UIManager(object):
 
             if session and hasattr(session, 'last_interaction_time'):
                 age = (now - session.last_interaction_time).total_seconds() / 60
-                if age > max_age_minutes:
+
+                # Check if the session has active views with pending interactions
+                active_views = any(v and hasattr(v, 'is_interacting') and v.is_interacting()
+                                   for v in session.views if v)
+
+                if age > max_age_minutes and not active_views:
                     sessions_to_remove.append(uid)
+                    logger.debug(f"Marking inactive session '{uid}' for cleanup (age: {age:.1f} minutes)")
 
         count = 0
         for uid in sessions_to_remove:
             if self.delete(session=uid):
                 count += 1
                 logger.debug(f"Cleaned up inactive session '{uid}'")
+
+        # Also clean up locks for removed sessions
+        for uid in sessions_to_remove:
+            if uid in self._session_locks:
+                del self._session_locks[uid]
+
+        if count > 0:
+            logger.info(f"Cleaned up {count} inactive sessions")
 
         return count

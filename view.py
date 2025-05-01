@@ -350,13 +350,13 @@ class CascadeView(View):
             # Don't validate the type if discord.Poll doesn't exist
         self.__poll = value
 
-    def get_message_kwargs(self) -> dict:
+    def get_message_kwargs(self) -> Dict[str, Any]:
         """
         Get a dictionary of message properties for this view.
 
         Returns:
         --------
-        dict
+        Dict[str, Any]
             A dictionary of message properties to use when creating/editing messages
         """
         kwargs = {'view': self}
@@ -394,13 +394,13 @@ class CascadeView(View):
 
         return kwargs
 
-    def get_followup_kwargs(self) -> dict:
+    def get_followup_kwargs(self) -> Dict[str, Any]:
         """
         Get a dictionary of message properties for followup messages.
 
         Returns:
         --------
-        dict
+        Dict[str, Any]
             A dictionary of message properties to use when creating followup messages
         """
         kwargs = {'view': self}
@@ -440,128 +440,171 @@ class CascadeView(View):
         user_id = self.interaction.user.id
         interaction_id = self.interaction.id
 
-        try:
-            # Skip if this is a duplicate or transition
-            if self._is_duplicate or (hasattr(self, '_transition_in_progress') and self._transition_in_progress):
-                logger.debug(f"View '{self.name}' is skipping interaction handling")
-                return
-
-            logger.debug(f"Handling interaction for view '{self.name}' (id: {id(self)}) for user {user_id}")
-
-            # Ensure session is set up
-            await self.__ensure_session(user_id)
-
-            # Run session cleanup in the background
-            self.interaction.client.loop.create_task(self.manager.cleanup_old_sessions())
-
-            # Defer early to prevent timeouts
-            if not (hasattr(self.interaction, 'response') and self.interaction.response.is_done()):
-                try:
-                    await self.interaction.response.defer(ephemeral=self.ephemeral)
-                except discord.errors.HTTPException:
-                    # Interaction might already be acknowledged
-                    pass
-
-            # Store current message reference (for this instance)
-            current_message = self.message
-
-            # Clear our own message reference - CRITICAL for proper cleanup
-            self.__message = None
-
-            # Find ALL other active messages in the session (from other views)
-            other_messages = []
-            if self.session:
-                for view in list(self.session.views):
-                    if view is not self and view.message is not None:
-                        other_messages.append((view, view.message))
-                        logger.debug(f"Found message '{view.message.id}' from view '{view.name}' to clean up")
-
-            # Create a new message
-            new_message = await self.interaction.original_response()
-
-            # Get message properties for edit
-            edit_kwargs = self.get_message_kwargs()
-
-            # Edit the message with all properties
-            await new_message.edit(**edit_kwargs)
-
-            # Set the message property
-            self.message = new_message
-            logger.debug(f"Created new message '{new_message.id}' for view '{self.name}'")
-
-            # First, clean up our own previous message if it exists
-            if current_message:
-                try:
-                    # Try to delete first
-                    try:
-                        await current_message.delete()
-                        logger.debug(f"Deleted our own previous message '{current_message.id}'")
-                    except (discord.Forbidden, discord.NotFound):
-                        # Fall back to updating
-                        await current_message.edit(
-                            view=None,
-                            embeds=[discord.Embed(
-                                title=f"{self.name}",
-                                description="This view has been moved to another channel.",
-                                color=0x808080  # Gray color
-                            )]
-                        )
-                        logger.debug(f"Updated our own previous message '{current_message.id}'")
-                except Exception as e:
-                    logger.debug(f"Could not clean up previous message: {e}")
-
-            # Then clean up ALL other messages in the session
-            for view, old_message in other_messages:
-                try:
-                    # Try to delete first
-                    try:
-                        await old_message.delete()
-                        logger.debug(f"Deleted other message '{old_message.id}' from view '{view.name}'")
-                    except (discord.Forbidden, discord.NotFound):
-                        # Fall back to updating
-                        await old_message.edit(
-                            view=None,
-                            embeds=[discord.Embed(
-                                title=f"{view.name}",
-                                description="This view has been moved to another channel.",
-                                color=0x808080  # Gray color
-                            )]
-                        )
-                        logger.debug(f"Updated other message '{old_message.id}' from view '{view.name}'")
-
-                    # Clear the view's message reference and items
-                    view.clear_message_reference()
-                    view.clear_items()
-                    view.stop()
-
-                    # Remove the view from the session
-                    if view in self.session.views:
-                        self.session.views.remove(view)
-                        logger.debug(f"Removed view '{view.name}' from session")
-
-                except Exception as e:
-                    logger.error(f"Error cleaning up message '{old_message.id}': {e}")
-
-        except Exception as e:
-            logger.error(f"Error in interaction handling: {e}", exc_info=True)
-            # Send fallback message
+        # Acquire lock for this user to prevent race conditions with multiple interactions
+        session_lock = await self.manager.get_session_lock(user_id)
+        async with session_lock:
             try:
-                fallback_kwargs = self.get_followup_kwargs()
-                if 'embeds' not in fallback_kwargs:
-                    fallback_kwargs['embeds'] = [discord.Embed(
-                        title=f"{self.name}",
-                        description="An error occurred",
-                        color=0xE02B2B
-                    )]
-                await self.interaction.followup.send(**fallback_kwargs)
-            except Exception as follow_up_error:
-                logger.error(f"Failed to send followup message: {follow_up_error}")
-        finally:
-            # Clean up tracking
-            if interaction_id in self.__class__._processed_interactions:
-                if self.__class__._processed_interactions[interaction_id] == id(self):
-                    del self.__class__._processed_interactions[interaction_id]
-                    logger.debug(f"Removed interaction '{interaction_id}' from processed tracking")
+                # Skip if this is a duplicate or transition
+                if self._is_duplicate or (hasattr(self, '_transition_in_progress') and self._transition_in_progress):
+                    logger.debug(f"View '{self.name}' is skipping interaction handling")
+                    return
+
+                logger.debug(f"Handling interaction for view '{self.name}' (id: {id(self)}) for user {user_id}")
+
+                # Ensure session is set up
+                await self.__ensure_session(user_id)
+
+                # Run session cleanup in the background
+                self.interaction.client.loop.create_task(self.manager.cleanup_old_sessions())  # NOQA
+
+                # Defer early to prevent timeouts
+                if not (hasattr(self.interaction, 'response') and self.interaction.response.is_done()):
+                    try:
+                        await self.interaction.response.defer(ephemeral=self.ephemeral)
+                    except discord.errors.HTTPException:
+                        # Interaction might already be acknowledged
+                        pass
+
+                # Store current message reference (for this instance)
+                current_message = self.message
+
+                # Clear our own message reference - CRITICAL for proper cleanup
+                self.__message = None
+
+                # Find ALL other active messages in the session (from other views)
+                other_messages = []
+                if self.session:
+                    for view in list(self.session.views):
+                        if view is not self and view.message is not None:
+                            other_messages.append((view, view.message))
+                            logger.debug(f"Found message '{view.message.id}' from view '{view.name}' to clean up")
+
+                # Create a new message
+                new_message = await self.interaction.original_response()
+
+                # Get message properties for edit
+                edit_kwargs = self.get_message_kwargs()
+
+                # Edit the message with all properties
+                await new_message.edit(**edit_kwargs)
+
+                # Set the message property
+                self.message = new_message
+                logger.debug(f"Created new message '{new_message.id}' for view '{self.name}'")
+
+                # First, clean up our own previous message if it exists
+                if current_message:
+                    try:
+                        # Try to delete first
+                        try:
+                            await current_message.delete()
+                            logger.debug(f"Deleted our own previous message '{current_message.id}'")
+                        except (discord.Forbidden, discord.NotFound):
+                            # Fall back to updating
+                            await current_message.edit(
+                                view=None,
+                                embeds=[discord.Embed(
+                                    title=f"{self.name}",
+                                    description="This view has been moved to another channel.",
+                                    color=0x808080  # Gray color
+                                )]
+                            )
+                            logger.debug(f"Updated our own previous message '{current_message.id}'")
+                    except Exception as e:
+                        logger.debug(f"Could not clean up previous message: {e}")
+
+                # Then clean up ALL other messages in the session
+                # Group messages by channel for potential batch deletion
+                channel_messages = {}
+                for view, old_message in other_messages:
+                    if old_message.channel.id not in channel_messages:
+                        channel_messages[old_message.channel.id] = []
+                    channel_messages[old_message.channel.id].append((view, old_message))
+
+                # Process each channel's messages
+                for channel_id, messages in channel_messages.items():
+                    channel = messages[0][1].channel  # Get channel from first message
+
+                    # Check if bulk delete is available and messages are less than 14 days old
+                    two_weeks_ago = datetime.now() - timedelta(days=14)
+                    eligible_messages = [(v, m) for v, m in messages if m.created_at > two_weeks_ago]
+
+                    # Try bulk deletion if we have multiple eligible messages in the same channel
+                    if len(eligible_messages) > 1 and hasattr(channel, 'delete_messages'):
+                        try:
+                            # Extract message objects for bulk deletion
+                            message_objects = [m for _, m in eligible_messages]
+                            await channel.delete_messages(message_objects)
+                            logger.debug(f"Bulk deleted {len(message_objects)} messages from channel {channel_id}")
+
+                            # Clean up the views associated with these messages
+                            for view, _ in eligible_messages:
+                                view.clear_message_reference()
+                                view.clear_items()
+                                view.stop()
+
+                                # Remove the view from the session
+                                if view in self.session.views:
+                                    self.session.views.remove(view)
+                                    logger.debug(f"Removed view '{view.name}' from session")
+
+                        except Exception as e:
+                            logger.error(f"Error in bulk message deletion: {e}")
+                            # Fall back to individual processing
+                            eligible_messages = []
+
+                    # Process remaining messages individually
+                    for view, old_message in [m for m in messages if m not in eligible_messages]:
+                        try:
+                            # Try to delete first
+                            try:
+                                await old_message.delete()
+                                logger.debug(f"Deleted message '{old_message.id}' from view '{view.name}'")
+                            except (discord.Forbidden, discord.NotFound):
+                                # Fall back to updating
+                                await old_message.edit(
+                                    view=None,
+                                    embeds=[discord.Embed(
+                                        title=f"{view.name}",
+                                        description="This view has been moved to another channel.",
+                                        color=0x808080  # Gray color
+                                    )]
+                                )
+                                logger.debug(f"Updated message '{old_message.id}' from view '{view.name}'")
+
+                            # Clear the view's message reference and items
+                            view.clear_message_reference()
+                            view.clear_items()
+                            view.stop()
+
+                            # Remove the view from the session
+                            if view in self.session.views:
+                                self.session.views.remove(view)
+                                logger.debug(f"Removed view '{view.name}' from session")
+
+                        except Exception as e:
+                            logger.error(f"Error cleaning up message '{old_message.id}': {e}")
+
+            except Exception as e:
+                logger.error(f"Error in interaction handling: {e}", exc_info=True)
+                # Send fallback message
+                try:
+                    fallback_kwargs = self.get_followup_kwargs()
+                    if 'embeds' not in fallback_kwargs:
+                        fallback_kwargs['embeds'] = [discord.Embed(
+                            title=f"{self.name}",
+                            description="An error occurred",
+                            color=0xE02B2B
+                        )]
+                    await self.interaction.followup.send(**fallback_kwargs)
+                except Exception as follow_up_error:
+                    logger.error(f"Failed to send followup message: {follow_up_error}")
+            finally:
+                # Clean up tracking
+                if interaction_id in self.__class__._processed_interactions:
+                    if self.__class__._processed_interactions[interaction_id] == id(self):
+                        del self.__class__._processed_interactions[interaction_id]
+                        logger.debug(f"Removed interaction '{interaction_id}' from processed tracking")
 
     async def __ensure_session(self, user_id: int) -> None:
         """
@@ -616,121 +659,150 @@ class CascadeView(View):
         # Store the current interaction before we create the new view
         current_interaction = interaction or self.interaction
 
-        # Mark this interaction as handled to prevent further processing
-        self._transition_in_progress = True
+        if current_interaction:
+            # Acquire lock for this user to prevent race conditions
+            user_id = current_interaction.user.id
+            session_lock = await self.manager.get_session_lock(user_id)
+            async with session_lock:
+                # Mark this interaction as handled to prevent further processing
+                self._transition_in_progress = True
 
-        # Stop this view to prevent it from processing further
-        self.stop()
+                # Stop this view to prevent it from processing further
+                self.stop()
 
-        # Defer the interaction to prevent timeouts
-        if not (hasattr(current_interaction, 'response') and current_interaction.response.is_done()):
-            try:
-                await current_interaction.response.defer(ephemeral=kwargs.get('ephemeral', False))
-            except discord.errors.HTTPException:
-                # Interaction might already be acknowledged, that's okay
-                pass
+                # Defer the interaction to prevent timeouts
+                if not (hasattr(current_interaction, 'response') and current_interaction.response.is_done()):
+                    try:
+                        await current_interaction.response.defer(ephemeral=kwargs.get('ephemeral', False))
+                    except discord.errors.HTTPException:
+                        # Interaction might already be acknowledged, that's okay
+                        pass
 
-        # Clean up this view
-        self.clear_items()
-        if self.session:
-            if self in self.session.views:
-                self.session.views.remove(self)
+                # Clean up this view
+                self.clear_items()
+                if self.session:
+                    if self in self.session.views:
+                        self.session.views.remove(self)
 
-        # Save current message reference
-        current_message = self.message
+                # Save current message reference
+                current_message = self.message
 
-        # Important: Clear our message reference to prevent the new view
-        # from being associated with us during cleanup scans
-        self.clear_message_reference()
+                # Important: Clear our message reference to prevent the new view
+                # from being associated with us during cleanup scans
+                self.clear_message_reference()
 
-        # Transfer message properties that weren't explicitly overridden
-        for attr in self.__class__.__attrs__:
-            if attr not in ('interaction', 'message') and attr not in kwargs:
-                prop_value = getattr(self, attr)
-                if prop_value is not None:
-                    kwargs[attr] = prop_value
+                # Transfer message properties that weren't explicitly overridden
+                for attr in self.__class__.__attrs__:
+                    if attr not in ('interaction', 'message') and attr not in kwargs:
+                        prop_value = getattr(self, attr)
+                        if prop_value is not None:
+                            kwargs[attr] = prop_value
 
-        # Create the new view WITHOUT setting the interaction
-        new_view = view_class(**kwargs)
+                # Create the new view WITHOUT setting the interaction
+                new_view = view_class(**kwargs)
 
-        # Update the original message with the new view
-        if current_message:
-            # Special handling for file attachments
-            has_files = 'file' in kwargs or 'files' in kwargs
+                # Update the original message with the new view
+                if current_message:
+                    # Special handling for file attachments
+                    has_files = 'file' in kwargs or 'files' in kwargs
 
-            try:
-                if has_files:
-                    # Can't edit with new files, must create new message
+                    try:
+                        if has_files:
+                            # Can't edit with new files, must create new message
+                            followup_kwargs = new_view.get_followup_kwargs()
+                            followup_message = await current_interaction.followup.send(wait=True, **followup_kwargs)
+
+                            # Try to delete the old message
+                            try:
+                                await current_message.delete()
+                            except (discord.Forbidden, discord.NotFound):
+                                # If we can't delete, at least update it to show it's been moved
+                                await current_message.edit(
+                                    view=None,
+                                    embeds=[discord.Embed(
+                                        title=f"{self.name}",
+                                        description="This view has been moved to another message.",
+                                        color=0x808080  # Gray color
+                                    )]
+                                )
+
+                            # Set the new message
+                            new_view.message = followup_message
+
+                            logger.debug(f"Created new message for '{new_view.name}' with files during transition")
+                        else:
+                            # No files, just edit the existing message
+                            edit_kwargs = new_view.get_message_kwargs()
+                            await current_message.edit(**edit_kwargs)
+
+                            # Set the message on the new view
+                            new_view.message = current_message
+
+                            logger.debug(
+                                f"Transitioned from '{self.name}' to '{new_view.name}' on message '{current_message.id}'")
+
+                        # Add the new view to the session
+                        if self.session:
+                            new_view.session = self.session
+                            self.session.set(view=new_view)
+
+                    except discord.errors.NotFound:
+                        # If the message is gone, create a new one
+                        followup_kwargs = new_view.get_followup_kwargs()
+                        followup_message = await current_interaction.followup.send(wait=True, **followup_kwargs)
+
+                        new_view.message = followup_message
+
+                        # Add the new view to the session
+                        if self.session:
+                            new_view.session = self.session
+                            self.session.set(view=new_view)
+
+                        logger.debug(f"Created new message for '{new_view.name}' after transition failed")
+                else:
+                    # If there's no original message, create a new one
                     followup_kwargs = new_view.get_followup_kwargs()
                     followup_message = await current_interaction.followup.send(wait=True, **followup_kwargs)
 
-                    # Try to delete the old message
-                    try:
-                        await current_message.delete()
-                    except (discord.Forbidden, discord.NotFound):
-                        # If we can't delete, at least update it to show it's been moved
-                        await current_message.edit(
-                            view=None,
-                            embeds=[discord.Embed(
-                                title=f"{self.name}",
-                                description="This view has been moved to another message.",
-                                color=0x808080  # Gray color
-                            )]
-                        )
-
-                    # Set the new message
                     new_view.message = followup_message
 
-                    logger.debug(f"Created new message for '{new_view.name}' with files during transition")
-                else:
-                    # No files, just edit the existing message
-                    edit_kwargs = new_view.get_message_kwargs()
-                    await current_message.edit(**edit_kwargs)
+                    # Add the new view to the session
+                    if self.session:
+                        new_view.session = self.session
+                        self.session.set(view=new_view)
 
-                    # Set the message on the new view
-                    new_view.message = current_message
+                    logger.debug(f"Created new message for '{new_view.name}' during transition")
 
-                    logger.debug(
-                        f"Transitioned from '{self.name}' to '{new_view.name}' on message '{current_message.id}'")
+                # Remove this interaction from processing to prevent duplicate responses
+                interaction_id = current_interaction.id
+                if interaction_id in self.__class__._processed_interactions:
+                    del self.__class__._processed_interactions[interaction_id]
 
-                # Add the new view to the session
-                if self.session:
-                    new_view.session = self.session
-                    self.session.set(view=new_view)
-
-            except discord.errors.NotFound:
-                # If the message is gone, create a new one
-                followup_kwargs = new_view.get_followup_kwargs()
-                followup_message = await current_interaction.followup.send(wait=True, **followup_kwargs)
-
-                new_view.message = followup_message
-
-                # Add the new view to the session
-                if self.session:
-                    new_view.session = self.session
-                    self.session.set(view=new_view)
-
-                logger.debug(f"Created new message for '{new_view.name}' after transition failed")
+                return new_view
         else:
-            # If there's no original message, create a new one
-            followup_kwargs = new_view.get_followup_kwargs()
-            followup_message = await current_interaction.followup.send(wait=True, **followup_kwargs)
+            # Handle case where no interaction is available (shouldn't happen in normal use)
+            logger.warning(f"Transition initiated without interaction context in view '{self.name}'")
 
-            new_view.message = followup_message
+            # Proceed with transition without lock
+            self._transition_in_progress = True
+            self.stop()
 
-            # Add the new view to the session
+            # Transfer message properties
+            for attr in self.__class__.__attrs__:
+                if attr not in ('interaction', 'message') and attr not in kwargs:
+                    prop_value = getattr(self, attr)
+                    if prop_value is not None:
+                        kwargs[attr] = prop_value
+
+            # Create new view
+            new_view = view_class(**kwargs)
+
+            # Add to session if available
             if self.session:
                 new_view.session = self.session
                 self.session.set(view=new_view)
 
-            logger.debug(f"Created new message for '{new_view.name}' during transition")
-
-        # Remove this interaction from processing to prevent duplicate responses
-        interaction_id = current_interaction.id
-        if interaction_id in self.__class__._processed_interactions:
-            del self.__class__._processed_interactions[interaction_id]
-
-        return new_view
+            return new_view
 
     def clear_message_reference(self):
         """Clear the message reference."""
