@@ -32,7 +32,7 @@ class CascadeView(View):
 
     __attrs__ = (
         "content", "embeds", "embed", "file", "files", "tts", "ephemeral", "interaction",
-        "allowed_mentions", "suppress_embeds", "silent", "delete_after", "poll"
+        "allowed_mentions", "suppress_embeds", "silent", "delete_after", "poll", "context"
     )
 
     # Set in __init__.py to avoid circular imports
@@ -706,6 +706,9 @@ class CascadeView(View):
         # Store the current interaction before we create the new view
         current_interaction = interaction or self.interaction
 
+        # Determine if this is a context-based or interaction-based view
+        is_context_based = self.interaction is None and hasattr(self, '__context') and self.__context
+
         if current_interaction:
             # Acquire lock for this user to prevent race conditions
             user_id = current_interaction.user.id
@@ -731,8 +734,9 @@ class CascadeView(View):
                     if self in self.session.views:
                         self.session.views.remove(self)
 
-                # Save current message reference
+                # Save current message reference - CRITICALLY IMPORTANT
                 current_message = self.message
+                current_channel = getattr(current_message, 'channel', None)
 
                 # Important: Clear our message reference to prevent the new view
                 # from being associated with us during cleanup scans
@@ -740,13 +744,18 @@ class CascadeView(View):
 
                 # Transfer message properties that weren't explicitly overridden
                 for attr in self.__class__.__attrs__:
-                    if attr not in ('interaction', 'message') and attr not in kwargs:
+                    if attr not in ('interaction', 'message', 'context') and attr not in kwargs:
                         prop_value = getattr(self, attr)
                         if prop_value is not None:
                             kwargs[attr] = prop_value
 
-                # Create the new view WITHOUT setting the interaction
-                new_view = view_class(**kwargs)
+                # Create the new view WITHOUT setting the interaction yet
+                if is_context_based and self.__context:
+                    # For context-based views, pass the context
+                    new_view = view_class(context=self.__context, **kwargs)
+                else:
+                    # For interaction-based views, create normally
+                    new_view = view_class(**kwargs)
 
                 # Update the original message with the new view
                 if current_message:
@@ -756,25 +765,49 @@ class CascadeView(View):
                     try:
                         if has_files:
                             # Can't edit with new files, must create new message
-                            followup_kwargs = new_view.get_followup_kwargs()
-                            followup_message = await current_interaction.followup.send(wait=True, **followup_kwargs)
+                            if is_context_based and current_channel:
+                                # For context-based, send to channel
+                                message_kwargs = new_view.get_message_kwargs()
+                                new_message = await current_channel.send(**message_kwargs)
 
-                            # Try to delete the old message
-                            try:
-                                await current_message.delete()
-                            except (discord.Forbidden, discord.NotFound):
-                                # If we can't delete, at least update it to show it's been moved
-                                await current_message.edit(
-                                    view=None,
-                                    embeds=[discord.Embed(
-                                        title=f"{self.name}",
-                                        description="This view has been moved to another message.",
-                                        color=0x808080  # Gray color
-                                    )]
-                                )
+                                # DO NOT delete the old message for context-based views
+                                if not is_context_based:
+                                    try:
+                                        await current_message.delete()
+                                    except (discord.Forbidden, discord.NotFound):
+                                        # If we can't delete, at least update it
+                                        await current_message.edit(
+                                            view=None,
+                                            embeds=[discord.Embed(
+                                                title=f"{self.name}",
+                                                description="This view has been moved to another message.",
+                                                color=0x808080  # Gray color
+                                            )]
+                                        )
 
-                            # Set the new message
-                            new_view.message = followup_message
+                                # Set the new message
+                                new_view.message = new_message
+                            else:
+                                # For interaction-based, use followup
+                                followup_kwargs = new_view.get_followup_kwargs()
+                                followup_message = await current_interaction.followup.send(wait=True, **followup_kwargs)
+
+                                # Try to delete the old message
+                                try:
+                                    await current_message.delete()
+                                except (discord.Forbidden, discord.NotFound):
+                                    # If we can't delete, at least update it
+                                    await current_message.edit(
+                                        view=None,
+                                        embeds=[discord.Embed(
+                                            title=f"{self.name}",
+                                            description="This view has been moved to another message.",
+                                            color=0x808080  # Gray color
+                                        )]
+                                    )
+
+                                # Set the new message
+                                new_view.message = followup_message
 
                             logger.debug(f"Created new message for '{new_view.name}' with files during transition")
                         else:
@@ -795,10 +828,16 @@ class CascadeView(View):
 
                     except discord.errors.NotFound:
                         # If the message is gone, create a new one
-                        followup_kwargs = new_view.get_followup_kwargs()
-                        followup_message = await current_interaction.followup.send(wait=True, **followup_kwargs)
-
-                        new_view.message = followup_message
+                        if is_context_based and current_channel and self.__context:
+                            # For context-based, send to channel
+                            message_kwargs = new_view.get_message_kwargs()
+                            new_message = await current_channel.send(**message_kwargs)
+                            new_view.message = new_message
+                        else:
+                            # For interaction-based, use followup
+                            followup_kwargs = new_view.get_followup_kwargs()
+                            followup_message = await current_interaction.followup.send(wait=True, **followup_kwargs)
+                            new_view.message = followup_message
 
                         # Add the new view to the session
                         if self.session:
@@ -808,10 +847,18 @@ class CascadeView(View):
                         logger.debug(f"Created new message for '{new_view.name}' after transition failed")
                 else:
                     # If there's no original message, create a new one
-                    followup_kwargs = new_view.get_followup_kwargs()
-                    followup_message = await current_interaction.followup.send(wait=True, **followup_kwargs)
-
-                    new_view.message = followup_message
+                    if is_context_based and self.__context:
+                        # For context-based, send to channel
+                        message_kwargs = new_view.get_message_kwargs()
+                        channel = getattr(self.__context, 'channel', None)
+                        if channel:
+                            new_message = await channel.send(**message_kwargs)
+                            new_view.message = new_message
+                    else:
+                        # For interaction-based, use followup
+                        followup_kwargs = new_view.get_followup_kwargs()
+                        followup_message = await current_interaction.followup.send(wait=True, **followup_kwargs)
+                        new_view.message = followup_message
 
                     # Add the new view to the session
                     if self.session:
@@ -821,9 +868,10 @@ class CascadeView(View):
                     logger.debug(f"Created new message for '{new_view.name}' during transition")
 
                 # Remove this interaction from processing to prevent duplicate responses
-                interaction_id = current_interaction.id
-                if interaction_id in self.__class__._processed_interactions:
-                    del self.__class__._processed_interactions[interaction_id]
+                if not is_context_based:
+                    interaction_id = current_interaction.id
+                    if interaction_id in self.__class__._processed_interactions:
+                        del self.__class__._processed_interactions[interaction_id]
 
                 return new_view
         else:
@@ -836,7 +884,7 @@ class CascadeView(View):
 
             # Transfer message properties
             for attr in self.__class__.__attrs__:
-                if attr not in ('interaction', 'message') and attr not in kwargs:
+                if attr not in ('interaction', 'message', 'context') and attr not in kwargs:
                     prop_value = getattr(self, attr)
                     if prop_value is not None:
                         kwargs[attr] = prop_value
