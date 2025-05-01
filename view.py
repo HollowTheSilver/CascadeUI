@@ -455,7 +455,7 @@ class CascadeView(View):
                 await self.__ensure_session(user_id)
 
                 # Run session cleanup in the background
-                self.interaction.client.loop.create_task(self.manager.cleanup_old_sessions())
+                self.interaction.client.loop.create_task(self.manager.cleanup_old_sessions())  # NOQA
 
                 # Defer early to prevent timeouts
                 if not (hasattr(self.interaction, 'response') and self.interaction.response.is_done()):
@@ -514,78 +514,36 @@ class CascadeView(View):
                         logger.debug(f"Could not clean up previous message: {e}")
 
                 # Then clean up ALL other messages in the session
-                # Group messages by channel for potential batch deletion
-                channel_messages = {}
                 for view, old_message in other_messages:
-                    if old_message.channel.id not in channel_messages:
-                        channel_messages[old_message.channel.id] = []
-                    channel_messages[old_message.channel.id].append((view, old_message))
-
-                # Process each channel's messages
-                for channel_id, messages in channel_messages.items():
-                    channel = messages[0][1].channel  # Get channel from first message
-
-                    # Check if bulk delete is available and messages are less than 14 days old
-                    # Use timezone-aware datetime to match Discord's timestamps
-                    two_weeks_ago = datetime.now().replace(tzinfo=None) - timedelta(days=14)
-                    eligible_messages = [(v, m) for v, m in messages if
-                                         m.created_at.replace(tzinfo=None) > two_weeks_ago]
-
-                    # Try bulk deletion if we have multiple eligible messages in the same channel
-                    if len(eligible_messages) > 1 and hasattr(channel, 'delete_messages'):
+                    try:
+                        # Try to delete first
                         try:
-                            # Extract message objects for bulk deletion
-                            message_objects = [m for _, m in eligible_messages]
-                            await channel.delete_messages(message_objects)
-                            logger.debug(f"Bulk deleted {len(message_objects)} messages from channel {channel_id}")
+                            await old_message.delete()
+                            logger.debug(f"Deleted message '{old_message.id}' from view '{view.name}'")
+                        except (discord.Forbidden, discord.NotFound):
+                            # Fall back to updating
+                            await old_message.edit(
+                                view=None,
+                                embeds=[discord.Embed(
+                                    title=f"{view.name}",
+                                    description="This view has been moved to another channel.",
+                                    color=0x808080  # Gray color
+                                )]
+                            )
+                            logger.debug(f"Updated message '{old_message.id}' from view '{view.name}'")
 
-                            # Clean up the views associated with these messages
-                            for view, _ in eligible_messages:
-                                view.clear_message_reference()
-                                view.clear_items()
-                                view.stop()
+                        # Clear the view's message reference and items
+                        view.clear_message_reference()
+                        view.clear_items()
+                        view.stop()
 
-                                # Remove the view from the session
-                                if view in self.session.views:
-                                    self.session.views.remove(view)
-                                    logger.debug(f"Removed view '{view.name}' from session")
+                        # Remove the view from the session
+                        if view in self.session.views:
+                            self.session.views.remove(view)
+                            logger.debug(f"Removed view '{view.name}' from session")
 
-                        except Exception as e:
-                            logger.error(f"Error in bulk message deletion: {e}")
-                            # Fall back to individual processing
-                            eligible_messages = []
-
-                    # Process remaining messages individually
-                    for view, old_message in [m for m in messages if m not in eligible_messages]:
-                        try:
-                            # Try to delete first
-                            try:
-                                await old_message.delete()
-                                logger.debug(f"Deleted message '{old_message.id}' from view '{view.name}'")
-                            except (discord.Forbidden, discord.NotFound):
-                                # Fall back to updating
-                                await old_message.edit(
-                                    view=None,
-                                    embeds=[discord.Embed(
-                                        title=f"{view.name}",
-                                        description="This view has been moved to another channel.",
-                                        color=0x808080  # Gray color
-                                    )]
-                                )
-                                logger.debug(f"Updated message '{old_message.id}' from view '{view.name}'")
-
-                            # Clear the view's message reference and items
-                            view.clear_message_reference()
-                            view.clear_items()
-                            view.stop()
-
-                            # Remove the view from the session
-                            if view in self.session.views:
-                                self.session.views.remove(view)
-                                logger.debug(f"Removed view '{view.name}' from session")
-
-                        except Exception as e:
-                            logger.error(f"Error cleaning up message '{old_message.id}': {e}")
+                    except Exception as e:
+                        logger.error(f"Error cleaning up message '{old_message.id}': {e}")
 
             except Exception as e:
                 logger.error(f"Error in interaction handling: {e}", exc_info=True)
