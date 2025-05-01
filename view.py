@@ -5,6 +5,7 @@
 
 import asyncio
 import discord
+from discord.ext import commands
 from discord import Interaction
 from discord.ui import View, Item
 from typing import List, Dict, Optional, Union, Callable, Any, Type, TYPE_CHECKING
@@ -13,7 +14,7 @@ from datetime import datetime, timedelta
 from .utils.logger import AsyncLogger
 
 # Import type references
-from .types import UISessionObj, UIManagerObj, CascadeViewObj
+from .types import UISessionObj, CascadeViewObj
 
 # Create logger
 logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a")
@@ -21,7 +22,6 @@ logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a")
 # Import only for type checking
 if TYPE_CHECKING:
     from .session import UISession
-    from .manager import UIManager
 
 
 # // ========================================( Class )======================================== // #
@@ -30,13 +30,12 @@ if TYPE_CHECKING:
 class CascadeView(View):
     """Base class for all CascadeUI views."""
 
-    # Expanded __attrs__ to include all supported message properties
     __attrs__ = (
         "content", "embeds", "embed", "file", "files", "tts", "ephemeral", "interaction",
         "allowed_mentions", "suppress_embeds", "silent", "delete_after", "poll"
     )
 
-    # This will be set in __init__.py to avoid circular imports
+    # Set in __init__.py to avoid circular imports
     manager = None  # Type: Optional[UIManager]
     _processed_interactions = {}  # Class-level dictionary
 
@@ -55,6 +54,7 @@ class CascadeView(View):
         self.__session = None
         self.__interaction = None
         self.__message = None
+        self.__context = None
 
         # Initialize message properties with None
         self.__content = None
@@ -73,14 +73,16 @@ class CascadeView(View):
         self._transition_in_progress = False
         self._is_duplicate = False
 
-        # Temporarily store interaction for later
+        # Temporarily store interaction and context for later
         interaction = custom_kwargs.pop("interaction", None)
+        context = custom_kwargs.pop("context", None)
 
         # Process standard attributes from kwargs
         for key, value in custom_kwargs.items():
             setattr(self, key, value)
 
-        # Handle interaction if provided
+        # Handle initialization priority with duplicate detection
+        # Priority 1: Direct interaction parameter (maintains backward compatibility)
         if interaction is not None:
             # Set interaction without triggering handler
             self.__interaction = interaction
@@ -94,6 +96,53 @@ class CascadeView(View):
 
             # Now trigger the handler
             self.interaction = interaction
+
+        # Priority 2: Context with interaction (slash commands)
+        elif context is not None:
+            # Store context
+            self.__context = context
+
+            # If context has interaction, process it
+            if hasattr(context, 'interaction') and context.interaction:
+                # Set interaction without triggering handler
+                self.__interaction = context.interaction
+
+                # Check for existing view of this class
+                existing_view = self.manager.check_for_existing_view(self)
+
+                # Stop here if we're a duplicate
+                if self._is_duplicate:
+                    return
+
+                # Now trigger the handler
+                self.interaction = context.interaction
+
+            # Priority 3: Regular command context (non-interaction based)
+            elif hasattr(context, 'send'):
+                # For regular commands, we need a different approach to check for duplicates
+                # since we don't have an interaction yet
+
+                # Create a special key for this user to check for duplicates
+                user_id = getattr(context, 'author', None)
+                if user_id:
+                    user_id = user_id.id
+
+                    # Check if a session exists for this user
+                    if self.manager and hasattr(self.manager, 'get'):
+                        existing_session = self.manager.get(session=user_id)
+                        if existing_session:
+                            # Look for existing view of same class
+                            for existing_view in existing_session.views:
+                                if (existing_view is not self and
+                                        existing_view.__class__.__name__ == self.__class__.__name__):
+                                    # Found a duplicate - mark this view as duplicate
+                                    self._is_duplicate = True
+                                    logger.debug(f"Found duplicate view {existing_view.name}, using existing one")
+                                    return
+
+                # Schedule the send operation if not a duplicate
+                if hasattr(context, 'bot') and context.bot:
+                    context.bot.loop.create_task(self.__handle_context())
 
     # Basic Properties
     @property
@@ -112,6 +161,23 @@ class CascadeView(View):
                 f"Invalid attribute type '{type(value)}' provided. Attribute 'session' must be a valid UI session object."
             raise AttributeError(exception)
         self.__session = value
+
+    @property
+    def context(self) -> Optional[Union[commands.Context, discord.Interaction]]:
+        """Get the context associated with this view."""
+        return self.__context
+
+    @context.setter
+    def context(self, value: Optional[Union[commands.Context, discord.Interaction]]) -> None:
+        """Set the context for this view."""
+        if value is not None and not isinstance(value, (commands.Context, discord.Interaction)):
+            exception: str = (
+                f"Invalid attribute type '{type(value)}' provided. "
+                f"Attribute 'context' must be a discord.py Context or Interaction object."
+            )
+            raise AttributeError(exception)
+        self.__context = value
+        logger.debug(f"Context set for view '{self.name}'")
 
     @property
     def interaction(self) -> Optional[Interaction]:
@@ -379,13 +445,13 @@ class CascadeView(View):
 
         # These are only used in send, not in edit - check if they're supported
         if self.file is not None and hasattr(discord.Message, 'edit') and hasattr(discord.Message.edit,
-                                                                                  '__annotations__') and 'file' in discord.Message.edit.__annotations__:
+                                                                                  '__annotations__') and 'file' in discord.Message.edit.__annotations__:  # NOQA
             kwargs['file'] = self.file
         if self.files is not None and hasattr(discord.Message, 'edit') and hasattr(discord.Message.edit,
-                                                                                   '__annotations__') and 'files' in discord.Message.edit.__annotations__:
+                                                                                   '__annotations__') and 'files' in discord.Message.edit.__annotations__:  # NOQA
             kwargs['files'] = self.files
         if self.delete_after is not None and hasattr(discord.Message, 'edit') and hasattr(discord.Message.edit,
-                                                                                          '__annotations__') and 'delete_after' in discord.Message.edit.__annotations__:
+                                                                                          '__annotations__') and 'delete_after' in discord.Message.edit.__annotations__:  # NOQA
             kwargs['delete_after'] = self.delete_after
 
         # Only include poll if it exists in discord
@@ -435,6 +501,27 @@ class CascadeView(View):
 
         return kwargs
 
+    async def __handle_context(self) -> None:
+        """Internal method to send this view via a command context."""
+        try:
+            # Get message properties
+            message_kwargs = self.get_message_kwargs()
+
+            # Send the message
+            message = await self.context.send(**message_kwargs)
+
+            # Set the message
+            self.message = message
+            logger.debug(f"Created new message '{message.id}' via context for view '{self.name}'")
+
+            # Get user_id from context
+            user_id = self.context.author.id
+
+            # Ensure session exists
+            await self.__ensure_session(user_id)
+        except Exception as e:
+            logger.error(f"Error sending view via context: {e}", exc_info=True)
+
     async def __handle_interaction(self) -> None:
         """Central method for handling interactions and message management."""
         user_id = self.interaction.user.id
@@ -458,9 +545,9 @@ class CascadeView(View):
                 self.interaction.client.loop.create_task(self.manager.cleanup_old_sessions())  # NOQA
 
                 # Defer early to prevent timeouts
-                if not (hasattr(self.interaction, 'response') and self.interaction.response.is_done()):
+                if not (hasattr(self.interaction, 'response') and self.interaction.response.is_done()):  # NOQA
                     try:
-                        await self.interaction.response.defer(ephemeral=self.ephemeral)
+                        await self.interaction.response.defer(ephemeral=self.ephemeral)  # NOQA
                     except discord.errors.HTTPException:
                         # Interaction might already be acknowledged
                         pass
@@ -631,9 +718,9 @@ class CascadeView(View):
                 self.stop()
 
                 # Defer the interaction to prevent timeouts
-                if not (hasattr(current_interaction, 'response') and current_interaction.response.is_done()):
+                if not (hasattr(current_interaction, 'response') and current_interaction.response.is_done()):  # NOQA
                     try:
-                        await current_interaction.response.defer(ephemeral=kwargs.get('ephemeral', False))
+                        await current_interaction.response.defer(ephemeral=kwargs.get('ephemeral', False))  # NOQA
                     except discord.errors.HTTPException:
                         # Interaction might already be acknowledged, that's okay
                         pass
@@ -832,10 +919,10 @@ class CascadeView(View):
             if self.message:
                 await self.message.edit(view=retry_view, embed=user_embed)
             else:
-                if interaction.response.is_done():
+                if interaction.response.is_done():  # NOQA
                     await interaction.followup.send(embed=user_embed, view=retry_view, ephemeral=True)
                 else:
-                    await interaction.response.send_message(embed=user_embed, view=retry_view, ephemeral=True)
+                    await interaction.response.send_message(embed=user_embed, view=retry_view, ephemeral=True)  # NOQA
         except Exception as follow_up_error:
             logger.error(f"Failed to send error message: {follow_up_error}")
 
