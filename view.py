@@ -7,8 +7,8 @@ import asyncio
 import discord
 from discord import Interaction
 from discord.ui import View, Item
-from typing import List, Optional, Union, Callable, Any, Type, TYPE_CHECKING
-from datetime import datetime
+from typing import List, Dict, Optional, Union, Callable, Any, Type, TYPE_CHECKING
+from datetime import datetime, timedelta
 
 from .utils.logger import AsyncLogger
 
@@ -455,7 +455,7 @@ class CascadeView(View):
                 await self.__ensure_session(user_id)
 
                 # Run session cleanup in the background
-                self.interaction.client.loop.create_task(self.manager.cleanup_old_sessions())  # NOQA
+                self.interaction.client.loop.create_task(self.manager.cleanup_old_sessions())
 
                 # Defer early to prevent timeouts
                 if not (hasattr(self.interaction, 'response') and self.interaction.response.is_done()):
@@ -526,8 +526,10 @@ class CascadeView(View):
                     channel = messages[0][1].channel  # Get channel from first message
 
                     # Check if bulk delete is available and messages are less than 14 days old
-                    two_weeks_ago = datetime.now() - timedelta(days=14)
-                    eligible_messages = [(v, m) for v, m in messages if m.created_at > two_weeks_ago]
+                    # Use timezone-aware datetime to match Discord's timestamps
+                    two_weeks_ago = datetime.now().replace(tzinfo=None) - timedelta(days=14)
+                    eligible_messages = [(v, m) for v, m in messages if
+                                         m.created_at.replace(tzinfo=None) > two_weeks_ago]
 
                     # Try bulk deletion if we have multiple eligible messages in the same channel
                     if len(eligible_messages) > 1 and hasattr(channel, 'delete_messages'):
