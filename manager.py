@@ -180,7 +180,6 @@ class UIManager(object):
             ...
         return False
 
-    # Add this method to the UIManager class
     def check_for_existing_view(self, view: CascadeViewObj) -> Optional[CascadeViewObj]:
         """
             Check if there's already a view of the same class for this user.
