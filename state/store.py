@@ -66,11 +66,11 @@ class StateStore:
 
         self._initialized = True
 
-        # Register core reducers
-        self._register_core_reducers()
+        # We'll register core reducers later to avoid circular imports
 
     def _register_core_reducers(self):
         """Register the built-in reducers."""
+        # Import here to avoid circular imports
         from .reducers import (
             reduce_view_created,
             reduce_view_updated,
@@ -133,6 +133,10 @@ class StateStore:
         if len(self.history) > self.history_limit:
             self.history.pop(0)
 
+        # Make sure we have the core reducers
+        if not self._core_reducers:
+            self._register_core_reducers()
+
         # Find the appropriate reducer
         reducer = self.reducers.get(action_type)
 
@@ -174,7 +178,7 @@ class StateStore:
         try:
             await callback(self.state, action)
         except Exception as e:
-            logger.error(f"Error notifying subscriber {subscriber_id}: {e}")
+            print(f"Error notifying subscriber {subscriber_id}: {e}")
 
     def subscribe(self, subscriber_id: str, callback: SubscriberFn) -> None:
         """Register to receive state updates."""
@@ -193,7 +197,7 @@ class StateStore:
         try:
             await self.persistence_backend.save_state(self.state)
         except Exception as e:
-            logger.error(f"Error persisting state: {e}")
+            print(f"Error persisting state: {e}")
 
     async def restore_state(self) -> None:
         """Restore state from persistence backend."""
@@ -205,7 +209,7 @@ class StateStore:
             if restored_state:
                 self.state = restored_state
         except Exception as e:
-            logger.error(f"Error restoring state: {e}")
+            print(f"Error restoring state: {e}")
 
     def enable_persistence(self, backend) -> None:
         """Enable state persistence with the specified backend."""
@@ -213,7 +217,13 @@ class StateStore:
         self.persistence_backend = backend
 
 
-# Global instance accessor
+# Singleton instance
+_store_instance = None
+
+
 def get_store() -> StateStore:
     """Get the global state store instance."""
-    return StateStore()
+    global _store_instance
+    if _store_instance is None:
+        _store_instance = StateStore()
+    return _store_instance

@@ -4,7 +4,8 @@
 
 from .store import StateStore, get_store
 from .actions import ActionCreators
-# We don't directly export reducers since they're registered with the store
+# Import reducers here to ensure they're loaded
+from . import reducers
 
 __all__ = [
     "StateStore",
