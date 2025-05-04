@@ -14,40 +14,35 @@ Description:
 # // ========================================( Modules )======================================== // #
 
 
-# First, import all types
-from .types import UIManagerObj, UISessionObj, CascadeViewObj
+from .views.base import StatefulView
+from .views.specialized import FormView, PaginatedView
+from .components.base import StatefulButton, StatefulSelect
+from .state.store import get_store
+from .state.actions import ActionCreators
+from .utils.decorators import cascade_reducer, cascade_component, cascade_persistent
+from .utils.logging import AsyncLogger
 
-# Import the logger
-from .utils.logger import AsyncLogger
-
-# Next, import all classes
-from .manager import UIManager
-from .view import CascadeView
-from .session import UISession
-from .views.paginated import PaginatedCascadeView
+# Package-level logger
+logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a")
 
 
 # // ========================================( Script )======================================== // #
 
 
-# Create a package-level logger
-logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a")
+__version__ = "1.0.0"
 
-# CRITICAL: Create the singleton UIManager instance and resolve circular dependencies
-manager_instance = UIManager()
-
-# CRITICAL: Set the manager attribute on CascadeView to break the circular dependency
-CascadeView.manager = manager_instance
-
-# Expose these classes at the package level
+# Export public API
 __all__ = [
-    'UIManager',
-    'CascadeView',
-    'UISession',
-    'PaginatedCascadeView',
-    'AsyncLogger'
+    "StatefulView",
+    "FormView",
+    "PaginatedView",
+    "StatefulButton",
+    "StatefulSelect",
+    "get_store",
+    "ActionCreators",
+    "cascade_reducer",
+    "cascade_component",
+    "cascade_persistent"
 ]
-
-__version__ = '1.1.0'
 
 logger.info(f"CascadeUI v{__version__} initialized")
