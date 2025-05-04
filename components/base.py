@@ -21,10 +21,18 @@ class StatefulComponent:
         component_id = getattr(component, "custom_id", None) or str(id(component))
 
         async def stateful_callback(interaction):
-            # Get view from component
-            view = interaction.client._view_store.get_view_from_message(interaction.message.id)
+            # Get view from the component itself
+            view = component.view
 
             if not view:
+                # If we still can't find the view, log error and call original callback
+                from ..utils.logging import AsyncLogger
+                logger = AsyncLogger(name="cascadeui.components", level="DEBUG", path="logs", mode="a")
+                logger.error(f"Could not find view for component {component_id}")
+
+                # Call original callback if provided
+                if original_callback:
+                    return await original_callback(interaction)
                 return
 
             # Get component value
@@ -37,6 +45,7 @@ class StatefulComponent:
                 value = True
 
             # Dispatch interaction action
+            from ..state.actions import ActionCreators
             payload = ActionCreators.component_interaction(
                 component_id=component_id,
                 view_id=view.id,
