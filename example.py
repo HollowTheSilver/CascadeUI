@@ -100,8 +100,19 @@ class CounterView(StatefulView):
             "counter": self.counter
         })
 
-        # Acknowledge interaction
-        await interaction.response.defer()
+        # Create updated embed
+        embed = discord.Embed(
+            title="Counter Example",
+            description=f"Current value: {self.counter}",
+            color=discord.Color.blue()
+        )
+
+        # Try to update message directly as well
+        try:
+            await interaction.response.edit_message(embed=embed, view=self)
+        except:
+            # If already responded, use followup or defer
+            await interaction.response.defer()
 
     async def decrement(self, interaction):
         # Update counter
@@ -113,8 +124,19 @@ class CounterView(StatefulView):
             "counter": self.counter
         })
 
-        # Acknowledge interaction
-        await interaction.response.defer()
+        # Create updated embed
+        embed = discord.Embed(
+            title="Counter Example",
+            description=f"Current value: {self.counter}",
+            color=discord.Color.blue()
+        )
+
+        # Try to update message directly as well
+        try:
+            await interaction.response.edit_message(embed=embed, view=self)
+        except:
+            # If already responded, use followup or defer
+            await interaction.response.defer()
 
     async def update_from_state(self, state):
         """Update view when state changes."""
@@ -127,7 +149,11 @@ class CounterView(StatefulView):
 
         # Update message if it exists
         if self.message:
-            await self.message.edit(embed=embed, view=self)
+            try:
+                await self.message.edit(embed=embed, view=self)
+                logger.error(f"Updated counter view to {self.counter}")  # Debug
+            except Exception as e:
+                logger.error(f"Error updating message: {e}")  # Debug
 
 
 # Create a custom reducer for the counter
