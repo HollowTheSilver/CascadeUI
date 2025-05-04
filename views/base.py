@@ -10,12 +10,12 @@ import discord
 from discord import Interaction
 from discord.ui import View, Item
 
-from ..state.store import get_store
+# Import from singleton instead of store directly
+from ..state.singleton import get_store
 from ..state.actions import ActionCreators
 
+# Add logger
 from ..utils.logging import AsyncLogger
-
-# Package-level logger
 logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a")
 
 

@@ -6,9 +6,9 @@ import asyncio
 import copy
 from datetime import datetime
 from typing import Dict, Any, Callable, Awaitable, Optional, List, Union
-from ..utils.logging import AsyncLogger
 
-# Package-level logger
+# Import logging at module level
+from ..utils.logging import AsyncLogger
 logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a")
 
 # Type definitions
@@ -65,8 +65,38 @@ class StateStore:
         self.persistence_backend = None
 
         self._initialized = True
+        logger.debug("StateStore initialized")
 
-        # We'll register core reducers later to avoid circular imports
+    def _load_core_reducers(self):
+        """Load the built-in reducers only when needed."""
+        if self._core_reducers:
+            return
+
+        # Import here to avoid circular imports
+        from .reducers import (
+            reduce_view_created,
+            reduce_view_updated,
+            reduce_view_destroyed,
+            reduce_session_created,
+            reduce_session_updated,
+            reduce_navigation,
+            reduce_component_interaction
+        )
+
+        # Register core reducers
+        self._core_reducers = {
+            "VIEW_CREATED": reduce_view_created,
+            "VIEW_UPDATED": reduce_view_updated,
+            "VIEW_DESTROYED": reduce_view_destroyed,
+            "SESSION_CREATED": reduce_session_created,
+            "SESSION_UPDATED": reduce_session_updated,
+            "NAVIGATION": reduce_navigation,
+            "COMPONENT_INTERACTION": reduce_component_interaction,
+        }
+
+        # Update combined reducers
+        self.reducers = {**self._core_reducers, **self._custom_reducers}
+        logger.debug("Core reducers loaded")
 
     def _register_core_reducers(self):
         """Register the built-in reducers."""

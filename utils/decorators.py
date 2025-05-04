@@ -2,11 +2,13 @@
 # // ========================================( Modules )======================================== // #
 
 
-import asyncio
 from functools import wraps
 from typing import Callable, Dict, Any
+import asyncio
 
-from ..state.store import get_store
+# Import logger
+from ..utils.logging import AsyncLogger
+logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a")
 
 
 # // ========================================( Functions )======================================== // #
@@ -20,8 +22,10 @@ def cascade_reducer(action_type: str):
         async def wrapper(action: Dict[str, Any], state: Dict[str, Any]):
             return await func(action, state)
 
-        # Register with global state store
+        # Import lazily to avoid circular imports
+        from ..state.singleton import get_store
         get_store().register_reducer(action_type, wrapper)
+        logger.debug(f"Registered reducer for action type: {action_type}")
 
         return wrapper
 

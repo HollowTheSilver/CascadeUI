@@ -14,16 +14,15 @@ Description:
 # // ========================================( Modules )======================================== // #
 
 
+# Import singleton early to ensure it's available
+from .state.singleton import get_store
+
+# Then import other components that might need the store
 from .views.base import StatefulView
 from .views.specialized import FormView, PaginatedView
 from .components.base import StatefulButton, StatefulSelect
-from .state.store import get_store
 from .state.actions import ActionCreators
 from .utils.decorators import cascade_reducer, cascade_component, cascade_persistent
-from .utils.logging import AsyncLogger
-
-# Package-level logger
-logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a")
 
 
 # // ========================================( Script )======================================== // #
@@ -45,4 +44,4 @@ __all__ = [
     "cascade_persistent"
 ]
 
-logger.info(f"CascadeUI v{__version__} initialized")
+"""logger.info(f"CascadeUI v{__version__} initialized")"""
