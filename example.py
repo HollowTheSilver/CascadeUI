@@ -5,35 +5,17 @@
 import inspect
 import discord
 from discord.ext import commands
-from discord import app_commands
 from discord.ext.commands import Context
 
 # Import CascadeUI components
 from cascadeui import StatefulView, StatefulButton, get_store, cascade_reducer
 
-from typing import (
-    Any,
-    Callable,
-    Coroutine,
-    Mapping,
-    List,
-    Dict,
-    Tuple,
-    TYPE_CHECKING,
-    Optional,
-    Iterable,
-    Sequence,
-    TypeVar,
-    Type,
-    Union,
-    Iterable,
-    Collection,
-    overload,
-    Self,
-    LiteralString,
-)
-
 from utilities.logger import AsyncLogger
+from typing import (
+    List,
+    Optional,
+    TypeVar,
+)
 
 
 # \\ Logger \\
@@ -98,9 +80,22 @@ class CounterView(StatefulView):
             "counter": self.counter
         })
 
+    # Update for CounterView
+
     async def update_from_state(self, state):
-        """Update view when state changes."""
-        # Create embed with current counter value
+        """Update view based on current state."""
+        logger.debug(f"Updating view {self.id} from state")
+
+        # Get the counter value from state - always sync with global state
+        counter_in_state = state.get("application", {}).get("counters", {}).get(self.id)
+
+        # Update local state if needed
+        if counter_in_state is not None:
+            old_value = self.counter
+            self.counter = counter_in_state
+            logger.debug(f"Updated counter from {old_value} to {self.counter} based on state")
+
+        # Update UI with current counter value
         embed = discord.Embed(
             title="Counter Example",
             description=f"Current value: {self.counter}",
@@ -111,6 +106,7 @@ class CounterView(StatefulView):
         if self.message:
             try:
                 await self.message.edit(embed=embed, view=self)
+                logger.debug(f"Updated message UI with counter={self.counter}")
             except Exception as e:
                 logger.error(f"Error updating message: {e}")
 
@@ -146,13 +142,13 @@ async def counter_reducer(action, state):
 
 class Example(commands.Cog, name="example"):
     """
-        Example discord cog class.
+        Example discord extension class.
 
         """
 
     def __init__(self, bot) -> None:
         """
-        Initialize example cog.
+        Initialize Example cog.
 
         ... VersionAdded:: 1.0
 

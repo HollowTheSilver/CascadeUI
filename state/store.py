@@ -141,14 +141,6 @@ class StateStore:
                        source_id: Optional[str] = None) -> StateData:
         """
         Process an action by updating state and notifying subscribers.
-
-        Args:
-            action_type: The type of action being dispatched
-            payload: Data associated with the action
-            source_id: ID of the component that dispatched the action
-
-        Returns:
-            The updated state
         """
         # Create the action object
         action = {
@@ -158,33 +150,38 @@ class StateStore:
             "timestamp": datetime.now().isoformat()
         }
 
+        logger.debug(f"Dispatching action {action_type} from source {source_id}")
+
         # Add to history for debugging
         self.history.append(action)
         if len(self.history) > self.history_limit:
             self.history.pop(0)
 
-        # Make sure we have the core reducers
-        if not self._core_reducers:
-            self._register_core_reducers()
+        # Make sure reducers are loaded
+        self._load_core_reducers()
 
         # Find the appropriate reducer
         reducer = self.reducers.get(action_type)
 
         if reducer:
+            logger.debug(f"Found reducer for action {action_type}")
             # Apply the reducer to transform state
-            new_state = await reducer(action, self.state)
-            self.state = new_state
+            try:
+                new_state = await reducer(action, self.state)
+                self.state = new_state
+                logger.debug(f"State updated by reducer for {action_type}")
+            except Exception as e:
+                logger.error(f"Error in reducer for {action_type}: {e}", exc_info=True)
+        else:
+            logger.warning(f"No reducer found for action type {action_type}")
 
-            # Notify subscribers
-            await self._notify_subscribers(action)
+        # Always notify subscribers regardless of reducer
+        logger.debug(f"Notifying subscribers about {action_type}")
+        await self._notify_subscribers(action)
 
-            # Handle persistence if enabled
-            if self.persistence_enabled and self.persistence_backend:
-                if action_type in [
-                    "VIEW_CREATED", "VIEW_UPDATED", "VIEW_DESTROYED",
-                    "SESSION_CREATED", "SESSION_UPDATED", "NAVIGATION"
-                ]:
-                    asyncio.create_task(self._persist_state())  # NOQA
+        # Handle persistence
+        if self.persistence_enabled and self.persistence_backend:
+            asyncio.create_task(self._persist_state())  # NOQA
 
         return self.state
 
@@ -192,9 +189,17 @@ class StateStore:
         """Notify all subscribers about a state change."""
         tasks = []
 
+        logger.debug(f"Notifying {len(self.subscribers)} subscribers about action: {action['type']}")
+
         for subscriber_id, callback in list(self.subscribers.items()):
-            # Skip notifying the source to avoid loops
-            if subscriber_id != action.get("source"):
+            # Skip notifying the source to avoid loops ONLY if explicitly configured
+            # Allow self-notifications by default
+            should_notify = True
+            if action.get("source") == subscriber_id and action.get("skip_self_notify", False):
+                should_notify = False
+
+            if should_notify:
+                logger.debug(f"Notifying subscriber {subscriber_id} about action {action['type']}")
                 task = asyncio.create_task(self._safe_notify(subscriber_id, callback, action))
                 tasks.append(task)
 
@@ -205,9 +210,10 @@ class StateStore:
     async def _safe_notify(self, subscriber_id: str, callback: SubscriberFn, action: Action) -> None:
         """Safely call a subscriber callback."""
         try:
+            logger.debug(f"Executing notification callback for subscriber {subscriber_id}")
             await callback(self.state, action)
         except Exception as e:
-            logger.error(f"Error notifying subscriber {subscriber_id}: {e}")
+            logger.error(f"Error notifying subscriber {subscriber_id}: {e}", exc_info=True)
 
     def subscribe(self, subscriber_id: str, callback: SubscriberFn) -> None:
         """Register to receive state updates."""
