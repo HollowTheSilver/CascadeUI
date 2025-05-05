@@ -220,23 +220,28 @@ class StateStore:
         if not self.persistence_enabled or not self.persistence_backend:
             return
 
-        try:
-            await self.persistence_backend.save_state(self.state)
-        except Exception as e:
-            logger.error(f"Error persisting state: {e}")
+        # Use safe_execute to prevent crashes
+        await safe_execute(
+            self.persistence_backend.save_state(self.state),
+            fallback=None,
+            log_error=True
+        )
 
     async def restore_state(self) -> None:
         """Restore state from persistence backend."""
         if not self.persistence_enabled or not self.persistence_backend:
             return
 
-        try:
-            restored_state = await self.persistence_backend.load_state()
-            if restored_state:
-                self.state = restored_state
-                logger.info("State restored from persistence backend")
-        except Exception as e:
-            logger.error(f"Error restoring state: {e}")
+        # Use safe_execute to prevent crashes
+        restored_state = await safe_execute(
+            self.persistence_backend.load_state(),
+            fallback=None,
+            log_error=True
+        )
+
+        if restored_state:
+            self.state = restored_state
+            logger.info("State restored from persistence backend")
 
     def enable_persistence(self, backend) -> None:
         """Enable state persistence with the specified backend."""

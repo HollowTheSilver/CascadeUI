@@ -2,10 +2,9 @@
 
 
 from typing import Dict, Any, Optional
-
 from .types import ViewId, SessionId, UserId, ComponentId
 
-# Type aliases
+# Type alias for action payloads
 ActionPayload = Dict[str, Any]
 
 
