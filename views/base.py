@@ -97,9 +97,14 @@ class StatefulView(View):
         await self.update_from_state(state)
 
     async def update_from_state(self, state):
-        """Update this view based on current state.
+        """
+        Update this view based on current state.
 
-        Override this in subclasses to update specific UI elements.
+        This default implementation does nothing. Subclasses should override
+        this method to implement state-driven UI updates when needed.
+
+        Args:
+            state: The current application state
         """
         pass
 

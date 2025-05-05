@@ -4,6 +4,7 @@
 
 import inspect
 import discord
+import datetime
 from discord.ext import commands
 from discord.ext.commands import Context
 
@@ -51,64 +52,87 @@ class CounterView(StatefulView):
             callback=self.decrement
         ))
 
-        # Add an exit button
+        # Add reset button
+        self.add_item(StatefulButton(
+            label="Reset",
+            style=discord.ButtonStyle.secondary,
+            callback=self.reset
+        ))
+
+        # Add exit button
         self.add_exit_button()
 
     async def increment(self, interaction):
-        # Acknowledge interaction first
+        """Increment the counter with immediate UI update."""
+        # Acknowledge interaction with deferred update
         await interaction.response.defer()
 
         # Update counter
         self.counter += 1
 
-        # Dispatch action to update state
+        # Dispatch action to update state (for persistence/synchronization)
         await self.dispatch("COUNTER_UPDATED", {
             "view_id": self.id,
             "counter": self.counter
         })
 
+        # Immediate UI update
+        await self.update_ui()
+
     async def decrement(self, interaction):
-        # Acknowledge interaction first
+        """Decrement the counter with immediate UI update."""
+        # Acknowledge interaction with deferred update
         await interaction.response.defer()
 
         # Update counter
         self.counter -= 1
 
+        # Dispatch action to update state (for persistence/synchronization)
+        await self.dispatch("COUNTER_UPDATED", {
+            "view_id": self.id,
+            "counter": self.counter
+        })
+
+        # Immediate UI update
+        await self.update_ui()
+
+    async def reset(self, interaction):
+        """Reset the counter to zero."""
+        # Acknowledge interaction with deferred update
+        await interaction.response.defer()
+
+        # Reset counter
+        self.counter = 0
+
         # Dispatch action to update state
         await self.dispatch("COUNTER_UPDATED", {
             "view_id": self.id,
             "counter": self.counter
         })
 
-    # Update for CounterView
+        # Immediate UI update
+        await self.update_ui()
 
-    async def update_from_state(self, state):
-        """Update view based on current state."""
-        logger.debug(f"Updating view {self.id} from state")
-
-        # Get the counter value from state - always sync with global state
-        counter_in_state = state.get("application", {}).get("counters", {}).get(self.id)
-
-        # Update local state if needed
-        if counter_in_state is not None:
-            old_value = self.counter
-            self.counter = counter_in_state
-            logger.debug(f"Updated counter from {old_value} to {self.counter} based on state")
-
-        # Update UI with current counter value
+    async def update_ui(self):
+        """Update the UI with current counter value."""
+        # Create an embed with counter value and styling
         embed = discord.Embed(
-            title="Counter Example",
+            title="Fast Counter",
             description=f"Current value: {self.counter}",
-            color=discord.Color.blue()
+            color=discord.Color.blue() if self.counter >= 0 else discord.Color.red()
         )
+
+        # Add a footer with a timestamp
+        embed.set_footer(text=f"Last updated: {datetime.now().strftime('%H:%M:%S')}")
 
         # Update message if it exists
         if self.message:
-            try:
-                await self.message.edit(embed=embed, view=self)
-                logger.debug(f"Updated message UI with counter={self.counter}")
-            except Exception as e:
-                logger.error(f"Error updating message: {e}")
+            await self.message.edit(embed=embed, view=self)
+
+    # Override to do nothing since we update manually
+    async def update_from_state(self, state):
+        """Disabled automatic state-driven updates."""
+        pass
 
 
 # Create a custom reducer for the counter
