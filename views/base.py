@@ -90,6 +90,9 @@ class StatefulView(View):
 
     async def _on_state_changed(self, state, action):
         """React to state changes."""
+        # Add logging to track notification
+        logger.debug(f"View '{self.id}' received state update for action '{action['type']}'")
+
         # Default implementation - update UI if needed
         await self.update_from_state(state)
 

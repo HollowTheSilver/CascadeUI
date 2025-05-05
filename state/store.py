@@ -184,7 +184,7 @@ class StateStore:
                     "VIEW_CREATED", "VIEW_UPDATED", "VIEW_DESTROYED",
                     "SESSION_CREATED", "SESSION_UPDATED", "NAVIGATION"
                 ]:
-                    asyncio.create_task(self._persist_state())
+                    asyncio.create_task(self._persist_state())  # NOQA
 
         return self.state
 
@@ -202,13 +202,12 @@ class StateStore:
             # Wait for all notifications to complete
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _safe_notify(self, subscriber_id: str, callback: SubscriberFn,
-                           action: Action) -> None:
+    async def _safe_notify(self, subscriber_id: str, callback: SubscriberFn, action: Action) -> None:
         """Safely call a subscriber callback."""
         try:
             await callback(self.state, action)
         except Exception as e:
-            print(f"Error notifying subscriber {subscriber_id}: {e}")
+            logger.error(f"Error notifying subscriber {subscriber_id}: {e}")
 
     def subscribe(self, subscriber_id: str, callback: SubscriberFn) -> None:
         """Register to receive state updates."""

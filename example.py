@@ -7,12 +7,10 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 from discord.ext.commands import Context
-from bot import SynchroClientObj
 
 # Import CascadeUI components
 from cascadeui import StatefulView, StatefulButton, get_store, cascade_reducer
 
-from utilities.logger import AsyncLogger
 from typing import (
     Any,
     Callable,
@@ -34,24 +32,8 @@ from typing import (
     Self,
     LiteralString,
 )
-from discord.errors import (
-    DiscordException,
-    ClientException,
-    GatewayNotFound,
-    HTTPException,
-    RateLimited,
-    Forbidden,
-    NotFound,
-    DiscordServerError,
-    InvalidData,
-    LoginFailure,
-    ConnectionClosed,
-    PrivilegedIntentsRequired,
-    InteractionResponded,
-)
-from google.api_core.exceptions import (  # NOQA
-    NotFound as fbNotFound,
-)
+
+from utilities.logger import AsyncLogger
 
 
 # \\ Logger \\
@@ -91,6 +73,9 @@ class CounterView(StatefulView):
         self.add_exit_button()
 
     async def increment(self, interaction):
+        # Acknowledge interaction first
+        await interaction.response.defer()
+
         # Update counter
         self.counter += 1
 
@@ -100,21 +85,10 @@ class CounterView(StatefulView):
             "counter": self.counter
         })
 
-        # Create updated embed
-        embed = discord.Embed(
-            title="Counter Example",
-            description=f"Current value: {self.counter}",
-            color=discord.Color.blue()
-        )
-
-        # Try to update message directly as well
-        try:
-            await interaction.response.edit_message(embed=embed, view=self)
-        except:
-            # If already responded, use followup or defer
-            await interaction.response.defer()
-
     async def decrement(self, interaction):
+        # Acknowledge interaction first
+        await interaction.response.defer()
+
         # Update counter
         self.counter -= 1
 
@@ -124,23 +98,9 @@ class CounterView(StatefulView):
             "counter": self.counter
         })
 
-        # Create updated embed
-        embed = discord.Embed(
-            title="Counter Example",
-            description=f"Current value: {self.counter}",
-            color=discord.Color.blue()
-        )
-
-        # Try to update message directly as well
-        try:
-            await interaction.response.edit_message(embed=embed, view=self)
-        except:
-            # If already responded, use followup or defer
-            await interaction.response.defer()
-
     async def update_from_state(self, state):
         """Update view when state changes."""
-        # Create an embed with the current counter value
+        # Create embed with current counter value
         embed = discord.Embed(
             title="Counter Example",
             description=f"Current value: {self.counter}",
@@ -151,9 +111,8 @@ class CounterView(StatefulView):
         if self.message:
             try:
                 await self.message.edit(embed=embed, view=self)
-                logger.error(f"Updated counter view to {self.counter}")  # Debug
             except Exception as e:
-                logger.error(f"Error updating message: {e}")  # Debug
+                logger.error(f"Error updating message: {e}")
 
 
 # Create a custom reducer for the counter
@@ -177,6 +136,7 @@ async def counter_reducer(action, state):
     # Update counter in state
     if view_id:
         new_state["application"]["counters"][view_id] = counter_value
+        logger.debug(f"State updated: counters[{view_id}] = {counter_value}")
 
     return new_state
 
@@ -184,21 +144,21 @@ async def counter_reducer(action, state):
 # // ========================================( Cog )======================================== // #
 
 
-class TestCascade(commands.Cog, name="testCascade"):
+class Example(commands.Cog, name="example"):
     """
-        Config Manager discord extension class.
+        Example discord cog class.
 
         """
 
-    def __init__(self, bot: SynchroClientObj) -> None:
+    def __init__(self, bot) -> None:
         """
-        Initialize configManager cog.
+        Initialize example cog.
 
         ... VersionAdded:: 1.0
 
         Parameters
         -----------
-        bot: commands.Bot[SynchroClient]
+        bot: commands.Bot[Client]
             Discord client instance.
 
         Raises
@@ -210,7 +170,7 @@ class TestCascade(commands.Cog, name="testCascade"):
         :class:`NoneType`
             None
         """
-        self.bot: SynchroClientObj = bot
+        self.bot = bot
         _listeners: List[callable] = list()
         for attr in dir(self):
             if awaitable := getattr(self, attr, None):
@@ -229,10 +189,10 @@ class TestCascade(commands.Cog, name="testCascade"):
             logger.error(f"Failed to register listener '{_listener}'")
 
     @commands.hybrid_command(
-        name="counterui",  # Note: must be lowercase
-        description="Display an interactive counter."
+        name="counter",  # Note: must be lowercase
+        description="Display an interactive counter example user interface."
     )
-    async def counterui(self, context: Context) -> None:
+    async def counter(self, context: Context) -> None:
         """
         Display an interactive counter view.
 
@@ -253,6 +213,6 @@ class TestCascade(commands.Cog, name="testCascade"):
         await context.send(embed=embed, view=view)
 
 
-async def setup(bot: SynchroClientObj) -> None:
-    cog: TestCascadeCog = TestCascade(bot=bot)
+async def setup(bot) -> None:
+    cog: TestCascadeCog = Example(bot=bot)
     await bot.add_cog(cog)
