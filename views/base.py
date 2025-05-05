@@ -4,13 +4,15 @@
 
 import asyncio
 import uuid
-from typing import Dict, Any, Optional, List, Union, Callable
+import weakref
+from typing import Dict, Any, Optional, List, Union, Callable, Set
+from ..utils.tasks import get_task_manager
+from ..utils.errors import with_error_boundary, safe_execute
 
 import discord
 from discord import Interaction
 from discord.ui import View, Item
 
-# Import from singleton instead of store directly
 from ..state.singleton import get_store
 from ..state.actions import ActionCreators
 
@@ -42,6 +44,9 @@ class StatefulView(View):
         # Message reference
         self._message = None
 
+        # Get task manager
+        self.task_manager = get_task_manager()
+
         # Setup from context or interaction if provided
         if self.interaction is None and self.context is not None:
             if hasattr(self.context, "interaction") and self.context.interaction:
@@ -65,9 +70,13 @@ class StatefulView(View):
 
         # Schedule initialization based on context
         if self.interaction:
-            asyncio.create_task(self._init_from_interaction())
+            self.create_task(self._init_from_interaction())
         elif self.context and hasattr(self.context, "send"):
-            asyncio.create_task(self._init_from_context())
+            self.create_task(self._init_from_context())
+
+    def create_task(self, coro):
+        """Create a task owned by this view."""
+        return self.task_manager.create_task(self.id, coro)
 
     def _register_view(self):
         """Register this view in the state store."""
@@ -77,7 +86,7 @@ class StatefulView(View):
                 session_id=self.session_id,
                 user_id=self.user_id
             )
-            asyncio.create_task(self.state_store.dispatch("SESSION_CREATED", payload))
+            self.create_task(self.state_store.dispatch("SESSION_CREATED", payload))
 
         # Then register the view
         payload = ActionCreators.view_created(
@@ -86,7 +95,7 @@ class StatefulView(View):
             user_id=self.user_id,
             session_id=self.session_id
         )
-        asyncio.create_task(self.state_store.dispatch("VIEW_CREATED", payload))
+        self.create_task(self.state_store.dispatch("VIEW_CREATED", payload))
 
     async def _on_state_changed(self, state, action):
         """React to state changes."""
@@ -112,6 +121,7 @@ class StatefulView(View):
         """Dispatch an action to the state store."""
         return await self.state_store.dispatch(action_type, payload, source_id=self.id)
 
+    @with_error_boundary("_init_from_interaction")
     async def _init_from_interaction(self):
         """Initialize this view from an interaction."""
         if not self.interaction:
@@ -140,6 +150,8 @@ class StatefulView(View):
 
         except Exception as e:
             logger.error(f"Error initializing view from interaction: {e}")
+            # Re-raise to allow proper error handling
+            raise
 
     async def _init_from_context(self):
         """Initialize this view from a command context."""
@@ -179,7 +191,7 @@ class StatefulView(View):
                 message_id=str(value.id),
                 channel_id=str(value.channel.id) if value.channel else None
             )
-            asyncio.create_task(self.dispatch("VIEW_UPDATED", payload))
+            self.create_task(self.dispatch("VIEW_UPDATED", payload))
 
     async def transition_to(self, view_class, interaction=None, **kwargs):
         """Transition from this view to a new view."""
@@ -208,12 +220,10 @@ class StatefulView(View):
         return new_view
 
     async def exit(self, delete_message=False):
-        """
-        Cleanly exit and clean up this view.
+        """Cleanly exit and clean up this view."""
+        # Cancel all tasks owned by this view
+        self.task_manager.cancel_tasks(self.id)
 
-        Args:
-            delete_message: Whether to delete the message or just remove the view
-        """
         # Stop this view
         self.stop()
 
@@ -225,6 +235,8 @@ class StatefulView(View):
                 else:
                     await self._message.edit(view=None)
             except Exception as e:
+                from ..utils.logging import AsyncLogger
+                logger = AsyncLogger(name=__name__, level="ERROR", path="logs", mode="a")
                 logger.error(f"Error cleaning up message: {e}")
 
         # Dispatch view destroyed action
@@ -255,7 +267,7 @@ class StatefulView(View):
         return button
 
     def __del__(self):
-        """Ensure cleanup when this view is garbage collected."""
+        """Clean reference to ensure GC can collect this view."""
         # Unsubscribe from state updates
         if hasattr(self, "state_store") and hasattr(self, "id"):
             self.state_store.unsubscribe(self.id)

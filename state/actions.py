@@ -1,8 +1,9 @@
-
 # // ========================================( Modules )======================================== // #
 
 
 from typing import Dict, Any, Optional
+
+from .types import ViewId, SessionId, UserId, ComponentId
 
 # Type aliases
 ActionPayload = Dict[str, Any]
@@ -15,8 +16,8 @@ class ActionCreators:
     """Helper methods to create standardized actions."""
 
     @staticmethod
-    def view_created(view_id: str, view_type: str, user_id: Optional[int] = None,
-                     session_id: Optional[str] = None, **props) -> ActionPayload:
+    def view_created(view_id: ViewId, view_type: str, user_id: Optional[UserId] = None,
+                     session_id: Optional[SessionId] = None, **props) -> ActionPayload:
         """Create a VIEW_CREATED action payload."""
         return {
             "view_id": view_id,
@@ -27,7 +28,7 @@ class ActionCreators:
         }
 
     @staticmethod
-    def view_updated(view_id: str, **updates) -> ActionPayload:
+    def view_updated(view_id: ViewId, **updates) -> ActionPayload:
         """Create a VIEW_UPDATED action payload."""
         return {
             "view_id": view_id,
@@ -35,14 +36,14 @@ class ActionCreators:
         }
 
     @staticmethod
-    def view_destroyed(view_id: str) -> ActionPayload:
+    def view_destroyed(view_id: ViewId) -> ActionPayload:
         """Create a VIEW_DESTROYED action payload."""
         return {
             "view_id": view_id
         }
 
     @staticmethod
-    def session_created(session_id: str, user_id: Optional[int] = None,
+    def session_created(session_id: SessionId, user_id: Optional[UserId] = None,
                         **data) -> ActionPayload:
         """Create a SESSION_CREATED action payload."""
         return {
@@ -52,7 +53,7 @@ class ActionCreators:
         }
 
     @staticmethod
-    def session_updated(session_id: str, **data) -> ActionPayload:
+    def session_updated(session_id: SessionId, **data) -> ActionPayload:
         """Create a SESSION_UPDATED action payload."""
         return {
             "session_id": session_id,
@@ -68,8 +69,8 @@ class ActionCreators:
         }
 
     @staticmethod
-    def component_interaction(component_id: str, view_id: str,
-                              user_id: Optional[int] = None,
+    def component_interaction(component_id: ComponentId, view_id: ViewId,
+                              user_id: Optional[UserId] = None,
                               **values) -> ActionPayload:
         """Create a COMPONENT_INTERACTION action payload."""
         return {

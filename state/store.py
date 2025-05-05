@@ -1,21 +1,19 @@
-
 # // ========================================( Modules )======================================== // #
 
 
 import asyncio
 import copy
 from datetime import datetime
-from typing import Dict, Any, Callable, Awaitable, Optional, List, Union
+from typing import Dict, Any, Optional, List, Union
 
 # Import logging at module level
 from ..utils.logging import AsyncLogger
-logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a")
+from ..utils.tasks import get_task_manager
+from ..utils.errors import with_error_boundary, safe_execute
 
-# Type definitions
-StateData = Dict[str, Any]
-Action = Dict[str, Any]
-ReducerFn = Callable[[Action, StateData], Awaitable[StateData]]
-SubscriberFn = Callable[[StateData, Action], Awaitable[None]]
+from .types import Action, StateData, ReducerFn, SubscriberFn
+
+logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a")
 
 
 # // ========================================( Class )======================================== // #
@@ -64,6 +62,9 @@ class StateStore:
         self.persistence_enabled = False
         self.persistence_backend = None
 
+        # Task management
+        self.task_manager = get_task_manager()
+
         self._initialized = True
         logger.debug("StateStore initialized")
 
@@ -98,33 +99,6 @@ class StateStore:
         self.reducers = {**self._core_reducers, **self._custom_reducers}
         logger.debug("Core reducers loaded")
 
-    def _register_core_reducers(self):
-        """Register the built-in reducers."""
-        # Import here to avoid circular imports
-        from .reducers import (
-            reduce_view_created,
-            reduce_view_updated,
-            reduce_view_destroyed,
-            reduce_session_created,
-            reduce_session_updated,
-            reduce_navigation,
-            reduce_component_interaction
-        )
-
-        # Register core reducers
-        self._core_reducers = {
-            "VIEW_CREATED": reduce_view_created,
-            "VIEW_UPDATED": reduce_view_updated,
-            "VIEW_DESTROYED": reduce_view_destroyed,
-            "SESSION_CREATED": reduce_session_created,
-            "SESSION_UPDATED": reduce_session_updated,
-            "NAVIGATION": reduce_navigation,
-            "COMPONENT_INTERACTION": reduce_component_interaction,
-        }
-
-        # Update combined reducers
-        self.reducers = {**self._core_reducers, **self._custom_reducers}
-
     def register_reducer(self, action_type: str, reducer: ReducerFn) -> None:
         """Register a custom reducer for a specific action type."""
         self._custom_reducers[action_type] = reducer
@@ -137,6 +111,7 @@ class StateStore:
             # Rebuild combined reducers
             self.reducers = {**self._core_reducers, **self._custom_reducers}
 
+    @with_error_boundary("dispatch")
     async def dispatch(self, action_type: str, payload: Any = None,
                        source_id: Optional[str] = None) -> StateData:
         """
@@ -181,7 +156,7 @@ class StateStore:
 
         # Handle persistence
         if self.persistence_enabled and self.persistence_backend:
-            asyncio.create_task(self._persist_state())  # NOQA
+            self.task_manager.create_task("state_store", self._persist_state())
 
         return self.state
 
@@ -200,12 +175,23 @@ class StateStore:
 
             if should_notify:
                 logger.debug(f"Notifying subscriber {subscriber_id} about action {action['type']}")
-                task = asyncio.create_task(self._safe_notify(subscriber_id, callback, action))
+                task = self.task_manager.create_task(
+                    "state_store_notify",
+                    self._safe_notify(subscriber_id, callback, action)
+                )
                 tasks.append(task)
 
         if tasks:
             # Wait for all notifications to complete
-            await asyncio.gather(*tasks, return_exceptions=True)
+            done, pending = await asyncio.wait(
+                tasks,
+                return_when=asyncio.ALL_COMPLETED
+            )
+
+            # Check for errors
+            for task in done:
+                if task.exception():
+                    logger.error(f"Error in subscriber notification: {task.exception()}")
 
     async def _safe_notify(self, subscriber_id: str, callback: SubscriberFn, action: Action) -> None:
         """Safely call a subscriber callback."""
@@ -214,6 +200,11 @@ class StateStore:
             await callback(self.state, action)
         except Exception as e:
             logger.error(f"Error notifying subscriber {subscriber_id}: {e}", exc_info=True)
+
+            # Don't propagate the exception to avoid breaking notification chain
+            # but log detailed error information for debugging
+            import traceback
+            logger.debug(f"Detailed error for {subscriber_id}:\n{traceback.format_exc()}")
 
     def subscribe(self, subscriber_id: str, callback: SubscriberFn) -> None:
         """Register to receive state updates."""
@@ -232,7 +223,7 @@ class StateStore:
         try:
             await self.persistence_backend.save_state(self.state)
         except Exception as e:
-            print(f"Error persisting state: {e}")
+            logger.error(f"Error persisting state: {e}")
 
     async def restore_state(self) -> None:
         """Restore state from persistence backend."""
@@ -243,13 +234,15 @@ class StateStore:
             restored_state = await self.persistence_backend.load_state()
             if restored_state:
                 self.state = restored_state
+                logger.info("State restored from persistence backend")
         except Exception as e:
-            print(f"Error restoring state: {e}")
+            logger.error(f"Error restoring state: {e}")
 
     def enable_persistence(self, backend) -> None:
         """Enable state persistence with the specified backend."""
         self.persistence_enabled = True
         self.persistence_backend = backend
+        logger.info(f"State persistence enabled with backend: {backend.__class__.__name__}")
 
 
 # Singleton instance

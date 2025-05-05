@@ -1,13 +1,9 @@
-
 # // ========================================( Modules )======================================== // #
 
 import copy
 from typing import Dict, Any
 
-# Type aliases
-StateData = Dict[str, Any]
-Action = Dict[str, Any]
-
+from .types import Action, StateData
 
 # // ========================================( Coroutines )======================================== // #
 
@@ -109,16 +105,18 @@ async def reduce_session_created(action: Action, state: StateData) -> StateData:
     if "sessions" not in new_state:
         new_state["sessions"] = {}
 
-    # Add the new session
-    new_state["sessions"][session_id] = {
-        "id": session_id,
-        "user_id": payload.get("user_id"),
-        "created_at": action["timestamp"],
-        "updated_at": action["timestamp"],
-        "views": [],
-        "history": [],
-        "data": payload.get("data", {}),
-    }
+    # Only create if session doesn't exist already
+    if session_id not in new_state["sessions"]:
+        # Add the new session
+        new_state["sessions"][session_id] = {
+            "id": session_id,
+            "user_id": payload.get("user_id"),
+            "created_at": action["timestamp"],
+            "updated_at": action["timestamp"],
+            "views": [],
+            "history": [],
+            "data": payload.get("data", {}),
+        }
 
     return new_state
 
