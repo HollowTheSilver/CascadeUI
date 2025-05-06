@@ -4,7 +4,7 @@
 
 import inspect
 import discord
-import datetime
+from datetime import datetime
 from discord.ext import commands
 from discord.ext.commands import Context
 
@@ -26,7 +26,7 @@ logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a")
 
 # \\ Generics \\
 
-TestCascadeCog = TypeVar('TestCascadeCog', bound='TestCascade')
+CounterExampleCog = TypeVar('CounterExampleCog', bound='CounterExample')
 
 
 # // ========================================( Views )======================================== // #
@@ -164,49 +164,14 @@ async def counter_reducer(action, state):
 # // ========================================( Cog )======================================== // #
 
 
-class Example(commands.Cog, name="example"):
+class CounterExample(commands.Cog, name="counter_example"):
     """
-        Example discord extension class.
+    Example discord extension class.
 
-        """
+    """
 
     def __init__(self, bot) -> None:
-        """
-        Initialize Example cog.
-
-        ... VersionAdded:: 1.0
-
-        Parameters
-        -----------
-        bot: commands.Bot[Client]
-            Discord client instance.
-
-        Raises
-        -------
-        ...
-
-        Returns
-        --------
-        :class:`NoneType`
-            None
-        """
         self.bot = bot
-        _listeners: List[callable] = list()
-        for attr in dir(self):
-            if awaitable := getattr(self, attr, None):
-                if inspect.iscoroutinefunction(awaitable) and attr.startswith("on_"):
-                    _listeners.append(awaitable)
-        _failed: List[Optional[callable]] = list()
-        for _listener in _listeners:
-            try:
-                self.bot.add_listener(_listener, _listener.__name__)
-            except (TypeError, AttributeError, Exception):
-                _failed.append(_listener.__name__)
-                _listener.remove(_listener)
-        if _listeners:
-            logger.info(f"Registered <{len(_listeners)}> event listeners")
-        for _listener in _failed:
-            logger.error(f"Failed to register listener '{_listener}'")
 
     @commands.hybrid_command(
         name="counter",  # Note: must be lowercase
@@ -234,5 +199,5 @@ class Example(commands.Cog, name="example"):
 
 
 async def setup(bot) -> None:
-    cog: TestCascadeCog = Example(bot=bot)
+    cog: CounterExampleCog = CounterExample(bot=bot)
     await bot.add_cog(cog)
