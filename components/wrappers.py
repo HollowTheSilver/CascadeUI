@@ -21,32 +21,32 @@ def with_loading_state(component: Any) -> Any:
         if hasattr(component, "label"):
             component.label = "Loading..."
 
-        # Get the view (this is what's failing in the current code)
-        # Instead of using interaction.message.view, we access the view through the interaction
-        view = interaction.client._view_store.get_view_from_message(interaction.message.id)
-
-        if view:
-            # Update message with loading state
-            await interaction.response.edit_message(view=view)
-
-            try:
-                # Call original callback
-                await original_callback(interaction)
-            finally:
-                # Reset component state
-                component.disabled = False
-                if hasattr(component, "label"):
-                    component.label = original_label
-
-                # Try to update the message again if possible
+        # DON'T defer - let the original callback handle interaction response
+        try:
+            # Get the view if possible
+            if hasattr(interaction, "message") and interaction.message:
                 try:
-                    await interaction.message.edit(view=view)
+                    # Try to update the message directly
+                    await interaction.response.edit_message(view=interaction.message.view)
                 except Exception:
-                    pass  # Message update might fail if interaction was already used
-        else:
-            # Fallback if view is not found
-            await interaction.response.defer()
+                    # If that fails, don't try to respond again
+                    pass
+
+            # Call original callback
             await original_callback(interaction)
+
+        finally:
+            # Reset component state
+            component.disabled = False
+            if hasattr(component, "label"):
+                component.label = original_label
+
+            # Try to update message after operation is complete
+            if hasattr(interaction, "message") and interaction.message:
+                try:
+                    await interaction.message.edit(view=interaction.message.view)
+                except Exception:
+                    pass  # Ignore errors in cleanup
 
     component.callback = loading_callback
     return component

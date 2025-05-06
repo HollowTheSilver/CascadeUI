@@ -89,14 +89,14 @@ class UserProfileView(StatefulView):
 
     async def save_profile(self, interaction):
         """Handle save button click with loading state."""
-        # The loading state is handled by the wrapper
+        # Defer the interaction properly
         await interaction.response.defer()
 
         # Simulate some processing
         import asyncio
         await asyncio.sleep(2)
 
-        # Update the UI
+        # Update the UI now that processing is complete
         await interaction.followup.send("Profile saved successfully!", ephemeral=True)
 
     async def confirm_changes(self, interaction):
