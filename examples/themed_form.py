@@ -14,6 +14,7 @@ from typing import (
 
 from cascadeui import (
     StatefulView,
+    StatefulButton,
     ConfirmationButtons,
     PaginationControls,
     with_loading_state,
@@ -57,12 +58,11 @@ class UserProfileView(StatefulView):
         super().__init__(context=context)
 
         # Create save button with loading state
-        save_button = discord.ui.Button(
+        save_button = StatefulButton(
             label="Save Profile",
             style=discord.ButtonStyle.primary,
-            custom_id="save"
+            callback=self.save_profile  # Set callback directly here
         )
-        save_button.callback = self.save_profile
 
         # Add loading state to button
         save_button = with_loading_state(save_button)

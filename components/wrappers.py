@@ -21,26 +21,32 @@ def with_loading_state(component: Any) -> Any:
         if hasattr(component, "label"):
             component.label = "Loading..."
 
-        # Update message with loading state
-        await interaction.response.edit_message(view=interaction.message.view)
+        # Get the view (this is what's failing in the current code)
+        # Instead of using interaction.message.view, we access the view through the interaction
+        view = interaction.client._view_store.get_view_from_message(interaction.message.id)
 
-        try:
-            # Create a new interaction for the callback since we used the original
-            # Note: Discord.py has special handling for deferred interactions
-            # For simplicity, we'll call the original callback but applications
-            # should be aware of interaction response limitations
-            await original_callback(interaction)
-        finally:
-            # Reset component state
-            component.disabled = False
-            if hasattr(component, "label"):
-                component.label = original_label
+        if view:
+            # Update message with loading state
+            await interaction.response.edit_message(view=view)
 
-            # Try to update the message again if possible
             try:
-                await interaction.message.edit(view=interaction.message.view)
-            except Exception:
-                pass  # Message update might fail if interaction was already used
+                # Call original callback
+                await original_callback(interaction)
+            finally:
+                # Reset component state
+                component.disabled = False
+                if hasattr(component, "label"):
+                    component.label = original_label
+
+                # Try to update the message again if possible
+                try:
+                    await interaction.message.edit(view=view)
+                except Exception:
+                    pass  # Message update might fail if interaction was already used
+        else:
+            # Fallback if view is not found
+            await interaction.response.defer()
+            await original_callback(interaction)
 
     component.callback = loading_callback
     return component
