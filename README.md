@@ -1,28 +1,95 @@
 # CascadeUI
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![discord.py 2.1+](https://img.shields.io/badge/discord.py-2.1+-738adb.svg)](https://github.com/Rapptz/discord.py)
+
+> **Note**: CascadeUI is currently in active development and has not yet been officially released. Installation is source-only until the package is published on PyPI.
+
 Stateful UI components and state management for [discord.py](https://github.com/Rapptz/discord.py).
 
 CascadeUI brings a Redux-inspired architecture to Discord bot interfaces. Views, buttons, selects, and forms are backed by a centralized state store with dispatched actions, reducers, and subscriber notifications. The result is predictable state flow and composable UI patterns that scale beyond simple one-off views.
 
-## Installation
+---
 
-```bash
-pip install cascadeui
+## Overview
+
+### The Problem
+```python
+# Traditional approach (fragile):
+view = MyView()
+view.counter = 0  # State scattered across view instances
+await ctx.send(view=view)  # No lifecycle tracking
+# User clicks button... but which view? What state? Is it still valid?
+# Another user clicks... shared mutable state! Race condition!
 ```
 
-Requires Python 3.10+ and discord.py 2.1+.
+### The Solution
+```python
+# CascadeUI approach (predictable):
+view = CounterView(context=ctx)
+await view.send(embed=embed)  # State registered, lifecycle tracked
+# Actions dispatched -> reducers transform state -> subscribers notified
+# Each view subscribes to relevant state slices, updates automatically
+```
+
+---
+
+## Key Features
+
+- **Centralized State Store**
+  - Singleton store with dispatch/reducer cycle
+  - Action history for debugging
+  - Subscriber filtering (views only receive relevant updates)
+
+- **Stateful Views**
+  - Wraps discord.py `View` with automatic state integration
+  - Lifecycle management: send, interact, timeout, cleanup
+  - View-to-view transitions with navigation history
+
+- **Stateful Components**
+  - `StatefulButton` and `StatefulSelect` with automatic action dispatching
+  - Composite components: `ConfirmationButtons`, `PaginationControls`, `FormLayout`
+  - Behavioral wrappers: loading states, confirmation prompts, per-user cooldowns
+
+- **Theming**
+  - Global theme registry with per-view overrides
+  - Apply colors, emojis, and footer text to embeds in one call
+  - Built-in themes: default, dark, light
+
+- **Persistence**
+  - Decorator-based state persistence to JSON
+  - Automatic save on state change, restore on startup
+
+- **Custom Reducers**
+  - Register your own action types with `@cascade_reducer`
+  - Immutable state updates with `copy.deepcopy`
+
+---
 
 ## Quick Start
+
+### Installation
+
+```bash
+# Install from source (PyPI coming soon)
+git clone https://github.com/HollowTheSilver/CascadeUI.git
+cd CascadeUI
+pip install -e .
+```
+
+**Requirements**: Python 3.10+ | discord.py 2.1+
+
+### A Counter in 30 Lines
 
 ```python
 import discord
 from discord.ext import commands
 from cascadeui import StatefulView, StatefulButton, cascade_reducer
+import copy
 
-# Define a custom reducer for your state
 @cascade_reducer("COUNTER_UPDATED")
 async def counter_reducer(action, state):
-    import copy
     new_state = copy.deepcopy(state)
     new_state.setdefault("application", {}).setdefault("counters", {})
     view_id = action["payload"]["view_id"]
@@ -33,50 +100,39 @@ class CounterView(StatefulView):
     def __init__(self, context):
         super().__init__(context=context)
         self.counter = 0
-
-        self.add_item(StatefulButton(
-            label="+1",
-            style=discord.ButtonStyle.primary,
-            callback=self.increment
-        ))
-        self.add_item(StatefulButton(
-            label="-1",
-            style=discord.ButtonStyle.danger,
-            callback=self.decrement
-        ))
+        self.add_item(StatefulButton(label="+1", style=discord.ButtonStyle.primary, callback=self.increment))
+        self.add_item(StatefulButton(label="-1", style=discord.ButtonStyle.danger, callback=self.decrement))
         self.add_exit_button()
 
     async def increment(self, interaction):
         await interaction.response.defer()
         self.counter += 1
         await self.dispatch("COUNTER_UPDATED", {"view_id": self.id, "counter": self.counter})
-        await self.update_ui()
+        if self.message:
+            await self.message.edit(embed=discord.Embed(title="Counter", description=f"Value: {self.counter}"), view=self)
 
     async def decrement(self, interaction):
         await interaction.response.defer()
         self.counter -= 1
         await self.dispatch("COUNTER_UPDATED", {"view_id": self.id, "counter": self.counter})
-        await self.update_ui()
-
-    async def update_ui(self):
-        embed = discord.Embed(title="Counter", description=f"Value: {self.counter}")
         if self.message:
-            await self.message.edit(embed=embed, view=self)
+            await self.message.edit(embed=discord.Embed(title="Counter", description=f"Value: {self.counter}"), view=self)
 
 bot = commands.Bot(command_prefix="!", intents=discord.Intents.default())
 
 @bot.hybrid_command()
 async def counter(ctx):
     view = CounterView(context=ctx)
-    embed = discord.Embed(title="Counter", description="Value: 0")
-    await view.send(embed=embed)
+    await view.send(embed=discord.Embed(title="Counter", description="Value: 0"))
 ```
+
+---
 
 ## Core Concepts
 
 ### State Store
 
-A singleton `StateStore` holds all application state and coordinates updates through a dispatch/reducer cycle. Actions are plain dicts with a `type` and `payload`. Reducers transform state immutably. Subscribers (usually views) receive filtered notifications when relevant state changes.
+A singleton `StateStore` holds all application state and coordinates updates through a dispatch/reducer cycle. Actions are plain dicts with a `type` and `payload`. Reducers transform state immutably. Subscribers receive filtered notifications when relevant state changes.
 
 ```python
 from cascadeui import get_store
@@ -126,9 +182,11 @@ pagination.add_to_view(my_view)
 
 Wrappers modify component behavior without changing the component itself:
 
-- `with_loading_state(button)` shows a loading indicator while the callback runs
-- `with_confirmation(button, message="Are you sure?")` adds a yes/no prompt before execution
-- `with_cooldown(button, seconds=5)` enforces a per-user cooldown between clicks
+| Wrapper | What it does |
+|---------|-------------|
+| `with_loading_state(button)` | Shows a loading indicator while the callback runs |
+| `with_confirmation(button, message="...")` | Adds a yes/no prompt before execution |
+| `with_cooldown(button, seconds=5)` | Enforces a per-user cooldown between clicks |
 
 ### Theming
 
@@ -181,15 +239,70 @@ async def profile_reducer(action, state):
 
 Reducers must return a new state dict. Use `copy.deepcopy(state)` to avoid mutating the current state.
 
+---
+
+## Data Flow
+
+```
+User clicks button
+       |
+  Interaction dispatched
+       |
+  Original callback runs (responds to Discord)
+       |
+  COMPONENT_INTERACTION action dispatched
+       |
+  Reducer transforms state immutably
+       |
+  Subscribers notified (filtered by action type)
+       |
+  Views update their UI from new state
+```
+
+---
+
 ## Examples
 
 Working examples are in the [`examples/`](examples/) directory:
 
-- **counter.py** - Basic stateful counter with increment/decrement/reset
-- **themed_form.py** - Theme switching, component wrappers, pagination, and form views
+| Example | What it covers |
+|---------|---------------|
+| **counter.py** | Basic stateful counter with increment, decrement, reset |
+| **themed_form.py** | Theme switching, component wrappers, pagination, form views |
 
 Each example is a discord.py cog that can be loaded into any bot.
 
+---
+
+## Development
+
+### Setting Up
+
+```bash
+git clone https://github.com/HollowTheSilver/CascadeUI.git
+cd CascadeUI
+pip install -e ".[dev]"
+```
+
+### Running Tests
+
+```bash
+pytest tests/ -v
+```
+
+### Code Style
+
+```bash
+black --line-length 100 cascadeui/
+isort --profile black --line-length 100 cascadeui/
+```
+
+---
+
 ## License
 
-MIT. See [LICENSE](LICENSE) for the full text.
+MIT License - see [LICENSE](LICENSE) for details.
+
+---
+
+**Made with care for the discord.py community**
