@@ -12,29 +12,6 @@ CascadeUI brings a Redux-inspired architecture to Discord bot interfaces. Views,
 
 ---
 
-## Overview
-
-### The Problem
-```python
-# Traditional approach (fragile):
-view = MyView()
-view.counter = 0  # State scattered across view instances
-await ctx.send(view=view)  # No lifecycle tracking
-# User clicks button... but which view? What state? Is it still valid?
-# Another user clicks... shared mutable state! Race condition!
-```
-
-### The Solution
-```python
-# CascadeUI approach (predictable):
-view = CounterView(context=ctx)
-await view.send(embed=embed)  # State registered, lifecycle tracked
-# Actions dispatched -> reducers transform state -> subscribers notified
-# Each view subscribes to relevant state slices, updates automatically
-```
-
----
-
 ## Key Features
 
 - **Centralized State Store**
