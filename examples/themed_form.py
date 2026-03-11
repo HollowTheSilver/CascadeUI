@@ -2,40 +2,29 @@
 # // ========================================( Modules )======================================== // #
 
 
+import asyncio
 import discord
 from discord.ext import commands
 from discord.ext.commands import Context
-from utilities.logger import AsyncLogger
-from typing import (
-    List,
-    Optional,
-    TypeVar,
-)
+import logging
 
 from cascadeui import (
     StatefulView,
     StatefulButton,
     FormView,
-    FormLayout,
     ConfirmationButtons,
     PaginationControls,
     with_loading_state,
     with_confirmation,
     Theme,
     register_theme,
-    set_current_theme,
-    get_current_theme
+    get_theme,
+    set_default_theme,
+    get_default_theme
 )
 
 
-# \\ Logger \\
-
-logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a")
-
-
-# \\ Generics \\
-
-ThemedFormExampleCog = TypeVar('ThemedFormExampleCog', bound='ThemedFormExample')
+logger = logging.getLogger(__name__)
 
 
 # Create a custom theme
@@ -48,9 +37,9 @@ my_theme = Theme("brand", {
     "footer_text": "My Bot v1.0"
 })
 
-# Register and use theme
+# Register and set as default
 register_theme(my_theme)
-set_current_theme("brand")
+set_default_theme("brand")
 
 
 # // ========================================( Views )======================================== // #
@@ -64,10 +53,8 @@ class UserProfileView(StatefulView):
         save_button = StatefulButton(
             label="Save Profile",
             style=discord.ButtonStyle.primary,
-            callback=self.save_profile  # Set callback directly here
+            callback=self.save_profile
         )
-
-        # Add loading state to button
         save_button = with_loading_state(save_button)
 
         # Add confirmation buttons with themed styling
@@ -82,24 +69,13 @@ class UserProfileView(StatefulView):
         self.add_item(save_button)
         confirmation.add_to_view(self)
 
-        # Create initial embed with theme
-        theme = get_current_theme()
-        self.embed = discord.Embed(
-            title="User Profile",
-            description="Edit your profile settings below"
-        )
-        theme.apply_to_embed(self.embed)
-
     async def save_profile(self, interaction):
-        """Handle save button click with loading state."""
-        # Defer the interaction properly
-        await interaction.response.defer()
+        """Handle save button click with loading state.
 
-        # Simulate some processing
-        import asyncio
+        Note: with_loading_state consumes the interaction response to show
+        the loading UI. Use followup for any messages.
+        """
         await asyncio.sleep(2)
-
-        # Update the UI now that processing is complete
         await interaction.followup.send("Profile saved successfully!", ephemeral=True)
 
     async def confirm_changes(self, interaction):
@@ -115,175 +91,125 @@ class UserProfileView(StatefulView):
 
 
 class ThemedFormExample(commands.Cog, name="themed_form_example"):
-    """
-        Example discord extension class.
-
-    """
+    """Example discord extension class."""
 
     def __init__(self, bot):
         self.bot = bot
 
     @commands.hybrid_command(
-        name="profile",  # Note: must be lowercase
-        description="Display an interactive counter example user interface."
+        name="profile",
+        description="Display a themed profile view."
     )
     async def profile(self, context: Context) -> None:
-        """
-        Display a themed form view.
-
-        :param context: The command context.
-        """
+        """Display a themed form view."""
         view = UserProfileView(context=context)
-        await context.send(embed=view.embed, view=view)
+
+        embed = discord.Embed(
+            title="User Profile",
+            description="Edit your profile settings below"
+        )
+        view.get_theme().apply_to_embed(embed)
+
+        await view.send(embed=embed)
 
     @commands.hybrid_command(
-        name="themetest",  # Note: must be lowercase
-        description="Example CascadeUI"
+        name="themetest",
+        description="Test theme switching with CascadeUI."
     )
     async def themetest(self, context):
         """Test theme switching functionality with distinct color palettes."""
 
         class ThemeSwitcherView(StatefulView):
-            def __init__(self, context):
-                super().__init__(context=context)
+            def __init__(self, ctx):
+                super().__init__(context=ctx)
 
-                # Add theme buttons
                 self.add_item(StatefulButton(
                     label="Default Theme",
                     style=discord.ButtonStyle.primary,
                     callback=self.set_default_theme
                 ))
-
                 self.add_item(StatefulButton(
                     label="Dark Theme",
                     style=discord.ButtonStyle.secondary,
                     callback=self.set_dark_theme
                 ))
-
                 self.add_item(StatefulButton(
                     label="Light Theme",
                     style=discord.ButtonStyle.secondary,
                     callback=self.set_light_theme
                 ))
 
-                # Create initial embed with current theme
-                self.update_embed()
+            def build_embed(self):
+                """Build the embed with the view's current theme."""
+                theme = self.get_theme()
 
-            async def update_embed(self):
-                """Update the embed with current theme info."""
-                theme = get_current_theme()
-
-                # Create embed with theme colors
-                self.embed = discord.Embed(
+                embed = discord.Embed(
                     title="Theme Switcher",
                     description=f"Current theme: **{theme.name}**",
                 )
+                theme.apply_to_embed(embed)
 
-                # Apply current theme
-                theme.apply_to_embed(self.embed)
-
-                # Choose appropriate emojis based on theme colors
-                if theme.name == "default":
-                    primary_emoji = "🔵"  # Blue
-                    success_emoji = "🟢"  # Green
-                    danger_emoji = "🔴"  # Red
-                    theme_desc = "Standard Discord-like colors"
-                elif theme.name == "dark":
-                    # Updated Dark Theme with more distinctive colors
-                    primary_emoji = "🟣"  # Purple
-                    success_emoji = "🔵"  # Blue/Cyan
-                    danger_emoji = "🟠"  # Orange
-                    theme_desc = "Rich, darker aesthetic"
-                elif theme.name == "light":
-                    # Updated Light Theme with brighter colors
-                    primary_emoji = "🟡"  # Yellow
-                    success_emoji = "🟢"  # Green
-                    danger_emoji = "🟠"  # Orange
-                    theme_desc = "Bright, softer palette"
-                else:
-                    # For custom themes, use default emojis
-                    primary_emoji = "⚪"  # Generic
-                    success_emoji = "⚪"  # Generic
-                    danger_emoji = "⚪"  # Generic
-                    theme_desc = "Custom theme"
-
-                # Add theme description
-                self.embed.add_field(
-                    name="Theme Style",
-                    value=theme_desc,
-                    inline=False
+                theme_info = {
+                    "default": ("🔵", "🟢", "🔴", "Standard Discord-like colors"),
+                    "dark": ("🟣", "🔵", "🟠", "Rich, darker aesthetic"),
+                    "light": ("🟡", "🟢", "🟠", "Bright, softer palette"),
+                }
+                primary_emoji, success_emoji, danger_emoji, theme_desc = theme_info.get(
+                    theme.name, ("⚪", "⚪", "⚪", "Custom theme")
                 )
 
-                # Add color indicators with emojis
-                self.embed.add_field(
-                    name="Primary Color",
-                    value=f"{primary_emoji} {theme.name} Primary",
-                    inline=True
-                )
-                self.embed.add_field(
-                    name="Success Color",
-                    value=f"{success_emoji} {theme.name} Success",
-                    inline=True
-                )
-                self.embed.add_field(
-                    name="Danger Color",
-                    value=f"{danger_emoji} {theme.name} Danger",
-                    inline=True
-                )
-
-                # Add hex codes for exact colors
-                self.embed.add_field(
+                embed.add_field(name="Theme Style", value=theme_desc, inline=False)
+                embed.add_field(name="Primary", value=f"{primary_emoji} {theme.name}", inline=True)
+                embed.add_field(name="Success", value=f"{success_emoji} {theme.name}", inline=True)
+                embed.add_field(name="Danger", value=f"{danger_emoji} {theme.name}", inline=True)
+                embed.add_field(
                     name="Color Hex Codes",
-                    value=f"Primary: #{theme.get_style('primary_color').value:06x}\n" +
-                          f"Success: #{theme.get_style('success_color').value:06x}\n" +
-                          f"Danger: #{theme.get_style('danger_color').value:06x}",
+                    value=(
+                        f"Primary: #{theme.get_style('primary_color').value:06x}\n"
+                        f"Success: #{theme.get_style('success_color').value:06x}\n"
+                        f"Danger: #{theme.get_style('danger_color').value:06x}"
+                    ),
                     inline=False
                 )
-
-                # Add theme features
-                self.embed.add_field(
+                embed.add_field(
                     name="Theme Features",
-                    value=f"Header Emoji: {theme.get_style('header_emoji', 'None')}\n" +
-                          f"Footer Text: {theme.get_style('footer_text', 'None')}",
+                    value=(
+                        f"Header Emoji: {theme.get_style('header_emoji', 'None')}\n"
+                        f"Footer Text: {theme.get_style('footer_text', 'None')}"
+                    ),
                     inline=False
                 )
+                return embed
 
-                # Update message if it exists
+            async def _switch_theme(self, interaction, theme_name):
+                await interaction.response.defer()
+                self.theme = get_theme(theme_name)
                 if self.message:
-                    await self.message.edit(embed=self.embed, view=self)
+                    await self.message.edit(embed=self.build_embed(), view=self)
 
             async def set_default_theme(self, interaction):
-                await interaction.response.defer()
-                set_current_theme("default")
-                await self.update_embed()
+                await self._switch_theme(interaction, "default")
 
             async def set_dark_theme(self, interaction):
-                await interaction.response.defer()
-                set_current_theme("dark")
-                await self.update_embed()
+                await self._switch_theme(interaction, "dark")
 
             async def set_light_theme(self, interaction):
-                await interaction.response.defer()
-                set_current_theme("light")
-                await self.update_embed()
+                await self._switch_theme(interaction, "light")
 
-        # Create and send the view
         view = ThemeSwitcherView(context)
-        view.embed = discord.Embed(title="Loading themes...")
-        await context.send(embed=view.embed, view=view)
+        await view.send(embed=view.build_embed())
 
     @commands.hybrid_command(
-        name="componenttest",  # Note: must be lowercase
-        description="Example CascadeUI"
+        name="componenttest",
+        description="Test CascadeUI component wrappers."
     )
     async def componenttest(self, context):
         """Test component composition functionality."""
 
         class ComponentTestView(StatefulView):
-            def __init__(self, context):
-                super().__init__(context=context)
+            def __init__(self, ctx):
+                super().__init__(context=ctx)
 
-                # Add confirmation buttons as a composite component
                 confirmation = ConfirmationButtons(
                     on_confirm=self.on_confirm,
                     on_cancel=self.on_cancel,
@@ -292,7 +218,6 @@ class ThemedFormExample(commands.Cog, name="themed_form_example"):
                 )
                 confirmation.add_to_view(self)
 
-                # Add button with loading state
                 save_button = StatefulButton(
                     label="Process Data",
                     style=discord.ButtonStyle.primary,
@@ -301,7 +226,6 @@ class ThemedFormExample(commands.Cog, name="themed_form_example"):
                 save_button = with_loading_state(save_button)
                 self.add_item(save_button)
 
-                # Add button with confirmation wrapper
                 delete_button = StatefulButton(
                     label="Delete Items",
                     style=discord.ButtonStyle.danger,
@@ -314,14 +238,6 @@ class ThemedFormExample(commands.Cog, name="themed_form_example"):
                 )
                 self.add_item(delete_button)
 
-                # Create the embed
-                self.embed = discord.Embed(
-                    title="Component Test",
-                    description="Test various composite components and wrappers."
-                )
-                theme = get_current_theme()
-                theme.apply_to_embed(self.embed)
-
             async def on_confirm(self, interaction):
                 await interaction.response.send_message("Action confirmed!", ephemeral=True)
 
@@ -329,47 +245,42 @@ class ThemedFormExample(commands.Cog, name="themed_form_example"):
                 await interaction.response.send_message("Action cancelled.", ephemeral=True)
 
             async def process_data(self, interaction):
-                # This will show the loading state due to the wrapper
-                await interaction.response.defer()
-
-                # Simulate processing
-                import asyncio
+                # with_loading_state consumes response — use followup
                 await asyncio.sleep(2)
-
                 await interaction.followup.send("Data processed successfully!", ephemeral=True)
 
             async def delete_items(self, interaction):
-                # This is called after confirmation
                 await interaction.response.send_message("Items deleted successfully!", ephemeral=True)
 
-        # Create and send the view
         view = ComponentTestView(context)
-        await context.send(embed=view.embed, view=view)
+        embed = discord.Embed(
+            title="Component Test",
+            description="Test various composite components and wrappers."
+        )
+        view.get_theme().apply_to_embed(embed)
+
+        await view.send(embed=embed)
 
     @commands.hybrid_command(
-        name="paginationtest",  # Note: must be lowercase
-        description="Example CascadeUI"
+        name="paginationtest",
+        description="Test CascadeUI pagination."
     )
     async def paginationtest(self, context):
         """Test pagination controls."""
 
         class PaginationTestView(StatefulView):
-            def __init__(self, context):
-                super().__init__(context=context)
+            def __init__(self, ctx):
+                super().__init__(context=ctx)
 
-                # Sample data
-                self.items = [
+                self.items_list = [
                     "Apple", "Banana", "Cherry", "Durian", "Elderberry",
                     "Fig", "Grape", "Honeydew", "Imbe", "Jackfruit",
                     "Kiwi", "Lemon", "Mango", "Nectarine", "Orange"
                 ]
                 self.items_per_page = 5
                 self.current_page = 0
+                self.total_pages = (len(self.items_list) + self.items_per_page - 1) // self.items_per_page
 
-                # Calculate total pages
-                self.total_pages = (len(self.items) + self.items_per_page - 1) // self.items_per_page
-
-                # Add pagination controls
                 pagination = PaginationControls(
                     page_count=self.total_pages,
                     current_page=self.current_page,
@@ -377,99 +288,72 @@ class ThemedFormExample(commands.Cog, name="themed_form_example"):
                 )
                 pagination.add_to_view(self)
 
-                # Create initial embed
-                self.update_embed()
-
-            def update_embed(self):
-                # Get items for current page
+            def build_embed(self):
                 start_idx = self.current_page * self.items_per_page
-                end_idx = min(start_idx + self.items_per_page, len(self.items))
-                current_items = self.items[start_idx:end_idx]
+                end_idx = min(start_idx + self.items_per_page, len(self.items_list))
+                current_items = self.items_list[start_idx:end_idx]
 
-                # Create embed
-                self.embed = discord.Embed(
+                embed = discord.Embed(
                     title="Fruit List",
                     description=f"Page {self.current_page + 1} of {self.total_pages}"
                 )
 
-                # Add items to embed
                 for i, item in enumerate(current_items, start=start_idx + 1):
-                    self.embed.add_field(
-                        name=f"Item {i}",
-                        value=item,
-                        inline=False
-                    )
+                    embed.add_field(name=f"Item {i}", value=item, inline=False)
 
-                # Apply theme
-                theme = get_current_theme()
-                theme.apply_to_embed(self.embed)
+                self.get_theme().apply_to_embed(embed)
+                return embed
 
             async def change_page(self, interaction, page_num):
-                # Update current page
                 self.current_page = page_num
+                await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
-                # Update embed
-                self.update_embed()
-
-                # Update message
-                await interaction.response.edit_message(embed=self.embed)
-
-        # Create and send the view
         view = PaginationTestView(context)
-        await context.send(embed=view.embed, view=view)
+        await view.send(embed=view.build_embed())
 
     @commands.hybrid_command(
-        name="formtest",  # Note: must be lowercase
-        description="Example CascadeUI"
+        name="formtest",
+        description="Test CascadeUI FormView."
     )
     async def formtest(self, context):
         """Test FormView specialized view."""
 
-        # Form fields definition
         fields = [
-            {
-                "id": "name",
-                "type": "string",
-                "label": "Your Name",
-                "required": True
-            },
-            {
-                "id": "favorite_color",
-                "type": "string",
-                "label": "Favorite Color",
-                "required": False
-            },
             {
                 "id": "subscribe",
                 "type": "boolean",
                 "label": "Subscribe to newsletter",
-                "default": False
+                "required": False
+            },
+            {
+                "id": "notifications",
+                "type": "boolean",
+                "label": "Enable notifications",
+                "required": False
             }
         ]
 
-        # Create FormView (instead of StatefulView + FormLayout)
-        view = FormView(
-            context=context,
-            title="User Profile",
-            fields=fields,
-            on_submit=lambda interaction, values: interaction.response.send_message(
+        async def on_submit(interaction, values):
+            await interaction.response.send_message(
                 f"Form submitted with values: {values}",
                 ephemeral=True
             )
+
+        view = FormView(
+            context=context,
+            title="User Preferences",
+            fields=fields,
+            on_submit=on_submit
         )
 
-        # Apply theme
-        theme = get_current_theme()
         embed = discord.Embed(
-            title="User Profile Form",
+            title="User Preferences Form",
             description="Please fill out the information below."
         )
-        theme.apply_to_embed(embed)
+        view.get_theme().apply_to_embed(embed)
 
-        # Send the view
-        await context.send(embed=embed, view=view)
+        await view.send(embed=embed)
 
 
 async def setup(bot) -> None:
-    cog: ThemedFormExampleCog = ThemedFormExample(bot=bot)
-    await bot.add_cog(cog)
+    await bot.add_cog(ThemedFormExample(bot=bot))

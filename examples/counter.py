@@ -2,7 +2,6 @@
 # // ========================================( Modules )======================================== // #
 
 
-import inspect
 import discord
 from datetime import datetime
 from discord.ext import commands
@@ -11,22 +10,9 @@ from discord.ext.commands import Context
 # Import CascadeUI components
 from cascadeui import StatefulView, StatefulButton, get_store, cascade_reducer
 
-from utilities.logger import AsyncLogger
-from typing import (
-    List,
-    Optional,
-    TypeVar,
-)
+import logging
 
-
-# \\ Logger \\
-
-logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a")
-
-
-# \\ Generics \\
-
-CounterExampleCog = TypeVar('CounterExampleCog', bound='CounterExample')
+logger = logging.getLogger(__name__)
 
 
 # // ========================================( Views )======================================== // #
@@ -52,86 +38,58 @@ class CounterView(StatefulView):
             callback=self.decrement
         ))
 
-        # Add reset button
         self.add_item(StatefulButton(
             label="Reset",
             style=discord.ButtonStyle.secondary,
             callback=self.reset
         ))
 
-        # Add exit button
         self.add_exit_button()
 
     async def increment(self, interaction):
         """Increment the counter with immediate UI update."""
-        # Acknowledge interaction with deferred update
         await interaction.response.defer()
-
-        # Update counter
         self.counter += 1
-
-        # Dispatch action to update state (for persistence/synchronization)
         await self.dispatch("COUNTER_UPDATED", {
             "view_id": self.id,
             "counter": self.counter
         })
-
-        # Immediate UI update
         await self.update_ui()
 
     async def decrement(self, interaction):
         """Decrement the counter with immediate UI update."""
-        # Acknowledge interaction with deferred update
         await interaction.response.defer()
-
-        # Update counter
         self.counter -= 1
-
-        # Dispatch action to update state (for persistence/synchronization)
         await self.dispatch("COUNTER_UPDATED", {
             "view_id": self.id,
             "counter": self.counter
         })
-
-        # Immediate UI update
         await self.update_ui()
 
     async def reset(self, interaction):
         """Reset the counter to zero."""
-        # Acknowledge interaction with deferred update
         await interaction.response.defer()
-
-        # Reset counter
         self.counter = 0
-
-        # Dispatch action to update state
         await self.dispatch("COUNTER_UPDATED", {
             "view_id": self.id,
             "counter": self.counter
         })
-
-        # Immediate UI update
         await self.update_ui()
 
     async def update_ui(self):
         """Update the UI with current counter value."""
-        # Create an embed with counter value and styling
         embed = discord.Embed(
             title="Fast Counter",
             description=f"Current value: {self.counter}",
             color=discord.Color.blue() if self.counter >= 0 else discord.Color.red()
         )
-
-        # Add a footer with a timestamp
         embed.set_footer(text=f"Last updated: {datetime.now().strftime('%H:%M:%S')}")
 
-        # Update message if it exists
         if self.message:
             await self.message.edit(embed=embed, view=self)
 
     # Override to do nothing since we update manually
     async def update_from_state(self, state):
-        """Disabled automatic state-driven updates."""
         pass
 
 
@@ -139,21 +97,18 @@ class CounterView(StatefulView):
 @cascade_reducer("COUNTER_UPDATED")
 async def counter_reducer(action, state):
     """Handle counter updates in the state."""
-    # Create a copy of the state to modify
-    new_state = state.copy()
+    import copy
+    new_state = copy.deepcopy(state)
 
-    # Initialize application state if needed
     if "application" not in new_state:
         new_state["application"] = {}
 
     if "counters" not in new_state["application"]:
         new_state["application"]["counters"] = {}
 
-    # Get data from action
     view_id = action["payload"].get("view_id")
     counter_value = action["payload"].get("counter")
 
-    # Update counter in state
     if view_id:
         new_state["application"]["counters"][view_id] = counter_value
         logger.debug(f"State updated: counters[{view_id}] = {counter_value}")
@@ -165,39 +120,28 @@ async def counter_reducer(action, state):
 
 
 class CounterExample(commands.Cog, name="counter_example"):
-    """
-    Example discord extension class.
-
-    """
+    """Example discord extension class."""
 
     def __init__(self, bot) -> None:
         self.bot = bot
 
     @commands.hybrid_command(
-        name="counter",  # Note: must be lowercase
+        name="counter",
         description="Display an interactive counter example user interface."
     )
     async def counter(self, context: Context) -> None:
-        """
-        Display an interactive counter view.
-
-        :param context: The command context.
-        """
-        # Create the counter view with the context
+        """Display an interactive counter view."""
         view = CounterView(context=context)
 
-        # Create initial embed
         embed = discord.Embed(
             title="Counter Example",
             description="Current value: 0",
             color=discord.Color.blue()
         )
 
-        # Send the message with the view
-        # Note: You don't need to set view.message manually - the StatefulView will handle this
-        await context.send(embed=embed, view=view)
+        # Use the new send() API for proper state registration
+        await view.send(embed=embed)
 
 
 async def setup(bot) -> None:
-    cog: CounterExampleCog = CounterExample(bot=bot)
-    await bot.add_cog(cog)
+    await bot.add_cog(CounterExample(bot=bot))

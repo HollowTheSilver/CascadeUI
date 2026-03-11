@@ -1,11 +1,62 @@
 [build-system]
-requires = ["setuptools>=42", "wheel"]
+requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "cascadeui"
+version = "2.0.0"
+description = "Stateful UI components and state management for discord.py"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "HollowTheSilver", email = "hollow@users.noreply.github.com" }
+]
+keywords = ["discord", "discord.py", "ui", "components", "state-management"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Chat",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+    "Framework :: AsyncIO",
+]
+dependencies = [
+    "discord.py>=2.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "black>=23.0",
+    "isort>=5.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/HollowTheSilver/CascadeUI"
+Repository = "https://github.com/HollowTheSilver/CascadeUI"
+Issues = "https://github.com/HollowTheSilver/CascadeUI/issues"
+
+[tool.setuptools.packages.find]
+include = ["cascadeui*"]
+
+[tool.setuptools.package-data]
+cascadeui = ["py.typed"]
 
 [tool.black]
 line-length = 100
-target-version = ['py38']
+target-version = ["py310"]
 
 [tool.isort]
 profile = "black"
 line_length = 100
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

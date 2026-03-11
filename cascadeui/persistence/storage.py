@@ -51,7 +51,7 @@ class FileStorageBackend(StorageBackend):
             temp_path = f"{self.file_path}.tmp"
 
             # Write to file (use run_in_executor to make file I/O non-blocking)
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, lambda: self._write_file(temp_path, data))
 
             # Rename temp file to actual file (atomic operation on most platforms)
@@ -76,7 +76,7 @@ class FileStorageBackend(StorageBackend):
             backup_path = f"{self.file_path}.bak"
 
             # Read from file (use run_in_executor to make file I/O non-blocking)
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             try:
                 data = await loop.run_in_executor(None, lambda: self._read_file(self.file_path))
                 # Create backup of good file
@@ -117,7 +117,7 @@ class FileStorageBackend(StorageBackend):
                 return False
 
             backup_path = f"{self.file_path}.bak"
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
 
             # Copy file to backup
             import shutil

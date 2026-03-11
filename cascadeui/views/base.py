@@ -3,8 +3,7 @@
 
 
 import uuid
-import weakref
-from typing import Dict, Any, Optional, List, Union, Callable, Set
+from typing import Any, Optional, Set
 from ..utils.tasks import get_task_manager
 from ..utils.errors import with_error_boundary, safe_execute
 
@@ -27,12 +26,13 @@ class StatefulView(View):
     """Base class for all stateful UI views."""
 
     def __init__(self, *args, **kwargs):
-        # Extract custom arguments
+        # Extract custom arguments before passing to View
         self.state_store = kwargs.pop("state_store", None) or get_store()
         self.session_id = kwargs.pop("session_id", None)
         self.user_id = kwargs.pop("user_id", None)
         self.context = kwargs.pop("context", None)
         self.interaction = kwargs.pop("interaction", None)
+        self.theme = kwargs.pop("theme", None)
 
         # Initialize standard View class
         super().__init__(*args, **kwargs)
@@ -43,10 +43,13 @@ class StatefulView(View):
         # Message reference
         self._message = None
 
+        # Whether state registration has been done
+        self._registered = False
+
         # Get task manager
         self.task_manager = get_task_manager()
 
-        # Setup from context or interaction if provided
+        # Derive user_id and session_id from context/interaction
         if self.interaction is None and self.context is not None:
             if hasattr(self.context, "interaction") and self.context.interaction:
                 self.interaction = self.context.interaction
@@ -57,48 +60,135 @@ class StatefulView(View):
         if self.interaction is not None and self.user_id is None:
             self.user_id = self.interaction.user.id
 
-        # If no session ID, create one based on user
         if self.session_id is None and self.user_id is not None:
             self.session_id = f"user_{self.user_id}"
 
-        # Subscribe to state updates
-        self.state_store.subscribe(self.id, self._on_state_changed)
+        # Action types this view cares about (subclasses can override)
+        self.subscribed_actions: Optional[Set[str]] = {
+            "VIEW_UPDATED", "VIEW_DESTROYED",
+            "COMPONENT_INTERACTION", "SESSION_UPDATED",
+        }
 
-        # Register this view in the state
-        self._register_view()
-
-        # Schedule initialization based on context
-        if self.interaction:
-            self.create_task(self._init_from_interaction())
-        elif self.context and hasattr(self.context, "send"):
-            self.create_task(self._init_from_context())
+        # Subscribe to state updates with action filter
+        self.state_store.subscribe(self.id, self._on_state_changed, self.subscribed_actions)
 
     def create_task(self, coro):
         """Create a task owned by this view."""
         return self.task_manager.create_task(self.id, coro)
 
-    def _register_view(self):
-        """Register this view in the state store."""
-        # First, ensure session exists
+    async def _register_state(self):
+        """Register this view in the state store. Called once on first send."""
+        if self._registered:
+            return
+        self._registered = True
+
+        # Ensure session exists
         if self.session_id:
             payload = ActionCreators.session_created(
                 session_id=self.session_id,
                 user_id=self.user_id
             )
-            self.create_task(self.state_store.dispatch("SESSION_CREATED", payload))
+            await self.state_store.dispatch("SESSION_CREATED", payload)
 
-        # Then register the view
+        # Register the view
         payload = ActionCreators.view_created(
             view_id=self.id,
             view_type=self.__class__.__name__,
             user_id=self.user_id,
             session_id=self.session_id
         )
-        self.create_task(self.state_store.dispatch("VIEW_CREATED", payload))
+        await self.state_store.dispatch("VIEW_CREATED", payload)
+
+    async def _update_message_state(self, message):
+        """Update state store with message info after sending."""
+        if message is None:
+            return
+        payload = ActionCreators.view_updated(
+            view_id=self.id,
+            message_id=str(message.id),
+            channel_id=str(message.channel.id) if message.channel else None
+        )
+        await self.dispatch("VIEW_UPDATED", payload)
+
+    async def send(self, content=None, *, embed=None, embeds=None, ephemeral=False):
+        """
+        Send this view as a message using the stored context or interaction.
+
+        This is the preferred way to display a StatefulView. It handles
+        state registration and message tracking automatically.
+
+        Args:
+            content: Text content for the message.
+            embed: A single embed to include.
+            embeds: A list of embeds to include.
+            ephemeral: Whether the message should be ephemeral (interaction only).
+        """
+        await self._register_state()
+
+        send_kwargs = {"view": self}
+        if content is not None:
+            send_kwargs["content"] = content
+        if embed is not None:
+            send_kwargs["embed"] = embed
+        if embeds is not None:
+            send_kwargs["embeds"] = embeds
+
+        if self.context and hasattr(self.context, "send"):
+            if ephemeral:
+                send_kwargs["ephemeral"] = ephemeral
+            message = await self.context.send(**send_kwargs)
+            self._message = message
+            await self._update_message_state(message)
+            return message
+
+        elif self.interaction:
+            send_kwargs["ephemeral"] = ephemeral
+            if not self.interaction.response.is_done():
+                await self.interaction.response.send_message(**send_kwargs)
+                message = await self.interaction.original_response()
+            else:
+                message = await self.interaction.followup.send(**send_kwargs, wait=True)
+            self._message = message
+            await self._update_message_state(message)
+            return message
+
+        else:
+            raise RuntimeError(
+                "StatefulView.send() requires either 'context' or 'interaction' to be set."
+            )
+
+    def get_theme(self):
+        """Get the theme for this view, falling back to the global default.
+
+        Returns a Theme instance. If no per-view theme is set and no global
+        default exists, returns a bare Theme with standard defaults.
+        """
+        if self.theme is not None:
+            return self.theme
+        from ..theming.core import get_default_theme, Theme
+        return get_default_theme() or Theme("fallback")
+
+    async def on_timeout(self) -> None:
+        """Called when the view times out. Disables all components and cleans up state."""
+        for item in self.children:
+            if hasattr(item, "disabled"):
+                item.disabled = True
+
+        if self._message:
+            try:
+                await self._message.edit(view=self)
+            except discord.NotFound:
+                pass  # Message was already deleted
+            except Exception as e:
+                logger.debug(f"Could not disable components on timeout: {e}")
+
+        # Cancel tasks and clean up state, mirroring exit()
+        self.task_manager.cancel_tasks(self.id)
+        await self.dispatch("VIEW_DESTROYED", ActionCreators.view_destroyed(self.id))
+        self.state_store.unsubscribe(self.id)
 
     async def _on_state_changed(self, state, action):
         """React to state changes."""
-        # Log notification
         logger.debug(f"View '{self.id}' received state update for action '{action['type']}'")
 
         # Default implementation - update UI if needed
@@ -119,59 +209,6 @@ class StatefulView(View):
     async def dispatch(self, action_type, payload=None):
         """Dispatch an action to the state store."""
         return await self.state_store.dispatch(action_type, payload, source_id=self.id)
-
-    @with_error_boundary("_init_from_interaction")
-    async def _init_from_interaction(self):
-        """Initialize this view from an interaction."""
-        if not self.interaction:
-            return
-
-        try:
-            # Defer if not already responded
-            if not (hasattr(self.interaction, "response") and self.interaction.response.is_done()):
-                try:
-                    await self.interaction.response.defer(ephemeral=getattr(self, "ephemeral", False))
-                except discord.errors.HTTPException:
-                    pass  # Already acknowledged
-
-            # Create or update message
-            response = await self.interaction.original_response()
-            await response.edit(view=self)
-            self._message = response
-
-            # Update state with message info
-            payload = ActionCreators.view_updated(
-                view_id=self.id,
-                message_id=str(response.id),
-                channel_id=str(response.channel.id) if response.channel else None
-            )
-            await self.dispatch("VIEW_UPDATED", payload)
-
-        except Exception as e:
-            logger.error(f"Error initializing view from interaction: {e}")
-            # Re-raise to allow proper error handling
-            raise
-
-    async def _init_from_context(self):
-        """Initialize this view from a command context."""
-        if not self.context or not hasattr(self.context, "send"):
-            return
-
-        try:
-            # Send new message
-            message = await self.context.send(view=self)
-            self._message = message
-
-            # Update state with message info
-            payload = ActionCreators.view_updated(
-                view_id=self.id,
-                message_id=str(message.id),
-                channel_id=str(message.channel.id) if message.channel else None
-            )
-            await self.dispatch("VIEW_UPDATED", payload)
-
-        except Exception as e:
-            logger.error(f"Error initializing view from context: {e}")
 
     @property
     def message(self):
@@ -194,7 +231,6 @@ class StatefulView(View):
 
     async def transition_to(self, view_class, interaction=None, **kwargs):
         """Transition from this view to a new view."""
-        # Get current interaction or use provided one
         current_interaction = interaction or self.interaction
 
         # Dispatch navigation action
@@ -234,8 +270,6 @@ class StatefulView(View):
                 else:
                     await self._message.edit(view=None)
             except Exception as e:
-                from ..utils.logging import AsyncLogger
-                logger = AsyncLogger(name=__name__, level="ERROR", path="logs", mode="a")
                 logger.error(f"Error cleaning up message: {e}")
 
         # Dispatch view destroyed action
@@ -257,9 +291,8 @@ class StatefulView(View):
         )
 
         async def exit_callback(interaction):
-            await interaction.response.defer(ephemeral=True)
+            await interaction.response.defer()
             await self.exit(delete_message=delete_message)
-            await interaction.followup.send("View closed.", ephemeral=True)
 
         button.callback = exit_callback
         self.add_item(button)
@@ -267,6 +300,5 @@ class StatefulView(View):
 
     def __del__(self):
         """Clean reference to ensure GC can collect this view."""
-        # Unsubscribe from state updates
         if hasattr(self, "state_store") and hasattr(self, "id"):
             self.state_store.unsubscribe(self.id)

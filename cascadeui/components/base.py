@@ -44,8 +44,12 @@ class StatefulComponent:
             elif isinstance(component, discord.ui.Button):
                 value = True
 
-            # Dispatch interaction action
-            from ..state.actions import ActionCreators
+            # Call original callback FIRST so it can respond to the interaction
+            # before state dispatch triggers update_from_state notifications
+            if original_callback:
+                await original_callback(interaction)
+
+            # Then dispatch state update (may trigger update_from_state on views)
             payload = ActionCreators.component_interaction(
                 component_id=component_id,
                 view_id=view.id,
@@ -53,10 +57,6 @@ class StatefulComponent:
                 value=value
             )
             await view.dispatch("COMPONENT_INTERACTION", payload)
-
-            # Call original callback if provided
-            if original_callback:
-                return await original_callback(interaction)
 
         return stateful_callback
 

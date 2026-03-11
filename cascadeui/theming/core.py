@@ -71,8 +71,8 @@ class Theme:
 
 
 # Global theme registry
-_themes = {}
-_current_theme = None
+_themes: Dict[str, Theme] = {}
+_default_theme: Optional[Theme] = None
 
 
 def register_theme(theme: Theme) -> None:
@@ -85,15 +85,15 @@ def get_theme(name: str) -> Optional[Theme]:
     return _themes.get(name)
 
 
-def set_current_theme(name: str) -> bool:
-    """Set the current theme by name."""
-    global _current_theme
+def set_default_theme(name: str) -> bool:
+    """Set the default theme used when no per-view theme is specified."""
+    global _default_theme
     if name in _themes:
-        _current_theme = _themes[name]
+        _default_theme = _themes[name]
         return True
     return False
 
 
-def get_current_theme() -> Optional[Theme]:
-    """Get the current theme."""
-    return _current_theme
+def get_default_theme() -> Optional[Theme]:
+    """Get the default theme."""
+    return _default_theme

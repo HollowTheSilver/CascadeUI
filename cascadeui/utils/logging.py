@@ -75,6 +75,9 @@ class AsyncLogger(Logger):
 
     max_files: int = 20
 
+    # Track which logger names have already been configured with handlers
+    _configured_loggers: set = set()
+
     def __init__(self, name: str, level: str = 'DEBUG', path: str = 'logs', output: Any = sys.stdout,
                  encoding: str = "utf-8", file: bool = True, stream: bool = True, max_files: int = 10,
                  propagate: bool = False, mode: str = "a", prefix: str = None,):
@@ -89,19 +92,21 @@ class AsyncLogger(Logger):
         self.stream: bool = stream
         self.mode: str = mode
         self.prefix: Optional[str] = prefix
-        # \\ set handlers
-        self.file_formatter: Formatter = FileFormatter()
-        self.stream_formatter: Formatter = ColoredStreamFormatter()
-        if self.stream:
-            self.stream_handler: StreamHandler = StreamHandler(output)
-            self.stream_handler.setFormatter(self.stream_formatter)
-            self.addHandler(hdlr=self.stream_handler)
-        if self.file:
-            # \\ todo: requires a scheduled callback / task to update filename on date change.
-            self.file_handler: FileHandler = FileHandler(
-                filename=rf'{self.log_dir}/{self.file_name}.log', encoding=encoding, mode=mode)
-            self.file_handler.setFormatter(fmt=self.file_formatter)
-            self.addHandler(hdlr=self.file_handler)
+        # \\ set handlers (only once per logger name to prevent proliferation)
+        if name not in AsyncLogger._configured_loggers:
+            AsyncLogger._configured_loggers.add(name)
+            self.file_formatter: Formatter = FileFormatter()
+            self.stream_formatter: Formatter = ColoredStreamFormatter()
+            if self.stream:
+                self.stream_handler: StreamHandler = StreamHandler(output)
+                self.stream_handler.setFormatter(self.stream_formatter)
+                self.addHandler(hdlr=self.stream_handler)
+            if self.file:
+                os.makedirs(self.log_dir, exist_ok=True)
+                self.file_handler: FileHandler = FileHandler(
+                    filename=rf'{self.log_dir}/{self.file_name}.log', encoding=encoding, mode=mode)
+                self.file_handler.setFormatter(fmt=self.file_formatter)
+                self.addHandler(hdlr=self.file_handler)
 
     async def purge_logs(self) -> None:
         """

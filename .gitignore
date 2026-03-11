@@ -71,5 +71,16 @@ node_modules/
 *.prof
 *.out
 
+# Internal Development (not published)
+CLAUDE.md
+TODO.md
+.claude/
+tests/
+
 # Project-Specific Ignores
-# Add any additional project-specific ignore patterns below this line
+*.token
+credentials.*
+*.key
+*.pem
+cascadeui_state.json
+*_state.json

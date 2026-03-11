@@ -89,8 +89,8 @@ class ToggleButton(StatefulButton):
             self.label = self.toggled_label if self.is_toggled else self.original_label
             self.style = ButtonStyle.success if self.is_toggled else ButtonStyle.secondary
 
-            # Dispatch state update
-            view = interaction.client._view_store.get_view_from_message(interaction.message.id)
+            # Dispatch state update using public .view property from discord.ui.Item
+            view = self.view
             if view and hasattr(view, "dispatch"):
                 component_id = getattr(self, "custom_id", None) or str(id(self))
                 payload = ActionCreators.component_interaction(
@@ -105,7 +105,6 @@ class ToggleButton(StatefulButton):
             if self.user_callback:
                 await self.user_callback(interaction)
             else:
-                # Default to defer if no callback
                 await interaction.response.defer()
 
         return toggle_callback

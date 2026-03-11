@@ -89,11 +89,13 @@ class PaginationControls(CompositeComponent):
             self.current_page -= 1
             self._update_buttons()
 
-            # Notify callback if provided
             if self.on_page_change:
                 await self.on_page_change(interaction, self.current_page)
             else:
                 await interaction.response.defer()
+        else:
+            # Already at first page — still must acknowledge the interaction
+            await interaction.response.defer()
 
     async def _on_next(self, interaction: Interaction) -> None:
         """Handle next button click."""
@@ -101,11 +103,13 @@ class PaginationControls(CompositeComponent):
             self.current_page += 1
             self._update_buttons()
 
-            # Notify callback if provided
             if self.on_page_change:
                 await self.on_page_change(interaction, self.current_page)
             else:
                 await interaction.response.defer()
+        else:
+            # Already at last page — still must acknowledge the interaction
+            await interaction.response.defer()
 
     def _update_buttons(self) -> None:
         """Update button states based on current page."""
@@ -119,38 +123,41 @@ register_component("pagination_controls", PaginationControls)
 
 
 class FormLayout(CompositeComponent):
-    """Layout for form fields with labels and inputs."""
+    """Layout for form fields with buttons and selects.
+
+    Supports "boolean" fields (toggle buttons) and "select" fields inline.
+    For "string" fields, use a Modal workflow — discord.ui.TextInput can only
+    appear inside Modals, not Views.
+    """
 
     def __init__(self, fields: List[Dict[str, Any]], on_submit: Optional[Callable] = None) -> None:
         super().__init__()
         self.fields = fields
         self.field_components = {}
 
-        # Create field components
         for field in fields:
             field_id = field.get("id", "field_" + str(len(self.field_components)))
             field_type = field.get("type", "string")
             field_label = field.get("label", field_id)
-            required = field.get("required", False)
 
-            # Create field based on type
-            if field_type == "string":
-                from .inputs import TextInput
-                component = TextInput(
-                    label=field_label,
-                    required=required,
-                    placeholder=field.get("placeholder")
-                )
-            elif field_type == "boolean":
+            if field_type == "boolean":
                 from .buttons import ToggleButton
                 component = ToggleButton(
                     label=field_label,
                     toggled=field.get("default", False)
                 )
-            # Add more field types as needed
+                self.field_components[field_id] = component
+                self.add_component(component)
 
-            self.field_components[field_id] = component
-            self.add_component(component)
+            elif field_type == "string":
+                # TextInput cannot be added to Views — only to Modals.
+                # Skip with a warning; use Modal class for string collection.
+                import warnings
+                warnings.warn(
+                    f"FormLayout field '{field_id}' has type 'string', which requires a Modal. "
+                    f"Use the Modal class from components.inputs for text input collection.",
+                    stacklevel=2
+                )
 
         # Add submit button
         if on_submit:

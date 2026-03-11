@@ -59,25 +59,32 @@ def cascade_component(component_id: str = None):
 
 
 def cascade_persistent(file_path: str = None):
-    """Decorator to make a view class persistent."""
+    """Decorator to enable state persistence for the application.
+
+    This should be applied once to a single "root" view class, not to every view.
+    Applying it to multiple classes would overwrite the persistence backend each time.
+    The persistence backend is shared across all views via the singleton StateStore.
+
+    Args:
+        file_path: Path to the JSON file for state storage.
+                   Defaults to '{ClassName}_state.json'.
+    """
 
     def decorator(cls):
         original_init = cls.__init__
 
         @wraps(cls.__init__)
         def new_init(self, *args, **kwargs):
-            # Call original init
             original_init(self, *args, **kwargs)
 
-            # Set up persistence
-            from ..persistence.storage import FileStorageBackend
-            storage = FileStorageBackend(file_path or f"{cls.__name__}_state.json")
+            # Only configure persistence once globally
+            if not self.state_store.persistence_enabled:
+                from ..persistence.storage import FileStorageBackend
+                storage = FileStorageBackend(file_path or f"{cls.__name__}_state.json")
+                self.state_store.enable_persistence(storage)
 
-            # Enable persistence in state store
-            self.state_store.enable_persistence(storage)
-
-            # Attempt to restore state
-            asyncio.create_task(self.state_store.restore_state())
+                # Schedule state restoration after the event loop is running
+                self.create_task(self.state_store.restore_state())
 
         cls.__init__ = new_init
         return cls

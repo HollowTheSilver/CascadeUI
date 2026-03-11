@@ -3,7 +3,7 @@
 
 
 from discord import Color
-from .core import Theme, register_theme, set_current_theme
+from .core import Theme, register_theme, set_default_theme
 
 
 # // ========================================( Script )======================================== // #
@@ -54,4 +54,4 @@ register_theme(dark_theme)
 register_theme(light_theme)
 
 # Set default theme
-set_current_theme("default")
+set_default_theme("default")

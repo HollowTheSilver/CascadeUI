@@ -5,7 +5,7 @@
 import copy
 import asyncio
 from datetime import datetime
-from typing import Dict, Any, Optional, List, Union
+from typing import Dict, Any, Optional, List, Set, Tuple, Union
 
 # Import logging at module level
 from ..utils.logging import AsyncLogger
@@ -43,8 +43,8 @@ class StateStore:
             "application": {},  # Application-specific data
         }
 
-        # Callbacks for state changes
-        self.subscribers: Dict[str, SubscriberFn] = {}
+        # Callbacks for state changes: {id: (callback, action_filter_set_or_None)}
+        self.subscribers: Dict[str, Tuple[SubscriberFn, Optional[Set[str]]]] = {}
 
         # Core reducers
         self._core_reducers: Dict[str, ReducerFn] = {}
@@ -167,20 +167,21 @@ class StateStore:
 
         logger.debug(f"Notifying {len(self.subscribers)} subscribers about action: {action['type']}")
 
-        for subscriber_id, callback in list(self.subscribers.items()):
-            # Skip notifying the source to avoid loops ONLY if explicitly configured
-            # Allow self-notifications by default
-            should_notify = True
-            if action.get("source") == subscriber_id and action.get("skip_self_notify", False):
-                should_notify = False
+        for subscriber_id, (callback, action_filter) in list(self.subscribers.items()):
+            # Skip if the subscriber has a filter and this action isn't in it
+            if action_filter is not None and action["type"] not in action_filter:
+                continue
 
-            if should_notify:
-                logger.debug(f"Notifying subscriber {subscriber_id} about action {action['type']}")
-                task = self.task_manager.create_task(
-                    "state_store_notify",
-                    self._safe_notify(subscriber_id, callback, action)
-                )
-                tasks.append(task)
+            # Skip notifying the source to avoid loops ONLY if explicitly configured
+            if action.get("source") == subscriber_id and action.get("skip_self_notify", False):
+                continue
+
+            logger.debug(f"Notifying subscriber {subscriber_id} about action {action['type']}")
+            task = self.task_manager.create_task(
+                "state_store_notify",
+                self._safe_notify(subscriber_id, callback, action)
+            )
+            tasks.append(task)
 
         if tasks:
             # Wait for all notifications to complete
@@ -207,9 +208,17 @@ class StateStore:
             import traceback
             logger.debug(f"Detailed error for {subscriber_id}:\n{traceback.format_exc()}")
 
-    def subscribe(self, subscriber_id: str, callback: SubscriberFn) -> None:
-        """Register to receive state updates."""
-        self.subscribers[subscriber_id] = callback
+    def subscribe(self, subscriber_id: str, callback: SubscriberFn,
+                  action_filter: Optional[set] = None) -> None:
+        """Register to receive state updates.
+
+        Args:
+            subscriber_id: Unique ID for this subscriber.
+            callback: Async callable receiving (state, action).
+            action_filter: Optional set of action types to listen for.
+                           If None, the subscriber receives all actions.
+        """
+        self.subscribers[subscriber_id] = (callback, action_filter)
 
     def unsubscribe(self, subscriber_id: str) -> None:
         """Stop receiving state updates."""
@@ -250,14 +259,3 @@ class StateStore:
         self.persistence_backend = backend
         logger.info(f"State persistence enabled with backend: {backend.__class__.__name__}")
 
-
-# Singleton instance
-_store_instance = None
-
-
-def get_store() -> StateStore:
-    """Get the global state store instance."""
-    global _store_instance
-    if _store_instance is None:
-        _store_instance = StateStore()
-    return _store_instance

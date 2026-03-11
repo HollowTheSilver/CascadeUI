@@ -85,7 +85,7 @@ class Modal(discord.ui.Modal, StatefulComponent):
 
         # Dispatch state update
         if self.view_id:
-            from ..state.store import get_store
+            from ..state.singleton import get_store
             store = get_store()
 
             payload = {

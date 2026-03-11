@@ -201,13 +201,16 @@ async def reduce_component_interaction(action: Action, state: StateData) -> Stat
             "interactions": []
         }
 
-    # Add the interaction
-    new_state["components"][component_id]["interactions"].append({
+    # Add the interaction (capped to prevent unbounded growth)
+    interactions = new_state["components"][component_id]["interactions"]
+    interactions.append({
         "user_id": payload.get("user_id"),
         "view_id": view_id,
         "value": payload.get("value"),
         "timestamp": action["timestamp"]
     })
+    if len(interactions) > 50:
+        new_state["components"][component_id]["interactions"] = interactions[-50:]
 
     # Update the last interaction timestamp
     new_state["components"][component_id]["last_interaction"] = action["timestamp"]

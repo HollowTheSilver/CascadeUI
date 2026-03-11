@@ -1,14 +1,7 @@
 """
-CascadeUI - Python Module
+CascadeUI - Stateful UI components for discord.py.
 
-----------------------------
-
-Copyright © HollowTheSilver 2024-2025 - https://github.com/HollowTheSilver
-
-Version: 1.1.0
-
-Description:
-- 🐍 A simple Discord ui instance manager to support efficient view and embed chaining.
+Copyright (c) 2024-2025 HollowTheSilver - https://github.com/HollowTheSilver
 """
 
 # // ========================================( Modules )======================================== // #
@@ -26,7 +19,7 @@ from .components.patterns import ConfirmationButtons, PaginationControls, FormLa
 from .components.wrappers import with_loading_state, with_confirmation, with_cooldown
 from .state.actions import ActionCreators
 from .state.types import StateData
-from .theming.core import Theme, register_theme, get_theme, set_current_theme, get_current_theme
+from .theming.core import Theme, register_theme, get_theme, set_default_theme, get_default_theme
 from .theming.themes import default_theme, dark_theme, light_theme
 from .utils.tasks import get_task_manager
 from .utils.errors import with_error_boundary, with_retry, safe_execute
@@ -36,7 +29,7 @@ from .utils.decorators import cascade_reducer, cascade_component, cascade_persis
 # // ========================================( Script )======================================== // #
 
 
-__version__ = "1.1.0"
+__version__ = "2.0.0"
 
 # Export public API
 __all__ = [
@@ -69,8 +62,8 @@ __all__ = [
     "Theme",
     "register_theme",
     "get_theme",
-    "set_current_theme",
-    "get_current_theme",
+    "set_default_theme",
+    "get_default_theme",
     "default_theme",
     "dark_theme",
     "light_theme",
@@ -84,5 +77,3 @@ __all__ = [
     "cascade_component",
     "cascade_persistent"
 ]
-
-"""logger.info(f"CascadeUI v{__version__} initialized")"""
