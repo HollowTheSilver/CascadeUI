@@ -72,7 +72,7 @@ def with_retry(config: Optional[RetryConfig] = None):
 
                     # Calculate backoff time with jitter and max cap
                     base_wait = retry_config.backoff_factor * (2 ** attempt)
-                    jitter = 0.1 * base_wait * (asyncio.get_event_loop().time() % 1.0)
+                    jitter = 0.1 * base_wait * (asyncio.get_running_loop().time() % 1.0)
                     wait_time = min(base_wait + jitter, retry_config.max_backoff)
 
                     logger.warning(

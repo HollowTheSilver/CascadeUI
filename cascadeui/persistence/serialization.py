@@ -30,4 +30,6 @@ class StateSerializer:
         """Handle non-serializable objects."""
         if isinstance(obj, datetime):
             return obj.isoformat()
+        if isinstance(obj, set):
+            return list(obj)
         raise TypeError(f"Type {type(obj)} not serializable")

@@ -246,6 +246,7 @@ Working examples are in the [`examples/`](examples/) directory:
 |---------|---------------|
 | **counter.py** | Basic stateful counter with increment, decrement, reset |
 | **themed_form.py** | Theme switching, component wrappers, pagination, form views |
+| **persistent_counter.py** | State persistence to disk with `@cascade_persistent` |
 
 Each example is a discord.py cog that can be loaded into any bot.
 

@@ -82,7 +82,8 @@ class StateStore:
             reduce_session_created,
             reduce_session_updated,
             reduce_navigation,
-            reduce_component_interaction
+            reduce_component_interaction,
+            reduce_modal_submitted,
         )
 
         # Register core reducers
@@ -94,6 +95,7 @@ class StateStore:
             "SESSION_UPDATED": reduce_session_updated,
             "NAVIGATION": reduce_navigation,
             "COMPONENT_INTERACTION": reduce_component_interaction,
+            "MODAL_SUBMITTED": reduce_modal_submitted,
         }
 
         # Update combined reducers

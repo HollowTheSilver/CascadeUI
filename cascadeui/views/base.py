@@ -33,6 +33,7 @@ class StatefulView(View):
         self.context = kwargs.pop("context", None)
         self.interaction = kwargs.pop("interaction", None)
         self.theme = kwargs.pop("theme", None)
+        self._state_key = kwargs.pop("state_key", None)
 
         # Initialize standard View class
         super().__init__(*args, **kwargs)
@@ -75,6 +76,16 @@ class StatefulView(View):
     def create_task(self, coro):
         """Create a task owned by this view."""
         return self.task_manager.create_task(self.id, coro)
+
+    @property
+    def state_key(self) -> str:
+        """Stable key for persistent state lookups.
+
+        If a state_key was provided at init, it is used for all state
+        data operations (reducer payloads, update_from_state lookups).
+        Falls back to self.id for non-persistent views.
+        """
+        return self._state_key or self.id
 
     async def _register_state(self):
         """Register this view in the state store. Called once on first send."""

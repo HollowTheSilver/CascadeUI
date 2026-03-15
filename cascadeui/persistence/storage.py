@@ -44,6 +44,9 @@ class FileStorageBackend(StorageBackend):
     async def save_state(self, state: Dict[str, Any]) -> bool:
         """Save state to file with retries."""
         try:
+            # Back up the current file before overwriting
+            await self.create_backup()
+
             # Serialize state
             data = StateSerializer.serialize(state)
 

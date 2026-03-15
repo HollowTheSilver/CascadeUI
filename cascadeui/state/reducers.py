@@ -216,3 +216,35 @@ async def reduce_component_interaction(action: Action, state: StateData) -> Stat
     new_state["components"][component_id]["last_interaction"] = action["timestamp"]
 
     return new_state
+
+
+async def reduce_modal_submitted(action: Action, state: StateData) -> StateData:
+    """Handle MODAL_SUBMITTED actions."""
+    new_state = copy.deepcopy(state)
+    payload = action["payload"]
+
+    view_id = payload.get("view_id")
+    if not view_id:
+        return state
+
+    # Initialize modals namespace if needed
+    if "modals" not in new_state:
+        new_state["modals"] = {}
+
+    # Store the submission keyed by view_id
+    if view_id not in new_state["modals"]:
+        new_state["modals"][view_id] = {"submissions": []}
+
+    # Record the submission (capped at 50 like component interactions)
+    submissions = new_state["modals"][view_id]["submissions"]
+    submissions.append({
+        "user_id": payload.get("user_id"),
+        "values": payload.get("values", {}),
+        "timestamp": action["timestamp"],
+    })
+    if len(submissions) > 50:
+        new_state["modals"][view_id]["submissions"] = submissions[-50:]
+
+    new_state["modals"][view_id]["last_submission"] = action["timestamp"]
+
+    return new_state
