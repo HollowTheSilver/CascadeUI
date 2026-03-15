@@ -25,5 +25,9 @@ SubscriberFn = Callable[[StateData, Action], Awaitable[None]]
 # next_fn continues the chain or runs the reducer if last.
 MiddlewareFn = Callable[[Action, StateData, Callable], Awaitable[StateData]]
 
+# Selector: extracts a slice of state for change detection.
+# Returns any value; the store compares old vs new to decide whether to notify.
+SelectorFn = Callable[[StateData], Any]
+
 # Type variable for generic functions
 T = TypeVar('T')

@@ -12,7 +12,7 @@ from ..utils.logging import AsyncLogger
 from ..utils.tasks import get_task_manager
 from ..utils.errors import with_error_boundary, safe_execute
 
-from .types import Action, StateData, ReducerFn, SubscriberFn, MiddlewareFn
+from .types import Action, StateData, ReducerFn, SubscriberFn, MiddlewareFn, SelectorFn
 
 logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a")
 
@@ -43,8 +43,12 @@ class StateStore:
             "application": {},  # Application-specific data
         }
 
-        # Callbacks for state changes: {id: (callback, action_filter_set_or_None)}
-        self.subscribers: Dict[str, Tuple[SubscriberFn, Optional[Set[str]]]] = {}
+        # Callbacks for state changes: {id: (callback, action_filter, selector)}
+        self.subscribers: Dict[str, Tuple[SubscriberFn, Optional[Set[str]], Optional[SelectorFn]]] = {}
+
+        # Memoized selector results for change detection
+        self._last_selected: Dict[str, Any] = {}
+        self._SENTINEL = object()  # Marker for "no previous value"
 
         # Core reducers
         self._core_reducers: Dict[str, ReducerFn] = {}
@@ -207,10 +211,22 @@ class StateStore:
 
         logger.debug(f"Notifying {len(self.subscribers)} subscribers about action: {action['type']}")
 
-        for subscriber_id, (callback, action_filter) in list(self.subscribers.items()):
+        for subscriber_id, (callback, action_filter, selector) in list(self.subscribers.items()):
             # Skip if the subscriber has a filter and this action isn't in it
             if action_filter is not None and action["type"] not in action_filter:
                 continue
+
+            # Skip if the subscriber has a selector and the selected value hasn't changed
+            if selector is not None:
+                try:
+                    new_value = selector(self.state)
+                except Exception:
+                    new_value = self._SENTINEL  # On error, always notify
+                old_value = self._last_selected.get(subscriber_id, self._SENTINEL)
+                if new_value is not self._SENTINEL and old_value is not self._SENTINEL and new_value == old_value:
+                    logger.debug(f"Skipping subscriber {subscriber_id}: selector unchanged")
+                    continue
+                self._last_selected[subscriber_id] = new_value
 
             # Skip notifying the source to avoid loops ONLY if explicitly configured
             if action.get("source") == subscriber_id and action.get("skip_self_notify", False):
@@ -249,7 +265,8 @@ class StateStore:
             logger.debug(f"Detailed error for {subscriber_id}:\n{traceback.format_exc()}")
 
     def subscribe(self, subscriber_id: str, callback: SubscriberFn,
-                  action_filter: Optional[set] = None) -> None:
+                  action_filter: Optional[set] = None,
+                  selector: Optional[SelectorFn] = None) -> None:
         """Register to receive state updates.
 
         Args:
@@ -257,13 +274,17 @@ class StateStore:
             callback: Async callable receiving (state, action).
             action_filter: Optional set of action types to listen for.
                            If None, the subscriber receives all actions.
+            selector: Optional function that extracts a slice of state.
+                      When set, the subscriber is only notified when the
+                      selected value changes between dispatches.
         """
-        self.subscribers[subscriber_id] = (callback, action_filter)
+        self.subscribers[subscriber_id] = (callback, action_filter, selector)
 
     def unsubscribe(self, subscriber_id: str) -> None:
         """Stop receiving state updates."""
         if subscriber_id in self.subscribers:
             del self.subscribers[subscriber_id]
+        self._last_selected.pop(subscriber_id, None)
 
     async def _persist_state(self) -> None:
         """Persist the current state if a backend is configured."""

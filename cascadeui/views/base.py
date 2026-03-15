@@ -70,8 +70,11 @@ class StatefulView(View):
             "COMPONENT_INTERACTION", "SESSION_UPDATED",
         }
 
-        # Subscribe to state updates with action filter
-        self.state_store.subscribe(self.id, self._on_state_changed, self.subscribed_actions)
+        # Build selector from the view's state_selector method (if overridden)
+        selector = self._build_selector()
+
+        # Subscribe to state updates with action filter and selector
+        self.state_store.subscribe(self.id, self._on_state_changed, self.subscribed_actions, selector)
 
     def create_task(self, coro):
         """Create a task owned by this view."""
@@ -86,6 +89,32 @@ class StatefulView(View):
         Falls back to self.id for non-persistent views.
         """
         return self._state_key or self.id
+
+    def _build_selector(self):
+        """Build a selector function if the subclass overrides state_selector.
+
+        Returns None if state_selector is not overridden (base implementation),
+        which means the subscriber receives all matching notifications.
+        """
+        # Only use a selector if the subclass actually overrides state_selector
+        if type(self).state_selector is not StatefulView.state_selector:
+            return lambda state: self.state_selector(state)
+        return None
+
+    def state_selector(self, state):
+        """Extract the state slice this view cares about.
+
+        Override this in subclasses to enable selector-based filtering.
+        The view will only receive update_from_state() calls when the
+        return value of this method changes between dispatches.
+
+        Args:
+            state: The full application state dict.
+
+        Returns:
+            Any value. The store compares old vs new using equality.
+        """
+        return None
 
     async def _register_state(self):
         """Register this view in the state store. Called once on first send."""

@@ -17,7 +17,7 @@ CascadeUI brings a Redux-inspired architecture to Discord bot interfaces. Views,
 - **Centralized State Store**
   - Singleton store with dispatch/reducer cycle
   - Action history for debugging
-  - Subscriber filtering (views only receive relevant updates)
+  - Subscriber filtering by action type and state selectors
 
 - **Stateful Views**
   - Wraps discord.py `View` with automatic state integration
@@ -131,6 +131,30 @@ store.register_reducer("MY_ACTION", my_reducer)
 await store.dispatch("MY_ACTION", {"key": "value"})
 ```
 
+### State Selectors
+
+Selectors let views subscribe to specific slices of state. Without a selector, a view's `update_from_state()` fires on every matching action. With a selector, it only fires when the selected value actually changes.
+
+```python
+class CounterView(StatefulView):
+    subscribed_actions = {"COUNTER_UPDATED"}
+
+    def state_selector(self, state):
+        # Only re-render when MY counter changes, not anyone else's
+        return state.get("application", {}).get("counters", {}).get(self.state_key)
+
+    async def update_from_state(self, state):
+        counter = self.state_selector(state)
+        if self.message and counter is not None:
+            await self.message.edit(embed=discord.Embed(title=f"Count: {counter}"))
+```
+
+You can also use selectors at the store level for non-view subscribers:
+
+```python
+store.subscribe("my-listener", callback, selector=lambda s: s["application"]["score"])
+```
+
 ### Views
 
 `StatefulView` wraps discord.py's `View` with state integration, lifecycle management, and task tracking. Use `view.send()` to display a view, which handles state registration and message tracking automatically.
@@ -155,7 +179,7 @@ Views automatically clean up on timeout (disabling components and notifying the 
 
 CascadeUI includes pre-built view patterns for common UI layouts:
 
-**TabView** — button-based tab switching where each tab renders its own content:
+**TabView** - button-based tab switching where each tab renders its own content:
 
 ```python
 from cascadeui import TabView
@@ -174,7 +198,7 @@ class SettingsView(TabView):
         return embed
 ```
 
-**WizardView** — multi-step form with Back/Next/Finish navigation and per-step validation:
+**WizardView** - multi-step form with Back/Next/Finish navigation and per-step validation:
 
 ```python
 from cascadeui import WizardView
@@ -205,7 +229,7 @@ pagination = PaginationControls(page_count=5, on_page_change=handle_page)
 pagination.add_to_view(my_view)
 ```
 
-**ToggleGroup** — radio-button-like selection where only one option is active at a time:
+**ToggleGroup** - radio-button-like selection where only one option is active at a time:
 
 ```python
 from cascadeui import ToggleGroup
@@ -218,7 +242,7 @@ group = ToggleGroup(
 group.add_to_view(my_view)
 ```
 
-**ProgressBar** — text-based progress indicator for embed fields (not a discord component):
+**ProgressBar** - text-based progress indicator for embed fields (not a discord component):
 
 ```python
 from cascadeui import ProgressBar
