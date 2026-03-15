@@ -16,7 +16,10 @@ from .inputs import (
     create_text_field, create_select_field, create_boolean_field
 )
 from .composition import CompositeComponent, register_component, get_component
-from .patterns import ConfirmationButtons, PaginationControls, FormLayout
+from .patterns import (
+    ConfirmationButtons, PaginationControls, FormLayout,
+    ToggleGroup, ProgressBar,
+)
 from .wrappers import with_loading_state, with_confirmation, with_cooldown
 
 
@@ -59,6 +62,8 @@ __all__ = [
     "ConfirmationButtons",
     "PaginationControls",
     "FormLayout",
+    "ToggleGroup",
+    "ProgressBar",
     "with_loading_state",
     "with_confirmation",
     "with_cooldown"

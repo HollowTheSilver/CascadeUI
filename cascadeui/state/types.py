@@ -21,5 +21,9 @@ StateData = Dict[str, Any]
 ReducerFn = Callable[[Action, StateData], Awaitable[StateData]]
 SubscriberFn = Callable[[StateData, Action], Awaitable[None]]
 
+# Middleware: async callable receiving (action, state, next_fn) -> StateData.
+# next_fn continues the chain or runs the reducer if last.
+MiddlewareFn = Callable[[Action, StateData, Callable], Awaitable[StateData]]
+
 # Type variable for generic functions
 T = TypeVar('T')

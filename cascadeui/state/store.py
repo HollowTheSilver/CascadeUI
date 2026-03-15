@@ -12,7 +12,7 @@ from ..utils.logging import AsyncLogger
 from ..utils.tasks import get_task_manager
 from ..utils.errors import with_error_boundary, safe_execute
 
-from .types import Action, StateData, ReducerFn, SubscriberFn
+from .types import Action, StateData, ReducerFn, SubscriberFn, MiddlewareFn
 
 logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a")
 
@@ -58,6 +58,9 @@ class StateStore:
         # Action history for debugging/time travel
         self.history: List[Action] = []
         self.history_limit = 100
+
+        # Middleware pipeline (executed in order before reducers)
+        self._middleware: List[MiddlewareFn] = []
 
         # Persistence settings
         self.persistence_enabled = False
@@ -114,6 +117,47 @@ class StateStore:
             # Rebuild combined reducers
             self.reducers = {**self._core_reducers, **self._custom_reducers}
 
+    def add_middleware(self, middleware: MiddlewareFn) -> None:
+        """Add middleware to the dispatch pipeline.
+
+        Middleware runs in order between action creation and the reducer.
+        Each middleware receives (action, state, next_fn) and must call
+        next_fn(action, state) to continue the chain, or return state
+        directly to short-circuit.
+        """
+        self._middleware.append(middleware)
+
+    def remove_middleware(self, middleware: MiddlewareFn) -> None:
+        """Remove a middleware from the pipeline."""
+        if middleware in self._middleware:
+            self._middleware.remove(middleware)
+
+    async def _run_middleware_chain(self, action: Action, reducer_fn) -> StateData:
+        """Build and execute the middleware chain ending at the reducer."""
+        async def run_reducer(act, state):
+            if reducer_fn:
+                try:
+                    new_state = await reducer_fn(act, state)
+                    self.state = new_state
+                    logger.debug(f"State updated by reducer for {act['type']}")
+                except Exception as e:
+                    logger.error(f"Error in reducer for {act['type']}: {e}", exc_info=True)
+            else:
+                logger.warning(f"No reducer found for action type {act['type']}")
+            return self.state
+
+        # Build the chain from inside out: last middleware wraps the reducer,
+        # second-to-last wraps that, etc. Default args capture loop variables.
+        chain = run_reducer
+        for mw in reversed(self._middleware):
+            def wrap(middleware=mw, next_fn=chain):
+                async def step(act, state):
+                    return await middleware(act, state, next_fn)
+                return step
+            chain = wrap()
+
+        return await chain(action, self.state)
+
     @with_error_boundary("dispatch")
     async def dispatch(self, action_type: str, payload: Any = None,
                        source_id: Optional[str] = None) -> StateData:
@@ -143,21 +187,15 @@ class StateStore:
 
         if reducer:
             logger.debug(f"Found reducer for action {action_type}")
-            # Apply the reducer to transform state
-            try:
-                new_state = await reducer(action, self.state)
-                self.state = new_state
-                logger.debug(f"State updated by reducer for {action_type}")
-            except Exception as e:
-                logger.error(f"Error in reducer for {action_type}: {e}", exc_info=True)
-        else:
-            logger.warning(f"No reducer found for action type {action_type}")
+
+        # Run through middleware chain (ends at reducer)
+        await self._run_middleware_chain(action, reducer)
 
         # Always notify subscribers regardless of reducer
         logger.debug(f"Notifying subscribers about {action_type}")
         await self._notify_subscribers(action)
 
-        # Handle persistence
+        # Handle persistence (if no persistence middleware is installed)
         if self.persistence_enabled and self.persistence_backend:
             self.task_manager.create_task("state_store", self._persist_state())
 

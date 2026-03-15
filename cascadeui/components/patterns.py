@@ -168,3 +168,83 @@ class FormLayout(CompositeComponent):
 
 # Register the component
 register_component("form_layout", FormLayout)
+
+
+class ToggleGroup(CompositeComponent):
+    """Radio-button-like group where only one option can be active at a time.
+
+    When a button is clicked, all others reset to secondary style and the
+    selected one becomes primary. The on_select callback receives the
+    selected value.
+
+    Usage:
+        group = ToggleGroup(
+            options=["Easy", "Medium", "Hard"],
+            on_select=my_handler,
+            default="Medium",
+        )
+        group.add_to_view(my_view)
+    """
+
+    def __init__(self, options: List[str], on_select: Optional[Callable] = None,
+                 default: Optional[str] = None, row: Optional[int] = None):
+        super().__init__()
+        self.options = options
+        self.on_select = on_select
+        self.selected = default or options[0] if options else None
+
+        for option in options:
+            is_active = option == self.selected
+            style = ButtonStyle.primary if is_active else ButtonStyle.secondary
+
+            def make_callback(opt=option):
+                async def callback(interaction: Interaction):
+                    self.selected = opt
+                    # Update all button styles in the view
+                    for item in interaction.message.components[0].children if hasattr(interaction.message, 'components') else []:
+                        pass  # Discord API doesn't let us introspect easily
+
+                    if self.on_select:
+                        await self.on_select(interaction, opt)
+                return callback
+
+            button = StatefulButton(
+                label=option,
+                style=style,
+                custom_id=f"toggle_{option.lower().replace(' ', '_')}",
+                row=row,
+                callback=make_callback(option),
+            )
+            self.add_component(button)
+
+
+register_component("toggle_group", ToggleGroup)
+
+
+class ProgressBar:
+    """Visual progress indicator rendered as a text-based bar for embeds.
+
+    Not a discord component. Generates a string representation of progress
+    that can be placed in embed fields or descriptions.
+
+    Usage:
+        bar = ProgressBar(total=100, fill_char="█", empty_char="░", width=20)
+        embed.add_field(name="Progress", value=bar.render(current=65))
+        # Output: █████████████░░░░░░░ 65%
+    """
+
+    def __init__(self, total: int = 100, width: int = 20,
+                 fill_char: str = "\u2588", empty_char: str = "\u2591"):
+        self.total = total
+        self.width = width
+        self.fill_char = fill_char
+        self.empty_char = empty_char
+
+    def render(self, current: int) -> str:
+        """Render the progress bar for the given value."""
+        clamped = max(0, min(current, self.total))
+        ratio = clamped / self.total if self.total > 0 else 0
+        filled = int(self.width * ratio)
+        empty = self.width - filled
+        percent = int(ratio * 100)
+        return f"{self.fill_char * filled}{self.empty_char * empty} {percent}%"

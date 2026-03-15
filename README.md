@@ -23,11 +23,18 @@ CascadeUI brings a Redux-inspired architecture to Discord bot interfaces. Views,
   - Wraps discord.py `View` with automatic state integration
   - Lifecycle management: send, interact, timeout, cleanup
   - View-to-view transitions with navigation history
+  - Pre-built patterns: `TabView`, `WizardView`, `FormView`, `PaginatedView`
 
 - **Stateful Components**
   - `StatefulButton` and `StatefulSelect` with automatic action dispatching
-  - Composite components: `ConfirmationButtons`, `PaginationControls`, `FormLayout`
+  - Composite components: `ConfirmationButtons`, `PaginationControls`, `FormLayout`, `ToggleGroup`
   - Behavioral wrappers: loading states, confirmation prompts, per-user cooldowns
+  - Utilities: `ProgressBar` for visual progress in embeds
+
+- **DevTools**
+  - Built-in state inspector with paginated embed output
+  - View active views, sessions, action history, store configuration
+  - Drop-in cog or use `StateInspector` directly
 
 - **Theming**
   - Global theme registry with per-view overrides
@@ -37,6 +44,11 @@ CascadeUI brings a Redux-inspired architecture to Discord bot interfaces. Views,
 - **Persistence**
   - Decorator-based state persistence to JSON
   - Automatic save on state change, restore on startup
+
+- **Middleware**
+  - Intercept and transform actions in the dispatch pipeline
+  - Built-in: debounced persistence, action logging
+  - Write custom middleware for rate limiting, validation, analytics
 
 - **Custom Reducers**
   - Register your own action types with `@cascade_reducer`
@@ -139,6 +151,44 @@ await view.send(content="Hello")
 
 Views automatically clean up on timeout (disabling components and notifying the state store) and support transitions between views via `view.transition_to(OtherView)`.
 
+### View Patterns
+
+CascadeUI includes pre-built view patterns for common UI layouts:
+
+**TabView** — button-based tab switching where each tab renders its own content:
+
+```python
+from cascadeui import TabView
+
+class SettingsView(TabView):
+    def __init__(self, context):
+        tabs = {
+            "General": self.general_tab,
+            "Audio": self.audio_tab,
+            "Display": self.display_tab,
+        }
+        super().__init__(context=context, tabs=tabs)
+
+    async def general_tab(self, embed):
+        embed.description = "General settings here"
+        return embed
+```
+
+**WizardView** — multi-step form with Back/Next/Finish navigation and per-step validation:
+
+```python
+from cascadeui import WizardView
+
+class SetupWizard(WizardView):
+    def __init__(self, context):
+        steps = [
+            {"name": "Welcome", "builder": self.welcome_step},
+            {"name": "Config", "builder": self.config_step, "validator": self.validate_config},
+            {"name": "Done", "builder": self.done_step},
+        ]
+        super().__init__(context=context, steps=steps, on_finish=self.finish)
+```
+
 ### Components
 
 `StatefulButton` and `StatefulSelect` extend discord.py's built-in components with automatic state dispatching. Every interaction triggers a `COMPONENT_INTERACTION` action in the store.
@@ -153,6 +203,29 @@ confirmation.add_to_view(my_view)
 
 pagination = PaginationControls(page_count=5, on_page_change=handle_page)
 pagination.add_to_view(my_view)
+```
+
+**ToggleGroup** — radio-button-like selection where only one option is active at a time:
+
+```python
+from cascadeui import ToggleGroup
+
+group = ToggleGroup(
+    options=["Easy", "Medium", "Hard"],
+    on_select=difficulty_handler,
+    default="Medium",
+)
+group.add_to_view(my_view)
+```
+
+**ProgressBar** — text-based progress indicator for embed fields (not a discord component):
+
+```python
+from cascadeui import ProgressBar
+
+bar = ProgressBar(total=100, width=20)
+embed.add_field(name="Progress", value=bar.render(65))
+# Output: █████████████░░░░░░░ 65%
 ```
 
 ### Component Wrappers
@@ -216,6 +289,54 @@ async def profile_reducer(action, state):
 
 Reducers must return a new state dict. Use `copy.deepcopy(state)` to avoid mutating the current state.
 
+### Middleware
+
+Middleware sits between dispatch and reducers, letting you intercept, transform, or react to actions without modifying core logic:
+
+```python
+from cascadeui import get_store, DebouncedPersistence, logging_middleware
+
+store = get_store()
+
+# Log every action
+store.add_middleware(logging_middleware())
+
+# Debounce persistence writes (flush at most every 2 seconds)
+persistence = DebouncedPersistence(store, interval=2.0)
+store.add_middleware(persistence)
+
+# Write your own middleware
+async def rate_limit(action, state, next_fn):
+    # Inspect, modify, or block actions before they hit the reducer
+    return await next_fn(action, state)
+
+store.add_middleware(rate_limit)
+```
+
+Built-in middleware:
+
+| Middleware | What it does |
+|-----------|-------------|
+| `DebouncedPersistence(store, interval)` | Batches disk writes, flushes on lifecycle events |
+| `logging_middleware()` | Logs every dispatched action at INFO level |
+
+### DevTools
+
+CascadeUI includes a built-in state inspector for debugging. It renders paginated embeds showing active views, sessions, action history, and store configuration.
+
+```python
+from cascadeui import DevToolsCog
+
+# As a cog (adds /inspect command, owner-only)
+await bot.add_cog(DevToolsCog(bot))
+
+# Or use StateInspector directly
+from cascadeui import StateInspector
+
+inspector = StateInspector()
+pages = inspector.build_pages()  # list of embeds
+```
+
 ---
 
 ## Data Flow
@@ -228,6 +349,8 @@ User clicks button
   Original callback runs (responds to Discord)
        |
   COMPONENT_INTERACTION action dispatched
+       |
+  Middleware pipeline (logging, persistence, custom)
        |
   Reducer transforms state immutably
        |
@@ -283,4 +406,3 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 ---
 
-**Made with care for the discord.py community**
