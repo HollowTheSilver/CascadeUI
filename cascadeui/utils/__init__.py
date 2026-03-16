@@ -2,7 +2,7 @@
 # // ========================================( Modules )======================================== // #
 
 
-from .decorators import cascade_reducer, cascade_component, cascade_persistent
+from .decorators import cascade_reducer, cascade_component
 from .errors import with_error_boundary, with_retry, safe_execute
 from .tasks import get_task_manager
 
@@ -13,7 +13,6 @@ from .tasks import get_task_manager
 __all__ = [
     "cascade_reducer",
     "cascade_component",
-    "cascade_persistent",
     "with_error_boundary",
     "with_retry",
     "safe_execute",

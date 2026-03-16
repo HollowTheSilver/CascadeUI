@@ -91,6 +91,8 @@ class StateStore:
             reduce_navigation,
             reduce_component_interaction,
             reduce_modal_submitted,
+            reduce_persistent_view_registered,
+            reduce_persistent_view_unregistered,
         )
 
         # Register core reducers
@@ -103,6 +105,8 @@ class StateStore:
             "NAVIGATION": reduce_navigation,
             "COMPONENT_INTERACTION": reduce_component_interaction,
             "MODAL_SUBMITTED": reduce_modal_submitted,
+            "PERSISTENT_VIEW_REGISTERED": reduce_persistent_view_registered,
+            "PERSISTENT_VIEW_UNREGISTERED": reduce_persistent_view_unregistered,
         }
 
         # Update combined reducers

@@ -1,0 +1,61 @@
+site_name: CascadeUI
+site_description: Redux-inspired UI framework for discord.py
+site_author: HollowTheSilver
+repo_url: https://github.com/HollowTheSilver/CascadeUI
+repo_name: HollowTheSilver/CascadeUI
+
+theme:
+  name: material
+  palette:
+    - scheme: slate
+      primary: deep purple
+      accent: purple
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+    - scheme: default
+      primary: deep purple
+      accent: purple
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+  features:
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - content.code.copy
+    - search.highlight
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - attr_list
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Installation: guide/installation.md
+      - Quick Start: guide/quickstart.md
+  - Guide:
+      - State Management: guide/state.md
+      - Views: guide/views.md
+      - Components: guide/components.md
+      - Persistence: guide/persistence.md
+      - Theming: guide/theming.md
+      - Middleware: guide/middleware.md
+      - DevTools: guide/devtools.md
+  - API Reference:
+      - State Store: api/store.md
+      - Views: api/views.md
+      - Components: api/components.md
+      - Persistence: api/persistence.md
+      - Theming: api/theming.md
+  - Examples: examples.md

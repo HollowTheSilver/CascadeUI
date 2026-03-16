@@ -4,6 +4,7 @@
 
 from .base import StatefulView
 from .specialized import FormView, PaginatedView
+from .persistent import PersistentView, setup_persistence
 
 
 # // ========================================( Script )======================================== // #
@@ -12,5 +13,7 @@ from .specialized import FormView, PaginatedView
 __all__ = [
     "StatefulView",
     "FormView",
-    "PaginatedView"
+    "PaginatedView",
+    "PersistentView",
+    "setup_persistence",
 ]

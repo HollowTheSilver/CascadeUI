@@ -248,3 +248,44 @@ async def reduce_modal_submitted(action: Action, state: StateData) -> StateData:
     new_state["modals"][view_id]["last_submission"] = action["timestamp"]
 
     return new_state
+
+
+async def reduce_persistent_view_registered(action: Action, state: StateData) -> StateData:
+    """Handle PERSISTENT_VIEW_REGISTERED actions."""
+    new_state = copy.deepcopy(state)
+    payload = action["payload"]
+
+    state_key = payload.get("state_key")
+    if not state_key:
+        return state
+
+    if "persistent_views" not in new_state:
+        new_state["persistent_views"] = {}
+
+    new_state["persistent_views"][state_key] = {
+        "state_key": state_key,
+        "class_name": payload.get("class_name"),
+        "message_id": payload.get("message_id"),
+        "channel_id": payload.get("channel_id"),
+        "guild_id": payload.get("guild_id"),
+        "registered_at": action["timestamp"],
+    }
+
+    return new_state
+
+
+async def reduce_persistent_view_unregistered(action: Action, state: StateData) -> StateData:
+    """Handle PERSISTENT_VIEW_UNREGISTERED actions."""
+    payload = action["payload"]
+
+    state_key = payload.get("state_key")
+    if not state_key:
+        return state
+
+    if "persistent_views" not in state or state_key not in state["persistent_views"]:
+        return state
+
+    new_state = copy.deepcopy(state)
+    del new_state["persistent_views"][state_key]
+
+    return new_state

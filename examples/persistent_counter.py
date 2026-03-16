@@ -10,7 +10,7 @@ from discord.ext.commands import Context
 
 from cascadeui import (
     StatefulView, StatefulButton, get_store,
-    cascade_reducer, cascade_persistent
+    cascade_reducer,
 )
 
 import logging
@@ -45,16 +45,13 @@ async def counter_reducer(action, state):
 # // ========================================( Views )======================================== // #
 
 
-@cascade_persistent(file_path="counter_state.json")
 class PersistentCounterView(StatefulView):
     """A counter that saves its state to disk automatically.
 
     Uses state_key to scope data by user ID, so each user's counter
     persists independently across view timeouts and bot restarts.
 
-    The @cascade_persistent decorator enables persistence for the entire
-    StateStore. This decorator only needs to be applied once to a single
-    "root" view. All views share the same StateStore.
+    Requires setup_persistence() to be called in the bot's setup_hook.
     """
 
     def __init__(self, *args, **kwargs):

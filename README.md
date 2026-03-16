@@ -6,7 +6,7 @@
 
 > **Note**: CascadeUI is currently in active development and has not yet been officially released. Installation is source-only until the package is published on PyPI.
 
-Stateful UI components and state management for [discord.py](https://github.com/Rapptz/discord.py).
+Redux-inspired UI framework for [discord.py](https://github.com/Rapptz/discord.py).
 
 CascadeUI brings a Redux-inspired architecture to Discord bot interfaces. Views, buttons, selects, and forms are backed by a centralized state store with dispatched actions, reducers, and subscriber notifications. The result is predictable state flow and composable UI patterns that scale beyond simple one-off views.
 
@@ -42,7 +42,9 @@ CascadeUI brings a Redux-inspired architecture to Discord bot interfaces. Views,
   - Built-in themes: default, dark, light
 
 - **Persistence**
-  - Decorator-based state persistence to JSON
+  - Single `setup_persistence()` entry point for all persistence
+  - Data persistence via `state_key` (restore on re-invoke)
+  - View persistence via `PersistentView` (survive bot restarts)
   - Automatic save on state change, restore on startup
 
 - **Middleware**
@@ -285,14 +287,38 @@ theme.apply_to_embed(embed)
 
 ### Persistence
 
-Decorate a view class with `@cascade_persistent` to automatically save and restore state to disk:
+Call `setup_persistence()` once in your bot's `setup_hook` to enable state saving and restoration. It must be called **after** loading your cogs, since cog imports register `PersistentView` subclasses:
 
 ```python
-from cascadeui import cascade_persistent
+from cascadeui import setup_persistence
 
-@cascade_persistent(file_path="bot_state.json")
-class PersistentView(StatefulView):
-    ...
+class MyBot(commands.Bot):
+    async def setup_hook(self):
+        # Load cogs first (registers PersistentView subclasses)
+        await self.load_extension("cogs.dashboard")
+        await self.load_extension("cogs.counter")
+
+        # Then enable persistence
+        # Without bot: data-only (views with state_key restore on re-invoke)
+        await setup_persistence(file_path="bot_state.json")
+
+        # With bot: also re-attaches PersistentView UIs that survive restarts
+        await setup_persistence(self, file_path="bot_state.json")
+```
+
+For views that should stay interactive across restarts, subclass `PersistentView`:
+
+```python
+from cascadeui import PersistentView, StatefulButton
+
+class RoleSelectorView(PersistentView):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.add_item(StatefulButton(
+            label="Get Role",
+            custom_id="roles:get",  # required for persistent views
+            callback=self.give_role,
+        ))
 ```
 
 ### Custom Reducers
@@ -393,7 +419,8 @@ Working examples are in the [`examples/`](examples/) directory:
 |---------|---------------|
 | **counter.py** | Basic stateful counter with increment, decrement, reset |
 | **themed_form.py** | Theme switching, component wrappers, pagination, form views |
-| **persistent_counter.py** | State persistence to disk with `@cascade_persistent` |
+| **persistent_counter.py** | Data persistence to disk with `setup_persistence` |
+| **persistent_dashboard.py** | Persistent views that survive bot restarts with `PersistentView` |
 
 Each example is a discord.py cog that can be loaded into any bot.
 

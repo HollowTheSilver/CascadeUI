@@ -208,6 +208,28 @@ class StatefulView(View):
         from ..theming.core import get_default_theme, Theme
         return get_default_theme() or Theme("fallback")
 
+    async def on_error(self, interaction: Interaction, error: Exception, item: Item) -> None:
+        """Called when a component callback raises an exception.
+
+        Sends a generic ephemeral error embed to the user so the interaction
+        doesn't silently fail. Subclasses can override this for custom handling.
+        """
+        logger.error(f"Error in {item!r} of view {self.__class__.__name__}: {error}", exc_info=True)
+
+        embed = discord.Embed(
+            title="Something went wrong",
+            description="An unexpected error occurred while processing your interaction.",
+            color=discord.Color.red(),
+        )
+
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(embed=embed, ephemeral=True)
+            else:
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+        except discord.HTTPException:
+            pass
+
     async def on_timeout(self) -> None:
         """Called when the view times out. Disables all components and cleans up state."""
         for item in self.children:
