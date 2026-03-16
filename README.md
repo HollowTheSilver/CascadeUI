@@ -3,12 +3,15 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![discord.py 2.1+](https://img.shields.io/badge/discord.py-2.1+-738adb.svg)](https://github.com/Rapptz/discord.py)
+[![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-blue?logo=readthedocs)](https://hollowthesilver.github.io/CascadeUI/)
 
 > **Note**: CascadeUI is currently in active development and has not yet been officially released. Installation is source-only until the package is published on PyPI.
 
 Redux-inspired UI framework for [discord.py](https://github.com/Rapptz/discord.py).
 
 CascadeUI brings a Redux-inspired architecture to Discord bot interfaces. Views, buttons, selects, and forms are backed by a centralized state store with dispatched actions, reducers, and subscriber notifications. The result is predictable state flow and composable UI patterns that scale beyond simple one-off views.
+
+**[Read the full documentation](https://hollowthesilver.github.io/CascadeUI/)**
 
 ---
 
