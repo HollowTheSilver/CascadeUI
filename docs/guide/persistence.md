@@ -8,6 +8,7 @@ Call `setup_persistence()` once in your bot's `setup_hook`, **after loading your
 
 ```python
 from cascadeui import setup_persistence
+from cascadeui.persistence import SQLiteBackend
 
 class MyBot(commands.Bot):
     async def setup_hook(self):
@@ -16,7 +17,7 @@ class MyBot(commands.Bot):
         await self.load_extension("cogs.counter")
 
         # Then enable persistence
-        await setup_persistence(self, file_path="bot_state.json")
+        await setup_persistence(self, backend=SQLiteBackend("cascadeui.db"))
 ```
 
 !!! warning "Cog loading order matters"
@@ -26,14 +27,82 @@ class MyBot(commands.Bot):
 
 ```python
 # Data-only persistence (no bot needed)
-await setup_persistence(file_path="bot_state.json")
+await setup_persistence(backend=SQLiteBackend("cascadeui.db"))
 
 # Full persistence: data + view re-attachment
+await setup_persistence(bot, backend=SQLiteBackend("cascadeui.db"))
+```
+
+- **Without `bot`**: Enables the storage backend and restores state from disk. Views with `state_key` can look up their saved data when re-invoked.
+- **With `bot`**: Does everything above, plus re-attaches `PersistentView` instances to their original Discord messages so they stay interactive after a restart.
+
+## Storage Backends
+
+### JSON File (built-in)
+
+No extra dependencies. Good for development and small bots:
+
+```python
 await setup_persistence(bot, file_path="bot_state.json")
 ```
 
-- **Without `bot`**: Enables the `FileStorageBackend` and restores state from disk. Views with `state_key` can look up their saved data when re-invoked.
-- **With `bot`**: Does everything above, plus re-attaches `PersistentView` instances to their original Discord messages so they stay interactive after a restart.
+Before every save, a `.bak` backup is created for recovery.
+
+### SQLite (recommended)
+
+Requires `aiosqlite`. Uses WAL mode for concurrent reads and avoids file locking issues on Windows:
+
+```bash
+pip install cascadeui[sqlite]
+```
+
+```python
+from cascadeui.persistence import SQLiteBackend
+
+await setup_persistence(bot, backend=SQLiteBackend("cascadeui.db"))
+```
+
+### Redis
+
+Requires `redis` (with async support). Useful for bots running across multiple processes or machines:
+
+```bash
+pip install cascadeui[redis]
+```
+
+```python
+from cascadeui.persistence import RedisBackend
+
+await setup_persistence(bot, backend=RedisBackend(url="redis://localhost"))
+```
+
+### Custom Backend
+
+Implement the `StorageBackend` interface:
+
+```python
+class MyBackend:
+    async def save_state(self, state: dict) -> bool:
+        # Serialize and store. Return True on success.
+        ...
+
+    async def load_state(self) -> dict:
+        # Load and deserialize. Return empty dict if no saved state.
+        ...
+```
+
+### Migrating Between Backends
+
+Move state from one backend to another:
+
+```python
+from cascadeui.persistence import migrate_storage, FileStorageBackend, SQLiteBackend
+
+await migrate_storage(
+    source=FileStorageBackend("old_state.json"),
+    target=SQLiteBackend("cascadeui.db"),
+)
+```
 
 ## Pattern 1: Data Persistence (re-invoke to restore)
 
@@ -41,24 +110,13 @@ Use a regular `StatefulView` with a `state_key` to persist data across view life
 
 ```python
 class CounterView(StatefulView):
-    def __init__(self, context, user_id):
-        super().__init__(
-            context=context,
-            state_key=f"counter:{user_id}",  # Stable identity for data
-        )
-        self.counter = 0
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
-    async def send(self, **kwargs):
         # Restore saved counter value from state
-        state = self.state_store.get_state()
-        counters = state.get("application", {}).get("counters", {})
-        saved = counters.get(self.state_key)
-        if saved is not None:
-            self.counter = saved
-        return await super().send(
-            embed=discord.Embed(title="Counter", description=f"Value: {self.counter}"),
-            **kwargs,
-        )
+        store = get_store()
+        counters = store.state.get("application", {}).get("counters", {})
+        self.counter = counters.get(self.state_key, 0)
 ```
 
 The view will timeout normally, but its data stays on disk. When the user runs the command again, the new view instance reads the saved data and picks up where they left off.
@@ -117,6 +175,9 @@ After a bot restart, `setup_persistence(bot)` automatically:
 - All components must have explicit `custom_id` values (auto-generated IDs won't survive restarts)
 - `timeout` is forced to `None` (persistent views never timeout)
 
+!!! danger "PersistentView cannot be ephemeral"
+    `PersistentView.send(ephemeral=True)` raises `ValueError`. Ephemeral messages have no permanent message ID and cannot be re-attached after a bot restart. This is a hard constraint from Discord's API.
+
 ### Stale Entry Handling
 
 If things change while the bot is offline:
@@ -138,7 +199,3 @@ When a `PersistentView` is sent, it dispatches a `PERSISTENT_VIEW_REGISTERED` ac
 This gets persisted to disk along with all other state. On restart, `setup_persistence` reads this registry and rebuilds the views.
 
 The `__init_subclass__` hook on `PersistentView` automatically registers every subclass in a class name -> class mapping. This is why cog loading order matters: the subclass must be imported (triggering `__init_subclass__`) before `setup_persistence` tries to look it up.
-
-## File Storage
-
-State is saved to a JSON file (default: `cascadeui_state.json`). Before every save, a `.bak` backup is created for recovery. The `StateSerializer` handles `datetime` and `set` objects; other non-serializable types raise a `TypeError`.

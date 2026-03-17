@@ -19,6 +19,7 @@ __pycache__/
 # Distribution / Packaging
 dist/
 build/
+site/
 *.egg-info/
 *.egg
 
@@ -70,13 +71,6 @@ node_modules/
 # Debugging and Profiling
 *.prof
 *.out
-
-# Internal Development (not published)
-CLAUDE.md
-TODO.md
-ARCHITECTURE.md
-.claude/
-tests/
 
 # Project-Specific Ignores
 *.token

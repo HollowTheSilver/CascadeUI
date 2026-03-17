@@ -27,7 +27,7 @@ class StatefulComponent:
             if not view:
                 # If we still can't find the view, log error and call original callback
                 from ..utils.logging import AsyncLogger
-                logger = AsyncLogger(name="cascadeui.components", level="DEBUG", path="logs", mode="a")
+                logger = AsyncLogger(name="cascadeui.components", level="DEBUG", path="logs", mode="a", prefix="cascadeui")
                 logger.error(f"Could not find view for component {component_id}")
 
                 # Call original callback if provided

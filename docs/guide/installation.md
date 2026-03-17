@@ -15,6 +15,18 @@ cd CascadeUI
 pip install -e .
 ```
 
+### Optional Backends
+
+CascadeUI supports pluggable persistence backends with optional dependencies:
+
+```bash
+# SQLite persistence (recommended for production)
+pip install -e ".[sqlite]"
+
+# Redis persistence
+pip install -e ".[redis]"
+```
+
 ### Development Install
 
 If you want to run tests or contribute:
@@ -29,6 +41,10 @@ This installs additional dependencies: `pytest`, `pytest-asyncio`, `black`, and 
 
 ```bash
 pip install cascadeui
+
+# With optional backends
+pip install cascadeui[sqlite]
+pip install cascadeui[redis]
 ```
 
 ## Verify Installation

@@ -77,6 +77,26 @@ store.add_middleware(persistence)
 await persistence.flush_now()
 ```
 
+### Undo Middleware
+
+Captures state snapshots for views with `enable_undo = True`. Add it once during setup:
+
+```python
+from cascadeui import UndoMiddleware
+
+store.add_middleware(UndoMiddleware(store))
+```
+
+The middleware automatically:
+
+- Checks if the dispatching view has `enable_undo = True`
+- Takes a `deepcopy` of `state["application"]` before the reducer runs
+- Pushes it onto the session's undo stack
+- Skips internal lifecycle actions (view creation, navigation, etc.)
+- Respects batching (one snapshot per batch, not per action)
+
+See [Views > Undo/Redo](views.md#undoredo) for the view-side API.
+
 ## Custom Middleware Examples
 
 ### Rate Limiting
@@ -106,4 +126,28 @@ async def validate_actions(action, state, next_fn):
         if score < 0:
             action["payload"]["score"] = 0  # Clamp to minimum
     return await next_fn(action, state)
+```
+
+### Analytics
+
+```python
+async def analytics(action, state, next_fn):
+    result = await next_fn(action, state)
+    if action["type"] == "PURCHASE_COMPLETED":
+        await send_to_analytics(action["payload"])
+    return result
+```
+
+## Middleware Order
+
+Middleware runs in registration order, which matters when middleware depends on each other:
+
+```python
+# Good: logging sees every action (including those blocked by rate limiting)
+store.add_middleware(logging_middleware())
+store.add_middleware(rate_limit)
+
+# Good: undo captures state before persistence writes
+store.add_middleware(UndoMiddleware(store))
+store.add_middleware(DebouncedPersistence(store))
 ```

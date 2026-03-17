@@ -106,12 +106,12 @@ async def counter_reducer(action, state):
     if "counters" not in new_state["application"]:
         new_state["application"]["counters"] = {}
 
-    view_id = action["payload"].get("view_id")
+    key = action["payload"].get("state_key") or action["payload"].get("view_id")
     counter_value = action["payload"].get("counter")
 
-    if view_id:
-        new_state["application"]["counters"][view_id] = counter_value
-        logger.debug(f"State updated: counters[{view_id}] = {counter_value}")
+    if key:
+        new_state["application"]["counters"][key] = counter_value
+        logger.debug(f"State updated: counters[{key}] = {counter_value}")
 
     return new_state
 

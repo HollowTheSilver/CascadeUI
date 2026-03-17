@@ -46,7 +46,7 @@ Returns the current state dict.
 
 #### `enable_persistence(backend)`
 
-Enables a persistence backend (e.g., `FileStorageBackend`). Typically called by `setup_persistence()`.
+Enables a persistence backend (e.g., `SQLiteBackend`). Typically called by `setup_persistence()`.
 
 #### `restore_state()`
 
@@ -60,10 +60,42 @@ Adds a middleware function to the dispatch pipeline.
 
 Removes a middleware function.
 
+#### `batch()`
+
+Returns an async context manager for batching multiple dispatches into a single notification cycle.
+
+```python
+async with store.batch() as b:
+    await b.dispatch("ACTION_A", payload_a)
+    await b.dispatch("ACTION_B", payload_b)
+```
+
+#### `on(event_name, callback)`
+
+Registers an event hook. `event_name` is a snake_case name (e.g., `"view_created"`) that maps to the action type `VIEW_CREATED`.
+
+#### `off(event_name, callback)`
+
+Removes an event hook.
+
+#### `register_computed(name, computed_value)`
+
+Registers a `ComputedValue` instance. Typically called by the `@computed` decorator.
+
+#### `get_scoped(scope, *, user_id=None, guild_id=None)`
+
+Returns scoped state for the given scope type and ID.
+
+#### `set_scoped(scope, data, *, user_id=None, guild_id=None)`
+
+Sets scoped state for the given scope type and ID.
+
 ### Properties
 
+- `state` (dict): The current state tree
 - `action_history` (list): Recent dispatched actions
 - `persistence_enabled` (bool): Whether a persistence backend is active
+- `computed` (dict-like): Access computed values by name (e.g., `store.computed["total_votes"]`)
 
 ---
 
@@ -77,6 +109,21 @@ async def my_reducer(action, state):
     new_state = copy.deepcopy(state)
     # ... modify new_state ...
     return new_state
+```
+
+---
+
+## `@computed(selector)`
+
+Decorator that registers a computed/derived value on the global store.
+
+```python
+@computed(selector=lambda s: s.get("application", {}).get("votes", {}))
+def total_votes(votes):
+    return sum(votes.values())
+
+# Access:
+store.computed["total_votes"]
 ```
 
 ---

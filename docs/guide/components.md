@@ -110,6 +110,9 @@ The active option's button is highlighted. Clicking a different option deselects
 
 Wrappers modify component behavior without changing the component itself. Apply them to buttons to add cross-cutting behavior.
 
+!!! danger "Wrappers consume the interaction response"
+    All three wrappers (`with_loading_state`, `with_confirmation`, `with_cooldown`) use `interaction.response` internally to show their UI (loading indicator, confirmation prompt, or cooldown message). Your wrapped callback **must** use `interaction.followup.send()` instead of `interaction.response.send_message()`. Calling `interaction.response` in a wrapped callback will raise `InteractionResponded`.
+
 ### Loading State
 
 Shows a visual loading indicator while the callback runs:
@@ -121,7 +124,14 @@ button = StatefulButton(label="Process", callback=my_handler)
 with_loading_state(button)
 ```
 
-The wrapper uses `interaction.response.edit_message()` to show the loading state, so the original callback should use `interaction.followup` for any messages it sends.
+The button is disabled and its label changes to "Loading..." while the callback runs. After the callback finishes, the original label and state are restored.
+
+```python
+async def my_handler(interaction):
+    # interaction.response is already consumed -- use followup
+    await asyncio.sleep(2)
+    await interaction.followup.send("Done!", ephemeral=True)
+```
 
 ### Confirmation Prompt
 
@@ -131,10 +141,15 @@ Adds a yes/no confirmation before executing the callback:
 from cascadeui import with_confirmation
 
 button = StatefulButton(label="Delete", callback=handle_delete)
-with_confirmation(button, message="Are you sure you want to delete this?")
+with_confirmation(
+    button,
+    message="Are you sure you want to delete this?",
+    confirmed_message="Deleted.",
+    cancelled_message="Kept safe.",
+)
 ```
 
-The confirmation dialog passes the fresh confirmation interaction to the callback, not the original (expired) interaction.
+The confirmation dialog is sent as an ephemeral message. If the user confirms, the callback runs with the confirmation interaction. If they cancel, the dialog is edited to show the cancelled message.
 
 ### Per-User Cooldown
 
@@ -147,7 +162,19 @@ button = StatefulButton(label="Claim", callback=handle_claim)
 with_cooldown(button, seconds=10)
 ```
 
-Each user has their own cooldown timer. Other users are not affected.
+Each user has their own cooldown timer. Other users are not affected. The `scope` parameter controls cooldown isolation:
+
+| Scope | Behavior |
+|-------|----------|
+| `"user"` (default) | Each user has an independent cooldown |
+| `"guild"` | Shared cooldown per server |
+| `"global"` | One cooldown for everyone |
+
+```python
+with_cooldown(button, seconds=30, scope="guild")
+```
+
+If a user clicks while on cooldown, they see an ephemeral message with the remaining time. The original callback is not called.
 
 ## Utilities
 

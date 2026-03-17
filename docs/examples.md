@@ -6,31 +6,60 @@ Working examples are in the [`examples/`](https://github.com/HollowTheSilver/Cas
 
 Basic stateful counter with increment, decrement, and reset buttons. Demonstrates `StatefulView`, `StatefulButton`, and custom reducers.
 
+**Command:** `/counter`
+
 ## themed_form.py
 
-Theme switching, component wrappers (loading state, confirmation, cooldowns), pagination, and form views. Shows how to use the theming system and behavioral wrappers together.
+Theme switching, component wrappers (loading state, confirmation), pagination, form views with validation, and modal text input with per-field validation. Shows how to use the theming system, behavioral wrappers, and the validation module together.
 
-## persistent_counter.py
+**Commands:** `/profile`, `/themetest`, `/componenttest`, `/paginationtest`, `/formtest`, `/validatetest`
 
-Data persistence to disk using `setup_persistence()` and `state_key`. The counter value survives across command re-invocations. Demonstrates Pattern 1 persistence (data only, re-invoke to restore).
+## persistence.py
 
-## persistent_dashboard.py
+SQLite-backed data persistence and `PersistentView` that survives bot restarts. Includes a persistent counter scoped per user and a role selector panel that stays interactive across restarts.
 
-A role selector panel using `PersistentView` that stays interactive across bot restarts. Demonstrates Pattern 2 persistence (view + data, survives restarts without user action).
+**Commands:** `/pcounter`, `/setup_roles`
+
+## navigation.py
+
+Navigation stack with push/pop between multi-level views. Demonstrates a main menu that pushes to settings and about pages, with a nested sub-page two levels deep.
+
+**Command:** `/navtest`
+
+## state_features.py
+
+Per-user state scoping (independent counters per user), action batching (multiple dispatches with single notification), computed/derived values (cached totals), and event hooks (logging component interactions).
+
+**Commands:** `/scopetest`, `/advancedtest`
+
+## undo_redo.py
+
+Undo/redo counter using `UndoMiddleware`. Shows stack depth in the embed so you can see exactly how the undo/redo stacks change with each action.
+
+**Command:** `/undotest`
 
 ## Running the Examples
 
 1. Create a bot on the [Discord Developer Portal](https://discord.com/developers/applications)
-2. Install CascadeUI: `pip install -e .`
-3. Load the example cog in your bot:
+2. Install CascadeUI: `pip install -e ".[sqlite]"`
+3. Load the example cogs in your bot:
 
 ```python
-async def setup_hook(self):
-    await self.load_extension("examples.counter")
+from cascadeui import setup_persistence
+from cascadeui.persistence import SQLiteBackend
 
-    # For persistence examples, also call setup_persistence:
-    from cascadeui import setup_persistence
-    await setup_persistence(self, file_path="bot_state.json")
+class MyBot(commands.Bot):
+    async def setup_hook(self):
+        # Load example cogs
+        await self.load_extension("examples.counter")
+        await self.load_extension("examples.themed_form")
+        await self.load_extension("examples.persistence")
+        await self.load_extension("examples.navigation")
+        await self.load_extension("examples.state_features")
+        await self.load_extension("examples.undo_redo")
+
+        # Enable persistence (after loading cogs)
+        await setup_persistence(self, backend=SQLiteBackend("cascadeui.db"))
 ```
 
 4. Run your bot and use the slash commands

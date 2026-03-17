@@ -2,7 +2,7 @@
 # // ========================================( Modules )======================================== // #
 
 
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from .types import ViewId, SessionId, UserId, ComponentId
 
 # Type alias for action payloads
@@ -102,4 +102,37 @@ class ActionCreators:
         """Create a PERSISTENT_VIEW_UNREGISTERED action payload."""
         return {
             "state_key": state_key,
+        }
+
+    @staticmethod
+    def navigation_push(
+        session_id: SessionId,
+        class_name: str,
+        module: Optional[str] = None,
+        kwargs: Optional[Dict[str, Any]] = None,
+        state_snapshot: Optional[Any] = None,
+    ) -> ActionPayload:
+        """Create a NAVIGATION_PUSH action payload."""
+        return {
+            "session_id": session_id,
+            "class_name": class_name,
+            "module": module,
+            "kwargs": kwargs or {},
+            "state_snapshot": state_snapshot,
+        }
+
+    @staticmethod
+    def navigation_pop(session_id: SessionId) -> ActionPayload:
+        """Create a NAVIGATION_POP action payload."""
+        return {
+            "session_id": session_id,
+        }
+
+    @staticmethod
+    def scoped_update(scope: str, scope_id: Any, data: Dict[str, Any]) -> ActionPayload:
+        """Create a SCOPED_UPDATE action payload."""
+        return {
+            "scope": scope,
+            "scope_id": scope_id,
+            "data": data,
         }

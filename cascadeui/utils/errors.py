@@ -8,7 +8,7 @@ import traceback
 from typing import Callable, Any, Coroutine, TypeVar, cast, Optional, Type, Tuple, Union
 
 from .logging import AsyncLogger
-logger = AsyncLogger(name="cascadeui.errors", level="DEBUG", path="logs", mode="a")
+logger = AsyncLogger(name="cascadeui.errors", level="DEBUG", path="logs", mode="a", prefix="cascadeui")
 
 T = TypeVar('T')
 
@@ -105,7 +105,6 @@ class ErrorBoundary:
         self.name = name
         # Convert string log level to integer
         self.log_level = self._get_log_level(log_level)
-        self.logger = AsyncLogger(name="cascadeui.errors", level=log_level, path="logs", mode="a")
 
     @staticmethod
     def _get_log_level(level_name: str) -> int:
@@ -125,10 +124,10 @@ class ErrorBoundary:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if exc_val is not None:
-            self.logger.log(
+            logger.log(
                 self.log_level,
                 f"Error in {self.name}: {exc_val}",
-                exc_info=True  # Simply use True instead of the tuple
+                exc_info=True
             )
             # Return False to propagate the exception
             return False
@@ -151,6 +150,5 @@ async def safe_execute(coro: Coroutine, fallback: Any = None, log_error: bool = 
         return await coro
     except Exception as e:
         if log_error:
-            logger = AsyncLogger(name="cascadeui.errors", level="ERROR", path="logs", mode="a")
             logger.error(f"Error in safe_execute: {e}", exc_info=True)
         return fallback

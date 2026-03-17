@@ -12,7 +12,7 @@ from ..state.singleton import get_store
 from ..state.actions import ActionCreators
 from ..utils.logging import AsyncLogger
 
-logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a")
+logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a", prefix="cascadeui")
 
 
 # // ========================================( Registry )======================================== // #
@@ -75,6 +75,12 @@ class PersistentView(StatefulView):
 
     async def send(self, content=None, *, embed=None, embeds=None, ephemeral=False):
         """Send the view and register it for persistence."""
+        if ephemeral:
+            raise ValueError(
+                f"{self.__class__.__name__} cannot be sent as ephemeral. "
+                "Persistent views require a real channel message to survive bot restarts. "
+                "Ephemeral messages have no permanent ID and cannot be re-attached."
+            )
         self._validate_custom_ids()
 
         message = await super().send(content, embed=embed, embeds=embeds, ephemeral=ephemeral)
@@ -125,6 +131,7 @@ class PersistentView(StatefulView):
 async def setup_persistence(
     bot=None,
     file_path: str = "cascadeui_state.json",
+    backend=None,
 ) -> Dict[str, List[str]]:
     """Enable state persistence and restore saved state from disk.
 
@@ -140,7 +147,10 @@ async def setup_persistence(
     Args:
         bot: Optional discord.py Bot instance. Required for re-attaching
              PersistentView instances; omit if you only need data persistence.
-        file_path: Path to the JSON file for state storage.
+        file_path: Path to the JSON file for state storage (used when no
+                   ``backend`` is provided).
+        backend: Optional StorageBackend instance (e.g. SQLiteBackend,
+                 RedisBackend). Falls back to FileStorageBackend if omitted.
 
     Returns:
         A summary dict with ``restored``, ``skipped``, ``failed``, and
@@ -148,12 +158,25 @@ async def setup_persistence(
         are kept in state for the next restart; removed entries (deleted
         message/channel) are permanently cleaned up.
     """
+    # Validate bot argument early — a wrong type here (e.g. passing a
+    # variable that doesn't exist) would otherwise fail deep in discord.py
+    # with a confusing error or silently break view restoration.
+    if bot is not None:
+        from discord.ext.commands import Bot
+        if not isinstance(bot, Bot):
+            raise TypeError(
+                f"setup_persistence() expected a discord.py Bot instance for 'bot', "
+                f"got {type(bot).__name__}. If calling from setup_hook, use 'self' "
+                f"(the bot instance), not an undefined variable."
+            )
+
     store = get_store()
 
     # Enable persistence if not already set up
     if not store.persistence_enabled:
-        from ..persistence.storage import FileStorageBackend
-        backend = FileStorageBackend(file_path)
+        if backend is None:
+            from ..persistence.storage import FileStorageBackend
+            backend = FileStorageBackend(file_path)
         store.enable_persistence(backend)
 
     # Restore state from disk
@@ -237,9 +260,10 @@ async def setup_persistence(
         except Exception as e:
             logger.error(f"Failed to restore persistent view '{state_key}': {e}", exc_info=True)
             failed.append(state_key)
-            # Clean up the subscriber that __init__ registered to prevent leaks
+            # Clean up the subscriber and undo entry that __init__ registered to prevent leaks
             if view is not None:
                 store.unsubscribe(view.id)
+                store._undo_enabled_views.pop(view.id, None)
 
     # Clean up entries for deleted messages/channels (but not skipped classes)
     if removed:

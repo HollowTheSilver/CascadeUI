@@ -75,17 +75,30 @@ group.add_to_view(view)
 
 ## Wrappers
 
-### `with_loading_state(button)`
+All wrappers consume the interaction response internally. The wrapped callback **must** use `interaction.followup` for any messages it sends.
 
-Shows a loading indicator while the callback runs. The callback should use `interaction.followup` for messages.
+### `with_loading_state(button, loading_label="Loading...", loading_emoji=None)`
 
-### `with_confirmation(button, message="Are you sure?")`
+Shows a loading indicator while the callback runs. The button is disabled and its label is replaced during execution.
 
-Adds a yes/no prompt before the callback runs. The fresh confirmation interaction is passed to the callback.
+### `with_confirmation(button, title="Confirm Action", message="Are you sure?", ...)`
 
-### `with_cooldown(button, seconds=5)`
+Adds an ephemeral yes/no prompt before the callback runs. Additional parameters:
 
-Enforces a per-user cooldown between clicks.
+- `color` - embed color (default: yellow)
+- `confirm_label` / `cancel_label` - button labels
+- `confirm_style` / `cancel_style` - button styles
+- `confirmed_message` / `cancelled_message` - text shown after choice
+- `on_cancel` - optional async callback on cancel
+- `timeout` - prompt timeout in seconds (default: 60)
+
+### `with_cooldown(button, seconds=5, message=None, scope="user")`
+
+Enforces a cooldown between clicks. Expired entries are automatically cleaned up.
+
+- `seconds` - cooldown duration
+- `message` - custom message (use `{remaining}` for time left)
+- `scope` - `"user"` (default), `"guild"`, or `"global"`
 
 ---
 

@@ -25,6 +25,12 @@ from .components.wrappers import with_loading_state, with_confirmation, with_coo
 from .state.actions import ActionCreators
 from .state.types import StateData
 from .state.middleware import DebouncedPersistence, logging_middleware
+from .state.computed import computed, ComputedValue
+from .state.undo import UndoMiddleware
+from .validation import (
+    ValidationResult, validate_field, validate_fields,
+    min_length, max_length, regex, choices, min_value, max_value,
+)
 from .theming.core import Theme, register_theme, get_theme, set_default_theme, get_default_theme
 from .theming.themes import default_theme, dark_theme, light_theme
 from .utils.tasks import get_task_manager
@@ -74,6 +80,22 @@ __all__ = [
     # Middleware
     "DebouncedPersistence",
     "logging_middleware",
+    "UndoMiddleware",
+
+    # Computed State
+    "computed",
+    "ComputedValue",
+
+    # Validation
+    "ValidationResult",
+    "validate_field",
+    "validate_fields",
+    "min_length",
+    "max_length",
+    "regex",
+    "choices",
+    "min_value",
+    "max_value",
 
     # Theming
     "Theme",

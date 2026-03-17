@@ -8,7 +8,7 @@ import asyncio
 
 # Import logger
 from ..utils.logging import AsyncLogger
-logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a")
+logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a", prefix="cascadeui")
 
 
 # // ========================================( Functions )======================================== // #

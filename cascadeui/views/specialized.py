@@ -19,6 +19,9 @@ class FormView(StatefulView):
 
     Supports field types: "select", "boolean".
     String fields should use a Modal workflow (see TextInput / Modal in components.inputs).
+
+    Fields can include a ``validators`` list of callables for per-field validation.
+    See ``cascadeui.validation`` for built-in validators.
     """
 
     def __init__(self, *args, title="Form", fields=None, on_submit=None, **kwargs):
@@ -34,7 +37,12 @@ class FormView(StatefulView):
 
     def _create_form_controls(self):
         """Create form controls based on field definitions."""
-        for i, field in enumerate(self.fields):
+        current_row = 0
+
+        for field in self.fields:
+            if current_row > 4:
+                break  # Discord max 5 rows (0-4)
+
             field_type = field.get("type", "string")
             field_id = field.get("id")
             field_label = field.get("label", field_id)
@@ -55,7 +63,8 @@ class FormView(StatefulView):
                     options=options,
                     min_values=1 if field_required else 0,
                     max_values=1,
-                    custom_id=f"form_{field_id}"
+                    custom_id=f"form_{field_id}",
+                    row=current_row,
                 )
 
                 # Capture field_id and select per-iteration via default args
@@ -68,22 +77,21 @@ class FormView(StatefulView):
 
                 select.callback = make_select_callback(field_id, select)
                 self.add_item(select)
+                current_row += 1  # Select takes a full row
 
             elif field_type == "boolean":
-                row = min(i, 4)  # Action rows 0-4
-
                 yes_button = StatefulButton(
                     label=f"{field_label}: Yes",
                     style=discord.ButtonStyle.success,
                     custom_id=f"form_{field_id}_yes",
-                    row=row
+                    row=current_row,
                 )
 
                 no_button = StatefulButton(
                     label=f"{field_label}: No",
                     style=discord.ButtonStyle.danger,
                     custom_id=f"form_{field_id}_no",
-                    row=row
+                    row=current_row,
                 )
 
                 # Capture field_id per-iteration via default arg
@@ -99,43 +107,71 @@ class FormView(StatefulView):
 
                 self.add_item(yes_button)
                 self.add_item(no_button)
+                current_row += 1  # Boolean pair takes one row
 
             # "string" type is intentionally not supported inline — Discord does not
             # allow text input inside Views, only inside Modals. Use a Modal workflow
             # or the components.inputs.Modal class for string collection.
 
-        # Add submit button
+        # Add submit button on the next available row (or last row if full)
+        submit_row = min(current_row, 4)
         submit_button = StatefulButton(
             label="Submit",
             style=discord.ButtonStyle.primary,
             custom_id="form_submit",
-            row=min(len(self.fields), 4)
+            row=submit_row,
         )
 
         async def submit_callback(interaction):
-            valid, message = self._validate_form()
+            valid, errors = await self._validate_form()
 
             if valid:
                 if self.on_submit:
                     await self.on_submit(interaction, self.values)
+                    # Ensure the interaction is acknowledged even if on_submit forgot
+                    if not interaction.response.is_done():
+                        await interaction.response.defer()
                 else:
                     await interaction.response.send_message(
                         f"Form submitted with values: {self.values}",
                         ephemeral=True
                     )
+                # Clean up the view after successful submission
+                await self.exit()
             else:
-                await interaction.response.send_message(
-                    f"Please complete all required fields: {message}",
-                    ephemeral=True
+                # Build an error embed with per-field messages
+                embed = discord.Embed(
+                    title="Validation Failed",
+                    color=discord.Color.red(),
                 )
+
+                if isinstance(errors, dict):
+                    # Per-field validation errors
+                    for field_id, field_errors in errors.items():
+                        field_label = field_id
+                        for f in self.fields:
+                            if f.get("id") == field_id:
+                                field_label = f.get("label", field_id)
+                                break
+                        error_messages = "\n".join(e.message for e in field_errors)
+                        embed.add_field(
+                            name=field_label,
+                            value=error_messages,
+                            inline=False,
+                        )
+                else:
+                    # Legacy string error (missing required fields)
+                    embed.description = errors
+
+                await interaction.response.send_message(embed=embed, ephemeral=True)
 
         submit_button.callback = submit_callback
         self.add_item(submit_button)
 
-    def _validate_form(self):
-        """Validate form data."""
+    async def _validate_form(self):
+        """Validate form data using both required-field checks and field validators."""
+        # Check required fields first
         missing_fields = []
-
         for field in self.fields:
             if field.get("required", False):
                 field_id = field.get("id")
@@ -143,7 +179,16 @@ class FormView(StatefulView):
                     missing_fields.append(field.get("label", field_id))
 
         if missing_fields:
-            return False, ", ".join(missing_fields)
+            return False, f"Please complete all required fields: {', '.join(missing_fields)}"
+
+        # Run per-field validators if any field has them
+        has_validators = any(field.get("validators") for field in self.fields)
+        if has_validators:
+            from ..validation import validate_fields
+            errors = await validate_fields(self.values, self.fields)
+            if errors:
+                return False, errors
+
         return True, ""
 
     async def _update_form_display(self):

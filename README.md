@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![discord.py 2.1+](https://img.shields.io/badge/discord.py-2.1+-738adb.svg)](https://github.com/Rapptz/discord.py)
-[![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-blue?logo=readthedocs)](https://hollowthesilver.github.io/CascadeUI/)
+[![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-8A2BE2?logo=readthedocs)](https://hollowthesilver.github.io/CascadeUI/)
 
 > **Note**: CascadeUI is currently in active development and has not yet been officially released. Installation is source-only until the package is published on PyPI.
 
@@ -21,11 +21,17 @@ CascadeUI brings a Redux-inspired architecture to Discord bot interfaces. Views,
   - Singleton store with dispatch/reducer cycle
   - Action history for debugging
   - Subscriber filtering by action type and state selectors
+  - Action batching for atomic multi-dispatch operations
+  - Event hooks for reacting to state lifecycle events
+  - Computed/derived values with automatic caching
 
 - **Stateful Views**
   - Wraps discord.py `View` with automatic state integration
   - Lifecycle management: send, interact, timeout, cleanup
   - View-to-view transitions with navigation history
+  - Navigation stack with push/pop for multi-level UIs
+  - Per-user and per-guild state scoping
+  - Undo/redo support with configurable history depth
   - Pre-built patterns: `TabView`, `WizardView`, `FormView`, `PaginatedView`
 
 - **Stateful Components**
@@ -33,6 +39,12 @@ CascadeUI brings a Redux-inspired architecture to Discord bot interfaces. Views,
   - Composite components: `ConfirmationButtons`, `PaginationControls`, `FormLayout`, `ToggleGroup`
   - Behavioral wrappers: loading states, confirmation prompts, per-user cooldowns
   - Utilities: `ProgressBar` for visual progress in embeds
+
+- **Form Validation**
+  - Built-in validators: `min_length`, `max_length`, `regex`, `choices`, `min_value`, `max_value`
+  - Custom sync and async validators
+  - Per-field error reporting with `validate_fields()`
+  - Works with `FormView`, `Modal`, or standalone
 
 - **DevTools**
   - Built-in state inspector with paginated embed output
@@ -48,11 +60,13 @@ CascadeUI brings a Redux-inspired architecture to Discord bot interfaces. Views,
   - Single `setup_persistence()` entry point for all persistence
   - Data persistence via `state_key` (restore on re-invoke)
   - View persistence via `PersistentView` (survive bot restarts)
+  - Pluggable storage backends: JSON file, SQLite, Redis
   - Automatic save on state change, restore on startup
+  - Migration utilities for switching between backends
 
 - **Middleware**
   - Intercept and transform actions in the dispatch pipeline
-  - Built-in: debounced persistence, action logging
+  - Built-in: debounced persistence, action logging, undo/redo
   - Write custom middleware for rate limiting, validation, analytics
 
 - **Custom Reducers**
@@ -70,6 +84,10 @@ CascadeUI brings a Redux-inspired architecture to Discord bot interfaces. Views,
 git clone https://github.com/HollowTheSilver/CascadeUI.git
 cd CascadeUI
 pip install -e .
+
+# Optional backends
+pip install -e ".[sqlite]"   # SQLite persistence via aiosqlite
+pip install -e ".[redis]"    # Redis persistence
 ```
 
 **Requirements**: Python 3.10+ | discord.py 2.1+
@@ -180,6 +198,112 @@ await view.send(content="Hello")
 
 Views automatically clean up on timeout (disabling components and notifying the state store) and support transitions between views via `view.transition_to(OtherView)`.
 
+### Navigation Stack
+
+Views can push onto and pop from a navigation stack, enabling multi-level UIs like menus with sub-pages:
+
+```python
+class MainMenuView(StatefulView):
+    async def go_settings(self, interaction):
+        await interaction.response.defer()
+        new_view = await self.push(SettingsView, interaction)
+        await interaction.edit_original_response(embed=new_view.build_embed(), view=new_view)
+
+class SettingsView(StatefulView):
+    async def go_back(self, interaction):
+        await interaction.response.defer()
+        prev_view = await self.pop(interaction)
+        if prev_view:
+            await interaction.edit_original_response(view=prev_view)
+```
+
+Push stops the current view and stacks it. Pop restores the previous view. The stack is stored in session state and cleaned up automatically.
+
+### Undo/Redo
+
+Enable undo/redo on any view by setting `enable_undo = True`. Each dispatched action creates a state snapshot. Undo restores the previous snapshot; redo re-applies it.
+
+```python
+from cascadeui import UndoMiddleware, get_store
+
+# Add the middleware once (e.g., in your cog's setup)
+store = get_store()
+store.add_middleware(UndoMiddleware(store))
+
+class MyView(StatefulView):
+    enable_undo = True
+    undo_limit = 20  # max snapshots to keep
+
+    async def undo_action(self, interaction):
+        await interaction.response.defer()
+        await self.undo(interaction)
+
+    async def redo_action(self, interaction):
+        await interaction.response.defer()
+        await self.redo(interaction)
+```
+
+Batched actions (via `store.batch()`) create a single undo entry. Performing a new action after undoing clears the redo stack.
+
+### State Scoping
+
+Isolate state per user or per guild so concurrent users don't overwrite each other:
+
+```python
+class ScopedCounterView(StatefulView):
+    scope = "user"  # or "guild"
+
+    async def click(self, interaction):
+        await interaction.response.defer()
+        current = self.scoped_state.get("clicks", 0)
+        await self.dispatch_scoped({"clicks": current + 1})
+```
+
+Each scoped view gets its own namespace in the state tree. Two users interacting with the same view type see independent data.
+
+### Computed State
+
+Derived values that cache automatically and only recompute when their input changes:
+
+```python
+from cascadeui import computed, get_store
+
+@computed(selector=lambda s: s.get("application", {}).get("votes", {}))
+def total_votes(votes):
+    return sum(votes.values())
+
+# Access anywhere
+store = get_store()
+total = store.computed["total_votes"]  # cached until votes dict changes
+```
+
+### Action Batching
+
+Dispatch multiple actions atomically. Subscribers and persistence fire once after all actions complete:
+
+```python
+async with self.batch() as b:
+    await b.dispatch("VOTE_CAST", {"user_id": user_id, "delta": 1})
+    await b.dispatch("VOTE_LOG", {"entry": "User voted +1"})
+# Single notification cycle fires here
+```
+
+### Event Hooks
+
+React to state lifecycle events without modifying reducers:
+
+```python
+store = get_store()
+
+async def on_interaction(action, state):
+    print(f"Component {action['payload']['component_id']} clicked")
+
+store.on("component_interaction", on_interaction)
+store.off("component_interaction", on_interaction)  # unregister
+```
+
+Hooks fire after reducers and subscribers. They receive the final state and cannot modify it.
+
 ### View Patterns
 
 CascadeUI includes pre-built view patterns for common UI layouts:
@@ -267,6 +391,49 @@ Wrappers modify component behavior without changing the component itself:
 | `with_confirmation(button, message="...")` | Adds a yes/no prompt before execution |
 | `with_cooldown(button, seconds=5)` | Enforces a per-user cooldown between clicks |
 
+> **Note**: Wrappers consume the interaction response internally. Your wrapped callback must use `interaction.followup` instead of `interaction.response`.
+
+### Form Validation
+
+Validate user input with built-in or custom validators:
+
+```python
+from cascadeui import validate_fields, min_length, max_length, regex, min_value
+
+field_defs = [
+    {
+        "id": "username",
+        "label": "Username",
+        "validators": [
+            min_length(3),
+            max_length(20),
+            regex(r"^[a-zA-Z0-9_]+$", "Alphanumeric and underscores only"),
+        ],
+    },
+    {
+        "id": "age",
+        "label": "Age",
+        "validators": [min_value(13), max_value(120)],
+    },
+]
+
+errors = await validate_fields(values, field_defs)
+# errors: {"username": [ValidationResult(valid=False, message="...")], ...}
+```
+
+Built-in validators:
+
+| Validator | Description |
+|-----------|-------------|
+| `min_length(n)` | String must be at least `n` characters |
+| `max_length(n)` | String must be at most `n` characters |
+| `regex(pattern, msg)` | String must match the regex pattern |
+| `choices(allowed)` | Value must be in the allowed list |
+| `min_value(n)` | Number must be at least `n` |
+| `max_value(n)` | Number must be at most `n` |
+
+Custom validators are plain functions `(value, field, all_values) -> ValidationResult`. Async validators are also supported.
+
 ### Theming
 
 Register themes globally and apply them per-view or as a default:
@@ -294,18 +461,17 @@ Call `setup_persistence()` once in your bot's `setup_hook` to enable state savin
 
 ```python
 from cascadeui import setup_persistence
+from cascadeui.persistence import SQLiteBackend
 
 class MyBot(commands.Bot):
     async def setup_hook(self):
-        # Load cogs first (registers PersistentView subclasses)
         await self.load_extension("cogs.dashboard")
         await self.load_extension("cogs.counter")
 
-        # Then enable persistence
-        # Without bot: data-only (views with state_key restore on re-invoke)
-        await setup_persistence(file_path="bot_state.json")
+        # SQLite backend (recommended)
+        await setup_persistence(self, backend=SQLiteBackend("cascadeui.db"))
 
-        # With bot: also re-attaches PersistentView UIs that survive restarts
+        # Or JSON file (no extra dependencies)
         await setup_persistence(self, file_path="bot_state.json")
 ```
 
@@ -322,6 +488,25 @@ class RoleSelectorView(PersistentView):
             custom_id="roles:get",  # required for persistent views
             callback=self.give_role,
         ))
+```
+
+#### Storage Backends
+
+| Backend | Install | Description |
+|---------|---------|-------------|
+| `FileStorageBackend` | built-in | JSON file storage (default) |
+| `SQLiteBackend` | `pip install cascadeui[sqlite]` | SQLite via aiosqlite, WAL mode |
+| `RedisBackend` | `pip install cascadeui[redis]` | Redis with optional TTL |
+
+Migrate between backends:
+
+```python
+from cascadeui.persistence import migrate_storage, FileStorageBackend, SQLiteBackend
+
+await migrate_storage(
+    source=FileStorageBackend("old_state.json"),
+    target=SQLiteBackend("cascadeui.db"),
+)
 ```
 
 ### Custom Reducers
@@ -372,6 +557,7 @@ Built-in middleware:
 |-----------|-------------|
 | `DebouncedPersistence(store, interval)` | Batches disk writes, flushes on lifecycle events |
 | `logging_middleware()` | Logs every dispatched action at INFO level |
+| `UndoMiddleware(store)` | Snapshots state for views with `enable_undo = True` |
 
 ### DevTools
 
@@ -403,13 +589,15 @@ User clicks button
        |
   COMPONENT_INTERACTION action dispatched
        |
-  Middleware pipeline (logging, persistence, custom)
+  Middleware pipeline (logging, persistence, undo, custom)
        |
   Reducer transforms state immutably
        |
-  Subscribers notified (filtered by action type)
+  Subscribers notified (filtered by action type + selector)
        |
   Views update their UI from new state
+       |
+  Hooks fire (read-only, post-update)
 ```
 
 ---
@@ -421,9 +609,11 @@ Working examples are in the [`examples/`](examples/) directory:
 | Example | What it covers |
 |---------|---------------|
 | **counter.py** | Basic stateful counter with increment, decrement, reset |
-| **themed_form.py** | Theme switching, component wrappers, pagination, form views |
-| **persistent_counter.py** | Data persistence to disk with `setup_persistence` |
-| **persistent_dashboard.py** | Persistent views that survive bot restarts with `PersistentView` |
+| **themed_form.py** | Theme switching, component wrappers, pagination, form/modal validation |
+| **persistence.py** | SQLite-backed data persistence and `PersistentView` that survives restarts |
+| **navigation.py** | Navigation stack with push/pop between multi-level views |
+| **state_features.py** | Per-user state scoping, action batching, computed values, event hooks |
+| **undo_redo.py** | Undo/redo with `UndoMiddleware` and stack depth display |
 
 Each example is a discord.py cog that can be loaded into any bot.
 
@@ -459,4 +649,3 @@ isort --profile black --line-length 100 cascadeui/
 MIT License - see [LICENSE](LICENSE) for details.
 
 ---
-

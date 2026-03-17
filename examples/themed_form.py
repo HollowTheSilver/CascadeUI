@@ -20,8 +20,16 @@ from cascadeui import (
     register_theme,
     get_theme,
     set_default_theme,
-    get_default_theme
+    get_default_theme,
+    choices,
+    validate_fields,
+    min_length,
+    max_length,
+    regex,
+    min_value,
+    max_value,
 )
+from cascadeui.components.inputs import Modal, TextInput
 
 
 logger = logging.getLogger(__name__)
@@ -223,7 +231,7 @@ class ThemedFormExample(commands.Cog, name="themed_form_example"):
                     style=discord.ButtonStyle.primary,
                     callback=self.process_data
                 )
-                save_button = with_loading_state(save_button)
+                save_button = with_loading_state(save_button, loading_label="Processing...")
                 self.add_item(save_button)
 
                 delete_button = StatefulButton(
@@ -234,7 +242,13 @@ class ThemedFormExample(commands.Cog, name="themed_form_example"):
                 delete_button = with_confirmation(
                     delete_button,
                     title="Confirm Deletion",
-                    message="Are you sure you want to delete these items?"
+                    message="Are you sure you want to delete these items?",
+                    color=discord.Color.red(),
+                    confirm_label="Delete",
+                    cancel_label="Keep",
+                    confirm_style=discord.ButtonStyle.danger,
+                    confirmed_message="Items deleted successfully!",
+                    cancelled_message="Items kept safe.",
                 )
                 self.add_item(delete_button)
 
@@ -250,7 +264,8 @@ class ThemedFormExample(commands.Cog, name="themed_form_example"):
                 await interaction.followup.send("Data processed successfully!", ephemeral=True)
 
             async def delete_items(self, interaction):
-                await interaction.response.send_message("Items deleted successfully!", ephemeral=True)
+                # confirmed_message handles user feedback — just do the work here
+                pass  # e.g. await db.delete_items(interaction.user.id)
 
         view = ComponentTestView(context)
         embed = discord.Embed(
@@ -313,45 +328,149 @@ class ThemedFormExample(commands.Cog, name="themed_form_example"):
 
     @commands.hybrid_command(
         name="formtest",
-        description="Test CascadeUI FormView."
+        description="Test CascadeUI FormView with validation."
     )
     async def formtest(self, context):
-        """Test FormView specialized view."""
+        """Test FormView with field validation.
+
+        Submit without filling required fields to see validation errors.
+        """
 
         fields = [
+            {
+                "id": "role",
+                "type": "select",
+                "label": "Preferred Role",
+                "required": True,
+                "options": [
+                    {"label": "Developer", "value": "dev"},
+                    {"label": "Designer", "value": "design"},
+                    {"label": "Manager", "value": "manager"},
+                ],
+                "validators": [choices(["dev", "design", "manager"])],
+            },
             {
                 "id": "subscribe",
                 "type": "boolean",
                 "label": "Subscribe to newsletter",
-                "required": False
+                "required": False,
             },
             {
-                "id": "notifications",
+                "id": "terms",
                 "type": "boolean",
-                "label": "Enable notifications",
-                "required": False
-            }
+                "label": "Accept Terms",
+                "required": True,
+            },
         ]
 
         async def on_submit(interaction, values):
             await interaction.response.send_message(
                 f"Form submitted with values: {values}",
-                ephemeral=True
+                ephemeral=True,
             )
 
         view = FormView(
             context=context,
             title="User Preferences",
             fields=fields,
-            on_submit=on_submit
+            on_submit=on_submit,
         )
 
         embed = discord.Embed(
             title="User Preferences Form",
-            description="Please fill out the information below."
+            description="Please fill out the information below.\nFields marked * are required.",
         )
         view.get_theme().apply_to_embed(embed)
 
+        await view.send(embed=embed)
+
+    @commands.hybrid_command(
+        name="validatetest",
+        description="Test text field validation with a modal."
+    )
+    async def validatetest(self, context):
+        """Test per-field text validation through a Modal dialog."""
+
+        field_defs = [
+            {
+                "id": "input_username",
+                "label": "Username",
+                "validators": [
+                    min_length(3),
+                    max_length(20),
+                    regex(r"^[a-zA-Z0-9_]+$", "Alphanumeric and underscores only"),
+                ],
+            },
+            {
+                "id": "input_age",
+                "label": "Age",
+                "validators": [min_value(13), max_value(120)],
+            },
+        ]
+
+        class ValidateFormView(StatefulView):
+            def __init__(self, ctx):
+                super().__init__(context=ctx)
+                self.add_item(StatefulButton(
+                    label="Open Registration Form",
+                    style=discord.ButtonStyle.primary,
+                    callback=self.open_form,
+                ))
+                self.add_exit_button()
+
+            async def open_form(self, interaction):
+                modal = Modal(
+                    title="Registration",
+                    inputs=[
+                        TextInput(
+                            label="Username",
+                            placeholder="3-20 chars, alphanumeric",
+                            min_length=1,
+                            max_length=20,
+                        ),
+                        TextInput(
+                            label="Age",
+                            placeholder="Must be 13-120",
+                            min_length=1,
+                            max_length=3,
+                        ),
+                    ],
+                    callback=self._on_submit,
+                    view_id=self.id,
+                )
+                await interaction.response.send_modal(modal)
+
+            async def _on_submit(self, interaction, values):
+                errors = await validate_fields(values, field_defs)
+
+                if errors:
+                    embed = discord.Embed(
+                        title="Validation Failed",
+                        color=discord.Color.red(),
+                    )
+                    label_map = {"input_username": "Username", "input_age": "Age"}
+                    for field_id, field_errors in errors.items():
+                        name = label_map.get(field_id, field_id)
+                        messages = "\n".join(e.message for e in field_errors)
+                        embed.add_field(name=name, value=messages, inline=False)
+                    await interaction.response.send_message(embed=embed, ephemeral=True)
+                else:
+                    username = values.get("input_username", "?")
+                    age = values.get("input_age", "?")
+                    await interaction.response.send_message(
+                        f"Registration successful! Username: **{username}**, Age: **{age}**",
+                        ephemeral=True,
+                    )
+
+            async def update_from_state(self, state):
+                pass
+
+        view = ValidateFormView(context)
+        embed = discord.Embed(
+            title="Validation Test",
+            description="Click the button below to open a form with field validation.",
+        )
+        view.get_theme().apply_to_embed(embed)
         await view.send(embed=embed)
 
 

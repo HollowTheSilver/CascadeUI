@@ -29,5 +29,9 @@ MiddlewareFn = Callable[[Action, StateData, Callable], Awaitable[StateData]]
 # Returns any value; the store compares old vs new to decide whether to notify.
 SelectorFn = Callable[[StateData], Any]
 
+# Hook: async callable receiving (action, state) -> None.
+# Hooks are read-only observers that fire after reducers and subscribers.
+HookFn = Callable[[Action, StateData], Awaitable[None]]
+
 # Type variable for generic functions
 T = TypeVar('T')

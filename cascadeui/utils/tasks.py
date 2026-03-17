@@ -36,7 +36,7 @@ class TaskManager:
         except Exception as e:
             # Log exception but don't crash
             from ..utils.logging import AsyncLogger
-            logger = AsyncLogger(name="cascadeui.tasks", level="ERROR", path="logs", mode="a")
+            logger = AsyncLogger(name="cascadeui.tasks", level="ERROR", path="logs", mode="a", prefix="cascadeui")
             logger.error(f"Task error for owner {owner_id}: {e}")
             raise
         finally:

@@ -25,13 +25,37 @@ Sends the view as a message. Handles state registration and message tracking.
 
 Dispatches an action through the store with `source=self.id`.
 
-#### `transition_to(view)`
+#### `transition_to(view_class, interaction=None, **kwargs)`
 
-Transitions to another view, cleaning up the current one.
+Transitions to another view class, cleaning up the current one. One-way (no stack).
 
-#### `add_exit_button(label="Exit", style=ButtonStyle.secondary, row=4)`
+#### `push(view_class, interaction, **kwargs)`
 
-Adds a gray exit button that calls `self.exit()`.
+Pushes the current view onto the navigation stack and returns a new instance of `view_class`.
+
+#### `pop(interaction)`
+
+Pops the top entry from the navigation stack, reconstructs that view, and returns it. Returns `None` if the stack is empty.
+
+#### `batch()`
+
+Returns an async context manager for batched dispatch. Convenience for `self.state_store.batch()`.
+
+#### `undo(interaction=None)`
+
+Undoes the last state change for this view's session (requires `enable_undo = True` and `UndoMiddleware`).
+
+#### `redo(interaction=None)`
+
+Redoes the last undone state change.
+
+#### `dispatch_scoped(data)`
+
+Updates scoped state (requires `scope` to be set on the view class).
+
+#### `add_exit_button(label="Exit", style=ButtonStyle.secondary, row=None, custom_id=None)`
+
+Adds a gray exit button that calls `self.exit()`. Pass `custom_id` for `PersistentView` subclasses.
 
 #### `exit(delete_message=False)`
 
@@ -55,10 +79,16 @@ Returns a slice of state. If the return value hasn't changed, `update_from_state
 - `state_key` (str | None): Stable data identity key
 - `message` (Message | None): The sent message, if any
 - `state_store` (StateStore): The singleton store
+- `session_id` (str | None): Session ID for this view
+- `scoped_state` (dict): The scoped state for this view's user/guild (empty dict if no scope)
 
 ### Class Attributes
 
 - `subscribed_actions` (set[str] | None): Action types to listen for. Default includes `VIEW_UPDATED`, `VIEW_DESTROYED`, `COMPONENT_INTERACTION`, `SESSION_UPDATED`. Set to `None` for all actions.
+- `scope` (str | None): `"user"`, `"guild"`, or `None`. Determines state scoping.
+- `enable_undo` (bool): Enable undo/redo for this view (default: `False`).
+- `undo_limit` (int): Max undo stack depth (default: `20`).
+- `auto_back_button` (bool): Automatically add a back button when pushed (default: `False`).
 
 ---
 
@@ -89,15 +119,18 @@ Called after the view is restored on bot restart. Override for post-restore setu
 - `state_key` must be provided
 - All components must have explicit `custom_id` values
 - Auto-registers subclasses via `__init_subclass__`
+- Cannot be sent as ephemeral (`send(ephemeral=True)` raises `ValueError`)
 
 ---
 
-## `setup_persistence(bot=None, file_path="cascadeui_state.json")`
+## `setup_persistence(bot=None, *, file_path=None, backend=None)`
 
 Single entry point for all persistence. Call once in `setup_hook`, after loading cogs.
 
 - Without `bot`: data-only persistence
 - With `bot`: also re-attaches PersistentView instances
+- `backend`: a `StorageBackend` instance (e.g., `SQLiteBackend`, `RedisBackend`)
+- `file_path`: shorthand for `FileStorageBackend(file_path)` (used when `backend` is not provided)
 
 Returns a dict: `{"restored": [...], "skipped": [...], "failed": [...], "removed": [...]}`
 
@@ -127,7 +160,7 @@ WizardView(
 ```python
 FormView(
     context=None,
-    fields=[{"id": str, "type": "select"|"boolean", "label": str, ...}, ...],
+    fields=[{"id": str, "type": "select"|"boolean", "label": str, "validators": [...], ...}, ...],
     on_submit=async_fn,
     **kwargs,
 )

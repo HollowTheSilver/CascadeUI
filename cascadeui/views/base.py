@@ -3,7 +3,7 @@
 
 
 import uuid
-from typing import Any, Optional, Set
+from typing import Any, Dict, Optional, Set
 from ..utils.tasks import get_task_manager
 from ..utils.errors import with_error_boundary, safe_execute
 
@@ -16,7 +16,19 @@ from ..state.actions import ActionCreators
 
 # Add logger
 from ..utils.logging import AsyncLogger
-logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a")
+logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a", prefix="cascadeui")
+
+
+# // ========================================( View Registry )======================================== // #
+
+
+# Maps class name -> class for navigation stack resolution
+_view_class_registry: Dict[str, type] = {}
+
+
+def _register_view_class(cls):
+    """Auto-register view classes for nav stack class resolution."""
+    _view_class_registry[cls.__name__] = cls
 
 
 # // ========================================( Classes )======================================== // #
@@ -25,11 +37,26 @@ logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a")
 class StatefulView(View):
     """Base class for all stateful UI views."""
 
+    # Subclass config: state scoping ("user", "guild", or None)
+    scope: Optional[str] = None
+
+    # Subclass config: enable undo/redo support
+    enable_undo: bool = False
+    undo_limit: int = 20
+
+    # Subclass config: auto-add a back button when pushed onto nav stack
+    auto_back_button: bool = True
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        _register_view_class(cls)
+
     def __init__(self, *args, **kwargs):
         # Extract custom arguments before passing to View
         self.state_store = kwargs.pop("state_store", None) or get_store()
         self.session_id = kwargs.pop("session_id", None)
         self.user_id = kwargs.pop("user_id", None)
+        self.guild_id = kwargs.pop("guild_id", None)
         self.context = kwargs.pop("context", None)
         self.interaction = kwargs.pop("interaction", None)
         self.theme = kwargs.pop("theme", None)
@@ -43,6 +70,7 @@ class StatefulView(View):
 
         # Message reference
         self._message = None
+        self._ephemeral = False
 
         # Whether state registration has been done
         self._registered = False
@@ -50,7 +78,7 @@ class StatefulView(View):
         # Get task manager
         self.task_manager = get_task_manager()
 
-        # Derive user_id and session_id from context/interaction
+        # Derive user_id, guild_id, and session_id from context/interaction
         if self.interaction is None and self.context is not None:
             if hasattr(self.context, "interaction") and self.context.interaction:
                 self.interaction = self.context.interaction
@@ -58,8 +86,14 @@ class StatefulView(View):
             if self.user_id is None and hasattr(self.context, "author"):
                 self.user_id = self.context.author.id
 
-        if self.interaction is not None and self.user_id is None:
-            self.user_id = self.interaction.user.id
+            if self.guild_id is None and hasattr(self.context, "guild") and self.context.guild:
+                self.guild_id = self.context.guild.id
+
+        if self.interaction is not None:
+            if self.user_id is None:
+                self.user_id = self.interaction.user.id
+            if self.guild_id is None and self.interaction.guild:
+                self.guild_id = self.interaction.guild_id
 
         if self.session_id is None and self.user_id is not None:
             self.session_id = f"user_{self.user_id}"
@@ -75,6 +109,10 @@ class StatefulView(View):
 
         # Subscribe to state updates with action filter and selector
         self.state_store.subscribe(self.id, self._on_state_changed, self.subscribed_actions, selector)
+
+        # Register for undo tracking if this view has it enabled
+        if self.enable_undo:
+            self.state_store._undo_enabled_views[self.id] = self.undo_limit
 
     def create_task(self, coro):
         """Create a task owned by this view."""
@@ -165,6 +203,15 @@ class StatefulView(View):
         """
         await self._register_state()
 
+        if ephemeral:
+            self._ephemeral = True
+            if self.timeout is None:
+                logger.warning(
+                    f"{self.__class__.__name__}: ephemeral views with timeout=None will lose "
+                    "editability after the interaction token expires (15 minutes). "
+                    "Consider setting a finite timeout."
+                )
+
         send_kwargs = {"view": self}
         if content is not None:
             send_kwargs["content"] = content
@@ -242,12 +289,19 @@ class StatefulView(View):
             except discord.NotFound:
                 pass  # Message was already deleted
             except Exception as e:
-                logger.debug(f"Could not disable components on timeout: {e}")
+                hint = ""
+                if self._ephemeral:
+                    hint = (
+                        " This is likely because the interaction token expired (15-minute limit). "
+                        "Ephemeral messages cannot be edited after the token expires."
+                    )
+                logger.warning(f"Could not disable components on timeout: {e}.{hint}")
 
         # Cancel tasks and clean up state, mirroring exit()
         self.task_manager.cancel_tasks(self.id)
-        await self.dispatch("VIEW_DESTROYED", ActionCreators.view_destroyed(self.id))
         self.state_store.unsubscribe(self.id)
+        self.state_store._undo_enabled_views.pop(self.id, None)
+        await self.dispatch("VIEW_DESTROYED", ActionCreators.view_destroyed(self.id))
 
     async def _on_state_changed(self, state, action):
         """React to state changes."""
@@ -291,6 +345,235 @@ class StatefulView(View):
             )
             self.create_task(self.dispatch("VIEW_UPDATED", payload))
 
+    # // ========================================( Batching )======================================== // #
+
+    def batch(self):
+        """Start an atomic batch of dispatches from this view.
+
+        Usage:
+            async with self.batch() as batch:
+                await batch.dispatch("SESSION_UPDATED", payload1)
+                await batch.dispatch("NAVIGATION", payload2)
+        """
+        return self.state_store.batch()
+
+    # // ========================================( Scoped State )======================================== // #
+
+    @property
+    def scoped_state(self) -> Dict[str, Any]:
+        """Get the scoped state slice for this view based on its scope class var.
+
+        Returns an empty dict if no scope is set or identifiers are missing.
+        """
+        if self.scope is None:
+            return {}
+
+        try:
+            if self.scope == "user" and self.user_id is not None:
+                return self.state_store.get_scoped("user", user_id=self.user_id)
+            elif self.scope == "guild" and self.guild_id is not None:
+                return self.state_store.get_scoped("guild", guild_id=self.guild_id)
+        except ValueError:
+            pass
+        return {}
+
+    async def dispatch_scoped(self, data: Dict[str, Any]) -> Any:
+        """Dispatch a SCOPED_UPDATE action for this view's scope.
+
+        Args:
+            data: Dict of key-value pairs to merge into the scoped state.
+        """
+        if self.scope is None:
+            raise ValueError("Cannot dispatch scoped update: view has no scope set")
+
+        scope_id = None
+        if self.scope == "user":
+            scope_id = self.user_id
+        elif self.scope == "guild":
+            scope_id = self.guild_id
+
+        if scope_id is None:
+            raise ValueError(f"Cannot dispatch scoped update: no {self.scope}_id available")
+
+        payload = {
+            "scope": self.scope,
+            "scope_id": scope_id,
+            "data": data,
+        }
+        return await self.dispatch("SCOPED_UPDATE", payload)
+
+    # // ========================================( Navigation Stack )======================================== // #
+
+    async def push(self, view_class, interaction=None, **kwargs):
+        """Push a new view onto the navigation stack and transition to it.
+
+        The current view's class and kwargs are saved so pop() can
+        reconstruct it later. Uses batch() for atomic dispatch.
+
+        Args:
+            view_class: The StatefulView subclass to push to.
+            interaction: Discord interaction for the new view.
+            **kwargs: Additional kwargs passed to the new view constructor.
+        """
+        current_interaction = interaction or self.interaction
+
+        # Build payload via ActionCreators for consistency
+        push_payload = ActionCreators.navigation_push(
+            session_id=self.session_id,
+            class_name=self.__class__.__name__,
+            module=self.__class__.__module__,
+        )
+
+        # Stop this view and clean up its subscription before dispatching
+        self.stop()
+        self.state_store.unsubscribe(self.id)
+        self.state_store._undo_enabled_views.pop(self.id, None)
+
+        await self.state_store.dispatch("NAVIGATION_PUSH", push_payload, source_id=self.id)
+
+        # Pass through state store and session
+        if "state_store" not in kwargs:
+            kwargs["state_store"] = self.state_store
+        if "session_id" not in kwargs:
+            kwargs["session_id"] = self.session_id
+        if "user_id" not in kwargs:
+            kwargs["user_id"] = self.user_id
+        if "guild_id" not in kwargs:
+            kwargs["guild_id"] = self.guild_id
+
+        # Create new view
+        new_view = view_class(interaction=current_interaction, **kwargs)
+        new_view._ephemeral = self._ephemeral
+
+        # Add back button if the target view wants one
+        if new_view.auto_back_button:
+            new_view._add_back_button()
+
+        return new_view
+
+    async def pop(self, interaction=None):
+        """Pop the current view and return to the previous one on the nav stack.
+
+        Returns the reconstructed previous view, or None if the stack is empty.
+        """
+        if not self.session_id:
+            return None
+
+        # Check if there's anything on the stack
+        sessions = self.state_store.state.get("sessions", {})
+        session = sessions.get(self.session_id, {})
+        nav_stack = session.get("nav_stack", [])
+
+        if not nav_stack:
+            return None
+
+        current_interaction = interaction or self.interaction
+
+        # Capture the entry BEFORE dispatching (reducer deepcopies, so our
+        # reference is stale after dispatch — read first, dispatch second)
+        entry = nav_stack[-1]
+
+        # Pop from state
+        pop_payload = ActionCreators.navigation_pop(self.session_id)
+        await self.state_store.dispatch("NAVIGATION_POP", pop_payload, source_id=self.id)
+
+        # Resolve the view class
+        class_name = entry.get("class_name")
+        view_cls = _view_class_registry.get(class_name)
+
+        if view_cls is None:
+            logger.warning(f"Cannot pop: view class '{class_name}' not in registry")
+            return None
+
+        # Stop this view and clean up its subscription
+        self.stop()
+        self.state_store.unsubscribe(self.id)
+        self.state_store._undo_enabled_views.pop(self.id, None)
+
+        # Reconstruct previous view
+        new_view = view_cls(
+            interaction=current_interaction,
+            state_store=self.state_store,
+            session_id=self.session_id,
+            user_id=self.user_id,
+            guild_id=self.guild_id,
+        )
+        new_view._ephemeral = self._ephemeral
+
+        return new_view
+
+    def _add_back_button(self):
+        """Add a back button that pops the nav stack."""
+        button = discord.ui.Button(
+            label="Back",
+            style=discord.ButtonStyle.secondary,
+            emoji="◀",
+            row=4,
+            custom_id=f"nav_back_{self.id[:8]}",
+        )
+
+        async def back_callback(interaction):
+            await interaction.response.defer()
+            prev_view = await self.pop(interaction)
+            if prev_view:
+                try:
+                    # Always edit via the interaction token so the deferred
+                    # response is properly consumed by Discord
+                    msg = await interaction.edit_original_response(view=prev_view)
+                    prev_view._message = msg
+                except discord.HTTPException:
+                    pass
+            else:
+                # Stack was empty — pop() already stopped/unsubscribed this view,
+                # so remove the dead components from the message to avoid a broken UI
+                try:
+                    await interaction.edit_original_response(view=None)
+                except discord.HTTPException:
+                    pass
+
+        button.callback = back_callback
+        self.add_item(button)
+
+    # // ========================================( Undo/Redo )======================================== // #
+
+    async def undo(self, interaction=None):
+        """Undo the last state change for this view's session.
+
+        Dispatches an UNDO action whose reducer pops the undo stack,
+        pushes current application state to the redo stack, and restores
+        the snapshot. All state changes happen inside the reducer pipeline.
+        """
+        if not self.session_id:
+            return
+
+        # Pre-check: don't dispatch if stack is empty (avoids a no-op dispatch)
+        sessions = self.state_store.state.get("sessions", {})
+        session = sessions.get(self.session_id, {})
+        if not session.get("undo_stack"):
+            return
+
+        await self.dispatch("UNDO", {"session_id": self.session_id})
+
+    async def redo(self, interaction=None):
+        """Redo the last undone state change for this view's session.
+
+        Dispatches a REDO action whose reducer pops the redo stack,
+        pushes current application state to the undo stack, and restores
+        the snapshot. All state changes happen inside the reducer pipeline.
+        """
+        if not self.session_id:
+            return
+
+        # Pre-check: don't dispatch if stack is empty
+        sessions = self.state_store.state.get("sessions", {})
+        session = sessions.get(self.session_id, {})
+        if not session.get("redo_stack"):
+            return
+
+        await self.dispatch("REDO", {"session_id": self.session_id})
+
+    # // ========================================( Transitions )======================================== // #
+
     async def transition_to(self, view_class, interaction=None, **kwargs):
         """Transition from this view to a new view."""
         current_interaction = interaction or self.interaction
@@ -308,11 +591,15 @@ class StatefulView(View):
         if "session_id" not in kwargs:
             kwargs["session_id"] = self.session_id
 
+        # Clean up this view BEFORE constructing the new one, so an exception
+        # in the new view's __init__ doesn't leave us subscribed forever
+        self.stop()
+        self.state_store.unsubscribe(self.id)
+        self.state_store._undo_enabled_views.pop(self.id, None)
+
         # Create new view
         new_view = view_class(interaction=current_interaction, **kwargs)
-
-        # Clean up this view
-        self.stop()
+        new_view._ephemeral = self._ephemeral
 
         return new_view
 
@@ -324,6 +611,11 @@ class StatefulView(View):
         # Stop this view
         self.stop()
 
+        # Unsubscribe BEFORE dispatching VIEW_DESTROYED so the view's own
+        # subscriber doesn't re-render after we remove components.
+        self.state_store.unsubscribe(self.id)
+        self.state_store._undo_enabled_views.pop(self.id, None)
+
         # Clean up the message
         if self._message:
             try:
@@ -332,24 +624,31 @@ class StatefulView(View):
                 else:
                     await self._message.edit(view=None)
             except Exception as e:
-                logger.error(f"Error cleaning up message: {e}")
+                hint = ""
+                if self._ephemeral:
+                    hint = (
+                        " This is likely because the interaction token expired (15-minute limit). "
+                        "Ephemeral messages cannot be edited after the token expires."
+                    )
+                logger.error(f"Error cleaning up message: {e}.{hint}")
 
-        # Dispatch view destroyed action
+        # Dispatch view destroyed action (other subscribers still see this)
         await self.dispatch("VIEW_DESTROYED", ActionCreators.view_destroyed(self.id))
-
-        # Unsubscribe from state updates
-        self.state_store.unsubscribe(self.id)
 
         return True
 
     def add_exit_button(self, label="Exit", style=discord.ButtonStyle.secondary,
-                        row=None, emoji="❌", delete_message=False):
-        """Add a button that exits this view when clicked."""
+                        row=None, emoji="❌", delete_message=False, custom_id=None):
+        """Add a button that exits this view when clicked.
+
+        For PersistentView subclasses, pass a custom_id (e.g. ``custom_id="exit"``).
+        """
         button = discord.ui.Button(
             label=label,
             style=style,
             row=row,
-            emoji=emoji
+            emoji=emoji,
+            custom_id=custom_id,
         )
 
         async def exit_callback(interaction):

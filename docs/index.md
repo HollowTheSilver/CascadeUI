@@ -6,10 +6,11 @@ CascadeUI brings a Redux-inspired architecture to Discord bot interfaces. Views,
 
 ## Features
 
-- **Centralized State Store** with dispatch/reducer cycle, action history, and filtered subscriptions
-- **Stateful Views** with lifecycle management, view transitions, and pre-built patterns (tabs, wizards, forms, pagination)
+- **Centralized State Store** with dispatch/reducer cycle, action history, filtered subscriptions, action batching, event hooks, and computed/derived values
+- **Stateful Views** with lifecycle management, navigation stack (push/pop), per-user/per-guild state scoping, undo/redo, and pre-built patterns (tabs, wizards, forms, pagination)
 - **Stateful Components** with automatic action dispatching and behavioral wrappers (loading, confirmation, cooldowns)
-- **Persistence** that lets state survive bot restarts, with two patterns for different use cases
+- **Form Validation** with built-in validators, custom sync/async validators, and per-field error reporting
+- **Persistence** with pluggable backends (JSON, SQLite, Redis), migration tools, and views that survive bot restarts
 - **Theming** with global defaults and per-view overrides
 - **Middleware** for intercepting and transforming actions in the dispatch pipeline
 - **DevTools** with a built-in state inspector for debugging
@@ -25,13 +26,15 @@ User clicks button
        |
   COMPONENT_INTERACTION action dispatched
        |
-  Middleware pipeline (logging, persistence, custom)
+  Middleware pipeline (logging, persistence, undo, custom)
        |
   Reducer transforms state immutably
        |
   Subscribers notified (filtered by action type + selector)
        |
   Views update their UI from new state
+       |
+  Hooks fire (read-only, post-update)
 ```
 
 ## Requirements

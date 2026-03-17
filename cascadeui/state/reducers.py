@@ -289,3 +289,136 @@ async def reduce_persistent_view_unregistered(action: Action, state: StateData) 
     del new_state["persistent_views"][state_key]
 
     return new_state
+
+
+# // ========================================( Navigation Stack )======================================== // #
+
+
+async def reduce_navigation_push(action: Action, state: StateData) -> StateData:
+    """Handle NAVIGATION_PUSH — add an entry to the session's nav stack."""
+    new_state = copy.deepcopy(state)
+    payload = action["payload"]
+
+    session_id = payload.get("session_id")
+    if not session_id or "sessions" not in new_state or session_id not in new_state["sessions"]:
+        return state
+
+    session = new_state["sessions"][session_id]
+    if "nav_stack" not in session:
+        session["nav_stack"] = []
+
+    session["nav_stack"].append({
+        "class_name": payload.get("class_name"),
+        "module": payload.get("module"),
+        "kwargs": payload.get("kwargs", {}),
+        "state_snapshot": payload.get("state_snapshot"),
+    })
+
+    return new_state
+
+
+async def reduce_navigation_pop(action: Action, state: StateData) -> StateData:
+    """Handle NAVIGATION_POP — remove the top entry from the session's nav stack."""
+    new_state = copy.deepcopy(state)
+    payload = action["payload"]
+
+    session_id = payload.get("session_id")
+    if not session_id or "sessions" not in new_state or session_id not in new_state["sessions"]:
+        return state
+
+    session = new_state["sessions"][session_id]
+    nav_stack = session.get("nav_stack", [])
+
+    if nav_stack:
+        nav_stack.pop()
+
+    return new_state
+
+
+# // ========================================( State Scoping )======================================== // #
+
+
+async def reduce_scoped_update(action: Action, state: StateData) -> StateData:
+    """Handle SCOPED_UPDATE — merge data into a scoped state slice."""
+    new_state = copy.deepcopy(state)
+    payload = action["payload"]
+
+    scope = payload.get("scope")
+    scope_id = payload.get("scope_id")
+    data = payload.get("data", {})
+
+    if not scope or scope_id is None:
+        return state
+
+    scope_key = f"{scope}:{scope_id}"
+
+    if "application" not in new_state:
+        new_state["application"] = {}
+    if "_scoped" not in new_state["application"]:
+        new_state["application"]["_scoped"] = {}
+
+    existing = new_state["application"]["_scoped"].get(scope_key, {})
+    new_state["application"]["_scoped"][scope_key] = {**existing, **data}
+
+    return new_state
+
+
+# // ========================================( Undo / Redo )======================================== // #
+
+
+async def reduce_undo(action: Action, state: StateData) -> StateData:
+    """Handle UNDO — pop undo stack, push current app state to redo, restore snapshot."""
+    new_state = copy.deepcopy(state)
+    payload = action["payload"]
+
+    session_id = payload.get("session_id")
+    if not session_id or "sessions" not in new_state or session_id not in new_state["sessions"]:
+        return state
+
+    session = new_state["sessions"][session_id]
+    undo_stack = session.get("undo_stack", [])
+
+    if not undo_stack:
+        return state
+
+    # Current application state -> redo stack
+    redo_stack = session.get("redo_stack", [])
+    redo_stack.append(copy.deepcopy(new_state.get("application", {})))
+
+    # Restore the snapshot from undo stack
+    snapshot = undo_stack.pop()
+    new_state["application"] = snapshot
+
+    session["undo_stack"] = undo_stack
+    session["redo_stack"] = redo_stack
+
+    return new_state
+
+
+async def reduce_redo(action: Action, state: StateData) -> StateData:
+    """Handle REDO — pop redo stack, push current app state to undo, restore snapshot."""
+    new_state = copy.deepcopy(state)
+    payload = action["payload"]
+
+    session_id = payload.get("session_id")
+    if not session_id or "sessions" not in new_state or session_id not in new_state["sessions"]:
+        return state
+
+    session = new_state["sessions"][session_id]
+    redo_stack = session.get("redo_stack", [])
+
+    if not redo_stack:
+        return state
+
+    # Current application state -> undo stack
+    undo_stack = session.get("undo_stack", [])
+    undo_stack.append(copy.deepcopy(new_state.get("application", {})))
+
+    # Restore the snapshot from redo stack
+    snapshot = redo_stack.pop()
+    new_state["application"] = snapshot
+
+    session["undo_stack"] = undo_stack
+    session["redo_stack"] = redo_stack
+
+    return new_state

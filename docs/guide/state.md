@@ -56,10 +56,16 @@ CascadeUI dispatches these actions automatically:
 | `SESSION_CREATED` | A new user session begins |
 | `SESSION_UPDATED` | A session is modified |
 | `NAVIGATION` | A view transition occurs |
+| `NAVIGATION_PUSH` | A view is pushed onto the navigation stack |
+| `NAVIGATION_POP` | A view is popped from the navigation stack |
+| `SCOPED_UPDATE` | Per-user or per-guild scoped state is updated |
 | `COMPONENT_INTERACTION` | Any StatefulButton or StatefulSelect is clicked |
 | `MODAL_SUBMITTED` | A modal form is submitted |
 | `PERSISTENT_VIEW_REGISTERED` | A PersistentView is sent and tracked |
 | `PERSISTENT_VIEW_UNREGISTERED` | A PersistentView is removed |
+| `UNDO` | An undo operation is performed |
+| `REDO` | A redo operation is performed |
+| `BATCH_COMPLETE` | A batch of actions finishes (contains all batched actions) |
 
 ## Subscribers
 
@@ -107,6 +113,77 @@ store.unsubscribe("my-listener")
 ```
 
 Views unsubscribe automatically on exit or timeout.
+
+## Action Batching
+
+Dispatch multiple actions atomically. Subscribers and persistence fire once after all actions complete, not once per action:
+
+```python
+# From a view
+async with self.batch() as b:
+    await b.dispatch("VOTE_CAST", {"user_id": user_id, "delta": 1})
+    await b.dispatch("VOTE_LOG", {"entry": "User voted +1"})
+# Single notification cycle fires here
+
+# From the store directly
+async with store.batch() as b:
+    await b.dispatch("FORM_UPDATED", payload1)
+    await b.dispatch("NAVIGATION", payload2)
+```
+
+Inside a batch, each dispatch still runs through middleware and reducers immediately (state flows sequentially). Only subscriber notifications are deferred until the batch exits.
+
+!!! info "Batch and undo"
+    When `UndoMiddleware` is active, all actions in a batch produce a single undo entry. Undoing will revert everything the batch did.
+
+## Event Hooks
+
+React to state lifecycle events without modifying reducers or subscribing:
+
+```python
+store = get_store()
+
+async def on_interaction(action, state):
+    component = action["payload"].get("component_id", "?")
+    print(f"Component {component} was clicked")
+
+store.on("component_interaction", on_interaction)
+store.off("component_interaction", on_interaction)  # Unregister
+```
+
+Hook names map to action types: `view_created` maps to `VIEW_CREATED`, `component_interaction` maps to `COMPONENT_INTERACTION`, etc. You can also pass the raw action type string directly.
+
+!!! note "Hooks vs. subscribers vs. middleware"
+    - **Middleware** runs *before* the reducer, can modify or block actions, and returns state.
+    - **Subscribers** run *after* the reducer, receive state, and are filtered by action type and selector.
+    - **Hooks** run *after* subscribers, receive the final state, and are read-only. Use hooks for logging, analytics, or side effects that don't need to modify state.
+
+## Computed State
+
+Derived values that cache automatically and only recompute when their input changes:
+
+```python
+from cascadeui import computed, get_store
+
+@computed(selector=lambda s: s.get("application", {}).get("votes", {}))
+def total_votes(votes):
+    return sum(votes.values())
+
+# Access anywhere
+store = get_store()
+total = store.computed["total_votes"]  # Cached until the votes dict changes
+```
+
+The `selector` picks which slice of state to watch. On access, if the selector's output hasn't changed since the last computation, the cached result is returned. No timer, no event: it's lazy.
+
+```python
+# Check if a computed value is registered
+if "total_votes" in store.computed:
+    total = store.computed["total_votes"]
+
+# Force recomputation on next access
+store._computed["total_votes"].invalidate()
+```
 
 ## Action History
 

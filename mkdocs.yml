@@ -48,6 +48,7 @@ nav:
       - State Management: guide/state.md
       - Views: guide/views.md
       - Components: guide/components.md
+      - Validation: guide/validation.md
       - Persistence: guide/persistence.md
       - Theming: guide/theming.md
       - Middleware: guide/middleware.md
@@ -56,6 +57,7 @@ nav:
       - State Store: api/store.md
       - Views: api/views.md
       - Components: api/components.md
+      - Validation: api/validation.md
       - Persistence: api/persistence.md
       - Theming: api/theming.md
   - Examples: examples.md

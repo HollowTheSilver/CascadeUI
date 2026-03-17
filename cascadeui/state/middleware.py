@@ -8,7 +8,7 @@ from typing import Optional, Set, Callable
 from .types import Action, StateData
 from ..utils.logging import AsyncLogger
 
-logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a")
+logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a", prefix="cascadeui")
 
 
 # // ========================================( Middleware )======================================== // #
@@ -108,7 +108,7 @@ def logging_middleware():
     Usage:
         store.add_middleware(logging_middleware())
     """
-    action_logger = AsyncLogger(name="cascadeui.actions", level="INFO", path="logs", mode="a")
+    action_logger = AsyncLogger(name="cascadeui.actions", level="INFO", path="logs", mode="a", prefix="cascadeui")
 
     async def middleware(action: Action, state: StateData,
                         next_fn: Callable) -> StateData:
