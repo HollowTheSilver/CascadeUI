@@ -237,6 +237,124 @@ Internal lifecycle actions (`VIEW_CREATED`, `VIEW_DESTROYED`, `NAVIGATION_PUSH`,
 !!! info "Batched actions"
     When actions are dispatched inside a `batch()`, the undo middleware takes one snapshot before the batch starts. Undoing reverts everything the batch did in one step.
 
+## Session Limiting
+
+Session limiting controls how many active instances of a view can exist within a given scope. Without it, users can invoke commands repeatedly, spawning duplicate views that pile up in chat. Session limiting adds declarative, per-view control with automatic cleanup.
+
+### Basic Usage
+
+Set three class attributes on any `StatefulView` subclass:
+
+```python
+class SettingsView(StatefulView):
+    session_limit = 1              # Max active instances (None = unlimited)
+    session_scope = "user_guild"   # Scope for counting instances
+    session_policy = "replace"     # What to do when the limit is reached
+```
+
+With this configuration, if a user opens a second `SettingsView` in the same guild, the first one is automatically exited (components disabled, message cleaned up) before the new one is sent.
+
+### Session Scope
+
+The scope determines how instances are grouped when counting toward the limit:
+
+| Scope | Groups by | Use case |
+|-------|-----------|----------|
+| `"user"` | User ID | Per-user views (settings, profiles) across all guilds |
+| `"guild"` | Guild ID | Per-server views (config panels) shared by all users |
+| `"user_guild"` (default) | User ID + Guild ID | Per-user within a specific guild |
+| `"global"` | Nothing | One instance across the entire bot |
+
+```python
+class GlobalAnnouncement(StatefulView):
+    session_limit = 1
+    session_scope = "global"    # Only one instance of this view, anywhere
+
+class UserProfile(StatefulView):
+    session_limit = 1
+    session_scope = "user"      # One per user, regardless of guild
+```
+
+### Session Policy
+
+The policy determines what happens when a new view would exceed the limit:
+
+| Policy | Behavior |
+|--------|----------|
+| `"replace"` (default) | Exits the oldest view(s) to make room for the new one |
+| `"reject"` | Raises `SessionLimitError`, blocking the new view from being sent |
+
+#### Replace policy
+
+The default. Old views are exited silently, and the new view takes their place:
+
+```python
+class SettingsView(StatefulView):
+    session_limit = 1
+    session_scope = "user_guild"
+    session_policy = "replace"    # Default -- exits old view automatically
+```
+
+#### Reject policy
+
+Blocks the new view and raises `SessionLimitError`. Useful when you want the user to explicitly close the existing view first:
+
+```python
+from cascadeui import StatefulView, SessionLimitError
+
+class ExpensiveView(StatefulView):
+    session_limit = 1
+    session_scope = "user_guild"
+    session_policy = "reject"
+
+# In your command:
+try:
+    view = ExpensiveView(interaction=interaction)
+    await view.send(embed=my_embed)
+except SessionLimitError:
+    await interaction.response.send_message(
+        "You already have this open. Close it first.",
+        ephemeral=True,
+    )
+```
+
+### Limits Greater Than 1
+
+Session limits are not restricted to 1. Setting `session_limit = 3` allows up to three concurrent instances before enforcement kicks in:
+
+```python
+class NotepadView(StatefulView):
+    session_limit = 3
+    session_scope = "user"
+    session_policy = "replace"   # Exits the oldest when a 4th is opened
+```
+
+When the limit is exceeded with the replace policy, only the oldest views are exited -- just enough to make room for the new one.
+
+### PersistentView Protection
+
+`PersistentView` instances are protected from being replaced by non-persistent views. If a regular `StatefulView` tries to replace a `PersistentView` that occupies a session slot, `SessionLimitError` is raised instead of replacing it. This prevents an accidental command invocation from destroying a long-lived panel.
+
+Persistent views **can** replace other persistent views of the same type.
+
+### Scope Resolution in DMs
+
+Some scopes require identity fields that may not be available. For example, `session_scope = "user_guild"` needs both a user ID and a guild ID. In DMs there is no guild, so the scope key cannot be resolved. When this happens, the view is still tracked internally but session limits are not enforced -- the view sends normally without checking for existing instances.
+
+| Scope | DM behavior |
+|-------|-------------|
+| `"user"` | Enforced (user ID is always available) |
+| `"guild"` | Not enforced (no guild ID) |
+| `"user_guild"` | Not enforced (no guild ID) |
+| `"global"` | Enforced (no identity needed) |
+
+### Interaction with Other Features
+
+- **Navigation stack**: When a view is exited by session limiting, its entire navigation stack is cleaned up. Pushed views on the old stack are not preserved.
+- **Ephemeral views**: Session limiting works with ephemeral views. The old ephemeral message's components are disabled, and the new view is sent as a fresh ephemeral message.
+- **Persistence**: Restored persistent views (from `setup_persistence`) are tracked in the active view registry but are not session-indexed (they lack user/guild context). They will not block new views from being created.
+- **Undo/redo**: When the replace policy exits an old view, its undo history is discarded along with the view. The new view starts fresh.
+
 ## View Patterns
 
 CascadeUI includes pre-built view patterns for common layouts.

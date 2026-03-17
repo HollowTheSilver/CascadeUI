@@ -89,6 +89,9 @@ Returns a slice of state. If the return value hasn't changed, `update_from_state
 - `enable_undo` (bool): Enable undo/redo for this view (default: `False`).
 - `undo_limit` (int): Max undo stack depth (default: `20`).
 - `auto_back_button` (bool): Automatically add a back button when pushed (default: `False`).
+- `session_limit` (int | None): Maximum number of active instances within the session scope. `None` (default) means unlimited.
+- `session_scope` (str): How instances are grouped for limit counting. One of `"user"`, `"guild"`, `"user_guild"` (default), or `"global"`.
+- `session_policy` (str): What to do when the limit is exceeded. `"replace"` (default) exits the oldest instances. `"reject"` raises `SessionLimitError`.
 
 ---
 
@@ -170,4 +173,32 @@ FormView(
 
 ```python
 PaginatedView(context=None, pages=[Embed, ...], **kwargs)
+```
+
+---
+
+## `SessionLimitError`
+
+Exception raised when `send()` is blocked by session limiting.
+
+```python
+from cascadeui import SessionLimitError
+```
+
+### Attributes
+
+- `view_type` (str): The class name of the view that hit the limit
+- `limit` (int): The session limit value that was exceeded
+
+### When it is raised
+
+- **Reject policy**: Always raised when a new view would exceed `session_limit` with `session_policy = "reject"`.
+- **PersistentView protection**: Raised when a non-persistent view attempts to replace a `PersistentView` under the replace policy.
+
+```python
+try:
+    view = MyView(interaction=interaction)
+    await view.send(embed=embed)
+except SessionLimitError as e:
+    print(f"Blocked: {e.view_type} limit is {e.limit}")
 ```

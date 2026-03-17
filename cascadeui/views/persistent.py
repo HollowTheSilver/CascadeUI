@@ -250,6 +250,7 @@ async def setup_persistence(
 
             # Register in state system
             await view._register_state()
+            store.register_view(view)
 
             # Let the view do post-restore work
             await view.on_restore(bot)
@@ -260,9 +261,10 @@ async def setup_persistence(
         except Exception as e:
             logger.error(f"Failed to restore persistent view '{state_key}': {e}", exc_info=True)
             failed.append(state_key)
-            # Clean up the subscriber and undo entry that __init__ registered to prevent leaks
+            # Clean up the subscriber, registry, and undo entry that __init__/register registered
             if view is not None:
                 store.unsubscribe(view.id)
+                store.unregister_view(view.id)
                 store._undo_enabled_views.pop(view.id, None)
 
     # Clean up entries for deleted messages/channels (but not skipped classes)

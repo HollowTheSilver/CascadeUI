@@ -11,7 +11,7 @@ Copyright (c) 2024-2025 HollowTheSilver - https://github.com/HollowTheSilver
 from .state.singleton import get_store
 
 # Then import other components that might need the store
-from .views.base import StatefulView
+from .views.base import StatefulView, SessionLimitError
 from .views.specialized import FormView, PaginatedView
 from .views.persistent import PersistentView, setup_persistence
 from .views.patterns import TabView, WizardView
@@ -48,6 +48,7 @@ __version__ = "2.0.0"
 __all__ = [
     # Views
     "StatefulView",
+    "SessionLimitError",
     "FormView",
     "PaginatedView",
     "PersistentView",

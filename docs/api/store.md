@@ -90,6 +90,23 @@ Returns scoped state for the given scope type and ID.
 
 Sets scoped state for the given scope type and ID.
 
+#### `register_view(view)`
+
+Registers a live view instance in the active view registry. Called internally by `StatefulView.send()`. Used by session limiting to track active instances.
+
+#### `unregister_view(view_id)`
+
+Removes a view from the active view registry. Idempotent. Called internally by `exit()`, `on_timeout()`, and `_navigate_to()`.
+
+#### `get_active_views(view_type, scope_key)`
+
+Returns a list of active view instances matching the given type name and scope key, ordered oldest-first.
+
+- `view_type` (str): The view class name (e.g., `"SettingsView"`)
+- `scope_key` (str): The scope key (e.g., `"user_guild:123:456"`)
+
+**Returns:** `list` of view instances.
+
 ### Properties
 
 - `state` (dict): The current state tree

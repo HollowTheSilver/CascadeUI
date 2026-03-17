@@ -1,4 +1,6 @@
-# CascadeUI
+<p align="center">
+  <img src="assets/banner.png" alt="CascadeUI — A Redux-Inspired Framework for Discord.py" width="100%">
+</p>
 
 Redux-inspired UI framework for [discord.py](https://github.com/Rapptz/discord.py).
 
@@ -8,6 +10,7 @@ CascadeUI brings a Redux-inspired architecture to Discord bot interfaces. Views,
 
 - **Centralized State Store** with dispatch/reducer cycle, action history, filtered subscriptions, action batching, event hooks, and computed/derived values
 - **Stateful Views** with lifecycle management, navigation stack (push/pop), per-user/per-guild state scoping, undo/redo, and pre-built patterns (tabs, wizards, forms, pagination)
+- **Session Limiting** with declarative per-view limits, scoped enforcement (user, guild, user+guild, global), and automatic cleanup or rejection policies
 - **Stateful Components** with automatic action dispatching and behavioral wrappers (loading, confirmation, cooldowns)
 - **Form Validation** with built-in validators, custom sync/async validators, and per-field error reporting
 - **Persistence** with pluggable backends (JSON, SQLite, Redis), migration tools, and views that survive bot restarts

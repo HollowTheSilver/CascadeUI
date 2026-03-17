@@ -38,6 +38,23 @@ Undo/redo counter using `UndoMiddleware`. Shows stack depth in the embed so you 
 
 **Command:** `/undotest`
 
+## settings_menu.py
+
+Advanced example showcasing multiple CascadeUI features working together in a realistic settings menu. Demonstrates:
+
+- **Session limiting** (`session_limit=1`, `session_scope="user_guild"`) to prevent duplicate settings panels
+- **Scoped state** (`scope="user"`) for per-user settings that persist across views
+- **Navigation stack** (push/pop) for a hub-and-spoke menu layout with sub-pages
+- **Theming** with a live theme switcher that applies changes to the embed in real time
+- **Undo/redo** for reverting notification preference toggles
+- **State selectors** for efficient re-rendering (only updates when the user's settings change)
+- **Batched dispatch** for atomic multi-field updates
+- **Custom reducer** (`SETTINGS_UPDATED`) for domain-specific state management
+
+The hub view pushes to Appearance, Notifications, and Locale sub-views, each with a back button to return. Session limiting ensures that running `/settings` a second time exits the first panel before creating the new one.
+
+**Command:** `/settings`
+
 ## Running the Examples
 
 1. Create a bot on the [Discord Developer Portal](https://discord.com/developers/applications)
@@ -57,6 +74,7 @@ class MyBot(commands.Bot):
         await self.load_extension("examples.navigation")
         await self.load_extension("examples.state_features")
         await self.load_extension("examples.undo_redo")
+        await self.load_extension("examples.settings_menu")
 
         # Enable persistence (after loading cogs)
         await setup_persistence(self, backend=SQLiteBackend("cascadeui.db"))

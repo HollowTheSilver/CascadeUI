@@ -1,9 +1,13 @@
-# CascadeUI
+<p align="center">
+  <img src="docs/assets/banner.png" alt="CascadeUI — A Redux-Inspired Framework for Discord.py" width="100%">
+</p>
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![discord.py 2.1+](https://img.shields.io/badge/discord.py-2.1+-738adb.svg)](https://github.com/Rapptz/discord.py)
-[![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-8A2BE2?logo=readthedocs)](https://hollowthesilver.github.io/CascadeUI/)
+<p align="center">
+  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python 3.10+"></a>
+  <a href="https://github.com/Rapptz/discord.py"><img src="https://img.shields.io/badge/discord.py-2.1+-738adb.svg" alt="discord.py 2.1+"></a>
+  <a href="https://hollowthesilver.github.io/CascadeUI/"><img src="https://img.shields.io/badge/docs-GitHub%20Pages-8A2BE2?logo=readthedocs" alt="Docs"></a>
+</p>
 
 > **Note**: CascadeUI is currently in active development and has not yet been officially released. Installation is source-only until the package is published on PyPI.
 
@@ -33,6 +37,12 @@ CascadeUI brings a Redux-inspired architecture to Discord bot interfaces. Views,
   - Per-user and per-guild state scoping
   - Undo/redo support with configurable history depth
   - Pre-built patterns: `TabView`, `WizardView`, `FormView`, `PaginatedView`
+
+- **Session Limiting**
+  - Declarative per-view control: `session_limit`, `session_scope`, `session_policy`
+  - Scoped enforcement: user, guild, user+guild, or global
+  - Replace policy exits old views automatically; reject policy raises `SessionLimitError`
+  - PersistentView protection prevents accidental replacement of long-lived panels
 
 - **Stateful Components**
   - `StatefulButton` and `StatefulSelect` with automatic action dispatching
@@ -244,6 +254,31 @@ class MyView(StatefulView):
 ```
 
 Batched actions (via `store.batch()`) create a single undo entry. Performing a new action after undoing clears the redo stack.
+
+### Session Limiting
+
+Control how many active instances of a view can exist within a given scope. Prevents duplicate views from piling up when users invoke the same command repeatedly.
+
+```python
+from cascadeui import StatefulView, SessionLimitError
+
+class SettingsView(StatefulView):
+    session_limit = 1              # Max active instances (None = unlimited)
+    session_scope = "user_guild"   # "user", "guild", "user_guild", or "global"
+    session_policy = "replace"     # "replace" (exit oldest) or "reject" (block new)
+```
+
+With the **replace** policy, opening a second `SettingsView` in the same guild exits the first one automatically. With the **reject** policy, the second `send()` raises `SessionLimitError`:
+
+```python
+try:
+    view = SettingsView(interaction=interaction)
+    await view.send(embed=settings_embed)
+except SessionLimitError:
+    await interaction.response.send_message("You already have this open.", ephemeral=True)
+```
+
+Scopes determine how instances are grouped: `"user"` counts per user across all guilds, `"guild"` counts per server, `"user_guild"` counts per user within a server, and `"global"` counts across the entire bot. `PersistentView` instances are protected from being replaced by non-persistent views.
 
 ### State Scoping
 
@@ -614,6 +649,7 @@ Working examples are in the [`examples/`](examples/) directory:
 | **navigation.py** | Navigation stack with push/pop between multi-level views |
 | **state_features.py** | Per-user state scoping, action batching, computed values, event hooks |
 | **undo_redo.py** | Undo/redo with `UndoMiddleware` and stack depth display |
+| **settings_menu.py** | Advanced example: session limiting, scoped state, push/pop navigation, undo/redo, theming |
 
 Each example is a discord.py cog that can be loaded into any bot.
 

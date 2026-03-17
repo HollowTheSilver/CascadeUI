@@ -2,7 +2,7 @@
 # // ========================================( Modules )======================================== // #
 
 
-from .base import StatefulView
+from .base import StatefulView, SessionLimitError
 from .specialized import FormView, PaginatedView
 from .persistent import PersistentView, setup_persistence
 
@@ -16,4 +16,5 @@ __all__ = [
     "PaginatedView",
     "PersistentView",
     "setup_persistence",
+    "SessionLimitError",
 ]

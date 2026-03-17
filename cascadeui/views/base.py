@@ -31,6 +31,18 @@ def _register_view_class(cls):
     _view_class_registry[cls.__name__] = cls
 
 
+# // ========================================( Exceptions )======================================== // #
+
+
+class SessionLimitError(Exception):
+    """Raised when send() is blocked by session_policy='reject'."""
+
+    def __init__(self, view_type: str, limit: int):
+        self.view_type = view_type
+        self.limit = limit
+        super().__init__(f"Session limit ({limit}) reached for {view_type}.")
+
+
 # // ========================================( Classes )======================================== // #
 
 
@@ -46,6 +58,11 @@ class StatefulView(View):
 
     # Subclass config: auto-add a back button when pushed onto nav stack
     auto_back_button: bool = False
+
+    # Subclass config: session limiting
+    session_limit: Optional[int] = None      # None = unlimited
+    session_scope: str = "user_guild"        # "user", "guild", "user_guild", "global"
+    session_policy: str = "replace"          # "replace" or "reject"
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -211,6 +228,36 @@ class StatefulView(View):
             embeds: A list of embeds to include.
             ephemeral: Whether the message should be ephemeral (interaction only).
         """
+        # Session limit enforcement
+        if self.session_limit is not None:
+            scope_key = self.state_store._build_session_scope_key(self)
+            if scope_key is not None:
+                view_type = self.__class__.__name__
+                existing = self.state_store.get_active_views(view_type, scope_key)
+                overflow = len(existing) - self.session_limit + 1
+
+                if overflow > 0:
+                    if self.session_policy == "reject":
+                        raise SessionLimitError(view_type, self.session_limit)
+
+                    # Pre-scan: check all candidates before exiting any, so we
+                    # don't destroy views and then raise on a later protected one
+                    to_replace = existing[:overflow]
+                    from .persistent import PersistentView
+
+                    if not isinstance(self, PersistentView):
+                        for old_view in to_replace:
+                            if isinstance(old_view, PersistentView):
+                                raise SessionLimitError(view_type, self.session_limit)
+
+                    # Replace policy: exit oldest views to make room
+                    for old_view in to_replace:
+                        await old_view.exit()
+
+        # Register in instance registry before state so the view is
+        # tracked even if the state dispatch triggers subscribers that query it
+        self.state_store.register_view(self)
+
         await self._register_state()
 
         if ephemeral:
@@ -230,29 +277,33 @@ class StatefulView(View):
         if embeds is not None:
             send_kwargs["embeds"] = embeds
 
-        if self.context and hasattr(self.context, "send"):
-            if ephemeral:
+        # Send the message, rolling back registry on failure to prevent
+        # orphaned entries that permanently consume session limit slots
+        try:
+            if self.context and hasattr(self.context, "send"):
+                if ephemeral:
+                    send_kwargs["ephemeral"] = ephemeral
+                message = await self.context.send(**send_kwargs)
+
+            elif self.interaction:
                 send_kwargs["ephemeral"] = ephemeral
-            message = await self.context.send(**send_kwargs)
-            self._message = message
-            await self._update_message_state(message)
-            return message
+                if not self.interaction.response.is_done():
+                    await self.interaction.response.send_message(**send_kwargs)
+                    message = await self.interaction.original_response()
+                else:
+                    message = await self.interaction.followup.send(**send_kwargs, wait=True)
 
-        elif self.interaction:
-            send_kwargs["ephemeral"] = ephemeral
-            if not self.interaction.response.is_done():
-                await self.interaction.response.send_message(**send_kwargs)
-                message = await self.interaction.original_response()
             else:
-                message = await self.interaction.followup.send(**send_kwargs, wait=True)
-            self._message = message
-            await self._update_message_state(message)
-            return message
+                raise RuntimeError(
+                    "StatefulView.send() requires either 'context' or 'interaction' to be set."
+                )
+        except Exception:
+            self.state_store.unregister_view(self.id)
+            raise
 
-        else:
-            raise RuntimeError(
-                "StatefulView.send() requires either 'context' or 'interaction' to be set."
-            )
+        self._message = message
+        await self._update_message_state(message)
+        return message
 
     def get_theme(self):
         """Get the theme for this view, falling back to the global default.
@@ -310,6 +361,7 @@ class StatefulView(View):
         # Cancel tasks and clean up state, mirroring exit()
         self.task_manager.cancel_tasks(self.id)
         self.state_store.unsubscribe(self.id)
+        self.state_store.unregister_view(self.id)
         self.state_store._undo_enabled_views.pop(self.id, None)
         await self.dispatch("VIEW_DESTROYED", ActionCreators.view_destroyed(self.id))
 
@@ -429,6 +481,7 @@ class StatefulView(View):
         # Stop this view and clean up its subscription before dispatching
         self.stop()
         self.state_store.unsubscribe(self.id)
+        self.state_store.unregister_view(self.id)
         self.state_store._undo_enabled_views.pop(self.id, None)
 
         await self.state_store.dispatch(action_type, action_payload, source_id=self.id)
@@ -620,6 +673,7 @@ class StatefulView(View):
         # Unsubscribe BEFORE dispatching VIEW_DESTROYED so the view's own
         # subscriber doesn't re-render after we remove components.
         self.state_store.unsubscribe(self.id)
+        self.state_store.unregister_view(self.id)
         self.state_store._undo_enabled_views.pop(self.id, None)
 
         # Clean up the message
@@ -669,3 +723,4 @@ class StatefulView(View):
         """Clean reference to ensure GC can collect this view."""
         if hasattr(self, "state_store") and hasattr(self, "id"):
             self.state_store.unsubscribe(self.id)
+            self.state_store.unregister_view(self.id)

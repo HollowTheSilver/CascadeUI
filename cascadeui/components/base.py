@@ -8,6 +8,9 @@ import discord
 from discord.ui import Item
 
 from ..state.actions import ActionCreators
+from ..utils.logging import AsyncLogger
+
+logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a", prefix="cascadeui")
 
 
 # // ========================================( Classes )======================================== // #
@@ -25,9 +28,6 @@ class StatefulComponent:
             view = component.view
 
             if not view:
-                # If we still can't find the view, log error and call original callback
-                from ..utils.logging import AsyncLogger
-                logger = AsyncLogger(name="cascadeui.components", level="DEBUG", path="logs", mode="a", prefix="cascadeui")
                 logger.error(f"Could not find view for component {component_id}")
 
                 # Call original callback if provided

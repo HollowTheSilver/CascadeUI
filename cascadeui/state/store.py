@@ -160,6 +160,12 @@ class StateStore:
         # Populated by StatefulView.__init__ when enable_undo = True
         self._undo_enabled_views: Dict[str, int] = {}
 
+        # Active view instance registry: view_id -> view instance
+        self._active_views: Dict[str, Any] = {}
+
+        # Session limit index: (view_type, scope_key) -> [view_id, ...] oldest-first
+        self._session_index: Dict[tuple, list] = {}
+
         # Persistence settings
         self.persistence_enabled = False
         self.persistence_backend = None
@@ -390,6 +396,51 @@ class StateStore:
             return f"guild:{gid}"
         else:
             raise ValueError(f"Unknown scope: {scope}")
+
+    # // ========================================( View Registry )======================================== // #
+
+    def register_view(self, view) -> None:
+        """Register a live view instance. Called from StatefulView.send()."""
+        self._active_views[view.id] = view
+        scope_key = self._build_session_scope_key(view)
+        if scope_key is not None:
+            key = (view.__class__.__name__, scope_key)
+            self._session_index.setdefault(key, []).append(view.id)
+
+    def unregister_view(self, view_id: str) -> None:
+        """Remove a view from the registry. Idempotent."""
+        view = self._active_views.pop(view_id, None)
+        if view is not None:
+            scope_key = self._build_session_scope_key(view)
+            if scope_key is not None:
+                key = (view.__class__.__name__, scope_key)
+                ids = self._session_index.get(key, [])
+                if view_id in ids:
+                    ids.remove(view_id)
+                    if not ids:
+                        del self._session_index[key]
+
+    def get_active_views(self, view_type: str, scope_key: str) -> list:
+        """Return active view instances for a type+scope, oldest-first."""
+        key = (view_type, scope_key)
+        ids = self._session_index.get(key, [])
+        return [self._active_views[vid] for vid in ids if vid in self._active_views]
+
+    @staticmethod
+    def _build_session_scope_key(view) -> Optional[str]:
+        """Build the scope key from a view's session_scope and identity fields."""
+        scope = view.session_scope
+        if scope == "user":
+            return f"user:{view.user_id}" if view.user_id else None
+        elif scope == "guild":
+            return f"guild:{view.guild_id}" if view.guild_id else None
+        elif scope == "user_guild":
+            if view.user_id and view.guild_id:
+                return f"user_guild:{view.user_id}:{view.guild_id}"
+            return None
+        elif scope == "global":
+            return "global"
+        return None
 
     # // ========================================( Dispatch )======================================== // #
 
