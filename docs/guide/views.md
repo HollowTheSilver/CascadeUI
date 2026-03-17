@@ -78,16 +78,16 @@ Set `subscribed_actions = None` to receive all actions (not recommended for perf
 
 ### View Transitions
 
-Navigate between views with `transition_to()`:
+Navigate between views with `replace()`:
 
 ```python
 async def go_to_settings(self, interaction):
     await interaction.response.defer()
-    new_view = await self.transition_to(SettingsView)
+    new_view = await self.replace(SettingsView)
     await interaction.edit_original_response(view=new_view)
 ```
 
-`transition_to` is a one-way transition: it stops the current view and starts the new one. There is no implicit "back" capability. For multi-level navigation, use the navigation stack instead.
+`replace` is a one-way transition: it stops the current view and starts the new one. There is no implicit "back" capability. For multi-level navigation, use the navigation stack instead.
 
 ### Error Handling
 
@@ -144,10 +144,10 @@ class SettingsView(StatefulView):
 !!! warning "Pop on empty stack"
     If `pop()` is called when the stack is empty, it returns `None`. The auto back button handles this gracefully by removing the dead view from the message.
 
-### Push vs. transition_to
+### Push vs. Replace
 
-| | `push()` | `transition_to()` |
-|---|----------|-------------------|
+| | `push()` | `replace()` |
+|---|----------|-------------|
 | Stack | Adds entry, supports back | No stack, one-way |
 | Session | Shared | Shared |
 | Use case | Menu hierarchy | Replacing the current view entirely |

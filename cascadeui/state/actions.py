@@ -61,8 +61,8 @@ class ActionCreators:
         }
 
     @staticmethod
-    def navigation(destination: str, **params) -> ActionPayload:
-        """Create a NAVIGATION action payload."""
+    def navigation_replace(destination: str, **params) -> ActionPayload:
+        """Create a NAVIGATION_REPLACE action payload."""
         return {
             "destination": destination,
             "params": params

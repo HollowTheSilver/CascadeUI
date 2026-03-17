@@ -1,4 +1,4 @@
-"""Tests for 7.5 — Event Hooks."""
+"""Tests for event hooks (on/off lifecycle observation)."""
 
 import copy
 import pytest

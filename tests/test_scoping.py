@@ -1,4 +1,4 @@
-"""Tests for 7.2 — Per-User / Per-Guild State Scoping."""
+"""Tests for per-user and per-guild state scoping."""
 
 import copy
 import pytest

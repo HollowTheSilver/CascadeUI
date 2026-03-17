@@ -1,4 +1,4 @@
-"""Tests for 7.1 — Database Persistence Backends."""
+"""Tests for database persistence backends (SQLite, Redis, File)."""
 
 import os
 import pytest

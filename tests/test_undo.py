@@ -1,4 +1,4 @@
-"""Tests for 7.4 — Undo/Redo."""
+"""Tests for undo/redo middleware and state snapshot restoration."""
 
 import copy
 import pytest

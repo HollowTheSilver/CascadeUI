@@ -45,7 +45,7 @@ class StatefulView(View):
     undo_limit: int = 20
 
     # Subclass config: auto-add a back button when pushed onto nav stack
-    auto_back_button: bool = True
+    auto_back_button: bool = False
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -61,6 +61,14 @@ class StatefulView(View):
         self.interaction = kwargs.pop("interaction", None)
         self.theme = kwargs.pop("theme", None)
         self._state_key = kwargs.pop("state_key", None)
+
+        # Capture kwargs needed to reconstruct this view via pop()
+        # (excludes internal forwarding keys that _navigate_to injects)
+        self._init_kwargs = {}
+        if self.theme is not None:
+            self._init_kwargs["theme"] = self.theme
+        if self._state_key is not None:
+            self._init_kwargs["state_key"] = self._state_key
 
         # Initialize standard View class
         super().__init__(*args, **kwargs)
@@ -98,11 +106,13 @@ class StatefulView(View):
         if self.session_id is None and self.user_id is not None:
             self.session_id = f"user_{self.user_id}"
 
-        # Action types this view cares about (subclasses can override)
-        self.subscribed_actions: Optional[Set[str]] = {
-            "VIEW_UPDATED", "VIEW_DESTROYED",
-            "COMPONENT_INTERACTION", "SESSION_UPDATED",
-        }
+        # Action types this view cares about — subclasses can override at
+        # class level (e.g. subscribed_actions = {"MY_ACTION", ...})
+        if "subscribed_actions" not in type(self).__dict__:
+            self.subscribed_actions: Optional[Set[str]] = {
+                "VIEW_UPDATED", "VIEW_DESTROYED",
+                "COMPONENT_INTERACTION", "SESSION_UPDATED",
+            }
 
         # Build selector from the view's state_selector method (if overridden)
         selector = self._build_selector()
@@ -353,7 +363,7 @@ class StatefulView(View):
         Usage:
             async with self.batch() as batch:
                 await batch.dispatch("SESSION_UPDATED", payload1)
-                await batch.dispatch("NAVIGATION", payload2)
+                await batch.dispatch("NAVIGATION_REPLACE", payload2)
         """
         return self.state_store.batch()
 
@@ -404,34 +414,31 @@ class StatefulView(View):
 
     # // ========================================( Navigation Stack )======================================== // #
 
-    async def push(self, view_class, interaction=None, **kwargs):
-        """Push a new view onto the navigation stack and transition to it.
+    async def _navigate_to(self, view_class, interaction=None, *, action_type, action_payload,
+                           **kwargs):
+        """Internal: clean up current view, dispatch navigation action, construct next view.
 
-        The current view's class and kwargs are saved so pop() can
-        reconstruct it later. Uses batch() for atomic dispatch.
-
-        Args:
-            view_class: The StatefulView subclass to push to.
-            interaction: Discord interaction for the new view.
-            **kwargs: Additional kwargs passed to the new view constructor.
+        All navigation methods (push, replace, pop) share this path so cleanup
+        and kwarg forwarding stay consistent in one place.
         """
         current_interaction = interaction or self.interaction
 
-        # Build payload via ActionCreators for consistency
-        push_payload = ActionCreators.navigation_push(
-            session_id=self.session_id,
-            class_name=self.__class__.__name__,
-            module=self.__class__.__module__,
-        )
+        # Cancel background tasks owned by this view before stopping
+        self.task_manager.cancel_tasks(self.id)
 
         # Stop this view and clean up its subscription before dispatching
         self.stop()
         self.state_store.unsubscribe(self.id)
         self.state_store._undo_enabled_views.pop(self.id, None)
 
-        await self.state_store.dispatch("NAVIGATION_PUSH", push_payload, source_id=self.id)
+        await self.state_store.dispatch(action_type, action_payload, source_id=self.id)
 
-        # Pass through state store and session
+        # Remove the departing view from state so it doesn't accumulate
+        await self.state_store.dispatch(
+            "VIEW_DESTROYED", ActionCreators.view_destroyed(self.id), source_id=self.id
+        )
+
+        # Pass through state store, session, and scoping context
         if "state_store" not in kwargs:
             kwargs["state_store"] = self.state_store
         if "session_id" not in kwargs:
@@ -444,6 +451,32 @@ class StatefulView(View):
         # Create new view
         new_view = view_class(interaction=current_interaction, **kwargs)
         new_view._ephemeral = self._ephemeral
+
+        return new_view
+
+    async def push(self, view_class, interaction=None, **kwargs):
+        """Push a new view onto the navigation stack.
+
+        The current view's class is saved so pop() can reconstruct it later.
+        Use this for drill-down UIs where the user needs a "back" path.
+
+        Args:
+            view_class: The StatefulView subclass to push to.
+            interaction: Discord interaction for the new view.
+            **kwargs: Additional kwargs passed to the new view constructor.
+        """
+        push_payload = ActionCreators.navigation_push(
+            session_id=self.session_id,
+            class_name=self.__class__.__name__,
+            module=self.__class__.__module__,
+            kwargs=self._init_kwargs if self._init_kwargs else None,
+        )
+
+        new_view = await self._navigate_to(
+            view_class, interaction,
+            action_type="NAVIGATION_PUSH", action_payload=push_payload,
+            **kwargs,
+        )
 
         # Add back button if the target view wants one
         if new_view.auto_back_button:
@@ -467,17 +500,11 @@ class StatefulView(View):
         if not nav_stack:
             return None
 
-        current_interaction = interaction or self.interaction
-
         # Capture the entry BEFORE dispatching (reducer deepcopies, so our
         # reference is stale after dispatch — read first, dispatch second)
         entry = nav_stack[-1]
 
-        # Pop from state
-        pop_payload = ActionCreators.navigation_pop(self.session_id)
-        await self.state_store.dispatch("NAVIGATION_POP", pop_payload, source_id=self.id)
-
-        # Resolve the view class
+        # Resolve the view class before navigating
         class_name = entry.get("class_name")
         view_cls = _view_class_registry.get(class_name)
 
@@ -485,22 +512,14 @@ class StatefulView(View):
             logger.warning(f"Cannot pop: view class '{class_name}' not in registry")
             return None
 
-        # Stop this view and clean up its subscription
-        self.stop()
-        self.state_store.unsubscribe(self.id)
-        self.state_store._undo_enabled_views.pop(self.id, None)
+        pop_payload = ActionCreators.navigation_pop(self.session_id)
+        saved_kwargs = entry.get("kwargs") or {}
 
-        # Reconstruct previous view
-        new_view = view_cls(
-            interaction=current_interaction,
-            state_store=self.state_store,
-            session_id=self.session_id,
-            user_id=self.user_id,
-            guild_id=self.guild_id,
+        return await self._navigate_to(
+            view_cls, interaction,
+            action_type="NAVIGATION_POP", action_payload=pop_payload,
+            **saved_kwargs,
         )
-        new_view._ephemeral = self._ephemeral
-
-        return new_view
 
     def _add_back_button(self):
         """Add a back button that pops the nav stack."""
@@ -574,34 +593,21 @@ class StatefulView(View):
 
     # // ========================================( Transitions )======================================== // #
 
-    async def transition_to(self, view_class, interaction=None, **kwargs):
-        """Transition from this view to a new view."""
-        current_interaction = interaction or self.interaction
+    async def replace(self, view_class, interaction=None, **kwargs):
+        """Replace the current view with a new one (no stack history saved).
 
-        # Dispatch navigation action
-        await self.dispatch("NAVIGATION", ActionCreators.navigation(
+        Use this for one-way transitions where going "back" doesn't apply,
+        such as welcome screen -> main dashboard.
+        """
+        replace_payload = ActionCreators.navigation_replace(
             destination=view_class.__name__,
-            **kwargs
-        ))
+        )
 
-        # Include state store and session in new view
-        if "state_store" not in kwargs:
-            kwargs["state_store"] = self.state_store
-
-        if "session_id" not in kwargs:
-            kwargs["session_id"] = self.session_id
-
-        # Clean up this view BEFORE constructing the new one, so an exception
-        # in the new view's __init__ doesn't leave us subscribed forever
-        self.stop()
-        self.state_store.unsubscribe(self.id)
-        self.state_store._undo_enabled_views.pop(self.id, None)
-
-        # Create new view
-        new_view = view_class(interaction=current_interaction, **kwargs)
-        new_view._ephemeral = self._ephemeral
-
-        return new_view
+        return await self._navigate_to(
+            view_class, interaction,
+            action_type="NAVIGATION_REPLACE", action_payload=replace_payload,
+            **kwargs,
+        )
 
     async def exit(self, delete_message=False):
         """Cleanly exit and clean up this view."""

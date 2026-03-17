@@ -25,9 +25,9 @@ Sends the view as a message. Handles state registration and message tracking.
 
 Dispatches an action through the store with `source=self.id`.
 
-#### `transition_to(view_class, interaction=None, **kwargs)`
+#### `replace(view_class, interaction=None, **kwargs)`
 
-Transitions to another view class, cleaning up the current one. One-way (no stack).
+Replaces the current view with another view class. One-way (no stack history saved).
 
 #### `push(view_class, interaction, **kwargs)`
 

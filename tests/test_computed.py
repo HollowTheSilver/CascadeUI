@@ -1,4 +1,4 @@
-"""Tests for 7.3 — Computed State / Derived Values."""
+"""Tests for computed state and derived values (@computed decorator)."""
 
 import copy
 import pytest

@@ -196,7 +196,7 @@ view = MyView(context=ctx)
 await view.send(content="Hello")
 ```
 
-Views automatically clean up on timeout (disabling components and notifying the state store) and support transitions between views via `view.transition_to(OtherView)`.
+Views automatically clean up on timeout (disabling components and notifying the state store) and support transitions between views via `view.replace(OtherView)` or `view.push(OtherView)` for stack-based navigation.
 
 ### Navigation Stack
 

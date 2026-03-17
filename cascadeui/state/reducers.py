@@ -145,8 +145,8 @@ async def reduce_session_updated(action: Action, state: StateData) -> StateData:
     return new_state
 
 
-async def reduce_navigation(action: Action, state: StateData) -> StateData:
-    """Handle NAVIGATION actions."""
+async def reduce_navigation_replace(action: Action, state: StateData) -> StateData:
+    """Handle NAVIGATION_REPLACE actions."""
     new_state = copy.deepcopy(state)
     payload = action["payload"]
 

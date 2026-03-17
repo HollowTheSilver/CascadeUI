@@ -1,4 +1,4 @@
-"""Tests for 7.7 — Action Batching / Transactions."""
+"""Tests for action batching and atomic dispatch transactions."""
 
 import copy
 import pytest

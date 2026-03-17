@@ -1,4 +1,4 @@
-"""Tests for 7.9 — Form Validation System."""
+"""Tests for form validation system (validators, validate_field, validate_fields)."""
 
 import pytest
 

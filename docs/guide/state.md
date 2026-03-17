@@ -55,7 +55,7 @@ CascadeUI dispatches these actions automatically:
 | `VIEW_DESTROYED` | A view is cleaned up (exit or timeout) |
 | `SESSION_CREATED` | A new user session begins |
 | `SESSION_UPDATED` | A session is modified |
-| `NAVIGATION` | A view transition occurs |
+| `NAVIGATION_REPLACE` | A view is replaced (one-way transition) |
 | `NAVIGATION_PUSH` | A view is pushed onto the navigation stack |
 | `NAVIGATION_POP` | A view is popped from the navigation stack |
 | `SCOPED_UPDATE` | Per-user or per-guild scoped state is updated |
@@ -128,7 +128,7 @@ async with self.batch() as b:
 # From the store directly
 async with store.batch() as b:
     await b.dispatch("FORM_UPDATED", payload1)
-    await b.dispatch("NAVIGATION", payload2)
+    await b.dispatch("NAVIGATION_REPLACE", payload2)
 ```
 
 Inside a batch, each dispatch still runs through middleware and reducers immediately (state flows sequentially). Only subscriber notifications are deferred until the batch exits.
