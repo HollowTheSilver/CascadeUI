@@ -319,10 +319,8 @@ class TestNavigationChainTracking:
         await hub.send()
         assert len(store.get_active_views("_HubView", "user_guild:100:200")) == 1
 
-        # Push to sub-view
+        # Push to sub-view — _navigate_to registers it, no send() needed
         sub = await hub.push(_SubView)
-        sub._message = MagicMock()
-        await sub.send()
 
         # Sub-view should be tracked under _HubView, not _SubView
         assert len(store.get_active_views("_HubView", "user_guild:100:200")) == 1
@@ -345,8 +343,6 @@ class TestNavigationChainTracking:
         menu1 = _MenuView(interaction=_make_interaction())
         await menu1.send()
         detail = await menu1.push(_DetailView)
-        detail._message = MagicMock()
-        await detail.send()
 
         # Second command: new menu should trigger replace on the detail view
         menu2 = _MenuView(interaction=_make_interaction())
@@ -370,8 +366,6 @@ class TestNavigationChainTracking:
         hub = _StrictHub(interaction=_make_interaction())
         await hub.send()
         sub = await hub.push(_StrictSub)
-        sub._message = MagicMock()
-        await sub.send()
 
         # Second command should be rejected
         hub2 = _StrictHub(interaction=_make_interaction())
@@ -398,12 +392,8 @@ class TestNavigationChainTracking:
         await root.send()
 
         mid = await root.push(_Middle)
-        mid._message = MagicMock()
-        await mid.send()
 
         deep = await mid.push(_Deep)
-        deep._message = MagicMock()
-        await deep.send()
 
         # Deep view should be tracked under _Root
         assert len(store.get_active_views("_Root", "user_guild:100:200")) == 1
@@ -425,13 +415,9 @@ class TestNavigationChainTracking:
         await root.send()
 
         child = await root.push(_PopChild)
-        child._message = MagicMock()
-        await child.send()
 
         # Pop back to root
         restored = await child.pop()
-        restored._message = MagicMock()
-        await restored.send()
 
         # Restored view should be tracked under _PopRoot
         assert len(store.get_active_views("_PopRoot", "user_guild:100:200")) == 1
