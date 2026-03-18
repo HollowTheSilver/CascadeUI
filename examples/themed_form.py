@@ -13,7 +13,7 @@ from cascadeui import (
     StatefulButton,
     FormView,
     ConfirmationButtons,
-    PaginationControls,
+    PaginatedView,
     with_loading_state,
     with_confirmation,
     Theme,
@@ -278,53 +278,31 @@ class ThemedFormExample(commands.Cog, name="themed_form_example"):
 
     @commands.hybrid_command(
         name="paginationtest",
-        description="Test CascadeUI pagination."
+        description="Test CascadeUI pagination with dynamic data."
     )
     async def paginationtest(self, context):
-        """Test pagination controls."""
+        """Test PaginatedView with from_data, jump buttons, and go-to-page modal."""
 
-        class PaginationTestView(StatefulView):
-            def __init__(self, ctx):
-                super().__init__(context=ctx)
+        fruits = [
+            "Apple", "Banana", "Cherry", "Durian", "Elderberry",
+            "Fig", "Grape", "Honeydew", "Imbe", "Jackfruit",
+            "Kiwi", "Lemon", "Mango", "Nectarine", "Orange",
+            "Papaya", "Quince", "Raspberry", "Strawberry", "Tangerine",
+        ]
 
-                self.items_list = [
-                    "Apple", "Banana", "Cherry", "Durian", "Elderberry",
-                    "Fig", "Grape", "Honeydew", "Imbe", "Jackfruit",
-                    "Kiwi", "Lemon", "Mango", "Nectarine", "Orange"
-                ]
-                self.items_per_page = 5
-                self.current_page = 0
-                self.total_pages = (len(self.items_list) + self.items_per_page - 1) // self.items_per_page
+        def format_page(items):
+            embed = discord.Embed(title="Fruit Catalog")
+            for item in items:
+                embed.add_field(name=item, value=f"A delicious {item.lower()}.", inline=False)
+            return embed
 
-                pagination = PaginationControls(
-                    page_count=self.total_pages,
-                    current_page=self.current_page,
-                    on_page_change=self.change_page
-                )
-                pagination.add_to_view(self)
-
-            def build_embed(self):
-                start_idx = self.current_page * self.items_per_page
-                end_idx = min(start_idx + self.items_per_page, len(self.items_list))
-                current_items = self.items_list[start_idx:end_idx]
-
-                embed = discord.Embed(
-                    title="Fruit List",
-                    description=f"Page {self.current_page + 1} of {self.total_pages}"
-                )
-
-                for i, item in enumerate(current_items, start=start_idx + 1):
-                    embed.add_field(name=f"Item {i}", value=item, inline=False)
-
-                self.get_theme().apply_to_embed(embed)
-                return embed
-
-            async def change_page(self, interaction, page_num):
-                self.current_page = page_num
-                await interaction.response.edit_message(embed=self.build_embed(), view=self)
-
-        view = PaginationTestView(context)
-        await view.send(embed=view.build_embed())
+        view = await PaginatedView.from_data(
+            items=fruits,
+            per_page=3,
+            formatter=format_page,
+            context=context,
+        )
+        await view.send()
 
     @commands.hybrid_command(
         name="formtest",

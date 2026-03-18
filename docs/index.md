@@ -9,7 +9,7 @@ CascadeUI brings a Redux-inspired architecture to Discord bot interfaces. Views,
 ## Features
 
 - **Centralized State Store** with dispatch/reducer cycle, action history, filtered subscriptions, action batching, event hooks, and computed/derived values
-- **Stateful Views** with lifecycle management, interaction ownership, navigation stack (push/pop), per-user/per-guild state scoping, undo/redo, and pre-built patterns (tabs, wizards, forms, pagination)
+- **Stateful Views** with lifecycle management, auto-defer safety net, interaction ownership, navigation stack (push/pop), per-user/per-guild state scoping, undo/redo, and pre-built patterns (tabs, wizards, forms, pagination)
 - **Session Limiting** with declarative per-view limits, scoped enforcement (user, guild, user+guild, global), and automatic cleanup or rejection policies
 - **Stateful Components** with automatic action dispatching and behavioral wrappers (loading, confirmation, cooldowns)
 - **Form Validation** with built-in validators, custom sync/async validators, and per-field error reporting

@@ -1,21 +1,23 @@
-
 # // ========================================( Modules )======================================== // #
 
 
+import asyncio
+import time
 import uuid
 from typing import Any, Dict, Optional, Set
-from ..utils.tasks import get_task_manager
-from ..utils.errors import with_error_boundary, safe_execute
 
 import discord
 from discord import Interaction
-from discord.ui import View, Item
+from discord.ui import Item, View
 
-from ..state.singleton import get_store
 from ..state.actions import ActionCreators
+from ..state.singleton import get_store
+from ..utils.errors import safe_execute, with_error_boundary
 
 # Add logger
 from ..utils.logging import AsyncLogger
+from ..utils.tasks import get_task_manager
+
 logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a", prefix="cascadeui")
 
 
@@ -60,13 +62,17 @@ class StatefulView(View):
     auto_back_button: bool = False
 
     # Subclass config: session limiting
-    session_limit: Optional[int] = None      # None = unlimited
-    session_scope: str = "user_guild"        # "user", "guild", "user_guild", "global"
-    session_policy: str = "replace"          # "replace" or "reject"
+    session_limit: Optional[int] = None  # None = unlimited
+    session_scope: str = "user_guild"  # "user", "guild", "user_guild", "global"
+    session_policy: str = "replace"  # "replace" or "reject"
 
     # Subclass config: interaction ownership
-    owner_only: bool = True                  # Reject interactions from non-owners
+    owner_only: bool = True  # Reject interactions from non-owners
     owner_only_message: str = "You cannot interact with this."
+
+    # Subclass config: auto-defer safety net
+    auto_defer: bool = True
+    auto_defer_delay: float = 2.5
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -131,15 +137,19 @@ class StatefulView(View):
         # class level (e.g. subscribed_actions = {"MY_ACTION", ...})
         if "subscribed_actions" not in type(self).__dict__:
             self.subscribed_actions: Optional[Set[str]] = {
-                "VIEW_UPDATED", "VIEW_DESTROYED",
-                "COMPONENT_INTERACTION", "SESSION_UPDATED",
+                "VIEW_UPDATED",
+                "VIEW_DESTROYED",
+                "COMPONENT_INTERACTION",
+                "SESSION_UPDATED",
             }
 
         # Build selector from the view's state_selector method (if overridden)
         selector = self._build_selector()
 
         # Subscribe to state updates with action filter and selector
-        self.state_store.subscribe(self.id, self._on_state_changed, self.subscribed_actions, selector)
+        self.state_store.subscribe(
+            self.id, self._on_state_changed, self.subscribed_actions, selector
+        )
 
         # Register for undo tracking if this view has it enabled
         if self.enable_undo:
@@ -194,8 +204,7 @@ class StatefulView(View):
         # Ensure session exists
         if self.session_id:
             payload = ActionCreators.session_created(
-                session_id=self.session_id,
-                user_id=self.user_id
+                session_id=self.session_id, user_id=self.user_id
             )
             await self.state_store.dispatch("SESSION_CREATED", payload)
 
@@ -204,7 +213,7 @@ class StatefulView(View):
             view_id=self.id,
             view_type=self.__class__.__name__,
             user_id=self.user_id,
-            session_id=self.session_id
+            session_id=self.session_id,
         )
         await self.state_store.dispatch("VIEW_CREATED", payload)
 
@@ -215,7 +224,7 @@ class StatefulView(View):
         payload = ActionCreators.view_updated(
             view_id=self.id,
             message_id=str(message.id),
-            channel_id=str(message.channel.id) if message.channel else None
+            channel_id=str(message.channel.id) if message.channel else None,
         )
         await self.dispatch("VIEW_UPDATED", payload)
 
@@ -317,8 +326,56 @@ class StatefulView(View):
         """
         if self.theme is not None:
             return self.theme
-        from ..theming.core import get_default_theme, Theme
+        from ..theming.core import Theme, get_default_theme
+
         return get_default_theme() or Theme("fallback")
+
+    # // ==================( Auto-Defer Safety Net )================== // #
+
+    async def _scheduled_task(self, item: Item, interaction: Interaction):
+        """Override discord.py's internal dispatch to add auto-defer protection.
+
+        Replicates View._scheduled_task with an added timer that automatically
+        defers the interaction if the callback hasn't responded within
+        ``auto_defer_delay`` seconds. This prevents the "This interaction failed"
+        error when callbacks are slow.
+        """
+        try:
+            item._refresh_state(interaction, interaction.data)  # type: ignore
+
+            allow = await item._run_checks(interaction) and await self.interaction_check(
+                interaction
+            )
+            if not allow:
+                return
+
+            if self.timeout:
+                self._BaseView__timeout_expiry = time.monotonic() + self.timeout  # type: ignore
+
+            defer_task = None
+            if self.auto_defer:
+                defer_task = asyncio.create_task(self._auto_defer_timer(interaction))
+
+            try:
+                await item.callback(interaction)
+            finally:
+                if defer_task is not None and not defer_task.done():
+                    defer_task.cancel()
+        except Exception as e:
+            return await self.on_error(interaction, e, item)
+
+    async def _auto_defer_timer(self, interaction: Interaction):
+        """Background timer that defers the interaction if the callback hasn't responded."""
+        try:
+            await asyncio.sleep(self.auto_defer_delay)
+            if not interaction.response.is_done():
+                await interaction.response.defer()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.debug(f"Auto-defer failed for interaction in {self.__class__.__name__}")
+
+    # // ==================( Interaction Hooks )================== // #
 
     async def interaction_check(self, interaction: Interaction) -> bool:
         """Called before every component callback to validate the interaction.
@@ -335,9 +392,7 @@ class StatefulView(View):
         if self.owner_only and self.user_id is not None:
             if interaction.user.id != self.user_id:
                 try:
-                    await interaction.response.send_message(
-                        self.owner_only_message, ephemeral=True
-                    )
+                    await interaction.response.send_message(self.owner_only_message, ephemeral=True)
                 except discord.HTTPException:
                     pass
                 return False
@@ -430,7 +485,7 @@ class StatefulView(View):
             payload = ActionCreators.view_updated(
                 view_id=self.id,
                 message_id=str(value.id),
-                channel_id=str(value.channel.id) if value.channel else None
+                channel_id=str(value.channel.id) if value.channel else None,
             )
             self.create_task(self.dispatch("VIEW_UPDATED", payload))
 
@@ -493,8 +548,9 @@ class StatefulView(View):
 
     # // ========================================( Navigation Stack )======================================== // #
 
-    async def _navigate_to(self, view_class, interaction=None, *, action_type, action_payload,
-                           **kwargs):
+    async def _navigate_to(
+        self, view_class, interaction=None, *, action_type, action_payload, **kwargs
+    ):
         """Internal: clean up current view, dispatch navigation action, construct next view.
 
         All navigation methods (push, replace, pop) share this path so cleanup
@@ -553,8 +609,10 @@ class StatefulView(View):
         )
 
         new_view = await self._navigate_to(
-            view_class, interaction,
-            action_type="NAVIGATION_PUSH", action_payload=push_payload,
+            view_class,
+            interaction,
+            action_type="NAVIGATION_PUSH",
+            action_payload=push_payload,
             **kwargs,
         )
 
@@ -596,8 +654,10 @@ class StatefulView(View):
         saved_kwargs = entry.get("kwargs") or {}
 
         return await self._navigate_to(
-            view_cls, interaction,
-            action_type="NAVIGATION_POP", action_payload=pop_payload,
+            view_cls,
+            interaction,
+            action_type="NAVIGATION_POP",
+            action_payload=pop_payload,
             **saved_kwargs,
         )
 
@@ -684,8 +744,10 @@ class StatefulView(View):
         )
 
         return await self._navigate_to(
-            view_class, interaction,
-            action_type="NAVIGATION_REPLACE", action_payload=replace_payload,
+            view_class,
+            interaction,
+            action_type="NAVIGATION_REPLACE",
+            action_payload=replace_payload,
             **kwargs,
         )
 
@@ -724,8 +786,15 @@ class StatefulView(View):
 
         return True
 
-    def add_exit_button(self, label="Exit", style=discord.ButtonStyle.secondary,
-                        row=None, emoji="❌", delete_message=False, custom_id=None):
+    def add_exit_button(
+        self,
+        label="Exit",
+        style=discord.ButtonStyle.secondary,
+        row=None,
+        emoji="❌",
+        delete_message=False,
+        custom_id=None,
+    ):
         """Add a button that exits this view when clicked.
 
         For PersistentView subclasses, pass a custom_id (e.g. ``custom_id="exit"``).

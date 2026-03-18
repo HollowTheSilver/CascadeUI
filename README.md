@@ -32,6 +32,7 @@ CascadeUI brings a Redux-inspired architecture to Discord bot interfaces. Views,
 - **Stateful Views**
   - Wraps discord.py `View` with automatic state integration
   - Lifecycle management: send, interact, timeout, cleanup
+  - Auto-defer safety net: automatically defers slow callbacks before Discord's 3-second deadline
   - Interaction ownership: only the invoking user can interact (`owner_only`, on by default)
   - View-to-view transitions with navigation history
   - Navigation stack with push/pop for multi-level UIs

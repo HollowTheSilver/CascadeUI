@@ -98,6 +98,8 @@ Called before every component callback. Returns `True` to allow the interaction,
 - `session_policy` (str): What to do when the limit is exceeded. `"replace"` (default) exits the oldest instances. `"reject"` raises `SessionLimitError`.
 - `owner_only` (bool): Only the creating user can interact with the view (default: `True`). Set to `False` for shared views like polls or dashboards.
 - `owner_only_message` (str): Ephemeral message sent to non-owners when `owner_only` is `True` (default: `"You cannot interact with this."`).
+- `auto_defer` (bool): Enable the auto-defer safety net (default: `True`). Automatically defers interactions when callbacks are slow.
+- `auto_defer_delay` (float): Seconds to wait before auto-deferring (default: `2.5`).
 
 ---
 
@@ -178,8 +180,27 @@ FormView(
 ### `PaginatedView`
 
 ```python
-PaginatedView(context=None, pages=[Embed, ...], **kwargs)
+PaginatedView(context=None, pages=[Embed | str | dict, ...], **kwargs)
 ```
+
+Pages can be `Embed` objects, strings, or dicts with `"embed"` and/or `"content"` keys.
+
+#### Class Attributes
+
+- `jump_threshold` (int): Page count above which first/last and go-to-page buttons appear (default: `5`).
+
+#### Class Methods
+
+##### `await PaginatedView.from_data(items, per_page, formatter, **kwargs)`
+
+Creates a `PaginatedView` by chunking `items` into groups of `per_page` and applying `formatter` (sync or async) to each chunk. Returns a ready-to-send instance.
+
+#### Navigation Buttons
+
+- **Previous/Next** (`◀`/`▶`): Always shown. Disabled at boundaries.
+- **First/Last** (`⏮`/`⏭`): Shown when `len(pages) > jump_threshold`. Disabled at boundaries.
+- **Go-to-page**: Shown when `len(pages) > jump_threshold`. Opens a modal for direct page input. Replaces the disabled page indicator.
+- **Page indicator**: Shown when `len(pages) <= jump_threshold`. Disabled button displaying "Page X/Y".
 
 ---
 

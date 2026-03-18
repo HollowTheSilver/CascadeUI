@@ -89,6 +89,46 @@ async def go_to_settings(self, interaction):
 
 `replace` is a one-way transition: it stops the current view and starts the new one. There is no implicit "back" capability. For multi-level navigation, use the navigation stack instead.
 
+### Auto-Defer Safety Net
+
+CascadeUI automatically defers interactions when callbacks are slow, preventing the "This interaction failed" error that Discord shows when a response takes longer than 3 seconds.
+
+This is enabled by default on all `StatefulView` subclasses. If a callback hasn't responded within 2.5 seconds, the framework automatically calls `interaction.response.defer()` in the background. If the callback responds before the timer fires, the timer is cancelled harmlessly.
+
+```python
+class MyView(StatefulView):
+    auto_defer = True        # Default — enabled for all views
+    auto_defer_delay = 2.5   # Seconds before auto-defer fires
+```
+
+#### How it works
+
+1. When a component callback starts, a background timer is spawned
+2. The timer waits `auto_defer_delay` seconds, then checks `interaction.response.is_done()`
+3. If the callback hasn't responded yet, the timer calls `interaction.response.defer()`
+4. If the callback responds before the timer, the timer is cancelled
+
+#### Compatibility
+
+Auto-defer is safe with all existing patterns:
+
+- **Manual `defer()` calls**: The callback sets `is_done()` to `True`, so the timer skips
+- **`with_loading_state`**: Consumes the response immediately, timer skips
+- **`with_confirmation`**: Sends a confirmation prompt immediately, timer skips
+- **`with_cooldown`**: Sends a cooldown message or passes through, timer skips
+
+!!! warning "Modal callbacks"
+    `interaction.response.send_modal()` must be the first response to an interaction. If auto-defer fires before you call `send_modal()`, the interaction is consumed and the modal cannot be sent. If your callback opens a modal, ensure it does so quickly (within `auto_defer_delay`). You can also disable auto-defer for modal-heavy views with `auto_defer = False`.
+
+#### Disabling auto-defer
+
+Set `auto_defer = False` on a view class to opt out entirely:
+
+```python
+class ManualDeferView(StatefulView):
+    auto_defer = False  # Handle all deferrals manually
+```
+
 ### Error Handling
 
 `StatefulView` includes a built-in `on_error` handler that shows a red ephemeral embed when an interaction callback raises an exception. This prevents silent failures and gives users visible feedback.
@@ -508,17 +548,70 @@ See [Validation](validation.md) for details on built-in validators.
 
 ### PaginatedView
 
-Paginated content with Previous/Next navigation:
+Paginated content with automatic navigation buttons. Supports plain embeds, strings, and mixed-content dicts:
 
 ```python
 from cascadeui import PaginatedView
 
-class HelpView(PaginatedView):
-    def __init__(self, context, pages):
-        super().__init__(context=context, pages=pages)
+pages = [
+    discord.Embed(title="Page 1", description="First page"),
+    discord.Embed(title="Page 2", description="Second page"),
+    discord.Embed(title="Page 3", description="Third page"),
+]
 
-    # pages is a list of embeds, one per page
+view = PaginatedView(context=ctx, pages=pages)
+await view.send()  # First page is displayed automatically
 ```
+
+#### Page types
+
+Pages can be any of the following:
+
+| Type | Example | Description |
+|------|---------|-------------|
+| `discord.Embed` | `discord.Embed(title="Page 1")` | Embed-only page |
+| `str` | `"Plain text page"` | Text-only page |
+| `dict` | `{"embed": embed, "content": "text"}` | Mixed content page |
+
+#### Jump buttons and go-to-page
+
+When the page count exceeds `jump_threshold` (default 5), additional navigation appears automatically:
+
+- **First/last buttons** (`⏮`/`⏭`) for jumping to the start or end
+- **Go-to-page button** replaces the page indicator and opens a modal where users can type a page number directly
+
+```
+Below threshold:  [◀ Previous] [Page 1/3] [Next ▶]
+Above threshold:  [⏮] [◀] [1/20] [▶] [⏭]
+```
+
+Override the threshold on a subclass:
+
+```python
+class DetailedView(PaginatedView):
+    jump_threshold = 3  # Show jump buttons at 4+ pages
+```
+
+#### Dynamic pagination with `from_data`
+
+Auto-paginate a list of items without manually building embeds:
+
+```python
+async def format_page(items):
+    embed = discord.Embed(title="User List")
+    embed.description = "\n".join(f"- {item}" for item in items)
+    return embed
+
+view = await PaginatedView.from_data(
+    items=all_users,       # Full list of items
+    per_page=10,           # Items per page
+    formatter=format_page, # Sync or async callable
+    context=ctx,
+)
+await view.send()
+```
+
+The formatter receives a list of items for one page and returns an `Embed`, `str`, or page dict. Both sync and async formatters are supported.
 
 ## PersistentView
 
