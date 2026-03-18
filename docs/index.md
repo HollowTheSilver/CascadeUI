@@ -43,7 +43,7 @@ User clicks button
 ## Requirements
 
 - Python 3.10+
-- discord.py 2.1+
+- discord.py 2.7+
 
 ## Quick Links
 

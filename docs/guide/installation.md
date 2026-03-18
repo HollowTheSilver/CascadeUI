@@ -3,7 +3,7 @@
 ## Requirements
 
 - Python 3.10 or higher
-- discord.py 2.1 or higher
+- discord.py 2.7 or higher
 
 ## From Source
 

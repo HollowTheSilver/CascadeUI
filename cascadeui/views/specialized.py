@@ -2,6 +2,7 @@
 
 
 import asyncio
+import inspect
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import discord
@@ -270,7 +271,7 @@ class PaginatedView(StatefulView):
         chunks = [items[i : i + per_page] for i in range(0, len(items), per_page)]
         pages = []
         for chunk in chunks:
-            if asyncio.iscoroutinefunction(formatter):
+            if inspect.iscoroutinefunction(formatter):
                 pages.append(await formatter(chunk))
             else:
                 pages.append(formatter(chunk))
