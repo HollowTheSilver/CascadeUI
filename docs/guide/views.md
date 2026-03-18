@@ -434,7 +434,7 @@ Some scopes require identity fields that may not be available. For example, `ses
 
 ### Interaction with Other Features
 
-- **Navigation stack**: Session limits track the entire navigation chain. When a user pushes from `SettingsHub` to `NotificationsView`, the sub-view counts against `SettingsHub`'s limit. A second `/settings` command will find and replace the active sub-view, not just the root. When a view is exited by session limiting, its entire navigation stack is cleaned up.
+- **Navigation stack**: Session limits track the entire navigation chain. When a root view pushes to a sub-view, the sub-view counts against the root's limit. A second command will find and replace the active sub-view, not just the root. When a view is exited by session limiting, its entire navigation stack is cleaned up.
 - **Ephemeral views**: Session limiting works with ephemeral views. The old ephemeral message's components are disabled, and the new view is sent as a fresh ephemeral message.
 - **Persistence**: Restored persistent views (from `setup_persistence`) are tracked in the active view registry but are not session-indexed (they lack user/guild context). They will not block new views from being created.
 - **Undo/redo**: When the replace policy exits an old view, its undo history is discarded along with the view. The new view starts fresh.
