@@ -14,7 +14,11 @@ def _make_interaction(user_id=100, guild_id=200):
     interaction.user = MagicMock(id=user_id)
     interaction.guild = MagicMock(id=guild_id)
     interaction.guild_id = guild_id
+    # InteractionResponse.is_done() is sync in discord.py — use MagicMock
+    # so the return value is a plain bool, not a coroutine.
+    interaction.response = MagicMock()
     interaction.response.is_done.return_value = False
+    interaction.response.send_message = AsyncMock()
     interaction.original_response = AsyncMock(return_value=MagicMock(id=999, channel=MagicMock(id=888)))
     return interaction
 
@@ -290,3 +294,174 @@ class TestMissingIdentity:
 
         view2 = _DmView(interaction=interaction2)
         await view2.send()  # No error — enforcement skipped
+
+
+# // ========================================( Navigation Chain Tracking )======================================== // #
+
+
+class TestNavigationChainTracking:
+    """Session limiting must track the entire push/pop navigation chain under
+    the root view's class name so that sub-views count against the root's limit."""
+
+    async def test_push_registers_subview_under_root(self):
+        """After push(), the sub-view should be indexed under the root view's class name."""
+
+        class _HubView(StatefulView):
+            session_limit = 1
+            session_scope = "user_guild"
+
+        class _SubView(StatefulView):
+            async def update_from_state(self, state):
+                pass
+
+        store = get_store()
+        hub = _HubView(interaction=_make_interaction())
+        await hub.send()
+        assert len(store.get_active_views("_HubView", "user_guild:100:200")) == 1
+
+        # Push to sub-view
+        sub = await hub.push(_SubView)
+        sub._message = MagicMock()
+        await sub.send()
+
+        # Sub-view should be tracked under _HubView, not _SubView
+        assert len(store.get_active_views("_HubView", "user_guild:100:200")) == 1
+        assert len(store.get_active_views("_SubView", "user_guild:100:200")) == 0
+
+    async def test_second_command_replaces_subview(self):
+        """A second root command should find and replace the active sub-view."""
+
+        class _MenuView(StatefulView):
+            session_limit = 1
+            session_scope = "user_guild"
+
+        class _DetailView(StatefulView):
+            async def update_from_state(self, state):
+                pass
+
+        store = get_store()
+
+        # First command: menu -> detail
+        menu1 = _MenuView(interaction=_make_interaction())
+        await menu1.send()
+        detail = await menu1.push(_DetailView)
+        detail._message = MagicMock()
+        await detail.send()
+
+        # Second command: new menu should trigger replace on the detail view
+        menu2 = _MenuView(interaction=_make_interaction())
+        with patch.object(detail, "exit", new_callable=AsyncMock) as mock_exit:
+            await menu2.send()
+            mock_exit.assert_called_once()
+
+    async def test_second_command_rejected_when_on_subview(self):
+        """With reject policy, a second command should fail even when on a sub-view."""
+
+        class _StrictHub(StatefulView):
+            session_limit = 1
+            session_scope = "user_guild"
+            session_policy = "reject"
+
+        class _StrictSub(StatefulView):
+            async def update_from_state(self, state):
+                pass
+
+        store = get_store()
+        hub = _StrictHub(interaction=_make_interaction())
+        await hub.send()
+        sub = await hub.push(_StrictSub)
+        sub._message = MagicMock()
+        await sub.send()
+
+        # Second command should be rejected
+        hub2 = _StrictHub(interaction=_make_interaction())
+        with pytest.raises(SessionLimitError):
+            await hub2.send()
+
+    async def test_origin_chains_through_multiple_pushes(self):
+        """Pushing A -> B -> C should track C under A's class name."""
+
+        class _Root(StatefulView):
+            session_limit = 1
+            session_scope = "user_guild"
+
+        class _Middle(StatefulView):
+            async def update_from_state(self, state):
+                pass
+
+        class _Deep(StatefulView):
+            async def update_from_state(self, state):
+                pass
+
+        store = get_store()
+        root = _Root(interaction=_make_interaction())
+        await root.send()
+
+        mid = await root.push(_Middle)
+        mid._message = MagicMock()
+        await mid.send()
+
+        deep = await mid.push(_Deep)
+        deep._message = MagicMock()
+        await deep.send()
+
+        # Deep view should be tracked under _Root
+        assert len(store.get_active_views("_Root", "user_guild:100:200")) == 1
+        assert deep._session_origin == "_Root"
+
+    async def test_pop_preserves_origin(self):
+        """After pop(), the restored parent view should still carry the root origin."""
+
+        class _PopRoot(StatefulView):
+            session_limit = 1
+            session_scope = "user_guild"
+
+        class _PopChild(StatefulView):
+            async def update_from_state(self, state):
+                pass
+
+        store = get_store()
+        root = _PopRoot(interaction=_make_interaction())
+        await root.send()
+
+        child = await root.push(_PopChild)
+        child._message = MagicMock()
+        await child.send()
+
+        # Pop back to root
+        restored = await child.pop()
+        restored._message = MagicMock()
+        await restored.send()
+
+        # Restored view should be tracked under _PopRoot
+        assert len(store.get_active_views("_PopRoot", "user_guild:100:200")) == 1
+        # The restored view IS a _PopRoot — origin is cleared back to None
+        assert restored._session_origin is None
+
+    async def test_replace_does_not_set_origin(self):
+        """replace() is a one-way transition — should NOT propagate session origin."""
+
+        class _SourceView(StatefulView):
+            session_limit = 1
+            session_scope = "user_guild"
+
+        class _DestView(StatefulView):
+            session_limit = 1
+            session_scope = "user_guild"
+
+            async def update_from_state(self, state):
+                pass
+
+        store = get_store()
+        source = _SourceView(interaction=_make_interaction())
+        await source.send()
+
+        dest = await source.replace(_DestView)
+        dest._message = MagicMock()
+        await dest.send()
+
+        # replace() is one-way — dest view should be independent, tracked under
+        # its own class name with origin cleared.
+        assert dest._session_origin is None
+        assert len(store.get_active_views("_DestView", "user_guild:100:200")) == 1
+        assert len(store.get_active_views("_SourceView", "user_guild:100:200")) == 0

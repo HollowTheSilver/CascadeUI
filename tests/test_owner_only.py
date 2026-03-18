@@ -13,7 +13,10 @@ def _make_interaction(user_id=100, guild_id=200):
     interaction.user = MagicMock(id=user_id)
     interaction.guild = MagicMock(id=guild_id)
     interaction.guild_id = guild_id
+    # InteractionResponse.is_done() is sync in discord.py — use MagicMock
+    interaction.response = MagicMock()
     interaction.response.is_done.return_value = False
+    interaction.response.send_message = AsyncMock()
     interaction.original_response = AsyncMock(
         return_value=MagicMock(id=999, channel=MagicMock(id=888))
     )

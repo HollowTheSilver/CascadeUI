@@ -110,6 +110,11 @@ class StatefulView(View):
         # Whether state registration has been done
         self._registered = False
 
+        # Session origin: when a view is pushed via navigation, this is set to
+        # the root view's class name so the entire nav chain is tracked under
+        # one session index key.  None means this view IS the root.
+        self._session_origin: Optional[str] = None
+
         # Get task manager
         self.task_manager = get_task_manager()
 
@@ -245,7 +250,7 @@ class StatefulView(View):
         if self.session_limit is not None:
             scope_key = self.state_store._build_session_scope_key(self)
             if scope_key is not None:
-                view_type = self.__class__.__name__
+                view_type = self._session_origin or self.__class__.__name__
                 existing = self.state_store.get_active_views(view_type, scope_key)
                 overflow = len(existing) - self.session_limit + 1
 
@@ -587,6 +592,27 @@ class StatefulView(View):
         # Create new view
         new_view = view_class(interaction=current_interaction, **kwargs)
         new_view._ephemeral = self._ephemeral
+
+        # Propagate session origin so the entire navigation chain is tracked
+        # under the root view's class name in the session index.
+        if action_type == "NAVIGATION_REPLACE":
+            # replace() is a one-way transition — the destination view is independent
+            # and should be tracked under its own class name, not the source's.
+            new_view._session_origin = None
+        else:
+            origin = self._session_origin or self.__class__.__name__
+            # If the destination IS the root class (e.g. pop() back to root),
+            # clear the origin so it knows it's the root again.
+            if view_class.__name__ == origin:
+                new_view._session_origin = None
+            else:
+                new_view._session_origin = origin
+
+        # Register the new view in the active view registry immediately.
+        # Sub-views from push/pop typically edit the existing message instead
+        # of calling send(), so register_view() must happen here — otherwise
+        # the sub-view is invisible to session limit enforcement.
+        self.state_store.register_view(new_view)
 
         return new_view
 

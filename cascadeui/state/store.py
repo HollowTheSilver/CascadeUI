@@ -400,11 +400,17 @@ class StateStore:
     # // ========================================( View Registry )======================================== // #
 
     def register_view(self, view) -> None:
-        """Register a live view instance. Called from StatefulView.send()."""
+        """Register a live view instance. Idempotent — safe to call multiple times.
+
+        Uses ``view._session_origin`` (if set) as the type key so that
+        navigated sub-views are tracked under the root view's class name.
+        """
+        already_registered = view.id in self._active_views
         self._active_views[view.id] = view
         scope_key = self._build_session_scope_key(view)
-        if scope_key is not None:
-            key = (view.__class__.__name__, scope_key)
+        if scope_key is not None and not already_registered:
+            view_type = getattr(view, "_session_origin", None) or view.__class__.__name__
+            key = (view_type, scope_key)
             self._session_index.setdefault(key, []).append(view.id)
 
     def unregister_view(self, view_id: str) -> None:
@@ -413,7 +419,8 @@ class StateStore:
         if view is not None:
             scope_key = self._build_session_scope_key(view)
             if scope_key is not None:
-                key = (view.__class__.__name__, scope_key)
+                view_type = getattr(view, "_session_origin", None) or view.__class__.__name__
+                key = (view_type, scope_key)
                 ids = self._session_index.get(key, [])
                 if view_id in ids:
                     ids.remove(view_id)

@@ -92,7 +92,7 @@ Sets scoped state for the given scope type and ID.
 
 #### `register_view(view)`
 
-Registers a live view instance in the active view registry. Called internally by `StatefulView.send()`. Used by session limiting to track active instances.
+Registers a live view instance in the active view registry. Called internally by `StatefulView.send()` and `_navigate_to()`. Idempotent -- safe to call multiple times for the same view. Used by session limiting to track active instances.
 
 #### `unregister_view(view_id)`
 
