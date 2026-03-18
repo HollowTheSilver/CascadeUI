@@ -93,6 +93,50 @@ async def go_to_settings(self, interaction):
 
 `StatefulView` includes a built-in `on_error` handler that shows a red ephemeral embed when an interaction callback raises an exception. This prevents silent failures and gives users visible feedback.
 
+### Interaction Ownership
+
+By default, only the user who created a view can interact with it. If another user clicks a button on someone else's view, they receive an ephemeral rejection message and the callback does not run.
+
+```python
+class MyView(StatefulView):
+    owner_only = True                                    # Default
+    owner_only_message = "You cannot interact with this."  # Default
+```
+
+This prevents a common class of bugs where another user accidentally modifies someone else's state by clicking their buttons.
+
+To make a view accessible to everyone, set `owner_only = False`:
+
+```python
+class PollView(StatefulView):
+    owner_only = False  # Anyone can vote
+```
+
+`PersistentView` defaults to `owner_only = False` since persistent views are typically shared panels like role selectors or dashboards.
+
+#### Custom Access Control
+
+Override `interaction_check()` for more advanced logic, like role-based access:
+
+```python
+class AdminView(StatefulView):
+    async def interaction_check(self, interaction):
+        # Keep the ownership check from StatefulView
+        if not await super().interaction_check(interaction):
+            return False
+
+        # Add role-based check
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "Admins only.", ephemeral=True
+            )
+            return False
+        return True
+```
+
+!!! note "Views without a user context"
+    When `user_id` is `None` (e.g. restored `PersistentView` instances or views created without a context/interaction), the ownership check is skipped and all users can interact. This is the correct behavior for restored views since the original user may not even be online.
+
 ### Exit Button
 
 Add a standard exit button that cleans up the view:

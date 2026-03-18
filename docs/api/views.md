@@ -73,6 +73,10 @@ Called when a matching state change occurs. Override to react to state updates.
 
 Returns a slice of state. If the return value hasn't changed, `update_from_state` won't fire.
 
+#### `interaction_check(interaction)` *(override)*
+
+Called before every component callback. Returns `True` to allow the interaction, `False` to block it. By default, rejects non-owners with an ephemeral message when `owner_only` is `True`. Override for custom access control (call `await super().interaction_check(interaction)` to preserve the ownership check).
+
 ### Properties
 
 - `id` (str): UUID instance identifier
@@ -92,6 +96,8 @@ Returns a slice of state. If the return value hasn't changed, `update_from_state
 - `session_limit` (int | None): Maximum number of active instances within the session scope. `None` (default) means unlimited.
 - `session_scope` (str): How instances are grouped for limit counting. One of `"user"`, `"guild"`, `"user_guild"` (default), or `"global"`.
 - `session_policy` (str): What to do when the limit is exceeded. `"replace"` (default) exits the oldest instances. `"reject"` raises `SessionLimitError`.
+- `owner_only` (bool): Only the creating user can interact with the view (default: `True`). Set to `False` for shared views like polls or dashboards.
+- `owner_only_message` (str): Ephemeral message sent to non-owners when `owner_only` is `True` (default: `"You cannot interact with this."`).
 
 ---
 

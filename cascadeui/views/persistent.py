@@ -42,6 +42,9 @@ class PersistentView(StatefulView):
     registered views automatically.
     """
 
+    # Persistent views are typically shared panels (role selectors, dashboards)
+    owner_only: bool = False
+
     def __init_subclass__(cls, **kwargs):
         """Auto-register every concrete subclass so restore can find it by name."""
         super().__init_subclass__(**kwargs)

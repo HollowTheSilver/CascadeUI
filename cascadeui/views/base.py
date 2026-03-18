@@ -64,6 +64,10 @@ class StatefulView(View):
     session_scope: str = "user_guild"        # "user", "guild", "user_guild", "global"
     session_policy: str = "replace"          # "replace" or "reject"
 
+    # Subclass config: interaction ownership
+    owner_only: bool = True                  # Reject interactions from non-owners
+    owner_only_message: str = "You cannot interact with this."
+
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         _register_view_class(cls)
@@ -315,6 +319,29 @@ class StatefulView(View):
             return self.theme
         from ..theming.core import get_default_theme, Theme
         return get_default_theme() or Theme("fallback")
+
+    async def interaction_check(self, interaction: Interaction) -> bool:
+        """Called before every component callback to validate the interaction.
+
+        When ``owner_only`` is True (the default), only the user who created
+        the view can interact with it. Other users receive an ephemeral
+        rejection message. Override this for custom access control (e.g.
+        role-based checks), calling ``await super().interaction_check(interaction)``
+        to preserve the ownership check.
+
+        Skipped when ``self.user_id`` is None (e.g. restored PersistentViews
+        with no originating user context).
+        """
+        if self.owner_only and self.user_id is not None:
+            if interaction.user.id != self.user_id:
+                try:
+                    await interaction.response.send_message(
+                        self.owner_only_message, ephemeral=True
+                    )
+                except discord.HTTPException:
+                    pass
+                return False
+        return True
 
     async def on_error(self, interaction: Interaction, error: Exception, item: Item) -> None:
         """Called when a component callback raises an exception.
