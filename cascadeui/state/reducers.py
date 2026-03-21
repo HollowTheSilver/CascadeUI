@@ -268,6 +268,7 @@ async def reduce_persistent_view_registered(action: Action, state: StateData) ->
         "message_id": payload.get("message_id"),
         "channel_id": payload.get("channel_id"),
         "guild_id": payload.get("guild_id"),
+        "user_id": payload.get("user_id"),
         "registered_at": action["timestamp"],
     }
 

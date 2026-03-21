@@ -87,6 +87,7 @@ class ActionCreators:
         message_id: str,
         channel_id: str,
         guild_id: Optional[str] = None,
+        user_id: Optional[str] = None,
     ) -> ActionPayload:
         """Create a PERSISTENT_VIEW_REGISTERED action payload."""
         return {
@@ -95,6 +96,7 @@ class ActionCreators:
             "message_id": message_id,
             "channel_id": channel_id,
             "guild_id": guild_id,
+            "user_id": user_id,
         }
 
     @staticmethod

@@ -91,6 +91,52 @@ class PersistentView(StatefulView):
         if message is None:
             return message
 
+        # If this state_key already has a registered view/message, clean up the old
+        # one to prevent orphaned views and messages.
+        registry = self.state_store.state.get("persistent_views", {})
+        existing = registry.get(self.state_key)
+        if existing and existing.get("message_id") != str(message.id):
+            # Try to exit the old view instance if it's still alive in this process.
+            # exit() handles the full cleanup: unsubscribe, unregister, disable
+            # components on the message, and dispatch VIEW_DESTROYED.
+            old_view_exited = False
+            for vid, old_view in list(self.state_store._active_views.items()):
+                if (getattr(old_view, "_state_key", None) == self.state_key
+                        and old_view.id != self.id):
+                    await old_view.exit()
+                    old_view_exited = True
+                    logger.info(
+                        f"Exited previous view instance for state_key '{self.state_key}'"
+                    )
+                    break
+
+            # If the old view wasn't alive (e.g. from a previous bot session that
+            # wasn't restored), fall back to message-only cleanup.
+            if not old_view_exited:
+                old_msg_id = existing["message_id"]
+                old_ch_id = existing["channel_id"]
+                bot = (
+                    getattr(self.context, "bot", None)
+                    or getattr(self.interaction, "client", None)
+                )
+                if bot:
+                    try:
+                        old_channel = bot.get_channel(int(old_ch_id))
+                        if old_channel and isinstance(old_channel, discord.abc.Messageable):
+                            old_message = await old_channel.fetch_message(int(old_msg_id))
+                            await old_message.edit(view=None)
+                            logger.info(
+                                f"Cleaned up previous message {old_msg_id} for "
+                                f"state_key '{self.state_key}'"
+                            )
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        pass  # Old message already gone, nothing to clean up
+                    except Exception as e:
+                        logger.debug(
+                            f"Could not clean up previous message for "
+                            f"'{self.state_key}': {e}"
+                        )
+
         # Record this view in the persistent registry
         guild_id = None
         if message.guild:
@@ -102,6 +148,7 @@ class PersistentView(StatefulView):
             message_id=str(message.id),
             channel_id=str(message.channel.id),
             guild_id=guild_id,
+            user_id=str(self.user_id) if self.user_id else None,
         )
         await self.dispatch("PERSISTENT_VIEW_REGISTERED", payload)
 
@@ -121,6 +168,12 @@ class PersistentView(StatefulView):
         Override this to perform post-restore setup like fetching fresh data
         or updating the embed. The view's ``_message`` is already set when
         this is called.
+
+        .. warning::
+            If this method raises an exception, the view will be unregistered
+            from CascadeUI's state system but will remain in discord.py's
+            internal view store (there is no public API to remove it). Avoid
+            raising from this method unless recovery is not possible.
 
         Args:
             bot: The discord.py Bot instance.
@@ -228,6 +281,15 @@ async def setup_persistence(
             removed.append(state_key)
             continue
 
+        # Guard against non-messageable channels (e.g. CategoryChannel, ForumChannel)
+        if not isinstance(channel, discord.abc.Messageable):
+            logger.warning(
+                f"Channel {channel_id} for '{state_key}' is not messageable "
+                f"({type(channel).__name__}), removing entry"
+            )
+            removed.append(state_key)
+            continue
+
         # Fetch the message — NotFound means it was deleted while offline
         try:
             message = await channel.fetch_message(int(message_id))
@@ -247,6 +309,13 @@ async def setup_persistence(
             # Set _message directly (not via the property setter) to avoid
             # firing a VIEW_UPDATED dispatch before _register_state runs.
             view._message = message
+
+            # Restore identity fields from saved state so session limiting
+            # can index the view properly after restart.
+            if entry.get("user_id"):
+                view.user_id = int(entry["user_id"])
+            if entry.get("guild_id"):
+                view.guild_id = int(entry["guild_id"])
 
             # Re-attach to discord.py's internal view tracking
             bot.add_view(view, message_id=message.id)
