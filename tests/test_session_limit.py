@@ -6,21 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from cascadeui.views.base import StatefulView, SessionLimitError
 from cascadeui.views.persistent import PersistentView
 from cascadeui.state.singleton import get_store
-
-
-# Helper to create a view with a mock interaction so send() works
-def _make_interaction(user_id=100, guild_id=200):
-    interaction = AsyncMock()
-    interaction.user = MagicMock(id=user_id)
-    interaction.guild = MagicMock(id=guild_id)
-    interaction.guild_id = guild_id
-    # InteractionResponse.is_done() is sync in discord.py — use MagicMock
-    # so the return value is a plain bool, not a coroutine.
-    interaction.response = MagicMock()
-    interaction.response.is_done.return_value = False
-    interaction.response.send_message = AsyncMock()
-    interaction.original_response = AsyncMock(return_value=MagicMock(id=999, channel=MagicMock(id=888)))
-    return interaction
+from helpers import make_interaction as _make_interaction
 
 
 # // ========================================( Default Behavior )======================================== // #

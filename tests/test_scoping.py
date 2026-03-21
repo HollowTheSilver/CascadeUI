@@ -6,7 +6,7 @@ import pytest
 from cascadeui.state.singleton import get_store
 
 
-class TestStateScooping:
+class TestStateScoping:
     async def test_user_scope_isolation(self):
         """Different users should have isolated scoped state."""
         store = get_store()

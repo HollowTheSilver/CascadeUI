@@ -8,24 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from cascadeui.views.specialized import PaginatedView
 from cascadeui.state.singleton import get_store
-
-
-def _make_interaction(user_id=100, guild_id=200):
-    interaction = AsyncMock()
-    interaction.user = MagicMock(id=user_id)
-    interaction.guild = MagicMock(id=guild_id)
-    interaction.guild_id = guild_id
-    # InteractionResponse.is_done() is sync in discord.py — use MagicMock
-    interaction.response = MagicMock()
-    interaction.response.is_done.return_value = False
-    interaction.response.defer = AsyncMock()
-    interaction.response.send_message = AsyncMock()
-    interaction.response.send_modal = AsyncMock()
-    interaction.data = {}
-    interaction.original_response = AsyncMock(
-        return_value=MagicMock(id=999, channel=MagicMock(id=888))
-    )
-    return interaction
+from helpers import make_interaction as _make_interaction
 
 
 def _make_embeds(n):

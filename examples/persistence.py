@@ -218,6 +218,8 @@ class PersistenceExample(commands.Cog, name="persistence_example"):
     )
     @commands.has_permissions(manage_roles=True)
     async def setup_roles(self, context: Context) -> None:
+        # Running this again with the same state_key automatically cleans
+        # up the previous panel (exits the old view and removes its components).
         view = RoleSelectorView(
             context=context,
             state_key="role_selector:main",

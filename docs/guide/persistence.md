@@ -176,6 +176,16 @@ After a bot restart, `setup_persistence(bot)` automatically:
 - All components must have explicit `custom_id` values (auto-generated IDs won't survive restarts)
 - `timeout` is forced to `None` (persistent views never timeout)
 
+!!! info "owner_only defaults to False"
+    `StatefulView` defaults to `owner_only = True`, meaning only the user who created the view can interact with it. `PersistentView` flips this to `False` because persistent views are typically shared panels (role selectors, ticket systems, dashboards) that any user should be able to use.
+
+    If your persistent view should be restricted to its creator, set it explicitly:
+
+    ```python
+    class PrivateDashboard(PersistentView):
+        owner_only = True  # Override the PersistentView default
+    ```
+
 !!! danger "PersistentView cannot be ephemeral"
     `PersistentView.send(ephemeral=True)` raises `ValueError`. Ephemeral messages have no permanent message ID and cannot be re-attached after a bot restart. This is a hard constraint from Discord's API.
 

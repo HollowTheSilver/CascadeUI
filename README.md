@@ -382,6 +382,45 @@ class SetupWizard(WizardView):
         super().__init__(context=context, steps=steps, on_finish=self.finish)
 ```
 
+**FormView** - declarative form with field definitions, built-in validation, and a submit callback:
+
+```python
+from cascadeui import FormView
+
+class ProfileForm(FormView):
+    def __init__(self, context):
+        fields = [
+            {"id": "name", "type": "select", "label": "Display Name",
+             "validators": [min_length(2), max_length(32)]},
+            {"id": "notifications", "type": "boolean", "label": "Enable Notifications"},
+        ]
+        super().__init__(context=context, fields=fields, on_submit=self.save_profile)
+
+    async def save_profile(self, interaction, values):
+        # values = {"name": "Alice", "notifications": True}
+        ...
+```
+
+**PaginatedView** - automatic page navigation with first/last jump buttons and a go-to-page modal for large datasets:
+
+```python
+from cascadeui import PaginatedView
+
+# Build pages from raw data — chunks items and applies a formatter to each page
+view = await PaginatedView.from_data(
+    items=all_members,
+    per_page=10,
+    formatter=lambda chunk: discord.Embed(
+        title="Members",
+        description="\n".join(m.name for m in chunk),
+    ),
+    context=ctx,
+)
+await view.send()
+```
+
+Pages above `jump_threshold` (default 5) automatically get first/last buttons and a go-to-page modal. Pages can be `Embed` objects, strings, or dicts with both `embed` and `content` keys.
+
 ### Components
 
 `StatefulButton` and `StatefulSelect` extend discord.py's built-in components with automatic state dispatching. Every interaction triggers a `COMPONENT_INTERACTION` action in the store.

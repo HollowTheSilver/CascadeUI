@@ -16,7 +16,7 @@ Theme switching, component wrappers (loading state, confirmation), pagination, f
 
 ## persistence.py
 
-SQLite-backed data persistence and `PersistentView` that survives bot restarts. Includes a persistent counter scoped per user and a role selector panel that stays interactive across restarts.
+SQLite-backed data persistence and `PersistentView` that survives bot restarts. Includes a persistent counter scoped per user and a role selector panel that stays interactive across restarts. Running `/setup_roles` again automatically cleans up the previous panel.
 
 **Commands:** `/pcounter`, `/setup_roles`
 

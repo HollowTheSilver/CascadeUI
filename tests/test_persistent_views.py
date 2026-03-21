@@ -117,6 +117,7 @@ class TestPersistentViewReducers:
             "message_id": "111",
             "channel_id": "222",
             "guild_id": "333",
+            "user_id": "444",
         })
 
         new_state = await reduce_persistent_view_registered(action, state)
@@ -127,6 +128,7 @@ class TestPersistentViewReducers:
         assert entry["message_id"] == "111"
         assert entry["channel_id"] == "222"
         assert entry["guild_id"] == "333"
+        assert entry["user_id"] == "444"
 
     async def test_register_overwrites_existing(self):
         state = base_state()
