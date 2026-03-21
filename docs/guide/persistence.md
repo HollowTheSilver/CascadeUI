@@ -165,9 +165,10 @@ After a bot restart, `setup_persistence(bot)` automatically:
 
 1. Reads the persistent view registry from saved state
 2. Looks up the `RoleSelectorView` class by name
-3. Fetches the original channel and message
+3. Fetches the original channel and message (skipping non-messageable channels)
 4. Creates a new view instance and attaches it via `bot.add_view(view, message_id=...)`
-5. Calls `on_restore(bot)` for any post-restore setup
+5. Restores identity fields (`user_id`, `guild_id`) from the saved entry so session limiting works correctly after restart
+6. Calls `on_restore(bot)` for any post-restore setup
 
 **Requirements for PersistentView:**
 
@@ -186,6 +187,7 @@ If things change while the bot is offline:
 |----------|-------------|
 | Message deleted | Entry removed from state, won't try again |
 | Channel deleted | Entry removed from state, won't try again |
+| Channel is non-messageable (e.g. category, forum) | Entry removed from state, won't try again |
 | View class renamed/removed | Entry skipped but kept (in case the import is just missing temporarily) |
 
 ## How It Works Under the Hood
@@ -194,8 +196,11 @@ When a `PersistentView` is sent, it dispatches a `PERSISTENT_VIEW_REGISTERED` ac
 
 - `state_key` (lookup key)
 - `class_name` (for reconstructing the view)
-- `message_id`, `channel_id`, `guild_id` (for re-attaching to the message)
+- `message_id`, `channel_id`, `guild_id`, `user_id` (for re-attaching and session indexing)
 
-This gets persisted to disk along with all other state. On restart, `setup_persistence` reads this registry and rebuilds the views.
+This gets persisted to disk along with all other state. On restart, `setup_persistence` reads this registry, rebuilds the views, and restores their identity fields so session limiting works correctly across restarts.
+
+!!! warning "One message per state_key"
+    The persistent view registry tracks one message per `state_key`. If you send a second view with the same `state_key`, the framework automatically exits the previous view instance (unsubscribing, unregistering, and disabling its components) and overwrites the registry entry. If the previous instance is no longer alive (e.g., from a prior bot session that wasn't restored), the old message's components are removed directly. Design your `state_key` values to be unique per intended instance (e.g., `"roles:main"` for a single panel, or `f"profile:{user_id}"` for per-user views).
 
 The `__init_subclass__` hook on `PersistentView` automatically registers every subclass in a class name -> class mapping. This is why cog loading order matters: the subclass must be imported (triggering `__init_subclass__`) before `setup_persistence` tries to look it up.

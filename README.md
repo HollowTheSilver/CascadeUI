@@ -4,12 +4,15 @@
 
 <p align="center">
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
-  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10%20|%203.11%20|%203.12%20|%203.13%20|%203.14-blue.svg?logo=python&logoColor=white" alt="Python 3.10–3.14"></a>
-  <a href="https://github.com/Rapptz/discord.py"><img src="https://img.shields.io/badge/discord.py-2.7+-738adb.svg?logo=discord&logoColor=white" alt="discord.py 2.7+"></a>
   <a href="https://hollowthesilver.github.io/CascadeUI/"><img src="https://img.shields.io/badge/docs-GitHub%20Pages-8A2BE2?logo=readthedocs" alt="Docs"></a>
+  <img src="https://img.shields.io/badge/PyPI-coming%20soon-lightgrey?logo=pypi&logoColor=white" alt="Downloads">
+  <a href="https://github.com/Rapptz/discord.py"><img src="https://img.shields.io/badge/discord.py-2.7+-738adb.svg?logo=discord&logoColor=white" alt="discord.py 2.7+"></a>
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10%20|%203.11%20|%203.12%20|%203.13%20|%203.14-blue.svg?logo=python&logoColor=white" alt="Python 3.10–3.14"></a>
 </p>
 
 > **Note**: CascadeUI is currently in active development and has not yet been officially released. Installation is source-only until the package is published on PyPI.
+>
+> This initial release targets **Discord V1 Components** (Views, Buttons, Selects, Modals). Full V2 Component support (LayoutView, Container, Section, TextDisplay, etc.) is planned for the next major release.
 
 Redux-inspired UI framework for [discord.py](https://github.com/Rapptz/discord.py).
 

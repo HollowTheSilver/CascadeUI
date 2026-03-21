@@ -1,10 +1,13 @@
 <p align="center">
-  <img src="assets/banner.png" alt="CascadeUI — A Redux-Inspired Framework for Discord.py" width="100%">
+  <img src="assets/docs-banner.png" alt="CascadeUI — A Redux-Inspired Framework for Discord.py" width="100%">
 </p>
 
 Redux-inspired UI framework for [discord.py](https://github.com/Rapptz/discord.py).
 
 CascadeUI brings a Redux-inspired architecture to Discord bot interfaces. Views, buttons, selects, and forms are backed by a centralized state store with dispatched actions, reducers, and subscriber notifications. The result is predictable state flow and composable UI patterns that scale beyond simple one-off views.
+
+!!! note "V1 Components"
+    This initial release targets **Discord V1 Components** (Views, Buttons, Selects, Modals). Full V2 Component support (LayoutView, Container, Section, TextDisplay, etc.) is planned for the next major release.
 
 ## Features
 

@@ -53,9 +53,9 @@ Redoes the last undone state change.
 
 Updates scoped state (requires `scope` to be set on the view class).
 
-#### `add_exit_button(label="Exit", style=ButtonStyle.secondary, row=None, custom_id=None)`
+#### `add_exit_button(label="Exit", style=ButtonStyle.secondary, row=None, emoji="❌", delete_message=False, custom_id=None)`
 
-Adds a gray exit button that calls `self.exit()`. Pass `custom_id` for `PersistentView` subclasses.
+Adds an exit button that calls `self.exit()`. Set `delete_message=True` to delete the message instead of disabling components. Pass `custom_id` for `PersistentView` subclasses.
 
 #### `exit(delete_message=False)`
 
@@ -123,7 +123,15 @@ PersistentView(
 
 #### `on_restore(bot)` *(override)*
 
-Called after the view is restored on bot restart. Override for post-restore setup.
+Called after the view is restored on bot restart. Override for post-restore setup (e.g., fetching fresh data or updating the embed).
+
+!!! warning
+    If `on_restore` raises an exception, the view is unregistered from CascadeUI's state system but remains in discord.py's internal view store (there is no public API to remove it). Avoid raising from this method unless recovery is not possible.
+
+### Class Attribute Overrides
+
+- `timeout` is forced to `None`
+- `owner_only` defaults to `False` (persistent views are typically shared)
 
 ### Requirements
 
@@ -131,6 +139,7 @@ Called after the view is restored on bot restart. Override for post-restore setu
 - All components must have explicit `custom_id` values
 - Auto-registers subclasses via `__init_subclass__`
 - Cannot be sent as ephemeral (`send(ephemeral=True)` raises `ValueError`)
+- Duplicate `state_key` registration automatically exits the previous view instance and cleans up its message
 
 ---
 

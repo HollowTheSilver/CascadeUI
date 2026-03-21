@@ -11,7 +11,7 @@ features in a single, cohesive example:
     - Theming             (live theme switching with per-view themes)
     - Undo/Redo           (revert notification preference changes)
     - State selectors     (views only re-render when their slice changes)
-    - Batched dispatch     (multiple state updates in one notification)
+    - Batched dispatch    (multiple state updates in one notification)
     - Exit button         (clean teardown with component removal)
 
 Usage:

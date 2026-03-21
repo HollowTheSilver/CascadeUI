@@ -175,14 +175,17 @@ class AdminView(StatefulView):
 ```
 
 !!! note "Views without a user context"
-    When `user_id` is `None` (e.g. restored `PersistentView` instances or views created without a context/interaction), the ownership check is skipped and all users can interact. This is the correct behavior for restored views since the original user may not even be online.
+    When `user_id` is `None` (e.g. views created without a context/interaction), the ownership check is skipped and all users can interact. Restored `PersistentView` instances have their `user_id` restored from saved state, but default to `owner_only = False` so the ownership check does not apply regardless.
 
 ### Exit Button
 
 Add a standard exit button that cleans up the view:
 
 ```python
-self.add_exit_button()  # Adds a gray "Exit" button
+self.add_exit_button()  # Adds an "Exit" button with ❌ emoji
+
+# Customize the button:
+self.add_exit_button(label="Close", emoji=None, delete_message=True)
 
 # For PersistentView, you must pass a custom_id:
 self.add_exit_button(custom_id="my_view:exit")
@@ -436,7 +439,7 @@ Some scopes require identity fields that may not be available. For example, `ses
 
 - **Navigation stack**: Session limits track the entire navigation chain. When a root view pushes to a sub-view, the sub-view counts against the root's limit. A second command will find and replace the active sub-view, not just the root. When a view is exited by session limiting, its entire navigation stack is cleaned up.
 - **Ephemeral views**: Session limiting works with ephemeral views. The old ephemeral message's components are disabled, and the new view is sent as a fresh ephemeral message.
-- **Persistence**: Restored persistent views (from `setup_persistence`) are tracked in the active view registry but are not session-indexed (they lack user/guild context). They will not block new views from being created.
+- **Persistence**: Restored persistent views (from `setup_persistence`) are session-indexed using the user and guild identity saved at registration time. This means a restored view correctly counts against its session limit after a bot restart.
 - **Undo/redo**: When the replace policy exits an old view, its undo history is discarded along with the view. The new view starts fresh.
 
 ## View Patterns
@@ -539,7 +542,7 @@ view = FormView(context=ctx, fields=fields, on_submit=on_submit)
 ```
 
 !!! warning "on_submit must acknowledge the interaction"
-    The `on_submit` callback receives the raw interaction. You **must** call `interaction.response.send_message()`, `.defer()`, or similar. If your callback doesn't acknowledge the interaction within 3 seconds, the user will see "This interaction failed."
+    The `on_submit` callback receives the raw interaction. You **must** call `interaction.response.send_message()`, `.defer()`, or similar. The [auto-defer safety net](#auto-defer-safety-net) will prevent a hard failure if your callback is slow, but you should still respond explicitly rather than relying on it.
 
 !!! note "String fields require Modals"
     Discord does not allow text input inside Views, only inside Modals. FormView supports `select` and `boolean` field types inline. For text input, use the `Modal` class from `cascadeui.components.inputs`.
