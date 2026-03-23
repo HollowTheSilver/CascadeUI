@@ -9,6 +9,7 @@
   <a href="https://github.com/Rapptz/discord.py"><img src="https://img.shields.io/badge/discord.py-2.7+-738adb.svg?logo=discord&logoColor=white" alt="discord.py 2.7+"></a>
   <a href="https://github.com/HollowTheSilver/CascadeUI/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/HollowTheSilver/CascadeUI/ci.yml?logo=github&label=CI" alt="CI"></a>
   <a href="https://github.com/psf/black"><img src="https://img.shields.io/badge/code%20style-black-000000.svg" alt="Code style: black"></a>
+  <a href="https://discord.com/invite/9Xj68BpKRb"><img src="https://img.shields.io/discord/1405822635920855040?logo=discord&logoColor=white&label=Discord&color=5865F2" alt="Discord"></a>
   <a href="https://hollowthesilver.github.io/CascadeUI/"><img src="https://img.shields.io/badge/docs-GitHub%20Pages-8A2BE2?logo=readthedocs" alt="Docs"></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
 </p>
@@ -306,6 +307,15 @@ Working examples in the [`examples/`](examples/) directory, each a discord.py co
 > The full documentation site covers state management, views, components, persistence, theming, middleware, devtools, and API reference.
 
 **[hollowthesilver.github.io/CascadeUI](https://hollowthesilver.github.io/CascadeUI/)**
+
+---
+
+## Support
+
+Questions, bug reports, or just want to see what's next?
+
+- **Discord**: [Join the server](https://discord.com/invite/9Xj68BpKRb) for help, discussion, and updates
+- **Issues**: [GitHub Issues](https://github.com/HollowTheSilver/CascadeUI/issues) for bug reports and feature requests
 
 ---
 

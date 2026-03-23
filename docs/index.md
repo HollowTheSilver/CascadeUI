@@ -53,3 +53,8 @@ User clicks button
 - [Installation](guide/installation.md)
 - [Quick Start](guide/quickstart.md)
 - [GitHub Repository](https://github.com/HollowTheSilver/CascadeUI)
+
+## Support
+
+- [Discord Server](https://discord.com/invite/9Xj68BpKRb) for help, discussion, and updates
+- [GitHub Issues](https://github.com/HollowTheSilver/CascadeUI/issues) for bug reports and feature requests
