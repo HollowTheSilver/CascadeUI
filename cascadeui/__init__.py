@@ -1,7 +1,7 @@
 """
 CascadeUI - Stateful UI components for discord.py.
 
-Copyright (c) 2024-2025 HollowTheSilver - https://github.com/HollowTheSilver
+Copyright (c) 2024-2026 HollowTheSilver - https://github.com/HollowTheSilver
 """
 
 # // ========================================( Modules )======================================== // #
@@ -18,9 +18,13 @@ from .views.patterns import TabView, WizardView
 from .components.base import StatefulButton, StatefulSelect
 from .components.composition import CompositeComponent, register_component, get_component
 from .components.patterns import (
-    ConfirmationButtons, PaginationControls, FormLayout,
-    ToggleGroup, ProgressBar,
+    ConfirmationButtons,
+    PaginationControls,
+    FormLayout,
+    ToggleGroup,
+    ProgressBar,
 )
+from .components.inputs import TextInput, Modal
 from .components.wrappers import with_loading_state, with_confirmation, with_cooldown
 from .state.actions import ActionCreators
 from .state.types import StateData
@@ -28,8 +32,15 @@ from .state.middleware import DebouncedPersistence, logging_middleware
 from .state.computed import computed, ComputedValue
 from .state.undo import UndoMiddleware
 from .validation import (
-    ValidationResult, validate_field, validate_fields,
-    min_length, max_length, regex, choices, min_value, max_value,
+    ValidationResult,
+    validate_field,
+    validate_fields,
+    min_length,
+    max_length,
+    regex,
+    choices,
+    min_value,
+    max_value,
 )
 from .theming.core import Theme, register_theme, get_theme, set_default_theme, get_default_theme
 from .theming.themes import default_theme, dark_theme, light_theme
@@ -42,7 +53,7 @@ from .devtools import StateInspector, InspectorView, DevToolsCog
 # // ========================================( Script )======================================== // #
 
 
-__version__ = "2.0.0"
+__version__ = "1.0.0"
 
 # Export public API
 __all__ = [
@@ -55,7 +66,6 @@ __all__ = [
     "setup_persistence",
     "TabView",
     "WizardView",
-
     # Components
     "StatefulButton",
     "StatefulSelect",
@@ -67,26 +77,24 @@ __all__ = [
     "ProgressBar",
     "register_component",
     "get_component",
-
+    # Input Components
+    "TextInput",
+    "Modal",
     # Component Wrappers
     "with_loading_state",
     "with_confirmation",
     "with_cooldown",
-
     # State
     "get_store",
     "ActionCreators",
     "StateData",
-
     # Middleware
     "DebouncedPersistence",
     "logging_middleware",
     "UndoMiddleware",
-
     # Computed State
     "computed",
     "ComputedValue",
-
     # Validation
     "ValidationResult",
     "validate_field",
@@ -97,7 +105,6 @@ __all__ = [
     "choices",
     "min_value",
     "max_value",
-
     # Theming
     "Theme",
     "register_theme",
@@ -107,7 +114,6 @@ __all__ = [
     "default_theme",
     "dark_theme",
     "light_theme",
-
     # Utilities
     "get_task_manager",
     "with_error_boundary",
@@ -115,7 +121,6 @@ __all__ = [
     "safe_execute",
     "cascade_reducer",
     "cascade_component",
-
     # DevTools
     "StateInspector",
     "InspectorView",

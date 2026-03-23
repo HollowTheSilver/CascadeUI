@@ -5,26 +5,22 @@
 - Python 3.10 or higher
 - discord.py 2.7 or higher
 
-## From Source
+## From PyPI
 
-CascadeUI is not yet published on PyPI. Install directly from the repository:
+```bash
+pip install cascadeui
+
+# With optional backends
+pip install cascadeui[sqlite]
+pip install cascadeui[redis]
+```
+
+### From Source
 
 ```bash
 git clone https://github.com/HollowTheSilver/CascadeUI.git
 cd CascadeUI
 pip install -e .
-```
-
-### Optional Backends
-
-CascadeUI supports pluggable persistence backends with optional dependencies:
-
-```bash
-# SQLite persistence (recommended for production)
-pip install -e ".[sqlite]"
-
-# Redis persistence
-pip install -e ".[redis]"
 ```
 
 ### Development Install
@@ -36,16 +32,6 @@ pip install -e ".[dev]"
 ```
 
 This installs additional dependencies: `pytest`, `pytest-asyncio`, `black`, and `isort`.
-
-## From PyPI (Coming Soon)
-
-```bash
-pip install cascadeui
-
-# With optional backends
-pip install cascadeui[sqlite]
-pip install cascadeui[redis]
-```
 
 ## Verify Installation
 

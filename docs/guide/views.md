@@ -219,6 +219,22 @@ class SettingsView(StatefulView):
 - The stack is stored in session state and cleaned up automatically when the session ends.
 - The new view inherits the same `session_id`, so all navigation within a session shares state.
 
+### Constructor kwargs are preserved automatically
+
+When a view is pushed onto the stack, all constructor kwargs are saved so `pop()` can reconstruct it faithfully. Non-reconstructible kwargs (`context`, `interaction`, `message`, etc.) are excluded and re-supplied by the framework.
+
+This works transparently — subclasses don't need to do anything special:
+
+```python
+class MyPaginatedView(PaginatedView):
+    def __init__(self, *args, ticket_data=None, **kwargs):
+        self.ticket_data = ticket_data
+        super().__init__(*args, **kwargs)
+
+# push saves pages, ticket_data, theme, etc.
+# pop reconstructs with the same kwargs
+```
+
 ### Auto Back Button
 
 Set `auto_back_button = True` on a view class to automatically add a back button when the view is pushed:
@@ -320,6 +336,9 @@ Only `state["application"]` is snapshotted, not the full state tree. Internal st
 ### Actions that don't create snapshots
 
 Internal lifecycle actions (`VIEW_CREATED`, `VIEW_DESTROYED`, `NAVIGATION_PUSH`, `COMPONENT_INTERACTION`, etc.) are excluded from undo tracking. Only your custom application actions create snapshots.
+
+!!! warning "`dispatch_scoped()` does not create undo snapshots"
+    `dispatch_scoped()` dispatches a `SCOPED_UPDATE` action, which is excluded from undo tracking. If your view uses both `scope` and `enable_undo`, dispatch a custom action type via `self.dispatch()` instead, and write a reducer that updates the scoped state path directly. See the `settings_menu.py` example for this pattern.
 
 !!! info "Batched actions"
     When actions are dispatched inside a `batch()`, the undo middleware takes one snapshot before the batch starts. Undoing reverts everything the batch did in one step.
@@ -545,7 +564,7 @@ view = FormView(context=ctx, fields=fields, on_submit=on_submit)
     The `on_submit` callback receives the raw interaction. You **must** call `interaction.response.send_message()`, `.defer()`, or similar. The [auto-defer safety net](#auto-defer-safety-net) will prevent a hard failure if your callback is slow, but you should still respond explicitly rather than relying on it.
 
 !!! note "String fields require Modals"
-    Discord does not allow text input inside Views, only inside Modals. FormView supports `select` and `boolean` field types inline. For text input, use the `Modal` class from `cascadeui.components.inputs`.
+    Discord does not allow text input inside Views, only inside Modals. FormView supports `select` and `boolean` field types inline. For text input, use `Modal` and `TextInput` from `cascadeui`. See the [Components guide](components.md#modals) for usage.
 
 See [Validation](validation.md) for details on built-in validators.
 
@@ -615,6 +634,41 @@ await view.send()
 ```
 
 The formatter receives a list of items for one page and returns an `Embed`, `str`, or page dict. Both sync and async formatters are supported.
+
+#### Refreshing dynamic data
+
+Views created with `from_data` can re-paginate with fresh data without rebuilding the entire view:
+
+```python
+# In update_from_state or any callback:
+fresh_items = get_updated_items()
+await view.refresh_data(fresh_items)
+```
+
+This re-chunks the items, re-applies the formatter, clamps the page index, and edits the message.
+
+
+#### Adding extra components with `_build_extra_items`
+
+Subclasses can override `_build_extra_items()` to add components below the navigation buttons (rows 1-4). The hook is called after nav buttons during init, on every page turn, and after `refresh_data()`:
+
+```python
+class MyPaginatedView(PaginatedView):
+    def _build_extra_items(self):
+        self.clear_row(1)  # Remove old components first
+        self.add_item(StatefulSelect(
+            custom_id="my_view_select",  # Stable ID — survives page turns
+            placeholder="Pick one...",
+            options=self._build_options(),
+            row=1,
+            callback=self.on_select,
+        ))
+```
+
+Use `clear_row()` at the start to avoid duplicating components on repeated calls.
+
+!!! warning "Use a stable `custom_id`"
+    Components added in `_build_extra_items()` are removed and re-added on every page turn. Without a stable `custom_id`, Discord auto-generates a new UUID each time, which breaks any pending interaction on the old component. Always set an explicit `custom_id`.
 
 ## PersistentView
 

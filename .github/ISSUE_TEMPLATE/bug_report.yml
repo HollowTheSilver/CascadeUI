@@ -1,0 +1,70 @@
+name: Bug Report
+description: Report a bug in CascadeUI
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the bug. What did you expect vs what actually happened?
+      placeholder: "When I call view.push(...), the state doesn't..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Minimal code snippet or steps that trigger the bug.
+      render: python
+    validations:
+      required: true
+
+  - type: input
+    id: cascadeui-version
+    attributes:
+      label: CascadeUI version
+      placeholder: "1.0.0"
+    validations:
+      required: true
+
+  - type: input
+    id: discordpy-version
+    attributes:
+      label: discord.py version
+      placeholder: "2.7.1"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: python-version
+    attributes:
+      label: Python version
+      options:
+        - "3.10"
+        - "3.11"
+        - "3.12"
+        - "3.13"
+        - "3.14"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log output
+      description: >
+        CascadeUI writes logs to `logs/cascadeui-YYYY-MM-DD.log` in your bot's
+        working directory. Paste a short relevant snippet here, or link a
+        GitHub Gist (https://gist.github.com/) for longer logs.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: Anything else that might help (tracebacks, screenshots, etc.)
+    validations:
+      required: false

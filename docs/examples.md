@@ -55,6 +55,24 @@ The hub view pushes to Appearance, Notifications, and Locale sub-views, each wit
 
 **Command:** `/settings`
 
+## ticket_system.py
+
+A production-style support ticket system demonstrating most of CascadeUI's framework features working together in a single cog:
+
+- **PersistentView** for a ticket panel that survives bot restarts
+- **Modal + Validation** for ticket creation with field-level error checking (subject, description, priority)
+- **PaginatedView** for paginated ticket lists via `from_data` factory, with `refresh_data()` for live updates and `_build_extra_items()` for a select menu below navigation
+- **Ticket detail view** with live status updates via state selectors and inline close button
+- **Custom reducers** (`TICKET_CREATED`, `TICKET_CLOSED`) for domain-specific state management
+- **Live-updating list** -- the ticket list subscribes to `TICKET_CREATED`/`TICKET_CLOSED` and rebuilds its pages automatically when tickets change
+- **State selectors** so the panel only re-renders when the open ticket count changes
+- **Session limiting** on the ticket list view (one per user per guild)
+- **Theming** with a custom "support" theme applied to all embeds
+
+The panel is posted once per channel with `/ticket_setup`. Any user can create tickets via a modal, view their open tickets in a paginated list, select a ticket to see its full details, or close tickets through a select-and-confirm flow. Running `/ticket_setup` again in the same channel replaces the old panel automatically.
+
+**Commands:** `/ticket_setup`, `/my_tickets`
+
 ## Running the Examples
 
 1. Create a bot on the [Discord Developer Portal](https://discord.com/developers/applications)
@@ -75,6 +93,7 @@ class MyBot(commands.Bot):
         await self.load_extension("examples.state_features")
         await self.load_extension("examples.undo_redo")
         await self.load_extension("examples.settings_menu")
+        await self.load_extension("examples.ticket_system")
 
         # Enable persistence (after loading cogs)
         await setup_persistence(self, backend=SQLiteBackend("cascadeui.db"))

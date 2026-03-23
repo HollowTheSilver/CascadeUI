@@ -29,11 +29,53 @@ StatefulSelect(
     placeholder=None,
     options=[SelectOption(...)],
     callback=async_fn,
+    custom_id=None,        # Required for PersistentView; recommended in _build_extra_items
     min_values=1,
     max_values=1,
     row=None,
 )
 ```
+
+---
+
+## `TextInput`
+
+Wraps `discord.ui.TextInput` with a stable `custom_id` derived from the label.
+
+```python
+TextInput(
+    label=str,               # Required
+    placeholder=None,
+    default=None,
+    required=True,
+    min_length=None,
+    max_length=None,
+    style=TextStyle.short,   # or TextStyle.long for multi-line
+)
+```
+
+The `custom_id` is auto-generated as `"input_{label}"` (lowercased, spaces replaced with underscores).
+
+---
+
+## `Modal`
+
+Wraps `discord.ui.Modal` with state integration and optional validation.
+
+```python
+Modal(
+    title=str,               # Required
+    inputs=[TextInput(...)], # List of TextInput or discord.ui.TextInput
+    callback=async_fn,       # async def callback(interaction, values)
+    validators=None,         # Optional: {custom_id: [validator, ...]}
+    timeout=None,
+    view_id=None,            # If set, dispatches MODAL_SUBMITTED action
+)
+```
+
+- `validators` - dict mapping `custom_id` to a list of validator functions. On failure, an ephemeral error message is sent and the callback is skipped.
+- `view_id` - links the modal to a view's state. A `MODAL_SUBMITTED` action is dispatched before the callback runs.
+- If no `callback` is provided, the interaction is deferred automatically.
 
 ---
 

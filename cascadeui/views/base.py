@@ -2,6 +2,7 @@
 
 
 import asyncio
+import functools
 import time
 import uuid
 from typing import Any, Dict, Optional, Set
@@ -26,6 +27,14 @@ logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a", prefix
 
 # Maps class name -> class for navigation stack resolution
 _view_class_registry: Dict[str, type] = {}
+
+# Kwargs that are ephemeral per-invocation and must NOT be saved for
+# push/pop reconstruction.  _navigate_to() re-supplies these when
+# building the next view, so persisting them would be wrong.
+_NON_RECONSTRUCTIBLE_KWARGS = frozenset({
+    "context", "interaction", "message",
+    "state_store", "session_id", "user_id", "guild_id",
+})
 
 
 def _register_view_class(cls):
@@ -78,6 +87,34 @@ class StatefulView(View):
         super().__init_subclass__(**kwargs)
         _register_view_class(cls)
 
+        # Wrap __init__ on subclasses that define their own, so kwargs are
+        # auto-captured for push/pop reconstruction.  Only the outermost
+        # (most-derived) wrapper captures; intermediate classes skip via
+        # the _pending_init_kwargs guard.
+        if "__init__" in cls.__dict__:
+            original_init = cls.__init__
+
+            @functools.wraps(original_init)
+            def _capturing_init(self, *args, **kw):
+                if not hasattr(self, "_pending_init_kwargs"):
+                    # Positional args (beyond *args pass-through) cannot be
+                    # captured for push/pop reconstruction.  Fail fast so the
+                    # error is obvious at construction time, not at pop() time.
+                    if args:
+                        raise TypeError(
+                            f"{type(self).__name__}.__init__() received positional "
+                            f"arguments {args!r} which cannot be captured for "
+                            f"push/pop reconstruction. Use keyword arguments instead."
+                        )
+                    self._pending_init_kwargs = {
+                        k: v
+                        for k, v in kw.items()
+                        if k not in _NON_RECONSTRUCTIBLE_KWARGS
+                    }
+                original_init(self, *args, **kw)
+
+            cls.__init__ = _capturing_init
+
     def __init__(self, *args, **kwargs):
         # Extract custom arguments before passing to View
         self.state_store = kwargs.pop("state_store", None) or get_store()
@@ -89,13 +126,20 @@ class StatefulView(View):
         self.theme = kwargs.pop("theme", None)
         self._state_key = kwargs.pop("state_key", None)
 
-        # Capture kwargs needed to reconstruct this view via pop()
-        # (excludes internal forwarding keys that _navigate_to injects)
-        self._init_kwargs = {}
-        if self.theme is not None:
-            self._init_kwargs["theme"] = self.theme
-        if self._state_key is not None:
-            self._init_kwargs["state_key"] = self._state_key
+        # Merge any kwargs auto-captured by the __init_subclass__ wrapper.
+        # This includes all reconstructible kwargs from the most-derived
+        # class, before any of them were consumed by intermediate __init__s.
+        # For direct StatefulView usage (no wrapper), fall back to explicit
+        # capture of the base class's own reconstructible kwargs.
+        self._init_kwargs = getattr(self, "_pending_init_kwargs", {})
+        if hasattr(self, "_pending_init_kwargs"):
+            del self._pending_init_kwargs
+        else:
+            # No wrapper ran — StatefulView used directly, capture manually
+            if self.theme is not None:
+                self._init_kwargs["theme"] = self.theme
+            if self._state_key is not None:
+                self._init_kwargs["state_key"] = self._state_key
 
         # Initialize standard View class
         super().__init__(*args, **kwargs)
@@ -142,9 +186,7 @@ class StatefulView(View):
         # class level (e.g. subscribed_actions = {"MY_ACTION", ...})
         if "subscribed_actions" not in type(self).__dict__:
             self.subscribed_actions: Optional[Set[str]] = {
-                "VIEW_UPDATED",
                 "VIEW_DESTROYED",
-                "COMPONENT_INTERACTION",
                 "SESSION_UPDATED",
             }
 
@@ -614,6 +656,12 @@ class StatefulView(View):
         # the sub-view is invisible to session limit enforcement.
         self.state_store.register_view(new_view)
 
+        # Register the view in state (SESSION_CREATED + VIEW_CREATED) so
+        # state["views"] contains this view's session_id. Without this,
+        # features that look up session_id via state (e.g. UndoMiddleware)
+        # won't work for pushed/popped views.
+        await new_view._register_state()
+
         return new_view
 
     async def push(self, view_class, interaction=None, **kwargs):
@@ -840,6 +888,15 @@ class StatefulView(View):
         button.callback = exit_callback
         self.add_item(button)
         return button
+
+    def clear_row(self, row: int):
+        """Remove all components on the given row number.
+
+        Useful for dynamically rebuilding a specific section of the view
+        without affecting other rows.
+        """
+        for item in [c for c in self.children if getattr(c, "row", None) == row]:
+            self.remove_item(item)
 
     def __del__(self):
         """Clean reference to ensure GC can collect this view."""

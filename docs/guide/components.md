@@ -39,6 +39,84 @@ select = StatefulSelect(
 self.add_item(select)
 ```
 
+## Modals
+
+CascadeUI's `Modal` wraps `discord.ui.Modal` with state integration and optional validation.
+
+### Opening a Modal
+
+Open a modal from any button callback using `interaction.response.send_modal()`:
+
+```python
+from cascadeui import Modal, TextInput
+
+async def open_feedback(interaction):
+    modal = Modal(
+        title="Send Feedback",
+        inputs=[
+            TextInput(label="Subject", placeholder="Brief summary"),
+            TextInput(label="Details", style=discord.TextStyle.long),
+        ],
+        callback=handle_feedback,
+    )
+    await interaction.response.send_modal(modal)
+
+async def handle_feedback(interaction, values):
+    subject = values.get("input_subject")
+    details = values.get("input_details")
+    await interaction.response.send_message(
+        f"Thanks! Received: {subject}", ephemeral=True
+    )
+```
+
+`TextInput` generates a `custom_id` from the label automatically (e.g. `"Subject"` becomes `"input_subject"`). You can also pass raw `discord.ui.TextInput` items if you need full control over the `custom_id`.
+
+If no `callback` is provided, the modal defers the interaction automatically.
+
+### Validation
+
+Pass a `validators` dict mapping `custom_id` to a list of validator functions. If any field fails validation, the user sees an ephemeral error message and the callback is not called:
+
+```python
+from cascadeui import Modal, TextInput, min_length, max_length, regex
+
+modal = Modal(
+    title="Create Tag",
+    inputs=[
+        TextInput(label="Name", placeholder="tag-name"),
+        TextInput(label="Content", style=discord.TextStyle.long),
+    ],
+    callback=save_tag,
+    validators={
+        "input_name": [
+            min_length(2, "Tag name must be at least 2 characters"),
+            max_length(32, "Tag name must be at most 32 characters"),
+            regex(r"^[a-z0-9-]+$", "Only lowercase letters, numbers, and hyphens"),
+        ],
+        "input_content": [
+            min_length(1, "Content cannot be empty"),
+        ],
+    },
+)
+```
+
+All validators from the [validation system](validation.md) work here: `min_length`, `max_length`, `regex`, `choices`, `min_value`, `max_value`, and custom async validators.
+
+### State Integration
+
+If you pass `view_id` to the modal, a `MODAL_SUBMITTED` action is dispatched to the state store before the callback runs:
+
+```python
+modal = Modal(
+    title="Edit Name",
+    inputs=[TextInput(label="Name")],
+    callback=handle_edit,
+    view_id=self.id,  # Links this modal to the current view's state
+)
+```
+
+This lets reducers and middleware observe modal submissions alongside other actions.
+
 ## Composite Components
 
 Composite components group related items and add them to a view as a unit.

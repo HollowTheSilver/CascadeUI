@@ -8,12 +8,15 @@ Base class for all CascadeUI views. Extends `discord.ui.View`.
 
 ```python
 StatefulView(
-    context=None,          # commands.Context or Interaction
+    context=None,          # commands.Context — extracts user/guild/interaction
+    interaction=None,      # discord.Interaction — alternative to context
     timeout=180,           # Seconds before timeout (None = no timeout)
     state_key=None,        # Stable identity for persistent data
     theme=None,            # Per-view Theme override
 )
 ```
+
+Pass either `context` or `interaction` — both extract the user, guild, and interaction for `send()`. Use `context` from prefix/hybrid commands, `interaction` from app commands or component callbacks.
 
 ### Methods
 
@@ -31,11 +34,11 @@ Replaces the current view with another view class. One-way (no stack history sav
 
 #### `push(view_class, interaction, **kwargs)`
 
-Pushes the current view onto the navigation stack and returns a new instance of `view_class`.
+Pushes the current view onto the navigation stack and returns a new instance of `view_class`. All constructor kwargs are auto-captured so `pop()` can reconstruct the view faithfully.
 
 #### `pop(interaction)`
 
-Pops the top entry from the navigation stack, reconstructs that view, and returns it. Returns `None` if the stack is empty.
+Pops the top entry from the navigation stack, reconstructs that view with its original kwargs, and returns it. Returns `None` if the stack is empty. Non-reconstructible kwargs (`context`, `interaction`, etc.) are re-supplied by the framework.
 
 #### `batch()`
 
@@ -56,6 +59,10 @@ Updates scoped state (requires `scope` to be set on the view class).
 #### `add_exit_button(label="Exit", style=ButtonStyle.secondary, row=None, emoji="❌", delete_message=False, custom_id=None)`
 
 Adds an exit button that calls `self.exit()`. Set `delete_message=True` to delete the message instead of disabling components. Pass `custom_id` for `PersistentView` subclasses.
+
+#### `clear_row(row: int)`
+
+Removes all components on the given row number. Useful for dynamically rebuilding a specific section of the view without affecting other rows.
 
 #### `exit(delete_message=False)`
 
@@ -88,7 +95,7 @@ Called before every component callback. Returns `True` to allow the interaction,
 
 ### Class Attributes
 
-- `subscribed_actions` (set[str] | None): Action types to listen for. Default includes `VIEW_UPDATED`, `VIEW_DESTROYED`, `COMPONENT_INTERACTION`, `SESSION_UPDATED`. Set to `None` for all actions.
+- `subscribed_actions` (set[str] | None): Action types to listen for. Default includes `VIEW_DESTROYED`, `SESSION_UPDATED`. Set to `None` for all actions.
 - `scope` (str | None): `"user"`, `"guild"`, or `None`. Determines state scoping.
 - `enable_undo` (bool): Enable undo/redo for this view (default: `False`).
 - `undo_limit` (int): Max undo stack depth (default: `20`).
@@ -202,7 +209,17 @@ Pages can be `Embed` objects, strings, or dicts with `"embed"` and/or `"content"
 
 ##### `await PaginatedView.from_data(items, per_page, formatter, **kwargs)`
 
-Creates a `PaginatedView` by chunking `items` into groups of `per_page` and applying `formatter` (sync or async) to each chunk. Returns a ready-to-send instance.
+Creates a `PaginatedView` by chunking `items` into groups of `per_page` and applying `formatter` (sync or async) to each chunk. Returns a ready-to-send instance. Stores `per_page` and `formatter` on the instance for use by `refresh_data()`.
+
+#### Instance Methods
+
+##### `await refresh_data(items)`
+
+Re-paginates with new data using the original `per_page` and `formatter` from `from_data()`. Rebuilds pages, clamps the current page index, and calls `_update_page()` (which triggers `_build_extra_items()` and edits the message). Raises `RuntimeError` if the view was not created via `from_data()`.
+
+##### `_build_extra_items()` *(override)*
+
+Hook for subclasses to add components below the navigation buttons (rows 1-4). Called after `_add_navigation_buttons()` during init and during every `_update_page()` call (page turns, `refresh_data()`). Use `clear_row()` at the start to remove stale components before re-adding.
 
 #### Navigation Buttons
 

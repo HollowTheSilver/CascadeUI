@@ -134,32 +134,30 @@ If validation fails, the user sees an ephemeral embed with per-field error messa
 
 ## Integration with Modals
 
-For text input validation (via Discord modals), run `validate_fields` in the modal's submit handler:
+Pass a `validators` dict to `Modal` to validate input on submission. Keys are the field's `custom_id`, values are lists of validators:
 
 ```python
-from cascadeui import validate_fields, min_length, regex
-from cascadeui.components.inputs import Modal, TextInput
+from cascadeui import Modal, TextInput, min_length, regex
 
-field_defs = [
-    {
-        "id": "input_username",
-        "label": "Username",
-        "validators": [min_length(3), regex(r"^[a-zA-Z0-9_]+$", "Alphanumeric only")],
+modal = Modal(
+    title="Set Username",
+    inputs=[
+        TextInput(label="Username", placeholder="alphanumeric only"),
+    ],
+    callback=handle_username,
+    validators={
+        "input_username": [
+            min_length(3),
+            regex(r"^[a-zA-Z0-9_]+$", "Alphanumeric only"),
+        ],
     },
-]
-
-async def on_submit(self, interaction, values):
-    errors = await validate_fields(values, field_defs)
-    if errors:
-        # Show errors to user
-        embed = discord.Embed(title="Validation Failed", color=discord.Color.red())
-        for field_id, field_errors in errors.items():
-            messages = "\n".join(e.message for e in field_errors)
-            embed.add_field(name=field_id, value=messages, inline=False)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-    else:
-        await interaction.response.send_message("Success!", ephemeral=True)
+)
+await interaction.response.send_modal(modal)
 ```
+
+If any validator fails, the user sees an ephemeral message listing the errors and the callback is not called. If all validators pass, the callback runs normally.
+
+You can also call `validate_fields()` manually in a custom `on_submit` if you need more control over error presentation.
 
 !!! note "Discord's own validation"
     Discord's `TextInput` has built-in `min_length` and `max_length` constraints that are enforced client-side (the modal won't submit if they fail). CascadeUI validators run server-side after submission, so they can check patterns, ranges, and cross-field logic that Discord can't.

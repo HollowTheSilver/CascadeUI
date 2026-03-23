@@ -22,14 +22,14 @@ from cascadeui import (
     set_default_theme,
     get_default_theme,
     choices,
-    validate_fields,
     min_length,
     max_length,
     regex,
     min_value,
     max_value,
+    Modal,
+    TextInput,
 )
-from cascadeui.components.inputs import Modal, TextInput
 
 
 logger = logging.getLogger(__name__)
@@ -192,8 +192,7 @@ class ThemedFormExample(commands.Cog, name="themed_form_example"):
             async def _switch_theme(self, interaction, theme_name):
                 await interaction.response.defer()
                 self.theme = get_theme(theme_name)
-                if self.message:
-                    await self.message.edit(embed=self.build_embed(), view=self)
+                await interaction.edit_original_response(embed=self.build_embed(), view=self)
 
             async def set_default_theme(self, interaction):
                 await self._switch_theme(interaction, "default")
@@ -369,23 +368,6 @@ class ThemedFormExample(commands.Cog, name="themed_form_example"):
     async def validatetest(self, context):
         """Test per-field text validation through a Modal dialog."""
 
-        field_defs = [
-            {
-                "id": "input_username",
-                "label": "Username",
-                "validators": [
-                    min_length(3),
-                    max_length(20),
-                    regex(r"^[a-zA-Z0-9_]+$", "Alphanumeric and underscores only"),
-                ],
-            },
-            {
-                "id": "input_age",
-                "label": "Age",
-                "validators": [min_value(13), max_value(120)],
-            },
-        ]
-
         class ValidateFormView(StatefulView):
             def __init__(self, ctx):
                 super().__init__(context=ctx)
@@ -415,30 +397,28 @@ class ThemedFormExample(commands.Cog, name="themed_form_example"):
                     ],
                     callback=self._on_submit,
                     view_id=self.id,
+                    validators={
+                        "input_username": [
+                            min_length(3),
+                            max_length(20),
+                            regex(r"^[a-zA-Z0-9_]+$", "Alphanumeric and underscores only"),
+                        ],
+                        "input_age": [
+                            min_value(13),
+                            max_value(120),
+                        ],
+                    },
                 )
                 await interaction.response.send_modal(modal)
 
             async def _on_submit(self, interaction, values):
-                errors = await validate_fields(values, field_defs)
-
-                if errors:
-                    embed = discord.Embed(
-                        title="Validation Failed",
-                        color=discord.Color.red(),
-                    )
-                    label_map = {"input_username": "Username", "input_age": "Age"}
-                    for field_id, field_errors in errors.items():
-                        name = label_map.get(field_id, field_id)
-                        messages = "\n".join(e.message for e in field_errors)
-                        embed.add_field(name=name, value=messages, inline=False)
-                    await interaction.response.send_message(embed=embed, ephemeral=True)
-                else:
-                    username = values.get("input_username", "?")
-                    age = values.get("input_age", "?")
-                    await interaction.response.send_message(
-                        f"Registration successful! Username: **{username}**, Age: **{age}**",
-                        ephemeral=True,
-                    )
+                # Only called if all validators pass
+                username = values.get("input_username", "?")
+                age = values.get("input_age", "?")
+                await interaction.response.send_message(
+                    f"Registration successful! Username: **{username}**, Age: **{age}**",
+                    ephemeral=True,
+                )
 
             async def update_from_state(self, state):
                 pass

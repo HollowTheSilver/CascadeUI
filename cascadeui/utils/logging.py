@@ -431,6 +431,10 @@ class AsyncLogger(Logger):
             atexit.register(AsyncLogger.shutdown)
             AsyncLogger._atexit_registered = True
 
+        # \\ one-time log cleanup on init — only for this prefix
+        if file and self.max_files > 0:
+            self._purge_old_logs()
+
         self._initialized = True
 
     # // ========================================( Queue Listener )======================================== // #
@@ -464,34 +468,46 @@ class AsyncLogger(Logger):
 
     # // ========================================( Methods )======================================== // #
 
-    async def purge_logs(self) -> None:
-        """Purge outdated log files from log directory."""
-        self.info("Gathering log files...")
+    def _purge_old_logs(self) -> None:
+        """Remove oldest log files when count exceeds max_files.
 
-        def _purge():
-            log_files = [
-                os.path.join(self.log_dir, f)
-                for f in os.listdir(self.log_dir)
-                if os.path.isfile(os.path.join(self.log_dir, f))
-            ]
-            if len(log_files) < self.max_files:
-                return None
-            log_files.sort(key=os.path.getctime)
-            to_remove = log_files[: -self.max_files] if self.max_files else log_files
-            removed = 0
-            for filepath in to_remove:
-                try:
-                    os.unlink(filepath)
-                    removed += 1
-                except PermissionError:
-                    pass
-            return removed
+        Only targets files matching this logger's prefix pattern (e.g.
+        ``cascadeui-*.log``), so other log files in the same directory
+        are never touched. Called once during ``__init__`` — no background
+        tasks or event loop required.
+        """
+        try:
+            all_files = os.listdir(self.log_dir)
+        except OSError:
+            return
 
-        result = await asyncio.to_thread(_purge)
-        if result is None:
-            self.info("Purge cancelled. Below max_files threshold.")
+        # Only target files matching this logger's prefix
+        if self.prefix:
+            matching = [f for f in all_files if f.startswith(self.prefix) and f.endswith(".log")]
         else:
-            self.info(f"Purged <{result}> outdated log files.")
+            matching = [f for f in all_files if f.endswith(".log")]
+
+        if len(matching) <= self.max_files:
+            return
+
+        # Sort by creation time, remove oldest
+        matching_paths = [os.path.join(self.log_dir, f) for f in matching]
+        matching_paths.sort(key=os.path.getctime)
+        to_remove = matching_paths[: -self.max_files]
+        for filepath in to_remove:
+            try:
+                os.unlink(filepath)
+            except (PermissionError, OSError):
+                pass
+
+    async def purge_logs(self) -> None:
+        """Async version of log cleanup for manual use.
+
+        Runs ``_purge_old_logs`` in a thread. Useful if you want to trigger
+        cleanup explicitly at runtime rather than relying on the automatic
+        init-time purge.
+        """
+        await asyncio.to_thread(self._purge_old_logs)
 
     async def disable(self) -> None:
         """Flush, close, and remove all handlers."""

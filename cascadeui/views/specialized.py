@@ -238,13 +238,18 @@ class PaginatedView(StatefulView):
     # Page count above which first/last and go-to-page buttons appear
     jump_threshold: int = 5
 
-    def __init__(self, *args, pages=None, **kwargs):
+    def __init__(self, *args, pages=None, _per_page=None, _formatter=None, **kwargs):
         super().__init__(*args, **kwargs)
 
         self.pages = pages or []
         self.current_page = 0
 
+        # Restored from _init_kwargs on pop, or set by from_data()
+        self._per_page: Optional[int] = _per_page
+        self._formatter: Optional[Callable] = _formatter
+
         self._add_navigation_buttons()
+        self._build_extra_items()
 
     @classmethod
     async def from_data(
@@ -275,7 +280,50 @@ class PaginatedView(StatefulView):
                 pages.append(await formatter(chunk))
             else:
                 pages.append(formatter(chunk))
-        return cls(pages=pages, **kwargs)
+        view = cls(pages=pages, _per_page=per_page, _formatter=formatter, **kwargs)
+        return view
+
+    async def refresh_data(self, items: list):
+        """Re-paginate with new data using the original per_page and formatter.
+
+        Only works on views created via ``from_data()``. Rebuilds pages,
+        clamps the current page index, updates nav buttons and extra items,
+        and edits the message.
+
+        Parameters
+        ----------
+        items:
+            The new full list of items to paginate.
+        """
+        if self._per_page is None or self._formatter is None:
+            raise RuntimeError("refresh_data() requires a view created via from_data()")
+
+        chunks = [items[i : i + self._per_page] for i in range(0, len(items), self._per_page)]
+        pages = []
+        for chunk in chunks:
+            if inspect.iscoroutinefunction(self._formatter):
+                pages.append(await self._formatter(chunk))
+            else:
+                pages.append(self._formatter(chunk))
+
+        self.pages = pages or []
+        if self.current_page >= len(self.pages):
+            self.current_page = max(0, len(self.pages) - 1)
+
+        await self._update_page()
+
+    def _build_extra_items(self):
+        """Hook for subclasses to add components below the navigation buttons.
+
+        Called after ``_add_navigation_buttons()`` during init and during
+        every ``_update_page()`` call (which includes page turns and
+        ``refresh_data()``). Override this to add select menus, buttons,
+        or other items on rows 1-4. Use ``clear_row()`` first to remove
+        stale components.
+
+        The default implementation does nothing.
+        """
+        pass
 
     def _add_navigation_buttons(self):
         """Add navigation buttons to the view.
@@ -466,6 +514,8 @@ class PaginatedView(StatefulView):
                 item.label = f"Page {self.current_page + 1}/{total}"
             elif cid == "paginated_goto":
                 item.label = f"{self.current_page + 1}/{total}"
+
+        self._build_extra_items()
 
         if self.message:
             await self.message.edit(**page_kwargs, view=self)

@@ -292,6 +292,10 @@ class AppearanceView(StatefulView):
         selected = interaction.data["values"][0]
         await interaction.response.defer()
         await self.dispatch_scoped({"settings": {**self._get_settings(), "theme": selected}})
+        # dispatch_scoped fires SCOPED_UPDATE, which isn't in subscribed_actions,
+        # so update_from_state won't fire — manual edit needed.
+        if self.message:
+            await self.message.edit(embed=self.build_embed(), view=self)
 
     async def go_back(self, interaction):
         await navigate_back(self, interaction)
@@ -397,10 +401,12 @@ class NotificationsView(StatefulView):
         s = self._get_settings()
         s[key] = not s[key]
         await interaction.response.defer()
-        await self.dispatch_scoped({"settings": s})
-        self._build_buttons()
-        if self.message:
-            await self.message.edit(embed=self.build_embed(), view=self)
+        # update_from_state handles _build_buttons + message.edit via the
+        # SETTINGS_UPDATED subscription, so no manual edit needed here.
+        await self.dispatch("SETTINGS_UPDATED", {
+            "scope_key": f"user:{self.user_id}",
+            "changes": {key: s[key]},
+        })
 
     async def toggle_dm(self, interaction):
         await self._toggle(interaction, "notifications_dm")
@@ -414,16 +420,10 @@ class NotificationsView(StatefulView):
     async def do_undo(self, interaction):
         await interaction.response.defer()
         await self.undo(interaction)
-        self._build_buttons()
-        if self.message:
-            await self.message.edit(embed=self.build_embed(), view=self)
 
     async def do_redo(self, interaction):
         await interaction.response.defer()
         await self.redo(interaction)
-        self._build_buttons()
-        if self.message:
-            await self.message.edit(embed=self.build_embed(), view=self)
 
     async def go_back(self, interaction):
         await navigate_back(self, interaction)
@@ -537,6 +537,8 @@ class LocaleView(StatefulView):
         s = self._get_settings()
         s["language"] = selected
         await self.dispatch_scoped({"settings": s})
+        if self.message:
+            await self.message.edit(embed=self.build_embed(), view=self)
 
     async def on_timezone(self, interaction):
         selected = interaction.data["values"][0]
@@ -544,6 +546,8 @@ class LocaleView(StatefulView):
         s = self._get_settings()
         s["timezone"] = selected
         await self.dispatch_scoped({"settings": s})
+        if self.message:
+            await self.message.edit(embed=self.build_embed(), view=self)
 
     async def go_back(self, interaction):
         await navigate_back(self, interaction)
