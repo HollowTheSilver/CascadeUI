@@ -1,9 +1,8 @@
-
 # // ========================================( Modules )======================================== // #
 
 
-from .storage import StorageBackend
 from ..utils.logging import AsyncLogger
+from .storage import StorageBackend
 
 logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a", prefix="cascadeui")
 
@@ -31,8 +30,7 @@ async def migrate_storage(source: StorageBackend, target: StorageBackend) -> boo
         True if migration succeeded, False otherwise.
     """
     logger.info(
-        f"Migrating state from {source.__class__.__name__} "
-        f"to {target.__class__.__name__}"
+        f"Migrating state from {source.__class__.__name__} " f"to {target.__class__.__name__}"
     )
 
     state = await source.load_state()

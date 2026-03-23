@@ -1,12 +1,11 @@
-
 # // ========================================( Modules )======================================== // #
 
 
 import asyncio
-from typing import Optional, Set, Callable
+from typing import Callable, Optional, Set
 
-from .types import Action, StateData
 from ..utils.logging import AsyncLogger
+from .types import Action, StateData
 
 logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a", prefix="cascadeui")
 
@@ -30,8 +29,7 @@ class DebouncedPersistence:
         store.add_middleware(persistence)
     """
 
-    def __init__(self, store, interval: float = 2.0,
-                 flush_actions: Optional[Set[str]] = None):
+    def __init__(self, store, interval: float = 2.0, flush_actions: Optional[Set[str]] = None):
         self._store = store
         self._interval = interval
         self._flush_actions = flush_actions or {"VIEW_DESTROYED"}
@@ -39,8 +37,7 @@ class DebouncedPersistence:
         self._timer: Optional[asyncio.TimerHandle] = None
         self._write_lock = asyncio.Lock()
 
-    async def __call__(self, action: Action, state: StateData,
-                       next_fn: Callable) -> StateData:
+    async def __call__(self, action: Action, state: StateData, next_fn: Callable) -> StateData:
         """Process the action through the chain, then handle persistence."""
         result = await next_fn(action, state)
 
@@ -65,8 +62,7 @@ class DebouncedPersistence:
         try:
             loop = asyncio.get_running_loop()
             self._timer = loop.call_later(
-                self._interval,
-                lambda: asyncio.ensure_future(self._flush())
+                self._interval, lambda: asyncio.ensure_future(self._flush())
             )
         except RuntimeError:
             pass
@@ -108,10 +104,11 @@ def logging_middleware():
     Usage:
         store.add_middleware(logging_middleware())
     """
-    action_logger = AsyncLogger(name="cascadeui.actions", level="INFO", path="logs", mode="a", prefix="cascadeui")
+    action_logger = AsyncLogger(
+        name="cascadeui.actions", level="INFO", path="logs", mode="a", prefix="cascadeui"
+    )
 
-    async def middleware(action: Action, state: StateData,
-                        next_fn: Callable) -> StateData:
+    async def middleware(action: Action, state: StateData, next_fn: Callable) -> StateData:
         action_logger.info(
             f"[{action['type']}] source={action.get('source', 'N/A')} "
             f"payload_keys={list(action.get('payload', {}).keys())}"

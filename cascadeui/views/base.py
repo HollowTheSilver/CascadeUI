@@ -31,10 +31,17 @@ _view_class_registry: Dict[str, type] = {}
 # Kwargs that are ephemeral per-invocation and must NOT be saved for
 # push/pop reconstruction.  _navigate_to() re-supplies these when
 # building the next view, so persisting them would be wrong.
-_NON_RECONSTRUCTIBLE_KWARGS = frozenset({
-    "context", "interaction", "message",
-    "state_store", "session_id", "user_id", "guild_id",
-})
+_NON_RECONSTRUCTIBLE_KWARGS = frozenset(
+    {
+        "context",
+        "interaction",
+        "message",
+        "state_store",
+        "session_id",
+        "user_id",
+        "guild_id",
+    }
+)
 
 
 def _register_view_class(cls):
@@ -107,9 +114,7 @@ class StatefulView(View):
                             f"push/pop reconstruction. Use keyword arguments instead."
                         )
                     self._pending_init_kwargs = {
-                        k: v
-                        for k, v in kw.items()
-                        if k not in _NON_RECONSTRUCTIBLE_KWARGS
+                        k: v for k, v in kw.items() if k not in _NON_RECONSTRUCTIBLE_KWARGS
                     }
                 original_init(self, *args, **kw)
 

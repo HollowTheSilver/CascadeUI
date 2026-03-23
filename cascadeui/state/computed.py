@@ -1,11 +1,10 @@
-
 # // ========================================( Modules )======================================== // #
 
 
 from typing import Any, Callable, Optional
 
-from .types import StateData, SelectorFn
 from .singleton import get_store
+from .types import SelectorFn, StateData
 
 _SENTINEL = object()
 
@@ -57,9 +56,11 @@ def computed(selector: SelectorFn):
         # Access:
         result = store.computed["total_votes"]
     """
+
     def decorator(fn: Callable[[Any], Any]):
         cv = ComputedValue(name=fn.__name__, selector=selector, compute_fn=fn)
         store = get_store()
         store.register_computed(fn.__name__, cv)
         return fn
+
     return decorator

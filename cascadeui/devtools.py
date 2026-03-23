@@ -1,4 +1,3 @@
-
 # // ========================================( Modules )======================================== // #
 
 
@@ -10,7 +9,6 @@ import discord
 from discord.ext import commands
 
 from .state.singleton import get_store
-
 
 # // ========================================( Inspector )======================================== // #
 
@@ -114,11 +112,7 @@ class StateInspector:
 
             embed.add_field(
                 name=f"{view_type} ({short_id})",
-                value=(
-                    f"Message: `{msg_id}`\n"
-                    f"Channel: `{channel_id}`\n"
-                    f"User: `{user_id}`"
-                ),
+                value=(f"Message: `{msg_id}`\n" f"Channel: `{channel_id}`\n" f"User: `{user_id}`"),
                 inline=True,
             )
 
@@ -220,9 +214,8 @@ class StateInspector:
         sub_count = len(self.store.subscribers)
         embed.add_field(
             name=f"Subscribers ({sub_count})",
-            value=", ".join(
-                f"`{sid[:8]}...`" for sid in list(self.store.subscribers.keys())[:10]
-            ) or "None",
+            value=", ".join(f"`{sid[:8]}...`" for sid in list(self.store.subscribers.keys())[:10])
+            or "None",
             inline=False,
         )
 
@@ -233,7 +226,8 @@ class StateInspector:
             value=", ".join(
                 f"`{mw.__class__.__name__ if hasattr(mw, '__class__') and mw.__class__.__name__ != 'function' else mw.__name__ if hasattr(mw, '__name__') else 'anonymous'}`"
                 for mw in self.store._middleware
-            ) or "None",
+            )
+            or "None",
             inline=False,
         )
 
@@ -311,10 +305,7 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
     def __init__(self, bot):
         self.bot = bot
 
-    @commands.hybrid_command(
-        name="inspect",
-        description="Inspect the CascadeUI state store."
-    )
+    @commands.hybrid_command(name="inspect", description="Inspect the CascadeUI state store.")
     @commands.is_owner()
     async def inspect(self, ctx: commands.Context):
         inspector = StateInspector()

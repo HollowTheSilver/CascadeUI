@@ -1,8 +1,7 @@
-
 # // ========================================( Modules )======================================== // #
 
 import copy
-from typing import Dict, Any
+from typing import Any, Dict
 
 from .types import Action, StateData
 
@@ -137,10 +136,7 @@ async def reduce_session_updated(action: Action, state: StateData) -> StateData:
 
     # Update data field if provided
     if "data" in payload:
-        session_data["data"] = {
-            **session_data.get("data", {}),
-            **payload["data"]
-        }
+        session_data["data"] = {**session_data.get("data", {}), **payload["data"]}
 
     return new_state
 
@@ -169,12 +165,14 @@ async def reduce_navigation_replace(action: Action, state: StateData) -> StateDa
                 session["history"] = []
 
             # Add navigation event
-            session["history"].append({
-                "from_view": source_id,
-                "to_view_type": dest_view_type,
-                "timestamp": action["timestamp"],
-                "params": payload.get("params", {})
-            })
+            session["history"].append(
+                {
+                    "from_view": source_id,
+                    "to_view_type": dest_view_type,
+                    "timestamp": action["timestamp"],
+                    "params": payload.get("params", {}),
+                }
+            )
 
     return new_state
 
@@ -196,19 +194,18 @@ async def reduce_component_interaction(action: Action, state: StateData) -> Stat
 
     # Record the interaction
     if component_id not in new_state["components"]:
-        new_state["components"][component_id] = {
-            "id": component_id,
-            "interactions": []
-        }
+        new_state["components"][component_id] = {"id": component_id, "interactions": []}
 
     # Add the interaction (capped to prevent unbounded growth)
     interactions = new_state["components"][component_id]["interactions"]
-    interactions.append({
-        "user_id": payload.get("user_id"),
-        "view_id": view_id,
-        "value": payload.get("value"),
-        "timestamp": action["timestamp"]
-    })
+    interactions.append(
+        {
+            "user_id": payload.get("user_id"),
+            "view_id": view_id,
+            "value": payload.get("value"),
+            "timestamp": action["timestamp"],
+        }
+    )
     if len(interactions) > 50:
         new_state["components"][component_id]["interactions"] = interactions[-50:]
 
@@ -237,11 +234,13 @@ async def reduce_modal_submitted(action: Action, state: StateData) -> StateData:
 
     # Record the submission (capped at 50 like component interactions)
     submissions = new_state["modals"][view_id]["submissions"]
-    submissions.append({
-        "user_id": payload.get("user_id"),
-        "values": payload.get("values", {}),
-        "timestamp": action["timestamp"],
-    })
+    submissions.append(
+        {
+            "user_id": payload.get("user_id"),
+            "values": payload.get("values", {}),
+            "timestamp": action["timestamp"],
+        }
+    )
     if len(submissions) > 50:
         new_state["modals"][view_id]["submissions"] = submissions[-50:]
 
@@ -308,12 +307,14 @@ async def reduce_navigation_push(action: Action, state: StateData) -> StateData:
     if "nav_stack" not in session:
         session["nav_stack"] = []
 
-    session["nav_stack"].append({
-        "class_name": payload.get("class_name"),
-        "module": payload.get("module"),
-        "kwargs": payload.get("kwargs", {}),
-        "state_snapshot": payload.get("state_snapshot"),
-    })
+    session["nav_stack"].append(
+        {
+            "class_name": payload.get("class_name"),
+            "module": payload.get("module"),
+            "kwargs": payload.get("kwargs", {}),
+            "state_snapshot": payload.get("state_snapshot"),
+        }
+    )
 
     return new_state
 

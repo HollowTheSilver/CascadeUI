@@ -1,20 +1,12 @@
-
 # // ========================================( Modules )======================================== // #
 
 
+from .actions import ActionCreators
 from .singleton import get_store
 from .store import StateStore
-from .actions import ActionCreators
-from .types import StateData, Action
-
+from .types import Action, StateData
 
 # // ========================================( Script )======================================== // #
 
 
-__all__ = [
-    "StateStore",
-    "get_store",
-    "ActionCreators",
-    "StateData",
-    "Action"
-]
+__all__ = ["StateStore", "get_store", "ActionCreators", "StateData", "Action"]

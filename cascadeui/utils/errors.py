@@ -1,16 +1,18 @@
-
 # // ========================================( Modules )======================================== // #
 
 
-import functools
 import asyncio
+import functools
 import traceback
-from typing import Callable, Any, Coroutine, TypeVar, cast, Optional, Type, Tuple, Union
+from typing import Any, Callable, Coroutine, Optional, Tuple, Type, TypeVar, Union, cast
 
 from .logging import AsyncLogger
-logger = AsyncLogger(name="cascadeui.errors", level="DEBUG", path="logs", mode="a", prefix="cascadeui")
 
-T = TypeVar('T')
+logger = AsyncLogger(
+    name="cascadeui.errors", level="DEBUG", path="logs", mode="a", prefix="cascadeui"
+)
+
+T = TypeVar("T")
 
 
 # // ========================================( Classes )======================================== // #
@@ -19,11 +21,13 @@ T = TypeVar('T')
 class RetryConfig:
     """Configuration for retry behavior."""
 
-    def __init__(self,
-                 max_retries: int = 3,
-                 backoff_factor: float = 1.0,
-                 exceptions_to_retry: Tuple[Type[Exception], ...] = (Exception,),
-                 max_backoff: float = 30.0):
+    def __init__(
+        self,
+        max_retries: int = 3,
+        backoff_factor: float = 1.0,
+        exceptions_to_retry: Tuple[Type[Exception], ...] = (Exception,),
+        max_backoff: float = 30.0,
+    ):
         self.max_retries = max_retries
         self.backoff_factor = backoff_factor
         self.exceptions_to_retry = exceptions_to_retry
@@ -71,7 +75,7 @@ def with_retry(config: Optional[RetryConfig] = None):
                     last_exception = e
 
                     # Calculate backoff time with jitter and max cap
-                    base_wait = retry_config.backoff_factor * (2 ** attempt)
+                    base_wait = retry_config.backoff_factor * (2**attempt)
                     jitter = 0.1 * base_wait * (asyncio.get_running_loop().time() % 1.0)
                     wait_time = min(base_wait + jitter, retry_config.max_backoff)
 
@@ -110,12 +114,13 @@ class ErrorBoundary:
     def _get_log_level(level_name: str) -> int:
         """Convert string log level to integer constant."""
         import logging
+
         level_map = {
             "DEBUG": logging.DEBUG,
             "INFO": logging.INFO,
             "WARNING": logging.WARNING,
             "ERROR": logging.ERROR,
-            "CRITICAL": logging.CRITICAL
+            "CRITICAL": logging.CRITICAL,
         }
         return level_map.get(level_name.upper(), logging.ERROR)
 
@@ -124,11 +129,7 @@ class ErrorBoundary:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if exc_val is not None:
-            logger.log(
-                self.log_level,
-                f"Error in {self.name}: {exc_val}",
-                exc_info=True
-            )
+            logger.log(self.log_level, f"Error in {self.name}: {exc_val}", exc_info=True)
             # Return False to propagate the exception
             return False
         return True

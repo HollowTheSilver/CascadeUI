@@ -1,8 +1,7 @@
-
 # // ========================================( Modules )======================================== // #
 
 
-from typing import Dict, Any, Optional, List, Union, Callable
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import discord
 from discord.ui import Item
@@ -51,10 +50,7 @@ class StatefulComponent:
 
             # Then dispatch state update (may trigger update_from_state on views)
             payload = ActionCreators.component_interaction(
-                component_id=component_id,
-                view_id=view.id,
-                user_id=interaction.user.id,
-                value=value
+                component_id=component_id, view_id=view.id, user_id=interaction.user.id, value=value
             )
             await view.dispatch("COMPONENT_INTERACTION", payload)
 

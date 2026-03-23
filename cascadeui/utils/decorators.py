@@ -1,13 +1,13 @@
-
 # // ========================================( Modules )======================================== // #
 
 
-from functools import wraps
-from typing import Callable, Dict, Any
 import asyncio
+from functools import wraps
+from typing import Any, Callable, Dict
 
 # Import logger
 from ..utils.logging import AsyncLogger
+
 logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a", prefix="cascadeui")
 
 
@@ -24,6 +24,7 @@ def cascade_reducer(action_type: str):
 
         # Import lazily to avoid circular imports
         from ..state.singleton import get_store
+
         get_store().register_reducer(action_type, wrapper)
         logger.debug(f"Registered reducer for action type: {action_type}")
 
@@ -43,12 +44,15 @@ def cascade_component(component_id: str = None):
             actual_id = component_id or func.__name__
 
             # Dispatch interaction action
-            await self.dispatch("COMPONENT_INTERACTION", {
-                "component_id": actual_id,
-                "view_id": self.id,
-                "user_id": interaction.user.id,
-                "handler": func.__name__
-            })
+            await self.dispatch(
+                "COMPONENT_INTERACTION",
+                {
+                    "component_id": actual_id,
+                    "view_id": self.id,
+                    "user_id": interaction.user.id,
+                    "handler": func.__name__,
+                },
+            )
 
             # Call original function
             return await func(self, interaction)
@@ -56,5 +60,3 @@ def cascade_component(component_id: str = None):
         return wrapper
 
     return decorator
-
-

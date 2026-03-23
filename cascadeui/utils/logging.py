@@ -1,32 +1,30 @@
-
 # // ========================================( Modules )======================================== // #
 
 
-import json as _json
-import os
-import sys
-import atexit
-import queue
 import asyncio
+import atexit
+import json as _json
 import logging
+import os
+import queue
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from logging import (
-    Logger,
-    Formatter,
-    FileHandler,
-    StreamHandler,
-    LogRecord,
-    Handler,
+    CRITICAL,
     DEBUG,
+    ERROR,
     INFO,
     WARNING,
-    ERROR,
-    CRITICAL,
+    FileHandler,
+    Formatter,
+    Handler,
+    Logger,
+    LogRecord,
+    StreamHandler,
 )
 from logging.handlers import QueueHandler, QueueListener
 from typing import Any, Optional, Union
-
 
 # // ========================================( Color Schemes )======================================== // #
 
@@ -104,8 +102,15 @@ COLOR_SCHEMES: dict[str, ColorScheme] = {
         name="\x1b[32;1m",
     ),
     "none": ColorScheme(
-        debug="", info="", warning="", error="", critical="",
-        timestamp="", function="", name="", reset="",
+        debug="",
+        info="",
+        warning="",
+        error="",
+        critical="",
+        timestamp="",
+        function="",
+        name="",
+        reset="",
     ),
 }
 
@@ -207,8 +212,7 @@ class ColoredStreamFormatter(Formatter):
         self._formatters: dict[int, Formatter] = {}
         for level in (DEBUG, INFO, WARNING, ERROR, CRITICAL):
             fmt = (
-                self.template.stream_fmt
-                .replace("$ts$", self.colors.timestamp)
+                self.template.stream_fmt.replace("$ts$", self.colors.timestamp)
                 .replace("$lvl$", self.colors.level_color(level))
                 .replace("$fn$", self.colors.function)
                 .replace("$name$", self.colors.name)
@@ -445,9 +449,7 @@ class AsyncLogger(Logger):
         if cls._listener is not None:
             cls._listener.stop()
         all_handlers = list(cls._stream_handlers.values()) + list(cls._file_handlers.values())
-        cls._listener = QueueListener(
-            cls._queue, *all_handlers, respect_handler_level=True
-        )
+        cls._listener = QueueListener(cls._queue, *all_handlers, respect_handler_level=True)
         cls._listener.start()
 
     @classmethod

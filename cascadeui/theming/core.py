@@ -1,11 +1,10 @@
-
 # // ========================================( Modules )======================================== // #
 
 
-from typing import Dict, Any, Optional, Union
-import discord
-from discord import Color, ButtonStyle
+from typing import Any, Dict, Optional, Union
 
+import discord
+from discord import ButtonStyle, Color
 
 # // ========================================( Classes )======================================== // #
 
@@ -34,7 +33,7 @@ class Theme:
                 "secondary": ButtonStyle.secondary,
                 "success": ButtonStyle.success,
                 "danger": ButtonStyle.danger,
-                "link": ButtonStyle.link
+                "link": ButtonStyle.link,
             }
 
     def get_style(self, key: str, default: Any = None) -> Any:
@@ -56,10 +55,9 @@ class Theme:
 
         return embed
 
-    def create_button(self,
-                      label: str,
-                      button_type: str = "primary",
-                      **kwargs) -> discord.ui.Button:
+    def create_button(
+        self, label: str, button_type: str = "primary", **kwargs
+    ) -> discord.ui.Button:
         """Create a themed button."""
         from ..components.base import StatefulButton
 

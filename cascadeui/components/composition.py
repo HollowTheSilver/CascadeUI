@@ -1,13 +1,13 @@
-
 # // ========================================( Modules )======================================== // #
 
 
-from typing import List, Dict, Any, Optional, Callable, Union, Type
+from typing import Any, Callable, Dict, List, Optional, Type, Union
+
 import discord
 from discord import Interaction
 
-from .base import StatefulComponent, StatefulButton
 from ..state.actions import ActionCreators
+from .base import StatefulButton, StatefulComponent
 
 # Component registry for pre-built components
 _component_registry = {}
@@ -32,7 +32,7 @@ class CompositeComponent:
     def __init__(self) -> None:
         self.components = []
 
-    def add_component(self, component) -> 'CompositeComponent':
+    def add_component(self, component) -> "CompositeComponent":
         """Add a component to this composite."""
         self.components.append(component)
         return self

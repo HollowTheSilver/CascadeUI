@@ -1,11 +1,9 @@
-
 # // ========================================( Modules )======================================== // #
 
 
 import asyncio
 import weakref
-from typing import Dict, Set, Optional, Coroutine, Any
-
+from typing import Any, Coroutine, Dict, Optional, Set
 
 # // ========================================( Classes )======================================== // #
 
@@ -36,7 +34,10 @@ class TaskManager:
         except Exception as e:
             # Log exception but don't crash
             from ..utils.logging import AsyncLogger
-            logger = AsyncLogger(name="cascadeui.tasks", level="ERROR", path="logs", mode="a", prefix="cascadeui")
+
+            logger = AsyncLogger(
+                name="cascadeui.tasks", level="ERROR", path="logs", mode="a", prefix="cascadeui"
+            )
             logger.error(f"Task error for owner {owner_id}: {e}")
             raise
         finally:

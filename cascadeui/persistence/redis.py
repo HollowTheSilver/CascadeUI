@@ -1,13 +1,12 @@
-
 # // ========================================( Modules )======================================== // #
 
 
 import asyncio
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional
 
-from .storage import StorageBackend
-from .serialization import StateSerializer
 from ..utils.logging import AsyncLogger
+from .serialization import StateSerializer
+from .storage import StorageBackend
 
 logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a", prefix="cascadeui")
 
@@ -29,8 +28,12 @@ class RedisBackend(StorageBackend):
         await setup_persistence(bot, backend=RedisBackend(url="redis://localhost"))
     """
 
-    def __init__(self, url: str = "redis://localhost", key: str = "cascadeui:state",
-                 ttl: Optional[int] = None):
+    def __init__(
+        self,
+        url: str = "redis://localhost",
+        key: str = "cascadeui:state",
+        ttl: Optional[int] = None,
+    ):
         self.url = url
         self.key = key
         self.ttl = ttl

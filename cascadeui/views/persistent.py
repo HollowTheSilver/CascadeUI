@@ -1,16 +1,15 @@
-
 # // ========================================( Modules )======================================== // #
 
 
 import re
-from typing import Dict, Optional, Any, List
+from typing import Any, Dict, List, Optional
 
 import discord
 
-from .base import StatefulView
-from ..state.singleton import get_store
 from ..state.actions import ActionCreators
+from ..state.singleton import get_store
 from ..utils.logging import AsyncLogger
+from .base import StatefulView
 
 logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a", prefix="cascadeui")
 
@@ -101,13 +100,13 @@ class PersistentView(StatefulView):
             # components on the message, and dispatch VIEW_DESTROYED.
             old_view_exited = False
             for vid, old_view in list(self.state_store._active_views.items()):
-                if (getattr(old_view, "_state_key", None) == self.state_key
-                        and old_view.id != self.id):
+                if (
+                    getattr(old_view, "_state_key", None) == self.state_key
+                    and old_view.id != self.id
+                ):
                     await old_view.exit()
                     old_view_exited = True
-                    logger.info(
-                        f"Exited previous view instance for state_key '{self.state_key}'"
-                    )
+                    logger.info(f"Exited previous view instance for state_key '{self.state_key}'")
                     break
 
             # If the old view wasn't alive (e.g. from a previous bot session that
@@ -115,9 +114,8 @@ class PersistentView(StatefulView):
             if not old_view_exited:
                 old_msg_id = existing["message_id"]
                 old_ch_id = existing["channel_id"]
-                bot = (
-                    getattr(self.context, "bot", None)
-                    or getattr(self.interaction, "client", None)
+                bot = getattr(self.context, "bot", None) or getattr(
+                    self.interaction, "client", None
                 )
                 if bot:
                     try:
@@ -133,8 +131,7 @@ class PersistentView(StatefulView):
                         pass  # Old message already gone, nothing to clean up
                     except Exception as e:
                         logger.debug(
-                            f"Could not clean up previous message for "
-                            f"'{self.state_key}': {e}"
+                            f"Could not clean up previous message for " f"'{self.state_key}': {e}"
                         )
 
         # Record this view in the persistent registry
@@ -219,6 +216,7 @@ async def setup_persistence(
     # with a confusing error or silently break view restoration.
     if bot is not None:
         from discord.ext.commands import Bot
+
         if not isinstance(bot, Bot):
             raise TypeError(
                 f"setup_persistence() expected a discord.py Bot instance for 'bot', "
@@ -232,6 +230,7 @@ async def setup_persistence(
     if not store.persistence_enabled:
         if backend is None:
             from ..persistence.storage import FileStorageBackend
+
             backend = FileStorageBackend(file_path)
         store.enable_persistence(backend)
 

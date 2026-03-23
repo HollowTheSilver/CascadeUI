@@ -1,13 +1,11 @@
-
 # // ========================================( Modules )======================================== // #
 
 
-from typing import Callable, Optional, Any, Dict, Tuple
 from datetime import datetime, timedelta
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import discord
-from discord import Interaction, ButtonStyle
-
+from discord import ButtonStyle, Interaction
 
 # // ========================================( Functions )======================================== // #
 
@@ -132,14 +130,10 @@ def with_confirmation(
             if on_cancel is not None:
                 await on_cancel(cancel_interaction)
 
-        confirm_button = discord.ui.Button(
-            label=confirm_label, style=confirm_style
-        )
+        confirm_button = discord.ui.Button(label=confirm_label, style=confirm_style)
         confirm_button.callback = _on_confirm
 
-        cancel_button = discord.ui.Button(
-            label=cancel_label, style=cancel_style
-        )
+        cancel_button = discord.ui.Button(label=cancel_label, style=cancel_style)
         cancel_button.callback = _on_cancel
 
         confirmation_view.add_item(confirm_button)
@@ -147,9 +141,7 @@ def with_confirmation(
 
         embed = discord.Embed(title=title, description=message, color=color)
 
-        await interaction.response.send_message(
-            embed=embed, view=confirmation_view, ephemeral=True
-        )
+        await interaction.response.send_message(embed=embed, view=confirmation_view, ephemeral=True)
 
     component.callback = confirmation_callback
     return component

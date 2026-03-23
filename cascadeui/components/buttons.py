@@ -1,15 +1,13 @@
-
 # // ========================================( Modules )======================================== // #
 
 
-from typing import Optional, Callable, Any
+from typing import Any, Callable, Optional
 
 import discord
 from discord import ButtonStyle, Interaction
 
-from .base import StatefulButton
 from ..state.actions import ActionCreators
-
+from .base import StatefulButton
 
 # // ========================================( Classes )======================================== // #
 
@@ -57,8 +55,14 @@ class LinkButton(discord.ui.Button):
 class ToggleButton(StatefulButton):
     """A button that toggles between two states."""
 
-    def __init__(self, label: str, toggled_label: str = None,
-                 toggled: bool = False, callback: Optional[Callable] = None, **kwargs):
+    def __init__(
+        self,
+        label: str,
+        toggled_label: str = None,
+        toggled: bool = False,
+        callback: Optional[Callable] = None,
+        **kwargs,
+    ):
         self.original_label = label
         self.toggled_label = toggled_label or f"{label} ✓"
         self.is_toggled = toggled
@@ -97,7 +101,7 @@ class ToggleButton(StatefulButton):
                     component_id=component_id,
                     view_id=view.id,
                     user_id=interaction.user.id,
-                    value=self.is_toggled
+                    value=self.is_toggled,
                 )
                 await view.dispatch("COMPONENT_INTERACTION", payload)
 

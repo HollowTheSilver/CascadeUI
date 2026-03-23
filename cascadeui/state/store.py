@@ -1,18 +1,17 @@
-
 # // ========================================( Modules )======================================== // #
 
 
-import copy
 import asyncio
+import copy
 from datetime import datetime
-from typing import Dict, Any, Optional, List, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
+
+from ..utils.errors import safe_execute, with_error_boundary
 
 # Import logging at module level
 from ..utils.logging import AsyncLogger
 from ..utils.tasks import get_task_manager
-from ..utils.errors import with_error_boundary, safe_execute
-
-from .types import Action, StateData, ReducerFn, SubscriberFn, MiddlewareFn, SelectorFn, HookFn
+from .types import Action, HookFn, MiddlewareFn, ReducerFn, SelectorFn, StateData, SubscriberFn
 
 logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a", prefix="cascadeui")
 
@@ -33,8 +32,9 @@ class BatchContext:
         self._store = store
         self._actions: List[Action] = []
 
-    async def dispatch(self, action_type: str, payload: Any = None,
-                       source_id: Optional[str] = None) -> StateData:
+    async def dispatch(
+        self, action_type: str, payload: Any = None, source_id: Optional[str] = None
+    ) -> StateData:
         """Dispatch an action within the batch (no subscriber notification)."""
         action = {
             "type": action_type,
@@ -125,7 +125,9 @@ class StateStore:
         }
 
         # Callbacks for state changes: {id: (callback, action_filter, selector)}
-        self.subscribers: Dict[str, Tuple[SubscriberFn, Optional[Set[str]], Optional[SelectorFn]]] = {}
+        self.subscribers: Dict[
+            str, Tuple[SubscriberFn, Optional[Set[str]], Optional[SelectorFn]]
+        ] = {}
 
         # Memoized selector results for change detection
         self._last_selected: Dict[str, Any] = {}
@@ -183,21 +185,21 @@ class StateStore:
 
         # Import here to avoid circular imports
         from .reducers import (
-            reduce_view_created,
-            reduce_view_updated,
-            reduce_view_destroyed,
-            reduce_session_created,
-            reduce_session_updated,
-            reduce_navigation_replace,
             reduce_component_interaction,
             reduce_modal_submitted,
+            reduce_navigation_pop,
+            reduce_navigation_push,
+            reduce_navigation_replace,
             reduce_persistent_view_registered,
             reduce_persistent_view_unregistered,
-            reduce_navigation_push,
-            reduce_navigation_pop,
-            reduce_scoped_update,
-            reduce_undo,
             reduce_redo,
+            reduce_scoped_update,
+            reduce_session_created,
+            reduce_session_updated,
+            reduce_undo,
+            reduce_view_created,
+            reduce_view_destroyed,
+            reduce_view_updated,
         )
 
         # Register core reducers
@@ -252,6 +254,7 @@ class StateStore:
 
     async def _run_middleware_chain(self, action: Action, reducer_fn) -> StateData:
         """Build and execute the middleware chain ending at the reducer."""
+
         async def run_reducer(act, state):
             if reducer_fn:
                 try:
@@ -268,10 +271,13 @@ class StateStore:
         # second-to-last wraps that, etc. Default args capture loop variables.
         chain = run_reducer
         for mw in reversed(self._middleware):
+
             def wrap(middleware=mw, next_fn=chain):
                 async def step(act, state):
                     return await middleware(act, state, next_fn)
+
                 return step
+
             chain = wrap()
 
         return await chain(action, self.state)
@@ -452,8 +458,9 @@ class StateStore:
     # // ========================================( Dispatch )======================================== // #
 
     @with_error_boundary("dispatch")
-    async def dispatch(self, action_type: str, payload: Any = None,
-                       source_id: Optional[str] = None) -> StateData:
+    async def dispatch(
+        self, action_type: str, payload: Any = None, source_id: Optional[str] = None
+    ) -> StateData:
         """
         Process an action by updating state and notifying subscribers.
         """
@@ -462,7 +469,7 @@ class StateStore:
             "type": action_type,
             "payload": payload or {},
             "source": source_id,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now().isoformat(),
         }
 
         logger.debug(f"Dispatching action {action_type} from source {source_id}")
@@ -501,14 +508,19 @@ class StateStore:
         """Notify all subscribers about a state change."""
         tasks = []
 
-        logger.debug(f"Notifying {len(self.subscribers)} subscribers about action: {action['type']}")
+        logger.debug(
+            f"Notifying {len(self.subscribers)} subscribers about action: {action['type']}"
+        )
 
         for subscriber_id, (callback, action_filter, selector) in list(self.subscribers.items()):
             # For BATCH_COMPLETE, check subscriber's filter against any batched action
             if action["type"] == "BATCH_COMPLETE":
                 if action_filter is not None:
                     batched_types = {a["type"] for a in action["payload"].get("actions", [])}
-                    if not (action_filter & batched_types) and "BATCH_COMPLETE" not in action_filter:
+                    if (
+                        not (action_filter & batched_types)
+                        and "BATCH_COMPLETE" not in action_filter
+                    ):
                         continue
             else:
                 # Normal action: skip if the subscriber has a filter and this action isn't in it
@@ -522,7 +534,11 @@ class StateStore:
                 except Exception:
                     new_value = self._SENTINEL  # On error, always notify
                 old_value = self._last_selected.get(subscriber_id, self._SENTINEL)
-                if new_value is not self._SENTINEL and old_value is not self._SENTINEL and new_value == old_value:
+                if (
+                    new_value is not self._SENTINEL
+                    and old_value is not self._SENTINEL
+                    and new_value == old_value
+                ):
                     logger.debug(f"Skipping subscriber {subscriber_id}: selector unchanged")
                     continue
                 self._last_selected[subscriber_id] = new_value
@@ -533,24 +549,22 @@ class StateStore:
 
             logger.debug(f"Notifying subscriber {subscriber_id} about action {action['type']}")
             task = self.task_manager.create_task(
-                "state_store_notify",
-                self._safe_notify(subscriber_id, callback, action)
+                "state_store_notify", self._safe_notify(subscriber_id, callback, action)
             )
             tasks.append(task)
 
         if tasks:
             # Wait for all notifications to complete
-            done, pending = await asyncio.wait(
-                tasks,
-                return_when=asyncio.ALL_COMPLETED
-            )
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
 
             # Check for errors
             for task in done:
                 if task.exception():
                     logger.error(f"Error in subscriber notification: {task.exception()}")
 
-    async def _safe_notify(self, subscriber_id: str, callback: SubscriberFn, action: Action) -> None:
+    async def _safe_notify(
+        self, subscriber_id: str, callback: SubscriberFn, action: Action
+    ) -> None:
         """Safely call a subscriber callback."""
         try:
             logger.debug(f"Executing notification callback for subscriber {subscriber_id}")
@@ -561,11 +575,16 @@ class StateStore:
             # Don't propagate the exception to avoid breaking notification chain
             # but log detailed error information for debugging
             import traceback
+
             logger.debug(f"Detailed error for {subscriber_id}:\n{traceback.format_exc()}")
 
-    def subscribe(self, subscriber_id: str, callback: SubscriberFn,
-                  action_filter: Optional[set] = None,
-                  selector: Optional[SelectorFn] = None) -> None:
+    def subscribe(
+        self,
+        subscriber_id: str,
+        callback: SubscriberFn,
+        action_filter: Optional[set] = None,
+        selector: Optional[SelectorFn] = None,
+    ) -> None:
         """Register to receive state updates.
 
         Args:
@@ -606,9 +625,7 @@ class StateStore:
 
         # Use safe_execute to prevent crashes
         restored_state = await safe_execute(
-            self.persistence_backend.load_state(),
-            fallback=None,
-            log_error=True
+            self.persistence_backend.load_state(), fallback=None, log_error=True
         )
 
         if restored_state:

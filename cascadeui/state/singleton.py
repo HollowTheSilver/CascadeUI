@@ -1,8 +1,8 @@
-
 # // ========================================( Modules )======================================== // #
 
 # Import logging at module level
 from ..utils.logging import AsyncLogger
+
 logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a", prefix="cascadeui")
 
 # Store singleton
@@ -18,6 +18,7 @@ def get_store():
     if _store_instance is None:
         # Import here to avoid circular imports
         from .store import StateStore
+
         _store_instance = StateStore()
         logger.debug("Created new StateStore instance")
     return _store_instance

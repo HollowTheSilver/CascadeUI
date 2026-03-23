@@ -1,14 +1,13 @@
-
 # // ========================================( Modules )======================================== // #
 
 
-import json
 import asyncio
-from typing import Dict, Any, Optional
+import json
+from typing import Any, Dict, Optional
 
-from .storage import StorageBackend
-from .serialization import StateSerializer
 from ..utils.logging import AsyncLogger
+from .serialization import StateSerializer
+from .storage import StorageBackend
 
 logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a", prefix="cascadeui")
 
@@ -100,9 +99,7 @@ class SQLiteBackend(StorageBackend):
             import aiosqlite
 
             async with aiosqlite.connect(self.db_path) as db:
-                cursor = await db.execute(
-                    "SELECT data FROM cascadeui_state WHERE id = 1"
-                )
+                cursor = await db.execute("SELECT data FROM cascadeui_state WHERE id = 1")
                 row = await cursor.fetchone()
 
             if row is None:

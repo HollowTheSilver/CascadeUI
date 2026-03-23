@@ -1,15 +1,13 @@
-
 # // ========================================( Modules )======================================== // #
 
 
-from typing import List, Dict, Any, Optional, Callable
+from typing import Any, Callable, Dict, List, Optional
 
 import discord
 from discord import Interaction
 
-from .base import StatefulView
 from ..components.base import StatefulButton, StatefulSelect
-
+from .base import StatefulView
 
 # // ========================================( TabView )======================================== // #
 
@@ -59,6 +57,7 @@ class TabView(StatefulView):
                     await interaction.response.defer()
                     self._active_tab = index
                     await self._refresh_tabs()
+
                 return callback
 
             button = StatefulButton(
@@ -138,8 +137,13 @@ class WizardView(StatefulView):
                 await interaction.response.send_message("Setup complete!")
     """
 
-    def __init__(self, *args, steps: Optional[List[Dict[str, Any]]] = None,
-                 on_finish: Optional[Callable] = None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        steps: Optional[List[Dict[str, Any]]] = None,
+        on_finish: Optional[Callable] = None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
 
         self._steps: List[Dict[str, Any]] = steps or []
