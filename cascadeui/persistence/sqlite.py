@@ -23,7 +23,7 @@ class SQLiteBackend(StorageBackend):
     avoid WinError 32 (file-in-use) issues on Windows.
 
     Requires the ``aiosqlite`` package (optional dependency):
-        pip install cascadeui[sqlite]
+        pip install pycascadeui[sqlite]
 
     Usage:
         from cascadeui.persistence import SQLiteBackend
@@ -50,7 +50,7 @@ class SQLiteBackend(StorageBackend):
             except ImportError:
                 raise ImportError(
                     "aiosqlite is required for SQLiteBackend. "
-                    "Install it with: pip install cascadeui[sqlite]"
+                    "Install it with: pip install pycascadeui[sqlite]"
                 )
 
             async with aiosqlite.connect(self.db_path) as db:

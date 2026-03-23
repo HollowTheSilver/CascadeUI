@@ -49,7 +49,7 @@ from cascadeui.persistence import SQLiteBackend
 backend = SQLiteBackend("cascadeui.db")
 ```
 
-**Requires:** `pip install cascadeui[sqlite]`
+**Requires:** `pip install pycascadeui[sqlite]`
 
 #### Methods
 
@@ -66,7 +66,7 @@ from cascadeui.persistence import RedisBackend
 backend = RedisBackend(url="redis://localhost", key="cascadeui:state", ttl=None)
 ```
 
-**Requires:** `pip install cascadeui[redis]`
+**Requires:** `pip install pycascadeui[redis]`
 
 #### Constructor Parameters
 

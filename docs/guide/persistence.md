@@ -53,7 +53,7 @@ Before every save, a `.bak` backup is created for recovery.
 Requires `aiosqlite`. Uses WAL mode for concurrent reads and avoids file locking issues on Windows:
 
 ```bash
-pip install cascadeui[sqlite]
+pip install pycascadeui[sqlite]
 ```
 
 ```python
@@ -67,7 +67,7 @@ await setup_persistence(bot, backend=SQLiteBackend("cascadeui.db"))
 Requires `redis` (with async support). Useful for bots running across multiple processes or machines:
 
 ```bash
-pip install cascadeui[redis]
+pip install pycascadeui[redis]
 ```
 
 ```python

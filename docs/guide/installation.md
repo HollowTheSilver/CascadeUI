@@ -8,11 +8,11 @@
 ## From PyPI
 
 ```bash
-pip install cascadeui
+pip install pycascadeui
 
 # With optional backends
-pip install cascadeui[sqlite]
-pip install cascadeui[redis]
+pip install pycascadeui[sqlite]
+pip install pycascadeui[redis]
 ```
 
 ### From Source

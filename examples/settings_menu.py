@@ -19,7 +19,7 @@ Usage:
     Invoking ``/settings`` a second time while the first panel is still
     open will automatically close the old one (session_limit=1).
 
-    Requires: pip install cascadeui discord.py
+    Requires: pip install pycascadeui discord.py
 """
 
 # // ========================================( Modules )======================================== // #

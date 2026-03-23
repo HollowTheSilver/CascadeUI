@@ -1,54 +1,74 @@
 <p align="center">
-  <img src="docs/assets/banner.png" alt="CascadeUI — A Redux-Inspired Framework for Discord.py" width="100%">
+  <img src="https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/docs/assets/banner.png" alt="CascadeUI — A Redux-Inspired Framework for Discord.py" width="100%">
 </p>
 
 <p align="center">
-  <a href="https://pypi.org/project/cascadeui/"><img src="https://img.shields.io/pypi/v/cascadeui?logo=pypi&logoColor=white" alt="PyPI"></a>
+  <a href="https://pypi.org/project/pycascadeui/"><img src="https://img.shields.io/pypi/v/pycascadeui?logo=pypi&logoColor=white" alt="PyPI"></a>
+  <a href="https://pypi.org/project/pycascadeui/"><img src="https://img.shields.io/pypi/dm/pycascadeui?logo=pypi&logoColor=white&label=downloads" alt="Downloads"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10%20|%203.11%20|%203.12%20|%203.13%20|%203.14-blue.svg?logo=python&logoColor=white" alt="Python 3.10-3.14"></a>
   <a href="https://github.com/Rapptz/discord.py"><img src="https://img.shields.io/badge/discord.py-2.7+-738adb.svg?logo=discord&logoColor=white" alt="discord.py 2.7+"></a>
+  <a href="https://github.com/HollowTheSilver/CascadeUI/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/HollowTheSilver/CascadeUI/ci.yml?logo=github&label=CI" alt="CI"></a>
+  <a href="https://github.com/psf/black"><img src="https://img.shields.io/badge/code%20style-black-000000.svg" alt="Code style: black"></a>
   <a href="https://hollowthesilver.github.io/CascadeUI/"><img src="https://img.shields.io/badge/docs-GitHub%20Pages-8A2BE2?logo=readthedocs" alt="Docs"></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
 </p>
 
+<p align="center">
+  Redux-inspired UI framework for <a href="https://github.com/Rapptz/discord.py">discord.py</a>.<br>
+  Centralized state, dispatched actions, reducers, and subscriber notifications<br>
+  for predictable state flow and composable UI patterns.
+</p>
+
+> [!NOTE]
 > This initial release targets **Discord V1 Components** (Views, Buttons, Selects, Modals). Full V2 Component support (LayoutView, Container, Section, TextDisplay, etc.) is planned for the next major release.
 
-Redux-inspired UI framework for [discord.py](https://github.com/Rapptz/discord.py). Centralized state store, dispatched actions, reducers, and subscriber notifications give you predictable state flow and composable UI patterns that scale beyond simple one-off views.
+<p align="center">
+  <a href="https://hollowthesilver.github.io/CascadeUI/"><strong>Read the full documentation</strong></a>
+</p>
 
-**[Read the full documentation](https://hollowthesilver.github.io/CascadeUI/)**
-
-![CascadeUI Demo](assets/gifs/hero-demo.gif)
+![CascadeUI Demo](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/hero-demo.gif)
 
 ---
 
 ## Features
 
+#### State Management
 - **Centralized State Store** -- Singleton store with dispatch/reducer cycle, action batching, computed values, event hooks, and subscriber filtering by action type + state selectors
+- **Custom Reducers** -- Register your own action types with `@cascade_reducer`
+- **Middleware** -- Intercept and transform actions; built-in debounced persistence, logging, and undo/redo
+
+#### Views & Patterns
 - **Stateful Views** -- Wraps discord.py `View` with lifecycle management, auto-defer safety net, interaction ownership, navigation stack (push/pop), state scoping, and undo/redo
 - **Session Limiting** -- Declarative per-view limits (`session_limit`, `session_scope`, `session_policy`) with automatic old-view cleanup
-- **Pre-built Patterns** -- `FormView`, `PaginatedView` (with jump buttons and go-to-page modal), `TabView`, `WizardView`
+- **Pre-built Patterns** -- `FormView`, `PaginatedView` (jump buttons + go-to-page modal), `TabView`, `WizardView`
+
+#### Components & Theming
 - **Stateful Components** -- `StatefulButton`, `StatefulSelect`, plus composites (`ConfirmationButtons`, `ToggleGroup`, `ProgressBar`) and behavioral wrappers (loading, confirmation, cooldown)
 - **Form Validation** -- Built-in validators (`min_length`, `max_length`, `regex`, `choices`, `min_value`, `max_value`) with per-field error reporting
 - **Theming** -- Global registry with per-view overrides; built-in default, dark, and light themes
+
+#### Infrastructure
 - **Persistence** -- `setup_persistence()` for data + view survival across restarts; pluggable backends (JSON, SQLite, Redis)
-- **Middleware** -- Intercept and transform actions; built-in debounced persistence, logging, and undo/redo
-- **Custom Reducers** -- Register your own action types with `@cascade_reducer`
 - **DevTools** -- Built-in state inspector with paginated embed output
 
 ---
 
 ## Quick Start
 
-### Installation
+> [!TIP]
+> Install from PyPI, then `import cascadeui` -- the package name on PyPI is `pycascadeui` but the import stays `cascadeui`.
 
 ```bash
-pip install cascadeui
+pip install pycascadeui
 
 # Optional backends
-pip install -e ".[sqlite]"   # SQLite persistence via aiosqlite
-pip install -e ".[redis]"    # Redis persistence
+pip install pycascadeui[sqlite]   # SQLite persistence via aiosqlite
+pip install pycascadeui[redis]    # Redis persistence
 ```
 
 **Requirements**: Python 3.10+ | discord.py 2.7+
+
+<br>
 
 ### A Counter in 30 Lines
 
@@ -97,9 +117,9 @@ async def counter(ctx):
 
 ### Navigation Stack
 
-Push and pop views to build multi-level menus. Each level edits the same message.
+> Push and pop views to build multi-level menus. Each level edits the same message.
 
-![Navigation Stack](assets/gifs/navigation.gif)
+![Navigation Stack](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/navigation.gif)
 
 ```python
 class MainMenu(StatefulView):
@@ -117,11 +137,13 @@ class SettingsView(StatefulView):
 
 [Full guide](https://hollowthesilver.github.io/CascadeUI/guide/views/#navigation-stack)
 
+---
+
 ### Pagination
 
-Build paginated views from raw data. Pages above `jump_threshold` (default 5) get first/last buttons and a go-to-page modal.
+> Build paginated views from raw data. Pages above `jump_threshold` (default 5) get first/last buttons and a go-to-page modal.
 
-![Pagination](assets/gifs/pagination.gif)
+![Pagination](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/pagination.gif)
 
 ```python
 view = await PaginatedView.from_data(
@@ -138,11 +160,13 @@ await view.send()
 
 [Full guide](https://hollowthesilver.github.io/CascadeUI/guide/views/#paginatedview)
 
+---
+
 ### Session Limiting
 
-Prevent duplicate views from piling up. Open `/settings` twice and the old panel closes automatically.
+> Prevent duplicate views from piling up. Open `/settings` twice and the old panel closes automatically.
 
-![Session Limiting](assets/gifs/session-limiting.gif)
+![Session Limiting](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/session-limiting.gif)
 
 ```python
 class SettingsView(StatefulView):
@@ -153,15 +177,17 @@ class SettingsView(StatefulView):
 
 [Full guide](https://hollowthesilver.github.io/CascadeUI/guide/views/#session-limiting)
 
+---
+
 ### Persistence
 
-Persistent data keeps your settings and records intact between sessions.
+> Persistent data keeps your settings and records intact between sessions.
 
-![Persistent Data](assets/gifs/persistence-data.gif)
+![Persistent Data](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/persistence-data.gif)
 
-Persistent views keep their buttons working even after a full bot restart.
+> Persistent views keep their buttons working even after a full bot restart.
 
-![Surviving Restarts](assets/gifs/persistence-restart.gif)
+![Surviving Restarts](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/persistence-restart.gif)
 
 ```python
 # In your bot's setup_hook:
@@ -181,11 +207,13 @@ class RoleSelector(PersistentView):
 
 [Full guide](https://hollowthesilver.github.io/CascadeUI/guide/persistence/)
 
+---
+
 ### Ticket System (Demo)
 
-A full support ticket system combining PersistentView, Modal with validation, PaginatedView, custom reducers, state selectors, and theming in a single cog.
+> A full support ticket system combining PersistentView, Modal with validation, PaginatedView, custom reducers, state selectors, and theming in a single cog.
 
-![Ticket System](assets/gifs/ticket-system.gif)
+![Ticket System](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/ticket-system.gif)
 
 ```python
 class TicketPanelView(PersistentView):
@@ -199,9 +227,11 @@ class TicketPanelView(PersistentView):
 
 [View full example](examples/ticket_system.py)
 
+---
+
 ### Undo/Redo
 
-Snapshot-based undo/redo per view session. Two class attributes and you get full state history.
+> Snapshot-based undo/redo per view session. Two class attributes and you get full state history.
 
 ```python
 class NotificationSettings(StatefulView):
@@ -219,9 +249,11 @@ class NotificationSettings(StatefulView):
 
 [Full guide](https://hollowthesilver.github.io/CascadeUI/guide/views/#undoredo)
 
+---
+
 ### Theming
 
-Register themes globally, apply per-view or as a default. Embed colors update instantly.
+> Register themes globally, apply per-view or as a default. Embed colors update instantly.
 
 ```python
 my_theme = Theme("custom", {
@@ -240,9 +272,9 @@ set_default_theme("custom")
 ## Architecture
 
 ```
-User clicks button  ->  Interaction callback  ->  dispatch(action)
-     -> Middleware pipeline  ->  Reducer (immutable state update)
-     -> Subscribers notified (filtered)  ->  Views re-render
+User clicks button  →  Interaction callback  →  dispatch(action)
+     → Middleware pipeline  →  Reducer (immutable state update)
+     → Subscribers notified (filtered)  →  Views re-render
 ```
 
 All state lives in a single `StateStore` singleton. **Actions** are plain dicts describing what happened. **Reducers** receive the action and return new state immutably. **Subscribers** (views) are notified when state changes, filtered by action type and state selectors so views only re-render when their relevant slice actually changes.
@@ -270,7 +302,8 @@ Working examples in the [`examples/`](examples/) directory, each a discord.py co
 
 ## Documentation
 
-The full documentation site covers state management, views, components, persistence, theming, middleware, devtools, and API reference:
+> [!IMPORTANT]
+> The full documentation site covers state management, views, components, persistence, theming, middleware, devtools, and API reference.
 
 **[hollowthesilver.github.io/CascadeUI](https://hollowthesilver.github.io/CascadeUI/)**
 
@@ -290,6 +323,6 @@ isort --profile black --line-length 100 cascadeui/ # sort imports
 
 ---
 
-## License
-
-MIT License - see [LICENSE](LICENSE) for details.
+<p align="center">
+  MIT License -- see <a href="LICENSE">LICENSE</a> for details.
+</p>

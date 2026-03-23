@@ -22,7 +22,7 @@ class RedisBackend(StorageBackend):
     Supports optional TTL for automatic expiration.
 
     Requires the ``redis`` package (optional dependency):
-        pip install cascadeui[redis]
+        pip install pycascadeui[redis]
 
     Usage:
         from cascadeui.persistence import RedisBackend
@@ -48,7 +48,7 @@ class RedisBackend(StorageBackend):
                     except ImportError:
                         raise ImportError(
                             "redis[asyncio] is required for RedisBackend. "
-                            "Install it with: pip install cascadeui[redis]"
+                            "Install it with: pip install pycascadeui[redis]"
                         )
                     self._client = aioredis.from_url(self.url)
         return self._client

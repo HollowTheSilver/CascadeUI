@@ -24,7 +24,7 @@ Usage:
     Load this cog and call ``setup_persistence(bot, ...)`` in your setup_hook.
     Then run ``/ticket_setup`` in any channel to post the panel.
 
-    Requires: pip install cascadeui discord.py
+    Requires: pip install pycascadeui discord.py
 """
 
 # // ========================================( Modules )======================================== // #
