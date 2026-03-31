@@ -510,7 +510,11 @@ class StateStore:
         await self._fire_hooks(action)
 
         # Handle persistence — skip if DebouncedPersistence middleware is managing writes
-        if self.persistence_enabled and self.persistence_backend and not self._has_persistence_middleware:
+        if (
+            self.persistence_enabled
+            and self.persistence_backend
+            and not self._has_persistence_middleware
+        ):
             self.task_manager.create_task("state_store", self._persist_state())
 
         return self.state
