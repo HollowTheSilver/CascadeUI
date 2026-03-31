@@ -3,7 +3,7 @@
 All notable changes to CascadeUI are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased] — 2.0.0
+## [2.0.0] - 2026-03-31
 
 ### Added
 
@@ -90,6 +90,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 - **Settings examples** (V1 and V2) now use `dispatch("SETTINGS_UPDATED")` across
   all sub-pages for consistent live updates on the hub view.
+
+- **`@cascade_reducer` auto-deepcopy:** The decorator now deep-copies state before
+  passing it to the reducer function. Custom reducers no longer need `import copy`
+  or `copy.deepcopy(state)`. All example reducers updated to use `state` directly.
 
 - **Component module naming:** Version-specific files renamed to `v1_composition.py`,
   `v1_patterns.py`, `v2_patterns.py` for clarity. Shared files have no prefix.
