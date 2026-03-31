@@ -3,7 +3,107 @@
 All notable changes to CascadeUI are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [Unreleased] — 2.0.0
+
+### Added
+
+- **V2 component system support** — full support for Discord's V2 message components
+  (Container, Section, TextDisplay, MediaGallery, Separator, Thumbnail, File) alongside
+  the existing V1 (View/embeds) system. Both coexist per-message; V1 is not deprecated.
+
+- **`StatefulLayoutView`** base class extending `discord.ui.LayoutView` with all the
+  same state management features as `StatefulView`: subscriptions, navigation stack,
+  undo/redo, session limiting, auto-defer, owner_only. V2 views carry their display
+  content as children (no content/embed/embeds parameters).
+
+- **`PersistentLayoutView`** for V2 views that survive bot restarts. Shares the same
+  persistent view registry as `PersistentView`. Uses `walk_children()` for custom_id
+  validation in the V2 component tree.
+
+- **V2 pre-built patterns:**
+    - `PaginatedLayoutView` — pages as V2 component trees with the same nav controls,
+      go-to-page modal, `from_data()` factory, and `refresh_data()` as V1
+    - `FormLayoutView` — Container+TextDisplay display with the same validation pipeline
+    - `TabLayoutView` — button-based tab switching with async builders
+    - `WizardLayoutView` — multi-step with back/next navigation, step validators,
+      and `on_finish` callback
+
+- **V2 convenience helpers** (`cascadeui.components.v2_patterns`): `card()`,
+  `action_section()`, `toggle_section()`, `key_value()`, `alert()`, `divider()`,
+  `gap()`, `image_section()`, `gallery()`. Assembly shortcuts for common V2
+  patterns, all returning standard discord.py V2 components.
+
+- **V2 theming:** `accent_colour` and `separator_spacing` properties on `Theme`.
+  `apply_to_container()` method for applying theme accent color to V2 Containers.
+  All built-in themes include `accent_colour`.
+
+- **Navigation version enforcement:** `push()`/`pop()` between V1 and V2 views
+  raises `TypeError` because Discord's `IS_COMPONENTS_V2` flag is one-way per message.
+  `replace()` is allowed for cross-version transitions.
+
+- **`_freeze_components()`** on `_StatefulMixin` — single method that disables all
+  interactive items, handling both V1 flat children and V2 recursive tree traversal.
+
+- **Cross-view reactivity documentation** in the state management guide, explaining
+  `dispatch()` vs `dispatch_scoped()` for multi-view UIs.
+
+- **V2 examples:** `v2_counter.py`, `v2_dashboard.py`, `v2_settings.py`,
+  `v2_form.py`, `v2_pagination.py`, `v2_wizard.py`, `v2_persistence.py` —
+  covering all V2 patterns with session limiting and V2 helpers throughout.
+
+- **`rebuild=` callback on `push()`/`pop()`** — optional kwarg that auto-defers
+  the interaction, calls the callback with the new view, and edits the message.
+  V2: `rebuild=lambda v: v._build_ui()`. V1: `rebuild=lambda v: {"embed": v.build_embed()}`.
+
+- **Interaction serialization** (`serialize_interactions = True` by default) —
+  `asyncio.Lock` in `_scheduled_task` serializes rapid button clicks, preventing
+  racing `message.edit()` calls. Auto-defer runs outside the lock.
+
+- **`slugify()` utility** for converting display strings to safe `custom_id` fragments.
+
+- **DevTools V2 rebuild:** `InspectorView` is now a `TabLayoutView` with 5 tabs
+  (Overview, Views, Sessions, History, Config), self-filtering, and live auto-refresh
+  via `VIEW_CREATED`/`VIEW_DESTROYED` subscriptions. `StateInspector` is an alias.
+
+### Changed
+
+- **`_StatefulMixin` extraction:** ~840 lines of view-agnostic state management
+  extracted from `StatefulView` into `_StatefulMixin`. `StatefulView` is now
+  `_StatefulMixin + View`; `StatefulLayoutView` is `_StatefulMixin + LayoutView`.
+  No public API changes for V1 users.
+
+- **Session isolation:** Auto-derived `session_id` now includes the class name
+  (e.g. `MyView:user_123`) so independent view hierarchies get separate nav stacks
+  and undo history. Pushed/popped views inherit `session_id` from their parent.
+
+- **Button consistency:** All interactive buttons (library internals and examples)
+  use `StatefulButton(callback=...)`. `StatefulButton` skips `COMPONENT_INTERACTION`
+  dispatch when `view.is_finished()`, preventing extra state noise on exit/back.
+
+- **Message propagation:** `_navigate_to()` automatically transfers the message
+  reference to pushed/popped views so `update_from_state()` can edit the message
+  without manual wiring.
+
+- **V2 exit behavior:** `exit()` freezes V2 views and edits with the frozen view
+  (preserving visual content) instead of `edit(view=None)` which would produce an
+  empty message. V1 behavior unchanged.
+
+- **Settings examples** (V1 and V2) now use `dispatch("SETTINGS_UPDATED")` across
+  all sub-pages for consistent live updates on the hub view.
+
+- **Component module naming:** Version-specific files renamed to `v1_composition.py`,
+  `v1_patterns.py`, `v2_patterns.py` for clarity. Shared files have no prefix.
+
+- **`DebouncedPersistence` double-write fix:** Store's built-in per-dispatch
+  `_persist_state()` is automatically skipped when `DebouncedPersistence` middleware
+  is installed, preventing redundant disk writes.
+
+- **Session cleanup on view destroy:** Empty sessions (no views, no nav stack) are
+  automatically deleted when the last view exits.
+
+- **Documentation overhaul:** All guide and API reference pages rewritten V2-first
+  with tabbed V2/V1 examples. Fixed `@cascade_reducer` examples that incorrectly
+  showed manual `copy.deepcopy()`. Added Known Limitations page.
 
 ---
 

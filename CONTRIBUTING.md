@@ -51,7 +51,7 @@ isort --profile black --line-length 100 cascadeui/
 
 ## Pull Requests
 
-1. Fork the repo and create your branch from `main`
+1. Fork the repo and create your branch from `dev`
 2. Add tests for any new functionality
 3. Make sure all tests pass and formatting is clean
 4. Open a PR with a clear description of the change
