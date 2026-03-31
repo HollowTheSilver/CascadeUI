@@ -123,9 +123,9 @@ Decorator that registers a reducer function for a custom action type.
 ```python
 @cascade_reducer("MY_ACTION")
 async def my_reducer(action, state):
-    new_state = copy.deepcopy(state)
-    # ... modify new_state ...
-    return new_state
+    # State is already deep-copied by the decorator — mutate directly
+    state["my_key"] = action["payload"]["value"]
+    return state
 ```
 
 ---

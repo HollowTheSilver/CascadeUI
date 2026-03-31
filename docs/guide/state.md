@@ -26,23 +26,22 @@ await self.dispatch("MY_ACTION", {"key": "value"})
 
 ### Reducers
 
-Reducers transform state in response to actions. They receive the action and current state, and must return a **new** state dict (never mutate the original):
+Reducers transform state in response to actions. They receive the action and a deep copy of the current state, and return the modified state:
 
 ```python
 from cascadeui import cascade_reducer
-import copy
 
 @cascade_reducer("SCORE_UPDATED")
 async def score_reducer(action, state):
-    new_state = copy.deepcopy(state)
-    new_state.setdefault("scores", {})
+    # @cascade_reducer passes a deep copy — mutate and return directly
+    state.setdefault("scores", {})
     user_id = action["payload"]["user_id"]
-    new_state["scores"][user_id] = action["payload"]["score"]
-    return new_state
+    state["scores"][user_id] = action["payload"]["score"]
+    return state
 ```
 
-!!! warning "Always use `copy.deepcopy`"
-    Shallow copies can lead to shared references between old and new state, causing subtle bugs. `copy.deepcopy(state)` is the safe default.
+!!! tip "No `copy.deepcopy` needed"
+    The `@cascade_reducer` decorator automatically passes a deep copy of state to your function. Mutate it directly and return it — no `import copy` required. If you call `store.dispatch()` with a raw reducer function (without the decorator), you are responsible for copying state yourself.
 
 ### Built-in Actions
 

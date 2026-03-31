@@ -1,62 +1,278 @@
 # Views
 
-Views are the primary UI containers in CascadeUI. They wrap discord.py's `View` with state integration, lifecycle management, and task tracking.
+Views are the primary UI containers in CascadeUI. They integrate discord.py's view system with a centralized state store, lifecycle management, and task tracking.
 
-## StatefulView
+CascadeUI supports two component systems:
 
-The base class for all CascadeUI views:
+- **V2 (recommended)** — `StatefulLayoutView` wraps discord.py's `LayoutView`. Content and controls live together in containers with accent colors. The view IS the message content.
+- **V1 (classic)** — `StatefulView` wraps discord.py's `View`. Embeds sit on top, buttons float below. Content and controls are always visually separated.
+
+Both share the same state integration, navigation stack, session limiting, undo/redo, and all other framework features through a shared `_StatefulMixin`.
+
+---
+
+## V2 Views (LayoutView)
+
+### StatefulLayoutView
+
+The base class for V2 views. Unlike V1, there are no `content` or `embed` parameters on `send()` — the component tree IS the message:
 
 ```python
-from cascadeui import StatefulView, StatefulButton
+from cascadeui import StatefulLayoutView, StatefulButton, card, divider
+from discord.ui import ActionRow, TextDisplay
 
-class MyView(StatefulView):
-    def __init__(self, context):
-        super().__init__(context=context)
-        self.add_item(StatefulButton(
-            label="Click Me",
-            callback=self.on_click,
-        ))
+class MyView(StatefulLayoutView):
+    session_limit = 1
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._build_ui()
+
+    def _build_ui(self):
+        self.clear_items()
+        self.add_item(
+            card(
+                "## My Dashboard",
+                TextDisplay("Welcome to the V2 interface."),
+                divider(),
+                ActionRow(
+                    StatefulButton(
+                        label="Click Me",
+                        style=discord.ButtonStyle.primary,
+                        callback=self.on_click,
+                    ),
+                ),
+                color=discord.Color.blurple(),
+            )
+        )
+        self.add_exit_button()
 
     async def on_click(self, interaction):
-        await interaction.response.send_message("Clicked!", ephemeral=True)
+        await interaction.response.defer()
+        # Update state, rebuild UI, edit message
+        self._build_ui()
+        if self.message:
+            await self.message.edit(view=self)
+
+    async def update_from_state(self, state):
+        self._build_ui()
+        if self.message:
+            await self.message.edit(view=self)
 ```
 
-### Sending a View
-
-Use `view.send()` instead of manually sending messages. It handles state registration and message tracking:
+#### Sending a V2 view
 
 ```python
 view = MyView(context=ctx)
-await view.send(
-    content="Hello!",
-    embed=discord.Embed(title="My View"),
-)
+await view.send()  # No content/embed params — the component tree is the content
 ```
 
-!!! warning "Ephemeral views"
-    `view.send(ephemeral=True)` sends an ephemeral message. Ephemeral messages are tied to the 15-minute interaction token. Sending an ephemeral view with `timeout=None` is almost always a bug because the view will lose editability after the token expires. CascadeUI logs a warning if you do this.
+#### Key differences from V1
+
+| | V2 (`StatefulLayoutView`) | V1 (`StatefulView`) |
+|---|---|---|
+| Content | Component tree (Containers, TextDisplay) | Embeds + content string |
+| `send()` | No content/embed params | Accepts content, embed, embeds |
+| Interactive items | Must be wrapped in `ActionRow` | Can be added directly |
+| Exit behavior | Freezes components in place | Strips view, keeps embed |
+| Accent colors | Per-container via `card(color=...)` | One embed color |
+| Components per message | Up to 40 | Up to 25 (5 rows x 5) |
+
+!!! warning "ActionRow wrapping"
+    Buttons and selects cannot be top-level children of a `LayoutView`. Always wrap them in `ActionRow` before calling `add_item()`. The V2 helper functions (`card`, `action_section`, `toggle_section`) handle this automatically when buttons are part of a container.
+
+!!! warning "V2 exit behavior"
+    Calling `message.edit(view=None)` on a V2 message produces an empty message (Discord error 50006) because the view IS the content. CascadeUI handles this automatically — `exit()` freezes all components with `_freeze_components()` and edits with the frozen view, preserving visual content.
+
+### V2 View Patterns
+
+CascadeUI includes V2-specific patterns that mirror the V1 patterns with container-based presentation.
+
+#### TabLayoutView
+
+Button-based tab switching where each tab builds a V2 component tree:
+
+```python
+from cascadeui import TabLayoutView, card, key_value, divider
+from discord.ui import TextDisplay
+
+class DashboardView(TabLayoutView):
+    session_limit = 1
+
+    def __init__(self, *args, **kwargs):
+        tabs = {
+            "Overview": self.build_overview,
+            "Settings": self.build_settings,
+        }
+        super().__init__(*args, tabs=tabs, **kwargs)
+
+    async def build_overview(self):
+        return [
+            card(
+                "## Overview",
+                key_value({"Users": "42", "Uptime": "3h 12m"}),
+                color=discord.Color.green(),
+            ),
+        ]
+
+    async def build_settings(self):
+        return [
+            card(
+                "## Settings",
+                TextDisplay("Configure your preferences here."),
+                color=discord.Color.og_blurple(),
+            ),
+        ]
+```
+
+Tab builders are async functions that return a list of V2 components. The active tab's button is highlighted. An exit button is added automatically.
+
+#### WizardLayoutView
+
+Multi-step flow with Back/Next/Finish navigation and per-step validation:
+
+```python
+from cascadeui import WizardLayoutView, card, divider
+from discord.ui import TextDisplay
+
+class SetupWizard(WizardLayoutView):
+    session_limit = 1
+
+    def __init__(self, *args, **kwargs):
+        steps = [
+            {"name": "Welcome", "builder": self.build_welcome},
+            {"name": "Config", "builder": self.build_config,
+             "validator": self.validate_config},
+            {"name": "Confirm", "builder": self.build_confirm},
+        ]
+        super().__init__(*args, steps=steps, on_finish=self.finish, **kwargs)
+        self._mod_level = None
+
+    async def build_welcome(self):
+        return [card("## Welcome", TextDisplay("Let's set up your server."),
+                      color=discord.Color.blurple())]
+
+    async def build_config(self):
+        return [card("## Configuration", TextDisplay("Select your moderation level."),
+                      color=discord.Color.gold())]
+
+    async def validate_config(self):
+        return (self._mod_level is not None), "Please select a moderation level."
+
+    async def build_confirm(self):
+        return [card("## Confirm", TextDisplay(f"Level: {self._mod_level}"),
+                      color=discord.Color.green())]
+
+    async def finish(self, interaction):
+        await interaction.response.send_message("Setup complete!", ephemeral=True)
+        await self.exit()
+```
+
+Validators return `True` to advance, `False` to block, or a `(bool, str)` tuple where the string is an error message shown to the user.
+
+#### FormLayoutView
+
+Form with select menus, boolean toggles, and validation. Text input is handled via Modal:
+
+```python
+from cascadeui import FormLayoutView
+
+fields = [
+    {
+        "id": "role", "type": "select", "label": "Role",
+        "required": True,
+        "options": [
+            {"label": "Developer", "value": "dev"},
+            {"label": "Designer", "value": "design"},
+        ],
+    },
+    {"id": "notify", "type": "boolean", "label": "Notifications"},
+]
+
+async def on_submit(interaction, values):
+    await interaction.response.send_message(f"Saved: {values}", ephemeral=True)
+
+view = FormLayoutView(context=ctx, fields=fields, on_submit=on_submit)
+```
+
+Override `_rebuild_display()` to customize the form's visual presentation using V2 helpers like `card()`, `key_value()`, and `divider()`. See the `v2_form.py` example for a full implementation.
+
+#### PaginatedLayoutView
+
+Pages as V2 component trees instead of embeds:
+
+```python
+from cascadeui import PaginatedLayoutView, card
+from discord.ui import TextDisplay
+
+async def format_page(items):
+    lines = "\n".join(f"**{i['name']}** — {i['rarity']}" for i in items)
+    return [card("## Inventory", TextDisplay(lines), color=discord.Color.gold())]
+
+view = await PaginatedLayoutView.from_data(
+    items=all_items, per_page=5, formatter=format_page, context=ctx,
+)
+await view.send()
+```
+
+Navigation controls, jump buttons, go-to-page modal, and `refresh_data()` all work identically to the V1 `PaginatedView`.
+
+### PersistentLayoutView
+
+V2 views that survive bot restarts. See [Persistence](persistence.md) for setup.
+
+```python
+from cascadeui import PersistentLayoutView, StatefulButton, card
+from discord.ui import ActionRow
+
+class RolePanel(PersistentLayoutView):
+    session_limit = 1
+    session_scope = "guild"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.add_item(
+            card(
+                "## Role Selector",
+                ActionRow(
+                    StatefulButton(
+                        label="Get Role",
+                        custom_id="roles:get",  # Required for persistent views
+                        callback=self.toggle_role,
+                    ),
+                ),
+                color=discord.Color.blurple(),
+            )
+        )
+
+    async def toggle_role(self, interaction):
+        # Toggle role logic here
+        ...
+```
+
+!!! warning "custom_id required"
+    All interactive components in a `PersistentLayoutView` must have an explicit `custom_id`. Discord uses these to route interactions back to the view after a restart.
+
+---
+
+## Shared Features
+
+These features work identically on both V1 and V2 views.
 
 ### Lifecycle
 
-1. **Init** - view is created, components added, subscribed to store
-2. **Send** - message is sent, state registered (`VIEW_CREATED`)
-3. **Interact** - user clicks buttons/selects, callbacks fire
-4. **Exit/Timeout** - components disabled, state cleaned up (`VIEW_DESTROYED`)
+1. **Init** — view is created, components added, subscribed to store
+2. **Send** — message sent, state registered (`VIEW_CREATED`)
+3. **Interact** — user clicks buttons/selects, callbacks fire
+4. **Exit/Timeout** — components disabled, state cleaned up (`VIEW_DESTROYED`)
 
 ### Timeout Handling
 
-Views timeout after 180 seconds by default. On timeout, CascadeUI:
-
-- Disables all components
-- Edits the message to show the disabled state
-- Unsubscribes from the state store
-- Cancels any running background tasks
-
-Override the timeout:
+Views timeout after 180 seconds by default. On timeout, CascadeUI disables all components, edits the message, unsubscribes from the store, and cancels background tasks.
 
 ```python
-super().__init__(context=context, timeout=300)  # 5 minutes
-super().__init__(context=context, timeout=None)  # Never timeout
+super().__init__(*args, timeout=300, **kwargs)   # 5 minutes
+super().__init__(*args, timeout=None, **kwargs)  # Never timeout
 ```
 
 ### Reacting to State Changes
@@ -64,188 +280,164 @@ super().__init__(context=context, timeout=None)  # Never timeout
 Override `update_from_state()` to react when state changes:
 
 ```python
-class MyView(StatefulView):
+class MyView(StatefulLayoutView):
     subscribed_actions = {"MY_ACTION"}  # Only listen for specific actions
 
     async def update_from_state(self, state):
-        # Called when a matching action is dispatched
-        data = state.get("my_data")
-        if self.message and data:
-            await self.message.edit(embed=self.build_embed(data))
+        self._build_ui()
+        if self.message:
+            await self.message.edit(view=self)
 ```
 
 Set `subscribed_actions = None` to receive all actions (not recommended for performance).
 
-### View Transitions
-
-Navigate between views with `replace()`:
-
-```python
-async def go_to_settings(self, interaction):
-    await interaction.response.defer()
-    new_view = await self.replace(SettingsView)
-    await interaction.edit_original_response(view=new_view)
-```
-
-`replace` is a one-way transition: it stops the current view and starts the new one. There is no implicit "back" capability. For multi-level navigation, use the navigation stack instead.
-
 ### Auto-Defer Safety Net
 
-CascadeUI automatically defers interactions when callbacks are slow, preventing the "This interaction failed" error that Discord shows when a response takes longer than 3 seconds.
-
-This is enabled by default on all `StatefulView` subclasses. If a callback hasn't responded within 2.5 seconds, the framework automatically calls `interaction.response.defer()` in the background. If the callback responds before the timer fires, the timer is cancelled harmlessly.
+CascadeUI automatically defers interactions when callbacks are slow, preventing the "This interaction failed" error when a response takes longer than 3 seconds.
 
 ```python
-class MyView(StatefulView):
+class MyView(StatefulLayoutView):
     auto_defer = True        # Default — enabled for all views
     auto_defer_delay = 2.5   # Seconds before auto-defer fires
 ```
-
-#### How it works
 
 1. When a component callback starts, a background timer is spawned
 2. The timer waits `auto_defer_delay` seconds, then checks `interaction.response.is_done()`
 3. If the callback hasn't responded yet, the timer calls `interaction.response.defer()`
 4. If the callback responds before the timer, the timer is cancelled
 
-#### Compatibility
-
-Auto-defer is safe with all existing patterns:
-
-- **Manual `defer()` calls**: The callback sets `is_done()` to `True`, so the timer skips
-- **`with_loading_state`**: Consumes the response immediately, timer skips
-- **`with_confirmation`**: Sends a confirmation prompt immediately, timer skips
-- **`with_cooldown`**: Sends a cooldown message or passes through, timer skips
+Auto-defer is safe with all existing patterns — manual `defer()` calls, `with_loading_state`, `with_confirmation`, and `with_cooldown` all set `is_done()` before the timer fires.
 
 !!! warning "Modal callbacks"
     `interaction.response.send_modal()` must be the first response to an interaction. If auto-defer fires before you call `send_modal()`, the interaction is consumed and the modal cannot be sent. If your callback opens a modal, ensure it does so quickly (within `auto_defer_delay`). You can also disable auto-defer for modal-heavy views with `auto_defer = False`.
 
-#### Disabling auto-defer
+### Interaction Serialization
 
-Set `auto_defer = False` on a view class to opt out entirely:
+By default, CascadeUI serializes interaction processing per view using an `asyncio.Lock`. When a user clicks buttons rapidly, each click waits for the previous one to finish instead of racing. This prevents overlapping `message.edit()` calls that cause "This interaction failed" errors.
 
 ```python
-class ManualDeferView(StatefulView):
-    auto_defer = False  # Handle all deferrals manually
+class MyView(StatefulLayoutView):
+    serialize_interactions = True  # Default — prevents racing edits
 ```
 
-### Error Handling
+The auto-defer timer runs outside the lock, so queued interactions are deferred before Discord's 3-second timeout even while waiting for the lock.
 
-`StatefulView` includes a built-in `on_error` handler that shows a red ephemeral embed when an interaction callback raises an exception. This prevents silent failures and gives users visible feedback.
+Set `serialize_interactions = False` on views where parallel callback processing is acceptable.
 
 ### Interaction Ownership
 
-By default, only the user who created a view can interact with it. If another user clicks a button on someone else's view, they receive an ephemeral rejection message and the callback does not run.
+By default, only the user who created a view can interact with it:
 
 ```python
-class MyView(StatefulView):
+class MyView(StatefulLayoutView):
     owner_only = True                                    # Default
     owner_only_message = "You cannot interact with this."  # Default
 ```
 
-This prevents a common class of bugs where another user accidentally modifies someone else's state by clicking their buttons.
-
-To make a view accessible to everyone, set `owner_only = False`:
+To make a view accessible to everyone:
 
 ```python
-class PollView(StatefulView):
+class PollView(StatefulLayoutView):
     owner_only = False  # Anyone can vote
 ```
 
-`PersistentView` defaults to `owner_only = False` since persistent views are typically shared panels like role selectors or dashboards.
+`PersistentView` and `PersistentLayoutView` default to `owner_only = False` since persistent views are typically shared panels.
 
 #### Custom Access Control
 
-Override `interaction_check()` for more advanced logic, like role-based access:
+Override `interaction_check()` for role-based or other advanced access logic:
 
 ```python
-class AdminView(StatefulView):
+class AdminView(StatefulLayoutView):
     async def interaction_check(self, interaction):
-        # Keep the ownership check from StatefulView
         if not await super().interaction_check(interaction):
             return False
-
-        # Add role-based check
         if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message(
-                "Admins only.", ephemeral=True
-            )
+            await interaction.response.send_message("Admins only.", ephemeral=True)
             return False
         return True
 ```
 
-!!! note "Views without a user context"
-    When `user_id` is `None` (e.g. views created without a context/interaction), the ownership check is skipped and all users can interact. Restored `PersistentView` instances have their `user_id` restored from saved state, but default to `owner_only = False` so the ownership check does not apply regardless.
-
 ### Exit Button
-
-Add a standard exit button that cleans up the view:
 
 ```python
 self.add_exit_button()  # Adds an "Exit" button with ❌ emoji
 
-# Customize the button:
+# Customize:
 self.add_exit_button(label="Close", emoji=None, delete_message=True)
 
-# For PersistentView, you must pass a custom_id:
+# PersistentView/PersistentLayoutView require a custom_id:
 self.add_exit_button(custom_id="my_view:exit")
 ```
 
+### Error Handling
+
+All CascadeUI views include a built-in `on_error` handler that shows a red ephemeral embed when a callback raises an exception, preventing silent failures.
+
 ## Navigation Stack
 
-Push views onto a stack and pop them to go back. This is the standard pattern for multi-level UIs like settings menus with sub-pages:
+Push views onto a stack and pop them to go back. This is the standard pattern for multi-level UIs like settings menus:
 
-```python
-class MainMenuView(StatefulView):
-    async def go_settings(self, interaction):
-        await interaction.response.defer()
-        new_view = await self.push(SettingsView, interaction)
-        await interaction.edit_original_response(
-            embed=new_view.build_embed(), view=new_view,
-        )
+=== "V2"
 
-class SettingsView(StatefulView):
-    async def go_back(self, interaction):
-        await interaction.response.defer()
-        prev_view = await self.pop(interaction)
-        if prev_view:
-            await interaction.edit_original_response(view=prev_view)
-```
+    ```python
+    class HubView(StatefulLayoutView):
+        async def go_settings(self, interaction):
+            await self.push(SettingsView, interaction,
+                            rebuild=lambda v: v._build_ui())
+
+    class SettingsView(StatefulLayoutView):
+        async def go_back(self, interaction):
+            await self.pop(interaction,
+                           rebuild=lambda v: v._build_ui())
+    ```
+
+=== "V1"
+
+    ```python
+    class HubView(StatefulView):
+        async def go_settings(self, interaction):
+            await self.push(SettingsView, interaction,
+                            rebuild=lambda v: {"embed": v.build_embed()})
+
+    class SettingsView(StatefulView):
+        async def go_back(self, interaction):
+            await self.pop(interaction,
+                           rebuild=lambda v: {"embed": v.build_embed()})
+    ```
+
+### The `rebuild` callback
+
+The `rebuild=` parameter on `push()` and `pop()` eliminates boilerplate around deferring, rebuilding the UI, and editing the message:
+
+1. The interaction is auto-deferred (if not already)
+2. Your callback is called with the new view
+3. The message is edited with the rebuilt view
+
+For **V2 views**, `rebuild` typically calls `_build_ui()` and returns `None`. For **V1 views**, `rebuild` returns a dict of kwargs passed to `edit_original_response` (e.g., `{"embed": embed}`).
+
+Both sync and async callables are supported.
 
 ### How it works
 
-- `push(ViewClass, interaction)` stops the current view, stacks it, and returns a new instance of the target class.
-- `pop(interaction)` stops the current view, pops the top of the stack, reconstructs that view, and returns it.
-- The stack is stored in session state and cleaned up automatically when the session ends.
-- The new view inherits the same `session_id`, so all navigation within a session shares state.
+- `push(ViewClass, interaction, rebuild=...)` stops the current view, stacks it, and creates a new instance of the target class
+- `pop(interaction, rebuild=...)` stops the current view, pops the stack, and reconstructs the previous view
+- The stack is stored in session state and cleaned up when the session ends
+- The new view inherits the same `session_id`, so all navigation within a session shares state
 
 ### Constructor kwargs are preserved automatically
 
-When a view is pushed onto the stack, all constructor kwargs are saved so `pop()` can reconstruct it faithfully. Non-reconstructible kwargs (`context`, `interaction`, `message`, etc.) are excluded and re-supplied by the framework.
-
-This works transparently — subclasses don't need to do anything special:
-
-```python
-class MyPaginatedView(PaginatedView):
-    def __init__(self, *args, ticket_data=None, **kwargs):
-        self.ticket_data = ticket_data
-        super().__init__(*args, **kwargs)
-
-# push saves pages, ticket_data, theme, etc.
-# pop reconstructs with the same kwargs
-```
+When a view is pushed, all constructor kwargs are saved so `pop()` can reconstruct it faithfully. Non-reconstructible kwargs (`context`, `interaction`, `message`, etc.) are excluded and re-supplied by the framework. Subclasses don't need to do anything special.
 
 ### Auto Back Button
 
-Set `auto_back_button = True` on a view class to automatically add a back button when the view is pushed:
-
 ```python
-class SettingsView(StatefulView):
+class SettingsView(StatefulLayoutView):
     auto_back_button = True  # Back button added automatically when pushed
 ```
 
-!!! warning "Pop on empty stack"
-    If `pop()` is called when the stack is empty, it returns `None`. The auto back button handles this gracefully by removing the dead view from the message.
+!!! warning "Push/pop between V1 and V2"
+    `push()` and `pop()` between V1 and V2 views raises `TypeError`. Discord's `IS_COMPONENTS_V2` flag is a one-way switch per message — a V2 message cannot revert to V1 or vice versa. Use `replace()` for one-way transitions between versions. See [Known Limitations](known-limitations.md) for details.
 
 ### Push vs. Replace
 
@@ -253,6 +445,7 @@ class SettingsView(StatefulView):
 |---|----------|-------------|
 | Stack | Adds entry, supports back | No stack, one-way |
 | Session | Shared | Shared |
+| V1/V2 mixing | Blocked | Allowed |
 | Use case | Menu hierarchy | Replacing the current view entirely |
 
 ## State Scoping
@@ -260,7 +453,7 @@ class SettingsView(StatefulView):
 Isolate state per user or per guild so concurrent users don't overwrite each other:
 
 ```python
-class ScopedCounterView(StatefulView):
+class ScopedCounterView(StatefulLayoutView):
     scope = "user"  # Each user gets independent state
 
     async def click(self, interaction):
@@ -293,8 +486,43 @@ scoped = store.get_scoped("user", user_id=12345)
 store.set_scoped("user", {"key": "value"}, user_id=12345)
 ```
 
-!!! note "Scoping doesn't affect flat state"
-    Non-scoped state (`state["application"]`, `state["scores"]`, etc.) is completely unaffected. Scoping only applies to views that set `scope`.
+### Cross-View Reactivity
+
+`dispatch_scoped()` fires `SCOPED_UPDATE`, which other views don't subscribe to by default. For live cross-view updates, use `dispatch()` with a named action:
+
+```python
+# This does NOT notify other views:
+await self.dispatch_scoped({"settings": {"theme": "dark"}})
+
+# This notifies all views subscribing to "SETTINGS_UPDATED":
+await self.dispatch("SETTINGS_UPDATED", {
+    "scope_key": f"user:{self.user_id}",
+    "changes": {"theme": "dark"},
+})
+```
+
+The named action approach requires a [custom reducer](state.md#reducers) that writes to the scoped path:
+
+```python
+@cascade_reducer("SETTINGS_UPDATED")
+async def settings_reducer(action, state):
+    # @cascade_reducer passes a deep copy — mutate and return directly
+    state.setdefault("application", {}).setdefault("_scoped", {})
+    scope_key = action["payload"]["scope_key"]
+    changes = action["payload"]["changes"]
+    scoped = state["application"]["_scoped"].setdefault(scope_key, {})
+    scoped.setdefault("settings", {}).update(changes)
+    return state
+```
+
+**When to use which:**
+
+| Method | Other views react? | Creates undo snapshots? | Use when... |
+|--------|-------------------|------------------------|-------------|
+| `dispatch_scoped()` | No | No | Quick writes where only the current view needs to update |
+| `dispatch("NAMED_ACTION")` | Yes | Yes | Changes should be visible to other views, or undo is needed |
+
+See the `v2_settings.py` and `settings_menu.py` examples for the full pattern.
 
 ## Undo/Redo
 
@@ -307,14 +535,13 @@ from cascadeui import UndoMiddleware, get_store
 store = get_store()
 store.add_middleware(UndoMiddleware(store))
 
-class EditableView(StatefulView):
+class EditableView(StatefulLayoutView):
     enable_undo = True
     undo_limit = 20  # Max snapshots to keep (default: 20)
 
     async def undo_action(self, interaction):
         await interaction.response.defer()
         await self.undo(interaction)
-        # Re-read state and update UI after undo
 
     async def redo_action(self, interaction):
         await interaction.response.defer()
@@ -338,205 +565,144 @@ Only `state["application"]` is snapshotted, not the full state tree. Internal st
 Internal lifecycle actions (`VIEW_CREATED`, `VIEW_DESTROYED`, `NAVIGATION_PUSH`, `COMPONENT_INTERACTION`, etc.) are excluded from undo tracking. Only your custom application actions create snapshots.
 
 !!! warning "`dispatch_scoped()` does not create undo snapshots"
-    `dispatch_scoped()` dispatches a `SCOPED_UPDATE` action, which is excluded from undo tracking. If your view uses both `scope` and `enable_undo`, dispatch a custom action type via `self.dispatch()` instead, and write a reducer that updates the scoped state path directly. See the `settings_menu.py` example for this pattern.
+    `dispatch_scoped()` dispatches a `SCOPED_UPDATE` action, which is excluded from undo tracking. If your view uses both `scope` and `enable_undo`, dispatch a custom action type via `self.dispatch()` instead, and write a reducer that updates the scoped state path directly. See the `v2_settings.py` example for this pattern.
 
 !!! info "Batched actions"
     When actions are dispatched inside a `batch()`, the undo middleware takes one snapshot before the batch starts. Undoing reverts everything the batch did in one step.
 
 ## Session Limiting
 
-Session limiting controls how many active instances of a view can exist within a given scope. Without it, users can invoke commands repeatedly, spawning duplicate views that pile up in chat. Session limiting adds declarative, per-view control with automatic cleanup.
+Session limiting controls how many active instances of a view can exist within a given scope. Without it, users can invoke commands repeatedly, spawning duplicate views that pile up in chat.
 
 ### Basic Usage
 
-Set three class attributes on any `StatefulView` subclass:
+Set class attributes on any view subclass:
 
 ```python
-class SettingsView(StatefulView):
+class SettingsView(StatefulLayoutView):
     session_limit = 1              # Max active instances (None = unlimited)
     session_scope = "user_guild"   # Scope for counting instances
     session_policy = "replace"     # What to do when the limit is reached
 ```
 
-With this configuration, if a user opens a second `SettingsView` in the same guild, the first one is automatically exited (components disabled, message cleaned up) before the new one is sent.
+With this configuration, if a user opens a second `SettingsView` in the same guild, the first one is automatically exited before the new one is sent.
 
 ### Session Scope
 
-The scope determines how instances are grouped when counting toward the limit:
-
 | Scope | Groups by | Use case |
 |-------|-----------|----------|
-| `"user"` | User ID | Per-user views (settings, profiles) across all guilds |
-| `"guild"` | Guild ID | Per-server views (config panels) shared by all users |
+| `"user"` | User ID | Per-user views across all guilds |
+| `"guild"` | Guild ID | Per-server panels shared by all users |
 | `"user_guild"` (default) | User ID + Guild ID | Per-user within a specific guild |
 | `"global"` | Nothing | One instance across the entire bot |
 
-```python
-class GlobalAnnouncement(StatefulView):
-    session_limit = 1
-    session_scope = "global"    # Only one instance of this view, anywhere
-
-class UserProfile(StatefulView):
-    session_limit = 1
-    session_scope = "user"      # One per user, regardless of guild
-```
-
 ### Session Policy
-
-The policy determines what happens when a new view would exceed the limit:
 
 | Policy | Behavior |
 |--------|----------|
-| `"replace"` (default) | Exits the oldest view(s) to make room for the new one |
-| `"reject"` | Raises `SessionLimitError`, blocking the new view from being sent |
-
-#### Replace policy
-
-The default. Old views are exited silently, and the new view takes their place:
+| `"replace"` (default) | Exits the oldest view(s) to make room |
+| `"reject"` | Raises `SessionLimitError`, blocking the new view |
 
 ```python
-class SettingsView(StatefulView):
+from cascadeui import SessionLimitError
+
+class ExpensiveView(StatefulLayoutView):
     session_limit = 1
-    session_scope = "user_guild"
-    session_policy = "replace"    # Default -- exits old view automatically
-```
-
-#### Reject policy
-
-Blocks the new view and raises `SessionLimitError`. Useful when you want the user to explicitly close the existing view first:
-
-```python
-from cascadeui import StatefulView, SessionLimitError
-
-class ExpensiveView(StatefulView):
-    session_limit = 1
-    session_scope = "user_guild"
     session_policy = "reject"
 
 # In your command:
 try:
-    view = ExpensiveView(interaction=interaction)
-    await view.send(embed=my_embed)
+    view = ExpensiveView(context=ctx)
+    await view.send()
 except SessionLimitError:
-    await interaction.response.send_message(
-        "You already have this open. Close it first.",
-        ephemeral=True,
-    )
+    await ctx.send("You already have this open.", ephemeral=True)
 ```
-
-### Limits Greater Than 1
-
-Session limits are not restricted to 1. Setting `session_limit = 3` allows up to three concurrent instances before enforcement kicks in:
-
-```python
-class NotepadView(StatefulView):
-    session_limit = 3
-    session_scope = "user"
-    session_policy = "replace"   # Exits the oldest when a 4th is opened
-```
-
-When the limit is exceeded with the replace policy, only the oldest views are exited -- just enough to make room for the new one.
 
 ### PersistentView Protection
 
-`PersistentView` instances are protected from being replaced by non-persistent views. If a regular `StatefulView` tries to replace a `PersistentView` that occupies a session slot, `SessionLimitError` is raised instead of replacing it. This prevents an accidental command invocation from destroying a long-lived panel.
-
-Persistent views **can** replace other persistent views of the same type.
-
-### Scope Resolution in DMs
-
-Some scopes require identity fields that may not be available. For example, `session_scope = "user_guild"` needs both a user ID and a guild ID. In DMs there is no guild, so the scope key cannot be resolved. When this happens, the view is still tracked internally but session limits are not enforced -- the view sends normally without checking for existing instances.
-
-| Scope | DM behavior |
-|-------|-------------|
-| `"user"` | Enforced (user ID is always available) |
-| `"guild"` | Not enforced (no guild ID) |
-| `"user_guild"` | Not enforced (no guild ID) |
-| `"global"` | Enforced (no identity needed) |
+`PersistentView` and `PersistentLayoutView` instances are protected from being replaced by non-persistent views. If a regular view tries to replace a persistent one, `SessionLimitError` is raised instead. Persistent views can replace other persistent views of the same type.
 
 ### Interaction with Other Features
 
-- **Navigation stack**: Session limits track the entire navigation chain. When a root view pushes to a sub-view, the sub-view counts against the root's limit. A second command will find and replace the active sub-view, not just the root. When a view is exited by session limiting, its entire navigation stack is cleaned up.
-- **Ephemeral views**: Session limiting works with ephemeral views. The old ephemeral message's components are disabled, and the new view is sent as a fresh ephemeral message.
-- **Persistence**: Restored persistent views (from `setup_persistence`) are session-indexed using the user and guild identity saved at registration time. This means a restored view correctly counts against its session limit after a bot restart.
-- **Undo/redo**: When the replace policy exits an old view, its undo history is discarded along with the view. The new view starts fresh.
+- **Navigation stack**: Sub-views count against the root view's session limit. Replacing exits the entire navigation chain.
+- **Persistence**: Restored persistent views are session-indexed using saved identity, so limits work correctly after restart.
+- **Undo/redo**: When replace policy exits an old view, its undo history is discarded.
 
-## View Patterns
+---
 
-CascadeUI includes pre-built view patterns for common layouts.
+## V1 Views (Classic)
 
-### TabView
+### StatefulView
 
-Button-based tab switching where each tab renders its own content:
+The V1 base class wraps discord.py's `View` with embed-based content:
+
+```python
+from cascadeui import StatefulView, StatefulButton
+
+class MyView(StatefulView):
+    session_limit = 1
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.add_item(StatefulButton(
+            label="Click Me", callback=self.on_click,
+        ))
+        self.add_exit_button()
+
+    async def on_click(self, interaction):
+        await interaction.response.send_message("Clicked!", ephemeral=True)
+
+    async def update_from_state(self, state):
+        pass
+
+# Send with embed:
+view = MyView(context=ctx)
+await view.send(embed=discord.Embed(title="My View"))
+```
+
+### V1 View Patterns
+
+#### TabView
 
 ```python
 from cascadeui import TabView
 
 class SettingsView(TabView):
-    def __init__(self, context):
+    def __init__(self, *args, **kwargs):
         tabs = {
             "General": self.general_tab,
             "Audio": self.audio_tab,
-            "Display": self.display_tab,
         }
-        super().__init__(context=context, tabs=tabs)
+        super().__init__(*args, tabs=tabs, **kwargs)
 
     async def general_tab(self, embed):
         embed.description = "General settings here"
         return embed
-
-    async def audio_tab(self, embed):
-        embed.description = "Audio settings here"
-        return embed
-
-    async def display_tab(self, embed):
-        embed.description = "Display settings here"
-        return embed
 ```
 
-The active tab's button is highlighted with the primary style.
-
-### WizardView
-
-Multi-step form with Back/Next/Finish navigation and per-step validation:
+#### WizardView
 
 ```python
 from cascadeui import WizardView
 
 class SetupWizard(WizardView):
-    def __init__(self, context):
+    def __init__(self, *args, **kwargs):
         steps = [
             {"name": "Welcome", "builder": self.welcome_step},
-            {"name": "Config", "builder": self.config_step, "validator": self.validate_config},
-            {"name": "Done", "builder": self.done_step},
+            {"name": "Config", "builder": self.config_step,
+             "validator": self.validate_config},
         ]
-        super().__init__(context=context, steps=steps, on_finish=self.finish)
+        super().__init__(*args, steps=steps, on_finish=self.finish, **kwargs)
 
     async def welcome_step(self, embed):
-        embed.description = "Welcome to the setup wizard!"
-        return embed
-
-    async def config_step(self, embed):
-        embed.description = "Configure your settings"
+        embed.description = "Welcome!"
         return embed
 
     async def validate_config(self):
-        # Return True to allow advancement, False to block
-        return self.config_value is not None
-
-    async def done_step(self, embed):
-        embed.description = "Setup complete!"
-        return embed
-
-    async def finish(self, interaction):
-        await interaction.response.send_message("All done!")
+        return (self.config_value is not None), "Please configure a value."
 ```
 
-A step indicator shows progress (e.g., "Step 2/3").
-
-### FormView
-
-Form with select menus, boolean toggles, and per-field validation:
+#### FormView
 
 ```python
 from cascadeui import FormView, choices
@@ -554,23 +720,13 @@ fields = [
     {"id": "notify", "type": "boolean", "label": "Notifications"},
 ]
 
-async def on_submit(interaction, values):
-    await interaction.response.send_message(f"Saved: {values}", ephemeral=True)
-
 view = FormView(context=ctx, fields=fields, on_submit=on_submit)
 ```
 
-!!! warning "on_submit must acknowledge the interaction"
-    The `on_submit` callback receives the raw interaction. You **must** call `interaction.response.send_message()`, `.defer()`, or similar. The [auto-defer safety net](#auto-defer-safety-net) will prevent a hard failure if your callback is slow, but you should still respond explicitly rather than relying on it.
-
 !!! note "String fields require Modals"
-    Discord does not allow text input inside Views, only inside Modals. FormView supports `select` and `boolean` field types inline. For text input, use `Modal` and `TextInput` from `cascadeui`. See the [Components guide](components.md#modals) for usage.
+    Discord does not allow text input inside Views, only inside Modals. `FormView` and `FormLayoutView` support `select` and `boolean` field types inline. For text input, use `Modal` and `TextInput`. See [Components](components.md#modals).
 
-See [Validation](validation.md) for details on built-in validators.
-
-### PaginatedView
-
-Paginated content with automatic navigation buttons. Supports plain embeds, strings, and mixed-content dicts:
+#### PaginatedView
 
 ```python
 from cascadeui import PaginatedView
@@ -578,98 +734,14 @@ from cascadeui import PaginatedView
 pages = [
     discord.Embed(title="Page 1", description="First page"),
     discord.Embed(title="Page 2", description="Second page"),
-    discord.Embed(title="Page 3", description="Third page"),
 ]
 
 view = PaginatedView(context=ctx, pages=pages)
-await view.send()  # First page is displayed automatically
-```
-
-#### Page types
-
-Pages can be any of the following:
-
-| Type | Example | Description |
-|------|---------|-------------|
-| `discord.Embed` | `discord.Embed(title="Page 1")` | Embed-only page |
-| `str` | `"Plain text page"` | Text-only page |
-| `dict` | `{"embed": embed, "content": "text"}` | Mixed content page |
-
-#### Jump buttons and go-to-page
-
-When the page count exceeds `jump_threshold` (default 5), additional navigation appears automatically:
-
-- **First/last buttons** (`⏮`/`⏭`) for jumping to the start or end
-- **Go-to-page button** replaces the page indicator and opens a modal where users can type a page number directly
-
-```
-Below threshold:  [◀ Previous] [Page 1/3] [Next ▶]
-Above threshold:  [⏮] [◀] [1/20] [▶] [⏭]
-```
-
-Override the threshold on a subclass:
-
-```python
-class DetailedView(PaginatedView):
-    jump_threshold = 3  # Show jump buttons at 4+ pages
-```
-
-#### Dynamic pagination with `from_data`
-
-Auto-paginate a list of items without manually building embeds:
-
-```python
-async def format_page(items):
-    embed = discord.Embed(title="User List")
-    embed.description = "\n".join(f"- {item}" for item in items)
-    return embed
-
-view = await PaginatedView.from_data(
-    items=all_users,       # Full list of items
-    per_page=10,           # Items per page
-    formatter=format_page, # Sync or async callable
-    context=ctx,
-)
 await view.send()
 ```
 
-The formatter receives a list of items for one page and returns an `Embed`, `str`, or page dict. Both sync and async formatters are supported.
+Supports jump buttons (at 5+ pages), go-to-page modal, `from_data()` factory, `refresh_data()`, and `_build_extra_items()` hook. See the `ticket_system.py` example for a full implementation.
 
-#### Refreshing dynamic data
+### PersistentView
 
-Views created with `from_data` can re-paginate with fresh data without rebuilding the entire view:
-
-```python
-# In update_from_state or any callback:
-fresh_items = get_updated_items()
-await view.refresh_data(fresh_items)
-```
-
-This re-chunks the items, re-applies the formatter, clamps the page index, and edits the message.
-
-
-#### Adding extra components with `_build_extra_items`
-
-Subclasses can override `_build_extra_items()` to add components below the navigation buttons (rows 1-4). The hook is called after nav buttons during init, on every page turn, and after `refresh_data()`:
-
-```python
-class MyPaginatedView(PaginatedView):
-    def _build_extra_items(self):
-        self.clear_row(1)  # Remove old components first
-        self.add_item(StatefulSelect(
-            custom_id="my_view_select",  # Stable ID — survives page turns
-            placeholder="Pick one...",
-            options=self._build_options(),
-            row=1,
-            callback=self.on_select,
-        ))
-```
-
-Use `clear_row()` at the start to avoid duplicating components on repeated calls.
-
-!!! warning "Use a stable `custom_id`"
-    Components added in `_build_extra_items()` are removed and re-added on every page turn. Without a stable `custom_id`, Discord auto-generates a new UUID each time, which breaks any pending interaction on the old component. Always set an explicit `custom_id`.
-
-## PersistentView
-
-For views that need to stay interactive across bot restarts, see [Persistence](persistence.md).
+V1 views that survive bot restarts. See [Persistence](persistence.md).

@@ -33,6 +33,8 @@ Themes support the following style keys:
 | `warning_color` | `discord.Color` | varies | Warning state color |
 | `header_emoji` | `str` | `""` | Prepended to embed titles |
 | `footer_text` | `str` | `""` | Default embed footer text |
+| `accent_colour` | `discord.Color` | same as `primary_color` | V2 container accent color |
+| `separator_spacing` | `str` | `"small"` | Default V2 separator spacing |
 | `button_styles` | `dict` | see below | Maps button type names to `ButtonStyle` |
 
 The `button_styles` dict maps logical names to discord.py button styles:
@@ -158,3 +160,35 @@ class StatusView(StatefulView):
 ```
 
 Using `get_style()` instead of hardcoded colors means the same view renders correctly under any theme.
+
+## V2 Container Theming
+
+For V2 views, themes can set accent colors on containers:
+
+```python
+from discord.ui import Container
+
+class MyView(StatefulLayoutView):
+    def _build_ui(self):
+        theme = self.get_theme()
+        container = Container(...)
+        theme.apply_to_container(container)  # Sets accent_colour from theme
+        self.add_item(container)
+```
+
+`apply_to_container()` reads the theme's `accent_colour` style and applies it to the container. Returns the container for chaining.
+
+The `card()` helper accepts a `color` parameter directly, which is the simpler approach when you don't need theme-driven colors:
+
+```python
+from cascadeui import card
+
+# Direct color — most common
+self.add_item(card("## Title", color=discord.Color.green()))
+
+# Theme-driven color
+theme = self.get_theme()
+self.add_item(card("## Title", color=theme.get_style("accent_colour")))
+```
+
+All three built-in themes include `accent_colour`: `default` (blue), `dark` (purple), `light` (gold).

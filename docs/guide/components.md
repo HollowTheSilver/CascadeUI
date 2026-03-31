@@ -4,6 +4,8 @@ CascadeUI components extend discord.py's built-in UI components with automatic s
 
 ## Stateful Components
 
+These work in both V1 and V2 views.
+
 ### StatefulButton
 
 Extends `discord.ui.Button` with automatic `COMPONENT_INTERACTION` dispatching:
@@ -16,10 +18,20 @@ button = StatefulButton(
     style=discord.ButtonStyle.primary,
     callback=my_handler,
 )
-self.add_item(button)
 ```
 
 Every click dispatches a `COMPONENT_INTERACTION` action to the state store, tracking the interaction for debugging and state history.
+
+In V2 views, buttons must be wrapped in `ActionRow`:
+
+```python
+from discord.ui import ActionRow
+
+self.add_item(ActionRow(
+    StatefulButton(label="Save", callback=self.save),
+    StatefulButton(label="Cancel", callback=self.cancel),
+))
+```
 
 ### StatefulSelect
 
@@ -36,8 +48,174 @@ select = StatefulSelect(
     ],
     callback=my_handler,
 )
-self.add_item(select)
 ```
+
+Specialized select variants are also available: `Dropdown`, `RoleSelect`, `ChannelSelect`, `UserSelect`, `MentionableSelect`.
+
+---
+
+## V2 Helpers
+
+Convenience functions for building V2 component trees. These return standard discord.py V2 components — no custom classes needed.
+
+### card()
+
+Creates a `Container` with an optional title, children, and accent color:
+
+```python
+from cascadeui import card, divider
+from discord.ui import TextDisplay
+
+self.add_item(
+    card(
+        "## My Card Title",
+        TextDisplay("Card content goes here."),
+        divider(),
+        TextDisplay("-# Footer text"),
+        color=discord.Color.blurple(),
+    )
+)
+```
+
+The first string argument becomes a `TextDisplay` heading. All subsequent arguments are added as children. `color` sets the container's accent color (like embed color, but stackable — multiple cards can have different colors in one message).
+
+### key_value()
+
+Converts a dict to a formatted `TextDisplay`:
+
+```python
+from cascadeui import key_value
+
+self.add_item(key_value({
+    "Status": "Online",
+    "Users": "42",
+    "Uptime": "3h 12m",
+}))
+```
+
+Renders as:
+```
+**Status:** Online
+**Users:** 42
+**Uptime:** 3h 12m
+```
+
+### action_section()
+
+Creates a `Section` with text and a button accessory (text + action on the same line):
+
+```python
+from cascadeui import action_section
+
+self.add_item(
+    action_section(
+        "Click to refresh the dashboard",
+        label="Refresh",
+        callback=self.refresh,
+        emoji="\U0001f504",
+    )
+)
+```
+
+### toggle_section()
+
+Creates a `Section` with a green/red toggle button:
+
+```python
+from cascadeui import toggle_section
+
+self.add_item(
+    toggle_section(
+        "**Dark Mode**\nEnable dark theme",
+        active=self.dark_mode,
+        callback=self.toggle_dark,
+    )
+)
+```
+
+When `active=True`, the button shows a green checkmark. When `False`, a red X.
+
+### alert()
+
+A colored status container for success, warning, error, or info messages:
+
+```python
+from cascadeui import alert
+
+self.add_item(alert("Settings saved successfully!", level="success"))
+self.add_item(alert("No data found.", level="info"))
+```
+
+| Level | Color |
+|-------|-------|
+| `"success"` | Green |
+| `"warning"` | Gold |
+| `"error"` | Red |
+| `"info"` | Blue |
+
+### divider() and gap()
+
+Visual separators inside containers:
+
+```python
+from cascadeui import divider, gap
+
+# Thin line separator
+self.add_item(divider())
+
+# Larger spacing between content blocks
+self.add_item(gap())
+
+# Large spacing variant
+self.add_item(gap(large=True))
+```
+
+`divider()` is an alias for `Separator(spacing=SeparatorSpacing.small)`. `gap()` creates spacing without a visible line.
+
+### image_section()
+
+A `Section` with a `Thumbnail` image:
+
+```python
+from cascadeui import image_section
+
+self.add_item(
+    image_section("User avatar", url="https://example.com/avatar.png")
+)
+```
+
+### gallery()
+
+A `MediaGallery` from a list of image URLs:
+
+```python
+from cascadeui import gallery
+
+self.add_item(gallery(["https://example.com/img1.png", "https://example.com/img2.png"]))
+```
+
+---
+
+## Utilities
+
+### slugify()
+
+Converts display strings to safe `custom_id` fragments:
+
+```python
+from cascadeui import slugify
+
+slugify("Color Roles")    # "color-roles"
+slugify("He/Him")         # "hehim"
+```
+
+Useful for building stable `custom_id` values in persistent views where the ID must survive restarts:
+
+```python
+custom_id=f"roles:{slugify(category)}:{slugify(role_name)}"
+```
+
+---
 
 ## Modals
 
@@ -71,11 +249,9 @@ async def handle_feedback(interaction, values):
 
 `TextInput` generates a `custom_id` from the label automatically (e.g. `"Subject"` becomes `"input_subject"`). You can also pass raw `discord.ui.TextInput` items if you need full control over the `custom_id`.
 
-If no `callback` is provided, the modal defers the interaction automatically.
-
 ### Validation
 
-Pass a `validators` dict mapping `custom_id` to a list of validator functions. If any field fails validation, the user sees an ephemeral error message and the callback is not called:
+Pass a `validators` dict mapping `custom_id` to a list of validator functions:
 
 ```python
 from cascadeui import Modal, TextInput, min_length, max_length, regex
@@ -100,100 +276,31 @@ modal = Modal(
 )
 ```
 
-All validators from the [validation system](validation.md) work here: `min_length`, `max_length`, `regex`, `choices`, `min_value`, `max_value`, and custom async validators.
+All validators from the [validation system](validation.md) work here.
 
 ### State Integration
 
-If you pass `view_id` to the modal, a `MODAL_SUBMITTED` action is dispatched to the state store before the callback runs:
+Pass `view_id` to dispatch a `MODAL_SUBMITTED` action to the state store:
 
 ```python
 modal = Modal(
     title="Edit Name",
     inputs=[TextInput(label="Name")],
     callback=handle_edit,
-    view_id=self.id,  # Links this modal to the current view's state
+    view_id=self.id,
 )
 ```
 
-This lets reducers and middleware observe modal submissions alongside other actions.
-
-## Composite Components
-
-Composite components group related items and add them to a view as a unit.
-
-### ConfirmationButtons
-
-A confirm/cancel button pair:
-
-```python
-from cascadeui import ConfirmationButtons
-
-confirmation = ConfirmationButtons(
-    on_confirm=handle_confirm,
-    on_cancel=handle_cancel,
-)
-confirmation.add_to_view(my_view)
-```
-
-### PaginationControls
-
-Previous/Next buttons for paginated content:
-
-```python
-from cascadeui import PaginationControls
-
-pagination = PaginationControls(
-    page_count=5,
-    on_page_change=handle_page,
-)
-pagination.add_to_view(my_view)
-```
-
-### FormLayout
-
-Builds form controls from a field definition list:
-
-```python
-from cascadeui import FormLayout
-
-layout = FormLayout(fields=[
-    {"id": "color", "type": "select", "label": "Color",
-     "options": ["Red", "Blue", "Green"]},
-    {"id": "enabled", "type": "boolean", "label": "Enabled"},
-])
-layout.add_to_view(my_view)
-```
-
-!!! note
-    String fields are not supported inline (Discord requires Modals for text input). FormLayout will emit a warning if you include a `"string"` type field.
-
-### ToggleGroup
-
-Radio-button-like selection where only one option is active at a time:
-
-```python
-from cascadeui import ToggleGroup
-
-group = ToggleGroup(
-    options=["Easy", "Medium", "Hard"],
-    on_select=difficulty_handler,
-    default="Medium",
-)
-group.add_to_view(my_view)
-```
-
-The active option's button is highlighted. Clicking a different option deselects the previous one.
+---
 
 ## Component Wrappers
 
 Wrappers modify component behavior without changing the component itself. Apply them to buttons to add cross-cutting behavior.
 
 !!! danger "Wrappers consume the interaction response"
-    All three wrappers (`with_loading_state`, `with_confirmation`, `with_cooldown`) use `interaction.response` internally to show their UI (loading indicator, confirmation prompt, or cooldown message). Your wrapped callback **must** use `interaction.followup.send()` instead of `interaction.response.send_message()`. Calling `interaction.response` in a wrapped callback will raise `InteractionResponded`.
+    All three wrappers (`with_loading_state`, `with_confirmation`, `with_cooldown`) use `interaction.response` internally to show their UI. Your wrapped callback **must** use `interaction.followup.send()` instead of `interaction.response.send_message()`.
 
 ### Loading State
-
-Shows a visual loading indicator while the callback runs:
 
 ```python
 from cascadeui import with_loading_state
@@ -202,18 +309,9 @@ button = StatefulButton(label="Process", callback=my_handler)
 with_loading_state(button)
 ```
 
-The button is disabled and its label changes to "Loading..." while the callback runs. After the callback finishes, the original label and state are restored.
-
-```python
-async def my_handler(interaction):
-    # interaction.response is already consumed -- use followup
-    await asyncio.sleep(2)
-    await interaction.followup.send("Done!", ephemeral=True)
-```
+The button is disabled and its label changes to "Loading..." while the callback runs.
 
 ### Confirmation Prompt
-
-Adds a yes/no confirmation before executing the callback:
 
 ```python
 from cascadeui import with_confirmation
@@ -227,11 +325,7 @@ with_confirmation(
 )
 ```
 
-The confirmation dialog is sent as an ephemeral message. If the user confirms, the callback runs with the confirmation interaction. If they cancel, the dialog is edited to show the cancelled message.
-
 ### Per-User Cooldown
-
-Enforces a per-user cooldown between clicks:
 
 ```python
 from cascadeui import with_cooldown
@@ -240,21 +334,58 @@ button = StatefulButton(label="Claim", callback=handle_claim)
 with_cooldown(button, seconds=10)
 ```
 
-Each user has their own cooldown timer. Other users are not affected. The `scope` parameter controls cooldown isolation:
-
 | Scope | Behavior |
 |-------|----------|
 | `"user"` (default) | Each user has an independent cooldown |
 | `"guild"` | Shared cooldown per server |
 | `"global"` | One cooldown for everyone |
 
+---
+
+## V1 Composite Components
+
+!!! note "V1 only"
+    These components extend `CompositeComponent` and use row-based layout. They work with `StatefulView` but are not compatible with `StatefulLayoutView` (V2). For V2, use the helper functions above or build component trees directly.
+
+### ConfirmationButtons
+
 ```python
-with_cooldown(button, seconds=30, scope="guild")
+from cascadeui import ConfirmationButtons
+
+confirmation = ConfirmationButtons(on_confirm=handle_confirm, on_cancel=handle_cancel)
+confirmation.add_to_view(my_view)
 ```
 
-If a user clicks while on cooldown, they see an ephemeral message with the remaining time. The original callback is not called.
+### PaginationControls
 
-## Utilities
+```python
+from cascadeui import PaginationControls
+
+pagination = PaginationControls(page_count=5, on_page_change=handle_page)
+pagination.add_to_view(my_view)
+```
+
+### FormLayout
+
+```python
+from cascadeui import FormLayout
+
+layout = FormLayout(fields=[
+    {"id": "color", "type": "select", "label": "Color",
+     "options": ["Red", "Blue", "Green"]},
+    {"id": "enabled", "type": "boolean", "label": "Enabled"},
+])
+layout.add_to_view(my_view)
+```
+
+### ToggleGroup
+
+```python
+from cascadeui import ToggleGroup
+
+group = ToggleGroup(options=["Easy", "Medium", "Hard"], on_select=handler, default="Medium")
+group.add_to_view(my_view)
+```
 
 ### ProgressBar
 
@@ -267,5 +398,3 @@ bar = ProgressBar(total=100, width=20)
 embed.add_field(name="Progress", value=bar.render(65))
 # Output: ████████████░░░░░░░░ 65%
 ```
-
-Configurable fill and empty characters, width, and total.

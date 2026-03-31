@@ -106,18 +106,33 @@ await migrate_storage(
 
 ## Pattern 1: Data Persistence (re-invoke to restore)
 
-Use a regular `StatefulView` with a `state_key` to persist data across view lifetimes:
+Use any view with a `state_key` to persist data across view lifetimes. Works with both V1 and V2 views:
 
-```python
-class CounterView(StatefulView):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+=== "V2"
 
-        # Restore saved counter value from state
-        store = get_store()
-        counters = store.state.get("application", {}).get("counters", {})
-        self.counter = counters.get(self.state_key, 0)
-```
+    ```python
+    class CounterView(StatefulLayoutView):
+        session_limit = 1
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            store = get_store()
+            counters = store.state.get("application", {}).get("counters", {})
+            self.counter = counters.get(self.state_key, 0)
+    ```
+
+=== "V1"
+
+    ```python
+    class CounterView(StatefulView):
+        session_limit = 1
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            store = get_store()
+            counters = store.state.get("application", {}).get("counters", {})
+            self.counter = counters.get(self.state_key, 0)
+    ```
 
 The view will timeout normally, but its data stays on disk. When the user runs the command again, the new view instance reads the saved data and picks up where they left off.
 
@@ -129,36 +144,72 @@ The view will timeout normally, but its data stays on disk. When the user runs t
 
 ## Pattern 2: View Persistence (survive bot restarts)
 
-Use `PersistentView` for views that should stay interactive across bot restarts without user re-invocation:
+Use `PersistentView` (V1) or `PersistentLayoutView` (V2) for views that stay interactive across bot restarts:
 
-```python
-from cascadeui import PersistentView, StatefulButton
+=== "V2"
 
-class RoleSelectorView(PersistentView):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.add_item(StatefulButton(
-            label="Get Role",
-            custom_id="roles:get",  # Required for persistent views
-            callback=self.give_role,
-        ))
+    ```python
+    from cascadeui import PersistentLayoutView, StatefulButton, card, slugify
+    from discord.ui import ActionRow
 
-    async def give_role(self, interaction):
-        # Handle role assignment
-        ...
+    class RoleSelectorPanel(PersistentLayoutView):
+        session_limit = 1
+        session_scope = "guild"
 
-    async def on_restore(self, bot):
-        # Optional: runs after the view is restored on restart
-        ...
-```
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.add_item(
+                card(
+                    "## Role Selector",
+                    ActionRow(
+                        StatefulButton(
+                            label="Get Role",
+                            custom_id="roles:get",
+                            callback=self.give_role,
+                        ),
+                    ),
+                    color=discord.Color.blurple(),
+                )
+            )
+
+        async def give_role(self, interaction):
+            ...
+
+        async def on_restore(self, bot):
+            ...
+    ```
+
+=== "V1"
+
+    ```python
+    from cascadeui import PersistentView, StatefulButton
+
+    class RoleSelectorView(PersistentView):
+        session_limit = 1
+        session_scope = "guild"
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.add_item(StatefulButton(
+                label="Get Role",
+                custom_id="roles:get",
+                callback=self.give_role,
+            ))
+
+        async def give_role(self, interaction):
+            ...
+
+        async def on_restore(self, bot):
+            ...
+    ```
 
 Send it once (typically from an admin command):
 
 ```python
 @bot.hybrid_command()
 async def setup_roles(ctx):
-    view = RoleSelectorView(context=ctx, state_key="role_selector:main")
-    await view.send(embed=discord.Embed(title="Role Selector"))
+    view = RoleSelectorPanel(context=ctx, state_key=f"roles:panel:{ctx.guild.id}")
+    await view.send()
 ```
 
 After a bot restart, `setup_persistence(bot)` automatically:
@@ -213,4 +264,53 @@ This gets persisted to disk along with all other state. On restart, `setup_persi
 !!! warning "One message per state_key"
     The persistent view registry tracks one message per `state_key`. If you send a second view with the same `state_key`, the framework automatically exits the previous view instance (unsubscribing, unregistering, and disabling its components) and overwrites the registry entry. If the previous instance is no longer alive (e.g., from a prior bot session that wasn't restored), the old message's components are removed directly. Design your `state_key` values to be unique per intended instance (e.g., `"roles:main"` for a single panel, or `f"profile:{user_id}"` for per-user views).
 
-The `__init_subclass__` hook on `PersistentView` automatically registers every subclass in a class name -> class mapping. This is why cog loading order matters: the subclass must be imported (triggering `__init_subclass__`) before `setup_persistence` tries to look it up.
+The `__init_subclass__` hook on `PersistentView` and `PersistentLayoutView` automatically registers every subclass in a shared class name -> class mapping. This is why cog loading order matters: the subclass must be imported (triggering `__init_subclass__`) before `setup_persistence` tries to look it up.
+
+## State Data Structure
+
+The persisted state tree looks like this:
+
+```json
+{
+  "views": {
+    "a1b2c3d4-...": {
+      "type": "CounterView",
+      "session_id": "CounterView:user_123",
+      "channel_id": 123456,
+      "message_id": 789012,
+      "user_id": 123,
+      "guild_id": 456
+    }
+  },
+  "sessions": {
+    "CounterView:user_123": {
+      "views": ["a1b2c3d4-..."],
+      "nav_stack": [],
+      "undo_stack": [],
+      "redo_stack": [],
+      "data": {}
+    }
+  },
+  "application": {
+    "counters": {"counter:123": 42},
+    "_scoped": {
+      "user:123": {"settings": {"theme": "dark"}}
+    }
+  },
+  "persistent_views": {
+    "roles:panel:456": {
+      "class_name": "RoleSelectorPanel",
+      "state_key": "roles:panel:456",
+      "message_id": 789012,
+      "channel_id": 123456,
+      "guild_id": 456,
+      "user_id": 123
+    }
+  }
+}
+```
+
+- **`views`** — active view instances (cleaned up on exit/timeout)
+- **`sessions`** — user sessions with nav stacks and undo history
+- **`application`** — your custom state (counters, settings, etc.)
+- **`persistent_views`** — registry for views that survive restarts

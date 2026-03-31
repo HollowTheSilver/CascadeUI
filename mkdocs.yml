@@ -8,6 +8,8 @@ theme:
   name: material
   logo: assets/logo.png
   favicon: assets/logo.png
+  icon:
+    repo: fontawesome/brands/github
   palette:
     - scheme: slate
       primary: deep purple
@@ -22,11 +24,15 @@ theme:
         icon: material/brightness-7
         name: Switch to dark mode
   features:
+    - navigation.tabs
     - navigation.sections
     - navigation.expand
     - navigation.top
+    - navigation.indexes
     - content.code.copy
+    - content.tabs.link
     - search.highlight
+    - search.suggest
 
 markdown_extensions:
   - admonition
@@ -55,6 +61,7 @@ nav:
       - Theming: guide/theming.md
       - Middleware: guide/middleware.md
       - DevTools: guide/devtools.md
+      - Known Limitations: guide/known-limitations.md
   - API Reference:
       - State Store: api/store.md
       - Views: api/views.md
