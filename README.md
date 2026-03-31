@@ -59,6 +59,20 @@
 
 ---
 
+## Architecture
+
+```
+User clicks button  ->  Interaction callback  ->  dispatch(action)
+     -> Middleware pipeline  ->  Reducer (immutable state update)
+     -> Subscribers notified (filtered)  ->  Views re-render
+```
+
+All state lives in a single `StateStore` singleton. **Actions** are plain dicts describing what happened. **Reducers** receive the action and return new state immutably. **Subscribers** (views) are notified when state changes, filtered by action type and state selectors so views only re-render when their relevant slice actually changes.
+
+This is the same unidirectional data flow pattern used by Redux and similar state management libraries, adapted for Discord's interaction-driven UI model.
+
+---
+
 ## Quick Start
 
 > [!TIP]
@@ -401,20 +415,6 @@ set_default_theme("custom")
 ![Ticket System](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v1-ticket-system.gif)
 
 [View full example](examples/ticket_system.py)
-
----
-
-## Architecture
-
-```
-User clicks button  ->  Interaction callback  ->  dispatch(action)
-     -> Middleware pipeline  ->  Reducer (immutable state update)
-     -> Subscribers notified (filtered)  ->  Views re-render
-```
-
-All state lives in a single `StateStore` singleton. **Actions** are plain dicts describing what happened. **Reducers** receive the action and return new state immutably. **Subscribers** (views) are notified when state changes, filtered by action type and state selectors so views only re-render when their relevant slice actually changes.
-
-This is the same unidirectional data flow pattern used by Redux and similar state management libraries, adapted for Discord's interaction-driven UI model.
 
 ---
 

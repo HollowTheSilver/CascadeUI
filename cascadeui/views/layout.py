@@ -130,6 +130,7 @@ class StatefulLayoutView(_StatefulMixin, LayoutView):
 
         For PersistentLayoutView subclasses, pass a ``custom_id``.
         """
+
         async def exit_callback(interaction):
             await interaction.response.defer()
             await self.exit(delete_message=delete_message)

@@ -726,9 +726,7 @@ class _StatefulMixin:
                 result = await result
             edit_kwargs = result if isinstance(result, dict) else {}
             if current_interaction:
-                msg = await current_interaction.edit_original_response(
-                    view=new_view, **edit_kwargs
-                )
+                msg = await current_interaction.edit_original_response(view=new_view, **edit_kwargs)
                 new_view._message = msg
 
         return new_view
@@ -790,9 +788,7 @@ class _StatefulMixin:
                 result = await result
             edit_kwargs = result if isinstance(result, dict) else {}
             if current_interaction:
-                msg = await current_interaction.edit_original_response(
-                    view=new_view, **edit_kwargs
-                )
+                msg = await current_interaction.edit_original_response(view=new_view, **edit_kwargs)
                 new_view._message = msg
 
         return new_view
@@ -940,6 +936,7 @@ class _StatefulMixin:
 
         For PersistentView subclasses, pass a custom_id (e.g. ``custom_id="exit"``).
         """
+
         async def exit_callback(interaction):
             await interaction.response.defer()
             await self.exit(delete_message=delete_message)
