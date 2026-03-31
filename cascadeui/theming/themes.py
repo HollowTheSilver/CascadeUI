@@ -18,6 +18,7 @@ default_theme = Theme(
         "danger_color": Color.red(),
         "info_color": Color.blurple(),
         "warning_color": Color.gold(),
+        "accent_colour": Color.blue(),
         "header_emoji": "",
         "footer_text": "Powered by CascadeUI",
     },
@@ -33,7 +34,8 @@ dark_theme = Theme(
         "danger_color": Color.orange(),  # Orange instead of dark red
         "info_color": Color.dark_teal(),
         "warning_color": Color.gold(),
-        "header_emoji": "🌙",
+        "accent_colour": Color.purple(),
+        "header_emoji": "\U0001f319",
         "footer_text": "Powered by CascadeUI (Dark Theme)",
     },
 )
@@ -48,7 +50,8 @@ light_theme = Theme(
         "danger_color": Color.orange(),  # Orange instead of red
         "info_color": Color.teal(),
         "warning_color": Color.gold(),
-        "header_emoji": "☀️",
+        "accent_colour": Color.gold(),
+        "header_emoji": "\u2600\ufe0f",
         "footer_text": "Powered by CascadeUI (Light Theme)",
     },
 )

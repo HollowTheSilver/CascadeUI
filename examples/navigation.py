@@ -13,28 +13,13 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-# // ========================================( Helpers )======================================== // #
-
-
-async def _navigate_back(view, interaction):
-    """Pop the navigation stack and update the message with the previous view."""
-    await interaction.response.defer()
-    prev_view = await view.pop(interaction)
-    if prev_view:
-        embed = prev_view.build_embed() if hasattr(prev_view, "build_embed") else None
-        kwargs = {"view": prev_view}
-        if embed:
-            kwargs["embed"] = embed
-        msg = await interaction.edit_original_response(**kwargs)
-        prev_view._message = msg
-
-
 # // ========================================( Views )======================================== // #
 
 
 class MainMenuView(StatefulView):
     """Root navigation view — the entry point of the nav stack."""
 
+    session_limit = 1
     auto_back_button = False
 
     def __init__(self, *args, **kwargs):
@@ -58,20 +43,10 @@ class MainMenuView(StatefulView):
         )
 
     async def go_settings(self, interaction):
-        await interaction.response.defer()
-        new_view = await self.push(SettingsView, interaction)
-        msg = await interaction.edit_original_response(
-            embed=new_view.build_embed(), view=new_view,
-        )
-        new_view._message = msg
+        await self.push(SettingsView, interaction, rebuild=lambda v: {"embed": v.build_embed()})
 
     async def go_about(self, interaction):
-        await interaction.response.defer()
-        new_view = await self.push(AboutView, interaction)
-        msg = await interaction.edit_original_response(
-            embed=new_view.build_embed(), view=new_view,
-        )
-        new_view._message = msg
+        await self.push(AboutView, interaction, rebuild=lambda v: {"embed": v.build_embed()})
 
     async def update_from_state(self, state):
         pass
@@ -112,15 +87,10 @@ class SettingsView(StatefulView):
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
     async def go_nested(self, interaction):
-        await interaction.response.defer()
-        new_view = await self.push(NestedView, interaction)
-        msg = await interaction.edit_original_response(
-            embed=new_view.build_embed(), view=new_view,
-        )
-        new_view._message = msg
+        await self.push(NestedView, interaction, rebuild=lambda v: {"embed": v.build_embed()})
 
     async def go_back(self, interaction):
-        await _navigate_back(self, interaction)
+        await self.pop(interaction, rebuild=lambda v: {"embed": v.build_embed()})
 
     async def update_from_state(self, state):
         pass
@@ -147,7 +117,7 @@ class NestedView(StatefulView):
         )
 
     async def go_back(self, interaction):
-        await _navigate_back(self, interaction)
+        await self.pop(interaction, rebuild=lambda v: {"embed": v.build_embed()})
 
     async def update_from_state(self, state):
         pass
@@ -178,7 +148,7 @@ class AboutView(StatefulView):
         )
 
     async def go_back(self, interaction):
-        await _navigate_back(self, interaction)
+        await self.pop(interaction, rebuild=lambda v: {"embed": v.build_embed()})
 
     async def update_from_state(self, state):
         pass

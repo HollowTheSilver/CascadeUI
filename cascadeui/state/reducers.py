@@ -85,9 +85,17 @@ async def reduce_view_destroyed(action: Action, state: StateData) -> StateData:
 
     # Remove from session if applicable
     if session_id and "sessions" in new_state and session_id in new_state["sessions"]:
-        if "views" in new_state["sessions"][session_id]:
-            if view_id in new_state["sessions"][session_id]["views"]:
-                new_state["sessions"][session_id]["views"].remove(view_id)
+        session = new_state["sessions"][session_id]
+        if "views" in session:
+            if view_id in session["views"]:
+                session["views"].remove(view_id)
+
+            # Clean up empty sessions to prevent state leakage.
+            # Keep the session alive if a nav stack exists — push/pop
+            # temporarily empties the view list between destroying the
+            # old view and registering the new one.
+            if not session["views"] and not session.get("nav_stack"):
+                del new_state["sessions"][session_id]
 
     return new_state
 

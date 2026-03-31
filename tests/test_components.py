@@ -1,12 +1,16 @@
 """Tests for component creation and callback wrapping."""
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
+import pytest
 
-from cascadeui.components.base import StatefulButton, StatefulSelect, StatefulComponent
-from cascadeui.components.composition import CompositeComponent, register_component, get_component
+from cascadeui.components.base import StatefulButton, StatefulComponent, StatefulSelect
+from cascadeui.components.v1_composition import (
+    CompositeComponent,
+    get_component,
+    register_component,
+)
 
 
 class TestStatefulComponent:

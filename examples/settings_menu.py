@@ -25,7 +25,6 @@ Usage:
 # // ========================================( Modules )======================================== // #
 
 
-import copy
 import discord
 from discord.ext import commands
 from discord.ext.commands import Context
@@ -54,7 +53,7 @@ logger = logging.getLogger(__name__)
 @cascade_reducer("SETTINGS_UPDATED")
 async def settings_reducer(action, state):
     """Merge settings changes into the user's scoped state."""
-    new_state = copy.deepcopy(state)
+    new_state = state
     new_state.setdefault("application", {}).setdefault("_scoped", {})
 
     scope_key = action["payload"].get("scope_key")
@@ -78,28 +77,6 @@ DEFAULT_SETTINGS = {
     "language": "English",
     "timezone": "UTC",
 }
-
-
-# // ========================================( Helpers )======================================== // #
-
-
-async def navigate_back(view, interaction):
-    """Pop the navigation stack and update the message."""
-    await interaction.response.defer()
-    prev_view = await view.pop(interaction)
-    if prev_view:
-        embed = prev_view.build_embed()
-        msg = await interaction.edit_original_response(embed=embed, view=prev_view)
-        prev_view._message = msg
-
-
-async def navigate_to(view, target_cls, interaction):
-    """Push a new view and update the message."""
-    await interaction.response.defer()
-    new_view = await view.push(target_cls, interaction)
-    embed = new_view.build_embed()
-    msg = await interaction.edit_original_response(embed=embed, view=new_view)
-    new_view._message = msg
 
 
 # // ========================================( Settings Hub )======================================== // #
@@ -207,19 +184,25 @@ class SettingsHubView(StatefulView):
                 pass
 
     async def go_appearance(self, interaction):
-        await navigate_to(self, AppearanceView, interaction)
+        await self.push(AppearanceView, interaction, rebuild=lambda v: {"embed": v.build_embed()})
 
     async def go_notifications(self, interaction):
-        await navigate_to(self, NotificationsView, interaction)
+        await self.push(
+            NotificationsView, interaction, rebuild=lambda v: {"embed": v.build_embed()}
+        )
 
     async def go_locale(self, interaction):
-        await navigate_to(self, LocaleView, interaction)
+        await self.push(LocaleView, interaction, rebuild=lambda v: {"embed": v.build_embed()})
 
     async def reset_all(self, interaction):
         await interaction.response.defer()
-        await self.dispatch_scoped({"settings": {}})
-        if self.message:
-            await self.message.edit(embed=self.build_embed(), view=self)
+        await self.dispatch(
+            "SETTINGS_UPDATED",
+            {
+                "scope_key": f"user:{self.user_id}",
+                "changes": DEFAULT_SETTINGS,
+            },
+        )
 
 
 # // ========================================( Appearance )======================================== // #
@@ -291,14 +274,16 @@ class AppearanceView(StatefulView):
     async def on_theme_select(self, interaction):
         selected = interaction.data["values"][0]
         await interaction.response.defer()
-        await self.dispatch_scoped({"settings": {**self._get_settings(), "theme": selected}})
-        # dispatch_scoped fires SCOPED_UPDATE, which isn't in subscribed_actions,
-        # so update_from_state won't fire — manual edit needed.
-        if self.message:
-            await self.message.edit(embed=self.build_embed(), view=self)
+        await self.dispatch(
+            "SETTINGS_UPDATED",
+            {
+                "scope_key": f"user:{self.user_id}",
+                "changes": {"theme": selected},
+            },
+        )
 
     async def go_back(self, interaction):
-        await navigate_back(self, interaction)
+        await self.pop(interaction, rebuild=lambda v: {"embed": v.build_embed()})
 
 
 # // ========================================( Notifications )======================================== // #
@@ -426,7 +411,7 @@ class NotificationsView(StatefulView):
         await self.redo(interaction)
 
     async def go_back(self, interaction):
-        await navigate_back(self, interaction)
+        await self.pop(interaction, rebuild=lambda v: {"embed": v.build_embed()})
 
     def state_selector(self, state):
         scoped = state.get("application", {}).get("_scoped", {})
@@ -512,7 +497,7 @@ class LocaleView(StatefulView):
                 f"Language: **{s['language']}**\n"
                 f"Timezone: **{s['timezone']}**\n\n"
                 "Changes are saved to your user-scoped state and\n"
-                "persist across views via ``dispatch_scoped()``."
+                "update the hub live via dispatch."
             ),
         )
         theme.apply_to_embed(embed)
@@ -534,23 +519,27 @@ class LocaleView(StatefulView):
     async def on_language(self, interaction):
         selected = interaction.data["values"][0]
         await interaction.response.defer()
-        s = self._get_settings()
-        s["language"] = selected
-        await self.dispatch_scoped({"settings": s})
-        if self.message:
-            await self.message.edit(embed=self.build_embed(), view=self)
+        await self.dispatch(
+            "SETTINGS_UPDATED",
+            {
+                "scope_key": f"user:{self.user_id}",
+                "changes": {"language": selected},
+            },
+        )
 
     async def on_timezone(self, interaction):
         selected = interaction.data["values"][0]
         await interaction.response.defer()
-        s = self._get_settings()
-        s["timezone"] = selected
-        await self.dispatch_scoped({"settings": s})
-        if self.message:
-            await self.message.edit(embed=self.build_embed(), view=self)
+        await self.dispatch(
+            "SETTINGS_UPDATED",
+            {
+                "scope_key": f"user:{self.user_id}",
+                "changes": {"timezone": selected},
+            },
+        )
 
     async def go_back(self, interaction):
-        await navigate_back(self, interaction)
+        await self.pop(interaction, rebuild=lambda v: {"embed": v.build_embed()})
 
 
 # // ========================================( Cog )======================================== // #

@@ -2,6 +2,7 @@
 
 
 import asyncio
+import copy
 from functools import wraps
 from typing import Any, Callable, Dict
 
@@ -15,12 +16,17 @@ logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a", prefix
 
 
 def cascade_reducer(action_type: str):
-    """Decorator to register a reducer function with the state store."""
+    """Decorator to register a reducer function with the state store.
+
+    The decorated function receives ``(action, state)`` where ``state`` is
+    already a deep copy -- mutate it freely and return it.  There is no
+    need to ``import copy`` or call ``copy.deepcopy`` yourself.
+    """
 
     def decorator(func: Callable):
         @wraps(func)
         async def wrapper(action: Dict[str, Any], state: Dict[str, Any]):
-            return await func(action, state)
+            return await func(action, copy.deepcopy(state))
 
         # Import lazily to avoid circular imports
         from ..state.singleton import get_store

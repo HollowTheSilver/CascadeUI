@@ -66,6 +66,51 @@ class TestViewReducers:
         result = await reduce_view_destroyed(action, state)
         assert "v1" not in result["views"]
 
+    async def test_view_destroyed_cleans_up_empty_session(self):
+        state = base_state()
+        state["sessions"]["s1"] = {
+            "id": "s1",
+            "user_id": 456,
+            "views": ["v1"],
+            "history": [],
+            "data": {},
+        }
+        state["views"]["v1"] = {"id": "v1", "session_id": "s1"}
+        action = make_action("VIEW_DESTROYED", {"view_id": "v1"})
+        result = await reduce_view_destroyed(action, state)
+        assert "s1" not in result["sessions"]
+
+    async def test_view_destroyed_keeps_session_with_nav_stack(self):
+        state = base_state()
+        state["sessions"]["s1"] = {
+            "id": "s1",
+            "user_id": 456,
+            "views": ["v1"],
+            "history": [],
+            "data": {},
+            "nav_stack": [{"class_name": "RootView", "module": "test", "kwargs": {}}],
+        }
+        state["views"]["v1"] = {"id": "v1", "session_id": "s1"}
+        action = make_action("VIEW_DESTROYED", {"view_id": "v1"})
+        result = await reduce_view_destroyed(action, state)
+        assert "s1" in result["sessions"]
+
+    async def test_view_destroyed_keeps_session_with_other_views(self):
+        state = base_state()
+        state["sessions"]["s1"] = {
+            "id": "s1",
+            "user_id": 456,
+            "views": ["v1", "v2"],
+            "history": [],
+            "data": {},
+        }
+        state["views"]["v1"] = {"id": "v1", "session_id": "s1"}
+        state["views"]["v2"] = {"id": "v2", "session_id": "s1"}
+        action = make_action("VIEW_DESTROYED", {"view_id": "v1"})
+        result = await reduce_view_destroyed(action, state)
+        assert "s1" in result["sessions"]
+        assert result["sessions"]["s1"]["views"] == ["v2"]
+
 
 class TestSessionReducers:
     async def test_session_created(self):

@@ -30,7 +30,6 @@ Usage:
 # // ========================================( Modules )======================================== // #
 
 
-import copy
 from datetime import datetime, timezone
 
 import discord
@@ -76,7 +75,7 @@ support_theme = Theme("support", {
 @cascade_reducer("TICKET_CREATED")
 async def ticket_created_reducer(action, state):
     """Increment the guild counter and append the new ticket."""
-    new_state = copy.deepcopy(state)
+    new_state = state
     app = new_state.setdefault("application", {})
 
     guild_id = str(action["payload"]["guild_id"])
@@ -107,7 +106,7 @@ async def ticket_created_reducer(action, state):
 @cascade_reducer("TICKET_CLOSED")
 async def ticket_closed_reducer(action, state):
     """Set the matching ticket's status to closed."""
-    new_state = copy.deepcopy(state)
+    new_state = state
     app = new_state.get("application", {})
 
     guild_id = str(action["payload"]["guild_id"])
@@ -435,6 +434,8 @@ class TicketPanelView(PersistentView):
     ticket is created or closed.
     """
 
+    session_limit = 1
+    session_scope = "guild"
     subscribed_actions = {"TICKET_CREATED", "TICKET_CLOSED"}
 
     def __init__(self, *args, **kwargs):

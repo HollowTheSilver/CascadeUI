@@ -138,7 +138,9 @@ class FormView(StatefulView):
                         f"Form submitted with values: {self.values}", ephemeral=True
                     )
                 # Clean up the view after successful submission
-                await self.exit()
+                # (skip if on_submit already called exit/push/replace)
+                if not self.is_finished():
+                    await self.exit()
             else:
                 # Build an error embed with per-field messages
                 embed = discord.Embed(

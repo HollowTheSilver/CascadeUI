@@ -11,6 +11,7 @@ import discord
 from discord import Interaction
 from discord.ui import Item, View
 
+from ..components.base import StatefulButton
 from ..state.actions import ActionCreators
 from ..state.singleton import get_store
 from ..utils.errors import safe_execute, with_error_boundary
@@ -61,11 +62,17 @@ class SessionLimitError(Exception):
         super().__init__(f"Session limit ({limit}) reached for {view_type}.")
 
 
-# // ========================================( Classes )======================================== // #
+# // ========================================( Mixin )======================================== // #
 
 
-class StatefulView(View):
-    """Base class for all stateful UI views."""
+class _StatefulMixin:
+    """View-agnostic state management shared by StatefulView (V1) and StatefulLayoutView (V2).
+
+    This mixin contains all state integration, navigation, undo/redo, lifecycle,
+    and session management logic. Concrete view classes combine it with either
+    ``discord.ui.View`` (V1) or ``discord.ui.LayoutView`` (V2) and provide a
+    version-specific ``send()`` method.
+    """
 
     # Subclass config: state scoping ("user", "guild", or None)
     scope: Optional[str] = None
@@ -89,6 +96,14 @@ class StatefulView(View):
     # Subclass config: auto-defer safety net
     auto_defer: bool = True
     auto_defer_delay: float = 2.5
+
+    # Subclass config: interaction serialization
+    # When True, rapid button clicks are processed one at a time to prevent
+    # racing message edits that cause "This interaction failed" errors.
+    serialize_interactions: bool = True
+
+    # Persistent view marker — overridden to True by PersistentView / PersistentLayoutView
+    _persistent: bool = False
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -121,7 +136,7 @@ class StatefulView(View):
             cls.__init__ = _capturing_init
 
     def __init__(self, *args, **kwargs):
-        # Extract custom arguments before passing to View
+        # Extract custom arguments before passing to View/LayoutView
         self.state_store = kwargs.pop("state_store", None) or get_store()
         self.session_id = kwargs.pop("session_id", None)
         self.user_id = kwargs.pop("user_id", None)
@@ -146,7 +161,7 @@ class StatefulView(View):
             if self._state_key is not None:
                 self._init_kwargs["state_key"] = self._state_key
 
-        # Initialize standard View class
+        # Initialize the discord.py base class (View or LayoutView)
         super().__init__(*args, **kwargs)
 
         # Unique identifier for this view instance
@@ -167,6 +182,10 @@ class StatefulView(View):
         # Get task manager
         self.task_manager = get_task_manager()
 
+        # Interaction serialization lock — prevents racing message edits
+        # from rapid button clicks that cause "This interaction failed"
+        self._interaction_lock = asyncio.Lock()
+
         # Derive user_id, guild_id, and session_id from context/interaction
         if self.interaction is None and self.context is not None:
             if hasattr(self.context, "interaction") and self.context.interaction:
@@ -185,7 +204,11 @@ class StatefulView(View):
                 self.guild_id = self.interaction.guild_id
 
         if self.session_id is None and self.user_id is not None:
-            self.session_id = f"user_{self.user_id}"
+            # Include the class name so independent view hierarchies get
+            # isolated sessions (separate nav stacks, undo history, etc.).
+            # Pushed/popped views inherit session_id from their parent via
+            # _navigate_to(), so the entire chain stays on one session.
+            self.session_id = f"{type(self).__name__}:user_{self.user_id}"
 
         # Action types this view cares about — subclasses can override at
         # class level (e.g. subscribed_actions = {"MY_ACTION", ...})
@@ -228,7 +251,7 @@ class StatefulView(View):
         which means the subscriber receives all matching notifications.
         """
         # Only use a selector if the subclass actually overrides state_selector
-        if type(self).state_selector is not StatefulView.state_selector:
+        if type(self).state_selector is not _StatefulMixin.state_selector:
             return lambda state: self.state_selector(state)
         return None
 
@@ -280,96 +303,6 @@ class StatefulView(View):
         )
         await self.dispatch("VIEW_UPDATED", payload)
 
-    async def send(self, content=None, *, embed=None, embeds=None, ephemeral=False):
-        """
-        Send this view as a message using the stored context or interaction.
-
-        This is the preferred way to display a StatefulView. It handles
-        state registration and message tracking automatically.
-
-        Args:
-            content: Text content for the message.
-            embed: A single embed to include.
-            embeds: A list of embeds to include.
-            ephemeral: Whether the message should be ephemeral (interaction only).
-        """
-        # Session limit enforcement
-        if self.session_limit is not None:
-            scope_key = self.state_store._build_session_scope_key(self)
-            if scope_key is not None:
-                view_type = self._session_origin or self.__class__.__name__
-                existing = self.state_store.get_active_views(view_type, scope_key)
-                overflow = len(existing) - self.session_limit + 1
-
-                if overflow > 0:
-                    if self.session_policy == "reject":
-                        raise SessionLimitError(view_type, self.session_limit)
-
-                    # Pre-scan: check all candidates before exiting any, so we
-                    # don't destroy views and then raise on a later protected one
-                    to_replace = existing[:overflow]
-                    from .persistent import PersistentView
-
-                    if not isinstance(self, PersistentView):
-                        for old_view in to_replace:
-                            if isinstance(old_view, PersistentView):
-                                raise SessionLimitError(view_type, self.session_limit)
-
-                    # Replace policy: exit oldest views to make room
-                    for old_view in to_replace:
-                        await old_view.exit()
-
-        # Register in instance registry before state so the view is
-        # tracked even if the state dispatch triggers subscribers that query it
-        self.state_store.register_view(self)
-
-        await self._register_state()
-
-        if ephemeral:
-            self._ephemeral = True
-            if self.timeout is None:
-                logger.warning(
-                    f"{self.__class__.__name__}: ephemeral views with timeout=None will lose "
-                    "editability after the interaction token expires (15 minutes). "
-                    "Consider setting a finite timeout."
-                )
-
-        send_kwargs = {"view": self}
-        if content is not None:
-            send_kwargs["content"] = content
-        if embed is not None:
-            send_kwargs["embed"] = embed
-        if embeds is not None:
-            send_kwargs["embeds"] = embeds
-
-        # Send the message, rolling back registry on failure to prevent
-        # orphaned entries that permanently consume session limit slots
-        try:
-            if self.context and hasattr(self.context, "send"):
-                if ephemeral:
-                    send_kwargs["ephemeral"] = ephemeral
-                message = await self.context.send(**send_kwargs)
-
-            elif self.interaction:
-                send_kwargs["ephemeral"] = ephemeral
-                if not self.interaction.response.is_done():
-                    await self.interaction.response.send_message(**send_kwargs)
-                    message = await self.interaction.original_response()
-                else:
-                    message = await self.interaction.followup.send(**send_kwargs, wait=True)
-
-            else:
-                raise RuntimeError(
-                    "StatefulView.send() requires either 'context' or 'interaction' to be set."
-                )
-        except Exception:
-            self.state_store.unregister_view(self.id)
-            raise
-
-        self._message = message
-        await self._update_message_state(message)
-        return message
-
     def get_theme(self):
         """Get the theme for this view, falling back to the global default.
 
@@ -385,12 +318,17 @@ class StatefulView(View):
     # // ==================( Auto-Defer Safety Net )================== // #
 
     async def _scheduled_task(self, item: Item, interaction: Interaction):
-        """Override discord.py's internal dispatch to add auto-defer protection.
+        """Override discord.py's internal dispatch to add auto-defer and serialization.
 
-        Replicates View._scheduled_task with an added timer that automatically
-        defers the interaction if the callback hasn't responded within
-        ``auto_defer_delay`` seconds. This prevents the "This interaction failed"
-        error when callbacks are slow.
+        Replicates View._scheduled_task with two additions:
+
+        1. **Auto-defer timer** — defers the interaction if the callback hasn't
+           responded within ``auto_defer_delay`` seconds.
+        2. **Interaction lock** — when ``serialize_interactions`` is True, rapid
+           button clicks are processed one at a time. This prevents racing
+           ``message.edit()`` calls that cause "This interaction failed" errors.
+           The auto-defer timer runs *outside* the lock so queued interactions
+           are deferred before the 3-second Discord timeout.
         """
         try:
             item._refresh_state(interaction, interaction.data)  # type: ignore
@@ -409,7 +347,11 @@ class StatefulView(View):
                 defer_task = asyncio.create_task(self._auto_defer_timer(interaction))
 
             try:
-                await item.callback(interaction)
+                if self.serialize_interactions:
+                    async with self._interaction_lock:
+                        await item.callback(interaction)
+                else:
+                    await item.callback(interaction)
             finally:
                 if defer_task is not None and not defer_task.done():
                     defer_task.cancel()
@@ -472,11 +414,20 @@ class StatefulView(View):
         except discord.HTTPException:
             pass
 
-    async def on_timeout(self) -> None:
-        """Called when the view times out. Disables all components and cleans up state."""
-        for item in self.children:
+    def _freeze_components(self):
+        """Disable all interactive components in this view.
+
+        V2 LayoutViews nest buttons inside ActionRow/Container, so we walk
+        the full tree to reach them.  V1 Views have flat children.
+        """
+        items = self.walk_children() if self._is_layout() else self.children
+        for item in items:
             if hasattr(item, "disabled"):
                 item.disabled = True
+
+    async def on_timeout(self) -> None:
+        """Called when the view times out. Disables all components and cleans up state."""
+        self._freeze_components()
 
         if self._message:
             try:
@@ -598,6 +549,44 @@ class StatefulView(View):
         }
         return await self.dispatch("SCOPED_UPDATE", payload)
 
+    # // ========================================( Session Limiting )======================================== // #
+
+    async def _enforce_session_limit(self):
+        """Enforce session limiting before sending.
+
+        Called by concrete ``send()`` implementations. Exits overflow views
+        under replace policy, or raises ``SessionLimitError`` under reject policy.
+        """
+        if self.session_limit is None:
+            return
+
+        scope_key = self.state_store._build_session_scope_key(self)
+        if scope_key is None:
+            return
+
+        view_type = self._session_origin or self.__class__.__name__
+        existing = self.state_store.get_active_views(view_type, scope_key)
+        overflow = len(existing) - self.session_limit + 1
+
+        if overflow <= 0:
+            return
+
+        if self.session_policy == "reject":
+            raise SessionLimitError(view_type, self.session_limit)
+
+        # Pre-scan: check all candidates before exiting any, so we
+        # don't destroy views and then raise on a later protected one
+        to_replace = existing[:overflow]
+
+        if not self._persistent:
+            for old_view in to_replace:
+                if getattr(old_view, "_persistent", False):
+                    raise SessionLimitError(view_type, self.session_limit)
+
+        # Replace policy: exit oldest views to make room
+        for old_view in to_replace:
+            await old_view.exit()
+
     # // ========================================( Navigation Stack )======================================== // #
 
     async def _navigate_to(
@@ -609,6 +598,23 @@ class StatefulView(View):
         and kwarg forwarding stay consistent in one place.
         """
         current_interaction = interaction or self.interaction
+
+        # Version enforcement for push/pop — these edit the same message, so
+        # crossing V1/V2 boundaries is forbidden (IS_COMPONENTS_V2 is one-way)
+        if action_type in ("NAVIGATION_PUSH", "NAVIGATION_POP"):
+            from discord.ui import LayoutView as _LayoutView
+
+            self_is_v2 = isinstance(self, _LayoutView)
+            target_is_v2 = issubclass(view_class, _LayoutView)
+            if self_is_v2 != target_is_v2:
+                source_ver = "V2 (LayoutView)" if self_is_v2 else "V1 (View)"
+                target_ver = "V2 (LayoutView)" if target_is_v2 else "V1 (View)"
+                raise TypeError(
+                    f"Cannot push/pop between {source_ver} {self.__class__.__name__} "
+                    f"and {target_ver} {view_class.__name__}. Navigation chains must "
+                    f"use the same view version because the IS_COMPONENTS_V2 flag is "
+                    f"one-way per message. Use replace() for cross-version transitions."
+                )
 
         # Cancel background tasks owned by this view before stopping
         self.task_manager.cancel_tasks(self.id)
@@ -640,6 +646,12 @@ class StatefulView(View):
         new_view = view_class(interaction=current_interaction, **kwargs)
         new_view._ephemeral = self._ephemeral
 
+        # Push/pop reuse the same Discord message, so carry the message
+        # reference forward. Without this, update_from_state() can't edit
+        # the message (self.message would be None on the new view).
+        if action_type in ("NAVIGATION_PUSH", "NAVIGATION_POP") and self._message:
+            new_view._message = self._message
+
         # Propagate session origin so the entire navigation chain is tracked
         # under the root view's class name in the session index.
         if action_type == "NAVIGATION_REPLACE":
@@ -669,7 +681,7 @@ class StatefulView(View):
 
         return new_view
 
-    async def push(self, view_class, interaction=None, **kwargs):
+    async def push(self, view_class, interaction=None, *, rebuild=None, **kwargs):
         """Push a new view onto the navigation stack.
 
         The current view's class is saved so pop() can reconstruct it later.
@@ -678,6 +690,12 @@ class StatefulView(View):
         Args:
             view_class: The StatefulView subclass to push to.
             interaction: Discord interaction for the new view.
+            rebuild: Optional callable(view) to rebuild the new view's UI after
+                construction. When provided, the interaction is auto-deferred
+                and the message is edited with the rebuilt view. Accepts both
+                sync and async callables. If the callable returns a dict, those
+                are passed as extra kwargs to edit_original_response (e.g.
+                ``{"embed": view.build_embed()}`` for V1 views).
             **kwargs: Additional kwargs passed to the new view constructor.
         """
         push_payload = ActionCreators.navigation_push(
@@ -699,12 +717,35 @@ class StatefulView(View):
         if new_view.auto_back_button:
             new_view._add_back_button()
 
+        if rebuild is not None:
+            current_interaction = interaction or self.interaction
+            if current_interaction and not current_interaction.response.is_done():
+                await current_interaction.response.defer()
+            result = rebuild(new_view)
+            if asyncio.iscoroutine(result):
+                result = await result
+            edit_kwargs = result if isinstance(result, dict) else {}
+            if current_interaction:
+                msg = await current_interaction.edit_original_response(
+                    view=new_view, **edit_kwargs
+                )
+                new_view._message = msg
+
         return new_view
 
-    async def pop(self, interaction=None):
+    async def pop(self, interaction=None, *, rebuild=None):
         """Pop the current view and return to the previous one on the nav stack.
 
         Returns the reconstructed previous view, or None if the stack is empty.
+
+        Args:
+            interaction: Discord interaction.
+            rebuild: Optional callable(view) to rebuild the restored view's UI.
+                When provided, the interaction is auto-deferred and the message
+                is edited with the rebuilt view. Accepts both sync and async
+                callables. If the callable returns a dict, those are passed as
+                extra kwargs to edit_original_response (e.g.
+                ``{"embed": view.build_embed()}`` for V1 views).
         """
         if not self.session_id:
             return None
@@ -732,7 +773,7 @@ class StatefulView(View):
         pop_payload = ActionCreators.navigation_pop(self.session_id)
         saved_kwargs = entry.get("kwargs") or {}
 
-        return await self._navigate_to(
+        new_view = await self._navigate_to(
             view_cls,
             interaction,
             action_type="NAVIGATION_POP",
@@ -740,15 +781,24 @@ class StatefulView(View):
             **saved_kwargs,
         )
 
+        if rebuild is not None:
+            current_interaction = interaction or self.interaction
+            if current_interaction and not current_interaction.response.is_done():
+                await current_interaction.response.defer()
+            result = rebuild(new_view)
+            if asyncio.iscoroutine(result):
+                result = await result
+            edit_kwargs = result if isinstance(result, dict) else {}
+            if current_interaction:
+                msg = await current_interaction.edit_original_response(
+                    view=new_view, **edit_kwargs
+                )
+                new_view._message = msg
+
+        return new_view
+
     def _add_back_button(self):
         """Add a back button that pops the nav stack."""
-        button = discord.ui.Button(
-            label="Back",
-            style=discord.ButtonStyle.secondary,
-            emoji="◀",
-            row=4,
-            custom_id=f"nav_back_{self.id[:8]}",
-        )
 
         async def back_callback(interaction):
             await interaction.response.defer()
@@ -757,8 +807,7 @@ class StatefulView(View):
                 try:
                     # Always edit via the interaction token so the deferred
                     # response is properly consumed by Discord
-                    msg = await interaction.edit_original_response(view=prev_view)
-                    prev_view._message = msg
+                    await interaction.edit_original_response(view=prev_view)
                 except discord.HTTPException:
                     pass
             else:
@@ -769,8 +818,16 @@ class StatefulView(View):
                 except discord.HTTPException:
                     pass
 
-        button.callback = back_callback
-        self.add_item(button)
+        self.add_item(
+            StatefulButton(
+                label="Back",
+                style=discord.ButtonStyle.secondary,
+                emoji="\u25c0",
+                row=4,
+                custom_id=f"nav_back_{self.id[:8]}",
+                callback=back_callback,
+            )
+        )
 
     # // ========================================( Undo/Redo )======================================== // #
 
@@ -849,6 +906,11 @@ class StatefulView(View):
             try:
                 if delete_message:
                     await self._message.delete()
+                elif self._is_layout():
+                    # V2 messages ARE their components — edit(view=None) would
+                    # produce an empty message (error 50006).  Freeze instead.
+                    self._freeze_components()
+                    await self._message.edit(view=self)
                 else:
                     await self._message.edit(view=None)
             except Exception as e:
@@ -870,7 +932,7 @@ class StatefulView(View):
         label="Exit",
         style=discord.ButtonStyle.secondary,
         row=None,
-        emoji="❌",
+        emoji="\u274c",
         delete_message=False,
         custom_id=None,
     ):
@@ -878,19 +940,18 @@ class StatefulView(View):
 
         For PersistentView subclasses, pass a custom_id (e.g. ``custom_id="exit"``).
         """
-        button = discord.ui.Button(
+        async def exit_callback(interaction):
+            await interaction.response.defer()
+            await self.exit(delete_message=delete_message)
+
+        button = StatefulButton(
             label=label,
             style=style,
             row=row,
             emoji=emoji,
             custom_id=custom_id,
+            callback=exit_callback,
         )
-
-        async def exit_callback(interaction):
-            await interaction.response.defer()
-            await self.exit(delete_message=delete_message)
-
-        button.callback = exit_callback
         self.add_item(button)
         return button
 
@@ -908,3 +969,76 @@ class StatefulView(View):
         if hasattr(self, "state_store") and hasattr(self, "id"):
             self.state_store.unsubscribe(self.id)
             self.state_store.unregister_view(self.id)
+
+
+# // ========================================( Classes )======================================== // #
+
+
+class StatefulView(_StatefulMixin, View):
+    """Base class for all stateful V1 UI views."""
+
+    async def send(self, content=None, *, embed=None, embeds=None, ephemeral=False):
+        """
+        Send this view as a message using the stored context or interaction.
+
+        This is the preferred way to display a StatefulView. It handles
+        state registration and message tracking automatically.
+
+        Args:
+            content: Text content for the message.
+            embed: A single embed to include.
+            embeds: A list of embeds to include.
+            ephemeral: Whether the message should be ephemeral (interaction only).
+        """
+        await self._enforce_session_limit()
+
+        # Register in instance registry before state so the view is
+        # tracked even if the state dispatch triggers subscribers that query it
+        self.state_store.register_view(self)
+
+        await self._register_state()
+
+        if ephemeral:
+            self._ephemeral = True
+            if self.timeout is None:
+                logger.warning(
+                    f"{self.__class__.__name__}: ephemeral views with timeout=None will lose "
+                    "editability after the interaction token expires (15 minutes). "
+                    "Consider setting a finite timeout."
+                )
+
+        send_kwargs = {"view": self}
+        if content is not None:
+            send_kwargs["content"] = content
+        if embed is not None:
+            send_kwargs["embed"] = embed
+        if embeds is not None:
+            send_kwargs["embeds"] = embeds
+
+        # Send the message, rolling back registry on failure to prevent
+        # orphaned entries that permanently consume session limit slots
+        try:
+            if self.context and hasattr(self.context, "send"):
+                if ephemeral:
+                    send_kwargs["ephemeral"] = ephemeral
+                message = await self.context.send(**send_kwargs)
+
+            elif self.interaction:
+                send_kwargs["ephemeral"] = ephemeral
+                if not self.interaction.response.is_done():
+                    await self.interaction.response.send_message(**send_kwargs)
+                    message = await self.interaction.original_response()
+                else:
+                    message = await self.interaction.followup.send(**send_kwargs, wait=True)
+
+            else:
+                raise RuntimeError(
+                    "StatefulView.send() requires either 'context' or 'interaction' to be set."
+                )
+        except Exception:
+            self.state_store.unregister_view(self.id)
+            raise
+
+        self._message = message
+        await self._update_message_state(message)
+        return message

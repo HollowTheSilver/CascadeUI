@@ -2,7 +2,6 @@
 # // ========================================( Modules )======================================== // #
 
 
-import copy
 import discord
 from datetime import datetime
 from discord.ext import commands
@@ -25,7 +24,7 @@ logger = logging.getLogger(__name__)
 @cascade_reducer("PERSISTENT_COUNTER_UPDATED")
 async def counter_reducer(action, state):
     """Handle counter updates in the state."""
-    new_state = copy.deepcopy(state)
+    new_state = state
 
     new_state.setdefault("application", {})
     new_state["application"].setdefault("counters", {})
@@ -51,6 +50,8 @@ class PersistentCounterView(StatefulView):
 
     Requires setup_persistence() to be called in the bot's setup_hook.
     """
+
+    session_limit = 1
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -122,6 +123,9 @@ class RoleSelectorView(PersistentView):
 
     Requires setup_persistence(bot) to be called in the bot's setup_hook.
     """
+
+    session_limit = 1
+    session_scope = "guild"
 
     # Replace with your own role ID
     ROLE_ID = 123456789012345678

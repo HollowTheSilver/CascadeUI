@@ -95,6 +95,18 @@ class TabView(StatefulView):
         """Name of the currently active tab."""
         return self._tab_names[self._active_tab]
 
+    async def switch_tab(self, name: str):
+        """Switch to a tab by name and refresh the view.
+
+        Raises ``ValueError`` if the tab name is not found.
+        """
+        try:
+            index = self._tab_names.index(name)
+        except ValueError:
+            raise ValueError(f"Tab '{name}' not found. Available: {self._tab_names}")
+        self._active_tab = index
+        await self._refresh_tabs()
+
     async def update_from_state(self, state):
         pass
 

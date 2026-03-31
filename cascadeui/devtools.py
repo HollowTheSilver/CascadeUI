@@ -2,300 +2,387 @@
 
 
 import json
-from datetime import datetime
-from typing import List, Optional
+import logging
 
 import discord
 from discord.ext import commands
+from discord.ext.commands import Context
+from discord.ui import ActionRow, TextDisplay
 
+from .components.base import StatefulButton
+from .components.v2_patterns import action_section, alert, card, divider, gap, key_value
 from .state.singleton import get_store
+from .views.base import SessionLimitError
+from .views.layout_patterns import TabLayoutView
+
+logger = logging.getLogger(__name__)
+
 
 # // ========================================( Inspector )======================================== // #
 
 
-class StateInspector:
-    """Generates inspection pages for the current state store.
+class InspectorView(TabLayoutView):
+    """V2 state inspector for browsing the CascadeUI state store.
 
-    Produces a list of discord.Embed pages showing state tree overview,
-    active views, sessions, action history, and store configuration.
+    Uses TabLayoutView to dogfood the library's own V2 component system.
+    Self-filters its own view and session from displayed data to avoid
+    observer-effect noise in the inspection output.
+
+    Tabs:
+        Overview  — State tree summary with key counts and size
+        Views     — Active view instances and registry stats
+        Sessions  — Active sessions with nav stack and data info
+        History   — Recent action dispatch log
+        Config    — Reducers, middleware, hooks, persistence status
     """
 
-    def __init__(self, store=None):
-        self.store = store or get_store()
+    session_limit = 1
+    session_scope = "user_guild"
+    session_policy = "replace"
+    subscribed_actions = {"VIEW_CREATED", "VIEW_DESTROYED"}
 
-    def build_pages(self) -> List[discord.Embed]:
-        """Build all inspection pages."""
-        pages = [
-            self._overview_page(),
-            self._views_page(),
-            self._sessions_page(),
-            self._history_page(),
-            self._config_page(),
-        ]
-        # Add page numbers
-        for i, page in enumerate(pages):
-            page.set_footer(text=f"Page {i + 1}/{len(pages)}")
-        return pages
+    def state_selector(self, state):
+        """Track filtered view/session counts to detect external changes."""
+        views = {k for k in state.get("views", {}) if k != self.id}
+        sessions = {k for k in state.get("sessions", {}) if k != self.session_id}
+        return (len(views), len(sessions))
 
-    def _overview_page(self) -> discord.Embed:
-        """State tree overview with top-level key counts."""
-        state = self.store.state
-        embed = discord.Embed(
-            title="State Inspector",
-            description="Current state tree overview",
-            color=discord.Color.blurple(),
-            timestamp=datetime.now(),
-        )
+    def __init__(self, *args, **kwargs):
+        tabs = {
+            "\U0001f4ca Overview": self.build_overview,
+            "\U0001f441\ufe0f Views": self.build_views,
+            "\U0001f4c2 Sessions": self.build_sessions,
+            "\U0001f4dc History": self.build_history,
+            "\u2699\ufe0f Config": self.build_config,
+        }
+        super().__init__(*args, tabs=tabs, **kwargs)
 
-        embed.add_field(
-            name="Views",
-            value=f"`{len(state.get('views', {}))}` active",
-            inline=True,
-        )
-        embed.add_field(
-            name="Sessions",
-            value=f"`{len(state.get('sessions', {}))}` active",
-            inline=True,
-        )
-        embed.add_field(
-            name="Components",
-            value=f"`{len(state.get('components', {}))}` tracked",
-            inline=True,
-        )
+    # // ==================( Filtering )================== // #
 
-        app_state = state.get("application", {})
-        app_keys = list(app_state.keys()) if app_state else ["(empty)"]
-        embed.add_field(
-            name="Application Keys",
-            value="`" + "`, `".join(app_keys[:10]) + "`",
-            inline=False,
-        )
+    def _filtered_views(self):
+        """Return state views excluding the inspector's own entry."""
+        views = self.state_store.state.get("views", {})
+        return {k: v for k, v in views.items() if k != self.id}
 
+    def _filtered_sessions(self):
+        """Return state sessions excluding the inspector's own session."""
+        sessions = self.state_store.state.get("sessions", {})
+        return {k: v for k, v in sessions.items() if k != self.session_id}
+
+    def _filtered_history(self):
+        """Return action history excluding the inspector's own dispatches."""
+        return [a for a in self.state_store.history if a.get("source") != self.id]
+
+    def _filtered_active_views(self):
+        """Return active view instances excluding the inspector itself."""
+        return {k: v for k, v in self.state_store._active_views.items() if k != self.id}
+
+    # // ==================( Helpers )================== // #
+
+    def _exit_row(self):
+        """Build an exit button ActionRow for the bottom of each tab."""
+        btn = StatefulButton(
+            label="Close",
+            style=discord.ButtonStyle.secondary,
+            emoji="\u274c",
+            callback=self._close,
+        )
+        return ActionRow(btn)
+
+    async def _close(self, interaction):
+        await interaction.response.defer()
+        await self.exit()
+
+    async def _refresh(self, interaction):
+        await interaction.response.defer()
+        await self._refresh_tabs()
+
+    def _truncate(self, items, max_len=200):
+        """Join items as comma-separated string, truncating if too long."""
+        if not items:
+            return "None"
+        text = ", ".join(str(i) for i in items)
+        if len(text) <= max_len:
+            return text
+        # Find the last complete item that fits
+        truncated = text[:max_len].rsplit(", ", 1)[0]
+        shown = truncated.count(",") + 1
+        remaining = len(items) - shown
+        return f"{truncated}, ... +{remaining} more"
+
+    def _format_timestamp(self, timestamp):
+        """Extract HH:MM:SS from an ISO timestamp string."""
+        if not timestamp or timestamp == "N/A":
+            return "N/A"
+        if len(timestamp) > 19:
+            return timestamp[11:19]
+        if len(timestamp) > 11:
+            return timestamp[11:]
+        return timestamp
+
+    # // ==================( Overview Tab )================== // #
+
+    async def build_overview(self):
+        """State tree summary with key counts and estimated size."""
+        state = self.state_store.state
+        views = self._filtered_views()
+        sessions = self._filtered_sessions()
+        components = state.get("components", {})
         modals = state.get("modals", {})
-        if modals:
-            embed.add_field(
-                name="Modals",
-                value=f"`{len(modals)}` with submissions",
-                inline=True,
-            )
 
-        # State size estimate
+        stats = {
+            "Views": len(views),
+            "Sessions": len(sessions),
+            "Components": len(components),
+        }
+        if modals:
+            stats["Modals"] = len(modals)
+
+        overview = card(
+            "## State Inspector",
+            action_section(
+                "Snapshot of the CascadeUI state store",
+                label="Refresh",
+                callback=self._refresh,
+                emoji="\U0001f504",
+            ),
+            divider(),
+            key_value(stats),
+            color=discord.Color.blurple(),
+        )
+
+        # Application state summary
+        app_state = state.get("application", {})
+        app_keys = list(app_state.keys()) if app_state else []
+        history = self._filtered_history()
+
         state_json = json.dumps(state, default=str)
         size_kb = len(state_json.encode()) / 1024
-        embed.add_field(
-            name="State Size",
-            value=f"`{size_kb:.1f} KB`",
-            inline=True,
+
+        app_info = {
+            "App Keys": self._truncate(app_keys) if app_keys else "(empty)",
+            "State Size": f"{size_kb:.1f} KB",
+            "History Buffer": f"{len(history)}/{self.state_store.history_limit}",
+        }
+
+        app_card = card(
+            "## Application State",
+            key_value(app_info),
+            color=discord.Color.dark_grey(),
         )
 
-        return embed
+        return [overview, gap(), app_card, self._exit_row()]
 
-    def _views_page(self) -> discord.Embed:
-        """Active views listing."""
-        views = self.store.state.get("views", {})
-        embed = discord.Embed(
-            title="Active Views",
-            description=f"{len(views)} view(s) registered",
+    # // ==================( Views Tab )================== // #
+
+    async def build_views(self):
+        """Active view instances and registry statistics."""
+        views = self._filtered_views()
+        active = self._filtered_active_views()
+
+        if not views:
+            empty = alert("No active views", level="info")
+            return [empty, self._exit_row()]
+
+        # Build markdown block for view entries
+        lines = []
+        shown = list(views.items())[:8]
+        for view_id, view_data in shown:
+            short_id = view_id[:8] + "..."
+            view_type = view_data.get("type", "Unknown")
+            user_id = view_data.get("user_id", "N/A")
+            channel_id = view_data.get("channel_id", "N/A")
+            msg_id = view_data.get("message_id", "N/A")
+            lines.append(f"**{view_type}** (`{short_id}`)")
+            lines.append(f"-# User: {user_id} | Channel: {channel_id} | Msg: {msg_id}")
+
+        if len(views) > 8:
+            lines.append(f"\n-# ...showing first 8 of {len(views)}")
+
+        views_card = card(
+            "## Active Views",
+            TextDisplay(f"{len(views)} view(s) registered"),
+            divider(),
+            TextDisplay("\n".join(lines)),
             color=discord.Color.green(),
         )
 
-        if not views:
-            embed.description = "No active views"
-            return embed
+        # Registry stats
+        sub_count = len(self.state_store.subscribers) - 1  # Exclude self
+        session_index = self.state_store._session_index
+        registry = card(
+            "## View Registry",
+            key_value(
+                {
+                    "Active Instances": len(active),
+                    "Session Index Entries": len(session_index),
+                    "Subscribers": sub_count,
+                }
+            ),
+            color=discord.Color.dark_grey(),
+        )
 
-        for view_id, view_data in list(views.items())[:10]:
-            short_id = view_id[:8] + "..."
-            view_type = view_data.get("type", "Unknown")
-            msg_id = view_data.get("message_id", "N/A")
-            channel_id = view_data.get("channel_id", "N/A")
-            user_id = view_data.get("user_id", "N/A")
+        return [views_card, gap(), registry, self._exit_row()]
 
-            embed.add_field(
-                name=f"{view_type} ({short_id})",
-                value=(f"Message: `{msg_id}`\n" f"Channel: `{channel_id}`\n" f"User: `{user_id}`"),
-                inline=True,
-            )
+    # // ==================( Sessions Tab )================== // #
 
-        if len(views) > 10:
-            embed.description += f" (showing first 10 of {len(views)})"
+    async def build_sessions(self):
+        """Active sessions with view counts and nav stack info."""
+        sessions = self._filtered_sessions()
 
-        return embed
+        if not sessions:
+            empty = alert("No active sessions", level="info")
+            return [empty, self._exit_row()]
 
-    def _sessions_page(self) -> discord.Embed:
-        """Active sessions listing."""
-        sessions = self.store.state.get("sessions", {})
-        embed = discord.Embed(
-            title="Active Sessions",
-            description=f"{len(sessions)} session(s)",
+        lines = []
+        shown = list(sessions.items())[:6]
+        for session_id, session_data in shown:
+            view_count = len(session_data.get("views", []))
+            nav_depth = len(session_data.get("nav_stack", []))
+            created = self._format_timestamp(session_data.get("created_at", "N/A"))
+            data_keys = list(session_data.get("data", {}).keys())
+
+            lines.append(f"**{session_id}**")
+            detail = f"-# Views: {view_count} | Nav Stack: {nav_depth} | Created: {created}"
+            lines.append(detail)
+            if data_keys:
+                lines.append(f"-# Data Keys: {', '.join(data_keys[:5])}")
+            lines.append("")  # Blank line between entries
+
+        if len(sessions) > 6:
+            lines.append(f"-# ...showing first 6 of {len(sessions)}")
+
+        sessions_card = card(
+            "## Active Sessions",
+            TextDisplay(f"{len(sessions)} session(s)"),
+            divider(),
+            TextDisplay("\n".join(lines).rstrip()),
             color=discord.Color.gold(),
         )
 
-        if not sessions:
-            embed.description = "No active sessions"
-            return embed
+        return [sessions_card, self._exit_row()]
 
-        for session_id, session_data in list(sessions.items())[:10]:
-            user_id = session_data.get("user_id", "N/A")
-            view_count = len(session_data.get("views", []))
-            history_count = len(session_data.get("history", []))
-            created = session_data.get("created_at", "N/A")
+    # // ==================( History Tab )================== // #
 
-            # Truncate timestamp for readability
-            if created != "N/A" and len(created) > 19:
-                created = created[:19]
-
-            embed.add_field(
-                name=f"User {user_id}",
-                value=(
-                    f"Views: `{view_count}`\n"
-                    f"Nav History: `{history_count}`\n"
-                    f"Created: `{created}`"
-                ),
-                inline=True,
-            )
-
-        return embed
-
-    def _history_page(self) -> discord.Embed:
-        """Recent action history."""
-        history = self.store.history
-        embed = discord.Embed(
-            title="Action History",
-            description=f"{len(history)} action(s) in buffer (limit: {self.store.history_limit})",
-            color=discord.Color.orange(),
-        )
+    async def build_history(self):
+        """Recent action dispatch log."""
+        history = self._filtered_history()
 
         if not history:
-            embed.description = "No actions dispatched yet"
-            return embed
+            empty = alert("No actions dispatched yet", level="info")
+            return [empty, self._exit_row()]
 
-        # Show last 15 actions in reverse order
-        recent = list(reversed(history[-15:]))
+        recent = list(reversed(history[-20:]))
         lines = []
         for action in recent:
-            timestamp = action.get("timestamp", "")
-            if len(timestamp) > 19:
-                timestamp = timestamp[11:19]  # Just HH:MM:SS
+            timestamp = self._format_timestamp(action.get("timestamp", ""))
             action_type = action["type"]
             source = action.get("source", "N/A")
             if source and len(source) > 8:
                 source = source[:8] + "..."
             lines.append(f"`{timestamp}` **{action_type}** from `{source}`")
 
-        embed.description += "\n\n" + "\n".join(lines)
+        if len(history) > 20:
+            lines.append(f"\n-# ...showing last 20 of {len(history)}")
 
-        if len(history) > 15:
-            embed.description += f"\n\n*...and {len(history) - 15} older actions*"
+        history_card = card(
+            "## Action History",
+            action_section(
+                f"{len(history)} action(s) in buffer (limit: {self.state_store.history_limit})",
+                label="Refresh",
+                callback=self._refresh,
+                emoji="\U0001f504",
+            ),
+            divider(),
+            TextDisplay("\n".join(lines)),
+            color=discord.Color.orange(),
+        )
 
-        return embed
+        return [history_card, self._exit_row()]
 
-    def _config_page(self) -> discord.Embed:
-        """Store configuration and internals."""
-        embed = discord.Embed(
-            title="Store Configuration",
+    # // ==================( Config Tab )================== // #
+
+    async def build_config(self):
+        """Reducers, middleware, hooks, and persistence status."""
+        store = self.state_store
+
+        # Reducers
+        core = list(store._core_reducers.keys()) if store._core_reducers else []
+        custom = list(store._custom_reducers.keys())
+
+        reducers_card = card(
+            "## Reducers",
+            key_value(
+                {
+                    f"Core ({len(core)})": self._truncate(core),
+                    f"Custom ({len(custom)})": self._truncate(custom),
+                }
+            ),
             color=discord.Color.purple(),
         )
 
-        # Reducers
-        core = list(self.store._core_reducers.keys()) if self.store._core_reducers else []
-        custom = list(self.store._custom_reducers.keys())
-        embed.add_field(
-            name=f"Core Reducers ({len(core)})",
-            value="`" + "`, `".join(core) + "`" if core else "Not loaded yet",
-            inline=False,
-        )
-        embed.add_field(
-            name=f"Custom Reducers ({len(custom)})",
-            value="`" + "`, `".join(custom) + "`" if custom else "None",
-            inline=False,
-        )
+        # Middleware and hooks
+        mw_names = []
+        for mw in store._middleware:
+            if hasattr(mw, "__class__") and mw.__class__.__name__ != "function":
+                mw_names.append(mw.__class__.__name__)
+            elif hasattr(mw, "__name__"):
+                mw_names.append(mw.__name__)
+            else:
+                mw_names.append("anonymous")
 
-        # Subscribers
-        sub_count = len(self.store.subscribers)
-        embed.add_field(
-            name=f"Subscribers ({sub_count})",
-            value=", ".join(f"`{sid[:8]}...`" for sid in list(self.store.subscribers.keys())[:10])
-            or "None",
-            inline=False,
-        )
+        hook_count = sum(len(cbs) for cbs in store._hooks.values())
+        computed_count = len(store._computed)
 
-        # Middleware
-        mw_count = len(self.store._middleware)
-        embed.add_field(
-            name=f"Middleware ({mw_count})",
-            value=", ".join(
-                f"`{mw.__class__.__name__ if hasattr(mw, '__class__') and mw.__class__.__name__ != 'function' else mw.__name__ if hasattr(mw, '__name__') else 'anonymous'}`"
-                for mw in self.store._middleware
-            )
-            or "None",
-            inline=False,
+        middleware_card = card(
+            "## Middleware & Hooks",
+            key_value(
+                {
+                    "Middleware": self._truncate(mw_names),
+                    "Hooks": f"{hook_count} registered" if hook_count else "None",
+                    "Computed Values": f"{computed_count} registered" if computed_count else "None",
+                }
+            ),
+            color=discord.Color.dark_grey(),
         )
 
         # Persistence
-        if self.store.persistence_enabled:
-            backend = self.store.persistence_backend
+        if store.persistence_enabled:
+            backend = store.persistence_backend
             backend_name = backend.__class__.__name__ if backend else "None"
-            embed.add_field(
-                name="Persistence",
-                value=f"Enabled ({backend_name})",
-                inline=True,
-            )
+            persistent_views = store.state.get("persistent_views", {})
+            persist_info = {
+                "Status": f"Enabled ({backend_name})",
+                "Persistent Views": f"{len(persistent_views)} registered",
+            }
+            persist_color = discord.Color.green()
         else:
-            embed.add_field(
-                name="Persistence",
-                value="Disabled",
-                inline=True,
-            )
+            persist_info = {"Status": "Disabled"}
+            persist_color = discord.Color.red()
 
-        return embed
+        persistence_card = card(
+            "## Persistence",
+            key_value(persist_info),
+            color=persist_color,
+        )
+
+        return [reducers_card, gap(), middleware_card, gap(), persistence_card, self._exit_row()]
+
+    async def update_from_state(self, state):
+        """Auto-refresh the active tab when external state changes."""
+        if self.message:
+            await self._refresh_tabs()
 
 
-# // ========================================( View )======================================== // #
-
-
-class InspectorView(discord.ui.View):
-    """Paginated view for browsing inspector pages.
-
-    Uses plain discord.ui.View (not StatefulView) to avoid polluting
-    the state store with inspector metadata.
-    """
-
-    def __init__(self, pages: List[discord.Embed], timeout: float = 120):
-        super().__init__(timeout=timeout)
-        self.pages = pages
-        self.current_page = 0
-        self._update_buttons()
-
-    def _update_buttons(self):
-        self.prev_button.disabled = self.current_page == 0
-        self.next_button.disabled = self.current_page >= len(self.pages) - 1
-
-    @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary)
-    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.current_page = max(0, self.current_page - 1)
-        self._update_buttons()
-        await interaction.response.edit_message(embed=self.pages[self.current_page], view=self)
-
-    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary)
-    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.current_page = min(len(self.pages) - 1, self.current_page + 1)
-        self._update_buttons()
-        await interaction.response.edit_message(embed=self.pages[self.current_page], view=self)
-
-    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.primary)
-    async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        inspector = StateInspector()
-        self.pages = inspector.build_pages()
-        self.current_page = min(self.current_page, len(self.pages) - 1)
-        self._update_buttons()
-        await interaction.response.edit_message(embed=self.pages[self.current_page], view=self)
+# Backwards-compatible alias
+StateInspector = InspectorView
 
 
 # // ========================================( Cog )======================================== // #
 
 
 class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
-    """Optional cog that adds a state inspection command.
+    """Optional cog that adds a V2 state inspection command.
 
     Usage:
         from cascadeui.devtools import DevToolsCog
@@ -307,8 +394,14 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
 
     @commands.hybrid_command(name="inspect", description="Inspect the CascadeUI state store.")
     @commands.is_owner()
-    async def inspect(self, ctx: commands.Context):
-        inspector = StateInspector()
-        pages = inspector.build_pages()
-        view = InspectorView(pages)
-        await ctx.send(embed=pages[0], view=view)
+    async def inspect(self, ctx: Context) -> None:
+        """Open the CascadeUI state inspector.
+
+        A tabbed V2 dashboard showing the live state tree, active views,
+        sessions, action history, and store configuration.
+        """
+        try:
+            view = InspectorView(context=ctx)
+            await view.send()
+        except SessionLimitError:
+            await ctx.send("Inspector already open.", ephemeral=True)

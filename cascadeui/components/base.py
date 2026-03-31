@@ -48,6 +48,10 @@ class StatefulComponent:
             if original_callback:
                 await original_callback(interaction)
 
+            # Skip dispatch if the callback destroyed the view (exit, push, etc.)
+            if view.is_finished():
+                return
+
             # Then dispatch state update (may trigger update_from_state on views)
             payload = ActionCreators.component_interaction(
                 component_id=component_id, view_id=view.id, user_id=interaction.user.id, value=value

@@ -2,7 +2,6 @@
 # // ========================================( Modules )======================================== // #
 
 
-import copy
 import discord
 from discord.ext import commands
 from discord.ext.commands import Context
@@ -23,7 +22,7 @@ logger = logging.getLogger(__name__)
 @cascade_reducer("COUNTER_SET")
 async def counter_set_reducer(action, state):
     """Set the undo counter value in application state."""
-    new_state = copy.deepcopy(state)
+    new_state = state
     new_state.setdefault("application", {})
     new_state["application"]["undo_counter"] = action["payload"]["value"]
     return new_state
@@ -40,6 +39,7 @@ class UndoCounterView(StatefulView):
     current stack depths so you can see exactly what's happening.
     """
 
+    session_limit = 1
     enable_undo = True
     undo_limit = 10
 

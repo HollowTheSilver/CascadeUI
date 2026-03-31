@@ -26,6 +26,12 @@ class Theme:
         if "danger_color" not in self.styles:
             self.styles["danger_color"] = Color.red()
 
+        # V2 Container styling — defaults derived from V1 colors
+        if "accent_colour" not in self.styles:
+            self.styles["accent_colour"] = self.styles.get("primary_color")
+        if "separator_spacing" not in self.styles:
+            self.styles["separator_spacing"] = "small"
+
         # Button style mappings
         if "button_styles" not in self.styles:
             self.styles["button_styles"] = {
@@ -54,6 +60,17 @@ class Theme:
             embed.set_footer(text=footer_text)
 
         return embed
+
+    def apply_to_container(self, container) -> Any:
+        """Apply theme accent colour to a V2 Container.
+
+        Sets the Container's ``accent_colour`` from the theme's
+        ``accent_colour`` style. Returns the container for chaining.
+        """
+        accent = self.get_style("accent_colour")
+        if accent is not None:
+            container.accent_colour = accent
+        return container
 
     def create_button(
         self, label: str, button_type: str = "primary", **kwargs

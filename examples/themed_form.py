@@ -54,6 +54,8 @@ set_default_theme("brand")
 
 
 class UserProfileView(StatefulView):
+    session_limit = 1
+
     def __init__(self, context):
         super().__init__(context=context)
 
@@ -128,6 +130,8 @@ class ThemedFormExample(commands.Cog, name="themed_form_example"):
         """Test theme switching functionality with distinct color palettes."""
 
         class ThemeSwitcherView(StatefulView):
+            session_limit = 1
+
             def __init__(self, ctx):
                 super().__init__(context=ctx)
 
@@ -214,6 +218,8 @@ class ThemedFormExample(commands.Cog, name="themed_form_example"):
         """Test component composition functionality."""
 
         class ComponentTestView(StatefulView):
+            session_limit = 1
+
             def __init__(self, ctx):
                 super().__init__(context=ctx)
 
@@ -345,6 +351,7 @@ class ThemedFormExample(commands.Cog, name="themed_form_example"):
                 f"Form submitted with values: {values}",
                 ephemeral=True,
             )
+            await view.exit()
 
         view = FormView(
             context=context,
@@ -369,6 +376,8 @@ class ThemedFormExample(commands.Cog, name="themed_form_example"):
         """Test per-field text validation through a Modal dialog."""
 
         class ValidateFormView(StatefulView):
+            session_limit = 1
+
             def __init__(self, ctx):
                 super().__init__(context=ctx)
                 self.add_item(StatefulButton(

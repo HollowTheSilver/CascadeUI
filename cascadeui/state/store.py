@@ -148,6 +148,7 @@ class StateStore:
 
         # Middleware pipeline (executed in order before reducers)
         self._middleware: List[MiddlewareFn] = []
+        self._has_persistence_middleware: bool = False
 
         # Event hooks registry: {hook_name: [callbacks]}
         self._hooks: Dict[str, List[HookFn]] = {}
@@ -246,11 +247,21 @@ class StateStore:
         directly to short-circuit.
         """
         self._middleware.append(middleware)
+        self._update_persistence_middleware_flag()
 
     def remove_middleware(self, middleware: MiddlewareFn) -> None:
         """Remove a middleware from the pipeline."""
         if middleware in self._middleware:
             self._middleware.remove(middleware)
+            self._update_persistence_middleware_flag()
+
+    def _update_persistence_middleware_flag(self) -> None:
+        """Cache whether any middleware handles persistence writes."""
+        from .middleware import DebouncedPersistence
+
+        self._has_persistence_middleware = any(
+            isinstance(m, DebouncedPersistence) for m in self._middleware
+        )
 
     async def _run_middleware_chain(self, action: Action, reducer_fn) -> StateData:
         """Build and execute the middleware chain ending at the reducer."""
@@ -498,8 +509,8 @@ class StateStore:
         # Fire hooks after subscribers
         await self._fire_hooks(action)
 
-        # Handle persistence (if no persistence middleware is installed)
-        if self.persistence_enabled and self.persistence_backend:
+        # Handle persistence — skip if DebouncedPersistence middleware is managing writes
+        if self.persistence_enabled and self.persistence_backend and not self._has_persistence_middleware:
             self.task_manager.create_task("state_store", self._persist_state())
 
         return self.state

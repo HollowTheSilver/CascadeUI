@@ -2,7 +2,6 @@
 # // ========================================( Modules )======================================== // #
 
 
-import copy
 import discord
 from discord.ext import commands
 from discord.ext.commands import Context
@@ -30,7 +29,7 @@ def total_votes(votes):
 @cascade_reducer("VOTE_CAST")
 async def vote_reducer(action, state):
     """Increment or decrement a user's vote count."""
-    new_state = copy.deepcopy(state)
+    new_state = state
     new_state.setdefault("application", {})
     new_state["application"].setdefault("votes", {})
 
@@ -45,7 +44,7 @@ async def vote_reducer(action, state):
 @cascade_reducer("VOTE_LOG")
 async def vote_log_reducer(action, state):
     """Append an entry to the vote activity log (kept to last 20)."""
-    new_state = copy.deepcopy(state)
+    new_state = state
     new_state.setdefault("application", {})
     new_state["application"].setdefault("vote_log", [])
     new_state["application"]["vote_log"].append(action["payload"]["entry"])
@@ -63,6 +62,7 @@ class ScopedCounterView(StatefulView):
     scoped namespace. Two users clicking the same view see different counts.
     """
 
+    session_limit = 1
     scope = "user"
 
     def __init__(self, *args, **kwargs):
@@ -112,6 +112,9 @@ class VotingView(StatefulView):
     The total is derived from a @computed value (cached, lazy).
     A hook logs every component interaction to the console.
     """
+
+    session_limit = 1
+    owner_only = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

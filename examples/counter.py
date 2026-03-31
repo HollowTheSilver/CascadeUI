@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 
 class CounterView(StatefulView):
+    session_limit = 1
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -97,8 +99,7 @@ class CounterView(StatefulView):
 @cascade_reducer("COUNTER_UPDATED")
 async def counter_reducer(action, state):
     """Handle counter updates in the state."""
-    import copy
-    new_state = copy.deepcopy(state)
+    new_state = state
 
     if "application" not in new_state:
         new_state["application"] = {}

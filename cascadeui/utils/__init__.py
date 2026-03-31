@@ -3,6 +3,7 @@
 
 from .decorators import cascade_component, cascade_reducer
 from .errors import safe_execute, with_error_boundary, with_retry
+from .helpers import slugify
 from .tasks import get_task_manager
 
 # // ========================================( Script )======================================== // #
@@ -14,5 +15,6 @@ __all__ = [
     "with_error_boundary",
     "with_retry",
     "safe_execute",
+    "slugify",
     "get_task_manager",
 ]

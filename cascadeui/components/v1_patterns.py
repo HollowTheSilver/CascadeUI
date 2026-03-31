@@ -7,7 +7,7 @@ import discord
 from discord import ButtonStyle, Interaction
 
 from .base import StatefulButton, StatefulComponent
-from .composition import CompositeComponent, register_component
+from .v1_composition import CompositeComponent, register_component
 
 # // ========================================( Classes )======================================== // #
 
