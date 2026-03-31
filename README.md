@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/docs/assets/banner.png" alt="CascadeUI — A Redux-Inspired Framework for Discord.py" width="100%">
+  <img src="https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/docs/assets/banner.png" alt="CascadeUI - A Redux-Inspired Framework for Discord.py" width="100%">
 </p>
 
 <p align="center">
@@ -7,10 +7,10 @@
   <a href="https://pypi.org/project/pycascadeui/"><img src="https://img.shields.io/pypi/dm/pycascadeui?logo=pypi&logoColor=white&label=downloads" alt="Downloads"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10%20|%203.11%20|%203.12%20|%203.13%20|%203.14-blue.svg?logo=python&logoColor=white" alt="Python 3.10-3.14"></a>
   <a href="https://github.com/Rapptz/discord.py"><img src="https://img.shields.io/badge/discord.py-2.7+-738adb.svg?logo=discord&logoColor=white" alt="discord.py 2.7+"></a>
-  <a href="https://github.com/HollowTheSilver/CascadeUI/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/HollowTheSilver/CascadeUI/ci.yml?logo=github&label=CI" alt="CI"></a>
-  <a href="https://github.com/psf/black"><img src="https://img.shields.io/badge/code%20style-black-000000.svg" alt="Code style: black"></a>
   <a href="https://discord.com/invite/9Xj68BpKRb"><img src="https://img.shields.io/discord/1405822635920855040?logo=discord&logoColor=white&label=Discord&color=5865F2" alt="Discord"></a>
   <a href="https://hollowthesilver.github.io/CascadeUI/"><img src="https://img.shields.io/badge/docs-GitHub%20Pages-8A2BE2?logo=readthedocs" alt="Docs"></a>
+  <a href="https://github.com/psf/black"><img src="https://img.shields.io/badge/code%20style-black-000000.svg" alt="Code style: black"></a>
+  <a href="https://github.com/HollowTheSilver/CascadeUI/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/HollowTheSilver/CascadeUI/ci.yml?logo=github&label=CI" alt="CI"></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
 </p>
 
@@ -18,10 +18,6 @@
   Redux-inspired UI framework for <a href="https://github.com/Rapptz/discord.py">discord.py</a>.<br>
   Centralized state, dispatched actions, reducers, and subscriber notifications<br>
   for predictable state flow and composable UI patterns.
-</p>
-
-<p align="center">
-  Supports both <strong>V2 Components</strong> (LayoutView, Container, Section) and <strong>V1 Components</strong> (View, Embeds, Buttons).
 </p>
 
 <p align="center">
@@ -76,7 +72,7 @@ This is the same unidirectional data flow pattern used by Redux and similar stat
 ## Quick Start
 
 > [!TIP]
-> Install from PyPI, then `import cascadeui` -- the package name on PyPI is `pycascadeui` but the import stays `cascadeui`.
+> Install from PyPI, then `import cascadeui` -- the package name on PyPI is `pycascadeui` but the import is `cascadeui`.
 
 ```bash
 pip install pycascadeui
@@ -181,9 +177,9 @@ class DashboardView(TabLayoutView):
 
 ---
 
-### Settings with Navigation & Undo/Redo
+### Settings with Navigation Stack
 
-> Push/pop between settings sub-pages on the same message. Notification toggles support undo/redo. Accent colors change with the selected theme. Session limiting keeps one panel per user.
+> Push/pop between settings sub-pages on the same message. Accent colors change with the selected theme. Session limiting keeps one panel per user.
 
 ![Settings Menu](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-settings.gif)
 
@@ -241,6 +237,34 @@ Works with both V2 and V1 views. Use `session_policy = "reject"` to block the se
 
 ---
 
+### Undo/Redo
+
+> Snapshot-based undo/redo per view session. Two class attributes and you get full state history.
+
+![Undo/Redo](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-undo-redo.gif)
+
+```python
+class NotificationsView(StatefulLayoutView):
+    enable_undo = True
+    undo_limit = 10
+
+    async def toggle_setting(self, interaction):
+        await interaction.response.defer()
+        await self.dispatch("SETTINGS_UPDATED", {"dm_notifications": not self.dm_enabled})
+
+    async def undo_change(self, interaction):
+        await interaction.response.defer()
+        await self.undo(interaction)
+
+    async def redo_change(self, interaction):
+        await interaction.response.defer()
+        await self.redo(interaction)
+```
+
+The `UndoMiddleware` captures application state snapshots before each reducer runs, scoped to the view's session. Works with any dispatched action.
+
+---
+
 ### Pagination
 
 > Build paginated views from raw data with `from_data()`. Pages are V2 containers with accent colors. Navigation includes jump buttons and a go-to-page modal when the page count exceeds the threshold.
@@ -251,7 +275,7 @@ Works with both V2 and V1 views. Use `session_policy = "reject"` to block the se
 from cascadeui import PaginatedLayoutView
 
 def format_page(items):
-    lines = [f"**{item['name']}** — {item['rarity']} — {item['value']}g" for item in items]
+    lines = [f"**{item['name']}** | {item['rarity']} | {item['value']}g" for item in items]
     return [Container(
         TextDisplay("## Inventory"),
         Separator(),
@@ -282,7 +306,7 @@ async def setup_hook(self):
     await setup_persistence(bot=self, backend=SQLiteBackend("cascadeui.db"))
 ```
 
-#### View persistence — survives restarts
+#### View persistence: survives restarts
 
 > Post a panel once and it stays interactive forever. The bot restarts, the buttons still work. No need to re-send.
 
@@ -304,12 +328,12 @@ class RoleSelectorPanel(PersistentLayoutView):
             accent_colour=discord.Color.red(),
         ))
 
-# Post once, works forever — re-running replaces the old panel:
+# Post once, works forever. Re-running replaces the old panel:
 view = RoleSelectorPanel(context=ctx, state_key=f"roles:panel:{ctx.guild.id}")
 await view.send()
 ```
 
-#### Data persistence — restores state
+#### Data persistence: restores state
 
 > State is saved to disk automatically and restored when the command is invoked again. Close the bot, restart, run the command, and your previous data is still there.
 
