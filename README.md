@@ -6,55 +6,55 @@
   <a href="https://pypi.org/project/pycascadeui/"><img src="https://img.shields.io/pypi/v/pycascadeui?logo=pypi&logoColor=white" alt="PyPI"></a>
   <a href="https://pypi.org/project/pycascadeui/"><img src="https://img.shields.io/pypi/dm/pycascadeui?logo=pypi&logoColor=white&label=downloads" alt="Downloads"></a>
   <a href="https://github.com/HollowTheSilver/CascadeUI/stargazers"><img src="https://img.shields.io/github/stars/HollowTheSilver/CascadeUI?style=flat&logo=github&label=stars" alt="Stars"></a>
-  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10%20|%203.11%20|%203.12%20|%203.13%20|%203.14-blue.svg?logo=python&logoColor=white" alt="Python 3.10-3.14"></a>
-  <a href="https://github.com/Rapptz/discord.py"><img src="https://img.shields.io/badge/discord.py-2.7+-738adb.svg?logo=discord&logoColor=white" alt="discord.py 2.7+"></a>
   <a href="https://discord.com/invite/9Xj68BpKRb"><img src="https://img.shields.io/discord/1405822635920855040?logo=discord&logoColor=white&label=Discord&color=5865F2" alt="Discord"></a>
   <a href="https://hollowthesilver.github.io/CascadeUI/"><img src="https://img.shields.io/badge/docs-GitHub%20Pages-8A2BE2?logo=readthedocs" alt="Docs"></a>
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10%20|%203.11%20|%203.12%20|%203.13%20|%203.14-blue.svg?logo=python&logoColor=white" alt="Python 3.10-3.14"></a>
+  <a href="https://github.com/Rapptz/discord.py"><img src="https://img.shields.io/badge/discord.py-2.7+-738adb.svg?logo=discord&logoColor=white" alt="discord.py 2.7+"></a>
   <a href="https://github.com/psf/black"><img src="https://img.shields.io/badge/code%20style-black-000000.svg" alt="Code style: black"></a>
   <a href="https://github.com/HollowTheSilver/CascadeUI/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/HollowTheSilver/CascadeUI/ci.yml?logo=github&label=CI" alt="CI"></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
 </p>
 
 <p align="center">
-  Redux-inspired UI framework for <a href="https://github.com/Rapptz/discord.py">discord.py</a>.<br>
+  A powerful redux-inspired UI framework for <a href="https://github.com/Rapptz/discord.py">discord.py</a>.<br>
   Centralized state, dispatched actions, reducers, and subscriber notifications<br>
   for predictable state flow and composable UI patterns.
-</p>
-
-<p align="center">
-  <a href="https://hollowthesilver.github.io/CascadeUI/"><strong>Read the full documentation</strong></a>
 </p>
 
 <div align="center">
   <img src="https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-hero.gif" alt="CascadeUI V2 Dashboard" width="600">
 </div>
 
+<p align="center">
+  <a href="https://hollowthesilver.github.io/CascadeUI/"><strong>Read the full documentation</strong></a>
+</p>
+
 ---
 
 ## Features
 
 #### State Management
-- **Centralized State Store** -- Singleton store with dispatch/reducer cycle, action batching, computed values, event hooks, and subscriber filtering by action type + state selectors
-- **Custom Reducers** -- Register your own action types with `@cascade_reducer`
-- **Middleware** -- Intercept and transform actions; built-in debounced persistence, logging, and undo/redo
+- **Centralized State Store:**  Singleton store with dispatch/reducer cycle, action batching, computed values, event hooks, and subscriber filtering by action type + state selectors
+- **Custom Reducers:**  Register your own action types with `@cascade_reducer`
+- **Middleware:**  Intercept and transform actions; built-in debounced persistence, logging, and undo/redo
 
 #### Views & Patterns
-- **V2 Components** -- `StatefulLayoutView` with Container, Section, TextDisplay layouts; accent-colored cards, inline action buttons, and flexible component trees
-- **V1 Components** -- `StatefulView` wrapping discord.py `View` with embeds and content
-- **Pre-built Patterns** -- Tabs, Wizards, Forms, Pagination -- available in both V2 (`TabLayoutView`, `WizardLayoutView`, etc.) and V1 (`TabView`, `WizardView`, etc.)
-- **Navigation Stack** -- Push/pop views to build multi-level menus on a single message
-- **Session Limiting** -- Declarative per-view limits with automatic old-view cleanup
-- **Undo/Redo** -- Snapshot-based state history per view session
+- **V2 Components:**  `StatefulLayoutView` with Container, Section, TextDisplay layouts; accent-colored cards, inline action buttons, and flexible component trees
+- **V1 Components:**  `StatefulView` wrapping discord.py `View` with embeds and content
+- **Pre-built Patterns:**  Tabs, Wizards, Forms, Pagination -- available in both V2 (`TabLayoutView`, `WizardLayoutView`, etc.) and V1 (`TabView`, `WizardView`, etc.)
+- **Navigation Stack:**  Push/pop views to build multi-level menus on a single message
+- **Session Limiting:**  Declarative per-view limits with automatic old-view cleanup
+- **Undo/Redo:**  Snapshot-based state history per view session
 
 #### Components & Theming
-- **Stateful Components** -- `StatefulButton`, `StatefulSelect`, plus composites and behavioral wrappers (loading, confirmation, cooldown)
-- **V2 Helpers** -- `card()`, `action_section()`, `toggle_section()`, `alert()`, `key_value()`, `gallery()` for concise V2 assembly
-- **Form Validation** -- Built-in validators (`min_length`, `max_length`, `regex`, `choices`, `min_value`, `max_value`) with per-field error reporting
-- **Theming** -- Global registry with per-view overrides; accent colors for V2 Containers, embed colors for V1
+- **Stateful Components:**  `StatefulButton`, `StatefulSelect`, plus composites and behavioral wrappers (loading, confirmation, cooldown)
+- **V2 Helpers:**  `card()`, `action_section()`, `toggle_section()`, `alert()`, `key_value()`, `gallery()` for concise V2 assembly
+- **Form Validation:**  Built-in validators (`min_length`, `max_length`, `regex`, `choices`, `min_value`, `max_value`) with per-field error reporting
+- **Theming:**  Global registry with per-view overrides; accent colors for V2 Containers, embed colors for V1
 
 #### Infrastructure
-- **Persistence** -- `setup_persistence()` for data + view survival across restarts; pluggable backends (JSON, SQLite, Redis)
-- **DevTools** -- Built-in V2 tabbed state inspector with self-filtering and live auto-refresh
+- **Persistence:**  `setup_persistence()` for data + view survival across restarts; pluggable backends (JSON, SQLite, Redis)
+- **DevTools:**  Built-in V2 tabbed state inspector with self-filtering and live auto-refresh
 
 ---
 
@@ -146,9 +146,7 @@ async def counter(ctx):
 
 > Multiple containers with different accent colors, sections with inline action buttons, and tab-based navigation -- all in one message.
 
-<div align="center">
-  <img src="https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-dashboard.gif" alt="Tabbed Dashboard" width="600">
-</div>
+![Tabbed Dashboard](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-dashboard.gif)
 
 ```python
 from cascadeui import TabLayoutView, card, action_section, toggle_section, key_value
@@ -182,13 +180,11 @@ class DashboardView(TabLayoutView):
 
 ---
 
-### Settings with Navigation Stack
+### Navigation Stack
 
-> Push/pop between settings sub-pages on the same message. Accent colors change with the selected theme. Session limiting keeps one panel per user.
+> Push/pop between sub-pages on the same message. Accent colors change with the selected theme. Session limiting keeps one panel per user.
 
-<div align="center">
-  <img src="https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-settings.gif" alt="Settings Menu" width="600">
-</div>
+![Settings Menu](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-settings.gif)
 
 ```python
 from cascadeui import StatefulLayoutView, SessionLimitError
@@ -223,9 +219,7 @@ class NotificationsView(StatefulLayoutView):
 
 > Dispatch a named action from any view and every subscriber reacts instantly. Here, changing settings in the V2 panel updates the V1 panel's hub live, and vice versa.
 
-<div align="center">
-  <img src="https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-cross-view-reactivity.gif" alt="Cross-View Reactivity" width="600">
-</div>
+![Cross-View Reactivity](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-cross-view-reactivity.gif)
 
 ---
 
@@ -233,9 +227,7 @@ class NotificationsView(StatefulLayoutView):
 
 > Declare `session_limit` on any view class to cap active instances per user, guild, or globally. The old panel is automatically exited when a new one opens.
 
-<div align="center">
-  <img src="https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-session-limiting.gif" alt="V2 Session Limiting" width="600">
-</div>
+![V2 Session Limiting](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-session-limiting.gif)
 
 ```python
 class DashboardView(TabLayoutView):
@@ -252,9 +244,7 @@ Works with both V2 and V1 views. Use `session_policy = "reject"` to block the se
 
 > Snapshot-based undo/redo per view session. Two class attributes and you get full state history.
 
-<div align="center">
-  <img src="https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-undo-redo.gif" alt="Undo/Redo" width="600">
-</div>
+![Undo/Redo](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-undo-redo.gif)
 
 ```python
 class NotificationsView(StatefulLayoutView):
@@ -282,9 +272,7 @@ The `UndoMiddleware` captures application state snapshots before each reducer ru
 
 > Build paginated views from raw data with `from_data()`. Pages are V2 containers with accent colors. Navigation includes jump buttons and a go-to-page modal when the page count exceeds the threshold.
 
-<div align="center">
-  <img src="https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-pagination.gif" alt="Pagination" width="600">
-</div>
+![Pagination](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-pagination.gif)
 
 ```python
 from cascadeui import PaginatedLayoutView
@@ -325,9 +313,7 @@ async def setup_hook(self):
 
 > Post a panel once and it stays interactive forever. The bot restarts, the buttons still work. No need to re-send.
 
-<div align="center">
-  <img src="https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-persistence-restart.gif" alt="View Persistence" width="600">
-</div>
+![View Persistence](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-persistence-restart.gif)
 
 ```python
 from cascadeui import PersistentLayoutView, StatefulButton
@@ -354,9 +340,7 @@ await view.send()
 
 > State is saved to disk automatically and restored when the command is invoked again. Close the bot, restart, run the command, and your previous data is still there.
 
-<div align="center">
-  <img src="https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-persistence-data.gif" alt="Data Persistence" width="600">
-</div>
+![Data Persistence](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-persistence-data.gif)
 
 ```python
 from cascadeui import StatefulLayoutView, setup_persistence
@@ -381,9 +365,7 @@ Both `PersistentLayoutView` (V2) and `PersistentView` (V1) use the same persiste
 
 > Field definitions produce select menus and boolean toggles automatically. Validation runs on submit with per-field error reporting.
 
-<div align="center">
-  <img src="https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-form.gif" alt="Forms" width="600">
-</div>
+![Forms](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-form.gif)
 
 ```python
 from cascadeui import FormLayoutView, choices
@@ -407,9 +389,7 @@ class FeedbackForm(FormLayoutView):
 
 > Step-by-step flows with validation gates. Users can't proceed until required fields are filled. Each step builds its own V2 component tree.
 
-<div align="center">
-  <img src="https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-wizard.gif" alt="Wizard" width="600">
-</div>
+![Wizard](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-wizard.gif)
 
 ```python
 from cascadeui import WizardLayoutView, card
@@ -459,9 +439,7 @@ set_default_theme("custom")
 
 > A full support ticket system combining PersistentView, Modal with validation, PaginatedView, custom reducers, state selectors, and theming in a single cog.
 
-<div align="center">
-  <img src="https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v1-ticket-system.gif" alt="Ticket System" width="600">
-</div>
+![Ticket System](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v1-ticket-system.gif)
 
 [View full example](examples/ticket_system.py)
 
@@ -471,9 +449,7 @@ set_default_theme("custom")
 
 CascadeUI fully supports V1 components (View + Embeds). V1 is not deprecated -- use it when you need embed formatting (inline fields, author/footer/timestamp) or prefer the traditional layout. Every feature above (navigation, session limiting, persistence, undo/redo, theming) works identically with V1 views.
 
-<div align="center">
-  <img src="https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v1-navigation.gif" alt="V1 Navigation" width="600">
-</div>
+![V1 Navigation](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v1-navigation.gif)
 
 V1 equivalents: `StatefulView`, `FormView`, `PaginatedView`, `TabView`, `WizardView`, `PersistentView`.
 
