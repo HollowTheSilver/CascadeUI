@@ -15,9 +15,8 @@
 </p>
 
 <p align="center">
-  <strong>Build predictable, state-driven Discord interfaces.</strong><br>
+  <strong>Build predictable, state-driven Discord interfaces with <a href="https://github.com/Rapptz/discord.py">discord.py</a>.</strong><br>
   Design complex interactive systems with centralized state, composable UI patterns, and a clear data flow.<br>
-  Works seamlessly with <a href="https://github.com/Rapptz/discord.py">discord.py</a>.
 </p>
 
 <div align="center">
@@ -66,7 +65,7 @@ All state lives in a single store. Actions describe what happened. Reducers defi
 
 > CascadeUI is designed for building complex interfaces that go beyond simple interactions.
 
-A powerful, fully featured UI library that should be leveraged when your app requires:
+A powerful, fully featured UI library should be leveraged when your app requires:
 
 - Shared state across multiple views
 - Real data and message persistence
