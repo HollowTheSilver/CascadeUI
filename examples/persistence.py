@@ -1,4 +1,3 @@
-
 # // ========================================( Modules )======================================== // #
 
 
@@ -8,8 +7,12 @@ from discord.ext import commands
 from discord.ext.commands import Context
 
 from cascadeui import (
-    StatefulView, StatefulButton, PersistentView,
-    get_store, cascade_reducer, setup_persistence,
+    StatefulView,
+    StatefulButton,
+    PersistentView,
+    get_store,
+    cascade_reducer,
+    setup_persistence,
 )
 from cascadeui.persistence import SQLiteBackend
 
@@ -61,18 +64,27 @@ class PersistentCounterView(StatefulView):
         counters = store.state.get("application", {}).get("counters", {})
         self.counter = counters.get(self.state_key, 0)
 
-        self.add_item(StatefulButton(
-            label="Increment", style=discord.ButtonStyle.primary,
-            callback=self.increment,
-        ))
-        self.add_item(StatefulButton(
-            label="Decrement", style=discord.ButtonStyle.danger,
-            callback=self.decrement,
-        ))
-        self.add_item(StatefulButton(
-            label="Reset", style=discord.ButtonStyle.secondary,
-            callback=self.reset,
-        ))
+        self.add_item(
+            StatefulButton(
+                label="Increment",
+                style=discord.ButtonStyle.primary,
+                callback=self.increment,
+            )
+        )
+        self.add_item(
+            StatefulButton(
+                label="Decrement",
+                style=discord.ButtonStyle.danger,
+                callback=self.decrement,
+            )
+        )
+        self.add_item(
+            StatefulButton(
+                label="Reset",
+                style=discord.ButtonStyle.secondary,
+                callback=self.reset,
+            )
+        )
         self.add_exit_button()
 
     async def increment(self, interaction):
@@ -95,10 +107,13 @@ class PersistentCounterView(StatefulView):
 
     async def _sync_state(self):
         """Push the current counter value into the state store."""
-        await self.dispatch("PERSISTENT_COUNTER_UPDATED", {
-            "state_key": self.state_key,
-            "counter": self.counter,
-        })
+        await self.dispatch(
+            "PERSISTENT_COUNTER_UPDATED",
+            {
+                "state_key": self.state_key,
+                "counter": self.counter,
+            },
+        )
 
     async def update_ui(self):
         embed = discord.Embed(
@@ -106,13 +121,12 @@ class PersistentCounterView(StatefulView):
             description=f"Current value: {self.counter}",
             color=discord.Color.blue() if self.counter >= 0 else discord.Color.red(),
         )
-        embed.set_footer(text=f"SQLite-backed | Last updated: {datetime.now().strftime('%H:%M:%S')}")
+        embed.set_footer(
+            text=f"SQLite-backed | Last updated: {datetime.now().strftime('%H:%M:%S')}"
+        )
 
         if self.message:
             await self.message.edit(embed=embed, view=self)
-
-    async def update_from_state(self, state):
-        pass
 
 
 class RoleSelectorView(PersistentView):
@@ -133,28 +147,36 @@ class RoleSelectorView(PersistentView):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.add_item(StatefulButton(
-            label="Get Role", style=discord.ButtonStyle.primary,
-            custom_id="role_selector:get_role",
-            callback=self.toggle_role,
-        ))
-        self.add_item(StatefulButton(
-            label="View Info", style=discord.ButtonStyle.secondary,
-            custom_id="role_selector:info",
-            callback=self.show_info,
-        ))
+        self.add_item(
+            StatefulButton(
+                label="Get Role",
+                style=discord.ButtonStyle.primary,
+                custom_id="role_selector:get_role",
+                callback=self.toggle_role,
+            )
+        )
+        self.add_item(
+            StatefulButton(
+                label="View Info",
+                style=discord.ButtonStyle.secondary,
+                custom_id="role_selector:info",
+                callback=self.show_info,
+            )
+        )
 
     async def toggle_role(self, interaction: discord.Interaction):
         if interaction.guild is None:
             await interaction.response.send_message(
-                "This can only be used in a server.", ephemeral=True,
+                "This can only be used in a server.",
+                ephemeral=True,
             )
             return
 
         role = interaction.guild.get_role(self.ROLE_ID)
         if role is None:
             await interaction.response.send_message(
-                "Role not found. An admin needs to update the ROLE_ID.", ephemeral=True,
+                "Role not found. An admin needs to update the ROLE_ID.",
+                ephemeral=True,
             )
             return
 
@@ -168,7 +190,8 @@ class RoleSelectorView(PersistentView):
 
     async def show_info(self, interaction: discord.Interaction):
         await interaction.response.send_message(
-            "Click **Get Role** to toggle the role on or off.", ephemeral=True,
+            "Click **Get Role** to toggle the role on or off.",
+            ephemeral=True,
         )
 
     async def on_restore(self, bot):
@@ -195,8 +218,7 @@ class PersistenceExample(commands.Cog, name="persistence_example"):
         self.bot = bot
 
     @commands.hybrid_command(
-        name="pcounter",
-        description="Display a persistent counter backed by SQLite."
+        name="pcounter", description="Display a persistent counter backed by SQLite."
     )
     async def pcounter(self, context: Context) -> None:
         # state_key scopes data by user -- each user gets their own counter
@@ -217,8 +239,7 @@ class PersistenceExample(commands.Cog, name="persistence_example"):
         await view.send(embed=embed)
 
     @commands.hybrid_command(
-        name="setup_roles",
-        description="Post a role selector panel (admin only, runs once)."
+        name="setup_roles", description="Post a role selector panel (admin only, runs once)."
     )
     @commands.has_permissions(manage_roles=True)
     async def setup_roles(self, context: Context) -> None:

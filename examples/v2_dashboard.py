@@ -241,9 +241,6 @@ class DashboardView(TabLayoutView):
 
         return [info, gap(), tech, self._exit_row()]
 
-    async def update_from_state(self, state):
-        pass
-
 
 # // ========================================( Cog )======================================== // #
 

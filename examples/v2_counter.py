@@ -150,9 +150,6 @@ class V2CounterView(StatefulLayoutView):
         if self.message:
             await self.message.edit(view=self)
 
-    async def update_from_state(self, state):
-        pass
-
 
 # // ========================================( Cog )======================================== // #
 

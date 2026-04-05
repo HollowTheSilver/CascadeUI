@@ -150,9 +150,6 @@ class TabLayoutView(StatefulLayoutView):
         self._active_tab = index
         await self._refresh_tabs()
 
-    async def update_from_state(self, state):
-        pass
-
 
 # // ========================================( WizardLayoutView )======================================== // #
 
@@ -337,6 +334,3 @@ class WizardLayoutView(StatefulLayoutView):
     @property
     def step_count(self) -> int:
         return len(self._steps)
-
-    async def update_from_state(self, state):
-        pass

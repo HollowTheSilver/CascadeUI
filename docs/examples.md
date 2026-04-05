@@ -58,6 +58,12 @@ SQLite-backed data persistence and `PersistentLayoutView` that survives bot rest
 
 **Commands:** `/v2pcounter`, `/v2roles`
 
+### v2_tictactoe.py
+
+Two-player TicTacToe demonstrating multi-user interaction patterns. Features a challenge acceptance flow (opponent must accept before the game starts), dynamic board size (3x3 to 5x5), configurable win length (e.g. 3-in-a-row on a 5x5 board), Discord mentions, mutual rematch agreement (both players must confirm), forfeit tracking, and participant-aware session limiting via `register_participant()`. Uses `allowed_users` for restricting interaction to the two players and a custom reducer for tracking game statistics.
+
+**Command:** `/tictactoe @user [size] [win]`
+
 ---
 
 ## V1 Examples (Classic)
@@ -142,6 +148,7 @@ class MyBot(commands.Bot):
         await self.load_extension("examples.v2_pagination")
         await self.load_extension("examples.v2_wizard")
         await self.load_extension("examples.v2_persistence")
+        await self.load_extension("examples.v2_tictactoe")
 
         # V1 examples
         await self.load_extension("examples.counter")

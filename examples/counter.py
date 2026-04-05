@@ -1,4 +1,3 @@
-
 # // ========================================( Modules )======================================== // #
 
 
@@ -28,23 +27,21 @@ class CounterView(StatefulView):
         self.counter = 0
 
         # Add buttons
-        self.add_item(StatefulButton(
-            label="Increment",
-            style=discord.ButtonStyle.primary,
-            callback=self.increment
-        ))
+        self.add_item(
+            StatefulButton(
+                label="Increment", style=discord.ButtonStyle.primary, callback=self.increment
+            )
+        )
 
-        self.add_item(StatefulButton(
-            label="Decrement",
-            style=discord.ButtonStyle.danger,
-            callback=self.decrement
-        ))
+        self.add_item(
+            StatefulButton(
+                label="Decrement", style=discord.ButtonStyle.danger, callback=self.decrement
+            )
+        )
 
-        self.add_item(StatefulButton(
-            label="Reset",
-            style=discord.ButtonStyle.secondary,
-            callback=self.reset
-        ))
+        self.add_item(
+            StatefulButton(label="Reset", style=discord.ButtonStyle.secondary, callback=self.reset)
+        )
 
         self.add_exit_button()
 
@@ -52,30 +49,21 @@ class CounterView(StatefulView):
         """Increment the counter with immediate UI update."""
         await interaction.response.defer()
         self.counter += 1
-        await self.dispatch("COUNTER_UPDATED", {
-            "view_id": self.id,
-            "counter": self.counter
-        })
+        await self.dispatch("COUNTER_UPDATED", {"view_id": self.id, "counter": self.counter})
         await self.update_ui()
 
     async def decrement(self, interaction):
         """Decrement the counter with immediate UI update."""
         await interaction.response.defer()
         self.counter -= 1
-        await self.dispatch("COUNTER_UPDATED", {
-            "view_id": self.id,
-            "counter": self.counter
-        })
+        await self.dispatch("COUNTER_UPDATED", {"view_id": self.id, "counter": self.counter})
         await self.update_ui()
 
     async def reset(self, interaction):
         """Reset the counter to zero."""
         await interaction.response.defer()
         self.counter = 0
-        await self.dispatch("COUNTER_UPDATED", {
-            "view_id": self.id,
-            "counter": self.counter
-        })
+        await self.dispatch("COUNTER_UPDATED", {"view_id": self.id, "counter": self.counter})
         await self.update_ui()
 
     async def update_ui(self):
@@ -83,16 +71,12 @@ class CounterView(StatefulView):
         embed = discord.Embed(
             title="Fast Counter",
             description=f"Current value: {self.counter}",
-            color=discord.Color.blue() if self.counter >= 0 else discord.Color.red()
+            color=discord.Color.blue() if self.counter >= 0 else discord.Color.red(),
         )
         embed.set_footer(text=f"Last updated: {datetime.now().strftime('%H:%M:%S')}")
 
         if self.message:
             await self.message.edit(embed=embed, view=self)
-
-    # Override to do nothing since we update manually
-    async def update_from_state(self, state):
-        pass
 
 
 # Create a custom reducer for the counter
@@ -127,17 +111,14 @@ class CounterExample(commands.Cog, name="counter_example"):
         self.bot = bot
 
     @commands.hybrid_command(
-        name="counter",
-        description="Display an interactive counter example user interface."
+        name="counter", description="Display an interactive counter example user interface."
     )
     async def counter(self, context: Context) -> None:
         """Display an interactive counter view."""
         view = CounterView(context=context)
 
         embed = discord.Embed(
-            title="Counter Example",
-            description="Current value: 0",
-            color=discord.Color.blue()
+            title="Counter Example", description="Current value: 0", color=discord.Color.blue()
         )
 
         # Use the new send() API for proper state registration

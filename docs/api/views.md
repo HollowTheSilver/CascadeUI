@@ -80,9 +80,17 @@ Called when a matching state change occurs. Override to react to state updates.
 
 Returns a slice of state. If the return value hasn't changed, `update_from_state` won't fire.
 
+#### `register_participant(user_id)`
+
+Registers a non-owner user in the session index so that `session_limit` applies to them. Call after `send()` succeeds. Raises `SessionLimitError` (with `blocked_user_id` set) if the participant already has an active session of the same view type. Skips silently if `user_id` matches the view owner.
+
+#### `unregister_participant(user_id)`
+
+Removes a participant from the session index. Use when a participant leaves a multi-user view (e.g., a player disconnects mid-game).
+
 #### `interaction_check(interaction)` *(override)*
 
-Called before every component callback. Returns `True` to allow, `False` to block. By default, rejects non-owners with an ephemeral message when `owner_only` is `True`.
+Called before every component callback. Returns `True` to allow, `False` to block. By default, checks `allowed_users` first (if set), then falls back to `owner_only`.
 
 ### Shared Properties
 
@@ -105,6 +113,7 @@ Called before every component callback. Returns `True` to allow, `False` to bloc
 - `session_policy` (str): What to do when the limit is exceeded. `"replace"` (default) exits the oldest instances. `"reject"` raises `SessionLimitError`.
 - `owner_only` (bool): Only the creating user can interact with the view (default: `True`). Set to `False` for shared views.
 - `owner_only_message` (str): Ephemeral message sent to non-owners (default: `"You cannot interact with this."`).
+- `allowed_users` (set[int] | None): When set, only these user IDs can interact. Overrides `owner_only` completely. `None` (default) defers to `owner_only`. Supports runtime mutation (e.g., `view.allowed_users.add(user_id)`).
 - `auto_defer` (bool): Enable the auto-defer safety net (default: `True`).
 - `auto_defer_delay` (float): Seconds before auto-deferring (default: `2.5`).
 - `serialize_interactions` (bool): Serialize rapid button clicks with an `asyncio.Lock` (default: `True`). Set to `False` for views that handle parallel callbacks.
@@ -366,7 +375,7 @@ Returns a dict: `{"restored": [...], "skipped": [...], "failed": [...], "removed
 
 ## `SessionLimitError`
 
-Exception raised when `send()` is blocked by session limiting.
+Exception raised when a session limit is reached.
 
 ```python
 from cascadeui import SessionLimitError
@@ -376,8 +385,10 @@ from cascadeui import SessionLimitError
 
 - `view_type` (str): The class name of the view that hit the limit
 - `limit` (int): The session limit value that was exceeded
+- `blocked_user_id` (int | None): The user ID that was blocked. Set when raised by `register_participant()`, `None` when raised by `send()`.
 
 ### When it is raised
 
 - **Reject policy**: Always raised when a new view would exceed `session_limit` with `session_policy = "reject"`.
 - **PersistentView protection**: Raised when a non-persistent view attempts to replace a `PersistentView` under the replace policy.
+- **Participant registration**: Raised by `register_participant()` when the participant already has an active session of the same view type. Always uses reject semantics (never exits someone else's view).

@@ -1,13 +1,13 @@
 """Tests for session limiting: registry, enforcement, scope isolation, and cleanup."""
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from cascadeui.views.base import StatefulView, SessionLimitError
-from cascadeui.views.persistent import PersistentView
-from cascadeui.state.singleton import get_store
+import pytest
 from helpers import make_interaction as _make_interaction
 
+from cascadeui.state.singleton import get_store
+from cascadeui.views.base import SessionLimitError, StatefulView
+from cascadeui.views.persistent import PersistentView
 
 # // ========================================( Default Behavior )======================================== // #
 
@@ -437,3 +437,210 @@ class TestNavigationChainTracking:
         assert dest._session_origin is None
         assert len(store.get_active_views("_DestView", "user_guild:100:200")) == 1
         assert len(store.get_active_views("_SourceView", "user_guild:100:200")) == 0
+
+
+# // ========================================( Participant Sessions )======================================== // #
+
+
+class TestParticipantSessions:
+
+    # -- Registration --
+
+    async def test_register_participant_adds_to_index(self):
+        """Registering a participant should add their scope key to the session index."""
+
+        class _GameView(StatefulView):
+            session_limit = 1
+            session_scope = "user_guild"
+
+        store = get_store()
+        view = _GameView(interaction=_make_interaction(user_id=100, guild_id=200))
+        await view.send()
+
+        await view.register_participant(300)
+
+        # Participant's scope key should be in the index
+        assert len(store.get_active_views("_GameView", "user_guild:300:200")) == 1
+        assert 300 in view._participants
+
+    async def test_register_participant_skips_owner(self):
+        """Registering the owner's own ID should be a no-op."""
+
+        class _GameView(StatefulView):
+            session_limit = 1
+            session_scope = "user_guild"
+
+        store = get_store()
+        view = _GameView(interaction=_make_interaction(user_id=100, guild_id=200))
+        await view.send()
+
+        await view.register_participant(100)
+
+        # Owner is not in _participants (tracked via register_view instead)
+        assert 100 not in view._participants
+        # Only one entry under the owner's scope key (the view itself)
+        assert len(store.get_active_views("_GameView", "user_guild:100:200")) == 1
+
+    # -- Cleanup --
+
+    async def test_unregister_view_cleans_participant_keys(self):
+        """unregister_view should remove all participant scope keys."""
+
+        class _GameView(StatefulView):
+            session_limit = 1
+            session_scope = "user_guild"
+
+        store = get_store()
+        view = _GameView(interaction=_make_interaction(user_id=100, guild_id=200))
+        await view.send()
+        await view.register_participant(300)
+        await view.register_participant(400)
+
+        # Both participant scope keys should exist
+        assert len(store.get_active_views("_GameView", "user_guild:300:200")) == 1
+        assert len(store.get_active_views("_GameView", "user_guild:400:200")) == 1
+
+        store.unregister_view(view.id)
+
+        # All scope keys gone (owner + both participants)
+        assert len(store.get_active_views("_GameView", "user_guild:100:200")) == 0
+        assert len(store.get_active_views("_GameView", "user_guild:300:200")) == 0
+        assert len(store.get_active_views("_GameView", "user_guild:400:200")) == 0
+
+    async def test_unregister_participant_individual(self):
+        """Removing one participant should leave others intact."""
+
+        class _GameView(StatefulView):
+            session_limit = 1
+            session_scope = "user_guild"
+
+        store = get_store()
+        view = _GameView(interaction=_make_interaction(user_id=100, guild_id=200))
+        await view.send()
+        await view.register_participant(300)
+        await view.register_participant(400)
+
+        view.unregister_participant(300)
+
+        assert 300 not in view._participants
+        assert 400 in view._participants
+        assert len(store.get_active_views("_GameView", "user_guild:300:200")) == 0
+        assert len(store.get_active_views("_GameView", "user_guild:400:200")) == 1
+
+    # -- Blocking --
+
+    async def test_participant_blocks_new_owner_session(self):
+        """A user who is a participant in game 1 should be blocked from creating game 2."""
+
+        class _GameView(StatefulView):
+            session_limit = 1
+            session_scope = "user_guild"
+
+        store = get_store()
+        # Game 1: owner=100, participant=300
+        game1 = _GameView(interaction=_make_interaction(user_id=100, guild_id=200))
+        await game1.send()
+        await game1.register_participant(300)
+
+        # User 300 tries to create their own game (as owner)
+        game2 = _GameView(interaction=_make_interaction(user_id=300, guild_id=200))
+        with pytest.raises(SessionLimitError):
+            await game2.send()
+
+    async def test_participant_blocks_joining_another(self):
+        """A participant in game 1 should be blocked from joining game 2."""
+
+        class _GameView(StatefulView):
+            session_limit = 1
+            session_scope = "user_guild"
+
+        store = get_store()
+        # Game 1: owner=100, participant=300
+        game1 = _GameView(interaction=_make_interaction(user_id=100, guild_id=200))
+        await game1.send()
+        await game1.register_participant(300)
+
+        # Game 2: owner=400, tries to add participant=300
+        game2 = _GameView(interaction=_make_interaction(user_id=400, guild_id=200))
+        await game2.send()
+
+        with pytest.raises(SessionLimitError) as exc_info:
+            await game2.register_participant(300)
+
+        assert exc_info.value.blocked_user_id == 300
+
+    # -- Navigation propagation --
+
+    async def test_navigate_propagates_participants(self):
+        """push() should carry participants to the new view."""
+
+        class _GameView(StatefulView):
+            session_limit = 1
+            session_scope = "user_guild"
+
+        class _SubView(StatefulView):
+            session_scope = "user_guild"
+
+        store = get_store()
+        root = _GameView(interaction=_make_interaction(user_id=100, guild_id=200))
+        await root.send()
+        await root.register_participant(300)
+
+        child = await root.push(_SubView)
+
+        assert 300 in child._participants
+        # Participant scope key should exist under the child view
+        assert len(store.get_active_views("_GameView", "user_guild:300:200")) == 1
+
+    async def test_replace_does_not_propagate_participants(self):
+        """replace() should not carry participants to the destination view."""
+
+        class _GameView(StatefulView):
+            session_limit = 1
+            session_scope = "user_guild"
+
+        class _ResultView(StatefulView):
+            session_scope = "user_guild"
+
+        store = get_store()
+        game = _GameView(interaction=_make_interaction(user_id=100, guild_id=200))
+        await game.send()
+        await game.register_participant(300)
+
+        dest = await game.replace(_ResultView)
+
+        assert 300 not in dest._participants
+        # Participant's scope key should be cleaned up (game was unregistered)
+        assert len(store.get_active_views("_GameView", "user_guild:300:200")) == 0
+
+    # -- Scope edge cases --
+
+    async def test_guild_scope_skips_participant_index(self):
+        """Guild scope uses guild_id only, so participant index entries are skipped."""
+
+        class _GuildView(StatefulView):
+            session_limit = 1
+            session_scope = "guild"
+
+        store = get_store()
+        view = _GuildView(interaction=_make_interaction(user_id=100, guild_id=200))
+        await view.send()
+        await view.register_participant(300)
+
+        # Participant is tracked on the view for propagation
+        assert 300 in view._participants
+        # But only one entry in the session index (the owner's, not duplicated)
+        guild_views = store.get_active_views("_GuildView", "guild:200")
+        assert len(guild_views) == 1
+
+    async def test_session_limit_error_blocked_user_id(self):
+        """SessionLimitError should carry the blocked_user_id when raised by register_participant."""
+        error = SessionLimitError("TestView", 1, blocked_user_id=999)
+        assert error.view_type == "TestView"
+        assert error.limit == 1
+        assert error.blocked_user_id == 999
+
+    async def test_session_limit_error_no_blocked_user_id(self):
+        """SessionLimitError from send() should have blocked_user_id=None (backwards compat)."""
+        error = SessionLimitError("TestView", 1)
+        assert error.blocked_user_id is None

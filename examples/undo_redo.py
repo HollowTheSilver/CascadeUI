@@ -1,4 +1,3 @@
-
 # // ========================================( Modules )======================================== // #
 
 
@@ -7,8 +6,11 @@ from discord.ext import commands
 from discord.ext.commands import Context
 
 from cascadeui import (
-    StatefulView, StatefulButton, get_store,
-    cascade_reducer, UndoMiddleware,
+    StatefulView,
+    StatefulButton,
+    get_store,
+    cascade_reducer,
+    UndoMiddleware,
 )
 
 import logging
@@ -49,22 +51,36 @@ class UndoCounterView(StatefulView):
         store = get_store()
         self.counter = store.state.get("application", {}).get("undo_counter", 0)
 
-        self.add_item(StatefulButton(
-            label="+1", style=discord.ButtonStyle.primary,
-            callback=self.increment,
-        ))
-        self.add_item(StatefulButton(
-            label="-1", style=discord.ButtonStyle.danger,
-            callback=self.decrement,
-        ))
-        self.add_item(StatefulButton(
-            label="Undo", style=discord.ButtonStyle.secondary,
-            emoji="↩", callback=self.do_undo,
-        ))
-        self.add_item(StatefulButton(
-            label="Redo", style=discord.ButtonStyle.secondary,
-            emoji="↪", callback=self.do_redo,
-        ))
+        self.add_item(
+            StatefulButton(
+                label="+1",
+                style=discord.ButtonStyle.primary,
+                callback=self.increment,
+            )
+        )
+        self.add_item(
+            StatefulButton(
+                label="-1",
+                style=discord.ButtonStyle.danger,
+                callback=self.decrement,
+            )
+        )
+        self.add_item(
+            StatefulButton(
+                label="Undo",
+                style=discord.ButtonStyle.secondary,
+                emoji="↩",
+                callback=self.do_undo,
+            )
+        )
+        self.add_item(
+            StatefulButton(
+                label="Redo",
+                style=discord.ButtonStyle.secondary,
+                emoji="↪",
+                callback=self.do_redo,
+            )
+        )
         self.add_exit_button()
 
     async def increment(self, interaction):
@@ -110,9 +126,6 @@ class UndoCounterView(StatefulView):
         if self.message:
             await self.message.edit(embed=embed, view=self)
 
-    async def update_from_state(self, state):
-        pass
-
 
 # // ========================================( Cog )======================================== // #
 
@@ -123,10 +136,7 @@ class UndoRedoExample(commands.Cog, name="undo_redo_example"):
     def __init__(self, bot) -> None:
         self.bot = bot
 
-    @commands.hybrid_command(
-        name="undotest",
-        description="Counter with undo/redo support."
-    )
+    @commands.hybrid_command(name="undotest", description="Counter with undo/redo support.")
     async def undotest(self, context: Context) -> None:
         view = UndoCounterView(context=context)
 

@@ -107,9 +107,6 @@ class TabView(StatefulView):
         self._active_tab = index
         await self._refresh_tabs()
 
-    async def update_from_state(self, state):
-        pass
-
 
 # // ========================================( WizardView )======================================== // #
 
@@ -249,6 +246,3 @@ class WizardView(StatefulView):
     @property
     def step_count(self) -> int:
         return len(self._steps)
-
-    async def update_from_state(self, state):
-        pass

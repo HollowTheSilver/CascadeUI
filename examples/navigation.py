@@ -1,4 +1,3 @@
-
 # // ========================================( Modules )======================================== // #
 
 
@@ -25,14 +24,22 @@ class MainMenuView(StatefulView):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.add_item(StatefulButton(
-            label="Settings", style=discord.ButtonStyle.primary,
-            emoji="⚙", callback=self.go_settings,
-        ))
-        self.add_item(StatefulButton(
-            label="About", style=discord.ButtonStyle.secondary,
-            emoji="ℹ", callback=self.go_about,
-        ))
+        self.add_item(
+            StatefulButton(
+                label="Settings",
+                style=discord.ButtonStyle.primary,
+                emoji="⚙",
+                callback=self.go_settings,
+            )
+        )
+        self.add_item(
+            StatefulButton(
+                label="About",
+                style=discord.ButtonStyle.secondary,
+                emoji="ℹ",
+                callback=self.go_about,
+            )
+        )
         self.add_exit_button()
 
     def build_embed(self):
@@ -48,9 +55,6 @@ class MainMenuView(StatefulView):
     async def go_about(self, interaction):
         await self.push(AboutView, interaction, rebuild=lambda v: {"embed": v.build_embed()})
 
-    async def update_from_state(self, state):
-        pass
-
 
 class SettingsView(StatefulView):
     """Settings view with a toggle and deeper navigation."""
@@ -61,18 +65,30 @@ class SettingsView(StatefulView):
         super().__init__(*args, **kwargs)
         self._dark_mode = False
 
-        self.add_item(StatefulButton(
-            label="Toggle Dark Mode", style=discord.ButtonStyle.primary,
-            callback=self.toggle_dark,
-        ))
-        self.add_item(StatefulButton(
-            label="Go Deeper", style=discord.ButtonStyle.secondary,
-            emoji="⏩", callback=self.go_nested,
-        ))
-        self.add_item(StatefulButton(
-            label="Back", style=discord.ButtonStyle.secondary,
-            emoji="◀", row=4, callback=self.go_back,
-        ))
+        self.add_item(
+            StatefulButton(
+                label="Toggle Dark Mode",
+                style=discord.ButtonStyle.primary,
+                callback=self.toggle_dark,
+            )
+        )
+        self.add_item(
+            StatefulButton(
+                label="Go Deeper",
+                style=discord.ButtonStyle.secondary,
+                emoji="⏩",
+                callback=self.go_nested,
+            )
+        )
+        self.add_item(
+            StatefulButton(
+                label="Back",
+                style=discord.ButtonStyle.secondary,
+                emoji="◀",
+                row=4,
+                callback=self.go_back,
+            )
+        )
 
     def build_embed(self):
         status = "ON" if self._dark_mode else "OFF"
@@ -92,9 +108,6 @@ class SettingsView(StatefulView):
     async def go_back(self, interaction):
         await self.pop(interaction, rebuild=lambda v: {"embed": v.build_embed()})
 
-    async def update_from_state(self, state):
-        pass
-
 
 class NestedView(StatefulView):
     """A deeply nested view to test multi-level push/pop."""
@@ -104,10 +117,15 @@ class NestedView(StatefulView):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.add_item(StatefulButton(
-            label="Back", style=discord.ButtonStyle.secondary,
-            emoji="◀", row=4, callback=self.go_back,
-        ))
+        self.add_item(
+            StatefulButton(
+                label="Back",
+                style=discord.ButtonStyle.secondary,
+                emoji="◀",
+                row=4,
+                callback=self.go_back,
+            )
+        )
 
     def build_embed(self):
         return discord.Embed(
@@ -119,9 +137,6 @@ class NestedView(StatefulView):
     async def go_back(self, interaction):
         await self.pop(interaction, rebuild=lambda v: {"embed": v.build_embed()})
 
-    async def update_from_state(self, state):
-        pass
-
 
 class AboutView(StatefulView):
     """Simple about page pushed from the main menu."""
@@ -131,10 +146,15 @@ class AboutView(StatefulView):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.add_item(StatefulButton(
-            label="Back", style=discord.ButtonStyle.secondary,
-            emoji="◀", row=4, callback=self.go_back,
-        ))
+        self.add_item(
+            StatefulButton(
+                label="Back",
+                style=discord.ButtonStyle.secondary,
+                emoji="◀",
+                row=4,
+                callback=self.go_back,
+            )
+        )
 
     def build_embed(self):
         return discord.Embed(
@@ -163,10 +183,7 @@ class NavigationExample(commands.Cog, name="navigation_example"):
     def __init__(self, bot) -> None:
         self.bot = bot
 
-    @commands.hybrid_command(
-        name="navtest",
-        description="Navigation stack demo with push/pop."
-    )
+    @commands.hybrid_command(name="navtest", description="Navigation stack demo with push/pop.")
     async def navtest(self, context: Context) -> None:
         view = MainMenuView(context=context)
         await view.send(embed=view.build_embed())

@@ -343,6 +343,30 @@ class PollView(StatefulLayoutView):
 
 `PersistentView` and `PersistentLayoutView` default to `owner_only = False` since persistent views are typically shared panels.
 
+#### Multi-User Access Control
+
+For views shared between specific users (games, collaborative tools), set `allowed_users` to a set of user IDs. This overrides `owner_only` completely:
+
+```python
+class GameView(StatefulLayoutView):
+    owner_only_message = "You're not part of this game."
+    session_limit = 1
+
+    def __init__(self, *args, opponent_id: int, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.allowed_users = {self.user_id, opponent_id}
+```
+
+You can mutate `allowed_users` at runtime (e.g., `view.allowed_users.add(new_player_id)`) for join-in-progress patterns.
+
+To make session limiting apply to all participants (not just the view owner), register them after sending:
+
+```python
+view = GameView(context=ctx, opponent_id=opponent.id)
+await view.send()
+await view.register_participant(opponent.id)  # Raises SessionLimitError if they're in a game
+```
+
 #### Custom Access Control
 
 Override `interaction_check()` for role-based or other advanced access logic:
@@ -622,9 +646,15 @@ except SessionLimitError:
 
 `PersistentView` and `PersistentLayoutView` instances are protected from being replaced by non-persistent views. If a regular view tries to replace a persistent one, `SessionLimitError` is raised instead. Persistent views can replace other persistent views of the same type.
 
+### Participants and Multi-User Views
+
+By default, session limiting only tracks the view owner. For multi-user views (games, polls), call `register_participant(user_id)` after `send()` to add non-owner users to the session index. This prevents a participant from being in two games at once, for example.
+
+Participant enforcement always uses reject semantics. The replace policy only targets views owned by the current user, never views where they are just a participant.
+
 ### Interaction with Other Features
 
-- **Navigation stack**: Sub-views count against the root view's session limit. Replacing exits the entire navigation chain.
+- **Navigation stack**: Sub-views count against the root view's session limit. Replacing exits the entire navigation chain. Participants propagate through push/pop but not replace.
 - **Persistence**: Restored persistent views are session-indexed using saved identity, so limits work correctly after restart.
 - **Undo/redo**: When replace policy exits an old view, its undo history is discarded.
 

@@ -62,11 +62,14 @@ logger = logging.getLogger(__name__)
 # // ========================================( Theme )======================================== // #
 
 
-support_theme = Theme("support", {
-    "primary_color": discord.Color.from_rgb(88, 101, 242),
-    "header_emoji": "\N{TICKET}",
-    "footer_text": "Support Tickets",
-})
+support_theme = Theme(
+    "support",
+    {
+        "primary_color": discord.Color.from_rgb(88, 101, 242),
+        "header_emoji": "\N{TICKET}",
+        "footer_text": "Support Tickets",
+    },
+)
 
 
 # // ========================================( Reducers )======================================== // #
@@ -132,7 +135,8 @@ def _get_guild_tickets(guild_id):
 def _get_user_open_tickets(guild_id, user_id):
     """Get open tickets authored by a specific user in a guild."""
     return [
-        t for t in _get_guild_tickets(guild_id)
+        t
+        for t in _get_guild_tickets(guild_id)
         if t["author_id"] == user_id and t["status"] == "open"
     ]
 
@@ -216,14 +220,17 @@ class CreateTicketModal(Modal):
 
     async def _on_submit(self, interaction, values):
         store = get_store()
-        await store.dispatch("TICKET_CREATED", {
-            "guild_id": self._guild_id,
-            "author_id": self._user_id,
-            "subject": values["input_subject"],
-            "description": values["input_description"],
-            "priority": values["input_priority"].lower(),
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        })
+        await store.dispatch(
+            "TICKET_CREATED",
+            {
+                "guild_id": self._guild_id,
+                "author_id": self._user_id,
+                "subject": values["input_subject"],
+                "description": values["input_description"],
+                "priority": values["input_priority"].lower(),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
 
         # Find the ticket ID that was just created
         counter = store.state.get("application", {}).get("ticket_counter", {})
@@ -254,13 +261,15 @@ class TicketDetailView(StatefulView):
         super().__init__(*args, **kwargs)
         self._ticket = ticket or {}
 
-        self.add_item(StatefulButton(
-            label="Close This Ticket",
-            style=discord.ButtonStyle.danger,
-            emoji="\N{CROSS MARK}",
-            disabled=self._ticket.get("status") != "open",
-            callback=self.close_this_ticket,
-        ))
+        self.add_item(
+            StatefulButton(
+                label="Close This Ticket",
+                style=discord.ButtonStyle.danger,
+                emoji="\N{CROSS MARK}",
+                disabled=self._ticket.get("status") != "open",
+                callback=self.close_this_ticket,
+            )
+        )
         self.add_exit_button(label="Dismiss")
 
     def _build_embed(self):
@@ -333,15 +342,20 @@ class TicketDetailView(StatefulView):
 
     async def close_this_ticket(self, interaction):
         if self._ticket.get("status") != "open":
-            await interaction.response.send_message("This ticket is already closed.", ephemeral=True)
+            await interaction.response.send_message(
+                "This ticket is already closed.", ephemeral=True
+            )
             return
 
         await interaction.response.defer()
         store = get_store()
-        await store.dispatch("TICKET_CLOSED", {
-            "guild_id": self._ticket["guild_id"],
-            "ticket_id": self._ticket["id"],
-        })
+        await store.dispatch(
+            "TICKET_CLOSED",
+            {
+                "guild_id": self._ticket["guild_id"],
+                "ticket_id": self._ticket["id"],
+            },
+        )
         # update_from_state will handle the UI refresh via the subscriber
 
 
@@ -370,24 +384,30 @@ class CloseTicketView(StatefulView):
             for t in self._tickets[:25]  # Select max 25 options
         ]
 
-        self.add_item(StatefulSelect(
-            placeholder="Select a ticket to close...",
-            options=options,
-            callback=self.on_select,
-        ))
-        self.add_item(StatefulButton(
-            label="Close Ticket",
-            style=discord.ButtonStyle.danger,
-            emoji="\N{CROSS MARK}",
-            row=1,
-            callback=self.on_close,
-        ))
-        self.add_item(StatefulButton(
-            label="Cancel",
-            style=discord.ButtonStyle.secondary,
-            row=1,
-            callback=self.on_cancel,
-        ))
+        self.add_item(
+            StatefulSelect(
+                placeholder="Select a ticket to close...",
+                options=options,
+                callback=self.on_select,
+            )
+        )
+        self.add_item(
+            StatefulButton(
+                label="Close Ticket",
+                style=discord.ButtonStyle.danger,
+                emoji="\N{CROSS MARK}",
+                row=1,
+                callback=self.on_close,
+            )
+        )
+        self.add_item(
+            StatefulButton(
+                label="Cancel",
+                style=discord.ButtonStyle.secondary,
+                row=1,
+                callback=self.on_cancel,
+            )
+        )
 
     async def on_select(self, interaction):
         self._selected_id = interaction.data["values"][0]
@@ -395,17 +415,18 @@ class CloseTicketView(StatefulView):
 
     async def on_close(self, interaction):
         if not self._selected_id:
-            await interaction.response.send_message(
-                "Select a ticket first.", ephemeral=True
-            )
+            await interaction.response.send_message("Select a ticket first.", ephemeral=True)
             return
 
         await interaction.response.defer()
         store = get_store()
-        await store.dispatch("TICKET_CLOSED", {
-            "guild_id": self.guild_id,
-            "ticket_id": self._selected_id,
-        })
+        await store.dispatch(
+            "TICKET_CLOSED",
+            {
+                "guild_id": self.guild_id,
+                "ticket_id": self._selected_id,
+            },
+        )
         await interaction.followup.send(
             f"\N{WHITE HEAVY CHECK MARK} Ticket **{self._selected_id}** closed.", ephemeral=True
         )
@@ -414,9 +435,6 @@ class CloseTicketView(StatefulView):
     async def on_cancel(self, interaction):
         await interaction.response.edit_message(content="Cancelled.", view=None)
         await self.exit()
-
-    async def update_from_state(self, state):
-        pass
 
 
 # // ========================================( Ticket Panel )======================================== // #
@@ -441,27 +459,33 @@ class TicketPanelView(PersistentView):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.add_item(StatefulButton(
-            label="Create Ticket",
-            style=discord.ButtonStyle.primary,
-            emoji="\N{HEAVY PLUS SIGN}",
-            custom_id="ticket_panel:create",
-            callback=self.create_ticket,
-        ))
-        self.add_item(StatefulButton(
-            label="My Tickets",
-            style=discord.ButtonStyle.secondary,
-            emoji="\N{OPEN BOOK}",
-            custom_id="ticket_panel:list",
-            callback=self.list_tickets,
-        ))
-        self.add_item(StatefulButton(
-            label="Close Ticket",
-            style=discord.ButtonStyle.danger,
-            emoji="\N{CROSS MARK}",
-            custom_id="ticket_panel:close",
-            callback=self.close_ticket,
-        ))
+        self.add_item(
+            StatefulButton(
+                label="Create Ticket",
+                style=discord.ButtonStyle.primary,
+                emoji="\N{HEAVY PLUS SIGN}",
+                custom_id="ticket_panel:create",
+                callback=self.create_ticket,
+            )
+        )
+        self.add_item(
+            StatefulButton(
+                label="My Tickets",
+                style=discord.ButtonStyle.secondary,
+                emoji="\N{OPEN BOOK}",
+                custom_id="ticket_panel:list",
+                callback=self.list_tickets,
+            )
+        )
+        self.add_item(
+            StatefulButton(
+                label="Close Ticket",
+                style=discord.ButtonStyle.danger,
+                emoji="\N{CROSS MARK}",
+                custom_id="ticket_panel:close",
+                callback=self.close_ticket,
+            )
+        )
 
     def _build_embed(self):
         guild_id = self.guild_id
@@ -512,9 +536,7 @@ class TicketPanelView(PersistentView):
         tickets = _get_user_open_tickets(interaction.guild_id, interaction.user.id)
 
         if not tickets:
-            await interaction.response.send_message(
-                "You have no open tickets.", ephemeral=True
-            )
+            await interaction.response.send_message("You have no open tickets.", ephemeral=True)
             return
 
         # Defer first so send() uses the followup path internally
@@ -615,8 +637,7 @@ class TicketListView(PaginatedView):
         all_tickets = state.get("application", {}).get("tickets", {}).get(guild_id, [])
         # Return a tuple of open ticket IDs for this user
         return tuple(
-            t["id"] for t in all_tickets
-            if t["author_id"] == self.user_id and t["status"] == "open"
+            t["id"] for t in all_tickets if t["author_id"] == self.user_id and t["status"] == "open"
         )
 
     async def update_from_state(self, state):
@@ -631,15 +652,16 @@ class TicketListView(PaginatedView):
 
         if not fresh_tickets:
             # All tickets closed — show empty state
-            self.pages = [discord.Embed(
-                title="\N{OPEN BOOK} Your Open Tickets",
-                description="All tickets have been resolved!",
-            )]
+            self.pages = [
+                discord.Embed(
+                    title="\N{OPEN BOOK} Your Open Tickets",
+                    description="All tickets have been resolved!",
+                )
+            ]
             self.current_page = 0
             await self._update_page()
         else:
             await self.refresh_data(fresh_tickets)
-
 
 
 def _format_ticket_page(chunk):
@@ -682,7 +704,7 @@ class TicketSystemExample(commands.Cog, name="ticket_system_example"):
 
     @commands.hybrid_command(
         name="ticket_setup",
-        description="Post a persistent ticket panel in this channel (admin only)."
+        description="Post a persistent ticket panel in this channel (admin only).",
     )
     @commands.has_permissions(manage_guild=True)
     async def ticket_setup(self, context: Context) -> None:
@@ -697,10 +719,7 @@ class TicketSystemExample(commands.Cog, name="ticket_system_example"):
         )
         await view.send(embed=view._build_embed())
 
-    @commands.hybrid_command(
-        name="my_tickets",
-        description="View your open support tickets."
-    )
+    @commands.hybrid_command(name="my_tickets", description="View your open support tickets.")
     async def my_tickets(self, context: Context) -> None:
         """Show a paginated list of your open tickets in this guild."""
         if not context.guild:

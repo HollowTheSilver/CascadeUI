@@ -3,8 +3,8 @@
 </p>
 
 <p align="center">
-  <a href="https://pypi.org/project/pycascadeui/"><img src="https://img.shields.io/pypi/dm/pycascadeui?logo=pypi&logoColor=white&label=downloads" alt="Downloads"></a>
   <a href="https://github.com/HollowTheSilver/CascadeUI/stargazers"><img src="https://img.shields.io/github/stars/HollowTheSilver/CascadeUI?style=flat&logo=github&label=stars" alt="Stars"></a>
+  <a href="https://pypi.org/project/pycascadeui/"><img src="https://img.shields.io/pypi/dm/pycascadeui?logo=pypi&logoColor=white&label=downloads" alt="Downloads"></a>
   <a href="https://pypi.org/project/pycascadeui/"><img src="https://img.shields.io/pypi/v/pycascadeui?logo=pypi&logoColor=white" alt="PyPI"></a>
   <a href="https://github.com/Rapptz/discord.py"><img src="https://img.shields.io/badge/discord.py-2.7+-738adb.svg?logo=discord&logoColor=white" alt="discord.py 2.7+"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10%20|%203.11%20|%203.12%20|%203.13%20|%203.14-blue.svg?logo=python&logoColor=white" alt="Python 3.10-3.14"></a>
@@ -15,12 +15,12 @@
 </p>
 
 <p align="center">
-  <strong>Build predictable, state-driven Discord interfaces with <a href="https://github.com/Rapptz/discord.py">discord.py</a>.</strong><br>
+  <strong>Build predictable, state-driven interfaces with <a href="https://github.com/Rapptz/discord.py">discord.py</a>.</strong><br>
   Design complex interactive systems with centralized state, composable UI patterns, and a clear data flow.<br>
 </p>
 
 <div align="center">
-  <img src="https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-hero.gif" alt="CascadeUI Dashboard" width="600">
+  <img src="https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-hero.gif" alt="CascadeUI TicTacToe" width="600">
 </div>
 
 <p align="center">
@@ -72,9 +72,7 @@ A powerful, fully featured UI library should be leveraged when your app requires
 - Maintainable complex interaction logic
 - Message lifecycle and ownership control
 - Consistent UI composition
-- Pre-built patterns
 - Cross-view reactivity
-- Multi-user interactions
 - Multi-step flows and validation
 
 It may be unnecessary for small or simple interfaces.
@@ -87,37 +85,37 @@ It may be unnecessary for small or simple interfaces.
 
 ### State and Data Flow
 - Centralized store with dispatch and reducer cycle
+- Custom reducers via `@cascade_reducer` decorator with automatic deep copy
 - Action batching for grouped, atomic updates
 - Computed state and derived values
 - Selector-based subscriptions for targeted re-renders
+- Cross-view reactivity: dispatch from any view, all subscribers update instantly
 - Middleware pipeline for logging, persistence, and transformation
-- Interaction queuing to prevent race conditions under rapid input
-
-### Reactivity and Synchronization
-- Cross-view state synchronization
-- Automatic updates across all subscribed views
-- Action-driven architecture for predictable UI behavior
-- Event hooks for lifecycle and side effects
+- Event hooks for lifecycle observation and side effects
 
 ### Views and Interaction Patterns
 - Layout-based V2 system for structured interfaces
 - Full support for traditional discord.py Views (V1)
 - Pre-built patterns: tabs, wizards, forms, pagination
-- Navigation stack for multi-level interfaces
-- Session limiting and lifecycle control
+- Navigation stack with push, pop, and replace
+- Session limiting per user, guild, or globally with replace or reject policies
+- Multi-user access control via `allowed_users` with participant-aware session limiting
+- Interaction ownership control (owner-only by default)
+- Auto-defer for slow callbacks and interaction serialization for rapid input
+- Theming with per-view overrides and V2 accent colors
 
 ### Components and Composition
-- Stateful buttons, selects, and composite components
-- Declarative layout helpers for rapid UI construction
-- Reusable UI patterns and structured composition
-- Built-in form system with validation and error handling
+- Stateful buttons, selects, and modals with state integration
+- V2 layout helpers: `card()`, `key_value()`, `alert()`, `action_section()`, and more
+- Built-in form system with validation and per-field error handling
+- Component wrappers: loading states, confirmation dialogs, cooldowns
 
 ### Persistence and Infrastructure
-- Persistent views that survive bot restarts
-- Automatic state persistence (JSON, SQLite, Redis)
+- Persistent views that survive bot restarts with automatic message re-attachment
+- State persistence backends: JSON, SQLite, Redis
 - Undo and redo via snapshot-based state history
-- Scoped state (user, guild, global)
-- Developer tools for inspecting and debugging state
+- Scoped state isolation (user, guild, global)
+- Developer tools for live state inspection and debugging
 
 ---
 
@@ -218,35 +216,31 @@ await view.send()
 > Define structured input flows with automatic validation and per-field error handling.
 
 ```python
-from cascadeui import FormLayoutView, choices
+from cascadeui import FormLayoutView, choices, card, key_value, divider
 
 class RegistrationForm(FormLayoutView):
+    session_limit = 1
+
     def __init__(self, *args, **kwargs):
         fields = [
             {
-                "id": "username",
-                "label": "Username",
-                "type": "text",
-                "required": True,
-                "validators": [min_length(3), max_length(20)]
-            },
-            {
-                "id": "email",
-                "label": "Email",
-                "type": "text",
-                "required": True,
-                "validators": [regex(r"^[^@]+@[^@]+\.[^@]+$")]
-            },
-            {
-                "id": "plan",
-                "label": "Plan",
+                "id": "role",
+                "label": "Role",
                 "type": "select",
+                "required": True,
                 "options": [
-                    {"label": "Free", "value": "free"},
-                    {"label": "Pro", "value": "pro"}
+                    {"label": "Developer", "value": "developer"},
+                    {"label": "Designer", "value": "designer"},
+                    {"label": "Manager", "value": "manager"},
                 ],
-                "required": True
-            }
+                "validators": [choices(["developer", "designer", "manager"])],
+            },
+            {
+                "id": "terms",
+                "label": "Accept Terms of Service",
+                "type": "boolean",
+                "required": True,
+            },
         ]
 
         super().__init__(
@@ -254,11 +248,42 @@ class RegistrationForm(FormLayoutView):
             title="Registration",
             fields=fields,
             on_submit=self.handle_submit,
-            **kwargs
+            **kwargs,
         )
+
+    def _rebuild_display(self):
+        """Override display with V2 helpers for a richer presentation."""
+        v = self.values
+        action_rows = [c for c in self.children if isinstance(c, ActionRow)]
+        self.clear_items()
+
+        self.add_item(card(
+            "## Registration Form",
+            key_value({"Role": v.get("role", "-").title() if v.get("role") else "-"}),
+            divider(),
+            TextDisplay(f"Terms: {'Accepted' if v.get('terms') else 'Pending'}"),
+        ))
+
+        for row in action_rows:
+            self.add_item(row)
 ```
 
 ![Forms](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-form.gif)
+
+---
+
+### Developer Tools
+
+> Live state inspection and debugging with a tabbed inspector view. Add one line to your bot.
+
+```python
+from cascadeui.devtools import DevToolsCog
+
+# In your bot's setup_hook:
+await bot.add_cog(DevToolsCog(bot))
+```
+
+![DevTools](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-devtools.gif)
 
 ---
 
@@ -276,7 +301,7 @@ All core features such as navigation, persistence, and undo/redo are supported.
 
 ## Examples
 
-> The <a href="https://hollowthesilver.github.io/CascadeUI/examples/"><strong>documentation</strong></a> includes full implementations demonstrating real-world usage:
+> The <a href="https://hollowthesilver.github.io/CascadeUI/examples/"><strong>documentation</strong></a> includes full implementations demonstrating practical usage:
 
 - Dashboards and control panels
 - Settings systems
@@ -284,6 +309,7 @@ All core features such as navigation, persistence, and undo/redo are supported.
 - Forms and wizards
 - Persistent views
 - Ticket systems
+- Multi-user games
 
 ---
 
@@ -308,7 +334,7 @@ Requirements:
 
 ## Documentation
 
-https://hollowthesilver.github.io/CascadeUI/
+- https://hollowthesilver.github.io/CascadeUI/
 
 ---
 

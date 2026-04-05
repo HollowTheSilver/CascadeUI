@@ -54,11 +54,16 @@ def _register_view_class(cls):
 
 
 class SessionLimitError(Exception):
-    """Raised when send() is blocked by session_policy='reject'."""
+    """Raised when a session limit is reached.
 
-    def __init__(self, view_type: str, limit: int):
+    Raised by ``send()`` under reject policy, or by ``register_participant()``
+    when a participant is already in a session of the same view type.
+    """
+
+    def __init__(self, view_type: str, limit: int, blocked_user_id: int = None):
         self.view_type = view_type
         self.limit = limit
+        self.blocked_user_id = blocked_user_id
         super().__init__(f"Session limit ({limit}) reached for {view_type}.")
 
 
@@ -92,6 +97,7 @@ class _StatefulMixin:
     # Subclass config: interaction ownership
     owner_only: bool = True  # Reject interactions from non-owners
     owner_only_message: str = "You cannot interact with this."
+    allowed_users: Optional[Set[int]] = None  # None = use owner_only; set = specific users
 
     # Subclass config: auto-defer safety net
     auto_defer: bool = True
@@ -178,6 +184,11 @@ class _StatefulMixin:
         # the root view's class name so the entire nav chain is tracked under
         # one session index key.  None means this view IS the root.
         self._session_origin: Optional[str] = None
+
+        # Participants: non-owner users registered in the session index.
+        # Used by multi-user views (games, collaborative tools) so that
+        # session limiting applies to all participants, not just the owner.
+        self._participants: Set[int] = set()
 
         # Get task manager
         self.task_manager = get_task_manager()
@@ -374,22 +385,38 @@ class _StatefulMixin:
     async def interaction_check(self, interaction: Interaction) -> bool:
         """Called before every component callback to validate the interaction.
 
-        When ``owner_only`` is True (the default), only the user who created
-        the view can interact with it. Other users receive an ephemeral
-        rejection message. Override this for custom access control (e.g.
-        role-based checks), calling ``await super().interaction_check(interaction)``
-        to preserve the ownership check.
+        Access control priority:
 
-        Skipped when ``self.user_id`` is None (e.g. restored PersistentViews
-        with no originating user context).
+        1. ``allowed_users`` is not None — only users in the set can interact.
+        2. ``owner_only`` is True — only the view creator can interact.
+        3. Otherwise — all users can interact.
+
+        When ``allowed_users`` is set, it overrides ``owner_only`` completely.
+        Set it in ``__init__`` for dynamic allowlists::
+
+            self.allowed_users = {self.user_id, opponent.id}
+
+        The ``owner_only`` check is skipped when ``self.user_id`` is None
+        (e.g. restored PersistentViews with no originating user context).
+        ``allowed_users`` is always enforced regardless of ``user_id``.
+
+        Override this for custom access control (e.g. role-based checks),
+        calling ``await super().interaction_check(interaction)`` to preserve
+        the built-in checks.
         """
-        if self.owner_only and self.user_id is not None:
-            if interaction.user.id != self.user_id:
-                try:
-                    await interaction.response.send_message(self.owner_only_message, ephemeral=True)
-                except discord.HTTPException:
-                    pass
-                return False
+        if self.allowed_users is not None:
+            allowed = interaction.user.id in self.allowed_users
+        elif self.owner_only and self.user_id is not None:
+            allowed = interaction.user.id == self.user_id
+        else:
+            return True
+
+        if not allowed:
+            try:
+                await interaction.response.send_message(self.owner_only_message, ephemeral=True)
+            except discord.HTTPException:
+                pass
+            return False
         return True
 
     async def on_error(self, interaction: Interaction, error: Exception, item: Item) -> None:
@@ -574,18 +601,72 @@ class _StatefulMixin:
         if self.session_policy == "reject":
             raise SessionLimitError(view_type, self.session_limit)
 
+        # Replace policy: only replace views owned by this user. Views where
+        # this user is a participant (owned by someone else) are not replaceable.
+        replaceable = [v for v in existing if v.user_id == self.user_id]
+        to_replace = replaceable[:overflow]
+
+        if len(to_replace) < overflow:
+            # Not enough owned views to replace (some are participant entries)
+            raise SessionLimitError(view_type, self.session_limit)
+
         # Pre-scan: check all candidates before exiting any, so we
         # don't destroy views and then raise on a later protected one
-        to_replace = existing[:overflow]
-
         if not self._persistent:
             for old_view in to_replace:
                 if getattr(old_view, "_persistent", False):
                     raise SessionLimitError(view_type, self.session_limit)
 
-        # Replace policy: exit oldest views to make room
+        # Exit oldest owned views to make room
         for old_view in to_replace:
             await old_view.exit()
+
+    # // ========================================( Participants )======================================== // #
+
+    async def register_participant(self, user_id: int) -> None:
+        """Register a non-owner user as a participant in this view's session.
+
+        Participants are tracked in the session index so that session limiting
+        applies to them. For example, in a two-player game, the opponent should
+        not be able to join a second game while already in one.
+
+        Always uses reject policy: if the participant already has a session of
+        this view type, ``SessionLimitError`` is raised. It never exits someone
+        else's view to make room.
+
+        Call this after ``send()`` succeeds, not in ``__init__``.
+
+        Args:
+            user_id: The Discord user ID to register as a participant.
+
+        Raises:
+            SessionLimitError: If the participant already has a session.
+        """
+        if user_id == self.user_id:
+            return  # Owner is already tracked via register_view
+
+        # Check session limit for participant's scope key. Only meaningful
+        # for user-based scopes where the participant gets a distinct key.
+        if self.session_limit is not None:
+            scope_key = self.state_store._build_session_scope_key(self, user_id=user_id)
+            owner_key = self.state_store._build_session_scope_key(self)
+            if scope_key is not None and scope_key != owner_key:
+                view_type = self._session_origin or self.__class__.__name__
+                existing = self.state_store.get_active_views(view_type, scope_key)
+                if len(existing) >= self.session_limit:
+                    raise SessionLimitError(view_type, self.session_limit, blocked_user_id=user_id)
+
+        self._participants.add(user_id)
+        self.state_store._register_participant(self, user_id)
+
+    def unregister_participant(self, user_id: int) -> None:
+        """Remove a participant from this view's session tracking.
+
+        Args:
+            user_id: The Discord user ID to unregister.
+        """
+        self._participants.discard(user_id)
+        self.state_store._unregister_participant(self, user_id)
 
     # // ========================================( Navigation Stack )======================================== // #
 
@@ -669,9 +750,16 @@ class _StatefulMixin:
 
         # Register the new view in the active view registry immediately.
         # Sub-views from push/pop typically edit the existing message instead
-        # of calling send(), so register_view() must happen here — otherwise
+        # of calling send(), so register_view() must happen here -- otherwise
         # the sub-view is invisible to session limit enforcement.
         self.state_store.register_view(new_view)
+
+        # Propagate participants for push/pop (same users, same message).
+        # replace() is a one-way transition -- participants don't carry over.
+        if action_type != "NAVIGATION_REPLACE" and self._participants:
+            for pid in self._participants:
+                new_view._participants.add(pid)
+                self.state_store._register_participant(new_view, pid)
 
         # Register the view in state (SESSION_CREATED + VIEW_CREATED) so
         # state["views"] contains this view's session_id. Without this,

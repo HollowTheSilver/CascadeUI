@@ -416,8 +416,22 @@ class StateStore:
 
     # // ========================================( View Registry )======================================== // #
 
+    def _add_to_session_index(self, view_id: str, view_type: str, scope_key: str) -> None:
+        """Add a view ID to the session index under the given type+scope key."""
+        key = (view_type, scope_key)
+        self._session_index.setdefault(key, []).append(view_id)
+
+    def _remove_from_session_index(self, view_id: str, view_type: str, scope_key: str) -> None:
+        """Remove a view ID from the session index for the given type+scope key."""
+        key = (view_type, scope_key)
+        ids = self._session_index.get(key, [])
+        if view_id in ids:
+            ids.remove(view_id)
+            if not ids:
+                del self._session_index[key]
+
     def register_view(self, view) -> None:
-        """Register a live view instance. Idempotent — safe to call multiple times.
+        """Register a live view instance. Idempotent -- safe to call multiple times.
 
         Uses ``view._session_origin`` (if set) as the type key so that
         navigated sub-views are tracked under the root view's class name.
@@ -427,22 +441,27 @@ class StateStore:
         scope_key = self._build_session_scope_key(view)
         if scope_key is not None and not already_registered:
             view_type = getattr(view, "_session_origin", None) or view.__class__.__name__
-            key = (view_type, scope_key)
-            self._session_index.setdefault(key, []).append(view.id)
+            self._add_to_session_index(view.id, view_type, scope_key)
 
     def unregister_view(self, view_id: str) -> None:
-        """Remove a view from the registry. Idempotent."""
+        """Remove a view from the registry. Idempotent.
+
+        Cleans up both the owner's scope key and any participant scope keys.
+        """
         view = self._active_views.pop(view_id, None)
         if view is not None:
+            view_type = getattr(view, "_session_origin", None) or view.__class__.__name__
+
+            # Remove owner scope key
             scope_key = self._build_session_scope_key(view)
             if scope_key is not None:
-                view_type = getattr(view, "_session_origin", None) or view.__class__.__name__
-                key = (view_type, scope_key)
-                ids = self._session_index.get(key, [])
-                if view_id in ids:
-                    ids.remove(view_id)
-                    if not ids:
-                        del self._session_index[key]
+                self._remove_from_session_index(view_id, view_type, scope_key)
+
+            # Remove participant scope keys (skip if same as owner's key)
+            for pid in getattr(view, "_participants", set()):
+                p_key = self._build_session_scope_key(view, user_id=pid)
+                if p_key is not None and p_key != scope_key:
+                    self._remove_from_session_index(view_id, view_type, p_key)
 
     def get_active_views(self, view_type: str, scope_key: str) -> list:
         """Return active view instances for a type+scope, oldest-first."""
@@ -450,17 +469,46 @@ class StateStore:
         ids = self._session_index.get(key, [])
         return [self._active_views[vid] for vid in ids if vid in self._active_views]
 
+    def _register_participant(self, view, user_id: int) -> None:
+        """Add a participant's scope key to the session index for a view.
+
+        Skips registration if the participant's scope key is the same as the
+        owner's (guild and global scopes don't include user_id, so participant
+        keys would be duplicates).
+        """
+        scope_key = self._build_session_scope_key(view, user_id=user_id)
+        owner_key = self._build_session_scope_key(view)
+        if scope_key is not None and scope_key != owner_key:
+            view_type = getattr(view, "_session_origin", None) or view.__class__.__name__
+            self._add_to_session_index(view.id, view_type, scope_key)
+
+    def _unregister_participant(self, view, user_id: int) -> None:
+        """Remove a participant's scope key from the session index for a view."""
+        scope_key = self._build_session_scope_key(view, user_id=user_id)
+        owner_key = self._build_session_scope_key(view)
+        if scope_key is not None and scope_key != owner_key:
+            view_type = getattr(view, "_session_origin", None) or view.__class__.__name__
+            self._remove_from_session_index(view.id, view_type, scope_key)
+
     @staticmethod
-    def _build_session_scope_key(view) -> Optional[str]:
-        """Build the scope key from a view's session_scope and identity fields."""
+    def _build_session_scope_key(view, user_id=None) -> Optional[str]:
+        """Build the scope key from a view's session_scope and identity fields.
+
+        Args:
+            view: The view to build the scope key for.
+            user_id: Optional override for the view's user_id. Used to build
+                scope keys for participants (non-owner users tracked in the
+                session index). Only affects "user" and "user_guild" scopes.
+        """
         scope = view.session_scope
+        uid = user_id if user_id is not None else view.user_id
         if scope == "user":
-            return f"user:{view.user_id}" if view.user_id else None
+            return f"user:{uid}" if uid else None
         elif scope == "guild":
             return f"guild:{view.guild_id}" if view.guild_id else None
         elif scope == "user_guild":
-            if view.user_id and view.guild_id:
-                return f"user_guild:{view.user_id}:{view.guild_id}"
+            if uid and view.guild_id:
+                return f"user_guild:{uid}:{view.guild_id}"
             return None
         elif scope == "global":
             return "global"

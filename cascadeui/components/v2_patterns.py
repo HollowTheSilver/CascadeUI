@@ -14,23 +14,21 @@ from .base import StatefulButton
 
 
 def card(
-    title: str,
     *children,
     color: Optional[Union[discord.Colour, int]] = None,
     spoiler: bool = False,
 ) -> Container:
-    """Build a themed Container with a title and children.
+    """Build a themed Container from children.
 
-    The most common V2 pattern: a Container with a heading TextDisplay
-    followed by arbitrary content. The title is used as-is, so include
-    your own markdown heading prefix (``#``, ``##``, ``###``).
+    The most common V2 pattern: a Container wrapping a heading, body
+    content, and interactive components. Strings are automatically
+    wrapped in ``TextDisplay``, so you can mix raw text and V2
+    components freely.
 
     Args:
-        title: Card heading text. Include a markdown heading prefix
-            for sizing: ``"## Server Info"``, ``"# Counter"``,
-            ``"### Category"``.
-        *children: V2 components to include after the title
-            (TextDisplay, Section, Separator, ActionRow, etc.).
+        *children: V2 components or strings. Strings are wrapped in
+            ``TextDisplay`` automatically. Typical first child is a
+            heading string: ``"## Server Info"``.
         color: Container accent colour. Accepts ``discord.Colour``
             or a raw int.
         spoiler: Whether the container should be hidden behind a
@@ -47,9 +45,9 @@ def card(
             color=discord.Color.green(),
         )
     """
+    items = [TextDisplay(c) if isinstance(c, str) else c for c in children]
     return Container(
-        TextDisplay(title),
-        *children,
+        *items,
         accent_colour=color,
         spoiler=spoiler,
     )

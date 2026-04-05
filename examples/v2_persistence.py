@@ -180,9 +180,6 @@ class V2PersistentCounterView(StatefulLayoutView):
         if self.message:
             await self.message.edit(view=self)
 
-    async def update_from_state(self, state):
-        pass
-
 
 # // ========================================( Config )======================================== // #
 
@@ -264,9 +261,7 @@ class RoleSelectorPanel(PersistentLayoutView):
                     label=role_name,
                     style=discord.ButtonStyle.secondary,
                     custom_id=f"roles:{slugify(category_name)}:{slugify(role_name)}",
-                    callback=self._make_toggle(
-                        role_id, role_name, exclusive, category_role_ids
-                    ),
+                    callback=self._make_toggle(role_id, role_name, exclusive, category_role_ids),
                 )
                 buttons.append(btn)
 
@@ -317,9 +312,7 @@ class RoleSelectorPanel(PersistentLayoutView):
                 # In exclusive mode, remove other roles from this category first
                 if exclusive:
                     to_remove = [
-                        r
-                        for r in member.roles
-                        if r.id in category_role_ids and r.id != role_id
+                        r for r in member.roles if r.id in category_role_ids and r.id != role_id
                     ]
                     if to_remove:
                         await member.remove_roles(*to_remove)
@@ -343,9 +336,6 @@ class RoleSelectorPanel(PersistentLayoutView):
     async def on_restore(self, bot):
         """Called after the panel is re-attached on bot restart."""
         logger.info(f"Role selector panel restored (state_key={self.state_key})")
-
-    async def update_from_state(self, state):
-        pass
 
 
 # // ========================================( Cog )======================================== // #

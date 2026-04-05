@@ -3,6 +3,56 @@
 All notable changes to CascadeUI are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.1.0] - Unreleased
+
+### Added
+
+- **`allowed_users` on `_StatefulMixin`** -- `Optional[Set[int]]` attribute that overrides
+  `owner_only` when set. Provides declarative access control for multi-user views (games,
+  polls, collaborative tools). Supports runtime mutation for "join this game" patterns.
+  Precedence: `allowed_users` > `owner_only` > allow all. Reuses `owner_only_message`
+  for rejections.
+
+- **Participant-aware sessions** -- `register_participant(user_id)` and
+  `unregister_participant(user_id)` on views. Participants get their own scope keys in
+  the session index so that `session_limit` applies to all users in a multi-user view,
+  not just the owner. Always-reject policy for participants (never exits someone else's
+  view to make room). `_enforce_session_limit` now only replaces views owned by the
+  same user. `SessionLimitError` gains optional `blocked_user_id` for cog-level error
+  handling. Participants propagate on push/pop, cleared on replace. Scope key deduplication
+  for guild/global scopes prevents duplicate index entries.
+
+- **TicTacToe example** (`examples/v2_tictactoe.py`) -- two-player V2 game demonstrating
+  challenge acceptance flow, dynamic board size (3x3 to 5x5), configurable win length
+  (e.g. 3-in-a-row on a 5x5 board), Discord mentions, mutual rematch agreement,
+  participant session integration, forfeit tracking, and a custom game statistics reducer.
+
+### Changed
+
+- **`card()` accepts mixed children** -- `card()` now takes `*children` instead of a
+  separate `title` parameter. Strings anywhere in the argument list are automatically
+  wrapped in `TextDisplay`. This allows building a list of components and unpacking it
+  (`card(*items)`) without worrying about whether the first item is a string or
+  `TextDisplay`. Fully backward compatible with existing `card("## Title", ...)` usage.
+
+- **`_enforce_session_limit` replace policy refinement** -- under replace policy, only
+  views owned by the current user are replaceable. Views where the user is a participant
+  (owned by someone else) are never replaced. Previously irrelevant because participant
+  scope keys didn't exist; now load-bearing with participant sessions.
+
+- **Documentation updates** -- API reference covers `allowed_users`, `register_participant`,
+  `unregister_participant`, and `SessionLimitError.blocked_user_id`. Views guide adds
+  "Multi-User Access Control" and "Participants and Multi-User Views" sections. Examples
+  page includes TicTacToe. README adds Developer Tools showcase and multi-user feature bullet.
+
+### Removed
+
+- **Unnecessary `update_from_state` stubs** -- removed ~14 redundant `pass` overrides
+  from library pattern views (`TabView`, `WizardView`, `TabLayoutView`, `WizardLayoutView`)
+  and examples. The base class `_StatefulMixin.update_from_state()` is already a no-op.
+
+---
+
 ## [2.0.0] - 2026-03-31
 
 ### Added

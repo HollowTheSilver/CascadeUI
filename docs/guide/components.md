@@ -77,7 +77,7 @@ self.add_item(
 )
 ```
 
-The first string argument becomes a `TextDisplay` heading. All subsequent arguments are added as children. `color` sets the container's accent color (like embed color, but stackable — multiple cards can have different colors in one message).
+String arguments are automatically wrapped in `TextDisplay`, so you can mix raw strings and V2 components freely. `color` sets the container's accent color (like embed color, but stackable -- multiple cards can have different colors in one message).
 
 ### key_value()
 

@@ -93,12 +93,12 @@ Convenience functions for building V2 component trees. All return standard disco
 
 ### `card(*children, color=None)`
 
-Creates a `Container` with an optional title and accent color.
+Creates a `Container` with children and an optional accent color. Strings are automatically wrapped in `TextDisplay`.
 
 ```python
 card(
-    "## Title",              # First string becomes a TextDisplay heading
-    TextDisplay("Content"),  # Remaining args are child components
+    "## Title",              # Strings become TextDisplay automatically
+    TextDisplay("Content"),  # V2 components pass through as-is
     divider(),
     color=discord.Color.blurple(),
 )
