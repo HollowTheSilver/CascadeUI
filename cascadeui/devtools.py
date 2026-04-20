@@ -3,6 +3,7 @@
 
 import io
 import json
+import logging
 from datetime import datetime, timezone
 
 import discord
@@ -12,13 +13,11 @@ from discord.ui import ActionRow, TextDisplay
 
 from .components.base import StatefulButton, StatefulSelect
 from .components.patterns import action_section, alert, card, divider, gap, key_value
+from .exceptions import InstanceLimitError
 from .state.actions import ActionCreators
 from .state.computed import computed
 from .state.singleton import get_store
-from .exceptions import InstanceLimitError
 from .views.patterns import TabLayoutView
-
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -234,9 +233,7 @@ class InspectorView(TabLayoutView):
         state_sessions = store.state.get("sessions", {})
         self_view_present = self.id in state_views
         self_session_present = self.session_id in state_sessions
-        view_count = max(
-            0, store.computed["total_views"] - (1 if self_view_present else 0)
-        )
+        view_count = max(0, store.computed["total_views"] - (1 if self_view_present else 0))
         session_count = max(
             0,
             store.computed["total_sessions"] - (1 if self_session_present else 0),
@@ -755,9 +752,9 @@ class InspectorView(TabLayoutView):
         dispatches = [s for s in store.perf_samples if s["action"] != "COMPONENT_INTERACTION"]
         refreshes = [s for s in store._refresh_samples if s["view_id"] != self.id]
         notifies = [
-            s for s in store._notify_samples
-            if s["subscriber_id"] != self.id
-            and s["action"] != "COMPONENT_INTERACTION"
+            s
+            for s in store._notify_samples
+            if s["subscriber_id"] != self.id and s["action"] != "COMPONENT_INTERACTION"
         ]
 
         if not dispatches and not refreshes and not notifies:
@@ -815,7 +812,11 @@ class InspectorView(TabLayoutView):
             # Same back-fill as build_performance -- older samples lack
             # ``middleware_ms`` and ``edits``; default to zero/"?".
             filled = [
-                {**s, "middleware_ms": s.get("middleware_ms", 0.0), "hooks_ms": s.get("hooks_ms", 0.0)}
+                {
+                    **s,
+                    "middleware_ms": s.get("middleware_ms", 0.0),
+                    "hooks_ms": s.get("hooks_ms", 0.0),
+                }
                 for s in dispatches
             ]
             reducer = self._summarize(filled, "reducer_ms")
@@ -884,9 +885,7 @@ class InspectorView(TabLayoutView):
             lines.append("| subscriber_id | n | p95 | max |")
             lines.append("|---------------|---|-----|-----|")
             for p95, sub_id, vals in ranked:
-                lines.append(
-                    f"| `{sub_id}` | {len(vals)} | {p95:.2f} | {max(vals):.2f} |"
-                )
+                lines.append(f"| `{sub_id}` | {len(vals)} | {p95:.2f} | {max(vals):.2f} |")
             lines.append("")
             lines.append("### Raw samples (oldest first)")
             lines.append("")
@@ -919,9 +918,7 @@ class InspectorView(TabLayoutView):
             for cls_name, vals in sorted(by_class.items(), key=lambda kv: -max(kv[1])):
                 vals_sorted = sorted(vals)
                 p95 = vals_sorted[min(len(vals_sorted) - 1, int(len(vals_sorted) * 0.95))]
-                lines.append(
-                    f"| `{cls_name}` | {len(vals)} | {p95:.2f} | {max(vals):.2f} |"
-                )
+                lines.append(f"| `{cls_name}` | {len(vals)} | {p95:.2f} | {max(vals):.2f} |")
             lines.append("")
             lines.append("### Raw samples (oldest first)")
             lines.append("")
@@ -984,9 +981,9 @@ class InspectorView(TabLayoutView):
         # the inspector's own ``on_state_changed`` callback would otherwise
         # dominate the list since it fires for every unrelated action.
         notifies = [
-            s for s in store._notify_samples
-            if s["subscriber_id"] != self.id
-            and s["action"] != "COMPONENT_INTERACTION"
+            s
+            for s in store._notify_samples
+            if s["subscriber_id"] != self.id and s["action"] != "COMPONENT_INTERACTION"
         ]
 
         status_color = discord.Color.green() if enabled else discord.Color.dark_grey()
@@ -1007,7 +1004,11 @@ class InspectorView(TabLayoutView):
             ActionRow(
                 StatefulButton(
                     label=toggle_label,
-                    style=discord.ButtonStyle.primary if not enabled else discord.ButtonStyle.secondary,
+                    style=(
+                        discord.ButtonStyle.primary
+                        if not enabled
+                        else discord.ButtonStyle.secondary
+                    ),
                     emoji=toggle_emoji,
                     callback=self._perf_toggle,
                 ),
@@ -1120,8 +1121,7 @@ class InspectorView(TabLayoutView):
             for p95, sub_id, vals, vals_sorted in ranked[:10]:
                 label = sub_id if len(sub_id) <= 40 else sub_id[:37] + "..."
                 sub_lines.append(
-                    f"`{label}` n={len(vals)} "
-                    f"p95={p95:.2f}ms max={max(vals):.2f}ms"
+                    f"`{label}` n={len(vals)} " f"p95={p95:.2f}ms max={max(vals):.2f}ms"
                 )
             subscriber_card = card(
                 "## Subscriber Timings (ms)",
@@ -1136,9 +1136,7 @@ class InspectorView(TabLayoutView):
                     }
                 ),
                 divider(),
-                TextDisplay(
-                    "### By subscriber (top 10 by p95)\n" + "\n".join(sub_lines)
-                ),
+                TextDisplay("### By subscriber (top 10 by p95)\n" + "\n".join(sub_lines)),
                 color=discord.Color.purple(),
             )
 

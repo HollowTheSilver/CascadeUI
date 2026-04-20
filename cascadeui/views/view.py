@@ -5,7 +5,6 @@ from discord.ui import View
 
 from .base import _StatefulMixin
 
-
 # // ========================================( Classes )======================================== // #
 
 

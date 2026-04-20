@@ -161,9 +161,7 @@ class ToggleGroup(CompositeComponent):
                     self.selected = opt
                     for btn in self._buttons:
                         btn.style = (
-                            ButtonStyle.primary
-                            if btn.label == opt
-                            else ButtonStyle.secondary
+                            ButtonStyle.primary if btn.label == opt else ButtonStyle.secondary
                         )
 
                     if self._view is not None and not self._view.is_finished():

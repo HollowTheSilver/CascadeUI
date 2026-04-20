@@ -37,6 +37,7 @@ Design contracts:
 
 import asyncio
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Optional
@@ -47,8 +48,6 @@ from ...persistence.schema import (
     TABLE_APPLICATION_SLOTS,
     TABLE_PERSISTENT_VIEWS,
 )
-import logging
-
 from ..types import Action, StateData
 
 if TYPE_CHECKING:
@@ -170,6 +169,7 @@ class PersistenceMiddleware:
         # hard-require discord.py at module load.
         if bot is not None:
             import discord
+
             if not isinstance(bot, discord.Client):
                 raise TypeError(
                     "PersistenceMiddleware bot= must be a discord.py Bot "
@@ -315,9 +315,7 @@ class PersistenceMiddleware:
 
         self._initialized = True
 
-    def _resolve_manager(
-        self, store: Any, cfg: dict[str, Any]
-    ) -> "PersistenceManager":
+    def _resolve_manager(self, store: Any, cfg: dict[str, Any]) -> "PersistenceManager":
         """Build a :class:`PersistenceManager` from the stashed config.
 
         Zero-config construction defaults to aiosqlite-backed SQLite, and
@@ -353,9 +351,7 @@ class PersistenceMiddleware:
             registry if registry is not None else RegistryPersistence(backend=backend)
         )
         resolved_application = (
-            application
-            if application is not None
-            else ApplicationPersistence(backend=backend)
+            application if application is not None else ApplicationPersistence(backend=backend)
         )
 
         return PersistenceManager(
@@ -472,9 +468,7 @@ class PersistenceMiddleware:
                 # contract below.
                 serialized = json.dumps(value)
             except (TypeError, ValueError) as exc:
-                logger.error(
-                    f"Application slot {slot_name!r} is not JSON-serializable: {exc}"
-                )
+                logger.error(f"Application slot {slot_name!r} is not JSON-serializable: {exc}")
                 continue
 
             policy = self._manager.get_slot_policy(slot_name)
@@ -624,9 +618,7 @@ class PersistenceMiddleware:
                 return view
         return None
 
-    def _build_registry_row(
-        self, payload: dict, view: Optional[Any]
-    ) -> Optional[dict[str, Any]]:
+    def _build_registry_row(self, payload: dict, view: Optional[Any]) -> Optional[dict[str, Any]]:
         """Assemble a registry row from the action payload and live view.
 
         Missing live view is logged and returns ``None`` -- the view
@@ -660,9 +652,7 @@ class PersistenceMiddleware:
             # path cannot consume.
             init_kwargs_json = json.dumps(init_kwargs)
         except (TypeError, ValueError) as exc:
-            logger.error(
-                f"init_kwargs for {persistence_key!r} not JSON-serializable: {exc}"
-            )
+            logger.error(f"init_kwargs for {persistence_key!r} not JSON-serializable: {exc}")
             return None
 
         kwargs_version = int(getattr(view, "kwargs_schema_version", 1))

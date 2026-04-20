@@ -9,8 +9,7 @@ from discord.ui import Container, Section, TextDisplay, Thumbnail
 from ...components.patterns.v2 import card, divider, gap, key_value
 from ..base import _StatefulMixin
 from ..persistent import _PersistentMixin
-from .paginated import _BasePaginatedMixin, PaginatedLayoutView
-
+from .paginated import PaginatedLayoutView, _BasePaginatedMixin
 
 # Sentinel distinguishing "user passed subtitle=None" (explicit skip)
 # from "user omitted the kwarg" (fall back to class default).
@@ -84,9 +83,7 @@ class _BaseLeaderboardMixin:
         super()._validate_class_attributes()
         own = cls.__dict__
         layout = own.get("entry_layout", getattr(cls, "entry_layout", "lines"))
-        per_page = own.get(
-            "leaderboard_per_page", getattr(cls, "leaderboard_per_page", None)
-        )
+        per_page = own.get("leaderboard_per_page", getattr(cls, "leaderboard_per_page", None))
         if layout == "sections" and per_page is not None and per_page > 5:
             raise ValueError(
                 f"{cls.__name__}.entry_layout='sections' requires "
@@ -291,11 +288,7 @@ class _BaseLeaderboardMixin:
 
         # Subtitle is optional; falsy values (None, empty string) skip
         # the H3 entirely, which is the natural shape for two-card mode.
-        heading = (
-            f"### {self.subtitle}"
-            if self.subtitle
-            else None
-        )
+        heading = f"### {self.subtitle}" if self.subtitle else None
 
         # Resolve every avatar URL across the full top-N slice in one
         # concurrent fan-out. Overrides that await ``bot.fetch_user``
@@ -432,9 +425,7 @@ class LeaderboardLayoutView(_BaseLeaderboardMixin, PaginatedLayoutView):
     exit_policy = "delete"
     state_scope = None
 
-    def __init__(
-        self, *args, entries=None, title=None, subtitle=_UNSET, **kwargs
-    ):
+    def __init__(self, *args, entries=None, title=None, subtitle=_UNSET, **kwargs):
         if title is not None:
             self.title = title
         # Subtitle uses a sentinel so the user can pass ``subtitle=None``
@@ -510,6 +501,7 @@ class LeaderboardLayoutView(_BaseLeaderboardMixin, PaginatedLayoutView):
         render-hash pattern but scoped to leaderboard data shape, not
         component tree shape.
         """
+
         def _stat_key(value):
             try:
                 hash(value)

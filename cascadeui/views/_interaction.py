@@ -2,14 +2,13 @@
 
 
 import asyncio
+import logging
 import time
 from typing import Optional
 
 import discord
 from discord import Interaction
 from discord.ui import Item
-
-import logging
 
 from ..components.base import StatefulButton
 

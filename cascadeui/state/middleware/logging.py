@@ -28,9 +28,7 @@ class LoggingMiddleware:
         self._logger = logging.getLogger("cascadeui.actions")
         self._logger.setLevel(getattr(logging, level.upper(), logging.INFO))
 
-    async def __call__(
-        self, action: Action, state: StateData, next_fn: Callable
-    ) -> StateData:
+    async def __call__(self, action: Action, state: StateData, next_fn: Callable) -> StateData:
         self._logger.info(
             f"[{action['type']}] source={action.get('source', 'N/A')} "
             f"payload_keys={list(action.get('payload', {}).keys())}"

@@ -71,13 +71,10 @@ class SlotPolicy:
                     f"got {type(self.ttl_days).__name__}"
                 )
             if self.ttl_days <= 0:
-                raise ValueError(
-                    f"SlotPolicy.ttl_days must be positive, got {self.ttl_days}"
-                )
+                raise ValueError(f"SlotPolicy.ttl_days must be positive, got {self.ttl_days}")
         if not isinstance(self.persistent, bool):
             raise TypeError(
-                f"SlotPolicy.persistent must be bool, "
-                f"got {type(self.persistent).__name__}"
+                f"SlotPolicy.persistent must be bool, " f"got {type(self.persistent).__name__}"
             )
         if not self.persistent and self.ttl_days is not None:
             raise ValueError(
@@ -132,14 +129,10 @@ class RegistryPersistence:
     backend: Optional[PersistenceBackend]
 
     _logical_name: ClassVar[str] = NAMESPACE_REGISTRY
-    _required_capabilities: ClassVar[Capability] = (
-        Capability.RELATIONAL | Capability.SCHEMA_META
-    )
+    _required_capabilities: ClassVar[Capability] = Capability.RELATIONAL | Capability.SCHEMA_META
 
     def __post_init__(self) -> None:
-        _validate_capabilities(
-            type(self).__name__, self._required_capabilities, self.backend
-        )
+        _validate_capabilities(type(self).__name__, self._required_capabilities, self.backend)
 
 
 # // ========================================( Application Config )======================================== // #
@@ -184,14 +177,12 @@ class ApplicationPersistence:
         # the user-authored config, not a downstream capability mismatch.
         if not isinstance(self.slots, dict):
             raise TypeError(
-                f"ApplicationPersistence.slots must be a dict, "
-                f"got {type(self.slots).__name__}"
+                f"ApplicationPersistence.slots must be a dict, " f"got {type(self.slots).__name__}"
             )
         for name, policy in self.slots.items():
             if not isinstance(name, str):
                 raise TypeError(
-                    f"ApplicationPersistence.slots keys must be str, "
-                    f"got {type(name).__name__}"
+                    f"ApplicationPersistence.slots keys must be str, " f"got {type(name).__name__}"
                 )
             if not isinstance(policy, SlotPolicy):
                 raise TypeError(
@@ -203,9 +194,7 @@ class ApplicationPersistence:
         # TTL_INDEX is required only when at least one persistent slot
         # declares ttl_days. In-memory slots never reach the backend so
         # they impose no capability burden.
-        if any(
-            p.ttl_days is not None and p.persistent for p in self.slots.values()
-        ):
+        if any(p.ttl_days is not None and p.persistent for p in self.slots.values()):
             required |= Capability.TTL_INDEX
 
         _validate_capabilities(type(self).__name__, required, self.backend)

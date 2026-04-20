@@ -45,10 +45,7 @@ class InMemoryBackend:
     """
 
     capabilities: ClassVar[Capability] = (
-        Capability.KV
-        | Capability.RELATIONAL
-        | Capability.TTL_INDEX
-        | Capability.SCHEMA_META
+        Capability.KV | Capability.RELATIONAL | Capability.TTL_INDEX | Capability.SCHEMA_META
     )
 
     def __init__(self) -> None:
@@ -77,9 +74,7 @@ class InMemoryBackend:
     async def kv_delete(self, namespace: str, key: str) -> None:
         self._kv.get(namespace, {}).pop(key, None)
 
-    async def kv_scan(
-        self, namespace: str, prefix: str = ""
-    ) -> AsyncIterator[tuple[str, bytes]]:
+    async def kv_scan(self, namespace: str, prefix: str = "") -> AsyncIterator[tuple[str, bytes]]:
         # Snapshot the items list so the caller can mutate the namespace
         # through kv_write/kv_delete mid-iteration without RuntimeError.
         for key, value in list(self._kv.get(namespace, {}).items()):
@@ -111,11 +106,7 @@ class InMemoryBackend:
         rows = self._rows.get(namespace, [])
         if not where:
             return [dict(r) for r in rows]
-        return [
-            dict(r)
-            for r in rows
-            if all(r.get(col) == val for col, val in where.items())
-        ]
+        return [dict(r) for r in rows if all(r.get(col) == val for col, val in where.items())]
 
     async def row_delete(
         self,

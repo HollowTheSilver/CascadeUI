@@ -14,13 +14,11 @@ This module wraps ``ViewStore.dispatch_view`` to log the full dispatch
 table when a miss occurs.  Activated by ``setup_logging(trace=True)``.
 """
 
-
 import logging
 from typing import Optional
 
 import discord
 from discord.ui.view import ViewStore
-
 
 logger = logging.getLogger(__name__)
 
@@ -75,9 +73,7 @@ def _install_viewstore_trace() -> None:
                 _views_unavailable_warned = True
             return _original_dispatch_view(self, component_type, custom_id, interaction)
 
-        message_id: Optional[int] = (
-            interaction.message.id if interaction.message else None
-        )
+        message_id: Optional[int] = interaction.message.id if interaction.message else None
         inner_key = (component_type, custom_id)
 
         item = None

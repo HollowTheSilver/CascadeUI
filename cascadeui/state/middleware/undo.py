@@ -2,9 +2,8 @@
 
 
 import copy
-from typing import Any, Callable, Dict, List, Optional, Set
-
 import logging
+from typing import Any, Callable, Dict, List, Optional, Set
 
 from ..types import Action, StateData
 
@@ -242,6 +241,5 @@ class UndoMiddleware:
         state["views"] = {**views, view_id: new_view}
 
         logger.debug(
-            f"Undo snapshot pushed for view {view_id} "
-            f"(stack depth: {len(new_undo_stack)})"
+            f"Undo snapshot pushed for view {view_id} " f"(stack depth: {len(new_undo_stack)})"
         )

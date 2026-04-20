@@ -36,7 +36,6 @@ stays in memory and is skipped by :class:`PersistenceMiddleware`.
 
 from typing import Any, Callable, Optional, Set
 
-
 # // ========================================( Persistent registry )======================================== // #
 
 

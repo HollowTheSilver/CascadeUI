@@ -2,12 +2,11 @@
 
 
 import inspect
+import logging
 from typing import Any, Callable, Dict, Iterable, List, Optional, Union
 
 import discord
 from discord.ui import Item
-
-import logging
 
 from ..state.actions import ActionCreators
 from ..state.store import _CURRENT_INTERACTION

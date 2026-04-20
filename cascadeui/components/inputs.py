@@ -27,7 +27,7 @@ class TextInput(StatefulComponent):
         Optional list of validator callables attached to this field. Each
         callable receives ``(value, field_def, all_values)`` and returns a
         :class:`~cascadeui.ValidationResult` (or an awaitable that resolves
-        to one). :class:`Modal` auto-collects these at construction time  -- 
+        to one). :class:`Modal` auto-collects these at construction time  --
         a ``Modal`` built from ``TextInput`` instances needs no further
         wiring. Reused by :class:`~cascadeui.FormView` and
         :class:`~cascadeui.FormLayoutView` when rendering ``"text"`` fields

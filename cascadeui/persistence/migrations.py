@@ -20,7 +20,7 @@ release.
 # // ========================================( Modules )======================================== // #
 
 
-from typing import Any, Awaitable, Callable, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 if TYPE_CHECKING:
     from .protocols import PersistenceBackend
@@ -71,9 +71,7 @@ _KWARGS_MIGRATORS: dict[tuple[str, int], KwargsMigrator] = {}
 # // ========================================( Registration decorators )======================================== // #
 
 
-def register_migrator(
-    table: str, from_version: int
-) -> Callable[[Migrator], Migrator]:
+def register_migrator(table: str, from_version: int) -> Callable[[Migrator], Migrator]:
     """Register a library schema migrator for ``table``.
 
     The migrator runs when on-disk ``schema_version == from_version``
@@ -92,9 +90,7 @@ def register_migrator(
     def decorator(fn: Migrator) -> Migrator:
         key = (table, from_version)
         if key in _MIGRATORS:
-            raise ValueError(
-                f"Migrator already registered for {table} v{from_version}"
-            )
+            raise ValueError(f"Migrator already registered for {table} v{from_version}")
         _MIGRATORS[key] = fn
         return fn
 
@@ -129,8 +125,7 @@ def register_kwargs_migrator(
         key = (view_class_qualname, from_version)
         if key in _KWARGS_MIGRATORS:
             raise ValueError(
-                f"Kwargs migrator already registered for "
-                f"{view_class_qualname} v{from_version}"
+                f"Kwargs migrator already registered for " f"{view_class_qualname} v{from_version}"
             )
         _KWARGS_MIGRATORS[key] = fn
         return fn
@@ -147,9 +142,7 @@ def get_schema_migrator(table: str, from_version: int) -> Migrator | None:
     return _MIGRATORS.get((table, from_version))
 
 
-def get_kwargs_migrator(
-    view_class_qualname: str, from_version: int
-) -> KwargsMigrator | None:
+def get_kwargs_migrator(view_class_qualname: str, from_version: int) -> KwargsMigrator | None:
     """Return the registered kwargs migrator for a view class+version,
     or ``None`` if no migrator handles that step."""
     return _KWARGS_MIGRATORS.get((view_class_qualname, from_version))

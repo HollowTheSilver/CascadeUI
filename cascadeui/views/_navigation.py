@@ -2,10 +2,9 @@
 
 
 import asyncio
+import logging
 
 import discord
-
-import logging
 
 from ..components.base import StatefulButton
 from ..state.actions import ActionCreators

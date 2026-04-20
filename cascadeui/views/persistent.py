@@ -1,16 +1,15 @@
 # // ========================================( Modules )======================================== // #
 
 
+import logging
 import re
 from typing import Dict
 
 import discord
 
-import logging
-
 from ..state.actions import ActionCreators
-from .view import StatefulView
 from .layout import StatefulLayoutView
+from .view import StatefulView
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +104,7 @@ class _PersistentMixin:
         """Clean up a stale message left by a previous instance of this persistence_key.
 
         V1 calls ``edit(view=None)`` (strips buttons, keeps embed/content).
-        V2 calls ``delete()`` because V2 messages ARE their components  -- 
+        V2 calls ``delete()`` because V2 messages ARE their components  --
         ``edit(view=None)`` would produce an empty message (Discord error 50006).
         """
         await old_message.edit(view=None)
@@ -132,7 +131,9 @@ class _PersistentMixin:
                 ):
                     await old_view.exit()
                     old_view_exited = True
-                    logger.info(f"Exited previous view instance for persistence_key '{self.persistence_key}'")
+                    logger.info(
+                        f"Exited previous view instance for persistence_key '{self.persistence_key}'"
+                    )
                     break
 
             # If the old view wasn't alive (e.g. from a previous bot session that
