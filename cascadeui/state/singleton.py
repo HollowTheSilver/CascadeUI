@@ -1,9 +1,8 @@
 # // ========================================( Modules )======================================== // #
 
-# Import logging at module level
-from ..utils.logging import AsyncLogger
+import logging
 
-logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a", prefix="cascadeui")
+logger = logging.getLogger(__name__)
 
 # Store singleton
 _store_instance = None

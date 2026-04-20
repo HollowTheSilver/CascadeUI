@@ -21,8 +21,10 @@ def with_loading_state(
     is replaced with ``loading_label``. The view is edited immediately so the
     user sees the loading state without delay.
 
-    The original callback receives an interaction whose response is already
-    consumed. Use ``interaction.followup.send()`` for any replies.
+    The original callback receives an interaction whose response may already
+    be consumed. Use ``self.respond(interaction, ...)`` for any replies --
+    it routes through ``interaction.response`` or ``interaction.followup``
+    automatically.
 
     Args:
         component: The component to wrap.
@@ -43,8 +45,13 @@ def with_loading_state(
         if loading_emoji is not None and hasattr(component, "emoji"):
             component.emoji = loading_emoji
 
-        # Show loading state immediately via interaction response
-        await interaction.response.edit_message(view=view)
+        # Show loading state immediately. When the auto-defer timer has
+        # already consumed the response slot, the loading indicator is
+        # silently skipped -- the callback runs without visual feedback.
+        # The previous fallback (editing via the message endpoint) raced
+        # with state-driven refresh() calls on concurrent dispatches.
+        if not interaction.response.is_done():
+            await interaction.response.edit_message(view=view)
 
         try:
             await original_callback(interaction)
@@ -62,10 +69,21 @@ def with_loading_state(
             if hasattr(component, "emoji"):
                 component.emoji = original_emoji
 
-            # Update message to show restored state
+            # Update message to show restored state, but only if the
+            # view is still alive (exit/push may have finished it).
+            # CascadeUI views route through refresh() so the restore edit
+            # participates in cooldown throttling + 429 backoff rather
+            # than racing with state-driven refreshes; plain discord.ui
+            # views fall back to the interaction-message edit path.
             try:
-                if interaction.message:
-                    await interaction.message.edit(view=view)
+                if hasattr(view, "is_finished") and view.is_finished():
+                    pass
+                else:
+                    from ..views.base import _StatefulMixin
+                    if isinstance(view, _StatefulMixin) and view._message:
+                        await view.refresh()
+                    elif interaction.message:
+                        await interaction.message.edit(view=view)
             except Exception:
                 pass
 
@@ -96,7 +114,7 @@ def with_confirmation(
 
     The original callback (and ``on_cancel``) receive the confirmation
     button's interaction with the response already consumed.
-    Use ``interaction.followup.send()`` for any messages.
+    Use ``self.respond(interaction, ...)`` for any replies.
 
     Args:
         component: The component to wrap.
@@ -141,7 +159,14 @@ def with_confirmation(
 
         embed = discord.Embed(title=title, description=message, color=color)
 
-        await interaction.response.send_message(embed=embed, view=confirmation_view, ephemeral=True)
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                embed=embed, view=confirmation_view, ephemeral=True
+            )
+        else:
+            await interaction.followup.send(
+                embed=embed, view=confirmation_view, ephemeral=True
+            )
 
     component.callback = confirmation_callback
     return component
@@ -163,7 +188,7 @@ def with_cooldown(
         seconds: Duration of the cooldown in seconds.
         message: Custom cooldown message. Use ``{remaining}`` as a
             placeholder for the time left (e.g. ``"Wait {remaining}s"``).
-        scope: Cooldown scope — ``"user"`` (per-user), ``"guild"``
+        scope: Cooldown scope -- ``"user"`` (per-user), ``"guild"``
             (per-guild, shared across all users in a server), or
             ``"global"`` (one cooldown for everyone).
     """
@@ -192,7 +217,12 @@ def with_cooldown(
         if cooldown_until and now < cooldown_until:
             remaining = (cooldown_until - now).total_seconds()
             text = (message or default_message).format(remaining=f"{remaining:.1f}")
-            await interaction.response.send_message(text, ephemeral=True)
+            # Under serialize_interactions, a queued interaction may
+            # already be deferred by the auto-defer timer.
+            if not interaction.response.is_done():
+                await interaction.response.send_message(text, ephemeral=True)
+            else:
+                await interaction.followup.send(text, ephemeral=True)
             return
 
         cooldowns[key] = now + timedelta(seconds=seconds)

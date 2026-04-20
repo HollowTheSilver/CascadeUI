@@ -1,34 +1,31 @@
 # // ========================================( Modules )======================================== // #
 
 
-import logging
-
-from .migration import migrate_storage
-from .serialization import StateSerializer
-from .storage import FileStorageBackend, StorageBackend
+from .backends import InMemoryBackend
+from .backends import __all__ as _backends_all
+from .config import (
+    ApplicationPersistence,
+    RegistryPersistence,
+    SlotPolicy,
+)
+from .manager import PersistenceManager
+from .migrations import register_kwargs_migrator, register_migrator
+from .protocols import Capability, PersistenceBackend
 
 __all__ = [
-    "StateSerializer",
-    "StorageBackend",
-    "FileStorageBackend",
-    "migrate_storage",
+    "InMemoryBackend",
+    "Capability",
+    "PersistenceBackend",
+    "PersistenceManager",
+    "RegistryPersistence",
+    "ApplicationPersistence",
+    "SlotPolicy",
+    "register_kwargs_migrator",
+    "register_migrator",
 ]
 
-_logger = logging.getLogger(__name__)
-
-# Optional backends — imported lazily to avoid hard dependency on aiosqlite/redis
-try:
-    from .sqlite import SQLiteBackend
+# Re-export optional backends that were successfully imported
+if "SQLiteBackend" in _backends_all:
+    from .backends import SQLiteBackend  # noqa: F401
 
     __all__.append("SQLiteBackend")
-except ImportError as _e:
-    if "aiosqlite" not in str(_e):
-        _logger.warning(f"Failed to import SQLiteBackend: {_e}")
-
-try:
-    from .redis import RedisBackend
-
-    __all__.append("RedisBackend")
-except ImportError as _e:
-    if "redis" not in str(_e):
-        _logger.warning(f"Failed to import RedisBackend: {_e}")

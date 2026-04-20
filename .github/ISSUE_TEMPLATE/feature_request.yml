@@ -2,12 +2,39 @@ name: Feature Request
 description: Suggest a new feature or improvement
 labels: ["enhancement"]
 body:
+  - type: markdown
+    attributes:
+      value: >
+        Want to discuss the idea first? Join the
+        [support Discord server](https://discord.com/invite/9Xj68BpKRb) -
+        informal conversation is often faster than a full form for
+        shaping a proposal.
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: Category
+      description: Which area of CascadeUI does this relate to?
+      options:
+        - Views and patterns
+        - State management
+        - Components
+        - Theming
+        - Persistence
+        - DevTools
+        - Documentation
+        - Other
+    validations:
+      required: true
+
   - type: textarea
     id: problem
     attributes:
       label: What problem does this solve?
-      description: Describe the use case or pain point.
-      placeholder: "I'm building a ticket system and I need..."
+      description: >
+        Describe the use case or friction point. What are you trying to
+        build, and what makes it harder than it should be?
+      placeholder: "I'm building a ticket system and I need the view to survive restarts, but..."
     validations:
       required: true
 
@@ -15,7 +42,11 @@ body:
     id: solution
     attributes:
       label: What would the ideal API look like?
-      description: Show how you'd expect to use this feature in code.
+      description: >
+        Show how you would use the proposed feature in your code.
+        Include class definitions, method calls, and attribute names
+        that match CascadeUI's existing grammar (`on_*` hooks,
+        `*_message` attributes, `*_policy` enums).
       render: python
     validations:
       required: false
@@ -24,6 +55,21 @@ body:
     id: alternatives
     attributes:
       label: Alternatives considered
-      description: Have you tried any workarounds or other approaches?
+      description: >
+        Have you tried any workarounds? Is there a way to achieve this
+        with the current API that feels clunky?
+    validations:
+      required: false
+
+  - type: textarea
+    id: design-fit
+    attributes:
+      label: Design fit
+      description: >
+        CascadeUI provides building blocks, not opinionated layouts.
+        If proposing a new view pattern or component, explain why it
+        belongs in the library rather than in user code. A good test:
+        could three unrelated bot developers use this pattern without
+        modifying it?
     validations:
       required: false

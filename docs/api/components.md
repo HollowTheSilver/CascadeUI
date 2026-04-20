@@ -36,13 +36,39 @@ StatefulSelect(
 )
 ```
 
+### `set_selected(value)`
+
+Sets which options are marked as `default=True`. Accepts:
+
+- `None`, `""`, or an empty iterable -- clears all selections
+- A single `str` -- marks the matching option (the single-select common case)
+- An iterable of strings -- marks every matching option (for `max_values > 1`)
+
+Values that don't match any existing option are silently ignored, so state-driven rebuilds survive config migrations that drop enum variants.
+
+### `get_selected() -> list[str]`
+
+Returns a `list[str]` of all option values currently marked `default=True`, matching discord.py's `Select.values` always-list convention.
+
+### Two-Parameter Callbacks
+
+`StatefulSelect` callbacks may accept an optional second positional parameter `values`:
+
+```python
+async def on_select(interaction, values):
+    selected = values[0]  # list[str] of selected option values
+    ...
+```
+
+Detection happens at creation time via `inspect.signature`. Old single-parameter callbacks (`async def cb(interaction)`) still work -- only callbacks declaring 2+ positional parameters receive `values`.
+
 ### Select Variants
 
-- `Dropdown` — alias for `StatefulSelect`
-- `RoleSelect` — extends `discord.ui.RoleSelect`
-- `ChannelSelect` — extends `discord.ui.ChannelSelect`
-- `UserSelect` — extends `discord.ui.UserSelect`
-- `MentionableSelect` — extends `discord.ui.MentionableSelect`
+- `Dropdown` -- alias for `StatefulSelect`
+- `RoleSelect` -- extends `discord.ui.RoleSelect`
+- `ChannelSelect` -- extends `discord.ui.ChannelSelect`
+- `UserSelect` -- extends `discord.ui.UserSelect`
+- `MentionableSelect` -- extends `discord.ui.MentionableSelect`
 
 ---
 
@@ -59,37 +85,113 @@ TextInput(
     min_length=None,
     max_length=None,
     style=TextStyle.short,   # or TextStyle.long for multi-line
+    validators=None,         # Optional: list of validator functions
 )
 ```
 
-The `custom_id` is auto-generated as `"input_{label}"` (lowercased, spaces replaced with underscores).
+The `custom_id` is auto-generated as `"input_{label}"` (lowercased, spaces replaced with underscores). Use `TextInput._slug(label)` to reproduce the same transformation externally.
+
+`validators` attaches a list of validator functions directly to the input. `Modal` auto-collects them at construction time, keyed by each input's `custom_id`. This is the canonical attachment shape -- there is no separate modal-level validators dict.
 
 ---
 
 ## `Modal`
 
-Wraps `discord.ui.Modal` with state integration and optional validation.
+Wraps `discord.ui.Modal` with state integration and automatic validator collection.
 
 ```python
 Modal(
     title=str,               # Required
-    inputs=[TextInput(...)], # List of TextInput or discord.ui.TextInput
+    inputs=[...],            # TextInput, Checkbox, CheckboxGroup, RadioGroup, FileUpload
     callback=async_fn,       # async def callback(interaction, values)
-    validators=None,         # Optional: {custom_id: [validator, ...]}
     timeout=None,
     view_id=None,            # If set, dispatches MODAL_SUBMITTED action
 )
 ```
 
-- `validators` — dict mapping `custom_id` to a list of validator functions. On failure, an ephemeral error message is sent and the callback is skipped.
-- `view_id` — links the modal to a view's state. A `MODAL_SUBMITTED` action is dispatched before the callback runs.
+- `inputs` accepts any combination of CascadeUI input wrappers (`TextInput`, `Checkbox`, `CheckboxGroup`, `RadioGroup`, `FileUpload`) or raw `discord.ui.TextInput` instances.
+- Validators are read from each input's `validators` list and collected internally. On failure, an ephemeral error message is sent and the callback is skipped.
+- `view_id` -- links the modal to a view's state. A `MODAL_SUBMITTED` action is dispatched before the callback runs.
 - If no `callback` is provided, the interaction is deferred automatically.
+
+**Opening modals from CascadeUI callbacks:** use [`self.open_modal(interaction, modal)`](views.md#open_modal) instead of `interaction.response.send_modal()`. It handles the case where auto-defer has already consumed the response slot by sending an ephemeral fallback.
+
+---
+
+## `Checkbox`
+
+Wraps `discord.ui.Checkbox` with a stable `custom_id` derived from the label.
+
+```python
+Checkbox(
+    label=str,               # Required
+    default=False,
+    validators=None,
+)
+```
+
+After submit: `.value` -> `bool`.
+
+---
+
+## `CheckboxGroup`
+
+Wraps `discord.ui.CheckboxGroup` with stable `custom_id` and dict shorthand for options.
+
+```python
+CheckboxGroup(
+    label=str,               # Required
+    options=[{"label": str, "value": str, "default": bool}, ...],
+    min_values=0,
+    max_values=None,         # Defaults to len(options)
+    validators=None,
+)
+```
+
+Options accept dict shorthand or native `discord.CheckboxGroupOption` instances.
+After submit: `.values` -> `list[str]`.
+
+---
+
+## `RadioGroup`
+
+Wraps `discord.ui.RadioGroup` with stable `custom_id` and dict shorthand for options.
+
+```python
+RadioGroup(
+    label=str,               # Required
+    options=[{"label": str, "value": str, "default": bool}, ...],
+    validators=None,
+)
+```
+
+After submit: `.value` -> `str`.
+
+---
+
+## `FileUpload`
+
+Wraps `discord.ui.FileUpload` with stable `custom_id`.
+
+```python
+FileUpload(
+    label=str,               # Required
+    max_values=10,
+    validators=None,
+)
+```
+
+After submit: `.values` -> `list[discord.Attachment]`.
+
+!!! warning "Ephemeral attachment URLs"
+    `discord.Attachment` URLs expire. Read attachment data in the modal
+    callback -- do not store attachments in the state store.
 
 ---
 
 ## V2 Helpers
 
-Convenience functions for building V2 component trees. All return standard discord.py V2 components — no custom classes needed. These work inside `StatefulLayoutView` and its subclasses.
+Convenience functions for building V2 component trees. All return standard discord.py V2 components -- no custom classes needed. These work inside `StatefulLayoutView` and its subclasses.
 
 ### `card(*children, color=None)`
 
@@ -170,18 +272,41 @@ A `MediaGallery` from a list of image URLs.
 gallery(["https://example.com/img1.png", "https://example.com/img2.png"])
 ```
 
+### `emoji_grid(rows, cols, *, fill, row_labels=None, col_labels=None, corner=None, cell_sep=" ")`
+
+Returns an `EmojiGrid` -- a live subclass of `discord.ui.TextDisplay` that renders a rectangular cell grid with optional axis labels. Supports assignment by int index, `(row, col)` tuple, or iterable of keys. Provides `fill_rect(top_left, bottom_right, value)` and `clear()`. Plugs directly into `card()` and `Container()`.
+
+Axis label presets: `"alpha"` (regional indicator glyphs, max 26), `"numeric"` (keycap emoji, max 10). Pass a list of custom emoji for other label styles.
+
+```python
+grid = emoji_grid(10, 10, fill="🟦", row_labels="alpha", col_labels="numeric")
+grid[3, 5] = "💥"  # Hit at row 3, column 5
+```
+
+### `button_grid(rows, cols, cell_factory)`
+
+Packs a `(row, col) -> Button` factory into a list of `ActionRow` components, enforcing Discord's 5x5 LayoutView component limit.
+
+```python
+rows = button_grid(3, 3, lambda r, c: StatefulButton(
+    label=board[r][c], callback=self.on_cell_click,
+))
+for row in rows:
+    self.add_item(row)
+```
+
 ---
 
 ## Convenience Buttons
 
 Subclasses of `StatefulButton` with preset styles:
 
-- `PrimaryButton` — `ButtonStyle.primary`
-- `SecondaryButton` — `ButtonStyle.secondary`
-- `SuccessButton` — `ButtonStyle.success`
-- `DangerButton` — `ButtonStyle.danger`
-- `LinkButton` — `ButtonStyle.link`
-- `ToggleButton` — Toggles between two states on click
+- `PrimaryButton` -- `ButtonStyle.primary`
+- `SecondaryButton` -- `ButtonStyle.secondary`
+- `SuccessButton` -- `ButtonStyle.success`
+- `DangerButton` -- `ButtonStyle.danger`
+- `LinkButton` -- `ButtonStyle.link`
+- `ToggleButton` -- Toggles between two states on click
 
 ---
 
@@ -203,13 +328,6 @@ PaginationControls(page_count=int, on_page_change=async_fn)
 controls.add_to_view(view)
 ```
 
-### `FormLayout`
-
-```python
-FormLayout(fields=[{"id": str, "type": str, "label": str, ...}])
-layout.add_to_view(view)
-```
-
 ### `ToggleGroup`
 
 ```python
@@ -228,7 +346,7 @@ bar.render(current)  # Returns string like "████████░░░░
 
 ## Wrappers
 
-All wrappers consume the interaction response internally. The wrapped callback **must** use `interaction.followup` for any messages it sends.
+All wrappers attempt to use `interaction.response` internally, with an `is_done()` fallback for auto-defer compatibility. Wrapped callbacks should use `self.respond(interaction, ...)` for any replies -- it handles the response/followup routing automatically.
 
 ### `with_loading_state(button, loading_label="Loading...", loading_emoji=None)`
 
@@ -238,20 +356,20 @@ Shows a loading indicator while the callback runs. The button is disabled and it
 
 Adds an ephemeral yes/no prompt before the callback runs. Additional parameters:
 
-- `color` — embed color (default: yellow)
-- `confirm_label` / `cancel_label` — button labels
-- `confirm_style` / `cancel_style` — button styles
-- `confirmed_message` / `cancelled_message` — text shown after choice
-- `on_cancel` — optional async callback on cancel
-- `timeout` — prompt timeout in seconds (default: 60)
+- `color` -- embed color (default: yellow)
+- `confirm_label` / `cancel_label` -- button labels
+- `confirm_style` / `cancel_style` -- button styles
+- `confirmed_message` / `cancelled_message` -- text shown after choice
+- `on_cancel` -- optional async callback on cancel
+- `timeout` -- prompt timeout in seconds (default: 60)
 
 ### `with_cooldown(button, seconds=5, message=None, scope="user")`
 
 Enforces a cooldown between clicks. Expired entries are automatically cleaned up.
 
-- `seconds` — cooldown duration
-- `message` — custom message (use `{remaining}` for time left)
-- `scope` — `"user"` (default), `"guild"`, or `"global"`
+- `seconds` -- cooldown duration
+- `message` -- custom message (use `{remaining}` for time left)
+- `scope` -- `"user"` (default), `"guild"`, or `"global"`
 
 ---
 
@@ -265,3 +383,19 @@ Converts display strings to safe `custom_id` fragments.
 slugify("Color Roles")    # "color-roles"
 slugify("He/Him")         # "hehim"
 ```
+
+### `@cascade_component(component_id=None)`
+
+Decorator for registering a component callback in the shared component registry. Pair with `get_component(component_id)` to retrieve registered callbacks.
+
+```python
+from cascadeui import cascade_component, get_component
+
+@cascade_component("reroll")
+async def reroll_callback(interaction):
+    ...
+
+callback = get_component("reroll")
+```
+
+When `component_id` is omitted, the decorated function's `__name__` is used.

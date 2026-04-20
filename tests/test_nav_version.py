@@ -1,11 +1,12 @@
 """Tests for cross-version navigation enforcement (V1 <-> V2)."""
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from cascadeui.views.base import StatefulView
-from cascadeui.views.layout import StatefulLayoutView
+import pytest
 from helpers import make_interaction as _make_interaction
+
+from cascadeui.views.view import StatefulView
+from cascadeui.views.layout import StatefulLayoutView
 
 
 class _V1View(StatefulView):

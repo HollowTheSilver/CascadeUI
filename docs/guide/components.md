@@ -1,14 +1,23 @@
 # Components
 
-CascadeUI components extend discord.py's built-in UI components with automatic state dispatching and composability.
+CascadeUI components extend discord.py's built-in UI components with state
+dispatching, validation, and composition helpers. They fall into three tiers
+based on how they interact with the state store -- see
+[Core Concepts -- Component Tiers](concepts.md#component-tiers) for the
+tier-by-tier overview, and
+[Core Concepts -- Extension Strategies](concepts.md#extension-strategies) for
+the subclass / builder / wrapper / pattern taxonomy that governs how each
+section below is built.
 
-## Stateful Components
+---
 
-These work in both V1 and V2 views.
+## Interactive Components
+
+These fire `COMPONENT_INTERACTION` actions on every click or selection.
 
 ### StatefulButton
 
-Extends `discord.ui.Button` with automatic `COMPONENT_INTERACTION` dispatching:
+Extends `discord.ui.Button` with automatic state dispatching:
 
 ```python
 from cascadeui import StatefulButton
@@ -19,8 +28,6 @@ button = StatefulButton(
     callback=my_handler,
 )
 ```
-
-Every click dispatches a `COMPONENT_INTERACTION` action to the state store, tracking the interaction for debugging and state history.
 
 In V2 views, buttons must be wrapped in `ActionRow`:
 
@@ -33,9 +40,12 @@ self.add_item(ActionRow(
 ))
 ```
 
+Convenience subclasses: `PrimaryButton`, `SecondaryButton`, `SuccessButton`,
+`DangerButton`, `LinkButton`, `ToggleButton`.
+
 ### StatefulSelect
 
-Extends `discord.ui.Select` with the same state integration:
+Extends `discord.ui.Select` with state integration:
 
 ```python
 from cascadeui import StatefulSelect
@@ -50,101 +60,307 @@ select = StatefulSelect(
 )
 ```
 
-Specialized select variants are also available: `Dropdown`, `RoleSelect`, `ChannelSelect`, `UserSelect`, `MentionableSelect`.
+Specialized variants: `Dropdown` (alias), `RoleSelect`, `ChannelSelect`,
+`UserSelect`, `MentionableSelect`.
+
+#### `set_selected(value)` / `get_selected()`
+
+Programmatic state reflection for selects:
+
+```python
+# Set which options are marked as default
+select.set_selected("a")             # Single value
+select.set_selected(["a", "b"])      # Multiple values (max_values > 1)
+select.set_selected(None)            # Clear all selections
+
+# Read current selections
+selected = select.get_selected()     # Returns list[str]
+```
+
+Values that don't match any existing option are silently ignored, so
+state-driven rebuilds survive config migrations.
+
+#### Two-Parameter Callbacks
+
+`StatefulSelect` callbacks may accept an optional second parameter `values`:
+
+```python
+async def on_select(interaction, values):
+    selected = values[0]  # list[str] of selected option values
+    ...
+```
+
+Detection happens at creation time via `inspect.signature`. Single-parameter
+callbacks still work unchanged.
+
+### Passing Context to Callbacks
+
+Use closures or `functools.partial` to pass extra data:
+
+```python
+def _make_move(self, cell: int):
+    async def callback(interaction):
+        self.board[cell] = self.current_mark
+        self.build_ui()
+        await self.refresh()
+    return callback
+
+# Each button gets a unique callback with a different `cell`
+for i in range(9):
+    button = StatefulButton(label=self.board[i], callback=self._make_move(i))
+```
 
 ---
 
-## V2 Helpers
+## Modal Inputs
 
-Convenience functions for building V2 component trees. These return standard discord.py V2 components — no custom classes needed.
+These live inside `Modal` dialogs. They have `custom_id` attributes but
+`is_dispatchable = False` -- values are collected by the Modal on submit.
+All five share the same contract:
 
-### card()
+- `custom_id` derived from label via `TextInput._slug()`
+- Optional `validators` list auto-collected by `Modal`
+- Value write-back: `.value` or `.values` populated after submit
 
-Creates a `Container` with an optional title, children, and accent color:
+### TextInput
+
+Wraps `discord.ui.TextInput`:
+
+```python
+from cascadeui import TextInput
+
+name = TextInput(label="Name", placeholder="Enter your name")
+bio = TextInput(label="Bio", style=discord.TextStyle.long)
+```
+
+After submit: `name.value` → `str`.
+
+Validators are attached directly:
+
+```python
+from cascadeui import TextInput, min_length, regex
+
+name = TextInput(
+    label="Username",
+    validators=[
+        min_length(3),
+        regex(r"^[a-zA-Z0-9_]+$", "Alphanumeric only"),
+    ],
+)
+```
+
+### Checkbox
+
+Wraps `discord.ui.Checkbox` -- a single boolean toggle:
+
+```python
+from cascadeui import Checkbox
+
+agree = Checkbox(label="I agree to the terms", default=False)
+```
+
+After submit: `agree.value` → `bool`.
+
+### CheckboxGroup
+
+Wraps `discord.ui.CheckboxGroup` -- multi-select with labeled options:
+
+```python
+from cascadeui import CheckboxGroup
+
+roles = CheckboxGroup(
+    label="Preferred Roles",
+    options=[
+        {"label": "Tank", "value": "tank"},
+        {"label": "DPS", "value": "dps"},
+        {"label": "Support", "value": "support", "default": True},
+    ],
+    min_values=1,
+    max_values=3,
+)
+```
+
+Options accept dict shorthand (shown above) or native
+`discord.CheckboxGroupOption` instances. After submit: `roles.values` →
+`list[str]`.
+
+### RadioGroup
+
+Wraps `discord.ui.RadioGroup` -- single-select with labeled options:
+
+```python
+from cascadeui import RadioGroup
+
+difficulty = RadioGroup(
+    label="Difficulty",
+    options=[
+        {"label": "Easy", "value": "easy"},
+        {"label": "Normal", "value": "normal", "default": True},
+        {"label": "Hard", "value": "hard"},
+    ],
+)
+```
+
+Same dict shorthand as `CheckboxGroup`. After submit: `difficulty.value` →
+`str`.
+
+### FileUpload
+
+Wraps `discord.ui.FileUpload`:
+
+```python
+from cascadeui import FileUpload
+
+upload = FileUpload(label="Avatar", max_values=1)
+```
+
+After submit: `upload.values` → `list[discord.Attachment]`.
+
+!!! warning "Ephemeral attachment URLs"
+    `discord.Attachment` objects contain CDN URLs that expire. Read attachment
+    data in the modal callback -- do not store attachments in the state store.
+
+### Modal
+
+`Modal` collects all wrapped input types and handles submission:
+
+```python
+from cascadeui import Modal, TextInput, Checkbox
+
+name = TextInput(label="Name")
+agree = Checkbox(label="Agree to terms")
+
+async def handle(interaction, values):
+    print(name.value, agree.value)
+    await interaction.response.send_message("Done!", ephemeral=True)
+
+modal = Modal(title="Registration", inputs=[name, agree], callback=handle)
+await self.open_modal(interaction, modal)
+```
+
+Inside a CascadeUI view callback, use `self.open_modal()` instead of
+`interaction.response.send_modal()`. It handles the case where auto-defer
+has already consumed the response slot. See
+[Opening Modals from Callbacks](views.md#opening-modals-from-callbacks).
+
+After submit, each input's `.value` / `.values` is populated. `modal.values_by_input` provides a dict keyed by input instance.
+
+Validators from all inputs are auto-collected. If any fail, the modal
+responds with error messages and blocks submission.
+
+Pass `view_id=self.id` to dispatch a `MODAL_SUBMITTED` action for state
+tracking.
+
+---
+
+## V2 Builder Functions
+
+Convenience functions for building V2 component trees. All return standard
+discord.py components.
+
+### `card(*children, color=None)`
+
+Creates a `Container`. Strings are auto-wrapped in `TextDisplay`:
 
 ```python
 from cascadeui import card, divider
 from discord.ui import TextDisplay
 
-self.add_item(
-    card(
-        "## My Card Title",
-        TextDisplay("Card content goes here."),
-        divider(),
-        TextDisplay("-# Footer text"),
-        color=discord.Color.blurple(),
-    )
-)
+self.add_item(card(
+    "## My Card",
+    TextDisplay("Card content."),
+    divider(),
+    TextDisplay("-# Footer"),
+    color=discord.Color.blurple(),
+))
 ```
 
-String arguments are automatically wrapped in `TextDisplay`, so you can mix raw strings and V2 components freely. `color` sets the container's accent color (like embed color, but stackable -- multiple cards can have different colors in one message).
-
-### key_value()
+### `key_value(data)`
 
 Converts a dict to a formatted `TextDisplay`:
 
 ```python
 from cascadeui import key_value
 
-self.add_item(key_value({
-    "Status": "Online",
-    "Users": "42",
-    "Uptime": "3h 12m",
-}))
+self.add_item(key_value({"Status": "Online", "Users": "42"}))
+# Renders: **Status:** Online\n**Users:** 42
 ```
 
-Renders as:
-```
-**Status:** Online
-**Users:** 42
-**Uptime:** 3h 12m
-```
+### `action_section(text, *, label, callback, ...)`
 
-### action_section()
-
-Creates a `Section` with text and a button accessory (text + action on the same line):
+A `Section` with text and a button accessory:
 
 ```python
 from cascadeui import action_section
 
-self.add_item(
-    action_section(
-        "Click to refresh the dashboard",
-        label="Refresh",
-        callback=self.refresh,
-        emoji="\U0001f504",
-    )
-)
+self.add_item(action_section(
+    "Click to refresh the dashboard",
+    label="Refresh", callback=self.refresh_data, emoji="🔄",
+))
 ```
 
-### toggle_section()
+### `toggle_section(text, *, active, callback)`
 
-Creates a `Section` with a green/red toggle button:
+A `Section` with a green/red toggle button:
 
 ```python
 from cascadeui import toggle_section
 
-self.add_item(
-    toggle_section(
-        "**Dark Mode**\nEnable dark theme",
-        active=self.dark_mode,
-        callback=self.toggle_dark,
-    )
-)
+self.add_item(toggle_section(
+    "**Dark Mode**\nEnable dark theme",
+    active=self.dark_mode, callback=self.toggle_dark,
+))
 ```
 
-When `active=True`, the button shows a green checkmark. When `False`, a red X.
+### `image_section(text, *, url)`
 
-### alert()
+A `Section` with a `Thumbnail` image.
 
-A colored status container for success, warning, error, or info messages:
+### `link_section(text, *, label, url, emoji=None)`
+
+A `Section` with a link-style button accessory. Completes the `*_section`
+family for the three Section accessory shapes: action (StatefulButton), image
+(Thumbnail), and link. Link buttons open a URL directly -- no callback runs
+and no interaction fires.
 
 ```python
-from cascadeui import alert
+from cascadeui import link_section
 
-self.add_item(alert("Settings saved successfully!", level="success"))
-self.add_item(alert("No data found.", level="info"))
+self.add_item(link_section(
+    "Full documentation is on GitHub Pages.",
+    label="Open Docs",
+    url="https://hollowthesilver.github.io/CascadeUI/",
+))
 ```
+
+### `confirm_section(text, *, on_confirm, on_cancel, ...)`
+
+Returns a `[TextDisplay, ActionRow]` list rather than a single component so
+the caller can splat it into `card(...)`. The paired success/danger buttons
+run the supplied callbacks:
+
+```python
+from cascadeui import card, confirm_section
+
+self.add_item(card(
+    "## Delete Server Data",
+    *confirm_section(
+        "This cannot be undone.",
+        on_confirm=self._do_delete,
+        on_cancel=self._do_cancel,
+        confirm_label="Delete",
+    ),
+    color=discord.Color.red(),
+))
+```
+
+Defaults: confirm button is green with a check emoji, cancel is red with a
+cross emoji. Override any of `confirm_label`, `cancel_label`,
+`confirm_emoji`, `cancel_emoji` to customize.
+
+### `alert(message, *, level="info")`
+
+A colored status container:
 
 | Level | Color |
 |-------|-------|
@@ -153,248 +369,283 @@ self.add_item(alert("No data found.", level="info"))
 | `"error"` | Red |
 | `"info"` | Blue |
 
-### divider() and gap()
+### `stats_card(title, stats, *, color=None, footer=None)`
 
-Visual separators inside containers:
+Thin composition of `card(title, key_value(stats), ...)`. The title is
+rendered as a second-level heading automatically (pre-format with `##` for
+finer control), a small separator sits between the heading and the stats,
+and an optional `footer` line renders in Discord's subtext style:
 
 ```python
-from cascadeui import divider, gap
+from cascadeui import stats_card
 
-# Thin line separator
-self.add_item(divider())
-
-# Larger spacing between content blocks
-self.add_item(gap())
-
-# Large spacing variant
-self.add_item(gap(large=True))
+self.add_item(stats_card(
+    "Server Overview",
+    {"Members": 42, "Channels": 12, "Roles": 5},
+    color=discord.Color.green(),
+    footer="Updated just now",
+))
 ```
 
-`divider()` is an alias for `Separator(spacing=SeparatorSpacing.small)`. `gap()` creates spacing without a visible line.
+When `color` is omitted, the active theme's `accent_colour` is used
+automatically inside a view's `build_ui()`.
 
-### image_section()
+### `progress_bar(value, max_value, *, width=20, ...)`
 
-A `Section` with a `Thumbnail` image:
+Text-based progress bar returned as a `TextDisplay`. V2 equivalent of the V1
+`ProgressBar` composite. Renders `[████████████░░░░░░░░] 60%` by default with
+Unicode block glyphs. `value` is clamped to `[0, max_value]` so callers do
+not need to guard against overshoots.
 
 ```python
-from cascadeui import image_section
+from cascadeui import progress_bar
 
-self.add_item(
-    image_section("User avatar", url="https://example.com/avatar.png")
-)
+self.add_item(progress_bar(7, 10, width=10))  # [███████░░░] 70%
 ```
 
-### gallery()
+Override `filled` / `empty` for alternative glyphs, or set
+`show_percent=False` to drop the trailing percentage.
 
-A `MediaGallery` from a list of image URLs:
+### `divider()` and `gap(large=False)`
 
-```python
-from cascadeui import gallery
+`divider()` creates a thin line separator. `gap()` creates spacing without a
+visible line.
 
-self.add_item(gallery(["https://example.com/img1.png", "https://example.com/img2.png"]))
-```
+### `gallery(urls)`
 
----
+A `MediaGallery` from a list of image URLs.
 
-## Utilities
+### `button_row(buttons, *, style=..., emoji=None)`
 
-### slugify()
-
-Converts display strings to safe `custom_id` fragments:
-
-```python
-from cascadeui import slugify
-
-slugify("Color Roles")    # "color-roles"
-slugify("He/Him")         # "hehim"
-```
-
-Useful for building stable `custom_id` values in persistent views where the ID must survive restarts:
+Builds an `ActionRow` from a `{label: callback}` mapping. Dict insertion
+order determines button order, so every button in the row shares one style
+and emoji:
 
 ```python
-custom_id=f"roles:{slugify(category)}:{slugify(role_name)}"
-```
+from cascadeui import button_row
 
----
-
-## Modals
-
-CascadeUI's `Modal` wraps `discord.ui.Modal` with state integration and optional validation.
-
-### Opening a Modal
-
-Open a modal from any button callback using `interaction.response.send_modal()`:
-
-```python
-from cascadeui import Modal, TextInput
-
-async def open_feedback(interaction):
-    modal = Modal(
-        title="Send Feedback",
-        inputs=[
-            TextInput(label="Subject", placeholder="Brief summary"),
-            TextInput(label="Details", style=discord.TextStyle.long),
-        ],
-        callback=handle_feedback,
-    )
-    await interaction.response.send_modal(modal)
-
-async def handle_feedback(interaction, values):
-    subject = values.get("input_subject")
-    details = values.get("input_details")
-    await interaction.response.send_message(
-        f"Thanks! Received: {subject}", ephemeral=True
-    )
-```
-
-`TextInput` generates a `custom_id` from the label automatically (e.g. `"Subject"` becomes `"input_subject"`). You can also pass raw `discord.ui.TextInput` items if you need full control over the `custom_id`.
-
-### Validation
-
-Pass a `validators` dict mapping `custom_id` to a list of validator functions:
-
-```python
-from cascadeui import Modal, TextInput, min_length, max_length, regex
-
-modal = Modal(
-    title="Create Tag",
-    inputs=[
-        TextInput(label="Name", placeholder="tag-name"),
-        TextInput(label="Content", style=discord.TextStyle.long),
-    ],
-    callback=save_tag,
-    validators={
-        "input_name": [
-            min_length(2, "Tag name must be at least 2 characters"),
-            max_length(32, "Tag name must be at most 32 characters"),
-            regex(r"^[a-z0-9-]+$", "Only lowercase letters, numbers, and hyphens"),
-        ],
-        "input_content": [
-            min_length(1, "Content cannot be empty"),
-        ],
+self.add_item(button_row(
+    {
+        "Save": self._save,
+        "Reset": self._reset,
+        "Cancel": self._cancel,
     },
-)
+    style=discord.ButtonStyle.primary,
+))
 ```
 
-All validators from the [validation system](validation.md) work here.
+Raises `ValueError` if the mapping is empty or exceeds Discord's
+5-buttons-per-row limit. For per-button customization, build the `ActionRow`
+by hand.
 
-### State Integration
+### `cycle_button(*, values, on_change, ...)`
 
-Pass `view_id` to dispatch a `MODAL_SUBMITTED` action to the state store:
+A button that cycles through a fixed list of values. The button tracks its
+own index on the returned instance (`button._cycle_index`); clicking
+advances to the next value (wrapping) and updates the label before the
+`on_change` callback runs:
 
 ```python
-modal = Modal(
-    title="Edit Name",
-    inputs=[TextInput(label="Name")],
-    callback=handle_edit,
-    view_id=self.id,
-)
+from cascadeui import cycle_button
+
+async def _preset_changed(interaction, value):
+    self.preset = value
+    self.build_ui()
+    await self.refresh()
+
+self.add_item(ActionRow(cycle_button(
+    values=["Low", "Medium", "High"],
+    on_change=self._preset_changed,
+    emoji="⚙️",
+)))
 ```
+
+The callback receives the *new* value (post-advance). Optional `labels=`
+customizes the display strings, `start=` picks the initial index.
+
+### `toggle_button(*, active, on_toggle, ...)`
+
+Standalone boolean toggle button. Distinct from `toggle_section`, which
+wraps the same button shape in a Section with display text on the left.
+Use `toggle_button` when the button stands alone in an `ActionRow`:
+
+```python
+from cascadeui import toggle_button
+
+async def _dark_mode(interaction, active):
+    self.dark = active
+    self.build_ui()
+    await self.refresh()
+
+self.add_item(ActionRow(toggle_button(
+    active=self.dark,
+    on_toggle=_dark_mode,
+    labels=("Dark", "Light"),
+)))
+```
+
+The button flips its own state (`button._toggle_active`) and calls
+`on_toggle(interaction, new_state)` with the post-flip value. Style and
+label swap automatically between the active/inactive pair.
+
+### `tab_nav(tabs, *, active=None, ...)`
+
+Lighter alternative to `TabLayoutView` for views that want tab-style
+navigation without the full Tab pattern's lifecycle (async builders,
+`on_tab_switched`, refresh contract). Each tab is just a button the view
+handles in its own callback:
+
+```python
+from cascadeui import tab_nav
+
+self.add_item(tab_nav(
+    {
+        "Stats": self._show_stats,
+        "Settings": self._show_settings,
+        "Help": self._show_help,
+    },
+    active="Stats",
+))
+```
+
+The tab matching `active` renders with `active_style` (primary by default);
+all others render with `inactive_style` (secondary). If `active` is
+omitted, the first tab is marked active. Capped at Discord's 5-per-row
+limit -- use `TabLayoutView` for views that need more tabs.
 
 ---
 
-## Component Wrappers
+## Grid Helpers
 
-Wrappers modify component behavior without changing the component itself. Apply them to buttons to add cross-cutting behavior.
+Two helpers for building grid-based UIs:
+
+### `emoji_grid(rows, cols, *, fill, row_labels, col_labels, corner, cell_sep)`
+
+Returns an `EmojiGrid` -- a live `TextDisplay` subclass that rewrites its
+content on every mutation:
+
+```python
+from cascadeui import emoji_grid
+
+grid = emoji_grid(10, 10, fill="🟦", row_labels="alpha", col_labels="numeric")
+grid[(2, 3)] = "🔥"       # Set single cell
+grid.fill_rect((0, 0), (2, 2), "⬜")  # Fill rectangle
+grid.clear()               # Reset all cells to fill
+```
+
+#### Retained Mode vs Immediate Mode
+
+`EmojiGrid` supports two usage patterns:
+
+**Retained mode** -- mutate cells in place; content auto-rewrites. The grid
+object holds its own state and each mutation immediately updates the rendered
+string. Ideal for persistent grids where the board evolves incrementally:
+
+```python
+# Battleship pattern: mutate cells, grid auto-renders
+grid[(row, col)] = hit_emoji
+self.build_ui()  # grid.content is already updated
+```
+
+**Immediate mode** -- rebuild from external state each render. The grid is
+reconstructed from scratch on every `build_ui()` call, using external state
+as the source of truth:
+
+```python
+# Dashboard pattern: rebuild from state
+grid = emoji_grid(5, 5, fill="⬛")
+for pos, value in self.state_data.items():
+    grid[pos] = value
+```
+
+Both are valid patterns. Use retained mode when the grid IS the state; use
+immediate mode when external state drives the rendering.
+
+#### Axis Labels
+
+| `row_labels` | `col_labels` | Result |
+|---|---|---|
+| `None` | `None` | No labels |
+| `"alpha"` | `None` | A-Z row labels only |
+| `None` | `"numeric"` | 0-9 column header only |
+| `"alpha"` | `"numeric"` | Both, with corner character |
+
+Presets: `"alpha"` (regional indicators, max 26) and `"numeric"` (keycap
+emoji, max 10). Custom `Sequence[str]` also accepted.
+
+#### Mutation API
+
+| Operation | Example |
+|-----------|---------|
+| Single cell | `grid[(r, c)] = "🔥"` |
+| Multiple cells | `grid[[(0,0), (1,1)]] = "⭐"` |
+| Rectangle fill | `grid.fill_rect((0,0), (2,2), "⬜")` |
+| Row by index | `grid[0] = "🟥"` |
+| Clear all | `grid.clear()` |
+
+### `button_grid(rows, cols, cell_factory)`
+
+Packs buttons into `ActionRow` components:
+
+```python
+from cascadeui import button_grid
+
+rows = button_grid(3, 3, lambda r, c: StatefulButton(
+    label=self.board[r][c],
+    callback=self._make_move(r, c),
+))
+for row in rows:
+    self.add_item(row)
+```
+
+Discord caps at 5 rows × 5 buttons. Both dimensions must be 1-5.
+
+---
+
+## Behavioral Wrappers
+
+Modify component behavior without changing the component:
 
 !!! danger "Wrappers consume the interaction response"
-    All three wrappers (`with_loading_state`, `with_confirmation`, `with_cooldown`) use `interaction.response` internally to show their UI. Your wrapped callback **must** use `interaction.followup.send()` instead of `interaction.response.send_message()`.
+    All three wrappers attempt to use `interaction.response` internally (with
+    an `is_done()` fallback for auto-defer compatibility). Wrapped callbacks
+    should use `self.respond(interaction, ...)` for any replies -- it handles
+    the response/followup routing automatically.
 
-### Loading State
+### `with_loading_state(button)`
 
-```python
-from cascadeui import with_loading_state
+Disables the button and changes its label to "Loading..." while the callback
+runs.
 
-button = StatefulButton(label="Process", callback=my_handler)
-with_loading_state(button)
-```
+### `with_confirmation(button, *, message, confirmed_message, cancelled_message)`
 
-The button is disabled and its label changes to "Loading..." while the callback runs.
+Shows a confirmation prompt before executing the callback.
 
-### Confirmation Prompt
+### `with_cooldown(button, *, seconds, scope="user")`
 
-```python
-from cascadeui import with_confirmation
-
-button = StatefulButton(label="Delete", callback=handle_delete)
-with_confirmation(
-    button,
-    message="Are you sure you want to delete this?",
-    confirmed_message="Deleted.",
-    cancelled_message="Kept safe.",
-)
-```
-
-### Per-User Cooldown
-
-```python
-from cascadeui import with_cooldown
-
-button = StatefulButton(label="Claim", callback=handle_claim)
-with_cooldown(button, seconds=10)
-```
-
-| Scope | Behavior |
-|-------|----------|
-| `"user"` (default) | Each user has an independent cooldown |
-| `"guild"` | Shared cooldown per server |
-| `"global"` | One cooldown for everyone |
+Per-user (default), per-guild, or global cooldown.
 
 ---
 
 ## V1 Composite Components
 
 !!! note "V1 only"
-    These components extend `CompositeComponent` and use row-based layout. They work with `StatefulView` but are not compatible with `StatefulLayoutView` (V2). For V2, use the helper functions above or build component trees directly.
+    These use row-based layout and work with `StatefulView` only.
 
-### ConfirmationButtons
+`ConfirmationButtons`, `PaginationControls`, `ToggleGroup`, `ProgressBar`  -- 
+pre-built V1 component groups that attach to a view via `.add_to_view()`.
+See `cascadeui.components.patterns.v1` for the full API.
 
-```python
-from cascadeui import ConfirmationButtons
+---
 
-confirmation = ConfirmationButtons(on_confirm=handle_confirm, on_cancel=handle_cancel)
-confirmation.add_to_view(my_view)
-```
+## Utilities
 
-### PaginationControls
+### `slugify(text)`
 
-```python
-from cascadeui import PaginationControls
-
-pagination = PaginationControls(page_count=5, on_page_change=handle_page)
-pagination.add_to_view(my_view)
-```
-
-### FormLayout
+Converts display strings to safe `custom_id` fragments:
 
 ```python
-from cascadeui import FormLayout
+from cascadeui import slugify
 
-layout = FormLayout(fields=[
-    {"id": "color", "type": "select", "label": "Color",
-     "options": ["Red", "Blue", "Green"]},
-    {"id": "enabled", "type": "boolean", "label": "Enabled"},
-])
-layout.add_to_view(my_view)
-```
-
-### ToggleGroup
-
-```python
-from cascadeui import ToggleGroup
-
-group = ToggleGroup(options=["Easy", "Medium", "Hard"], on_select=handler, default="Medium")
-group.add_to_view(my_view)
-```
-
-### ProgressBar
-
-A text-based progress bar for embed fields (not a Discord component):
-
-```python
-from cascadeui import ProgressBar
-
-bar = ProgressBar(total=100, width=20)
-embed.add_field(name="Progress", value=bar.render(65))
-# Output: ████████████░░░░░░░░ 65%
+slugify("Color Roles")  # "color-roles"
 ```

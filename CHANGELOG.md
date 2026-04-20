@@ -1,9 +1,496 @@
 # Changelog
 
-All notable changes to CascadeUI are documented here.
-Format follows [Keep a Changelog](https://keepachangelog.com/).
+All notable changes to CascadeUI are documented here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [2.1.0] - Unreleased
+CascadeUI follows [Semantic Versioning](https://semver.org/) starting at
+**3.0.0**. Earlier 1.x and 2.x releases were pre-stable; their entries are
+preserved below for historical reference but are not the supported baseline.
+
+---
+
+## [Unreleased]
+
+Designs locked for upcoming releases. Implementation work lands in a
+future version; entries move into a dated release header on ship.
+
+### Planned
+
+- **Image Renderer for leaderboards.** Optional `[images]` extra shipping
+  `ImageLeaderboardLayoutView` with a `render: Callable[[entries, page],
+  PIL.Image]` hook. Attachment-based rendering for ranked displays that
+  outgrow pure-text pagination -- avatars, gradients, custom fonts.
+  Pillow-backed; core install stays lean because the extra is opt-in.
+- **Redis persistence backend.** Capability-flag conformant `RedisBackend`
+  with multi-process coordination and pub/sub for scoped invalidation.
+  Deferred from 3.0.0 so the backend Protocol design could settle
+  against real SQLite deployments first.
+- **`RolesLayoutView` / `PersistentRolesLayoutView`.** Multi-category
+  self-assign role panel pattern with typed `RoleCategory` schema and
+  built-in cardinality constraints (`exclusive`, `required`, and the
+  combinations). Absorbs the hand-written category dict + toggle
+  callback currently demonstrated in `v2_persistence.py`. V2-only,
+  mirrors the `LeaderboardLayoutView` / `PersistentLeaderboardLayoutView`
+  shape. The persistent variant is the primary consumer since role
+  panels are posted once and survive restarts. Example-level `required`
+  flag ships in 3.0.0 as a temporary config field; library promotion
+  lands in a later release.
+
+---
+
+## [3.0.0] - 2026-04-16 -- Stable Release
+
+CascadeUI 3.0.0 is the first stable release. The view layer was reorganized
+around a five-pillar model (Access Control, Instance Constraints, Lifecycle,
+Session Membership, Navigation), the persistence machinery was rebuilt around
+a capability-flag backend Protocol with per-namespace isolation, and the
+public API was sharpened so every hook and class attribute follows a single
+naming grammar (`on_<event>` for hooks, `*_message` for static text,
+`*_policy` for behavior switches).
+
+The entries below describe the feature surface of the library at this
+cut; future releases will document changes as standard Keep a Changelog
+diffs against this baseline.
+
+### View Layer -- Five Pillar Model
+
+- **Five Pillar refactor.** Every view-layer feature now belongs to exactly
+  one of: Access Control, Instance Constraints, View Lifecycle, Session
+  Membership, Navigation. Documented in `docs/guide/five-pillars.md`.
+- **`instance_*` family** (`instance_limit`, `instance_scope`, `instance_policy`,
+  `instance_limit_message`, `on_instance_limit`, `InstanceLimitError`) replaces
+  the older `session_*` capacity vocabulary. `state_scope` replaces `scope`
+  to disambiguate from `instance_scope`. `replace_policy` replaces `on_replace`
+  to keep `on_*` reserved for hooks.
+- **API grammar enforcement.** `on_<event>` for override hooks, `*_message`
+  for static text, `*_policy` for behavior switches. Every public attribute
+  follows the three-tier precedence model: class attribute ->
+  method override -> explicit argument.
+- **Render hook rename.** `build_ui` (no underscore) is the canonical render
+  method. `on_state_changed` (replacing `update_from_state`) is the public
+  state-change hook; default implementation calls `build_ui()` then `refresh()`.
+- **Session model overhaul.** `shared_data` (was `session_data`),
+  `session["members"]` (was `session["views"]`), `session["shared_data"]`
+  (was `session["data"]`). Session keys now use `module.qualname` to avoid
+  short-name collisions. Nav/undo/redo stacks are view-local with
+  forward-transfer on push/pop.
+- **`session_continuity` opt-in.** Default auto-derived `session_id` carries
+  a per-instance UUID suffix, so each view invocation gets its own session,
+  navigation chain, and undo timeline. Views that want repeat-open state
+  coalescing (undo history surviving close-and-reopen, shared_data continuity
+  across gestures) set `session_continuity: ClassVar[bool] = True` on the
+  class. The opt-in collapses the derivation back to the class-coalesced
+  shape. Navigation inheritance is unchanged -- push/pop chains stay on one
+  session regardless of polarity because `_navigate_to` forwards `session_id`
+  explicitly.
+
+### View Layer -- Capacity, Lifecycle, and Interaction
+
+- **`participant_limit` trio.** Class-level cap on total view occupants paired
+  with `participant_limit_message` (static) and `on_participant_limit` (dynamic).
+  `register_participant()` returns `bool`; `auto_register_participants` flag
+  performs all-or-nothing rollback before any Discord side effects.
+- **`set_class_attribute()`** for per-instance policy override of class-level
+  attributes; runs the same validation pipeline as `__init_subclass__` and
+  rejects descriptor shadowing.
+- **`check_instance_available()`** classmethod for sync pre-checks before
+  expensive `__init__`.
+- **`attach_child()` and `parent=` kwarg.** Parent-local cleanup cascade with
+  optional auto-attachment on successful `send()`. `protect_attached` excludes
+  views with active participants or attached children from replacement
+  candidates.
+- **Hook surface expansion.** `on_unauthorized` / `unauthorized_message`,
+  `on_replaced` / `replaced_message`, `on_message_delete`, `on_reopen_failure` /
+  `reopen_failure_message`, `error_message` for the default `on_error` embed.
+- **`exit_policy`** (default `"delete"` for replaces) governs whether bare
+  `exit()` deletes, disables, or leaves the message untouched.
+- **`send()` rollback.** Three-tier teardown (instance-limit, participant
+  registration, Discord HTTP) with full `exit()`-mirror cleanup. Returns
+  `None` on instance-limit rejection rather than raising.
+- **Ephemeral session handling.** Timeout derivation is driven by the user's
+  `timeout` value. When `timeout <= 900` the view lives inside the 15-minute
+  webhook token and expires normally. When `timeout > 900` the library
+  auto-engages `auto_refresh_ephemeral`, installs a refresh button at T+810s,
+  and freezes `on_state_changed` rebuilds once armed so state notifications
+  cannot clobber the refresh button before the T+900s cliff.
+  `on_reopen_failure` / `reopen_failure_message` control what the user sees
+  when reconstruction fails. `exit()` distinguishes `NotFound` (silent),
+  ephemeral `401` token expiry (DEBUG), and other `HTTPException` errors
+  (ERROR), matching the three-tier precedent established by `refresh()`.
+- **Push/pop kwarg auto-capture.** `__init_subclass__` snapshots constructor
+  kwargs so navigation works transparently without manual wiring.
+- **Message handling.** `send()` re-fetches the message via the channel
+  endpoint to avoid the 15-minute interaction-token expiry.
+  `_webhook_message` dual-reference preserves embed-edit capability for V1.
+  `refresh()` replaces manual `message.edit` patterns.
+- **Interaction helpers.** `respond()`, `open_modal()`, and `_safe_defer()`
+  with `is_done()` fallback. Auto-defer safety net (timer + post-callback
+  defer) plus `serialize_interactions = True` default.
+- **Refresh throttling.** Rate-limit-aware: reactive 429 backoff is always
+  on; opt-in `refresh_cooldown_ms` sets a proactive cooldown window.
+  Deferred refreshes re-enter `on_state_changed` against the latest store
+  state.
+
+### View Layer -- Decomposition
+
+- **`StatefulView` extracted** to `cascadeui/views/view.py`, mirroring
+  `StatefulLayoutView` in `layout.py`.
+- **`_InteractionMixin`** (`_interaction.py`) and **`_NavigationMixin`**
+  (`_navigation.py`) separate the interaction and navigation concerns from
+  the core mixin.
+- **Shared `_send_pipeline()`** deduplicates the V1/V2 send logic so rollback
+  and registration are written once.
+- **`cascadeui/views/patterns/`** package groups V1 and V2 variants per
+  pattern file, with `_Base{Pattern}Mixin` extracted in each.
+- **`cascadeui/exceptions.py`** at the package root holds runtime exception
+  types callers catch programmatically (currently `InstanceLimitError`).
+
+### View Patterns
+
+- **`MenuView` / `MenuLayoutView`** -- category-based navigation hub with
+  push/pop drill-down, themed cards, and per-category style customization.
+- **`LeaderboardLayoutView` / `PersistentLeaderboardLayoutView`** -- V2-only
+  paginated ranked display with `get_entries()`, `format_entry()`, and
+  `build_summary()` hooks.
+- **Leaderboard Section render mode.** `entry_layout = "sections"` renders
+  each rank as a Discord `Section` with split `format_primary()` /
+  `format_secondary()` hooks and an async `get_avatar_url()` accessory.
+  Falls back to a stacked two-line `TextDisplay` when the avatar hook
+  returns `None`, so a platform requirement (Section requires `accessory=`)
+  never forces a subclass override. `entry_layout = "sections"` is coupled
+  to `leaderboard_per_page <= 5` to stay inside Discord's component
+  caps, validated at class-definition time.
+- **`PaginatedView.from_cursor()` lazy pagination.** Classmethod for
+  paginating over an async `fetch(page_idx) -> PageResult` cursor
+  instead of an eager in-memory list. Fetched pages ride an LRU cache
+  that protects the current page from eviction, so navigation away and
+  back never shows "Loading..." on the page the user is looking at.
+  `refresh_pages()` clears the cache and re-fetches the current page
+  in place.
+- **`DisplayLayoutView`** -- one-shot V2 send shorthand that accepts a
+  `container=` kwarg without requiring a subclass.
+- **Pattern customization.** Wizard navigation, Tab active/inactive style,
+  and Pagination navigation each gain customization triples plus
+  `on_finish()`, `on_tab_switched()`, and `on_page_changed()` method hooks
+  (replacing constructor-parameter callbacks).
+- **Wizard navigation hooks.** `on_step_entered(step_index)` fires after
+  forward/back navigation settles on a new step; `on_step_exited(step_index)`
+  fires before the wizard leaves a step; `on_validation_failed(step_index,
+  error, interaction)` fires when a step validator returns `(False, error)`.
+  Default `on_validation_failed` responds ephemerally with the error text.
+- **Wizard conditional steps.** A step dict accepts an optional
+  `"condition": Callable[[], bool]` predicate; Back and Next skip past
+  steps whose condition returns False at navigation time. A condition
+  that raises is treated as visible (safe fallback) and logs a warning.
+  Step-indicator counts and `is_last` resolution use the visible-step
+  count, not the declared-step count.
+- **Wizard progress header (V2 only).** `WizardLayoutView` renders a
+  themed `card()` containing a `progress_bar` above step content when
+  more than one visible step exists. Override `_build_progress_header`
+  to customize the container or return `None` to suppress. Disable
+  globally via `show_progress_bar = False`.
+- **Wizard step-builder theme context.** `_rebuild_step_content` runs
+  inside the view's theme context, so any `card()` call in the user's
+  step builder (or in `_build_progress_header`) inherits the view's
+  accent colour automatically.
+- **Form field-change hook.** `on_field_changed(field_name, old, new)` fires
+  on every field transition (select, boolean, modal text). The hook is
+  gated on `old != new`, so repeated identical submissions do not trigger
+  redundant work.
+- **Form inline validation errors.** Validator failures surface on the
+  form body instead of an ephemeral message. `_field_errors` maps field
+  id to error list; `_form_error` holds a form-level message. V1 renders
+  errors as a red-tinted embed with a warning line under each failing
+  field; V2 renders a top-level `alert()` container plus inline warning
+  lines inside each field's card. Errors clear automatically on any
+  field-change gesture, so the UI stays in sync with the latest input.
+- **Form field groups.** A field dict accepts an optional
+  `"group": "Section Name"` key. Consecutive fields sharing the same
+  group collect into a single run (no merging across interleaved groups,
+  so declaration order is the UI contract). V1 renders each run as a
+  bold-headed embed field; V2 renders each run as its own themed `card()`.
+- **Form typed field types.** `integer`, `float`, and `date` join
+  `text`, `boolean`, and `select` as first-class field types. Typed
+  modal fields ride the shared form modal alongside `text` (5-input
+  Discord cap is now measured against the union). Parse failures
+  surface as inline field errors while preserving the user's raw input
+  so the next modal open shows what they typed. `min_value` / `max_value`
+  field keys clamp `integer` and `float`; `date` accepts ISO 8601
+  (`YYYY-MM-DD`). The submit callback short-circuits when
+  `_field_errors` is populated, so validators never fire against
+  unparsed strings.
+- **Form `multi_select` field type.** Renders a `StatefulSelect` with
+  `min_values=1` when required, `max_values=max(1, len(options))` by
+  default (override via the optional `max_values` field key). Selected
+  options survive rebuilds via `SelectOption(default=...)`, and the
+  callback writes a `list` to `form.values`. Required-field checks
+  count an empty list as unset.
+- **Typed form / wizard schemas.** `FormField`, `FormSchema`, `WizardStep`,
+  and `WizardSchema` (all exported from `cascadeui`) give form and wizard
+  patterns a typed construction path with IDE auto-complete and
+  class-definition-time validation. Patterns accept either the existing
+  dict API (`fields=[{...}]`, `steps=[{...}]`) or the typed variant
+  (`fields=[FormField(...)]`, `schema=MySchema()`); passing both raises
+  `ValueError`. Typed entries lower to the same internal dict shape
+  through `.to_dict()`, so every downstream helper keeps working against
+  one canonical representation.
+- **`on_category_selected`** (was `_on_category_selected`). MenuView /
+  MenuLayoutView pre-push hook now follows the public `on_<event>` grammar.
+  No deprecation alias -- override sites rename in place.
+- **V2 button-mutation parity.** Wizard / Tab / Paginated V2 variants now
+  rebuild navigation buttons in the component tree instead of mutating
+  individual button attributes.
+- **`PaginatedLayoutView._build_extra_items()`** preserved across page
+  navigation.
+
+### Components
+
+- **Grid helpers.** `emoji_grid()` returns a live `EmojiGrid` (TextDisplay
+  subclass) supporting cell, row, rectangle, and bulk assignment with
+  optional `"alpha"` / `"numeric"` axis labels. `button_grid()` packs a
+  `(row, col) -> Button` factory into ActionRows enforcing Discord's 5x5
+  component cap. See `examples/v2_grids.py` for the standalone showcase.
+- **V2 builder expansion.** `stats_card()` (themed key/value summary
+  panel), `progress_bar()` (text-rendered bar readable inside any
+  TextDisplay), `confirm_section()` (Section + confirm/cancel button
+  pair), `link_section()` (Section + `LinkButton` accessory),
+  `button_row()` (ActionRow-wrapped button sequence), `cycle_button()`
+  (button that rotates a state value through a preset list),
+  `toggle_button()` (one-button on/off toggle), and `tab_nav()` (tab
+  strip renderer for hand-rolled tab views). All return standard
+  discord.py V2 components and compose cleanly with `card()`.
+- **Modal input wrappers.** `Checkbox`, `CheckboxGroup`, `RadioGroup`,
+  `FileUpload`, plus `TextInput(validators=[...])` as the canonical
+  validator-attachment shape. `Modal` auto-collects validators from all
+  five wrapper types and writes submitted values back to the wrapper
+  instances.
+- **`FormView` native `"text"` field support** via grouped modal collection
+  (the `FormLayout` composite is removed as redundant).
+- **`StatefulSelect`** gains `set_selected()` / `get_selected()` for
+  state-driven defaults and a disabled-placeholder fallback when options
+  are empty. Select callbacks may declare an optional second `values`
+  parameter.
+
+### State System
+
+- **`@computed`** decorator with cached selectors. Module-level registry
+  preserves registrations across store resets so tests that replace the
+  singleton no longer lose computed values.
+- **`access_slot()`** auto-vivifies `state["application"][name][key]` with
+  a `default_factory`; **`read_slot()`** is the variadic pure-read
+  counterpart for selectors and `@computed`. **`slot_property`**
+  descriptor reads slots from instance state. **`persistent=True`** on
+  `access_slot` registers the slot name for write-through persistence via
+  `PersistenceMiddleware`.
+- **Scoped state accessors.** `StateStore.get_scoped()`, `get_scoped_from()`
+  (staticmethod for use inside reducers), `iter_scoped()`, `set_scoped()`,
+  `merge_scoped()`. Four-axis scoping (`user`, `guild`, `user_guild`,
+  `global`) with named-slot routing via `scoped_slot` class attribute.
+- **`seed_initial_state(state)` hook** on `_StatefulMixin` for views that
+  need to seed slots before the first render.
+- **`@cascade_reducer`** raises on built-in action collision and warns on
+  same-namespace overwrite. `register_reducer` exposes the same warning at
+  the store level.
+- **Hybrid subscriber notifications.** `_notify_subscribers` runs a
+  two-path fan-out keyed on `action["source"]`: the acting subscriber
+  (whose id matches the action source) is awaited inline so its refresh
+  rides the interaction's ack cycle, while every other subscriber is
+  scheduled as a background task via `task_manager`. State snapshots
+  are passed by argument so every task sees the state that matched its
+  notification. `BatchContext.source_id` threads the same contract
+  through batched regimes. `store._flush_notifications()` drains
+  in-flight tasks for tests; production code never needs to flush.
+- **Acting-view `interaction.response.edit_message` fast path.** The
+  acting view's refresh ships as one REST round-trip instead of two
+  (ack + channel `PATCH`). `_CURRENT_INTERACTION` contextvar bound in
+  `StatefulComponent.create_stateful_callback` lets `refresh()` route
+  the edit through the interaction response slot when the handled
+  interaction is a component click targeting this view's message and
+  its response is still open. Disqualified cases (modal submits,
+  cross-view dispatches, missing message, already-deferred responses)
+  fall through to the channel endpoint with no behavior change; 429
+  arms the reactive backoff window; non-429 HTTP errors fall through
+  to the channel path so a transient interaction-endpoint failure
+  never loses the refresh.
+- **`batch()` is transitive.** `store.dispatch()` queues actions when a
+  batch is active; nested batches absorb into the outer batch. Per-action
+  profiling samples are suppressed inside batches and one synthetic
+  `BATCH_COMPLETE` action carries the rolled-up sample with `batch_size`.
+- **Library uses `batch()` internally** in `_send_pipeline`, `_navigate_to`, and
+  `_cleanup_attached_children`.
+- **Undo coverage expanded** to include `dispatch_scoped` and
+  `update_session`. Snapshots store a per-slot diff of the `application`
+  keys the action actually touched (paired with the session's
+  `shared_data`) rather than a wholesale copy, using a `_MISSING`
+  identity sentinel for added slots. Sibling views writing to their own
+  slots survive this view's undo path, closing a cross-view contamination
+  class that wholesale snapshots could not. UNDO/REDO bypass subscriber
+  action filters so cross-view reactivity works without explicit
+  subscription.
+- **`subscribed_actions` default** is now an empty set (subscribe to
+  everything by default).
+- **StateStore public/private boundary.** Registration plumbing
+  (`_register_reducer`, `_register_computed`, `_register_view`,
+  `_register_participant`, `_add_middleware`, `_unsubscribe`, and their
+  counterparts) is single-underscore-prefixed; the public surface is
+  `dispatch`, `subscribe`, `batch`, `on`/`off`, `has_middleware`, the
+  scoped accessor family, and the `state`/`computed` properties. The
+  `BatchContext.dispatch(...)` legacy shim is removed -- use
+  `store.dispatch(...)` inside `async with store.batch()`. The live
+  `PersistenceManager` stashed by `PersistenceMiddleware.initialize` is
+  now published as `store.persistence_manager` (previously
+  `store._persistence_manager`); the public name matches the rest of the
+  store's read surface and is the documented path for manual prune,
+  flush, and reattach-summary access.
+
+### Persistence
+
+- **Two-namespace persistence.** Registry and application each write as
+  an independent stream with its own debounce window. Scoped data rides
+  under the application namespace -- the middleware routes scoped writes
+  through the same application-diff pipeline, so per-user/guild buckets
+  persist when a view opts its scoped slot in via `persistent_slots`.
+- **`PersistenceBackend` Protocol** with `Capability` flags (`KV`,
+  `RELATIONAL`, `SCHEMA_META`). Built-in backends: `InMemoryBackend`
+  (always available, reference implementation; reused as the default
+  testing seam) and `SQLiteBackend` (optional via `aiosqlite`).
+- **Per-namespace configs** (`RegistryPersistence`, `ApplicationPersistence`)
+  govern slot policies and debounce windows per namespace. Configured
+  once at `PersistenceMiddleware` construction; shorthand `backend=`
+  fills any namespace the caller leaves unconfigured. The registry is
+  always persisted; application slots (including scoped) are opt-in via
+  the `persistent_slots` class attribute or `SlotPolicy(persistent=True)`
+  at setup, so nothing is retained by accident.
+- **Typed persistence exceptions.** `PersistenceError` base plus
+  `PersistenceConfigError`, `PersistenceInitError`, `PersistenceSchemaError`,
+  and `PersistenceRehydrateError` for the four failure classes (bad
+  construction config, backend init failure, schema migration failure,
+  view rehydration failure). Exported from the package root.
+- **Schema migration registry.** `register_migrator(namespace, version,
+  fn)` for payload-shape migrations between schema versions;
+  `register_kwargs_migrator(view_cls, fn)` for rewriting captured
+  constructor kwargs when a view's `__init__` signature changes.
+- **`PersistenceMiddleware`** replaces `DebouncedPersistence` with
+  identity-diff dirty tracking, max-age ceilings, retry backoff on backend
+  failure, and observability hooks. Skips bookkeeping actions and
+  dispatch-only actions whose state reference is unchanged.
+- **Unified middleware install.** `setup_middleware(*middlewares, store=None)`
+  installs every middleware through one async helper: add to the dispatch
+  chain (guarded by class so repeat calls are no-ops), then await each
+  middleware's ``initialize(store)`` if present. `PersistenceMiddleware` is
+  now constructor-configurable (`backend=`, `registry=`, `application=`,
+  `bot=`, `migrators=`) and owns its own seven-phase startup pipeline;
+  the old top-level `setup_persistence()` entry point is gone. Bot-type
+  validation fires at construction so misuse points at the user's call site.
+- **`setup_logging(actions=True)`** auto-installs `LoggingMiddleware` for
+  observability without a separate `add_middleware` step.
+- **Restore-time hardening.** Ghost `views` / `sessions` / `components` /
+  `modals` entries pruned on load. `PersistentView` re-derives `session_id`
+  after identity restoration. Messageable guard on orphan cleanup avoids
+  crashes on `CategoryChannel` / `ForumChannel`.
+
+### DevTools and Performance
+
+- **`InspectorView`** rebuilt as a `TabLayoutView` with six tabs
+  (Overview, Views, Sessions, History, Performance, Config),
+  self-filtering to avoid observer-effect noise, and live auto-refresh
+  via `VIEW_CREATED` / `VIEW_DESTROYED` subscriptions. Uses `@computed`
+  internally for the Overview aggregations.
+- **Interactive controls.** Purge Stale, Flush to Disk, Clear History,
+  Exit Selected / Exit All, Clear Selected.
+- **`/cascadeui` hybrid command group** with nine owner-only subcommands
+  (`inspect`, `views`, `exit`, `exitall`, `sessions`, `clear`, `flush`,
+  `purge`, `reset`).
+- **Profiling tab** with reducer / middleware / notify sample breakdown,
+  per-subscriber timing inside the notify fan-out, per-dispatch edit counter,
+  and split `middleware_ms` / `reducer_ms` columns.
+- **Render-hash short-circuit** in `refresh()` skips `message.edit` when
+  the rendered tree digest is unchanged.
+- **Reducer shallow-copy** replaces `copy.deepcopy` in the dispatch path.
+- **Persistence no-op** when state is unchanged.
+- **Leaderboard rebuild short-circuit.** A semantic `_entries_signature_for`
+  guard skips the page-list rebuild when the source entries have not
+  changed, and `asyncio.gather` resolves avatars concurrently during a
+  single page build so the Section render mode does not serialize
+  per-entry CDN fetches.
+- **Stable `custom_id`s across rebuilds.** `_stabilize_custom_ids()` runs
+  at two seams -- after every `build_ui()` and at the top of `refresh()` --
+  so pattern rebuilds that bypass `build_ui()` still emit the same
+  `custom_id` for the same logical component across re-renders. Prevents
+  Discord's `ViewStore` from dropping in-flight clicks when a rebuild
+  swaps in a new button instance.
+- **Automatic message-deletion cleanup** via gateway listeners
+  (`on_raw_message_delete`, `on_raw_bulk_message_delete`).
+
+### Theming
+
+- **Theme context propagation** via `contextvars.ContextVar`. Builder
+  functions like `card()` and `stats_card()` auto-read the active view's
+  theme as a fallback when no explicit `color=` is passed.
+- **Class-level `theme = my_theme`** preserved alongside the kwarg path;
+  validated in `__init_subclass__`.
+- **`get_current_theme()`** returns the active theme inside a view context.
+- Removed unused theme methods, style keys, and the "Powered by CascadeUI"
+  footer default.
+
+### Defensive Input Handling
+
+- **Class-attribute validation.** `__init_subclass__` validates enum, int,
+  bool, and float class attributes at subclass-definition time. Catches
+  `instance_policy = "rejct"` or `owner_only = 1` before any user clicks
+  a button.
+- **Snowflake coercion** at `__init__`, the `allowed_users` setter, and
+  `register_participant`. Accepts either `int` or `discord.abc.Snowflake`;
+  raises `TypeError` for genuinely unrecognizable values. Helper lives in
+  `cascadeui/utils/coercion.py`.
+- **`set_class_attribute()` guards.** `_INSTANCE_DATA_ATTRS` rejects
+  snowflake-domain data; descriptor walk rejects shadowing methods or
+  properties.
+- **`attach_child()` invariants.** Self-attachment and circular-chain
+  attachments raise `ValueError`; re-parenting detaches cleanly from the
+  old parent.
+
+### Examples
+
+New examples introduced in 3.0.0:
+
+- **`v2_hello_world.py`** -- the canonical minimal example. A single-button
+  counter showing `state_scope = "user"`, `subscribed_actions`, the default
+  `on_state_changed()`, and the smallest viable CascadeUI cog.
+- **`v2_grids.py`** -- standalone showcase for `emoji_grid()` and
+  `button_grid()`, exercising axis labels, bulk assignment, and the eight
+  preset variations in `/grid_gallery`.
+- **`v2_battleship.py`** -- 10x10 two-player game. Debut platform for
+  `emoji_grid()` (live cell mutation), `auto_register_participants`,
+  `@computed` aggregations, `user_guild` scope, and cross-view reactivity
+  through ephemeral fleet panels.
+- **`v2_tictactoe.py`** -- configurable board size (3x3 to 5x5) with the
+  `button_grid()` debut, configurable win length (minimum corrected to 3),
+  and per-player scoped stats via `user_guild` scope.
+- **`v2_lobby.py`** -- open-join Werewolf-style flow keeping
+  `auto_register_participants=False` for the documented exception case.
+- **`v2_computed.py`** -- memoized derived state demo using the `@computed`
+  registry.
+
+### Project
+
+- Test suite expanded to **1509 tests**, all green, covering the new
+  view-layer decomposition, persistence rebuild, computed selectors,
+  scoped state accessors, refresh throttling, and the multi-user
+  participant model.
+- Python 3.10, 3.11, 3.12, 3.14 support continues; discord.py 2.7+ remains
+  the only runtime dependency.
+
+---
+
+## Pre-stable history
+
+The releases below predate the 3.0.0 stable cut. They are kept for
+historical reference. New users should pin to 3.0.0 or later.
+
+---
+
+## [2.1.0] - 2026-04-05
 
 ### Added
 
@@ -47,9 +534,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Removed
 
-- **Unnecessary `update_from_state` stubs** -- removed ~14 redundant `pass` overrides
+- **Unnecessary `on_state_changed` stubs** -- removed ~14 redundant `pass` overrides
   from library pattern views (`TabView`, `WizardView`, `TabLayoutView`, `WizardLayoutView`)
-  and examples. The base class `_StatefulMixin.update_from_state()` is already a no-op.
+  and examples. The base class `_StatefulMixin.on_state_changed()` is already a no-op.
 
 ---
 
@@ -57,7 +544,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
-- **V2 component system support** — full support for Discord's V2 message components
+- **V2 component system support** -- full support for Discord's V2 message components
   (Container, Section, TextDisplay, MediaGallery, Separator, Thumbnail, File) alongside
   the existing V1 (View/embeds) system. Both coexist per-message; V1 is not deprecated.
 
@@ -71,11 +558,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   validation in the V2 component tree.
 
 - **V2 pre-built patterns:**
-    - `PaginatedLayoutView` — pages as V2 component trees with the same nav controls,
+    - `PaginatedLayoutView` -- pages as V2 component trees with the same nav controls,
       go-to-page modal, `from_data()` factory, and `refresh_data()` as V1
-    - `FormLayoutView` — Container+TextDisplay display with the same validation pipeline
-    - `TabLayoutView` — button-based tab switching with async builders
-    - `WizardLayoutView` — multi-step with back/next navigation, step validators,
+    - `FormLayoutView` -- Container+TextDisplay display with the same validation pipeline
+    - `TabLayoutView` -- button-based tab switching with async builders
+    - `WizardLayoutView` -- multi-step with back/next navigation, step validators,
       and `on_finish` callback
 
 - **V2 convenience helpers** (`cascadeui.components.v2_patterns`): `card()`,
@@ -91,21 +578,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   raises `TypeError` because Discord's `IS_COMPONENTS_V2` flag is one-way per message.
   `replace()` is allowed for cross-version transitions.
 
-- **`_freeze_components()`** on `_StatefulMixin` — single method that disables all
+- **`_freeze_components()`** on `_StatefulMixin` -- single method that disables all
   interactive items, handling both V1 flat children and V2 recursive tree traversal.
 
 - **Cross-view reactivity documentation** in the state management guide, explaining
   `dispatch()` vs `dispatch_scoped()` for multi-view UIs.
 
 - **V2 examples:** `v2_counter.py`, `v2_dashboard.py`, `v2_settings.py`,
-  `v2_form.py`, `v2_pagination.py`, `v2_wizard.py`, `v2_persistence.py` —
+  `v2_form.py`, `v2_pagination.py`, `v2_wizard.py`, `v2_persistence.py`  -- 
   covering all V2 patterns with session limiting and V2 helpers throughout.
 
-- **`rebuild=` callback on `push()`/`pop()`** — optional kwarg that auto-defers
+- **`rebuild=` callback on `push()`/`pop()`** -- optional kwarg that auto-defers
   the interaction, calls the callback with the new view, and edits the message.
-  V2: `rebuild=lambda v: v._build_ui()`. V1: `rebuild=lambda v: {"embed": v.build_embed()}`.
+  V2: `rebuild=lambda v: v.build_ui()`. V1: `rebuild=lambda v: {"embed": v.build_embed()}`.
 
-- **Interaction serialization** (`serialize_interactions = True` by default) —
+- **Interaction serialization** (`serialize_interactions = True` by default)  -- 
   `asyncio.Lock` in `_scheduled_task` serializes rapid button clicks, preventing
   racing `message.edit()` calls. Auto-defer runs outside the lock.
 
@@ -113,7 +600,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 - **DevTools V2 rebuild:** `InspectorView` is now a `TabLayoutView` with 5 tabs
   (Overview, Views, Sessions, History, Config), self-filtering, and live auto-refresh
-  via `VIEW_CREATED`/`VIEW_DESTROYED` subscriptions. `StateInspector` is an alias.
+  via `VIEW_CREATED`/`VIEW_DESTROYED` subscriptions.
 
 ### Changed
 
@@ -131,7 +618,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   dispatch when `view.is_finished()`, preventing extra state noise on exit/back.
 
 - **Message propagation:** `_navigate_to()` automatically transfers the message
-  reference to pushed/popped views so `update_from_state()` can edit the message
+  reference to pushed/popped views so `on_state_changed()` can edit the message
   without manual wiring.
 
 - **V2 exit behavior:** `exit()` freezes V2 views and edits with the frozen view
@@ -170,7 +657,7 @@ that provides state management, component composition, theming, and persistence.
 
 - **StateStore** singleton with pub/sub subscriptions, action filtering, and
   state selectors for fine-grained notification control
-- **Unidirectional data flow**: action → middleware → reducer → state → UI
+- **Unidirectional data flow**: action -> middleware -> reducer -> state -> UI
 - **Custom reducers** via `@cascade_reducer` decorator
 - **Action batching** with `batch()` context manager for atomic multi-dispatch
   operations with a single subscriber notification
@@ -324,42 +811,3 @@ that provides state management, component composition, theming, and persistence.
 - PEP 561 typed package (`py.typed` marker)
 - PyPI classifier: Production/Stable
 - 225 tests across 22 test files
-
-### Development History
-
-The 1.0.0 release was built through several stages of iterative development:
-
-- **Critical bug fixes**: Resolved singleton duplication, async-in-constructor
-  patterns, double interaction responses, private API usage, race conditions in
-  FormView, and closure variable capture bugs.
-- **Design fixes**: Fixed logger handler proliferation, orphaned confirmation
-  dialog state, global-only theming (now per-view), persistence backend
-  overwrites, unbounded component interaction history, over-notification of
-  subscribers, and added proper timeout handling.
-- **Cleanup**: Removed dead files, consolidated imports, standardized deepcopy
-  usage in reducers, fixed asyncio deprecations.
-- **Publish readiness**: Package restructure to standard layout, pyproject.toml
-  metadata, README, test suite, .gitignore, stdlib logger migration, LICENSE.
-- **Pre-release hardening**: Modal submission reducer, backup-before-save,
-  dead code audit, persistence round-trip verification, stable `state_key`
-  identity for persistent data.
-- **Core enhancements**: Middleware system, state selectors, devtools inspector,
-  TabView/WizardView patterns, ToggleGroup/ProgressBar components, PersistentView
-  with `setup_persistence()`.
-- **Advanced features**: SQLite/Redis backends, per-user/guild scoping, computed
-  state, undo/redo, event hooks, MkDocs documentation site, action batching,
-  navigation stack, form validation.
-- **Production hardening**: Session limiting with scoped enforcement, pagination
-  enhancements (jump buttons, go-to modal, dynamic pagination, stacked pages),
-  interaction ownership, auto-defer safety net, navigation chain session tracking,
-  identity persistence for restored views, orphaned view cleanup.
-- **Launch preparation**: Advanced settings menu example, ticket system example,
-  transparent kwargs auto-capture for push/pop, PaginatedView extensibility hooks
-  (`_build_extra_items`, `refresh_data`, `clear_row`), Modal with validation,
-  README overhaul with GIF demos, GitHub discoverability, documentation site polish.
-- **Pre-release fixes**: Removed `VIEW_UPDATED` and `COMPONENT_INTERACTION` from
-  default `subscribed_actions` (internal bookkeeping actions were triggering
-  redundant re-renders); fixed navigation state registration (`_navigate_to` now
-  calls `_register_state` so pushed/popped views work with undo/redo); fixed
-  double-edit race in settings menu after migrating from `dispatch_scoped` to
-  custom action dispatch.

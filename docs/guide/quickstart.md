@@ -1,170 +1,217 @@
 # Quick Start
 
-This guide walks through building a simple stateful counter to introduce the core concepts.
+Build a working stateful counter in 5 minutes. This tutorial introduces the
+core concepts one at a time -- by the end, the full data flow pattern is clear.
 
-## The Counter Example
+## Prerequisites
 
-A counter with increment and decrement buttons, backed by the state store:
+- Python 3.10+ with discord.py 2.7+ installed
+- CascadeUI [installed](installation.md)
+- A Discord bot token and a test server
 
-=== "V2"
+---
 
-    ```python
-    import discord
-    from discord.ext import commands
-    from discord.ui import ActionRow, TextDisplay
-    from cascadeui import (
-        StatefulLayoutView, StatefulButton, cascade_reducer,
-        card, key_value, divider,
-    )
+## Step 1: Define a Reducer
 
-    # 1. Define a reducer for your custom action
-    @cascade_reducer("COUNTER_UPDATED")
-    async def counter_reducer(action, state):
-        # @cascade_reducer passes a deep copy — mutate and return directly
-        state.setdefault("application", {}).setdefault("counters", {})
-        view_id = action["payload"]["view_id"]
-        state["application"]["counters"][view_id] = action["payload"]["counter"]
-        return state
+A **reducer** handles a specific action type. When the view dispatches an
+action, the matching reducer receives a deep copy of the state, mutates it,
+and returns the result:
 
-    # 2. Create a stateful view
-    class CounterView(StatefulLayoutView):
-        session_limit = 1
+```python
+from cascadeui import cascade_reducer
 
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self.counter = 0
-            self._build_ui()
+@cascade_reducer("COUNTER_UPDATED")
+async def counter_reducer(action, state):
+    app = state.setdefault("application", {})
+    counters = app.setdefault("counters", {})
+    counters[action["payload"]["view_id"]] = action["payload"]["value"]
+    return state
+```
 
-        def _build_ui(self):
-            self.clear_items()
-            self.add_item(
-                card(
-                    "## Counter",
-                    key_value({"Value": str(self.counter)}),
-                    color=discord.Color.blurple(),
-                )
-            )
-            self.add_item(ActionRow(
-                StatefulButton(label="+1", style=discord.ButtonStyle.primary,
-                               callback=self.increment),
-                StatefulButton(label="-1", style=discord.ButtonStyle.danger,
-                               callback=self.decrement),
-            ))
-            self.add_exit_button()
+The `@cascade_reducer` decorator registers this function to handle
+`COUNTER_UPDATED` actions. The state is already deep-copied -- mutate it
+directly, no `copy.deepcopy()` needed.
 
-        async def _update(self, interaction):
-            await interaction.response.defer()
-            await self.dispatch("COUNTER_UPDATED", {
-                "view_id": self.id,
-                "counter": self.counter,
-            })
-            self._build_ui()
-            if self.message:
-                await self.message.edit(view=self)
+---
 
-        async def increment(self, interaction):
-            self.counter += 1
-            await self._update(interaction)
+## Step 2: Build the View
 
-        async def decrement(self, interaction):
-            self.counter -= 1
-            await self._update(interaction)
+A **view** is a single UI screen backed by the state store. V2 views
+(`StatefulLayoutView`) use Discord's container-based component system -- the
+component tree IS the message content:
 
-    # 3. Wire it up to a command
-    bot = commands.Bot(command_prefix="!", intents=discord.Intents.default())
+```python
+import discord
+from discord.ui import ActionRow, TextDisplay
+from cascadeui import StatefulLayoutView, StatefulButton, card, key_value
 
-    @bot.hybrid_command()
-    async def counter(ctx):
-        view = CounterView(context=ctx)
-        await view.send()
-    ```
+class CounterView(StatefulLayoutView):
+    instance_limit = 1                # One counter per user per guild
 
-=== "V1 (Classic)"
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.counter = 0
+        self.build_ui()
 
-    ```python
-    import discord
-    from discord.ext import commands
-    from cascadeui import StatefulView, StatefulButton, cascade_reducer
-
-    # 1. Define a reducer for your custom action
-    @cascade_reducer("COUNTER_UPDATED")
-    async def counter_reducer(action, state):
-        # @cascade_reducer passes a deep copy — mutate and return directly
-        state.setdefault("application", {}).setdefault("counters", {})
-        view_id = action["payload"]["view_id"]
-        state["application"]["counters"][view_id] = action["payload"]["counter"]
-        return state
-
-    # 2. Create a stateful view
-    class CounterView(StatefulView):
-        session_limit = 1
-
-        def __init__(self, context):
-            super().__init__(context=context)
-            self.counter = 0
-            self.add_item(StatefulButton(
-                label="+1",
-                style=discord.ButtonStyle.primary,
+    def build_ui(self):
+        """Rebuild the component tree from current state."""
+        self.clear_items()
+        self.add_item(card(
+            "## Counter",
+            key_value({"Value": str(self.counter)}),
+            color=discord.Color.blurple(),
+        ))
+        self.add_item(ActionRow(
+            StatefulButton(
+                label="+1", style=discord.ButtonStyle.primary,
                 callback=self.increment,
-            ))
-            self.add_item(StatefulButton(
-                label="-1",
-                style=discord.ButtonStyle.danger,
+            ),
+            StatefulButton(
+                label="-1", style=discord.ButtonStyle.danger,
                 callback=self.decrement,
-            ))
-            self.add_exit_button()
+            ),
+        ))
+        self.add_exit_button()
 
-        async def increment(self, interaction):
-            await interaction.response.defer()
-            self.counter += 1
-            await self.dispatch("COUNTER_UPDATED", {
-                "view_id": self.id,
-                "counter": self.counter,
-            })
-            if self.message:
-                await self.message.edit(
-                    embed=discord.Embed(title="Counter", description=f"Value: {self.counter}"),
-                    view=self,
-                )
+    async def increment(self, interaction):
+        self.counter += 1
+        await self.dispatch("COUNTER_UPDATED", {
+            "view_id": self.id, "value": self.counter,
+        })
 
-        async def decrement(self, interaction):
-            await interaction.response.defer()
-            self.counter -= 1
-            await self.dispatch("COUNTER_UPDATED", {
-                "view_id": self.id,
-                "counter": self.counter,
-            })
-            if self.message:
-                await self.message.edit(
-                    embed=discord.Embed(title="Counter", description=f"Value: {self.counter}"),
-                    view=self,
-                )
+    async def decrement(self, interaction):
+        self.counter -= 1
+        await self.dispatch("COUNTER_UPDATED", {
+            "view_id": self.id, "value": self.counter,
+        })
+```
 
-    # 3. Wire it up to a command
-    bot = commands.Bot(command_prefix="!", intents=discord.Intents.default())
+Key points:
 
-    @bot.hybrid_command()
-    async def counter(ctx):
-        view = CounterView(context=ctx)
-        await view.send(embed=discord.Embed(title="Counter", description="Value: 0"))
-    ```
+- **`build_ui()`** rebuilds the component tree from scratch. The default
+  `on_state_changed()` calls `build_ui()` followed by `refresh()` whenever
+  the view's state changes -- no manual wiring needed.
+- **`self.dispatch()`** sends the action through the middleware pipeline into
+  the reducer, which updates state, which notifies subscribers, which triggers
+  `on_state_changed()`.
+- **`StatefulButton`** wraps discord.py's `Button` with automatic
+  `COMPONENT_INTERACTION` dispatching for debugging and history tracking.
+- **`card()`** creates a `Container` from its children -- strings are
+  auto-wrapped in `TextDisplay`.
 
-## What Just Happened?
+---
 
-1. **`@cascade_reducer`** registered a function that handles `COUNTER_UPDATED` actions. Reducers receive the action and a deep-copied state, mutate it, and return it directly — no `copy.deepcopy()` needed.
+## Step 3: Wire It Up
 
-2. **`StatefulLayoutView`** (V2) or **`StatefulView`** (V1) wraps discord.py's view classes with state integration. They auto-subscribe to the state store and handle cleanup on timeout.
+Register the view as a slash command:
 
-3. **`StatefulButton`** extends discord.py's `Button` with automatic `COMPONENT_INTERACTION` dispatching. Every click is tracked in the state store.
+```python
+from discord.ext import commands
 
-4. **`view.dispatch()`** sends an action through the middleware pipeline into the reducer, which updates state. Subscribers (including the view itself) are notified.
+bot = commands.Bot(command_prefix="!", intents=discord.Intents.default())
 
-5. **`view.send()`** handles message creation, state registration, and message tracking in one call. V2 views send the component tree as the message content. V1 views accept `embed` and `content` parameters.
+@bot.hybrid_command()
+async def counter(ctx):
+    view = CounterView(context=ctx)
+    await view.send()
+```
+
+`view.send()` handles message creation, state registration, session tracking,
+and message reference capture in one call.
+
+---
+
+## The Data Flow
+
+Here is what happens each time a button is clicked:
+
+```
+Click "+1"  →  increment()  →  dispatch("COUNTER_UPDATED")
+                                        │
+                               counter_reducer() mutates state
+                                        │
+                               on_state_changed() fires
+                                        │
+                               build_ui() → refresh()
+                                        │
+                               Discord message edited ✓
+```
+
+This is the **unidirectional data flow** pattern -- every state change follows
+the same path. See [Core Concepts](concepts.md#data-flow) for the full
+diagram.
+
+---
+
+## V1 Alternative
+
+The same counter using the V1 component system (`StatefulView` + embeds):
+
+```python
+import discord
+from discord.ext import commands
+from cascadeui import StatefulView, StatefulButton, cascade_reducer
+
+@cascade_reducer("COUNTER_UPDATED")
+async def counter_reducer(action, state):
+    app = state.setdefault("application", {})
+    counters = app.setdefault("counters", {})
+    counters[action["payload"]["view_id"]] = action["payload"]["value"]
+    return state
+
+class CounterView(StatefulView):
+    instance_limit = 1
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.counter = 0
+        self.add_item(StatefulButton(
+            label="+1", style=discord.ButtonStyle.primary,
+            callback=self.increment,
+        ))
+        self.add_item(StatefulButton(
+            label="-1", style=discord.ButtonStyle.danger,
+            callback=self.decrement,
+        ))
+        self.add_exit_button()
+
+    def build_ui(self):
+        return {"embed": discord.Embed(
+            title="Counter",
+            description=f"Value: {self.counter}",
+            color=discord.Color.blurple(),
+        )}
+
+    async def increment(self, interaction):
+        self.counter += 1
+        await self.dispatch("COUNTER_UPDATED", {
+            "view_id": self.id, "value": self.counter,
+        })
+
+    async def decrement(self, interaction):
+        self.counter -= 1
+        await self.dispatch("COUNTER_UPDATED", {
+            "view_id": self.id, "value": self.counter,
+        })
+
+bot = commands.Bot(command_prefix="!", intents=discord.Intents.default())
+
+@bot.hybrid_command()
+async def counter(ctx):
+    view = CounterView(context=ctx)
+    await view.send(**view.build_ui())
+```
+
+V1 views use embeds for content and buttons below. `build_ui()` returns a
+dict that is splatted into `refresh()` (via the default `on_state_changed()`).
+The initial send passes the same dict to `view.send()`.
+
+---
 
 ## Next Steps
 
-- [State Management](state.md) — understand the dispatch/reducer cycle
-- [Views](views.md) — lifecycle, transitions, and pre-built patterns
-- [Components](components.md) — buttons, selects, V2 helpers, wrappers, and composition
-- [Persistence](persistence.md) — save and restore state across restarts
-- [Known Limitations](known-limitations.md) — architectural constraints to be aware of
+- **[Core Concepts](concepts.md)** -- the mental models that make everything click
+- **[Views](views.md)** -- lifecycle, navigation, sessions, policies
+- **[Components](components.md)** -- selects, modals, V2 builders, grid helpers
+- **[State Management](state.md)** -- custom reducers, scoped state, undo/redo
+- **[View Patterns](patterns.md)** -- pre-built forms, wizards, tabs, pagination

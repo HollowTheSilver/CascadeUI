@@ -1,17 +1,11 @@
 # // ========================================( Modules )======================================== // #
 
 
-from typing import Optional
-
 import discord
-from discord import Interaction
-from discord.ui import ActionRow, LayoutView
+from discord.ui import ActionRow, Item, LayoutView
 
 from ..components.base import StatefulButton
-from ..utils.logging import AsyncLogger
-from .base import SessionLimitError, _StatefulMixin
-
-logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a", prefix="cascadeui")
+from .base import _StatefulMixin
 
 
 # // ========================================( Classes )======================================== // #
@@ -31,57 +25,28 @@ class StatefulLayoutView(_StatefulMixin, LayoutView):
     async def send(self, *, ephemeral=False):
         """Send this V2 view as a message.
 
-        Unlike V1's ``send()``, there are no ``content``/``embed``/``embeds``
-        parameters. V2 views carry their display content as children
-        (Container, TextDisplay, Section, etc.).
+        Unlike V1's ``send()``, there are no
+        ``content``/``embed``/``embeds`` parameters -- V2 views carry
+        their display content as children (Container, TextDisplay,
+        Section, etc.).
+
+        See ``_StatefulMixin._send_pipeline`` for the full exception
+        contract and rollback semantics.
 
         Args:
-            ephemeral: Whether the message should be ephemeral (interaction only).
+            ephemeral: Whether the message should be ephemeral
+                (interaction-context only).
+
+        Returns:
+            The sent ``discord.Message`` on success, or ``None`` when a
+            policy gate blocked the send and the library handled the
+            user response internally.
         """
-        await self._enforce_session_limit()
+        return await self._send_pipeline({"view": self}, ephemeral=ephemeral)
 
-        # Register in instance registry before state so the view is
-        # tracked even if the state dispatch triggers subscribers that query it
-        self.state_store.register_view(self)
-        await self._register_state()
-
-        if ephemeral:
-            self._ephemeral = True
-            if self.timeout is None:
-                logger.warning(
-                    f"{self.__class__.__name__}: ephemeral views with timeout=None will lose "
-                    "editability after the interaction token expires (15 minutes). "
-                    "Consider setting a finite timeout."
-                )
-
-        send_kwargs = {"view": self}
-
-        try:
-            if self.context and hasattr(self.context, "send"):
-                if ephemeral:
-                    send_kwargs["ephemeral"] = ephemeral
-                message = await self.context.send(**send_kwargs)
-
-            elif self.interaction:
-                send_kwargs["ephemeral"] = ephemeral
-                if not self.interaction.response.is_done():
-                    await self.interaction.response.send_message(**send_kwargs)
-                    message = await self.interaction.original_response()
-                else:
-                    message = await self.interaction.followup.send(**send_kwargs, wait=True)
-
-            else:
-                raise RuntimeError(
-                    "StatefulLayoutView.send() requires either 'context' or "
-                    "'interaction' to be set."
-                )
-        except Exception:
-            self.state_store.unregister_view(self.id)
-            raise
-
-        self._message = message
-        await self._update_message_state(message)
-        return message
+    def _install_refresh_button(self, button: StatefulButton) -> None:
+        """V2 wraps the refresh button in an ActionRow before adding it."""
+        self.add_item(ActionRow(button))
 
     # // ==================( V2 Layout Helpers )================== // #
 
@@ -89,7 +54,7 @@ class StatefulLayoutView(_StatefulMixin, LayoutView):
         """Add a back button wrapped in an ActionRow for V2 layout views."""
 
         async def back_callback(interaction):
-            await interaction.response.defer()
+            await self._safe_defer(interaction)
             prev_view = await self.pop(interaction)
             if prev_view:
                 try:
@@ -97,7 +62,7 @@ class StatefulLayoutView(_StatefulMixin, LayoutView):
                 except discord.HTTPException:
                     pass
             else:
-                # V2 messages ARE their components — view=None would produce
+                # V2 messages ARE their components -- view=None would produce
                 # an empty message.  Freeze instead.
                 try:
                     self._freeze_components()
@@ -128,19 +93,16 @@ class StatefulLayoutView(_StatefulMixin, LayoutView):
     ):
         """Add a button that exits this view, wrapped in an ActionRow.
 
-        For PersistentLayoutView subclasses, pass a ``custom_id``.
+        Thin wrapper over :meth:`make_exit_button` that attaches the
+        result inside an ``ActionRow``. For ``PersistentLayoutView``
+        subclasses, pass a ``custom_id``.
         """
-
-        async def exit_callback(interaction):
-            await interaction.response.defer()
-            await self.exit(delete_message=delete_message)
-
-        button = StatefulButton(
+        button = self.make_exit_button(
             label=label,
             style=style,
             emoji=emoji,
+            delete_message=delete_message,
             custom_id=custom_id,
-            callback=exit_callback,
         )
         self.add_item(ActionRow(button))
         return button
@@ -153,3 +115,38 @@ class StatefulLayoutView(_StatefulMixin, LayoutView):
         specific children instead.
         """
         pass
+
+
+class DisplayLayoutView(StatefulLayoutView):
+    """No-subclass V2 view that renders a pre-built container.
+
+    Use when the goal is to ``send()`` a V2 component (typically as an
+    ephemeral response) without authoring a full ``StatefulLayoutView``
+    subclass. Interactive items inside the container still dispatch
+    through the normal pipeline -- this class trades per-instance state
+    for the ability to instantiate directly.
+
+    Defaults differ from ``StatefulLayoutView`` to match the common
+    one-shot use case:
+        * ``owner_only = False`` -- display cards are typically public.
+        * ``state_scope = None`` -- no per-scope state slice.
+
+    Example:
+        body = card(
+            TextDisplay("## Stats"),
+            key_value({"Games": "5", "Wins": "3"}),
+        )
+        await DisplayLayoutView(context=context, container=body).send(ephemeral=True)
+    """
+
+    owner_only = False
+    state_scope = None
+
+    def __init__(self, *args, container: Item, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._container = container
+        self.build_ui()
+
+    def build_ui(self) -> None:
+        self.clear_items()
+        self.add_item(self._container)

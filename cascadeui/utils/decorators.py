@@ -6,10 +6,9 @@ import copy
 from functools import wraps
 from typing import Any, Callable, Dict
 
-# Import logger
-from ..utils.logging import AsyncLogger
+import logging
 
-logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a", prefix="cascadeui")
+logger = logging.getLogger(__name__)
 
 
 # // ========================================( Functions )======================================== // #
@@ -19,9 +18,24 @@ def cascade_reducer(action_type: str):
     """Decorator to register a reducer function with the state store.
 
     The decorated function receives ``(action, state)`` where ``state`` is
-    already a deep copy -- mutate it freely and return it.  There is no
-    need to ``import copy`` or call ``copy.deepcopy`` yourself.
+    already a deep copy -- mutate it freely and return it.  Do not cache
+    ``state_store.state`` references across dispatches; the reducer's
+    snapshot is per-call and outside refs grow stale.
+
+    Raises ``ValueError`` at decoration time when ``action_type`` collides
+    with a built-in action (VIEW_CREATED, NAVIGATION_PUSH, UNDO, etc.).
+    Reach for middleware or a store hook instead -- shadowing the built-in
+    reducer would silently break sessions, navigation, and undo bookkeeping.
     """
+    from ..state.reducers import _BUILTIN_REDUCER_ACTIONS
+
+    if action_type in _BUILTIN_REDUCER_ACTIONS:
+        raise ValueError(
+            f"Cannot register a custom reducer for built-in action {action_type!r}. "
+            f"Built-in actions drive CascadeUI's session, navigation, and undo "
+            f"machinery. Use middleware (install via setup_middleware(YourMiddleware())) "
+            f"for cross-cutting observation, or store.on({action_type!r}, ...) for side-effects."
+        )
 
     def decorator(func: Callable):
         @wraps(func)
@@ -31,7 +45,7 @@ def cascade_reducer(action_type: str):
         # Import lazily to avoid circular imports
         from ..state.singleton import get_store
 
-        get_store().register_reducer(action_type, wrapper)
+        get_store()._register_reducer(action_type, wrapper)
         logger.debug(f"Registered reducer for action type: {action_type}")
 
         return wrapper

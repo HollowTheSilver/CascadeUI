@@ -1,0 +1,76 @@
+name: Design Discussion
+description: Propose a new pattern, component, or architectural change
+labels: ["design"]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Use this template for proposals that affect CascadeUI's public
+        API surface, add new pre-built patterns, or change how existing
+        systems work. Bug fixes and small improvements should use the
+        Feature Request template instead.
+
+
+        For early-stage ideas where you want to talk through the
+        design before filling out a formal proposal, the
+        [support Discord server](https://discord.com/invite/9Xj68BpKRb)
+        is the right place to start.
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What are you proposing?
+      description: >
+        Describe the change at a high level. What new class, method,
+        or attribute would exist after this change?
+    validations:
+      required: true
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Why does this belong in the library?
+      description: >
+        CascadeUI ships patterns that solve structural problems every
+        Discord UI eventually hits. If this proposal adds a new
+        pattern, explain the structural problem it solves and why a
+        subclass in user code is insufficient. If it changes existing
+        API surface, explain what's broken or awkward about the
+        current design.
+    validations:
+      required: true
+
+  - type: textarea
+    id: api-surface
+    attributes:
+      label: Proposed API surface
+      description: >
+        Show the class definition, attributes, and method signatures.
+        Follow the existing grammar: `on_*` for hooks, `*_message`
+        for static text, `*_policy` for behavior enums, three-tier
+        precedence (class attr, method override, explicit arg).
+      render: python
+    validations:
+      required: true
+
+  - type: textarea
+    id: existing-grammar
+    attributes:
+      label: How does this fit the existing grammar?
+      description: >
+        List the existing patterns this follows or extends. If it
+        introduces a new convention, explain why the existing
+        conventions do not work for this case.
+    validations:
+      required: false
+
+  - type: textarea
+    id: blast-radius
+    attributes:
+      label: Blast radius
+      description: >
+        What existing code would this change affect? Would any
+        existing behavior change? Would any downstream user code
+        need to be updated?
+    validations:
+      required: false

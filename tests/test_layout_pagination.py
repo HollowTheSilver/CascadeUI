@@ -1,13 +1,13 @@
 """Tests for PaginatedLayoutView (V2 pagination)."""
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from discord.ui import ActionRow, Container, LayoutView, TextDisplay
+from helpers import make_interaction as _make_interaction
 
 from cascadeui.views.layout import StatefulLayoutView
-from cascadeui.views.layout_specialized import PaginatedLayoutView
-from helpers import make_interaction as _make_interaction
+from cascadeui.views.patterns import PaginatedLayoutView
 
 
 class TestPaginatedLayoutViewInit:

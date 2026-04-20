@@ -1,14 +1,13 @@
 """Tests for TabLayoutView and WizardLayoutView (V2 patterns)."""
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from discord.ui import ActionRow, Container, LayoutView, TextDisplay
-
-from cascadeui.views.layout import StatefulLayoutView
-from cascadeui.views.layout_patterns import TabLayoutView, WizardLayoutView
 from helpers import make_interaction as _make_interaction
 
+from cascadeui.views.layout import StatefulLayoutView
+from cascadeui.views.patterns import TabLayoutView, WizardLayoutView
 
 # // ========================================( TabLayoutView )======================================== // #
 
@@ -236,15 +235,16 @@ class TestWizardLayoutViewNavigation:
 
         finish_called = []
 
-        async def on_finish(interaction):
-            finish_called.append(True)
-            await interaction.response.defer()
+        class FinishWizard(WizardLayoutView):
+            async def on_finish(self, interaction):
+                finish_called.append(True)
+                if not interaction.response.is_done():
+                    await interaction.response.defer()
 
         interaction = _make_interaction()
-        view = WizardLayoutView(
+        view = FinishWizard(
             interaction=interaction,
             steps=[{"name": "Only", "builder": builder}],
-            on_finish=on_finish,
         )
 
         nav_interaction = _make_interaction()

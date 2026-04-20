@@ -16,11 +16,7 @@ default_theme = Theme(
         "secondary_color": Color.light_grey(),
         "success_color": Color.green(),
         "danger_color": Color.red(),
-        "info_color": Color.blurple(),
-        "warning_color": Color.gold(),
         "accent_colour": Color.blue(),
-        "header_emoji": "",
-        "footer_text": "Powered by CascadeUI",
     },
 )
 
@@ -28,15 +24,12 @@ default_theme = Theme(
 dark_theme = Theme(
     "dark",
     {
-        "primary_color": Color.purple(),  # Purple instead of dark blue
+        "primary_color": Color.purple(),
         "secondary_color": Color.dark_grey(),
-        "success_color": Color.blue(),  # Blue instead of dark green
-        "danger_color": Color.orange(),  # Orange instead of dark red
-        "info_color": Color.dark_teal(),
-        "warning_color": Color.gold(),
+        "success_color": Color.blue(),
+        "danger_color": Color.orange(),
         "accent_colour": Color.purple(),
         "header_emoji": "\U0001f319",
-        "footer_text": "Powered by CascadeUI (Dark Theme)",
     },
 )
 
@@ -44,15 +37,12 @@ dark_theme = Theme(
 light_theme = Theme(
     "light",
     {
-        "primary_color": Color.gold(),  # Yellow/gold instead of blue
+        "primary_color": Color.gold(),
         "secondary_color": Color.light_grey(),
-        "success_color": Color.green(),  # Keep green for success
-        "danger_color": Color.orange(),  # Orange instead of red
-        "info_color": Color.teal(),
-        "warning_color": Color.gold(),
+        "success_color": Color.green(),
+        "danger_color": Color.orange(),
         "accent_colour": Color.gold(),
         "header_emoji": "\u2600\ufe0f",
-        "footer_text": "Powered by CascadeUI (Light Theme)",
     },
 )
 

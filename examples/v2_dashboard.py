@@ -1,5 +1,5 @@
 """
-V2 Dashboard — CascadeUI V2 Layout Showcase
+V2 Dashboard -- CascadeUI V2 Layout Showcase
 =============================================
 
 A multi-tab dashboard demonstrating V2 layout capabilities that are
@@ -7,15 +7,17 @@ impossible with V1 embeds:
 
     - Multiple containers with different accent colors in one message
     - Sections with button accessories (text + action on the same line)
-    - Tabbed navigation via TabLayoutView
+    - Tabbed navigation via ``TabLayoutView`` with customized tab styles
+    - ``on_tab_switched`` hook for analytics on every tab change
     - Separators for visual hierarchy between content blocks
     - State-driven module toggles with live visual feedback
     - Session limiting (one dashboard per user per guild)
     - V2 convenience helpers for concise component assembly
+    - ``@computed`` aggregate (``dashboard_total_visits``) read from the store
 
-In V1, you get one embed (one color) with buttons separated below.
-In V2, every content block can have its own color, its own inline
-buttons, and its own visual identity — all in a single message.
+A V1 view shows one embed (one color) with buttons separated below.
+A V2 view gives every content block its own color, its own inline
+buttons, and its own visual identity -- all in a single message.
 
 Commands:
     /v2dashboard   Open the dashboard
@@ -27,26 +29,59 @@ Usage:
 # // ========================================( Modules )======================================== // #
 
 
-import logging
-
 import discord
 from discord.ext import commands
 from discord.ext.commands import Context
-from discord.ui import ActionRow, Container, TextDisplay
+from discord.ui import ActionRow, TextDisplay
 
 from cascadeui import (
-    SessionLimitError,
-    StatefulButton,
     TabLayoutView,
     action_section,
     card,
+    cascade_reducer,
+    computed,
     divider,
     gap,
+    read_slot,
     key_value,
+    access_slot,
     toggle_section,
 )
 
+import logging
+
 logger = logging.getLogger(__name__)
+
+
+# // ========================================( Reducer + @computed )======================================== // #
+
+
+@cascade_reducer("DASHBOARD_TAB_VISITED")
+async def _dashboard_tab_visited(action, state):
+    """Track per-tab visit counts in application state.
+
+    The visits dict lives at ``state["application"]["dashboard"]["visits"]``
+    so the ``@computed`` aggregate below has a stable read path. Lifting
+    visits out of instance state is what lets the Overview tab back its
+    "Tab visits" line with a derived store value rather than a per-view
+    dict that would not survive a session restart.
+    """
+    visits = access_slot(state, "dashboard", "visits", default_factory=dict)
+    name = action["payload"]["tab_name"]
+    visits[name] = visits.get(name, 0) + 1
+    return state
+
+
+@computed(selector=lambda state: read_slot(state, "dashboard", "visits", default={}))
+def dashboard_total_visits(visits):
+    """Total tab visits across every dashboard session.
+
+    Selector returns the visits dict; the compute step sums values. The
+    cache key is the dict itself, so the sum only runs when a tab visit
+    actually mutates the slot -- subsequent renders reuse the cached
+    integer.
+    """
+    return sum(visits.values())
 
 
 # // ========================================( Dashboard )======================================== // #
@@ -57,18 +92,40 @@ class DashboardView(TabLayoutView):
 
     Three tabs demonstrate different V2 component patterns:
 
-        Overview  — Multiple themed containers with section accessories
-        Modules   — State-driven toggles with live visual feedback
-        About     — Rich text layout with separators and containers
+        Overview  -- Multiple themed containers with section accessories
+        Modules   -- State-driven toggles with live visual feedback
+        About     -- Rich text layout with separators and containers
     """
 
-    session_limit = 1
-    session_scope = "user_guild"
-    session_policy = "replace"
+    # // ----( Policy surface )---- // #
+    owner_only = True
+    instance_limit = 1
+    instance_scope = "user_guild"
+    instance_policy = "replace"
+    replace_policy = "delete"
+    exit_policy = "delete"
+    auto_defer = True  # library default; declared explicitly so the full policy surface is visible
+    # ``state_scope = None`` because module toggles and tab-visit counters
+    # live on the instance, not the Redux tree. The dashboard is a layout
+    # showcase rather than a state-management tutorial -- see ``v2_settings``
+    # for the scoped-state pattern.
+    state_scope = None
+    # Non-ephemeral panel; flag has no effect here. Declared explicitly
+    # so the full policy surface is visible in the class body.
+    auto_refresh_ephemeral = False
+
+    # // ----( Tab styling )---- // #
+    # Success green marks the active tab so the dashboard reads like an
+    # admin panel; inactive tabs stay on the muted secondary style.
+    active_tab_style = discord.ButtonStyle.success
+    inactive_tab_style = discord.ButtonStyle.secondary
 
     def __init__(self, *args, **kwargs):
-        # Module toggle states (instance-level, not Redux state — keeps
-        # this example focused on V2 layout rather than state management)
+        # Module toggle states live on the instance, not in the Redux
+        # tree, because this example is a layout showcase rather than a
+        # state-management tutorial. Visit counts, by contrast, live in
+        # the store so the ``@computed`` aggregate above has a stable
+        # read path -- see ``dashboard_total_visits``.
         self._modules = {
             "Moderation": True,
             "Logging": True,
@@ -84,21 +141,32 @@ class DashboardView(TabLayoutView):
         }
         super().__init__(*args, tabs=tabs, **kwargs)
 
+    # // ==================( Override hooks )================== // #
+
+    async def on_tab_switched(self, index: int) -> None:
+        """Dispatch a visit event for the newly active tab.
+
+        ``TabLayoutView.on_tab_switched`` is a no-op by default; overriding
+        it is the library-supported way to run analytics, audit logging,
+        or async setup on every tab change without having to reimplement
+        the tab-button wiring. Dispatching ``DASHBOARD_TAB_VISITED``
+        routes through the reducer above and feeds the ``@computed``
+        total that the Overview surfaces.
+        """
+        name = self._tab_names[index]
+        await self.dispatch("DASHBOARD_TAB_VISITED", {"tab_name": name})
+
     # // ==================( Helpers )================== // #
 
     def _exit_row(self):
-        """Build an exit button ActionRow for the bottom of each tab."""
-        btn = StatefulButton(
-            label="Close",
-            style=discord.ButtonStyle.secondary,
-            emoji="\u274c",
-            callback=self._close_dashboard,
-        )
-        return ActionRow(btn)
+        """Build an exit button ActionRow for the bottom of each tab.
 
-    async def _close_dashboard(self, interaction):
-        await interaction.response.defer()
-        await self.exit()
+        ``make_exit_button`` returns an unattached ``StatefulButton`` whose
+        callback honors ``exit_policy`` and any ``delete_message`` override,
+        so tab builders can pack it into their own ``ActionRow`` without
+        hand-rolling a close handler.
+        """
+        return ActionRow(self.make_exit_button(label="Close"))
 
     @property
     def _guild(self):
@@ -119,6 +187,7 @@ class DashboardView(TabLayoutView):
             - action_section() for text + button on one line
             - key_value() for formatted stats
             - gap() for invisible gaps between containers
+            - @computed read via ``store.computed["dashboard_total_visits"]``
         """
         guild = self._guild
         name = guild.name if guild else "Unknown Server"
@@ -126,8 +195,14 @@ class DashboardView(TabLayoutView):
         channels = len(guild.channels) if guild else "?"
         roles = len(guild.roles) if guild else "?"
         enabled = sum(1 for v in self._modules.values() if v)
+        # ``store.computed[name]`` returns the cached value produced by
+        # the ``@computed`` registration above. The selector recomputes
+        # only when the visits dict changes; subsequent tab renders read
+        # the cached integer.
+        visits = read_slot(self.state_store.state, "dashboard", "visits", default={})
+        total_visits = self.state_store.computed["dashboard_total_visits"]
 
-        # Server stats card — green accent
+        # Server stats card -- green accent
         stats = card(
             f"## {name}",
             action_section(
@@ -142,12 +217,20 @@ class DashboardView(TabLayoutView):
                     "Channels": channels,
                     "Roles": roles,
                     "Active Modules": f"{enabled}/{len(self._modules)}",
+                    "Tab visits (total)": total_visits or "_none yet_",
+                    "Tab visits (per tab)": (
+                        ", ".join(
+                            f"{tab.split(' ', 1)[-1]} {count}"
+                            for tab, count in visits.items()
+                        )
+                        or "_none yet_"
+                    ),
                 }
             ),
             color=discord.Color.green(),
         )
 
-        # Quick actions card — blurple accent
+        # Quick actions card -- blurple accent
         actions = card(
             "## Quick Actions",
             action_section(
@@ -163,12 +246,10 @@ class DashboardView(TabLayoutView):
 
     async def _refresh_overview(self, interaction):
         """Refresh the overview tab to update live stats."""
-        await interaction.response.defer()
         await self._refresh_tabs()
 
     async def _go_to_modules(self, interaction):
         """Switch to the Modules tab from the Overview quick action."""
-        await interaction.response.defer()
         await self.switch_tab("\U0001f9e9 Modules")
 
     # // ==================( Modules Tab )================== // #
@@ -193,13 +274,12 @@ class DashboardView(TabLayoutView):
                 )
             )
 
-        return [Container(*items, accent_colour=discord.Color.purple()), self._exit_row()]
+        return [card(*items, color=discord.Color.purple()), self._exit_row()]
 
     def _make_toggle(self, module_name):
         """Create a toggle callback for a specific module."""
 
         async def callback(interaction):
-            await interaction.response.defer()
             self._modules[module_name] = not self._modules[module_name]
             await self._refresh_tabs()
 
@@ -232,8 +312,8 @@ class DashboardView(TabLayoutView):
         tech = card(
             "## Built With",
             TextDisplay(
-                "**CascadeUI** \u2014 Stateful Discord UI framework\n"
-                "**discord.py 2.7+** \u2014 V2 component support\n\n"
+                "**CascadeUI** - Stateful Discord UI framework\n"
+                "**discord.py 2.7+** - V2 component support\n\n"
                 "-# TabLayoutView \u2022 Section \u2022 Container \u2022 StatefulButton"
             ),
             color=discord.Color.dark_grey(),
@@ -260,17 +340,16 @@ class V2DashboardExample(commands.Cog, name="v2_dashboard_example"):
 
         Three tabs demonstrate layout patterns that are impossible in V1:
         multiple colored containers, sections with inline action buttons,
-        and state-driven toggles — all in one message.
+        and state-driven toggles -- all in one message.
         """
         if not context.guild:
             await context.send("This command can only be used in a server.", ephemeral=True)
             return
 
-        try:
-            view = DashboardView(context=context)
-            await view.send()
-        except SessionLimitError:
-            await context.send("You already have a dashboard open.", ephemeral=True)
+        # send() auto-handles InstanceLimitError via on_instance_limit,
+        # which sends an ephemeral default message. No try/except needed.
+        view = DashboardView(context=context)
+        await view.send()
 
 
 async def setup(bot) -> None:

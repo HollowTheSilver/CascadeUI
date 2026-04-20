@@ -1,21 +1,84 @@
 # // ========================================( Modules )======================================== // #
 
 
+import io
 import json
-import logging
+from datetime import datetime, timezone
 
 import discord
 from discord.ext import commands
 from discord.ext.commands import Context
 from discord.ui import ActionRow, TextDisplay
 
-from .components.base import StatefulButton
-from .components.v2_patterns import action_section, alert, card, divider, gap, key_value
+from .components.base import StatefulButton, StatefulSelect
+from .components.patterns import action_section, alert, card, divider, gap, key_value
+from .state.actions import ActionCreators
+from .state.computed import computed
 from .state.singleton import get_store
-from .views.base import SessionLimitError
-from .views.layout_patterns import TabLayoutView
+from .exceptions import InstanceLimitError
+from .views.patterns import TabLayoutView
+
+import logging
 
 logger = logging.getLogger(__name__)
+
+
+# // ========================================( Store Internals )======================================== // #
+#
+# The inspector is the library's own debugging surface, so it reaches into
+# store state that user code never should. Private access concentrates
+# through these helpers so the privacy boundary stays auditable from one
+# place -- refactors to store internals change the helpers, not the dozens
+# of call sites downstream.
+
+
+async def _cleanup_ghost_view(store, view_id: str) -> None:
+    """Drop a ghost view (state row with no live instance) from the store.
+
+    Three-step mop-up: remove from the active-view registry, remove the
+    subscriber slot, dispatch VIEW_DESTROYED so the state-tree reducer
+    trims ``state["views"][view_id]`` and session membership. Used when
+    an instance dies without routing through ``exit()`` -- the state
+    row outlives the object and only the inspector can clean it.
+    """
+    store._unregister_view(view_id)
+    store._unsubscribe(view_id)
+    await store.dispatch("VIEW_DESTROYED", ActionCreators.view_destroyed(view_id))
+
+
+# // ========================================( Computed Aggregations )======================================== // #
+#
+# Module-level @computed registrations expose the library's derived-state
+# API inside its own DevTools. Only pure functions of `state` are eligible;
+# store runtime (active-view registry, subscribers, middleware) stays inline
+# in the Config tab because it is not part of the Redux state tree.
+#
+# Consumers subtract the inspector's own contribution (one view, one session)
+# at the read site, since @computed has no view context.
+
+
+@computed(selector=lambda s: len(s.get("views", {})))
+def total_views(count: int) -> int:
+    """Total registered views in the state tree (including the inspector itself)."""
+    return count
+
+
+@computed(selector=lambda s: len(s.get("sessions", {})))
+def total_sessions(count: int) -> int:
+    """Total sessions in the state tree (including the inspector's own session)."""
+    return count
+
+
+@computed(selector=lambda s: tuple(sorted(s.get("application", {}).keys())))
+def application_keys(keys: tuple) -> list:
+    """Sorted list of top-level keys inside ``state["application"]``."""
+    return list(keys)
+
+
+@computed(selector=lambda s: s)
+def state_size_bytes(state: dict) -> int:
+    """UTF-8 byte length of the JSON-serialized state tree."""
+    return len(json.dumps(state, default=str).encode())
 
 
 # // ========================================( Inspector )======================================== // #
@@ -24,28 +87,59 @@ logger = logging.getLogger(__name__)
 class InspectorView(TabLayoutView):
     """V2 state inspector for browsing the CascadeUI state store.
 
-    Uses TabLayoutView to dogfood the library's own V2 component system.
-    Self-filters its own view and session from displayed data to avoid
-    observer-effect noise in the inspection output.
+    Built on TabLayoutView so the inspector exercises the library's own
+    V2 component system. Self-filters its own view and session from
+    displayed data to avoid observer-effect noise in the inspection output.
 
     Tabs:
-        Overview  — State tree summary with key counts and size
-        Views     — Active view instances and registry stats
-        Sessions  — Active sessions with nav stack and data info
-        History   — Recent action dispatch log
-        Config    — Reducers, middleware, hooks, persistence status
+        Overview  -- State tree summary with key counts and size
+        Views     -- Active view instances with exit controls
+        Sessions  -- Active sessions with clear controls
+        History   -- Recent action dispatch log
+        Config    -- Reducers, middleware, hooks, persistence status
     """
 
-    session_limit = 1
-    session_scope = "user_guild"
-    session_policy = "replace"
-    subscribed_actions = {"VIEW_CREATED", "VIEW_DESTROYED"}
+    instance_limit = 1
+    instance_scope = "user_guild"
+    instance_policy = "replace"
+    # Push/pop routes through ``store.batch()`` which collapses VIEW_CREATED
+    # plus VIEW_DESTROYED into one BATCH_COMPLETE action. The navigation
+    # families (NAVIGATION_PUSH / NAVIGATION_POP / NAVIGATION_REPLACE) are
+    # subscribed explicitly so the selector fires on every transition even
+    # when the view count happens to be stable through the batch.
+    # VIEW_UPDATED keeps the Views tab's Channel / Msg fields live when the
+    # ``_message`` / ``_update_message_state`` contract writes land on
+    # existing rows. Session families catch cross-chain session membership
+    # changes that don't produce a VIEW_* action.
+    subscribed_actions = {
+        "VIEW_CREATED",
+        "VIEW_UPDATED",
+        "VIEW_DESTROYED",
+        "NAVIGATION_PUSH",
+        "NAVIGATION_POP",
+        "NAVIGATION_REPLACE",
+        "SESSION_CREATED",
+        "SESSION_UPDATED",
+    }
+    # Overview is the inspector's home tab; pin it alone on row 1 so the
+    # remaining five tabs share row 2 in scan order rather than inheriting
+    # the default "fill" split (5 on row 1, 1 on row 2) which isolates the
+    # least interesting tab on its own line.
+    tab_overflow_policy = "pin_first"
 
     def state_selector(self, state):
-        """Track filtered view/session counts to detect external changes."""
-        views = {k for k in state.get("views", {}) if k != self.id}
-        sessions = {k for k in state.get("sessions", {}) if k != self.session_id}
-        return (len(views), len(sessions))
+        """Return frozensets of filtered view/session IDs.
+
+        Identity tuple, not counts. A counts-based selector short-circuits
+        during push/pop batches where one view births and another dies in
+        the same synthetic BATCH_COMPLETE action -- the before/after count
+        is identical but the ID set changed. Frozensets expose the identity
+        diff and drive ``on_state_changed`` through the _notify_subscribers
+        selector gate.
+        """
+        views = frozenset(k for k in state.get("views", {}) if k != self.id)
+        sessions = frozenset(k for k in state.get("sessions", {}) if k != self.session_id)
+        return (views, sessions)
 
     def __init__(self, *args, **kwargs):
         tabs = {
@@ -53,6 +147,7 @@ class InspectorView(TabLayoutView):
             "\U0001f441\ufe0f Views": self.build_views,
             "\U0001f4c2 Sessions": self.build_sessions,
             "\U0001f4dc History": self.build_history,
+            "\u26a1 Performance": self.build_performance,
             "\u2699\ufe0f Config": self.build_config,
         }
         super().__init__(*args, tabs=tabs, **kwargs)
@@ -77,24 +172,24 @@ class InspectorView(TabLayoutView):
         """Return active view instances excluding the inspector itself."""
         return {k: v for k, v in self.state_store._active_views.items() if k != self.id}
 
+    def _filtered_components(self):
+        """Return component entries excluding the inspector's own interactions."""
+        components = self.state_store.state.get("components", {})
+        return {k: v for k, v in components.items() if v.get("view_id") != self.id}
+
+    def _filtered_modals(self):
+        """Return modal entries excluding the inspector's own view."""
+        modals = self.state_store.state.get("modals", {})
+        return {k: v for k, v in modals.items() if k != self.id}
+
     # // ==================( Helpers )================== // #
 
     def _exit_row(self):
         """Build an exit button ActionRow for the bottom of each tab."""
-        btn = StatefulButton(
-            label="Close",
-            style=discord.ButtonStyle.secondary,
-            emoji="\u274c",
-            callback=self._close,
-        )
-        return ActionRow(btn)
-
-    async def _close(self, interaction):
-        await interaction.response.defer()
-        await self.exit()
+        return ActionRow(self.make_exit_button(label="Close", emoji="\u274c"))
 
     async def _refresh(self, interaction):
-        await interaction.response.defer()
+        await self._safe_defer(interaction)
         await self._refresh_tabs()
 
     def _truncate(self, items, max_len=200):
@@ -124,15 +219,32 @@ class InspectorView(TabLayoutView):
 
     async def build_overview(self):
         """State tree summary with key counts and estimated size."""
-        state = self.state_store.state
-        views = self._filtered_views()
-        sessions = self._filtered_sessions()
-        components = state.get("components", {})
-        modals = state.get("modals", {})
+        store = self.state_store
+        components = self._filtered_components()
+        modals = self._filtered_modals()
+
+        # Total counts come from the module-level @computed aggregations; the
+        # inspector subtracts its own contribution only when registered.
+        # TabLayoutView.send() calls build_overview() before super().send()
+        # dispatches VIEW_CREATED / SESSION_CREATED, so on first render the
+        # inspector's own ids are not yet in state -- subtracting 1
+        # unconditionally would under-count every other view by one.
+        # Probing state membership picks the right subtraction every render.
+        state_views = store.state.get("views", {})
+        state_sessions = store.state.get("sessions", {})
+        self_view_present = self.id in state_views
+        self_session_present = self.session_id in state_sessions
+        view_count = max(
+            0, store.computed["total_views"] - (1 if self_view_present else 0)
+        )
+        session_count = max(
+            0,
+            store.computed["total_sessions"] - (1 if self_session_present else 0),
+        )
 
         stats = {
-            "Views": len(views),
-            "Sessions": len(sessions),
+            "Views": view_count,
+            "Sessions": session_count,
             "Components": len(components),
         }
         if modals:
@@ -152,17 +264,14 @@ class InspectorView(TabLayoutView):
         )
 
         # Application state summary
-        app_state = state.get("application", {})
-        app_keys = list(app_state.keys()) if app_state else []
+        app_keys = store.computed["application_keys"]
         history = self._filtered_history()
-
-        state_json = json.dumps(state, default=str)
-        size_kb = len(state_json.encode()) / 1024
+        size_kb = store.computed["state_size_bytes"] / 1024
 
         app_info = {
             "App Keys": self._truncate(app_keys) if app_keys else "(empty)",
             "State Size": f"{size_kb:.1f} KB",
-            "History Buffer": f"{len(history)}/{self.state_store.history_limit}",
+            "History Buffer": f"{len(history)}/{store.history_limit}",
         }
 
         app_card = card(
@@ -171,12 +280,78 @@ class InspectorView(TabLayoutView):
             color=discord.Color.dark_grey(),
         )
 
-        return [overview, gap(), app_card, self._exit_row()]
+        # Action buttons -- only show purge when non-inspector entries exist
+        actions = []
+        if components or modals:
+            actions.append(
+                StatefulButton(
+                    label=f"Purge Stale ({len(components) + len(modals)})",
+                    style=discord.ButtonStyle.danger,
+                    emoji="\U0001f5d1\ufe0f",
+                    callback=self._purge_stale,
+                )
+            )
+        if getattr(self.state_store, "persistence_manager", None) is not None:
+            actions.append(
+                StatefulButton(
+                    label="Flush to Disk",
+                    style=discord.ButtonStyle.primary,
+                    emoji="\U0001f4be",
+                    callback=self._flush_to_disk,
+                )
+            )
+        if history:
+            actions.append(
+                StatefulButton(
+                    label="Clear History",
+                    style=discord.ButtonStyle.secondary,
+                    emoji="\U0001f9f9",
+                    callback=self._clear_history,
+                )
+            )
+
+        items = [overview, gap(), app_card]
+        if actions:
+            actions.append(self.make_exit_button(label="Close", emoji="\u274c"))
+            items.append(ActionRow(*actions))
+        else:
+            items.append(self._exit_row())
+        return items
+
+    async def _purge_stale(self, interaction):
+        """Drop orphaned component and modal entries from the state tree.
+
+        Routes through the INSPECTOR_PURGED_STALE reducer instead of
+        mutating ``state["components"]`` and ``state["modals"]`` in place.
+        The reducer keeps the inspector's own entries (tab-button
+        COMPONENT_INTERACTION rows that are expected while the inspector
+        is alive) and drops every other entry, mirroring the read-side
+        ``_filtered_components`` / ``_filtered_modals`` filters above.
+        """
+        await self._safe_defer(interaction)
+        await self.dispatch("INSPECTOR_PURGED_STALE", {"inspector_id": self.id})
+        await self._refresh_tabs()
+
+    async def _flush_to_disk(self, interaction):
+        """Force an immediate persistence write."""
+        await self._safe_defer(interaction)
+        manager = getattr(self.state_store, "persistence_manager", None)
+        if manager is not None:
+            await manager.flush_all()
+            logger.info("Inspector: forced persistence flush")
+        await self._refresh_tabs()
+
+    async def _clear_history(self, interaction):
+        """Clear the action history buffer."""
+        await self._safe_defer(interaction)
+        self.state_store.history.clear()
+        logger.info("Inspector: cleared action history")
+        await self._refresh_tabs()
 
     # // ==================( Views Tab )================== // #
 
     async def build_views(self):
-        """Active view instances and registry statistics."""
+        """Active view instances with exit controls."""
         views = self._filtered_views()
         active = self._filtered_active_views()
 
@@ -193,7 +368,8 @@ class InspectorView(TabLayoutView):
             user_id = view_data.get("user_id", "N/A")
             channel_id = view_data.get("channel_id", "N/A")
             msg_id = view_data.get("message_id", "N/A")
-            lines.append(f"**{view_type}** (`{short_id}`)")
+            is_live = "\U0001f7e2" if view_id in active else "\U0001f534"
+            lines.append(f"{is_live} **{view_type}** (`{short_id}`)")
             lines.append(f"-# User: {user_id} | Channel: {channel_id} | Msg: {msg_id}")
 
         if len(views) > 8:
@@ -209,25 +385,124 @@ class InspectorView(TabLayoutView):
 
         # Registry stats
         sub_count = len(self.state_store.subscribers) - 1  # Exclude self
-        session_index = self.state_store._session_index
+        instance_index = self.state_store._instance_index
         registry = card(
             "## View Registry",
             key_value(
                 {
                     "Active Instances": len(active),
-                    "Session Index Entries": len(session_index),
+                    "Instance Index Entries": len(instance_index),
                     "Subscribers": sub_count,
                 }
             ),
             color=discord.Color.dark_grey(),
         )
 
-        return [views_card, gap(), registry, self._exit_row()]
+        # View select menu for targeted exit. Use positional indices as
+        # SelectOption.value so the wire payload stays inside Discord's
+        # 100-char cap regardless of how long the internal view_id is.
+        self._view_index_map: dict[str, str] = {}
+        options = []
+        for idx, (view_id, view_data) in enumerate(shown):
+            if not view_id:
+                continue
+            view_type = view_data.get("type", "Unknown")
+            short_id = view_id[:8]
+            is_live = view_id in active
+            label = f"{view_type} ({short_id}...)"
+            desc = "Live instance" if is_live else "Ghost (state only)"
+            idx_str = str(idx)
+            self._view_index_map[idx_str] = view_id
+            options.append(discord.SelectOption(label=label, value=idx_str, description=desc))
+
+        select = StatefulSelect(
+            placeholder="Select a view to exit...",
+            options=options,
+            custom_id="inspector_view_select",
+            callback=self._on_view_selected,
+        )
+
+        # Action row with bulk controls
+        actions = [
+            StatefulButton(
+                label="Exit Selected",
+                style=discord.ButtonStyle.danger,
+                emoji="\U0001f6d1",
+                callback=self._exit_selected_view,
+            ),
+            StatefulButton(
+                label=f"Exit All ({len(views)})",
+                style=discord.ButtonStyle.danger,
+                emoji="\u26a0\ufe0f",
+                callback=self._exit_all_views,
+            ),
+            self.make_exit_button(label="Close", emoji="\u274c"),
+        ]
+
+        return [
+            views_card,
+            gap(),
+            registry,
+            ActionRow(select),
+            ActionRow(*actions),
+        ]
+
+    async def _on_view_selected(self, interaction):
+        """Store the selected view ID for the Exit Selected button."""
+        raw = interaction.data.get("values", [None])[0]
+        index_map = getattr(self, "_view_index_map", {})
+        self._selected_view_id = index_map.get(raw) if raw is not None else None
+        await self._safe_defer(interaction)
+
+    async def _exit_selected_view(self, interaction):
+        """Exit the view chosen in the select menu."""
+        await self._safe_defer(interaction)
+        view_id = getattr(self, "_selected_view_id", None)
+        if not view_id:
+            return await self._refresh_tabs()
+
+        active = self._filtered_active_views()
+        if view_id in active:
+            try:
+                await active[view_id].exit()
+                logger.info(f"Inspector: exited live view {view_id[:8]}...")
+            except Exception as e:
+                logger.warning(f"Inspector: exit failed for {view_id[:8]}...: {e}")
+        else:
+            await _cleanup_ghost_view(self.state_store, view_id)
+            logger.info(f"Inspector: cleaned ghost view {view_id[:8]}...")
+
+        self._selected_view_id = None
+        await self._refresh_tabs()
+
+    async def _exit_all_views(self, interaction):
+        """Exit all views except the inspector."""
+        await self._safe_defer(interaction)
+        active = self._filtered_active_views()
+        views = self._filtered_views()
+        exited = 0
+
+        # Exit live instances first
+        for view_id, view in list(active.items()):
+            try:
+                await view.exit()
+                exited += 1
+            except Exception as e:
+                logger.warning(f"Inspector: exit failed for {view_id[:8]}...: {e}")
+
+        # Clean ghost entries (state but no live instance)
+        for view_id in list(views.keys()):
+            if view_id not in active:
+                await _cleanup_ghost_view(self.state_store, view_id)
+                exited += 1
+
+        logger.info(f"Inspector: exited {exited} view(s)")
+        await self._refresh_tabs()
 
     # // ==================( Sessions Tab )================== // #
 
     async def build_sessions(self):
-        """Active sessions with view counts and nav stack info."""
+        """Active sessions with view counts, nav stack info, and clear controls."""
         sessions = self._filtered_sessions()
 
         if not sessions:
@@ -237,16 +512,15 @@ class InspectorView(TabLayoutView):
         lines = []
         shown = list(sessions.items())[:6]
         for session_id, session_data in shown:
-            view_count = len(session_data.get("views", []))
-            nav_depth = len(session_data.get("nav_stack", []))
+            member_count = len(session_data.get("members", []))
             created = self._format_timestamp(session_data.get("created_at", "N/A"))
-            data_keys = list(session_data.get("data", {}).keys())
+            shared_keys = list(session_data.get("shared_data", {}).keys())
 
             lines.append(f"**{session_id}**")
-            detail = f"-# Views: {view_count} | Nav Stack: {nav_depth} | Created: {created}"
+            detail = f"-# Members: {member_count} | Created: {created}"
             lines.append(detail)
-            if data_keys:
-                lines.append(f"-# Data Keys: {', '.join(data_keys[:5])}")
+            if shared_keys:
+                lines.append(f"-# Shared Keys: {', '.join(shared_keys[:5])}")
             lines.append("")  # Blank line between entries
 
         if len(sessions) > 6:
@@ -260,7 +534,83 @@ class InspectorView(TabLayoutView):
             color=discord.Color.gold(),
         )
 
-        return [sessions_card, self._exit_row()]
+        # Session select + clear controls. SelectOption.value is capped at
+        # 100 chars by Discord; session IDs follow ClassName:user:guild:...
+        # patterns that routinely exceed the cap. Ship positional indices
+        # on the wire and resolve back to the real session_id at callback
+        # time via _session_index_map.
+        self._session_index_map: dict[str, str] = {}
+        options = []
+        for idx, (session_id, session_data) in enumerate(shown):
+            if not session_id:
+                continue
+            member_count = len(session_data.get("members", []))
+            label = session_id[:100]  # SelectOption label max
+            idx_str = str(idx)
+            self._session_index_map[idx_str] = session_id
+            options.append(
+                discord.SelectOption(
+                    label=label,
+                    value=idx_str,
+                    description=f"{member_count} member(s)",
+                )
+            )
+
+        select = StatefulSelect(
+            placeholder="Select a session to clear...",
+            options=options,
+            custom_id="inspector_session_select",
+            callback=self._on_session_selected,
+        )
+
+        actions = [
+            StatefulButton(
+                label="Clear Selected",
+                style=discord.ButtonStyle.danger,
+                emoji="\U0001f5d1\ufe0f",
+                callback=self._clear_selected_session,
+            ),
+            self.make_exit_button(label="Close", emoji="\u274c"),
+        ]
+
+        return [sessions_card, ActionRow(select), ActionRow(*actions)]
+
+    async def _on_session_selected(self, interaction):
+        """Store the selected session ID for the Clear Selected button."""
+        raw = interaction.data.get("values", [None])[0]
+        index_map = getattr(self, "_session_index_map", {})
+        self._selected_session_id = index_map.get(raw) if raw is not None else None
+        await self._safe_defer(interaction)
+
+    async def _clear_selected_session(self, interaction):
+        """Exit all views in the selected session and remove the session."""
+        await self._safe_defer(interaction)
+        session_id = getattr(self, "_selected_session_id", None)
+        if not session_id:
+            return await self._refresh_tabs()
+
+        sessions = self._filtered_sessions()
+        session_data = sessions.get(session_id)
+        if not session_data:
+            self._selected_session_id = None
+            return await self._refresh_tabs()
+
+        active = self.state_store._active_views
+        exited = 0
+        for view_id in list(session_data.get("members", [])):
+            if view_id in active:
+                try:
+                    await active[view_id].exit()
+                    exited += 1
+                except Exception as e:
+                    logger.warning(f"Inspector: exit failed for {view_id[:8]}...: {e}")
+            else:
+                await _cleanup_ghost_view(self.state_store, view_id)
+                exited += 1
+
+        logger.info(f"Inspector: cleared session {session_id} ({exited} view(s) exited)")
+        self._selected_session_id = None
+        await self._refresh_tabs()
 
     # // ==================( History Tab )================== // #
 
@@ -346,15 +696,17 @@ class InspectorView(TabLayoutView):
             color=discord.Color.dark_grey(),
         )
 
-        # Persistence
-        if store.persistence_enabled:
-            backend = store.persistence_backend
-            backend_name = backend.__class__.__name__ if backend else "None"
+        # Persistence -- v3 runs three independent namespaces (registry /
+        # application / scoped), each with its own backend or opted out.
+        manager = getattr(store, "persistence_manager", None)
+        if manager is not None:
             persistent_views = store.state.get("persistent_views", {})
-            persist_info = {
-                "Status": f"Enabled ({backend_name})",
-                "Persistent Views": f"{len(persistent_views)} registered",
-            }
+            persist_info = {"Persistent Views": f"{len(persistent_views)} registered"}
+            for ns_name, ns_cfg in manager.namespaces.items():
+                backend = getattr(ns_cfg, "backend", None)
+                persist_info[ns_name.capitalize()] = (
+                    backend.__class__.__name__ if backend is not None else "Opted out"
+                )
             persist_color = discord.Color.green()
         else:
             persist_info = {"Status": "Disabled"}
@@ -368,40 +720,753 @@ class InspectorView(TabLayoutView):
 
         return [reducers_card, gap(), middleware_card, gap(), persistence_card, self._exit_row()]
 
-    async def update_from_state(self, state):
+    # // ==================( Performance Tab )================== // #
+
+    async def _perf_toggle(self, interaction):
+        """Flip the store's perf flag on/off."""
+        store = self.state_store
+        if store._perf_enabled:
+            store.disable_perf()
+        else:
+            store.enable_perf()
+        await self._safe_defer(interaction)
+        await self._refresh_tabs()
+
+    async def _perf_clear(self, interaction):
+        """Drop every recorded sample (dispatch + refresh)."""
+        self.state_store.clear_perf()
+        await self._safe_defer(interaction)
+        await self._refresh_tabs()
+
+    async def _perf_export(self, interaction):
+        """Snapshot every sample buffer and send as an ephemeral file.
+
+        The tab displays aggregated views (percentiles + top N) to stay
+        within Discord's component and message limits. This handler
+        emits the full raw buffers as markdown with a trailing JSON
+        appendix, so reviewers receive everything the store captured
+        rather than the truncated surface.
+        """
+        store = self.state_store
+        # Snapshot first; the deques may mutate during formatting as
+        # background dispatches land. Same self-filter rules as
+        # ``build_performance`` so the report matches the tab's view,
+        # minus the aggregation cut.
+        dispatches = [s for s in store.perf_samples if s["action"] != "COMPONENT_INTERACTION"]
+        refreshes = [s for s in store._refresh_samples if s["view_id"] != self.id]
+        notifies = [
+            s for s in store._notify_samples
+            if s["subscriber_id"] != self.id
+            and s["action"] != "COMPONENT_INTERACTION"
+        ]
+
+        if not dispatches and not refreshes and not notifies:
+            await self.respond(
+                interaction,
+                content="No samples to export -- enable profiling and interact with a view first.",
+                ephemeral=True,
+            )
+            return
+
+        report = self._build_perf_report(dispatches, notifies, refreshes, store._perf_enabled)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        filename = f"cascadeui-perf-{stamp}.md"
+        attachment = discord.File(io.BytesIO(report.encode("utf-8")), filename=filename)
+
+        await self.respond(
+            interaction,
+            content=(
+                f"Performance snapshot -- {len(dispatches)} dispatches, "
+                f"{len(notifies)} subscriber samples, {len(refreshes)} refreshes."
+            ),
+            ephemeral=True,
+            file=attachment,
+        )
+
+    def _build_perf_report(self, dispatches, notifies, refreshes, enabled):
+        """Format the perf buffers as markdown with a trailing JSON appendix.
+
+        Sections mirror the Performance tab's three cards -- Dispatch,
+        Subscriber, Refresh -- but emit every sample rather than summary
+        percentiles. Raw JSON at the end keeps the report lossless for
+        programmatic analysis; ad-hoc tooling can skip the markdown and
+        parse the tail fence directly.
+        """
+        generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        status = "recording" if enabled else "paused"
+
+        lines = [
+            "# CascadeUI Performance Report",
+            "",
+            f"**Generated:** {generated}",
+            f"**Profiling state:** {status}",
+            "",
+            f"- Dispatch samples: {len(dispatches)}",
+            f"- Subscriber samples: {len(notifies)}",
+            f"- Refresh samples: {len(refreshes)}",
+            "",
+            "---",
+            "",
+        ]
+
+        if dispatches:
+            lines.append("## Dispatch Timings")
+            lines.append("")
+            # Same back-fill as build_performance -- older samples lack
+            # ``middleware_ms`` and ``edits``; default to zero/"?".
+            filled = [
+                {**s, "middleware_ms": s.get("middleware_ms", 0.0), "hooks_ms": s.get("hooks_ms", 0.0)}
+                for s in dispatches
+            ]
+            reducer = self._summarize(filled, "reducer_ms")
+            middleware = self._summarize(filled, "middleware_ms")
+            notify = self._summarize(filled, "notify_ms")
+            hooks = self._summarize(filled, "hooks_ms")
+            total = self._summarize(filled, "total_ms")
+
+            lines.append("### Aggregates (ms)")
+            lines.append("")
+            lines.append("| Phase | min | p50 | p95 | max |")
+            lines.append("|-------|-----|-----|-----|-----|")
+            for label, stats in [
+                ("Reducer", reducer),
+                ("Middleware", middleware),
+                ("Notify", notify),
+                ("Hooks", hooks),
+                ("Total", total),
+            ]:
+                lines.append(
+                    f"| {label} | {stats['min']:.2f} | {stats['p50']:.2f} | "
+                    f"{stats['p95']:.2f} | {stats['max']:.2f} |"
+                )
+            lines.append("")
+            lines.append("### Raw samples (oldest first)")
+            lines.append("")
+            lines.append(
+                "| # | time | action | total | reducer | middleware | notify | hooks | subs | edits |"
+            )
+            lines.append(
+                "|---|------|--------|-------|---------|------------|--------|-------|------|-------|"
+            )
+            for i, s in enumerate(dispatches):
+                t = self._format_timestamp(s["timestamp"])
+                mw = s.get("middleware_ms", 0.0)
+                hk = s.get("hooks_ms", 0.0)
+                edits = s.get("edits", "?")
+                lines.append(
+                    f"| {i} | {t} | {s['action']} | {s['total_ms']:.2f} | "
+                    f"{s['reducer_ms']:.2f} | {mw:.2f} | {s['notify_ms']:.2f} | "
+                    f"{hk:.2f} | {s['subscribers']} | {edits} |"
+                )
+            lines.append("")
+
+        if notifies:
+            lines.append("## Subscriber Timings")
+            lines.append("")
+            notify_stats = self._summarize(notifies, "ms")
+            lines.append(
+                f"**Overall:** n={notify_stats['count']}, min={notify_stats['min']:.2f}, "
+                f"p50={notify_stats['p50']:.2f}, p95={notify_stats['p95']:.2f}, "
+                f"max={notify_stats['max']:.2f}"
+            )
+            lines.append("")
+            lines.append("### By subscriber (full list, ranked by p95)")
+            lines.append("")
+            by_sub = {}
+            for s in notifies:
+                by_sub.setdefault(s["subscriber_id"], []).append(s["ms"])
+            ranked = []
+            for sub_id, vals in by_sub.items():
+                vals_sorted = sorted(vals)
+                p95 = vals_sorted[min(len(vals_sorted) - 1, int(len(vals_sorted) * 0.95))]
+                ranked.append((p95, sub_id, vals))
+            ranked.sort(key=lambda r: -r[0])
+            lines.append("| subscriber_id | n | p95 | max |")
+            lines.append("|---------------|---|-----|-----|")
+            for p95, sub_id, vals in ranked:
+                lines.append(
+                    f"| `{sub_id}` | {len(vals)} | {p95:.2f} | {max(vals):.2f} |"
+                )
+            lines.append("")
+            lines.append("### Raw samples (oldest first)")
+            lines.append("")
+            lines.append("| # | time | subscriber_id | action | ms |")
+            lines.append("|---|------|---------------|--------|-----|")
+            for i, s in enumerate(notifies):
+                t = self._format_timestamp(s["timestamp"])
+                lines.append(
+                    f"| {i} | {t} | `{s['subscriber_id']}` | {s['action']} | {s['ms']:.2f} |"
+                )
+            lines.append("")
+
+        if refreshes:
+            lines.append("## Refresh Timings")
+            lines.append("")
+            refresh_stats = self._summarize(refreshes, "refresh_ms")
+            lines.append(
+                f"**Overall:** n={refresh_stats['count']}, min={refresh_stats['min']:.2f}, "
+                f"p50={refresh_stats['p50']:.2f}, p95={refresh_stats['p95']:.2f}, "
+                f"max={refresh_stats['max']:.2f}"
+            )
+            lines.append("")
+            lines.append("### By view class (ranked by max)")
+            lines.append("")
+            by_class = {}
+            for s in refreshes:
+                by_class.setdefault(s["view_class"], []).append(s["refresh_ms"])
+            lines.append("| view_class | n | p95 | max |")
+            lines.append("|------------|---|-----|-----|")
+            for cls_name, vals in sorted(by_class.items(), key=lambda kv: -max(kv[1])):
+                vals_sorted = sorted(vals)
+                p95 = vals_sorted[min(len(vals_sorted) - 1, int(len(vals_sorted) * 0.95))]
+                lines.append(
+                    f"| `{cls_name}` | {len(vals)} | {p95:.2f} | {max(vals):.2f} |"
+                )
+            lines.append("")
+            lines.append("### Raw samples (oldest first)")
+            lines.append("")
+            lines.append("| # | time | view_class | view_id | ms |")
+            lines.append("|---|------|------------|---------|-----|")
+            for i, s in enumerate(refreshes):
+                t = self._format_timestamp(s["timestamp"])
+                vid = s["view_id"][:8] if s.get("view_id") else "?"
+                lines.append(
+                    f"| {i} | {t} | `{s['view_class']}` | `{vid}` | {s['refresh_ms']:.2f} |"
+                )
+            lines.append("")
+
+        lines.append("---")
+        lines.append("")
+        lines.append("## Raw JSON")
+        lines.append("")
+        lines.append("```json")
+        payload = {
+            "generated_utc": generated,
+            "enabled": enabled,
+            "dispatches": dispatches,
+            "subscribers": notifies,
+            "refreshes": refreshes,
+        }
+        lines.append(json.dumps(payload, indent=2, default=str))
+        lines.append("```")
+
+        return "\n".join(lines)
+
+    def _summarize(self, samples, field):
+        """Return (min, p50, p95, max) in ms for the given sample field.
+
+        No numpy dependency -- sort + index is clear enough at n<=100.
+        """
+        if not samples:
+            return None
+        values = sorted(s[field] for s in samples)
+        n = len(values)
+        return {
+            "count": n,
+            "min": values[0],
+            "p50": values[n // 2],
+            "p95": values[min(n - 1, int(n * 0.95))],
+            "max": values[-1],
+        }
+
+    async def build_performance(self):
+        """Per-dispatch and per-refresh timing samples.
+
+        Reads the store's own profiling hooks. The tab is inert until the
+        user flips the toggle; when enabled, every ``dispatch()`` and
+        every ``refresh()`` records a sample to a 100-entry ring buffer.
+        """
+        store = self.state_store
+        enabled = store._perf_enabled
+        dispatches = [s for s in store.perf_samples if s["action"] != "COMPONENT_INTERACTION"]
+        refreshes = [s for s in store._refresh_samples if s["view_id"] != self.id]
+        # Subscriber timing is self-filtered the same way refreshes are --
+        # the inspector's own ``on_state_changed`` callback would otherwise
+        # dominate the list since it fires for every unrelated action.
+        notifies = [
+            s for s in store._notify_samples
+            if s["subscriber_id"] != self.id
+            and s["action"] != "COMPONENT_INTERACTION"
+        ]
+
+        status_color = discord.Color.green() if enabled else discord.Color.dark_grey()
+        status_text = "Recording" if enabled else "Paused"
+        toggle_label = "Disable" if enabled else "Enable"
+        toggle_emoji = "\u23f8\ufe0f" if enabled else "\u25b6\ufe0f"
+
+        header = card(
+            "## Performance Profiling",
+            key_value(
+                {
+                    "Status": status_text,
+                    "Dispatch samples": f"{len(dispatches)} / 100",
+                    "Refresh samples": f"{len(refreshes)} / 100",
+                    "Subscriber samples": f"{len(notifies)} / 500",
+                }
+            ),
+            ActionRow(
+                StatefulButton(
+                    label=toggle_label,
+                    style=discord.ButtonStyle.primary if not enabled else discord.ButtonStyle.secondary,
+                    emoji=toggle_emoji,
+                    callback=self._perf_toggle,
+                ),
+                StatefulButton(
+                    label="Export Report",
+                    style=discord.ButtonStyle.success,
+                    emoji="\U0001f4e4",
+                    callback=self._perf_export,
+                ),
+                StatefulButton(
+                    label="Clear Samples",
+                    style=discord.ButtonStyle.secondary,
+                    emoji="\U0001f9f9",
+                    callback=self._perf_clear,
+                ),
+                StatefulButton(
+                    label="Refresh",
+                    style=discord.ButtonStyle.secondary,
+                    emoji="\U0001f504",
+                    callback=self._refresh,
+                ),
+            ),
+            color=status_color,
+        )
+
+        if not dispatches and not refreshes and not notifies:
+            hint_level = "info" if enabled else "warning"
+            hint_text = (
+                "Recording is on. Interact with a view in another channel to collect samples."
+                if enabled
+                else "Profiling is paused. Toggle Enable to begin sampling."
+            )
+            return [header, alert(hint_text, level=hint_level), self._exit_row()]
+
+        # Per-dispatch breakdown
+        dispatch_card = None
+        if dispatches:
+            reducer = self._summarize(dispatches, "reducer_ms")
+            # ``middleware_ms`` arrived with the measurement split -- older
+            # samples captured before the upgrade default to 0 so pre-split
+            # dispatches still render without crashing the summary math.
+            middleware = self._summarize(
+                [{**s, "middleware_ms": s.get("middleware_ms", 0.0)} for s in dispatches],
+                "middleware_ms",
+            )
+            notify = self._summarize(dispatches, "notify_ms")
+            total = self._summarize(dispatches, "total_ms")
+
+            def _fmt(stats):
+                return (
+                    f"min {stats['min']:.2f}  "
+                    f"p50 {stats['p50']:.2f}  "
+                    f"p95 {stats['p95']:.2f}  "
+                    f"max {stats['max']:.2f}"
+                )
+
+            recent = list(reversed(dispatches[-10:]))
+            recent_lines = []
+            for s in recent:
+                t = self._format_timestamp(s["timestamp"])
+                # "edits" and "middleware_ms" were added in later perf tasks,
+                # so samples captured mid-upgrade may lack the keys -- fall
+                # back to neutral placeholders rather than crash the tab.
+                edits = s.get("edits", "?")
+                mw = s.get("middleware_ms", 0.0)
+                recent_lines.append(
+                    f"`{t}` **{s['action']}** "
+                    f"`{s['total_ms']:.2f}ms` "
+                    f"(r:{s['reducer_ms']:.2f} / m:{mw:.2f} / n:{s['notify_ms']:.2f}) "
+                    f"subs:{s['subscribers']} edits:{edits}"
+                )
+
+            dispatch_card = card(
+                "## Dispatch Timings (ms)",
+                key_value(
+                    {
+                        f"Reducer  ({total['count']}x)": _fmt(reducer),
+                        "Middleware": _fmt(middleware),
+                        "Notify": _fmt(notify),
+                        "Total": _fmt(total),
+                    }
+                ),
+                divider(),
+                TextDisplay("### Recent dispatches\n" + "\n".join(recent_lines)),
+                color=discord.Color.blue(),
+            )
+
+        # Per-subscriber breakdown -- aggregates the notify_samples ring
+        # by subscriber_id, ranks by p95 so the slowest handler rises to
+        # the top. Pair with the dispatch card's Notify row: if notify_ms
+        # is high and one subscriber dominates this list, that's the
+        # candidate to selector-gate or fire-and-forget.
+        subscriber_card = None
+        if notifies:
+            notify_stats = self._summarize(notifies, "ms")
+            by_sub = {}
+            for s in notifies:
+                by_sub.setdefault(s["subscriber_id"], []).append(s["ms"])
+            sub_lines = []
+            # Rank by p95 descending so the slowest few are visible first.
+            ranked = []
+            for sub_id, vals in by_sub.items():
+                vals_sorted = sorted(vals)
+                p95 = vals_sorted[min(len(vals_sorted) - 1, int(len(vals_sorted) * 0.95))]
+                ranked.append((p95, sub_id, vals, vals_sorted))
+            ranked.sort(key=lambda r: -r[0])
+            # Display class name component of the subscriber_id if present
+            # (format is typically "ClassName:scope_key"); falls back to
+            # raw id otherwise. Truncated to keep each line scannable.
+            for p95, sub_id, vals, vals_sorted in ranked[:10]:
+                label = sub_id if len(sub_id) <= 40 else sub_id[:37] + "..."
+                sub_lines.append(
+                    f"`{label}` n={len(vals)} "
+                    f"p95={p95:.2f}ms max={max(vals):.2f}ms"
+                )
+            subscriber_card = card(
+                "## Subscriber Timings (ms)",
+                key_value(
+                    {
+                        f"Overall ({notify_stats['count']}x)": (
+                            f"min {notify_stats['min']:.2f}  "
+                            f"p50 {notify_stats['p50']:.2f}  "
+                            f"p95 {notify_stats['p95']:.2f}  "
+                            f"max {notify_stats['max']:.2f}"
+                        ),
+                    }
+                ),
+                divider(),
+                TextDisplay(
+                    "### By subscriber (top 10 by p95)\n" + "\n".join(sub_lines)
+                ),
+                color=discord.Color.purple(),
+            )
+
+        # Per-refresh breakdown
+        refresh_card = None
+        if refreshes:
+            refresh_stats = self._summarize(refreshes, "refresh_ms")
+            # Per-class p95 breakdown -- identifies which view class is slow
+            by_class = {}
+            for s in refreshes:
+                by_class.setdefault(s["view_class"], []).append(s["refresh_ms"])
+            class_lines = []
+            for cls_name, vals in sorted(by_class.items(), key=lambda kv: -max(kv[1])):
+                vals_sorted = sorted(vals)
+                p95 = vals_sorted[min(len(vals_sorted) - 1, int(len(vals_sorted) * 0.95))]
+                class_lines.append(
+                    f"`{cls_name}` n={len(vals)} p95={p95:.2f}ms max={max(vals):.2f}ms"
+                )
+
+            refresh_card = card(
+                "## Refresh Timings (ms)",
+                key_value(
+                    {
+                        f"Overall ({refresh_stats['count']}x)": (
+                            f"min {refresh_stats['min']:.2f}  "
+                            f"p50 {refresh_stats['p50']:.2f}  "
+                            f"p95 {refresh_stats['p95']:.2f}  "
+                            f"max {refresh_stats['max']:.2f}"
+                        ),
+                    }
+                ),
+                divider(),
+                TextDisplay("### By view class\n" + "\n".join(class_lines)),
+                color=discord.Color.teal(),
+            )
+
+        children = [header]
+        if dispatch_card:
+            children.extend([gap(), dispatch_card])
+        if subscriber_card:
+            children.extend([gap(), subscriber_card])
+        if refresh_card:
+            children.extend([gap(), refresh_card])
+        children.append(self._exit_row())
+        return children
+
+    async def on_state_changed(self, state):
         """Auto-refresh the active tab when external state changes."""
         if self.message:
             await self._refresh_tabs()
 
 
-# Backwards-compatible alias
-StateInspector = InspectorView
-
-
-# // ========================================( Cog )======================================== // #
+# // ========================================( DevTools Cog )======================================== // #
 
 
 class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
-    """Optional cog that adds a V2 state inspection command.
+    """CascadeUI developer tools cog.
+
+    Provides the visual state inspector and administrative commands
+    under a single ``/cascadeui`` command group. All subcommands are
+    owner-only and respond ephemerally.
 
     Usage:
-        from cascadeui.devtools import DevToolsCog
+        from cascadeui import DevToolsCog
         await bot.add_cog(DevToolsCog(bot))
+
+    Commands:
+        /cascadeui inspect        Open the visual state inspector
+        /cascadeui views          List active views
+        /cascadeui exit <id>      Exit a view by ID (partial match)
+        /cascadeui exitall        Exit all views + clean ghosts
+        /cascadeui sessions       List active sessions
+        /cascadeui clear <id>     Clear a session by ID
+        /cascadeui flush          Force persistence write
+        /cascadeui purge          Remove stale component/modal entries
+        /cascadeui reset          Reset entire state store (requires confirm)
     """
 
     def __init__(self, bot):
         self.bot = bot
 
-    @commands.hybrid_command(name="inspect", description="Inspect the CascadeUI state store.")
+    @commands.hybrid_group(name="cascadeui", description="CascadeUI developer tools.")
     @commands.is_owner()
+    async def cascadeui_group(self, ctx: Context) -> None:
+        """CascadeUI developer tools. Run a subcommand for details."""
+        lines = [
+            "**CascadeUI DevTools**",
+            "`/cascadeui inspect` -- Open the visual state inspector",
+            "`/cascadeui views` -- List active views",
+            "`/cascadeui exit <id>` -- Exit a view by ID",
+            "`/cascadeui exitall` -- Exit all views",
+            "`/cascadeui sessions` -- List sessions",
+            "`/cascadeui clear <id>` -- Clear a session",
+            "`/cascadeui flush` -- Force persistence write",
+            "`/cascadeui purge` -- Remove stale entries",
+            "`/cascadeui reset` -- Reset state store",
+        ]
+        await ctx.send("\n".join(lines), ephemeral=True)
+
+    # // ==================( View Commands )================== // #
+
+    @cascadeui_group.command(name="views", description="List active CascadeUI views.")
+    async def list_views(self, ctx: Context) -> None:
+        """List all active views in the state store."""
+        store = get_store()
+        views = store.state.get("views", {})
+        active = store._active_views
+
+        if not views:
+            return await ctx.send("No active views.", ephemeral=True)
+
+        lines = []
+        for view_id, view_data in list(views.items())[:15]:
+            view_type = view_data.get("type", "Unknown")
+            user_id = view_data.get("user_id", "N/A")
+            is_live = "\U0001f7e2" if view_id in active else "\U0001f534"
+            lines.append(f"{is_live} **{view_type}** `{view_id[:12]}...` (user: {user_id})")
+
+        if len(views) > 15:
+            lines.append(f"*...and {len(views) - 15} more*")
+
+        header = f"**{len(views)} view(s)** ({len(active)} live)\n"
+        await ctx.send(header + "\n".join(lines), ephemeral=True)
+
+    @cascadeui_group.command(name="exit", description="Exit a specific CascadeUI view by ID.")
+    async def exit_view(self, ctx: Context, view_id: str) -> None:
+        """Exit a specific view. Accepts full or partial (8+ char) IDs."""
+        store = get_store()
+
+        # Support partial ID matching
+        match = None
+        for vid in store.state.get("views", {}):
+            if vid == view_id or vid.startswith(view_id):
+                if match is not None:
+                    return await ctx.send(
+                        f"Ambiguous ID `{view_id}` matches multiple views. Use more characters.",
+                        ephemeral=True,
+                    )
+                match = vid
+
+        if not match:
+            return await ctx.send(f"No view found matching `{view_id}`.", ephemeral=True)
+
+        view_type = store.state.get("views", {}).get(match, {}).get("type", "Unknown")
+
+        if match in store._active_views:
+            try:
+                await store._active_views[match].exit()
+                await ctx.send(
+                    f"\U0001f7e2 Exited live **{view_type}** (`{match[:12]}...`).", ephemeral=True
+                )
+            except Exception as e:
+                await ctx.send(f"Exit failed: {e}", ephemeral=True)
+        else:
+            await _cleanup_ghost_view(store, match)
+            await ctx.send(
+                f"\U0001f534 Cleaned ghost **{view_type}** (`{match[:12]}...`).", ephemeral=True
+            )
+
+    @cascadeui_group.command(name="exitall", description="Exit all active CascadeUI views.")
+    async def exit_all(self, ctx: Context) -> None:
+        """Exit all active views and clean ghost entries."""
+        store = get_store()
+        views = dict(store.state.get("views", {}))
+        active = dict(store._active_views)
+        exited = 0
+
+        for view_id, view in list(active.items()):
+            try:
+                await view.exit()
+                exited += 1
+            except Exception:
+                pass
+
+        for view_id in list(views.keys()):
+            if view_id not in active:
+                await _cleanup_ghost_view(store, view_id)
+                exited += 1
+
+        await ctx.send(f"Exited {exited} view(s).", ephemeral=True)
+
+    # // ==================( State Commands )================== // #
+
+    @cascadeui_group.command(
+        name="flush", description="Force a CascadeUI persistence write to disk."
+    )
+    async def flush(self, ctx: Context) -> None:
+        """Write current state to disk immediately."""
+        store = get_store()
+        manager = getattr(store, "persistence_manager", None)
+        if manager is None:
+            return await ctx.send("Persistence is not enabled.", ephemeral=True)
+
+        await manager.flush_all()
+        state_json = json.dumps(store.state, default=str)
+        size_kb = len(state_json.encode()) / 1024
+        await ctx.send(f"\U0001f4be State flushed to disk ({size_kb:.1f} KB).", ephemeral=True)
+
+    @cascadeui_group.command(
+        name="purge", description="Remove stale CascadeUI component/modal entries."
+    )
+    async def purge(self, ctx: Context) -> None:
+        """Remove orphaned component and modal interaction data from state.
+
+        Routes through the ``INSPECTOR_PURGED_STALE`` reducer (matches the
+        inspector's own Purge Stale button) instead of mutating
+        ``state["components"]`` / ``state["modals"]`` in place. Keeps the
+        two entry points on one code path and lets middleware observe the
+        event. Preserves any live inspector's own rows -- same self-filter
+        property the inspector enforces on its Views / Sessions tabs.
+        """
+        store = get_store()
+        components = len(store.state.get("components", {}))
+        modals = len(store.state.get("modals", {}))
+        total = components + modals
+
+        if not total:
+            return await ctx.send("No stale entries to purge.", ephemeral=True)
+
+        inspector_id = next(
+            (vid for vid, view in store._active_views.items() if isinstance(view, InspectorView)),
+            None,
+        )
+        await store.dispatch("INSPECTOR_PURGED_STALE", {"inspector_id": inspector_id})
+        await ctx.send(
+            f"\U0001f5d1\ufe0f Purged {components} component(s) and {modals} modal(s).",
+            ephemeral=True,
+        )
+
+    @cascadeui_group.command(name="reset", description="Reset the entire CascadeUI state store.")
+    async def reset(self, ctx: Context, confirm: bool = False) -> None:
+        """Nuclear option: reset the state store to its initial empty state.
+
+        Requires ``confirm=True`` to execute. Exits all live views first.
+        """
+        if not confirm:
+            return await ctx.send(
+                "\u26a0\ufe0f This will **reset all state** and exit all views.\n"
+                "Run `/cascadeui reset confirm:True` to proceed.",
+                ephemeral=True,
+            )
+
+        store = get_store()
+
+        # Exit all live views
+        for view in list(store._active_views.values()):
+            try:
+                await view.exit()
+            except Exception:
+                pass
+
+        # Reset state
+        store.state = {
+            "sessions": {},
+            "views": {},
+            "components": {},
+            "application": {},
+        }
+
+        manager = getattr(store, "persistence_manager", None)
+        if manager is not None:
+            await manager.flush_all()
+
+        await ctx.send(
+            "\U0001f4a5 State store reset. All views exited, state cleared.", ephemeral=True
+        )
+
+    # // ==================( Session Commands )================== // #
+
+    @cascadeui_group.command(name="sessions", description="List active CascadeUI sessions.")
+    async def list_sessions(self, ctx: Context) -> None:
+        """List all sessions in the state store."""
+        store = get_store()
+        sessions = store.state.get("sessions", {})
+
+        if not sessions:
+            return await ctx.send("No active sessions.", ephemeral=True)
+
+        lines = []
+        for session_id, data in list(sessions.items())[:10]:
+            member_count = len(data.get("members", []))
+            lines.append(f"`{session_id}` - {member_count} member(s)")
+
+        if len(sessions) > 10:
+            lines.append(f"*...and {len(sessions) - 10} more*")
+
+        header = f"**{len(sessions)} session(s)**\n"
+        await ctx.send(header + "\n".join(lines), ephemeral=True)
+
+    @cascadeui_group.command(name="clear", description="Clear a specific CascadeUI session by ID.")
+    async def clear_session(self, ctx: Context, session_id: str) -> None:
+        """Exit all views in a session and remove the session entry."""
+        store = get_store()
+        sessions = store.state.get("sessions", {})
+
+        if session_id not in sessions:
+            return await ctx.send(f"No session found: `{session_id}`.", ephemeral=True)
+
+        session_data = sessions[session_id]
+        exited = 0
+        for view_id in list(session_data.get("members", [])):
+            if view_id in store._active_views:
+                try:
+                    await store._active_views[view_id].exit()
+                    exited += 1
+                except Exception:
+                    pass
+            else:
+                await _cleanup_ghost_view(store, view_id)
+                exited += 1
+
+        await ctx.send(
+            f"\U0001f5d1\ufe0f Cleared session `{session_id}` ({exited} view(s) exited).",
+            ephemeral=True,
+        )
+
+    # // ==================( Inspector Command )================== // #
+
+    @cascadeui_group.command(name="inspect", description="Open the CascadeUI state inspector.")
     async def inspect(self, ctx: Context) -> None:
-        """Open the CascadeUI state inspector.
+        """Open the visual state inspector.
 
         A tabbed V2 dashboard showing the live state tree, active views,
-        sessions, action history, and store configuration.
+        sessions, action history, and store configuration with interactive
+        controls for managing views, sessions, and state.
         """
         try:
             view = InspectorView(context=ctx)
             await view.send()
-        except SessionLimitError:
+        except InstanceLimitError:
             await ctx.send("Inspector already open.", ephemeral=True)
