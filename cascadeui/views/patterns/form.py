@@ -12,10 +12,10 @@ from ...components.base import StatefulButton, StatefulSelect
 from ...components.inputs import Modal as CascadeModal
 from ...components.inputs import TextInput as CascadeTextInput
 from ...components.patterns.v2 import alert, card
-from .types import FormSchema, _normalize_fields
 from ..base import _StatefulMixin
-from ..view import StatefulView
 from ..layout import StatefulLayoutView
+from ..view import StatefulView
+from .types import FormSchema, _normalize_fields
 
 logger = logging.getLogger(__name__)
 
@@ -55,9 +55,7 @@ def _validate_modal_field_count(cls_name: str, fields: List[Dict[str, Any]]) -> 
         )
 
 
-def _resolve_modal_edit_label(
-    override: Optional[str], modal_fields: List[Dict[str, Any]]
-) -> str:
+def _resolve_modal_edit_label(override: Optional[str], modal_fields: List[Dict[str, Any]]) -> str:
     """Resolve the grouped modal-edit button label.
 
     Precedence: explicit override -> singular ``"Edit {label}"`` when
@@ -212,9 +210,7 @@ def _build_form_modal(form, title: str) -> CascadeModal:
             form._clear_errors()
 
         for field_id, old_value, new_value in changes:
-            await form._call_hook_safe(
-                form.on_field_changed, field_id, old_value, new_value
-            )
+            await form._call_hook_safe(form.on_field_changed, field_id, old_value, new_value)
 
         if parse_errors:
             # Parse errors take precedence over validator errors -- running
@@ -228,9 +224,7 @@ def _build_form_modal(form, title: str) -> CascadeModal:
         if field_validators:
             from ...validation import validate_fields
 
-            field_defs = [
-                {"id": fid, "validators": fv} for fid, fv in field_validators.items()
-            ]
+            field_defs = [{"id": fid, "validators": fv} for fid, fv in field_validators.items()]
             errors = await validate_fields(form.values, field_defs)
             if errors:
                 form._set_validation_errors(errors)
@@ -358,9 +352,7 @@ class _BaseFormMixin:
     def _set_validation_errors(self, errors: Any) -> None:
         """Populate ``_field_errors`` / ``_form_error`` from ``_validate_form()``."""
         if isinstance(errors, dict):
-            self._field_errors = {
-                fid: [e.message for e in errs] for fid, errs in errors.items()
-            }
+            self._field_errors = {fid: [e.message for e in errs] for fid, errs in errors.items()}
             self._form_error = None
         else:
             self._field_errors = {}
@@ -423,9 +415,7 @@ class _BaseFormMixin:
         try:
             await hook(*args)
         except Exception as exc:
-            logger.warning(
-                f"{hook.__name__} raised in {type(self).__name__}: {exc}"
-            )
+            logger.warning(f"{hook.__name__} raised in {type(self).__name__}: {exc}")
 
     async def _open_text_modal(self, interaction: Interaction) -> None:
         """Open the grouped modal for every modal-rendered field on the form."""
@@ -619,9 +609,7 @@ class FormView(_BaseFormMixin, StatefulView):
                         self.values[fid] = value
                         if old_value != value:
                             self._clear_errors()
-                            await self._call_hook_safe(
-                                self.on_field_changed, fid, old_value, value
-                            )
+                            await self._call_hook_safe(self.on_field_changed, fid, old_value, value)
                         await self._update_form_display()
 
                     return callback
@@ -861,9 +849,7 @@ class FormLayoutView(_BaseFormMixin, StatefulLayoutView):
                         self.values[fid] = value
                         if old_value != value:
                             self._clear_errors()
-                            await self._call_hook_safe(
-                                self.on_field_changed, fid, old_value, value
-                            )
+                            await self._call_hook_safe(self.on_field_changed, fid, old_value, value)
                         await self._update_form_display()
 
                     return callback

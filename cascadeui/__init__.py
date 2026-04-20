@@ -42,6 +42,31 @@ from .components.patterns import (
 from .components.v1_composition import CompositeComponent, get_component, register_component
 from .components.wrappers import with_confirmation, with_cooldown, with_loading_state
 from .devtools import DevToolsCog, InspectorView
+
+# Then import other components that might need the store
+from .exceptions import (
+    InstanceLimitError,
+    PersistenceConfigError,
+    PersistenceError,
+    PersistenceInitError,
+    PersistenceRehydrateError,
+    PersistenceSchemaError,
+)
+from .persistence import (
+    ApplicationPersistence,
+    Capability,
+    InMemoryBackend,
+    PersistenceBackend,
+    PersistenceManager,
+    RegistryPersistence,
+    SlotPolicy,
+)
+from .persistence import __all__ as _persistence_all
+from .persistence import (
+    register_kwargs_migrator,
+    register_migrator,
+)
+from .setup import setup_middleware
 from .state.actions import ActionCreators
 from .state.computed import ComputedValue, computed
 from .state.middleware import LoggingMiddleware, PersistenceMiddleware, UndoMiddleware
@@ -51,11 +76,9 @@ from .state.singleton import get_store
 from .state.slots import access_slot, read_slot, slot_property
 from .state.store import StateStore
 from .state.types import StateData
-from .views.patterns.types import FormField, FormSchema, WizardSchema, WizardStep
 from .theming.context import get_current_theme
 from .theming.core import Theme, get_default_theme, get_theme, register_theme, set_default_theme
 from .theming.themes import dark_theme, default_theme, light_theme
-from .setup import setup_middleware
 from .utils.decorators import cascade_component, cascade_reducer
 from .utils.errors import safe_execute, with_error_boundary, with_retry
 from .utils.helpers import slugify
@@ -72,17 +95,6 @@ from .validation import (
     validate_field,
     validate_fields,
 )
-
-# Then import other components that might need the store
-from .exceptions import (
-    InstanceLimitError,
-    PersistenceConfigError,
-    PersistenceError,
-    PersistenceInitError,
-    PersistenceRehydrateError,
-    PersistenceSchemaError,
-)
-from .views.view import StatefulView
 from .views.layout import DisplayLayoutView, StatefulLayoutView
 from .views.patterns import (
     FormLayoutView,
@@ -98,19 +110,9 @@ from .views.patterns import (
     WizardLayoutView,
     WizardView,
 )
-from .persistence import (
-    ApplicationPersistence,
-    Capability,
-    InMemoryBackend,
-    PersistenceBackend,
-    PersistenceManager,
-    RegistryPersistence,
-    SlotPolicy,
-    register_kwargs_migrator,
-    register_migrator,
-)
-from .persistence import __all__ as _persistence_all
+from .views.patterns.types import FormField, FormSchema, WizardSchema, WizardStep
 from .views.persistent import PersistentLayoutView, PersistentView
+from .views.view import StatefulView
 
 # Optional backend -- only present when aiosqlite is installed
 if "SQLiteBackend" in _persistence_all:

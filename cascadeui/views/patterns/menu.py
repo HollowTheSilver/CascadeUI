@@ -10,9 +10,8 @@ from discord.ui import ActionRow
 from ...components.base import StatefulButton
 from ...components.patterns.v2 import action_section, card
 from ..base import _StatefulMixin
-from ..view import StatefulView
 from ..layout import StatefulLayoutView
-
+from ..view import StatefulView
 
 # // ========================================( Shared Mixin )======================================== // #
 
@@ -137,9 +136,7 @@ class MenuView(_BaseMenuMixin, StatefulView):
         """
         pass
 
-    def _build_category_button(
-        self, category: Dict[str, Any], index: int
-    ) -> StatefulButton:
+    def _build_category_button(self, category: Dict[str, Any], index: int) -> StatefulButton:
         """Build a single category button.
 
         Override to customize button appearance per category.

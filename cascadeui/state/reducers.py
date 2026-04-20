@@ -21,26 +21,28 @@ from .types import Action, StateData
 # They are listed here so @cascade_reducer raises on collision; users
 # who want to react to prunes should subscribe or use
 # store.on("application_slots_pruned", ...) rather than shadowing the name.
-_BUILTIN_REDUCER_ACTIONS = frozenset({
-    "VIEW_CREATED",
-    "VIEW_UPDATED",
-    "VIEW_DESTROYED",
-    "SESSION_CREATED",
-    "SESSION_UPDATED",
-    "NAVIGATION_REPLACE",
-    "NAVIGATION_PUSH",
-    "NAVIGATION_POP",
-    "SCOPED_UPDATE",
-    "COMPONENT_INTERACTION",
-    "MODAL_SUBMITTED",
-    "PERSISTENT_VIEW_REGISTERED",
-    "PERSISTENT_VIEW_UNREGISTERED",
-    "UNDO",
-    "REDO",
-    "APPLICATION_SLOTS_PRUNED",
-    "REGISTRY_PRUNED",
-    "INSPECTOR_PURGED_STALE",
-})
+_BUILTIN_REDUCER_ACTIONS = frozenset(
+    {
+        "VIEW_CREATED",
+        "VIEW_UPDATED",
+        "VIEW_DESTROYED",
+        "SESSION_CREATED",
+        "SESSION_UPDATED",
+        "NAVIGATION_REPLACE",
+        "NAVIGATION_PUSH",
+        "NAVIGATION_POP",
+        "SCOPED_UPDATE",
+        "COMPONENT_INTERACTION",
+        "MODAL_SUBMITTED",
+        "PERSISTENT_VIEW_REGISTERED",
+        "PERSISTENT_VIEW_UNREGISTERED",
+        "UNDO",
+        "REDO",
+        "APPLICATION_SLOTS_PRUNED",
+        "REGISTRY_PRUNED",
+        "INSPECTOR_PURGED_STALE",
+    }
+)
 
 # // ========================================( Coroutines )======================================== // #
 
@@ -250,19 +252,25 @@ async def reduce_component_interaction(action: Action, state: StateData) -> Stat
         return state
 
     components = state.get("components", {})
-    existing = components.get(component_id, {
-        "id": component_id,
-        "view_id": view_id,
-        "interactions": [],
-    })
+    existing = components.get(
+        component_id,
+        {
+            "id": component_id,
+            "view_id": view_id,
+            "interactions": [],
+        },
+    )
 
     interactions = existing.get("interactions", [])
-    new_interactions = [*interactions, {
-        "user_id": payload.get("user_id"),
-        "view_id": view_id,
-        "value": payload.get("value"),
-        "timestamp": action["timestamp"],
-    }]
+    new_interactions = [
+        *interactions,
+        {
+            "user_id": payload.get("user_id"),
+            "view_id": view_id,
+            "value": payload.get("value"),
+            "timestamp": action["timestamp"],
+        },
+    ]
     if len(new_interactions) > 50:
         new_interactions = new_interactions[-50:]
 
@@ -287,11 +295,14 @@ async def reduce_modal_submitted(action: Action, state: StateData) -> StateData:
     existing = modals.get(view_id, {"submissions": []})
 
     submissions = existing.get("submissions", [])
-    new_submissions = [*submissions, {
-        "user_id": payload.get("user_id"),
-        "values": payload.get("values", {}),
-        "timestamp": action["timestamp"],
-    }]
+    new_submissions = [
+        *submissions,
+        {
+            "user_id": payload.get("user_id"),
+            "values": payload.get("values", {}),
+            "timestamp": action["timestamp"],
+        },
+    ]
     if len(new_submissions) > 50:
         new_submissions = new_submissions[-50:]
 
@@ -464,9 +475,7 @@ def _apply_slot_diff(application: dict, diff: Dict[str, Any]) -> dict:
     return new_application
 
 
-def _build_inverse_diff(
-    current_application: dict, diff_keys: Any
-) -> Dict[str, Any]:
+def _build_inverse_diff(current_application: dict, diff_keys: Any) -> Dict[str, Any]:
     """Build the inverse diff from the current application for the same slot names.
 
     The inverse of applying ``diff`` is "restore these slots to their

@@ -1,7 +1,6 @@
 # // ========================================( Modules )======================================== // #
 
 
-from .view import StatefulView
 from .layout import DisplayLayoutView, StatefulLayoutView
 from .patterns import (
     FormLayoutView,
@@ -18,6 +17,7 @@ from .patterns import (
     WizardView,
 )
 from .persistent import PersistentLayoutView, PersistentView
+from .view import StatefulView
 
 # // ========================================( Script )======================================== // #
 

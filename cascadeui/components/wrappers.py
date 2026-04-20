@@ -80,6 +80,7 @@ def with_loading_state(
                     pass
                 else:
                     from ..views.base import _StatefulMixin
+
                     if isinstance(view, _StatefulMixin) and view._message:
                         await view.refresh()
                     elif interaction.message:
@@ -164,9 +165,7 @@ def with_confirmation(
                 embed=embed, view=confirmation_view, ephemeral=True
             )
         else:
-            await interaction.followup.send(
-                embed=embed, view=confirmation_view, ephemeral=True
-            )
+            await interaction.followup.send(embed=embed, view=confirmation_view, ephemeral=True)
 
     component.callback = confirmation_callback
     return component

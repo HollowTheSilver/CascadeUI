@@ -630,6 +630,7 @@ def setup_logging(
         root_logger.addHandler(handler)
         if trace:
             from ..tracing import _install_viewstore_trace
+
             _install_viewstore_trace()
         return
 
@@ -646,9 +647,7 @@ def setup_logging(
         date = str(datetime.now().date())
         filename = f"{prefix}-{date}.log" if prefix else f"{date}.log"
         os.makedirs(path, exist_ok=True)
-        fh = FileHandler(
-            filename=f"{path}/{filename}", encoding=encoding, mode=mode
-        )
+        fh = FileHandler(filename=f"{path}/{filename}", encoding=encoding, mode=mode)
         fh.setFormatter(resolved_file_fmt)
         root_logger.addHandler(fh)
 
@@ -657,6 +656,7 @@ def setup_logging(
 
     if trace:
         from ..tracing import _install_viewstore_trace
+
         _install_viewstore_trace()
 
     if actions:

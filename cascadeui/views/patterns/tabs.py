@@ -10,9 +10,8 @@ from discord.ui import ActionRow
 
 from ...components.base import StatefulButton
 from ..base import _StatefulMixin
-from ..view import StatefulView
 from ..layout import StatefulLayoutView
-
+from ..view import StatefulView
 
 logger = logging.getLogger(__name__)
 
@@ -107,9 +106,7 @@ class _BaseTabMixin:
             f"({sorted(_VALID_OVERFLOW_PRESETS)}) or a tuple of ints, got {type(value).__name__}."
         )
 
-    def _build_tab_rows(
-        self, buttons: List[StatefulButton]
-    ) -> List[List[StatefulButton]]:
+    def _build_tab_rows(self, buttons: List[StatefulButton]) -> List[List[StatefulButton]]:
         """Split ``buttons`` into rows per ``tab_overflow_policy``.
 
         Default implementation branches on the attribute. Subclasses

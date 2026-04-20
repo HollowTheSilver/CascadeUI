@@ -98,7 +98,7 @@ def action_section(
 ) -> Section:
     """Build a Section with a StatefulButton accessory.
 
-    V2's signature pattern -- text and an action button on the same line  -- 
+    V2's signature pattern -- text and an action button on the same line  --
     as a one-liner instead of 5+ lines.
 
     Args:

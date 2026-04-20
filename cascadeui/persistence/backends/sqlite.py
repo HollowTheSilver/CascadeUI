@@ -20,12 +20,11 @@ connection guards SQLite's single-writer semantics.
 
 
 import asyncio
+import logging
 import time
 from typing import Any, AsyncIterator, ClassVar
 
 import aiosqlite  # hard import -- backends/__init__.py catches ImportError
-
-import logging
 
 from ..protocols import Capability
 from ..schema import ALL_DDL, TABLE_KV, TABLE_SCHEMA_META
@@ -79,10 +78,7 @@ class SQLiteBackend:
     """
 
     capabilities: ClassVar[Capability] = (
-        Capability.KV
-        | Capability.RELATIONAL
-        | Capability.TTL_INDEX
-        | Capability.SCHEMA_META
+        Capability.KV | Capability.RELATIONAL | Capability.TTL_INDEX | Capability.SCHEMA_META
     )
 
     def __init__(self, db_path: str = "cascadeui.db") -> None:
@@ -175,9 +171,7 @@ class SQLiteBackend:
             )
             await db.commit()
 
-    async def kv_scan(
-        self, namespace: str, prefix: str = ""
-    ) -> AsyncIterator[tuple[str, bytes]]:
+    async def kv_scan(self, namespace: str, prefix: str = "") -> AsyncIterator[tuple[str, bytes]]:
         db = self._db()
         table = _quote_ident(TABLE_KV)
         if prefix:
@@ -242,9 +236,7 @@ class SQLiteBackend:
                 f"ON CONFLICT ({', '.join(_quote_ident(k) for k in key_columns)}) DO NOTHING"
             )
 
-        sql = (
-            f"INSERT INTO {table} ({col_list}) VALUES ({placeholders}) {conflict_sql}"
-        )
+        sql = f"INSERT INTO {table} ({col_list}) VALUES ({placeholders}) {conflict_sql}"
 
         db = self._db()
         async with self._write_lock:

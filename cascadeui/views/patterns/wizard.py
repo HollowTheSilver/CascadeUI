@@ -1,20 +1,19 @@
 # // ========================================( Modules )======================================== // #
 
 
+import logging
 from typing import Any, Callable, ClassVar, Dict, List, Optional
 
 import discord
 from discord import Interaction
 from discord.ui import ActionRow, Button
 
-import logging
-
 from ...components.base import StatefulButton
 from ...components.patterns.v2 import card, progress_bar
-from .types import WizardSchema, _normalize_steps
 from ..base import _StatefulMixin
-from ..view import StatefulView
 from ..layout import StatefulLayoutView
+from ..view import StatefulView
+from .types import WizardSchema, _normalize_steps
 
 logger = logging.getLogger(__name__)
 
@@ -131,9 +130,7 @@ class _BaseWizardMixin:
         try:
             await self.respond(interaction, error, ephemeral=True)
         except discord.HTTPException as e:
-            logger.debug(
-                f"Could not send validation error in {self.__class__.__name__}: {e}"
-            )
+            logger.debug(f"Could not send validation error in {self.__class__.__name__}: {e}")
 
     # // ----( Conditional step helpers )---- // #
 
@@ -206,9 +203,7 @@ class _BaseWizardMixin:
         try:
             await hook(*args)
         except Exception as exc:
-            logger.warning(
-                f"{hook.__name__} raised in {type(self).__name__}: {exc}"
-            )
+            logger.warning(f"{hook.__name__} raised in {type(self).__name__}: {exc}")
 
     async def _go_back(self, interaction: Interaction):
         prev = self._prev_visible_index(self._current_step)
@@ -300,9 +295,7 @@ class WizardView(_BaseWizardMixin, StatefulView):
     ):
         super().__init__(*args, **kwargs)
 
-        self._steps: List[Dict[str, Any]] = _normalize_steps(
-            steps, schema, type(self).__name__
-        )
+        self._steps: List[Dict[str, Any]] = _normalize_steps(steps, schema, type(self).__name__)
         self._current_step: int = 0
 
         self._build_nav_buttons()
@@ -408,9 +401,7 @@ class WizardLayoutView(_BaseWizardMixin, StatefulLayoutView):
     ):
         super().__init__(*args, **kwargs)
 
-        self._steps: List[Dict[str, Any]] = _normalize_steps(
-            steps, schema, type(self).__name__
-        )
+        self._steps: List[Dict[str, Any]] = _normalize_steps(steps, schema, type(self).__name__)
         self._current_step: int = 0
         self._extra_items: List = []
 

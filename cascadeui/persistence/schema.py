@@ -43,9 +43,7 @@ TABLE_KV: Final[str] = "cascadeui_kv"
 # // ========================================( DDL -- SQLite )======================================== // #
 
 
-DDL_PERSISTENT_VIEWS: Final[
-    str
-] = """
+DDL_PERSISTENT_VIEWS: Final[str] = """
 CREATE TABLE IF NOT EXISTS persistent_views (
     persistence_key TEXT PRIMARY KEY,
     view_class TEXT NOT NULL,
@@ -64,17 +62,13 @@ CREATE TABLE IF NOT EXISTS persistent_views (
 """
 
 
-DDL_PERSISTENT_VIEWS_INDEX: Final[
-    str
-] = """
+DDL_PERSISTENT_VIEWS_INDEX: Final[str] = """
 CREATE INDEX IF NOT EXISTS idx_persistent_views_message
     ON persistent_views(channel_id, message_id)
 """
 
 
-DDL_APPLICATION_SLOTS: Final[
-    str
-] = """
+DDL_APPLICATION_SLOTS: Final[str] = """
 CREATE TABLE IF NOT EXISTS application_slots (
     slot_name TEXT PRIMARY KEY,
     payload TEXT NOT NULL,
@@ -85,17 +79,13 @@ CREATE TABLE IF NOT EXISTS application_slots (
 """
 
 
-DDL_APPLICATION_SLOTS_INDEX: Final[
-    str
-] = """
+DDL_APPLICATION_SLOTS_INDEX: Final[str] = """
 CREATE INDEX IF NOT EXISTS idx_application_slots_expires
     ON application_slots(expires_at)
 """
 
 
-DDL_SCHEMA_META: Final[
-    str
-] = """
+DDL_SCHEMA_META: Final[str] = """
 CREATE TABLE IF NOT EXISTS cascadeui_schema (
     table_name TEXT PRIMARY KEY,
     schema_version INTEGER NOT NULL,
@@ -108,9 +98,7 @@ CREATE TABLE IF NOT EXISTS cascadeui_schema (
 # multiple logical stores share one physical table. Value is BLOB so callers
 # can stash arbitrary bytes (serialized JSON, pickle, msgpack) without the
 # backend caring about the payload shape.
-DDL_KV: Final[
-    str
-] = """
+DDL_KV: Final[str] = """
 CREATE TABLE IF NOT EXISTS cascadeui_kv (
     namespace TEXT NOT NULL,
     key TEXT NOT NULL,

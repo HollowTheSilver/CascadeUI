@@ -44,10 +44,9 @@ corresponding bookkeeping action (:data:`APPLICATION_SLOTS_PRUNED`,
 
 import asyncio
 import json
+import logging
 import time
 from typing import TYPE_CHECKING, Any, Callable, Optional
-
-import logging
 
 from ..exceptions import PersistenceInitError, PersistenceRehydrateError
 from .config import (
@@ -167,9 +166,7 @@ class PersistenceManager:
         if not isinstance(name, str):
             raise TypeError(f"slot name must be str, got {type(name).__name__}")
         if not isinstance(policy, SlotPolicy):
-            raise TypeError(
-                f"policy must be a SlotPolicy, got {type(policy).__name__}"
-            )
+            raise TypeError(f"policy must be a SlotPolicy, got {type(policy).__name__}")
         if name in self._slot_policies:
             raise ValueError(f"Slot policy already registered for {name!r}")
         self._slot_policies[name] = policy
@@ -281,10 +278,7 @@ class PersistenceManager:
         # without this pass an already-expired slot would reappear in
         # memory for up to a day. Gated on "at least one TTL slot exists"
         # so zero-TTL deployments pay nothing.
-        if any(
-            p.ttl_days is not None and p.persistent
-            for p in self._slot_policies.values()
-        ):
+        if any(p.ttl_days is not None and p.persistent for p in self._slot_policies.values()):
             try:
                 await backend.row_delete_where_lt(
                     TABLE_APPLICATION_SLOTS, "expires_at", int(time.time())
@@ -401,9 +395,7 @@ class PersistenceManager:
                 continue
             _channel, message = fetched
 
-            outcome = await self._reattach_one(
-                row, view_cls, init_kwargs, message, class_name
-            )
+            outcome = await self._reattach_one(row, view_cls, init_kwargs, message, class_name)
             summary[outcome].append(persistence_key)
 
         # Delete rows whose channel or message disappeared while the bot
@@ -495,9 +487,7 @@ class PersistenceManager:
             if channel is None:
                 channel = await self._bot.fetch_channel(int(channel_id))
         except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
-            logger.warning(
-                f"Could not fetch channel {channel_id} for {persistence_key!r}: {exc}"
-            )
+            logger.warning(f"Could not fetch channel {channel_id} for {persistence_key!r}: {exc}")
             removed_keys.append(persistence_key)
             return None
 
@@ -512,9 +502,7 @@ class PersistenceManager:
         try:
             message = await channel.fetch_message(int(message_id))
         except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
-            logger.warning(
-                f"Could not fetch message {message_id} for {persistence_key!r}: {exc}"
-            )
+            logger.warning(f"Could not fetch message {message_id} for {persistence_key!r}: {exc}")
             removed_keys.append(persistence_key)
             return None
 
@@ -545,9 +533,7 @@ class PersistenceManager:
             # at write, but defending the read seam keeps reattach
             # tolerant of older rows captured before the write-side
             # filter shipped.
-            init_kwargs = {
-                k: v for k, v in init_kwargs.items() if k not in _NON_PERSISTABLE_KWARGS
-            }
+            init_kwargs = {k: v for k, v in init_kwargs.items() if k not in _NON_PERSISTABLE_KWARGS}
             view = view_cls(persistence_key=persistence_key, **init_kwargs)
 
             # Validate custom_ids before discord.py attaches the view so
@@ -572,9 +558,7 @@ class PersistenceManager:
             # __init__ ran with user_id=None so session auto-derivation
             # was skipped; re-derive now that identity is known.
             if view.user_id and not view.session_id:
-                view.session_id = (
-                    f"{type(view)._class_session_key()}:user_{view.user_id}"
-                )
+                view.session_id = f"{type(view)._class_session_key()}:user_{view.user_id}"
 
             self._bot.add_view(view, message_id=message.id)
 
@@ -622,8 +606,7 @@ class PersistenceManager:
                         )
                     except Exception as cleanup_exc:
                         logger.error(
-                            f"Rollback dispatch failed for {persistence_key!r}: "
-                            f"{cleanup_exc}",
+                            f"Rollback dispatch failed for {persistence_key!r}: " f"{cleanup_exc}",
                             exc_info=True,
                         )
             return "failed"
@@ -647,9 +630,7 @@ class PersistenceManager:
         # fire the circular path at load time.
         from ..state.middleware.persistence import PersistenceMiddleware
 
-        if not any(
-            cfg.backend is not None for cfg in (self.registry, self.application)
-        ):
+        if not any(cfg.backend is not None for cfg in (self.registry, self.application)):
             return
 
         middleware = PersistenceMiddleware(self)
@@ -687,10 +668,7 @@ class PersistenceManager:
             return
         if self.application.backend is None:
             return
-        if not any(
-            p.ttl_days is not None and p.persistent
-            for p in self._slot_policies.values()
-        ):
+        if not any(p.ttl_days is not None and p.persistent for p in self._slot_policies.values()):
             return
         task = asyncio.create_task(self._ttl_sweeper_loop())
         task.add_done_callback(self._on_sweeper_done)
@@ -762,9 +740,7 @@ class PersistenceManager:
             raise ValueError("prune_application: pass slot OR older_than_days, not both")
 
         if slot is not None:
-            deleted = await backend.row_delete(
-                TABLE_APPLICATION_SLOTS, {"slot_name": slot}
-            )
+            deleted = await backend.row_delete(TABLE_APPLICATION_SLOTS, {"slot_name": slot})
         elif older_than_days is not None:
             cutoff = int(time.time()) - (older_than_days * 86400)
             deleted = await backend.row_delete_where_lt(
@@ -802,9 +778,7 @@ class PersistenceManager:
                 )
         else:
             for sk in persistence_keys:
-                deleted += await backend.row_delete(
-                    TABLE_PERSISTENT_VIEWS, {"persistence_key": sk}
-                )
+                deleted += await backend.row_delete(TABLE_PERSISTENT_VIEWS, {"persistence_key": sk})
 
         await self._store.dispatch(
             "REGISTRY_PRUNED",

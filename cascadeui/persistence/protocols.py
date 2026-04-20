@@ -111,9 +111,7 @@ class PersistenceBackend(Protocol):
         row does not exist."""
         ...
 
-    async def kv_scan(
-        self, namespace: str, prefix: str = ""
-    ) -> AsyncIterator[tuple[str, bytes]]:
+    async def kv_scan(self, namespace: str, prefix: str = "") -> AsyncIterator[tuple[str, bytes]]:
         """Iterate all ``(key, value)`` pairs in ``namespace`` whose
         keys start with ``prefix``. Empty prefix yields everything."""
         ...

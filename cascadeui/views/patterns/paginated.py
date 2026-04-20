@@ -11,9 +11,8 @@ from discord.ui import ActionRow, Button, Container, TextDisplay
 
 from ...components.base import StatefulButton
 from ..base import _StatefulMixin
-from ..view import StatefulView
 from ..layout import StatefulLayoutView
-
+from ..view import StatefulView
 
 # // ========================================( Shared Mixin )======================================== // #
 
@@ -252,22 +251,14 @@ class _BasePaginatedMixin:
             is shipped.
         """
         if not callable(fetch_fn):
-            raise TypeError(
-                f"fetch_fn must be callable, got {type(fetch_fn).__name__}"
-            )
+            raise TypeError(f"fetch_fn must be callable, got {type(fetch_fn).__name__}")
         if not callable(formatter):
-            raise TypeError(
-                f"formatter must be callable, got {type(formatter).__name__}"
-            )
+            raise TypeError(f"formatter must be callable, got {type(formatter).__name__}")
         if not isinstance(total, int) or isinstance(total, bool) or total < 0:
             raise ValueError(f"total must be a non-negative int, got {total!r}")
         if not isinstance(per_page, int) or isinstance(per_page, bool) or per_page < 1:
             raise ValueError(f"per_page must be a positive int, got {per_page!r}")
-        if (
-            not isinstance(cache_size, int)
-            or isinstance(cache_size, bool)
-            or cache_size < 1
-        ):
+        if not isinstance(cache_size, int) or isinstance(cache_size, bool) or cache_size < 1:
             raise ValueError(f"cache_size must be a positive int, got {cache_size!r}")
 
         total_pages = (total + per_page - 1) // per_page
@@ -397,14 +388,8 @@ class _BasePaginatedMixin:
             )
 
         if new_total is not None:
-            if (
-                not isinstance(new_total, int)
-                or isinstance(new_total, bool)
-                or new_total < 0
-            ):
-                raise ValueError(
-                    f"new_total must be a non-negative int, got {new_total!r}"
-                )
+            if not isinstance(new_total, int) or isinstance(new_total, bool) or new_total < 0:
+                raise ValueError(f"new_total must be a non-negative int, got {new_total!r}")
             new_page_count = (new_total + self._per_page - 1) // self._per_page
             self._cursor_total = new_total
             self.pages = [None] * new_page_count

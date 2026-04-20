@@ -7,7 +7,6 @@ from discord.ui import ActionRow, Item, LayoutView
 from ..components.base import StatefulButton
 from .base import _StatefulMixin
 
-
 # // ========================================( Classes )======================================== // #
 
 

@@ -17,11 +17,11 @@ Public exports (also re-exported from ``cascadeui``):
     - ``WizardSchema`` -- base class for declarative wizard definitions
 """
 
-from dataclasses import dataclass, field, fields as dataclass_fields
+from dataclasses import dataclass, field
+from dataclasses import fields as dataclass_fields
 from typing import Any, Callable, Dict, FrozenSet, List, Optional
 
 import discord
-
 
 # // ========================================( FormField )======================================== // #
 
@@ -78,9 +78,7 @@ class FormField:
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, str) or not self.id:
-            raise ValueError(
-                f"FormField.id must be a non-empty string (got {self.id!r})"
-            )
+            raise ValueError(f"FormField.id must be a non-empty string (got {self.id!r})")
         if not isinstance(self.label, str) or not self.label:
             raise ValueError(
                 f"FormField.label must be a non-empty string "
@@ -136,9 +134,7 @@ class WizardStep:
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name:
-            raise ValueError(
-                f"WizardStep.name must be a non-empty string (got {self.name!r})"
-            )
+            raise ValueError(f"WizardStep.name must be a non-empty string (got {self.name!r})")
         if not callable(self.builder):
             raise ValueError(
                 f"WizardStep.builder must be callable "
@@ -192,8 +188,7 @@ class FormSchema:
     def get_fields(self) -> List[FormField]:
         """Subclasses return the list of ``FormField`` instances."""
         raise NotImplementedError(
-            f"{type(self).__name__} must override get_fields() "
-            f"to return a list[FormField]."
+            f"{type(self).__name__} must override get_fields() " f"to return a list[FormField]."
         )
 
 
@@ -225,8 +220,7 @@ class WizardSchema:
     def get_steps(self) -> List[WizardStep]:
         """Subclasses return the list of ``WizardStep`` instances."""
         raise NotImplementedError(
-            f"{type(self).__name__} must override get_steps() "
-            f"to return a list[WizardStep]."
+            f"{type(self).__name__} must override get_steps() " f"to return a list[WizardStep]."
         )
 
 
@@ -247,9 +241,7 @@ def _normalize_fields(
     hand-written fields stay valid.
     """
     if schema is not None and fields is not None:
-        raise ValueError(
-            f"{cls_name} accepts either 'fields=' or 'schema=', not both."
-        )
+        raise ValueError(f"{cls_name} accepts either 'fields=' or 'schema=', not both.")
     if schema is not None:
         if not isinstance(schema, FormSchema):
             raise TypeError(
@@ -287,9 +279,7 @@ def _normalize_steps(
     hand-written steps stay valid.
     """
     if schema is not None and steps is not None:
-        raise ValueError(
-            f"{cls_name} accepts either 'steps=' or 'schema=', not both."
-        )
+        raise ValueError(f"{cls_name} accepts either 'steps=' or 'schema=', not both.")
     if schema is not None:
         if not isinstance(schema, WizardSchema):
             raise TypeError(

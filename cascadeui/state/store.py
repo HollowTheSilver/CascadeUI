@@ -4,11 +4,10 @@
 import asyncio
 import contextvars
 import copy
+import logging
 import time
 from datetime import datetime
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
-
-import logging
 
 from ..utils.errors import with_error_boundary
 from ..utils.tasks import get_task_manager
@@ -93,7 +92,7 @@ class BatchContext:
         if exc_type is not None:
             # Drop any actions queued in this batch. Outer batches keep their
             # actions intact because slicing from ``_start_idx`` preserves them.
-            del self._store._batched_actions[self._start_idx:]
+            del self._store._batched_actions[self._start_idx :]
             return False
 
         # Nested batches absorb into the outer batch. Only the outermost
@@ -144,18 +143,20 @@ class BatchContext:
             finally:
                 _CURRENT_EDIT_COUNTER.reset(token)
                 store._perf_edit_stack.pop()
-            store._perf_samples.append({
-                "action": "BATCH_COMPLETE",
-                "reducer_ms": 0.0,
-                "middleware_ms": 0.0,
-                "notify_ms": (t1 - t0) * 1000,
-                "hooks_ms": (t2 - t1) * 1000,
-                "total_ms": (t2 - t0) * 1000,
-                "subscribers": len(store.subscribers),
-                "edits": edit_counter,  # live ref, finalized in _flush_notifications
-                "timestamp": batch_action["timestamp"],
-                "batch_size": len(actions),
-            })
+            store._perf_samples.append(
+                {
+                    "action": "BATCH_COMPLETE",
+                    "reducer_ms": 0.0,
+                    "middleware_ms": 0.0,
+                    "notify_ms": (t1 - t0) * 1000,
+                    "hooks_ms": (t2 - t1) * 1000,
+                    "total_ms": (t2 - t0) * 1000,
+                    "subscribers": len(store.subscribers),
+                    "edits": edit_counter,  # live ref, finalized in _flush_notifications
+                    "timestamp": batch_action["timestamp"],
+                    "batch_size": len(actions),
+                }
+            )
         else:
             await store._notify_subscribers(batch_action)
             for action in actions:
@@ -232,6 +233,7 @@ class StateStore:
         # ran at import time survive a store reset (e.g. between tests).
         self._computed: Dict[str, Any] = {}
         from .computed import _COMPUTED_REGISTRY, ComputedValue
+
         for _name, (_selector, _fn) in _COMPUTED_REGISTRY.items():
             self._computed[_name] = ComputedValue(_name, _selector, _fn)
 
@@ -265,6 +267,7 @@ class StateStore:
         # notification fan-out, and total wall time. See ``enable_perf``
         # / ``disable_perf`` / ``clear_perf``.
         import collections as _collections
+
         self._perf_enabled: bool = False
         self._perf_samples: _collections.deque = _collections.deque(maxlen=100)
         # Parallel deque for view-refresh timings. Populated by
@@ -378,9 +381,7 @@ class StateStore:
         :func:`~cascadeui.utils.decorators.cascade_reducer` decorator.
         """
         if action_type in self._custom_reducers:
-            logger.warning(
-                f"Overwriting existing reducer for action type: {action_type}"
-            )
+            logger.warning(f"Overwriting existing reducer for action type: {action_type}")
         self._custom_reducers[action_type] = reducer
         self.reducers[action_type] = reducer
 
@@ -585,7 +586,7 @@ class StateStore:
         The canonical user path is the
         :func:`~cascadeui.state.computed.computed` decorator.
         """
-        from .computed import ComputedValue, _COMPUTED_REGISTRY
+        from .computed import _COMPUTED_REGISTRY, ComputedValue
 
         self._computed[name] = computed_value
         if isinstance(computed_value, ComputedValue):
@@ -615,9 +616,7 @@ class StateStore:
 
     # // ========================================( State Scoping )======================================== // #
 
-    def get_scoped(
-        self, scope: str, *, slot_name: str = "scoped", **identifiers
-    ) -> Dict[str, Any]:
+    def get_scoped(self, scope: str, *, slot_name: str = "scoped", **identifiers) -> Dict[str, Any]:
         """Get scoped state for a given scope and identifier.
 
         Args:
@@ -628,9 +627,7 @@ class StateStore:
                 their own bucket name for subsystem isolation.
             **identifiers: user_id=123 or guild_id=456
         """
-        return self.get_scoped_from(
-            self.state, scope, slot_name=slot_name, **identifiers
-        )
+        return self.get_scoped_from(self.state, scope, slot_name=slot_name, **identifiers)
 
     @staticmethod
     def get_scoped_from(
@@ -1068,20 +1065,22 @@ class StateStore:
             # trivial no-op reducers where the subtraction could go slightly
             # negative.
             middleware_ms = max(0.0, chain_ms - reducer_ms)
-            self._perf_samples.append({
-                "action": action_type,
-                "reducer_ms": reducer_ms,
-                "middleware_ms": middleware_ms,
-                "notify_ms": (t2 - t1) * 1000,
-                "hooks_ms": (t3 - t2) * 1000,
-                "total_ms": (t3 - t0) * 1000,
-                "subscribers": len(self.subscribers),
-                # Live reference -- a list that late subscriber refreshes may
-                # still mutate. ``_flush_notifications()`` finalizes this to an
-                # int once in-flight tasks drain.
-                "edits": edit_counter,
-                "timestamp": action["timestamp"],
-            })
+            self._perf_samples.append(
+                {
+                    "action": action_type,
+                    "reducer_ms": reducer_ms,
+                    "middleware_ms": middleware_ms,
+                    "notify_ms": (t2 - t1) * 1000,
+                    "hooks_ms": (t3 - t2) * 1000,
+                    "total_ms": (t3 - t0) * 1000,
+                    "subscribers": len(self.subscribers),
+                    # Live reference -- a list that late subscriber refreshes may
+                    # still mutate. ``_flush_notifications()`` finalizes this to an
+                    # int once in-flight tasks drain.
+                    "edits": edit_counter,
+                    "timestamp": action["timestamp"],
+                }
+            )
         else:
             await self._run_middleware_chain(action, reducer)
             logger.debug(f"Notifying subscribers about {action_type}")
@@ -1120,7 +1119,9 @@ class StateStore:
         # ``refresh()`` is later relaxed.
         interaction_token = _CURRENT_INTERACTION.set(None)
         try:
-            for subscriber_id, (callback, action_filter, selector) in list(self.subscribers.items()):
+            for subscriber_id, (callback, action_filter, selector) in list(
+                self.subscribers.items()
+            ):
                 # For BATCH_COMPLETE, check subscriber's filter against any batched action
                 if action["type"] == "BATCH_COMPLETE":
                     if action_filter is not None:
@@ -1171,9 +1172,7 @@ class StateStore:
                     # Acting view rides the interaction's own ack cycle. Hold the
                     # coroutine until after the fan-out loop so every other
                     # subscriber is already scheduled before this await yields.
-                    acting_coro = self._safe_notify(
-                        subscriber_id, callback, action, state_snapshot
-                    )
+                    acting_coro = self._safe_notify(subscriber_id, callback, action, state_snapshot)
                     continue
 
                 task = self.task_manager.create_task(
@@ -1239,12 +1238,14 @@ class StateStore:
             # against the fan-out. Captured here rather than around the
             # ``callback`` call so the accounting survives the error path.
             if perf:
-                self._notify_samples.append({
-                    "subscriber_id": subscriber_id,
-                    "action": action["type"],
-                    "ms": (time.perf_counter() - t0) * 1000,
-                    "timestamp": action["timestamp"],
-                })
+                self._notify_samples.append(
+                    {
+                        "subscriber_id": subscriber_id,
+                        "action": action["type"],
+                        "ms": (time.perf_counter() - t0) * 1000,
+                        "timestamp": action["timestamp"],
+                    }
+                )
 
     def subscribe(
         self,
@@ -1349,6 +1350,7 @@ class StateStore:
             edits = sample.get("edits")
             if isinstance(edits, list) and len(edits) == 1:
                 sample["edits"] = edits[0]
+
 
 # // ========================================( Computed Accessor )======================================== // #
 

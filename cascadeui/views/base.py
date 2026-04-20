@@ -4,6 +4,7 @@
 import asyncio
 import functools
 import inspect
+import logging
 import time
 import uuid
 from datetime import datetime
@@ -20,11 +21,9 @@ from ..state.singleton import get_store
 from ..state.store import _CURRENT_INTERACTION
 from ..utils.coercion import coerce_snowflake_id, coerce_snowflake_id_set
 from ..utils.errors import safe_execute, with_error_boundary
+from ..utils.tasks import get_task_manager
 from ._interaction import _InteractionMixin
 from ._navigation import _NavigationMixin
-
-import logging
-from ..utils.tasks import get_task_manager
 
 logger = logging.getLogger(__name__)
 
@@ -349,8 +348,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 return
             if not isinstance(value, bool):
                 raise ValueError(
-                    f"{cls.__name__}.{name} must be a bool or None, "
-                    f"got {type(value).__name__}"
+                    f"{cls.__name__}.{name} must be a bool or None, " f"got {type(value).__name__}"
                 )
             return
         if name in cls._BUTTON_STYLE_ATTRS:
@@ -468,9 +466,9 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         if "scoped" not in persistent_slots:
             return
         raise ValueError(
-            f"{cls.__name__}.persistent_slots includes \"scoped\" but "
+            f'{cls.__name__}.persistent_slots includes "scoped" but '
             f"scoped_slot is {scoped_slot!r}. Writes via dispatch_scoped() "
-            f"go to {scoped_slot!r}, not \"scoped\", so persistence will "
+            f'go to {scoped_slot!r}, not "scoped", so persistence will '
             f"not capture them. Set persistent_slots = ({scoped_slot!r},) "
             f"to match, or remove scoped_slot if you meant to use the "
             f"default bucket."
@@ -615,7 +613,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         Subclasses may set a ``session_class_key`` class attribute to
         override the default, but should only do so to intentionally
         unify two distinct classes into one session family (rare). The
-        override is read via ``cls.__dict__`` so it does not inherit  -- 
+        override is read via ``cls.__dict__`` so it does not inherit  --
         each class opts in for itself.
         """
         override = cls.__dict__.get("session_class_key")
@@ -784,9 +782,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             if type(self).session_continuity:
                 self.session_id = f"{class_key}:user_{self.user_id}"
             else:
-                self.session_id = (
-                    f"{class_key}:user_{self.user_id}:{uuid.uuid4().hex[:8]}"
-                )
+                self.session_id = f"{class_key}:user_{self.user_id}:{uuid.uuid4().hex[:8]}"
 
         # Action types this view cares about -- subclasses override at
         # class level (e.g. subscribed_actions = {"MY_ACTION", ...}).
@@ -949,9 +945,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     self.state_store._unsubscribe(self.id)
                     self.state_store._unregister_view(self.id)
                     self.state_store._undo_enabled_views.pop(self.id, None)
-                    await self.dispatch(
-                        "VIEW_DESTROYED", ActionCreators.view_destroyed(self.id)
-                    )
+                    await self.dispatch("VIEW_DESTROYED", ActionCreators.view_destroyed(self.id))
                     return None
 
         # -- Stage 4: ephemeral refresh-handoff derivation --
@@ -996,9 +990,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             self.state_store._unsubscribe(self.id)
             self.state_store._unregister_view(self.id)
             self.state_store._undo_enabled_views.pop(self.id, None)
-            await self.dispatch(
-                "VIEW_DESTROYED", ActionCreators.view_destroyed(self.id)
-            )
+            await self.dispatch("VIEW_DESTROYED", ActionCreators.view_destroyed(self.id))
             raise
 
         # -- Stage 6: message re-fetch for token-free editing --
@@ -1125,14 +1117,18 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             try:
                 await self.respond(self.interaction, message, ephemeral=True)
             except discord.HTTPException as e:
-                logger.debug(f"Could not send instance limit response in {self.__class__.__name__}: {e}")
+                logger.debug(
+                    f"Could not send instance limit response in {self.__class__.__name__}: {e}"
+                )
             return
 
         if self.context is not None and hasattr(self.context, "send"):
             try:
                 await self.context.send(message, ephemeral=True)
             except discord.HTTPException as e:
-                logger.debug(f"Could not send instance limit response in {self.__class__.__name__}: {e}")
+                logger.debug(
+                    f"Could not send instance limit response in {self.__class__.__name__}: {e}"
+                )
             return
 
         # No interaction and no context -- nothing to respond on.  Re-raise
@@ -1161,7 +1157,9 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         try:
             await self.respond(interaction, self.participant_limit_message, ephemeral=True)
         except discord.HTTPException as e:
-            logger.debug(f"Could not send participant limit response in {self.__class__.__name__}: {e}")
+            logger.debug(
+                f"Could not send participant limit response in {self.__class__.__name__}: {e}"
+            )
 
     async def on_replaced(self) -> None:
         """Called when this view is about to be replaced by a new session.
@@ -1181,7 +1179,9 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             try:
                 await self._message.channel.send(self.replaced_message)
             except discord.HTTPException as e:
-                logger.debug(f"Could not send replaced notification in {self.__class__.__name__}: {e}")
+                logger.debug(
+                    f"Could not send replaced notification in {self.__class__.__name__}: {e}"
+                )
 
     async def on_error(self, interaction: Interaction, error: Exception, item: Item) -> None:
         """Called when a component callback raises an exception.
@@ -1230,7 +1230,9 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         try:
             await self.respond(interaction, msg, ephemeral=True)
         except discord.HTTPException as e:
-            logger.debug(f"Could not send reopen failure response in {self.__class__.__name__}: {e}")
+            logger.debug(
+                f"Could not send reopen failure response in {self.__class__.__name__}: {e}"
+            )
         if error is None:
             await self.exit()
 
@@ -1256,6 +1258,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         for child in old_children:
             child._update_view(self)
         from ..tracing import is_viewstore_trace_enabled
+
         if self._message and is_viewstore_trace_enabled() and logger.isEnabledFor(logging.DEBUG):
             try:
                 summary = []
@@ -1271,8 +1274,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                             )
                 logger.debug(
                     f"[viewstore-trace] clear_items view={self.id[:8]} "
-                    f"cls={type(self).__name__} restored={len(summary)} :: "
-                    + "; ".join(summary)
+                    f"cls={type(self).__name__} restored={len(summary)} :: " + "; ".join(summary)
                 )
             except Exception as e:
                 logger.debug(f"[viewstore-trace] clear_items trace failed: {e}")
@@ -1344,6 +1346,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             key_counts[ck] = key_counts.get(ck, 0) + 1
 
         from ..tracing import is_viewstore_trace_enabled
+
         trace_on = is_viewstore_trace_enabled() and logger.isEnabledFor(logging.DEBUG)
         assigned: list[str] = []
         for item, ck, c_idx, p_idx in entries:
@@ -1393,17 +1396,19 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 parts.append(("t", item.content))
             # Buttons and selects: record the wire-visible attributes.
             elif hasattr(item, "custom_id"):
-                parts.append((
-                    "i",
-                    getattr(item, "custom_id", None),
-                    getattr(item, "label", None),
-                    # ButtonStyle is an IntEnum; its value is what ships.
-                    getattr(getattr(item, "style", None), "value", None),
-                    getattr(item, "disabled", None),
-                    getattr(item, "url", None),
-                    getattr(item, "placeholder", None),
-                    str(getattr(item, "emoji", None)) if getattr(item, "emoji", None) else None,
-                ))
+                parts.append(
+                    (
+                        "i",
+                        getattr(item, "custom_id", None),
+                        getattr(item, "label", None),
+                        # ButtonStyle is an IntEnum; its value is what ships.
+                        getattr(getattr(item, "style", None), "value", None),
+                        getattr(item, "disabled", None),
+                        getattr(item, "url", None),
+                        getattr(item, "placeholder", None),
+                        str(getattr(item, "emoji", None)) if getattr(item, "emoji", None) else None,
+                    )
+                )
             # Other layout items (Separator, MediaGallery, Thumbnail) do
             # not currently carry mutable state the user can observe
             # changing between rebuilds. If they gain one later, extend
@@ -1448,9 +1453,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         self.state_store._unregister_view(self.id)
         self.state_store._undo_enabled_views.pop(self.id, None)
 
-        await self.dispatch(
-            "VIEW_DESTROYED", ActionCreators.view_destroyed(self.id)
-        )
+        await self.dispatch("VIEW_DESTROYED", ActionCreators.view_destroyed(self.id))
 
     async def on_message_delete(self) -> None:
         """Called when the view's message is deleted externally.
@@ -1579,9 +1582,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         wait = self._refresh_not_before - now
         if wait > 0:
             if self._deferred_refresh_task is None or self._deferred_refresh_task.done():
-                self._deferred_refresh_task = self.create_task(
-                    self._deferred_refresh(wait)
-                )
+                self._deferred_refresh_task = self.create_task(self._deferred_refresh(wait))
             return
 
         store = self.state_store
@@ -1701,13 +1702,15 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     raise
         finally:
             if perf_on:
-                store._refresh_samples.append({
-                    "view_id": self.id,
-                    "view_class": type(self).__name__,
-                    "refresh_ms": (time.perf_counter() - t0) * 1000,
-                    "skipped": skipped,
-                    "timestamp": datetime.now().isoformat(),
-                })
+                store._refresh_samples.append(
+                    {
+                        "view_id": self.id,
+                        "view_class": type(self).__name__,
+                        "refresh_ms": (time.perf_counter() - t0) * 1000,
+                        "skipped": skipped,
+                        "timestamp": datetime.now().isoformat(),
+                    }
+                )
 
     def _handle_rate_limit(self, error: "discord.HTTPException") -> bool:
         """Detect a 429 response and arm the reactive backoff window.
@@ -2118,9 +2121,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             try:
                 await old_view.on_replaced()
             except Exception as e:
-                logger.warning(
-                    f"on_replaced raised in {old_view.__class__.__name__}: {e}"
-                )
+                logger.warning(f"on_replaced raised in {old_view.__class__.__name__}: {e}")
 
         # Exit oldest owned views to make room. Each view's replace_policy
         # decides what happens to its message: "delete" (default) removes
@@ -2370,9 +2371,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             except Exception as e:
                 logger.error(f"Error cleaning up message: {e}")
 
-        await self.dispatch(
-            "VIEW_DESTROYED", ActionCreators.view_destroyed(self.id)
-        )
+        await self.dispatch("VIEW_DESTROYED", ActionCreators.view_destroyed(self.id))
 
         return True
 
@@ -2450,4 +2449,3 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         if hasattr(self, "state_store") and hasattr(self, "id"):
             self.state_store._unsubscribe(self.id)
             self.state_store._unregister_view(self.id)
-
