@@ -8,12 +8,6 @@ Working examples are in the [`examples/`](https://github.com/HollowTheSilver/Cas
 
 These use the V2 component system (`StatefulLayoutView`, Containers, Sections, TextDisplay).
 
-### v2_counter.py
-
-Basic stateful counter with increment, decrement, and reset buttons. Demonstrates `StatefulLayoutView`, `StatefulButton`, custom reducers, and V2 helpers (`card`, `key_value`, `divider`).
-
-**Command:** `/v2counter`
-
 ### v2_dashboard.py
 
 Multi-tab server dashboard using `TabLayoutView`. Shows server info, member stats, and module toggles across three tabs. Demonstrates `action_section`, `toggle_section`, `key_value`, `alert`, tab switching, and session limiting.
@@ -24,19 +18,20 @@ Multi-tab server dashboard using `TabLayoutView`. Shows server info, member stat
 
 Full settings menu showcasing most CascadeUI features with V2 components:
 
-- **Session limiting** (`session_limit=1`, `session_scope="user_guild"`) to prevent duplicate panels
-- **Scoped state** (`scope="user"`) for per-user settings
+- **Instance limiting** (`instance_limit=1`, `instance_scope="user_guild"`) to prevent duplicate panels
+- **Scoped state** (`state_scope="user"`) for per-user settings and (`state_scope="user_guild"`) for per-server display preferences
 - **Navigation stack** (push/pop with `rebuild=` callback) for hub-and-spoke layout
 - **Theming** with a live theme switcher
 - **Undo/redo** for reverting notification preference toggles
 - **Custom reducer** (`SETTINGS_UPDATED`) for domain-specific state management
+- **`with_confirmation`** wrapper on the Reset All danger button
 - **Cross-view reactivity** between V2 settings and V1 settings via shared state keys
 
 **Command:** `/v2settings`
 
 ### v2_form.py
 
-Registration form using `FormLayoutView` with modal-based text input, dropdown selects, and per-field validation (regex, min/max length). Custom `_rebuild_display` for a styled form summary using `card`, `key_value`, and `divider`.
+Registration form using `FormLayoutView` with native `text` fields, a dropdown select, and the full set of built-in validators (`min_length`, `max_length`, `regex`, `min_value`, `max_value`, `choices`) alongside an async "username already taken" check. Text fields are grouped behind a single "Edit Text Fields" button that opens a `Modal`.
 
 **Command:** `/v2form`
 
@@ -48,15 +43,15 @@ Paginated inventory viewer using `PaginatedLayoutView` with `from_data()`. Conta
 
 ### v2_wizard.py
 
-Multi-step setup wizard using `WizardLayoutView`. Three steps with per-step validation, back/next navigation, and a finish handler. Uses `card`, `action_section`, `toggle_section`, and `alert` for step content.
+D&D character creator using `WizardLayoutView`. Five steps (Name & Race, Class & Subclass, Ability Scores, Background, Confirmation) with per-step validation, cross-step state (class list filters by race, subclass list filters by class, ability points draw from a shared pool), and the `on_finish` method hook. Demonstrates navigation button customization (`back_button_label`, `finish_button_label`, `finish_button_emoji`), inline selects for structured choices (alignment, languages with race-based defaults), a toggle button in a `card()` for a boolean flag (heroic destiny), and a modal for free-form backstory text.
 
 **Command:** `/v2wizard`
 
 ### v2_persistence.py
 
-SQLite-backed data persistence and `PersistentLayoutView` that survives bot restarts. Includes a persistent counter scoped per user and a role selector panel with exclusive-mode categories (selecting one role in a category auto-removes others). Running `/v2roles` again automatically cleans up the previous panel.
+A `PersistentLayoutView`-based role selector panel that survives bot restarts. Categories are rendered as accent-colored containers, with exclusive-mode support (selecting one role in a category auto-removes the others). Running `/v2roles` again automatically cleans up the previous panel.
 
-**Commands:** `/v2pcounter`, `/v2roles`
+**Command:** `/v2roles`
 
 ### v2_tictactoe.py
 
@@ -64,67 +59,54 @@ Two-player TicTacToe demonstrating multi-user interaction patterns. Features a c
 
 **Command:** `/tictactoe @user [size] [win]`
 
+### v2_lobby.py
+
+Open-join multi-user lobby demonstrating `participant_limit` with V2 components. Up to 8 players join via a button -- no pre-set `allowed_users`. Features host-vs-participant authority (only the host can Start Game or Disband), live participant card refresh, `register_participant` bool-return contract, `unregister_participant` for the Leave path, and a custom `on_participant_limit` override with personalized rejection messages.
+
+**Command:** `/lobby`
+
+### v2_grids.py
+
+Display-only showcase for the grid helpers (`emoji_grid()` and `button_grid()`). Demonstrates grid construction from slash-command arguments, axis label presets, cell mutation, and `fill_rect()` -- all without surrounding game logic. For interactive grid usage, see `v2_battleship.py` and `v2_tictactoe.py`.
+
+**Commands:** `/emoji_grid`, `/button_grid`
+
+### v2_battleship.py
+
+Two-player 10x10 Battleship with a standard fleet, text-rendered emoji grids, a fleet setup phase with re-roll consensus, ephemeral private fleet panels via `attach_child()`, turn-based select targeting, and automatic cleanup via `_cleanup_attached_children()` on game end. Demonstrates `attach_child()`, `register_participant()`, dispatch-then-cleanup ordering, the ephemeral interaction-bound constraint, and live cross-view reactivity (Re-Roll dispatches update both the ephemeral and the public ready card via the standard subscriber pipeline).
+
+**Command:** `/battleship @user`
+
+### v2_leaderboard.py
+
+Server leaderboard built on `LeaderboardLayoutView`. Overrides `format_entry` for MMR display with medal emojis and `build_summary` for aggregate stats. `leaderboard_top_n=25` with `leaderboard_per_page=5` produces five-page navigation. The cog inspects `bot.intents.members` and the guild cache: real members fill the top of the board when available, and synthetic Demo Player rows pad any remaining slots so the display always renders exactly 25 entries regardless of guild size or intent configuration. Stats are derived deterministically from member ID via `random.Random(member_id)`, so repeat invocations return a stable ranking without a persistence layer. Contrast with `v2_battleship.py`, which feeds the same view class from live computed state -- the tuple shape fed into the pattern is identical, the data source differs.
+
+**Command:** `/leaderboard`
+
 ---
 
 ## V1 Examples (Classic)
 
 These use the V1 component system (`StatefulView`, embeds, row-based layout).
 
-### counter.py
-
-Basic stateful counter with increment, decrement, and reset buttons. Demonstrates `StatefulView`, `StatefulButton`, and custom reducers.
-
-**Command:** `/counter`
-
 ### settings_menu.py
 
-Advanced settings menu with session limiting, scoped state, push/pop navigation, theming, undo/redo, state selectors, batched dispatch, and a custom reducer. The V1 counterpart to `v2_settings.py` — both share the same state keys for cross-view reactivity.
+Advanced settings menu retained as the legacy V1 demonstration. Showcases session limiting, scoped state, push/pop navigation, theming, undo/redo, state selectors, batched dispatch, and a custom reducer. The V1 counterpart to `v2_settings.py` -- both share the same state keys for cross-view reactivity.
 
 **Command:** `/settings`
 
-### themed_form.py
-
-Theme switching, component wrappers (loading state, confirmation), pagination, form views with validation, and modal text input with per-field validation.
-
-**Commands:** `/profile`, `/themetest`, `/componenttest`, `/paginationtest`, `/formtest`, `/validatetest`
-
-### persistence.py
-
-SQLite-backed data persistence and `PersistentView` that survives bot restarts. Includes a persistent counter scoped per user and a role selector panel that stays interactive across restarts.
-
-**Commands:** `/pcounter`, `/setup_roles`
-
 ### navigation.py
 
-Navigation stack with push/pop between multi-level views. Demonstrates a main menu that pushes to settings and about pages, with a nested sub-page two levels deep.
+Navigation stack with push/pop between multi-level views and session data sharing. A dark mode toggle in the settings view writes to `shared_data`, which the nested view reads without any constructor kwargs. Demonstrates `update_session()`, `shared_data`, and `SESSION_UPDATED` subscriptions alongside multi-level push/pop.
 
 **Command:** `/navtest`
 
-### state_features.py
-
-Per-user state scoping (independent counters per user), action batching (multiple dispatches with single notification), computed/derived values (cached totals), and event hooks (logging component interactions).
-
-**Commands:** `/scopetest`, `/advancedtest`
-
-### undo_redo.py
-
-Undo/redo counter using `UndoMiddleware`. Shows stack depth in the embed so you can see exactly how the undo/redo stacks change with each action.
-
-**Command:** `/undotest`
-
-### ticket_system.py
-
-A production-style support ticket system demonstrating most of CascadeUI's framework features:
-
-- **PersistentView** for a ticket panel that survives bot restarts
-- **Modal + Validation** for ticket creation with field-level error checking
-- **PaginatedView** with `from_data`, `refresh_data()`, and `_build_extra_items()`
-- **Custom reducers** (`TICKET_CREATED`, `TICKET_CLOSED`)
-- **Live-updating list** via state subscriptions
-- **Session limiting** on the ticket list view
-- **Theming** with a custom "support" theme
-
-**Commands:** `/ticket_setup`, `/my_tickets`
+!!! note "V1 primitive coverage"
+    `FormView`, `Modal` with validators, `PaginatedView.from_data`, and
+    `with_loading_state` remain fully supported in V1 but no longer ship
+    with a dedicated example file. See the [API reference](api/components.md)
+    for usage. Their V2 equivalents (`FormLayoutView`, V2 wizard modal
+    pattern, `PaginatedLayoutView`) are demonstrated in the V2 examples above.
 
 ---
 
@@ -135,13 +117,13 @@ A production-style support ticket system demonstrating most of CascadeUI's frame
 3. Load the example cogs in your bot:
 
 ```python
-from cascadeui import setup_persistence
+from cascadeui import setup_middleware
+from cascadeui.state.middleware import PersistenceMiddleware, UndoMiddleware
 from cascadeui.persistence import SQLiteBackend
 
 class MyBot(commands.Bot):
     async def setup_hook(self):
         # V2 examples
-        await self.load_extension("examples.v2_counter")
         await self.load_extension("examples.v2_dashboard")
         await self.load_extension("examples.v2_settings")
         await self.load_extension("examples.v2_form")
@@ -149,19 +131,27 @@ class MyBot(commands.Bot):
         await self.load_extension("examples.v2_wizard")
         await self.load_extension("examples.v2_persistence")
         await self.load_extension("examples.v2_tictactoe")
+        await self.load_extension("examples.v2_battleship")
+        await self.load_extension("examples.v2_leaderboard")
+        await self.load_extension("examples.v2_lobby")
+        await self.load_extension("examples.v2_grids")
 
-        # V1 examples
-        await self.load_extension("examples.counter")
+        # V1 examples (classic API)
         await self.load_extension("examples.settings_menu")
-        await self.load_extension("examples.themed_form")
-        await self.load_extension("examples.persistence")
         await self.load_extension("examples.navigation")
-        await self.load_extension("examples.state_features")
-        await self.load_extension("examples.undo_redo")
-        await self.load_extension("examples.ticket_system")
 
-        # Enable persistence (after loading cogs)
-        await setup_persistence(self, backend=SQLiteBackend("cascadeui.db"))
+        # Install middleware after loading cogs so PersistentView subclasses
+        # have registered themselves via __init_subclass__.
+        await setup_middleware(
+            PersistenceMiddleware(backend=SQLiteBackend("cascadeui.db"), bot=self),
+            UndoMiddleware(),  # required by the settings examples
+        )
 ```
 
 4. Run your bot and use the slash commands
+
+---
+
+## Built something with CascadeUI?
+
+The shipped examples are teaching material. For application-level work - real bots, real features, real constraints - check the **showcase forum** on the official [support Discord server](https://discord.com/invite/9Xj68BpKRb). It's where community members post what they built with the library and trade patterns you won't find in the reference examples.

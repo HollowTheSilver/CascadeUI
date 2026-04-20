@@ -1,5 +1,5 @@
 """
-V2 Pagination — CascadeUI V2 Paginated Content
+V2 Pagination -- CascadeUI V2 Paginated Content
 =================================================
 
 Demonstrates PaginatedLayoutView, CascadeUI's V2 pagination pattern.
@@ -14,7 +14,6 @@ V2 advantages shown here:
     - Inline page metadata alongside content
     - Jump buttons and go-to-page modal for large page counts
     - _build_extra_items() hook for adding an exit button
-    - refresh_data() for live re-pagination
 
 Commands:
     /v2pages   Browse a paginated item list
@@ -26,8 +25,6 @@ Usage:
 # // ========================================( Modules )======================================== // #
 
 
-import logging
-
 import discord
 from discord.ext import commands
 from discord.ext.commands import Context
@@ -35,13 +32,15 @@ from discord.ui import ActionRow, TextDisplay
 
 from cascadeui import PaginatedLayoutView, StatefulButton, card, divider
 
+import logging
+
 logger = logging.getLogger(__name__)
 
 
 # // ========================================( Data )======================================== // #
 
 
-# Sample inventory — enough items to trigger jump buttons (>5 pages at 4/page)
+# Sample inventory -- enough items to trigger jump buttons (>5 pages at 4/page)
 SAMPLE_ITEMS = [
     # Common (pages 1-2)
     {"name": "Iron Sword", "rarity": "Common", "value": 50},
@@ -98,7 +97,13 @@ class InventoryView(PaginatedLayoutView):
     on every page turn.
     """
 
-    session_limit = 1
+    owner_only = True
+    instance_limit = 1
+    instance_scope = "user_guild"
+    instance_policy = "reject"
+    instance_limit_message = "You already have a browser open. Close it before opening another."
+    exit_policy = "delete"
+    state_scope = None
 
     def _build_extra_items(self):
         """Add an exit button below the navigation row."""
@@ -124,7 +129,7 @@ def format_page(items: list) -> list:
             best_rarity = rarity
 
         rarity_tag = f"` {rarity} `"
-        lines.append(f"**{item['name']}** {rarity_tag} — {item['value']}g")
+        lines.append(f"**{item['name']}** {rarity_tag} - {item['value']}g")
 
     color = RARITY_COLORS.get(best_rarity, discord.Color.light_grey())
     total_value = sum(item["value"] for item in items)

@@ -1,10 +1,10 @@
 # // ========================================( Modules )======================================== // #
 
 
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional
 
 import discord
-from discord import ButtonStyle, Color
+from discord import Color
 
 # // ========================================( Classes )======================================== // #
 
@@ -26,21 +26,11 @@ class Theme:
         if "danger_color" not in self.styles:
             self.styles["danger_color"] = Color.red()
 
-        # V2 Container styling — defaults derived from V1 colors
+        # V2 Container styling -- defaults derived from V1 colors
         if "accent_colour" not in self.styles:
             self.styles["accent_colour"] = self.styles.get("primary_color")
         if "separator_spacing" not in self.styles:
             self.styles["separator_spacing"] = "small"
-
-        # Button style mappings
-        if "button_styles" not in self.styles:
-            self.styles["button_styles"] = {
-                "primary": ButtonStyle.primary,
-                "secondary": ButtonStyle.secondary,
-                "success": ButtonStyle.success,
-                "danger": ButtonStyle.danger,
-                "link": ButtonStyle.link,
-            }
 
     def get_style(self, key: str, default: Any = None) -> Any:
         """Get a style value from the theme."""
@@ -71,18 +61,6 @@ class Theme:
         if accent is not None:
             container.accent_colour = accent
         return container
-
-    def create_button(
-        self, label: str, button_type: str = "primary", **kwargs
-    ) -> discord.ui.Button:
-        """Create a themed button."""
-        from ..components.base import StatefulButton
-
-        # Get button style from theme
-        style_map = self.get_style("button_styles", {})
-        style = style_map.get(button_type, ButtonStyle.secondary)
-
-        return StatefulButton(label=label, style=style, **kwargs)
 
 
 # Global theme registry

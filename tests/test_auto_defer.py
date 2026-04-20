@@ -1,13 +1,13 @@
 """Tests for auto-defer safety net on StatefulView."""
 
 import asyncio
-
-import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from cascadeui.views.base import StatefulView
-from cascadeui.state.singleton import get_store
+import pytest
 from helpers import make_interaction as _make_interaction
+
+from cascadeui.state.singleton import get_store
+from cascadeui.views.view import StatefulView
 
 
 def _make_item(callback):
@@ -23,6 +23,7 @@ def _make_item(callback):
 
 
 class TestAutoDeferFires:
+    """Auto-defer timer fires when callbacks take longer than the delay threshold."""
     async def test_timer_defers_slow_callback(self):
         """Auto-defer fires when callback hasn't responded in time."""
         view = StatefulView(interaction=_make_interaction())
@@ -84,10 +85,74 @@ class TestAutoDeferFires:
         assert fired
 
 
+# // ========================================( Post-Callback Defer )======================================== // #
+
+
+class TestPostCallbackDefer:
+    """Post-callback defer catches fast callbacks that never touch the interaction response."""
+    async def test_fast_callback_deferred_after_completion(self):
+        """Fast callbacks that don't respond are deferred after completion.
+
+        This covers the dispatch → on_state_changed → refresh() pattern
+        where the callback edits the message via the channel endpoint
+        (not the interaction response) and finishes before the timer fires.
+        """
+        view = StatefulView(interaction=_make_interaction())
+        view.auto_defer_delay = 10  # Timer would never fire
+        view.owner_only = False
+
+        interaction = _make_interaction(is_done=False)
+
+        async def dispatch_style_callback(inter):
+            # Simulates: self.dispatch(...) → on_state_changed → refresh()
+            # Uses message.edit(), never touches interaction.response
+            pass
+
+        item = _make_item(dispatch_style_callback)
+        await view._scheduled_task(item, interaction)
+
+        # Post-callback defer fires because the callback didn't respond
+        interaction.response.defer.assert_called_once()
+
+    async def test_post_defer_skipped_when_callback_responds(self):
+        """Post-callback defer does not fire when the callback already responded."""
+        view = StatefulView(interaction=_make_interaction())
+        view.auto_defer_delay = 10
+        view.owner_only = False
+
+        interaction = _make_interaction(is_done=False)
+
+        async def responding_callback(inter):
+            await inter.response.defer()
+
+        item = _make_item(responding_callback)
+        await view._scheduled_task(item, interaction)
+
+        # Only the callback's own defer call, not a post-callback one
+        interaction.response.defer.assert_called_once()
+
+    async def test_post_defer_skipped_when_auto_defer_disabled(self):
+        """With auto_defer=False, post-callback defer does not fire."""
+        view = StatefulView(interaction=_make_interaction())
+        view.auto_defer = False
+        view.owner_only = False
+
+        interaction = _make_interaction(is_done=False)
+
+        async def silent_callback(inter):
+            pass
+
+        item = _make_item(silent_callback)
+        await view._scheduled_task(item, interaction)
+
+        interaction.response.defer.assert_not_called()
+
+
 # // ========================================( Timer Skipped )======================================== // #
 
 
 class TestAutoDeferSkipped:
+    """Auto-defer timer is skipped or cancelled when the callback responds first."""
     async def test_timer_skipped_when_callback_responds_fast(self):
         """If the callback responds before the timer, defer is not called by auto-defer."""
         view = StatefulView(interaction=_make_interaction())
@@ -139,7 +204,7 @@ class TestAutoDeferSkipped:
         item = _make_item(fast_callback)
         await view._scheduled_task(item, interaction)
 
-        # If we get here without hanging, the timer was cancelled
+        # Reaching this point confirms the timer was cancelled
         interaction.response.defer.assert_called_once()
 
 
@@ -147,6 +212,7 @@ class TestAutoDeferSkipped:
 
 
 class TestAutoDeferErrorHandling:
+    """Auto-defer handles expired interactions and callback errors gracefully."""
     async def test_handles_expired_interaction_gracefully(self):
         """If the interaction expired, the auto-defer timer catches the error."""
         view = StatefulView(interaction=_make_interaction())
@@ -156,6 +222,7 @@ class TestAutoDeferErrorHandling:
         interaction = _make_interaction(is_done=False)
 
         import discord
+
         interaction.response.defer = AsyncMock(side_effect=discord.NotFound(MagicMock(), ""))
 
         # Timer should not crash
@@ -186,6 +253,7 @@ class TestAutoDeferErrorHandling:
 
 
 class TestAutoDeferDefaults:
+    """Default auto-defer configuration values and subclass overrides."""
     async def test_default_auto_defer_enabled(self):
         """Auto-defer is enabled by default."""
         view = StatefulView(interaction=_make_interaction())
@@ -204,3 +272,112 @@ class TestAutoDeferDefaults:
 
         view = NoAutoDefer(interaction=_make_interaction())
         assert view.auto_defer is False
+
+
+# // ========================================( Respond Helper )======================================== // #
+
+
+class TestRespond:
+    """respond() routes to interaction.response or followup based on is_done state."""
+    async def test_uses_response_when_not_done(self):
+        """respond() routes to interaction.response.send_message when available."""
+        view = StatefulView(interaction=_make_interaction())
+        interaction = _make_interaction(is_done=False)
+
+        await view.respond(interaction, "hello", ephemeral=True)
+
+        interaction.response.send_message.assert_called_once_with("hello", ephemeral=True)
+        interaction.followup.send.assert_not_called()
+
+    async def test_uses_followup_when_done(self):
+        """respond() falls back to interaction.followup.send when already deferred."""
+        view = StatefulView(interaction=_make_interaction())
+        interaction = _make_interaction(is_done=True)
+
+        await view.respond(interaction, "hello", ephemeral=True)
+
+        interaction.followup.send.assert_called_once_with("hello", ephemeral=True)
+        interaction.response.send_message.assert_not_called()
+
+    async def test_forwards_kwargs(self):
+        """respond() passes extra kwargs (embed, view, etc.) through."""
+        view = StatefulView(interaction=_make_interaction())
+        interaction = _make_interaction(is_done=False)
+        mock_embed = MagicMock()
+
+        await view.respond(interaction, embed=mock_embed, ephemeral=True)
+
+        interaction.response.send_message.assert_called_once_with(
+            None, ephemeral=True, embed=mock_embed
+        )
+
+    async def test_forwards_kwargs_to_followup(self):
+        """respond() passes extra kwargs through to followup path too."""
+        view = StatefulView(interaction=_make_interaction())
+        interaction = _make_interaction(is_done=True)
+        mock_embed = MagicMock()
+
+        await view.respond(interaction, embed=mock_embed, ephemeral=True)
+
+        interaction.followup.send.assert_called_once_with(
+            None, ephemeral=True, embed=mock_embed
+        )
+
+    async def test_non_ephemeral(self):
+        """respond() works for public (non-ephemeral) responses."""
+        view = StatefulView(interaction=_make_interaction())
+        interaction = _make_interaction(is_done=False)
+
+        await view.respond(interaction, "public message")
+
+        interaction.response.send_message.assert_called_once_with(
+            "public message", ephemeral=False
+        )
+
+    async def test_content_only(self):
+        """respond() works with just content, no kwargs."""
+        view = StatefulView(interaction=_make_interaction())
+        interaction = _make_interaction(is_done=True)
+
+        await view.respond(interaction, "fallback")
+
+        interaction.followup.send.assert_called_once_with("fallback", ephemeral=False)
+
+
+class TestOpenModal:
+    """open_modal() sends modal or ephemeral fallback based on response slot availability."""
+    async def test_sends_modal_when_slot_available(self):
+        """open_modal() sends the modal when the response slot is free."""
+        view = StatefulView(interaction=_make_interaction())
+        interaction = _make_interaction(is_done=False)
+        modal = MagicMock()
+
+        result = await view.open_modal(interaction, modal)
+
+        assert result is True
+        interaction.response.send_modal.assert_called_once_with(modal)
+        interaction.followup.send.assert_not_called()
+
+    async def test_sends_fallback_when_slot_consumed(self):
+        """open_modal() sends an ephemeral fallback when already deferred."""
+        view = StatefulView(interaction=_make_interaction())
+        interaction = _make_interaction(is_done=True)
+        modal = MagicMock()
+
+        result = await view.open_modal(interaction, modal)
+
+        assert result is False
+        interaction.response.send_modal.assert_not_called()
+        interaction.followup.send.assert_called_once_with(
+            "Could not open the dialog. Please try again.", ephemeral=True
+        )
+
+    async def test_custom_fallback_message(self):
+        """open_modal() uses custom fallback text when provided."""
+        view = StatefulView(interaction=_make_interaction())
+        interaction = _make_interaction(is_done=True)
+        modal = MagicMock()
+
+        await view.open_modal(interaction, modal, fallback_message="Try later.")
+
+        interaction.followup.send.assert_called_once_with("Try later.", ephemeral=True)

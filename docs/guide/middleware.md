@@ -41,15 +41,32 @@ async def block_spam(action, state, next_fn):
     return await next_fn(action, state)
 ```
 
-## Adding and Removing Middleware
+## Adding Middleware
+
+The canonical install path is `setup_middleware`, which routes every middleware through a uniform install + `async initialize(store)` pipeline. Call it once from the bot author's `setup_hook`:
 
 ```python
-from cascadeui import get_store
+from cascadeui import setup_middleware
+from cascadeui.persistence import SQLiteBackend
+from cascadeui.state.middleware import (
+    LoggingMiddleware,
+    PersistenceMiddleware,
+    UndoMiddleware,
+)
 
-store = get_store()
-store.add_middleware(my_middleware)
-store.remove_middleware(my_middleware)
+class MyBot(commands.Bot):
+    async def setup_hook(self):
+        await setup_middleware(
+            LoggingMiddleware(),
+            PersistenceMiddleware(backend=SQLiteBackend("data.db"), bot=self),
+            UndoMiddleware(),
+        )
 ```
+
+`setup_middleware` gates duplicate installs via `store.has_middleware(type(mw))`, then awaits each middleware's `initialize(store)` method when one is defined. Middlewares that need async startup (backend init, migrations, blocking rehydrate) own that work themselves.
+
+!!! warning "Cogs do not install middleware"
+    Middleware install belongs to the bot author, not a cog. A cog that called `setup_middleware(...)` inside its own `setup(bot)` would silently mutate the bot's store without the author's consent. Declare the dependency in the cog's docstring instead and let the bot's `setup_hook` satisfy it.
 
 ## Built-in Middleware
 
@@ -58,44 +75,43 @@ store.remove_middleware(my_middleware)
 Logs every dispatched action at INFO level:
 
 ```python
-from cascadeui import logging_middleware
+from cascadeui.state.middleware import LoggingMiddleware
 
-store.add_middleware(logging_middleware())
+await setup_middleware(LoggingMiddleware())
 ```
 
-### Debounced Persistence
+Pass `level="DEBUG"` for verbose tracing or `level="WARNING"` to suppress routine traffic without removing the middleware. `setup_logging(actions=True)` (the default) auto-installs `LoggingMiddleware` for callers who already call `setup_logging` during startup, so a separate install step is not required.
 
-Batches disk writes to avoid writing on every single action. Flushes immediately on lifecycle actions (`VIEW_DESTROYED`) and exposes `flush_now()` for shutdown hooks:
+### Persistence
 
-```python
-from cascadeui import DebouncedPersistence
+Fans writes across two namespaces (registry, application) with independent debounce windows per namespace. Flushes immediately on lifecycle actions (`VIEW_DESTROYED`, `PERSISTENT_VIEW_REGISTERED`, `PERSISTENT_VIEW_UNREGISTERED`) and routes each action to the namespaces it touches via identity-diff. Scoped state rides under the application namespace; a scoped slot persists when its slot name is opted in (either via `persistent_slots = ("scoped",)` on the view class or via `SlotPolicy(persistent=True)` in `ApplicationPersistence.slots`).
 
-persistence = DebouncedPersistence(store, interval=2.0)
-store.add_middleware(persistence)
+Construct `PersistenceMiddleware` directly with the backends and bot reference it needs; `setup_middleware` installs it and its `initialize(store)` method runs the full pipeline (manager build, backend init, migrations, blocking rehydrate, message-cleanup listener, reattach). See [Persistence](persistence.md) for the full setup flow.
 
-# In your shutdown handler:
-await persistence.flush_now()
-```
+The middleware skips built-in bookkeeping actions (`SESSION_CREATED`, `VIEW_CREATED`, `VIEW_UPDATED`, `COMPONENT_INTERACTION`, navigation actions, `UNDO`, `REDO`) entirely, and uses a state identity check to skip dispatch-only actions that don't change state. Only custom reducer actions that actually mutate state trigger debounced writes. Slots default to in-memory; the middleware consults `is_persistent_slot(name)` during its identity-diff scan and only writes slots that have been opted in -- either via the `persistent_slots` class attribute on a `_StatefulMixin` subclass or via `SlotPolicy(persistent=True)` at setup time.
 
 ### Undo Middleware
 
-Captures state snapshots for views with `enable_undo = True`. Add it once during setup:
+Captures state snapshots for views with `enable_undo = True`. Install once during setup:
 
 ```python
-from cascadeui import UndoMiddleware
+from cascadeui import setup_middleware
+from cascadeui.state.middleware import UndoMiddleware
 
-store.add_middleware(UndoMiddleware(store))
+await setup_middleware(UndoMiddleware())
 ```
+
+`UndoMiddleware()` takes no arguments. Its `initialize(store)` method binds the middleware to the store during the install pass.
 
 The middleware automatically:
 
 - Checks if the dispatching view has `enable_undo = True`
-- Takes a `deepcopy` of `state["application"]` before the reducer runs
-- Pushes it onto the session's undo stack
+- Captures a per-slot diff of the `application` keys the action changed, plus the session's `shared_data`, before the reducer runs
+- Pushes the diff onto the view's undo stack -- only slots the action touched are snapshotted, so concurrent writes to other slots by sibling views survive this view's undo path
 - Skips internal lifecycle actions (view creation, navigation, etc.)
 - Respects batching (one snapshot per batch, not per action)
 
-See [Views > Undo/Redo](views.md#undoredo) for the view-side API.
+See [State Management -- Undo/Redo](state.md#undoredo) for the view-side API.
 
 ## Custom Middleware Examples
 
@@ -140,14 +156,18 @@ async def analytics(action, state, next_fn):
 
 ## Middleware Order
 
-Middleware runs in registration order, which matters when middleware depends on each other:
+Middleware runs in the order passed to `setup_middleware`, which matters when middleware depends on each other:
 
 ```python
-# Good: logging sees every action (including those blocked by rate limiting)
-store.add_middleware(logging_middleware())
-store.add_middleware(rate_limit)
+from cascadeui.persistence import SQLiteBackend
 
-# Good: undo captures state before persistence writes
-store.add_middleware(UndoMiddleware(store))
-store.add_middleware(DebouncedPersistence(store))
+# Good: logging sees every action (including those blocked by rate limiting).
+# UndoMiddleware captures state before PersistenceMiddleware writes it.
+await setup_middleware(
+    LoggingMiddleware(),
+    UndoMiddleware(),
+    PersistenceMiddleware(backend=SQLiteBackend("data.db"), bot=self),
+)
 ```
+
+Function-style middleware (plain `async def my_middleware(action, state, next_fn)` callables) bypasses the class-based install path. A class-based middleware is the right choice whenever the behavior is more than a one-off filter: the class gives `setup_middleware` a handle for duplicate-install detection, and an optional `initialize(store)` method lets the middleware own its async startup.

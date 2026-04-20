@@ -5,10 +5,10 @@
 
 from unittest.mock import AsyncMock, MagicMock
 
-from cascadeui.views.base import StatefulView
-from cascadeui.views.layout import StatefulLayoutView
 from helpers import make_interaction as _make_interaction
 
+from cascadeui.views.view import StatefulView
+from cascadeui.views.layout import StatefulLayoutView
 
 # // ========================================( Fixtures )======================================== // #
 
@@ -201,13 +201,9 @@ class TestRebuildDictReturn:
         hub._message = MagicMock(id=1, channel=MagicMock(id=2))
 
         embed = MagicMock()
-        new_view = await hub.push(
-            _SubView, interaction, rebuild=lambda v: {"embed": embed}
-        )
+        new_view = await hub.push(_SubView, interaction, rebuild=lambda v: {"embed": embed})
 
-        interaction.edit_original_response.assert_called_once_with(
-            view=new_view, embed=embed
-        )
+        interaction.edit_original_response.assert_called_once_with(view=new_view, embed=embed)
 
     async def test_none_return_no_extra_kwargs(self):
         interaction = _make_interaction()

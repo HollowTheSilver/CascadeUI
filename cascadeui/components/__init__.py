@@ -10,27 +10,32 @@ from .buttons import (
     SuccessButton,
     ToggleButton,
 )
-from .inputs import Modal, TextInput
-from .selects import ChannelSelect, Dropdown, MentionableSelect, RoleSelect, UserSelect
-from .v1_composition import CompositeComponent, get_component, register_component
-from .v1_patterns import (
+from .inputs import Checkbox, CheckboxGroup, FileUpload, Modal, RadioGroup, TextInput
+from .patterns import (
     ConfirmationButtons,
-    FormLayout,
     PaginationControls,
     ProgressBar,
     ToggleGroup,
-)
-from .v2_patterns import (
     action_section,
     alert,
+    button_row,
     card,
+    confirm_section,
+    cycle_button,
     divider,
     gallery,
     gap,
     image_section,
     key_value,
+    link_section,
+    progress_bar,
+    stats_card,
+    tab_nav,
+    toggle_button,
     toggle_section,
 )
+from .selects import ChannelSelect, Dropdown, MentionableSelect, RoleSelect, UserSelect
+from .v1_composition import CompositeComponent, get_component, register_component
 from .wrappers import with_confirmation, with_cooldown, with_loading_state
 
 # // ========================================( Script )======================================== // #
@@ -56,6 +61,10 @@ __all__ = [
     "MentionableSelect",
     # Input components
     "TextInput",
+    "Checkbox",
+    "CheckboxGroup",
+    "RadioGroup",
+    "FileUpload",
     "Modal",
     # V1 composition & patterns
     "CompositeComponent",
@@ -63,21 +72,33 @@ __all__ = [
     "get_component",
     "ConfirmationButtons",
     "PaginationControls",
-    "FormLayout",
     "ToggleGroup",
     "ProgressBar",
     # Component wrappers
     "with_loading_state",
     "with_confirmation",
     "with_cooldown",
-    # V2 patterns
+    # V2 cards & sections
     "card",
     "action_section",
     "toggle_section",
     "image_section",
+    "link_section",
+    "confirm_section",
+    # V2 buttons & rows
+    "button_row",
+    "cycle_button",
+    "toggle_button",
+    # V2 content
     "key_value",
     "alert",
+    "stats_card",
+    "progress_bar",
+    # V2 separators
     "divider",
     "gap",
+    # V2 navigation
+    "tab_nav",
+    # V2 media
     "gallery",
 ]

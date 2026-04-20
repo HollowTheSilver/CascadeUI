@@ -1,47 +1,147 @@
 # API: Persistence
 
-## `setup_persistence(bot=None, *, file_path=None, backend=None)`
-
-Single entry point for all persistence. Call once in `setup_hook`, after loading cogs.
-
-```python
-from cascadeui import setup_persistence
-from cascadeui.persistence import SQLiteBackend
-
-# SQLite backend (recommended)
-await setup_persistence(bot, backend=SQLiteBackend("cascadeui.db"))
-
-# JSON file backend
-await setup_persistence(bot, file_path="bot_state.json")
-
-# Data-only (no view re-attachment)
-await setup_persistence(backend=SQLiteBackend("cascadeui.db"))
-```
-
-**Returns:** `dict` with keys `restored`, `skipped`, `failed`, `removed` (lists of state keys).
+Persistence in CascadeUI spans two isolated namespaces (registry, application), each routed to a backend through a capability-flag Protocol. Scoped state rides under the application namespace: views opt a scoped slot in via `persistent_slots = ("scoped",)` on the class. The guide at [docs/guide/persistence.md](../guide/persistence.md) walks through setup patterns. This page is a flat symbol reference.
 
 ---
 
-## Storage Backends
+## `PersistenceMiddleware(manager=None, *, backend=None, registry=None, application=None, bot=None, migrators=None)`
 
-### `FileStorageBackend`
-
-JSON-based persistence backend. Used by default when `file_path` is passed.
+Write-through middleware that owns the persistence pipeline. Construct once in `setup_hook`, after every cog that defines a `PersistentView` subclass has loaded, and pass it through `setup_middleware` to install it into the dispatch chain.
 
 ```python
-from cascadeui.persistence import FileStorageBackend
+from cascadeui import setup_middleware
+from cascadeui.state.middleware import PersistenceMiddleware
+from cascadeui.persistence import SQLiteBackend
 
-backend = FileStorageBackend("my_state.json")
+# Shorthand: one backend fills every unconfigured namespace
+await setup_middleware(
+    PersistenceMiddleware(backend=SQLiteBackend("cascadeui.db"), bot=bot),
+)
+
+# Data-only (no view re-attachment)
+await setup_middleware(
+    PersistenceMiddleware(backend=SQLiteBackend("cascadeui.db")),
+)
 ```
 
-#### Methods
+**Parameters**
 
-- `save_state(state)` - serializes and writes to disk (creates `.bak` first)
-- `load_state()` - reads and deserializes from disk
+- `manager` -- optional pre-built `PersistenceManager`. When supplied, the pipeline kwargs (`backend`, `registry`, `application`, `bot`, `migrators`) are ignored and the middleware presumes the caller already ran `initialize_backends`, `apply_migrations`, and `rehydrate`. Reserved for advanced call sites that customize manager internals before install.
+- `backend` -- shorthand: fills any namespace not configured via `registry=`/`application=`.
+- `registry`, `application` -- per-namespace overrides. Each accepts the matching config class from `cascadeui.persistence`. Explicit config wins over shorthand; passing the config with `backend=None` opts the namespace out entirely.
+- `bot` -- when supplied, enables the reattach pipeline for `PersistentView` subclasses and installs the message-deletion cleanup listener. When omitted, only state data is restored.
+- `migrators` -- optional iterable of schema migrators. Defaults to the library's built-in registry.
 
-### `SQLiteBackend`
+### `async initialize(store)`
 
-SQLite-based persistence via `aiosqlite`. Uses WAL mode for safe concurrent access.
+Runs the async startup pipeline: build the manager from the stashed config, initialize unique backends, apply schema migrations, blocking rehydrate both namespaces, install the gateway message-cleanup listener (when `bot` is available), stash the manager on the store as `store.persistence_manager`, start the TTL sweeper if any slot declares `ttl_days`, and reattach persistent views (when `bot` is available). Idempotent: subsequent calls return immediately.
+
+Invoked automatically by `setup_middleware`. Direct invocation is supported for test fixtures that bypass the install helper.
+
+**Raises** -- `ValueError` when constructed with no backend configured for any namespace. `PersistenceInitError` when the optional `aiosqlite` dependency is required but missing.
+
+---
+
+## Per-namespace configuration
+
+### `RegistryPersistence(backend=...)`
+
+Governs the `PersistentView` registry namespace. Rows hold one entry per `persistence_key`; registry rows have no TTL and live until the view unregisters or the user prunes them explicitly. Pass `backend=None` to opt the registry out of persistence (persistent views still work in memory, but do not survive a restart).
+
+### `ApplicationPersistence(backend=..., slots={})`
+
+Governs the `state["application"]` namespace. `slots` maps slot name to a `SlotPolicy` for per-slot retention; slots without an explicit policy use `SlotPolicy()` defaults (in-memory, no TTL). When at least one slot declares `ttl_days`, the manager starts a daily TTL sweeper that deletes expired rows. Pass `backend=None` to opt application slots out of persistence entirely.
+
+### `SlotPolicy(ttl_days=None, persistent=False)`
+
+Per-slot policy declared inside `ApplicationPersistence.slots={"slot_name": SlotPolicy(...)}`. `persistent=True` writes the slot through to the backend; `persistent=False` (the default) keeps it in-memory. `ttl_days=N` prunes rows older than the cutoff on auto-prune cycles; `ttl_days=None` disables TTL. `persistent=False` paired with `ttl_days=N` raises `ValueError` -- in-memory slots never reach storage, so a TTL has nothing to prune.
+
+Slot opt-in is additive with the class-level `persistent_slots` tuple on `_StatefulMixin` subclasses. Either path registers the slot in the library's sticky `_PERSISTENT_SLOTS` set; both combine cleanly when used together (class declares "CAN persist"; policy layers on TTL).
+
+---
+
+## `PersistenceBackend` (Protocol)
+
+A backend is any class declaring `capabilities: Capability` and the methods required by the flags it advertises. `PersistenceManager` validates declared capabilities against method presence when `PersistenceMiddleware` initializes.
+
+```python
+from typing import Any, AsyncIterator, ClassVar
+
+from cascadeui.persistence import Capability, PersistenceBackend
+
+
+class MyBackend:
+    capabilities: ClassVar[Capability] = (
+        Capability.KV | Capability.RELATIONAL | Capability.SCHEMA_META
+    )
+
+    # Lifecycle
+    async def initialize(self) -> None: ...
+    async def close(self) -> None: ...
+
+    # Capability.KV
+    async def kv_read(self, namespace: str, key: str) -> bytes | None: ...
+    async def kv_write(self, namespace: str, key: str, value: bytes) -> None: ...
+    async def kv_delete(self, namespace: str, key: str) -> None: ...
+    async def kv_scan(
+        self, namespace: str, prefix: str = ""
+    ) -> AsyncIterator[tuple[str, bytes]]: ...
+
+    # Capability.RELATIONAL
+    async def row_upsert(
+        self, namespace: str, row: dict[str, Any], key_columns: list[str]
+    ) -> None: ...
+    async def row_select(
+        self, namespace: str, where: dict[str, Any] | None = None
+    ) -> list[dict[str, Any]]: ...
+    async def row_delete(self, namespace: str, where: dict[str, Any]) -> int: ...
+    async def row_delete_where_lt(
+        self, namespace: str, column: str, value: Any
+    ) -> int: ...
+
+    # Capability.SCHEMA_META
+    async def get_schema_version(self, table: str) -> int: ...
+    async def set_schema_version(self, table: str, version: int) -> None: ...
+```
+
+Three correctness guarantees beyond the method signatures:
+
+1. **Copy-on-store / copy-on-return** -- backends must defensively copy dict/list inputs in `row_upsert` and `kv_write`, and copy outputs in `row_select` and `kv_scan`. Callers mutating the returned dict must not see that mutation on the next read.
+2. **NULL-safe TTL prune** -- `row_delete_where_lt` must not sweep rows whose column value is missing or `None`.
+3. **Scan-snapshot safety** -- `kv_scan` must not raise `RuntimeError` when the caller writes to the same namespace mid-iteration.
+
+`InMemoryBackend` is the reference implementation.
+
+---
+
+## `Capability`
+
+Flag enum advertising which method sets a backend implements. Any combination via bitwise OR.
+
+- `Capability.KV` -- `kv_read`, `kv_write`, `kv_delete`, `kv_scan`
+- `Capability.RELATIONAL` -- `row_upsert`, `row_select`, `row_delete`, `row_delete_where_lt`
+- `Capability.SCHEMA_META` -- `get_schema_version`, `set_schema_version`
+- `Capability.TTL_INDEX` -- declares the backend has an indexed TTL column. Required when any `SlotPolicy` declares `ttl_days`.
+
+`PersistenceMiddleware.initialize` raises `PersistenceConfigError` at config time when a declared capability's method is missing.
+
+---
+
+## Built-in backends
+
+### `InMemoryBackend`
+
+Always available. All three capabilities. Process-local; state is lost on restart. Useful for tests and single-run bots.
+
+```python
+from cascadeui.persistence import InMemoryBackend
+
+backend = InMemoryBackend()
+```
+
+### `SQLiteBackend(path, *, busy_timeout_ms=5000, synchronous="NORMAL")`
+
+Requires `pip install pycascadeui[sqlite]`. All three capabilities. Uses WAL mode and prepared statements.
 
 ```python
 from cascadeui.persistence import SQLiteBackend
@@ -49,67 +149,56 @@ from cascadeui.persistence import SQLiteBackend
 backend = SQLiteBackend("cascadeui.db")
 ```
 
-**Requires:** `pip install pycascadeui[sqlite]`
-
-#### Methods
-
-- `save_state(state)` - serializes to JSON and writes to a single-row table
-- `load_state()` - reads and deserializes from the table (auto-creates if missing)
-
-### `RedisBackend`
-
-Redis-based persistence via `redis.asyncio`.
-
-```python
-from cascadeui.persistence import RedisBackend
-
-backend = RedisBackend(url="redis://localhost", key="cascadeui:state", ttl=None)
-```
-
-**Requires:** `pip install pycascadeui[redis]`
-
-#### Constructor Parameters
-
-- `url` (str): Redis connection URL
-- `key` (str): Redis key for the state blob (default: `"cascadeui:state"`)
-- `ttl` (int | None): Optional TTL in seconds for the key
+Importable from `cascadeui.persistence` only when `aiosqlite` is installed; the import is optional and silent otherwise.
 
 ---
 
-## `migrate_storage(source, target)`
+## `PersistenceManager`
 
-Copies state from one backend to another:
+The reattach/rehydrate/prune coordinator. Normally created and wired automatically by `PersistenceMiddleware.initialize`; access the live instance via `store.persistence_manager` when you need to drive pruning manually.
 
 ```python
-from cascadeui.persistence import migrate_storage, FileStorageBackend, SQLiteBackend
+# Drop one slot entirely (any age).
+await mgr.prune_application(slot="settings")
 
-await migrate_storage(
-    source=FileStorageBackend("old_state.json"),
-    target=SQLiteBackend("cascadeui.db"),
-)
+# Whole-namespace TTL sweep across every persistent slot.
+await mgr.prune_application(older_than_days=90)
+
+# Drop specific registry rows; omit persistence_keys to clear the
+# whole registry (destructive, rarely wanted).
+await mgr.prune_registry(persistence_keys=["roles:main", "tickets:panel"])
 ```
+
+`slot=` and `older_than_days=` are mutually exclusive on `prune_application`.
 
 ---
 
-## `StorageBackend` (Protocol)
+## Exceptions
 
-Interface for custom backends. Implement `save_state(state)` and `load_state()`:
+All four exception types are importable from the package root
+(`from cascadeui import PersistenceError, ...`). They form a simple
+hierarchy so callers can catch the whole family with `PersistenceError`
+or handle specific phases individually.
+
+| Class | Parent | Fires when |
+|-------|--------|------------|
+| `PersistenceError` | `RuntimeError` | Base class for every persistence failure. Catch this to handle any persistence error. |
+| `PersistenceInitError` | `PersistenceError` | Raised from `backend.initialize()` on connection failures, table-creation errors, or permission problems. Prevents the bot from starting against an unhealthy persistence layer. |
+| `PersistenceSchemaError` | `PersistenceError` | Raised when the on-disk schema version is higher than the library supports, or when a registered migrator fails mid-run and leaves the schema partially upgraded. |
+| `PersistenceRehydrateError` | `PersistenceError` | Raised during `PersistenceMiddleware.initialize` when a persisted JSON blob is corrupted, a required row is malformed, or the backend returns unexpected shape. Per-view re-attachment failures do NOT raise this -- they are logged and skipped. |
 
 ```python
-class MyBackend:
-    async def save_state(self, state: dict) -> bool:
-        ...  # Return True on success
+from cascadeui import PersistenceError, PersistenceSchemaError, setup_middleware
+from cascadeui.state.middleware import PersistenceMiddleware
 
-    async def load_state(self) -> dict:
-        ...  # Return empty dict if no saved state
+try:
+    await setup_middleware(PersistenceMiddleware(backend=backend))
+except PersistenceSchemaError as exc:
+    # Schema is ahead of the library -- refuse to boot rather than
+    # corrupt newer on-disk state by downgrading silently.
+    log.critical("Persistence schema too new: %s", exc)
+    raise
+except PersistenceError as exc:
+    log.error("Persistence layer failed to initialize: %s", exc)
+    raise
 ```
-
----
-
-## `StateSerializer`
-
-Handles serialization of non-standard types:
-
-- `datetime` objects are converted to/from ISO format strings
-- `set` objects are converted to/from lists
-- Other non-serializable types raise `TypeError`

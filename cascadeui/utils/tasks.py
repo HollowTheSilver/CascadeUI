@@ -9,7 +9,7 @@ from typing import Any, Coroutine, Dict, Optional, Set
 
 
 class TaskManager:
-    """Manages and tracks background tasks to ensure proper cleanup."""
+    """Tracks background tasks by owner ID with cancellation on teardown."""
 
     def __init__(self):
         self._tasks: Dict[str, Set[asyncio.Task]] = {}
@@ -32,13 +32,9 @@ class TaskManager:
             # Re-raise cancellation so it's properly handled
             raise
         except Exception as e:
-            # Log exception but don't crash
-            from ..utils.logging import AsyncLogger
+            import logging
 
-            logger = AsyncLogger(
-                name="cascadeui.tasks", level="ERROR", path="logs", mode="a", prefix="cascadeui"
-            )
-            logger.error(f"Task error for owner {owner_id}: {e}")
+            logging.getLogger("cascadeui.tasks").error(f"Task error for owner {owner_id}: {e}")
             raise
         finally:
             # Remove task from tracking
@@ -69,6 +65,19 @@ class TaskManager:
             return len(self._tasks.get(owner_id, set()))
 
         return sum(len(tasks) for tasks in self._tasks.values())
+
+    async def wait_tasks(self, owner_id: str) -> None:
+        """Await all in-flight tasks under the given owner.
+
+        Snapshots the current set so tasks spawned by awaited callbacks do
+        not extend the wait indefinitely. Exceptions inside tasks are already
+        logged by ``_wrap_task``; this helper swallows them so a single
+        failing subscriber does not abort the flush.
+        """
+        tasks = list(self._tasks.get(owner_id, ()))
+        if not tasks:
+            return
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 # Singleton instance

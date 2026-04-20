@@ -127,14 +127,14 @@ fields = [
     },
 ]
 
-view = FormView(context=ctx, fields=fields, on_submit=my_handler)
+view = FormView(context=ctx, fields=fields)
 ```
 
 If validation fails, the user sees an ephemeral embed with per-field error messages. Required field checks run first, then validators.
 
 ## Integration with Modals
 
-Pass a `validators` dict to `Modal` to validate input on submission. Keys are the field's `custom_id`, values are lists of validators:
+Attach validators directly to each `TextInput`. `Modal` collects them automatically at construction time, so there is no separate modal-level validators argument:
 
 ```python
 from cascadeui import Modal, TextInput, min_length, regex
@@ -142,18 +142,21 @@ from cascadeui import Modal, TextInput, min_length, regex
 modal = Modal(
     title="Set Username",
     inputs=[
-        TextInput(label="Username", placeholder="alphanumeric only"),
+        TextInput(
+            label="Username",
+            placeholder="alphanumeric only",
+            validators=[
+                min_length(3),
+                regex(r"^[a-zA-Z0-9_]+$", "Alphanumeric only"),
+            ],
+        ),
     ],
     callback=handle_username,
-    validators={
-        "input_username": [
-            min_length(3),
-            regex(r"^[a-zA-Z0-9_]+$", "Alphanumeric only"),
-        ],
-    },
 )
-await interaction.response.send_modal(modal)
+await self.open_modal(interaction, modal)
 ```
+
+Inside a CascadeUI view, use `self.open_modal()` instead of raw `send_modal()`.
 
 If any validator fails, the user sees an ephemeral message listing the errors and the callback is not called. If all validators pass, the callback runs normally.
 

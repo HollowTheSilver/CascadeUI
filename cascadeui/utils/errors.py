@@ -6,11 +6,9 @@ import functools
 import traceback
 from typing import Any, Callable, Coroutine, Optional, Tuple, Type, TypeVar, Union, cast
 
-from .logging import AsyncLogger
+import logging
 
-logger = AsyncLogger(
-    name="cascadeui.errors", level="DEBUG", path="logs", mode="a", prefix="cascadeui"
-)
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -86,7 +84,7 @@ def with_retry(config: Optional[RetryConfig] = None):
                     )
                     await asyncio.sleep(wait_time)
 
-            # If we get here, all retries failed
+            # All retries exhausted -- fall through to the terminal error log.
             logger.error(
                 f"All {retry_config.max_retries} attempts failed "
                 f"for {func.__name__}: {last_exception}"

@@ -3,26 +3,74 @@
 import copy
 from typing import Any, Dict
 
+from .middleware.undo import _MISSING
 from .types import Action, StateData
 
+# // ========================================( Constants )======================================== // #
+
+# Action types owned by the built-in reducers in this module. Registering a
+# custom reducer for any of these via @cascade_reducer would silently shadow
+# the library's own state machinery (sessions, navigation, undo stacks, etc.)
+# and produce hard-to-trace breakage. The decorator raises ValueError at
+# decoration time when a user attempts the collision -- see
+# cascadeui/utils/decorators.py.
+# Prune actions (APPLICATION_SLOTS_PRUNED, REGISTRY_PRUNED) are
+# library-owned observability signals fired by the persistence manager
+# after deleting rows on disk. The library ships no reducer for them --
+# they are dispatch-only so subscribers and hooks can observe prunes.
+# They are listed here so @cascade_reducer raises on collision; users
+# who want to react to prunes should subscribe or use
+# store.on("application_slots_pruned", ...) rather than shadowing the name.
+_BUILTIN_REDUCER_ACTIONS = frozenset({
+    "VIEW_CREATED",
+    "VIEW_UPDATED",
+    "VIEW_DESTROYED",
+    "SESSION_CREATED",
+    "SESSION_UPDATED",
+    "NAVIGATION_REPLACE",
+    "NAVIGATION_PUSH",
+    "NAVIGATION_POP",
+    "SCOPED_UPDATE",
+    "COMPONENT_INTERACTION",
+    "MODAL_SUBMITTED",
+    "PERSISTENT_VIEW_REGISTERED",
+    "PERSISTENT_VIEW_UNREGISTERED",
+    "UNDO",
+    "REDO",
+    "APPLICATION_SLOTS_PRUNED",
+    "REGISTRY_PRUNED",
+    "INSPECTOR_PURGED_STALE",
+})
+
 # // ========================================( Coroutines )======================================== // #
+
+#
+# All reducers below follow the shallow-spread contract:
+#
+#   1. Return ``state`` unchanged (same identity) when the action is a no-op.
+#   2. Otherwise return a new top-level dict, spreading intermediate dicts
+#      and lists only along the mutation path.  Unchanged branches share
+#      references with the input state.
+#   3. Never mutate the input ``state`` or any nested structure reachable
+#      from it.  The per-dispatch ``copy.deepcopy`` that used to gate this
+#      contract is gone -- the shallow spread replaces it.
+#
+# User reducers registered through ``@cascade_reducer`` still receive a
+# deep-copied ``state`` so the existing "mutate freely" contract is intact
+# for user code.  The shallow-spread pattern here is an internal speedup.
+#
 
 
 async def reduce_view_created(action: Action, state: StateData) -> StateData:
     """Handle VIEW_CREATED actions."""
-    new_state = copy.deepcopy(state)
     payload = action["payload"]
 
     view_id = payload.get("view_id")
     if not view_id:
         return state
 
-    # Initialize views if needed
-    if "views" not in new_state:
-        new_state["views"] = {}
-
-    # Add the new view
-    new_state["views"][view_id] = {
+    views = state.get("views", {})
+    new_view = {
         "id": view_id,
         "type": payload.get("view_type"),
         "user_id": payload.get("user_id"),
@@ -33,244 +81,240 @@ async def reduce_view_created(action: Action, state: StateData) -> StateData:
         "message_id": payload.get("message_id"),
         "channel_id": payload.get("channel_id"),
     }
+    new_views = {**views, view_id: new_view}
 
-    # Associate with session
+    new_state = {**state, "views": new_views}
+
+    # Associate with session (spread session.members on write)
     session_id = payload.get("session_id")
-    if session_id and "sessions" in new_state and session_id in new_state["sessions"]:
-        if "views" not in new_state["sessions"][session_id]:
-            new_state["sessions"][session_id]["views"] = []
-
-        if view_id not in new_state["sessions"][session_id]["views"]:
-            new_state["sessions"][session_id]["views"].append(view_id)
+    sessions = state.get("sessions", {})
+    if session_id and session_id in sessions:
+        session = sessions[session_id]
+        members = session.get("members", [])
+        if view_id not in members:
+            new_session = {**session, "members": [*members, view_id]}
+            new_state["sessions"] = {**sessions, session_id: new_session}
 
     return new_state
 
 
 async def reduce_view_updated(action: Action, state: StateData) -> StateData:
     """Handle VIEW_UPDATED actions."""
-    new_state = copy.deepcopy(state)
     payload = action["payload"]
 
     view_id = payload.get("view_id")
-    if not view_id or "views" not in new_state or view_id not in new_state["views"]:
+    views = state.get("views", {})
+    if not view_id or view_id not in views:
         return state
 
-    # Update the view
-    view_data = new_state["views"][view_id]
-    view_data["updated_at"] = action["timestamp"]
-
-    # Update individual fields
+    old_view = views[view_id]
+    new_view = {**old_view, "updated_at": action["timestamp"]}
     for key, value in payload.items():
         if key != "view_id":
-            view_data[key] = value
+            new_view[key] = value
 
-    return new_state
+    return {**state, "views": {**views, view_id: new_view}}
 
 
 async def reduce_view_destroyed(action: Action, state: StateData) -> StateData:
     """Handle VIEW_DESTROYED actions."""
-    new_state = copy.deepcopy(state)
     payload = action["payload"]
 
     view_id = payload.get("view_id")
-    if not view_id or "views" not in new_state or view_id not in new_state["views"]:
+    views = state.get("views", {})
+    if not view_id or view_id not in views:
         return state
 
-    # Get session info before removing view
-    view_data = new_state["views"][view_id]
+    view_data = views[view_id]
     session_id = view_data.get("session_id")
 
-    # Remove view from state
-    del new_state["views"][view_id]
+    new_state = {**state}
+    new_state["views"] = {k: v for k, v in views.items() if k != view_id}
+
+    # Remove component interaction entries owned by this view
+    components = state.get("components")
+    if components:
+        filtered = {cid: c for cid, c in components.items() if c.get("view_id") != view_id}
+        if filtered:
+            new_state["components"] = filtered
+        else:
+            new_state.pop("components", None)
+
+    # Remove modal submission entries owned by this view
+    modals = state.get("modals")
+    if modals and view_id in modals:
+        new_modals = {k: v for k, v in modals.items() if k != view_id}
+        if new_modals:
+            new_state["modals"] = new_modals
+        else:
+            new_state.pop("modals", None)
 
     # Remove from session if applicable
-    if session_id and "sessions" in new_state and session_id in new_state["sessions"]:
-        session = new_state["sessions"][session_id]
-        if "views" in session:
-            if view_id in session["views"]:
-                session["views"].remove(view_id)
-
-            # Clean up empty sessions to prevent state leakage.
-            # Keep the session alive if a nav stack exists — push/pop
-            # temporarily empties the view list between destroying the
-            # old view and registering the new one.
-            if not session["views"] and not session.get("nav_stack"):
-                del new_state["sessions"][session_id]
+    if session_id:
+        sessions = state.get("sessions", {})
+        session = sessions.get(session_id)
+        if session and view_id in session.get("members", []):
+            new_members = [m for m in session["members"] if m != view_id]
+            if new_members:
+                new_session = {**session, "members": new_members}
+                new_state["sessions"] = {**sessions, session_id: new_session}
+            else:
+                new_state["sessions"] = {k: v for k, v in sessions.items() if k != session_id}
 
     return new_state
 
 
 async def reduce_session_created(action: Action, state: StateData) -> StateData:
     """Handle SESSION_CREATED actions."""
-    new_state = copy.deepcopy(state)
     payload = action["payload"]
 
     session_id = payload.get("session_id")
     if not session_id:
         return state
 
-    # Initialize sessions if needed
-    if "sessions" not in new_state:
-        new_state["sessions"] = {}
+    sessions = state.get("sessions", {})
+    # Duplicate session id -- no-op, preserve existing content
+    if session_id in sessions:
+        return state
 
-    # Only create if session doesn't exist already
-    if session_id not in new_state["sessions"]:
-        # Add the new session
-        new_state["sessions"][session_id] = {
-            "id": session_id,
-            "user_id": payload.get("user_id"),
-            "created_at": action["timestamp"],
-            "updated_at": action["timestamp"],
-            "views": [],
-            "history": [],
-            "data": payload.get("data", {}),
-        }
-
-    return new_state
+    new_session = {
+        "id": session_id,
+        "user_id": payload.get("user_id"),
+        "created_at": action["timestamp"],
+        "updated_at": action["timestamp"],
+        "members": [],
+        "history": [],
+        "shared_data": payload.get("shared_data", {}),
+    }
+    return {**state, "sessions": {**sessions, session_id: new_session}}
 
 
 async def reduce_session_updated(action: Action, state: StateData) -> StateData:
     """Handle SESSION_UPDATED actions."""
-    new_state = copy.deepcopy(state)
     payload = action["payload"]
 
     session_id = payload.get("session_id")
-    if not session_id or "sessions" not in new_state or session_id not in new_state["sessions"]:
+    sessions = state.get("sessions", {})
+    if not session_id or session_id not in sessions:
         return state
 
-    # Update the session
-    session_data = new_state["sessions"][session_id]
-    session_data["updated_at"] = action["timestamp"]
+    old_session = sessions[session_id]
+    new_session = {**old_session, "updated_at": action["timestamp"]}
 
-    # Update data field if provided
-    if "data" in payload:
-        session_data["data"] = {**session_data.get("data", {}), **payload["data"]}
+    if "shared_data" in payload:
+        new_session["shared_data"] = {
+            **old_session.get("shared_data", {}),
+            **payload["shared_data"],
+        }
 
-    return new_state
+    return {**state, "sessions": {**sessions, session_id: new_session}}
 
 
 async def reduce_navigation_replace(action: Action, state: StateData) -> StateData:
     """Handle NAVIGATION_REPLACE actions."""
-    new_state = copy.deepcopy(state)
     payload = action["payload"]
 
     source_id = action.get("source")
     dest_view_type = payload.get("destination")
-
     if not source_id or not dest_view_type:
         return state
 
-    # Update navigation history
-    if "views" in new_state and source_id in new_state["views"]:
-        view_data = new_state["views"][source_id]
-        session_id = view_data.get("session_id")
+    views = state.get("views", {})
+    if source_id not in views:
+        return state
 
-        if session_id and "sessions" in new_state and session_id in new_state["sessions"]:
-            session = new_state["sessions"][session_id]
+    session_id = views[source_id].get("session_id")
+    sessions = state.get("sessions", {})
+    if not session_id or session_id not in sessions:
+        return state
 
-            # Initialize history if needed
-            if "history" not in session:
-                session["history"] = []
-
-            # Add navigation event
-            session["history"].append(
-                {
-                    "from_view": source_id,
-                    "to_view_type": dest_view_type,
-                    "timestamp": action["timestamp"],
-                    "params": payload.get("params", {}),
-                }
-            )
-
-    return new_state
+    old_session = sessions[session_id]
+    history = old_session.get("history", [])
+    new_event = {
+        "from_view": source_id,
+        "to_view_type": dest_view_type,
+        "timestamp": action["timestamp"],
+        "params": payload.get("params", {}),
+    }
+    new_session = {**old_session, "history": [*history, new_event]}
+    return {**state, "sessions": {**sessions, session_id: new_session}}
 
 
 async def reduce_component_interaction(action: Action, state: StateData) -> StateData:
     """Handle COMPONENT_INTERACTION actions."""
-    new_state = copy.deepcopy(state)
     payload = action["payload"]
 
     component_id = payload.get("component_id")
     view_id = payload.get("view_id")
-
     if not component_id or not view_id:
         return state
 
-    # Initialize components if needed
-    if "components" not in new_state:
-        new_state["components"] = {}
+    components = state.get("components", {})
+    existing = components.get(component_id, {
+        "id": component_id,
+        "view_id": view_id,
+        "interactions": [],
+    })
 
-    # Record the interaction
-    if component_id not in new_state["components"]:
-        new_state["components"][component_id] = {"id": component_id, "interactions": []}
+    interactions = existing.get("interactions", [])
+    new_interactions = [*interactions, {
+        "user_id": payload.get("user_id"),
+        "view_id": view_id,
+        "value": payload.get("value"),
+        "timestamp": action["timestamp"],
+    }]
+    if len(new_interactions) > 50:
+        new_interactions = new_interactions[-50:]
 
-    # Add the interaction (capped to prevent unbounded growth)
-    interactions = new_state["components"][component_id]["interactions"]
-    interactions.append(
-        {
-            "user_id": payload.get("user_id"),
-            "view_id": view_id,
-            "value": payload.get("value"),
-            "timestamp": action["timestamp"],
-        }
-    )
-    if len(interactions) > 50:
-        new_state["components"][component_id]["interactions"] = interactions[-50:]
+    new_component = {
+        **existing,
+        "interactions": new_interactions,
+        "last_interaction": action["timestamp"],
+    }
 
-    # Update the last interaction timestamp
-    new_state["components"][component_id]["last_interaction"] = action["timestamp"]
-
-    return new_state
+    return {**state, "components": {**components, component_id: new_component}}
 
 
 async def reduce_modal_submitted(action: Action, state: StateData) -> StateData:
     """Handle MODAL_SUBMITTED actions."""
-    new_state = copy.deepcopy(state)
     payload = action["payload"]
 
     view_id = payload.get("view_id")
     if not view_id:
         return state
 
-    # Initialize modals namespace if needed
-    if "modals" not in new_state:
-        new_state["modals"] = {}
+    modals = state.get("modals", {})
+    existing = modals.get(view_id, {"submissions": []})
 
-    # Store the submission keyed by view_id
-    if view_id not in new_state["modals"]:
-        new_state["modals"][view_id] = {"submissions": []}
+    submissions = existing.get("submissions", [])
+    new_submissions = [*submissions, {
+        "user_id": payload.get("user_id"),
+        "values": payload.get("values", {}),
+        "timestamp": action["timestamp"],
+    }]
+    if len(new_submissions) > 50:
+        new_submissions = new_submissions[-50:]
 
-    # Record the submission (capped at 50 like component interactions)
-    submissions = new_state["modals"][view_id]["submissions"]
-    submissions.append(
-        {
-            "user_id": payload.get("user_id"),
-            "values": payload.get("values", {}),
-            "timestamp": action["timestamp"],
-        }
-    )
-    if len(submissions) > 50:
-        new_state["modals"][view_id]["submissions"] = submissions[-50:]
+    new_modal = {
+        **existing,
+        "submissions": new_submissions,
+        "last_submission": action["timestamp"],
+    }
 
-    new_state["modals"][view_id]["last_submission"] = action["timestamp"]
-
-    return new_state
+    return {**state, "modals": {**modals, view_id: new_modal}}
 
 
 async def reduce_persistent_view_registered(action: Action, state: StateData) -> StateData:
     """Handle PERSISTENT_VIEW_REGISTERED actions."""
-    new_state = copy.deepcopy(state)
     payload = action["payload"]
 
-    state_key = payload.get("state_key")
-    if not state_key:
+    persistence_key = payload.get("persistence_key")
+    if not persistence_key:
         return state
 
-    if "persistent_views" not in new_state:
-        new_state["persistent_views"] = {}
-
-    new_state["persistent_views"][state_key] = {
-        "state_key": state_key,
+    persistent_views = state.get("persistent_views", {})
+    new_entry = {
+        "persistence_key": persistence_key,
         "class_name": payload.get("class_name"),
         "message_id": payload.get("message_id"),
         "channel_id": payload.get("channel_id"),
@@ -278,23 +322,65 @@ async def reduce_persistent_view_registered(action: Action, state: StateData) ->
         "user_id": payload.get("user_id"),
         "registered_at": action["timestamp"],
     }
-
-    return new_state
+    return {**state, "persistent_views": {**persistent_views, persistence_key: new_entry}}
 
 
 async def reduce_persistent_view_unregistered(action: Action, state: StateData) -> StateData:
     """Handle PERSISTENT_VIEW_UNREGISTERED actions."""
     payload = action["payload"]
 
-    state_key = payload.get("state_key")
-    if not state_key:
+    persistence_key = payload.get("persistence_key")
+    if not persistence_key:
         return state
 
-    if "persistent_views" not in state or state_key not in state["persistent_views"]:
+    persistent_views = state.get("persistent_views", {})
+    if persistence_key not in persistent_views:
         return state
 
-    new_state = copy.deepcopy(state)
-    del new_state["persistent_views"][state_key]
+    return {
+        **state,
+        "persistent_views": {k: v for k, v in persistent_views.items() if k != persistence_key},
+    }
+
+
+async def reduce_inspector_purged_stale(action: Action, state: StateData) -> StateData:
+    """Handle INSPECTOR_PURGED_STALE -- drop component/modal entries not owned by the inspector.
+
+    The DevTools inspector self-filters its own data from displayed aggregates so
+    its observation does not poison the state it reports.  Purge sweeps the
+    component/modal slots clean of stale (non-inspector) entries while keeping
+    the inspector's own live entries intact -- the same self-filter property
+    enforced by the read-side helpers in ``devtools.py``.
+
+    ``inspector_id`` present and non-None preserves that inspector's rows;
+    ``inspector_id`` present and None (CLI sledgehammer path) purges everything
+    -- no row can match ``view_id == None`` in a well-formed state tree.
+    Missing ``inspector_id`` key short-circuits as a defensive no-op against
+    malformed payloads.
+    """
+    payload = action["payload"]
+
+    if "inspector_id" not in payload:
+        return state
+
+    inspector_id = payload["inspector_id"]
+    new_state = {**state}
+
+    components = state.get("components")
+    if components:
+        kept = {cid: c for cid, c in components.items() if c.get("view_id") == inspector_id}
+        if kept:
+            new_state["components"] = kept
+        else:
+            new_state.pop("components", None)
+
+    modals = state.get("modals")
+    if modals:
+        kept_modals = {k: v for k, v in modals.items() if k == inspector_id}
+        if kept_modals:
+            new_state["modals"] = kept_modals
+        else:
+            new_state.pop("modals", None)
 
     return new_state
 
@@ -303,132 +389,196 @@ async def reduce_persistent_view_unregistered(action: Action, state: StateData) 
 
 
 async def reduce_navigation_push(action: Action, state: StateData) -> StateData:
-    """Handle NAVIGATION_PUSH — add an entry to the session's nav stack."""
-    new_state = copy.deepcopy(state)
-    payload = action["payload"]
+    """Handle NAVIGATION_PUSH -- no-op reducer.
 
-    session_id = payload.get("session_id")
-    if not session_id or "sessions" not in new_state or session_id not in new_state["sessions"]:
-        return state
-
-    session = new_state["sessions"][session_id]
-    if "nav_stack" not in session:
-        session["nav_stack"] = []
-
-    session["nav_stack"].append(
-        {
-            "class_name": payload.get("class_name"),
-            "module": payload.get("module"),
-            "kwargs": payload.get("kwargs", {}),
-            "state_snapshot": payload.get("state_snapshot"),
-        }
-    )
-
-    return new_state
+    Navigation stack is view-local (transferred at the Python object level
+    by ``_navigate_to``).  The dispatch still fires for middleware and
+    subscriber notification.
+    """
+    return state
 
 
 async def reduce_navigation_pop(action: Action, state: StateData) -> StateData:
-    """Handle NAVIGATION_POP — remove the top entry from the session's nav stack."""
-    new_state = copy.deepcopy(state)
-    payload = action["payload"]
+    """Handle NAVIGATION_POP -- no-op reducer.
 
-    session_id = payload.get("session_id")
-    if not session_id or "sessions" not in new_state or session_id not in new_state["sessions"]:
-        return state
-
-    session = new_state["sessions"][session_id]
-    nav_stack = session.get("nav_stack", [])
-
-    if nav_stack:
-        nav_stack.pop()
-
-    return new_state
+    Navigation stack is view-local (transferred at the Python object level
+    by ``_navigate_to``).  The dispatch still fires for middleware and
+    subscriber notification.
+    """
+    return state
 
 
 # // ========================================( State Scoping )======================================== // #
 
 
 async def reduce_scoped_update(action: Action, state: StateData) -> StateData:
-    """Handle SCOPED_UPDATE — merge data into a scoped state slice."""
-    new_state = copy.deepcopy(state)
+    """Handle SCOPED_UPDATE -- merge data into a scoped state slice.
+
+    Delegates key construction to ``StateStore._build_scope_key`` so the
+    write path and read path stay in sync. Returns state unchanged when the
+    payload is malformed (missing scope / bad identifiers) rather than
+    writing an unreachable key.
+    """
+    from .slots import read_slot
+    from .store import StateStore  # lazy to avoid circular import
+
     payload = action["payload"]
-
     scope = payload.get("scope")
-    scope_id = payload.get("scope_id")
-    data = payload.get("data", {})
-
-    if not scope or scope_id is None:
+    if not scope:
         return state
 
-    scope_key = f"{scope}:{scope_id}"
+    identifiers = payload.get("identifiers", {})
+    data = payload.get("data", {})
+    slot_name = payload.get("slot_name", "scoped")
 
-    if "application" not in new_state:
-        new_state["application"] = {}
-    if "_scoped" not in new_state["application"]:
-        new_state["application"]["_scoped"] = {}
+    try:
+        scope_key = StateStore._build_scope_key(scope, **identifiers)
+    except ValueError:
+        return state
 
-    existing = new_state["application"]["_scoped"].get(scope_key, {})
-    new_state["application"]["_scoped"][scope_key] = {**existing, **data}
+    old_bucket = read_slot(state, slot_name)
+    existing = old_bucket.get(scope_key, {})
+    new_bucket = {**old_bucket, scope_key: {**existing, **data}}
+    old_application = state.get("application", {})
+    new_application = {**old_application, slot_name: new_bucket}
 
-    return new_state
+    return {**state, "application": new_application}
 
 
 # // ========================================( Undo / Redo )======================================== // #
 
 
+def _apply_slot_diff(application: dict, diff: Dict[str, Any]) -> dict:
+    """Apply a per-slot diff to an application dict and return a new dict.
+
+    Values mapped to ``_MISSING`` delete the slot; any other value
+    replaces the slot wholesale. Slots absent from ``diff`` carry
+    through unchanged so sibling views' concurrent writes survive.
+    """
+    new_application = dict(application)
+    for name, target_value in diff.items():
+        if target_value is _MISSING:
+            new_application.pop(name, None)
+        else:
+            new_application[name] = target_value
+    return new_application
+
+
+def _build_inverse_diff(
+    current_application: dict, diff_keys: Any
+) -> Dict[str, Any]:
+    """Build the inverse diff from the current application for the same slot names.
+
+    The inverse of applying ``diff`` is "restore these slots to their
+    current values (or delete if currently absent)." Captures current
+    slot values by deepcopy so the inverse diff is self-contained, and
+    maps absent slots to ``_MISSING`` so the symmetric UNDO<->REDO
+    round-trip re-deletes slots that were added after the partner
+    action.
+    """
+    inverse: Dict[str, Any] = {}
+    for name in diff_keys:
+        current_val = current_application.get(name, _MISSING)
+        if current_val is _MISSING:
+            inverse[name] = _MISSING
+        else:
+            inverse[name] = copy.deepcopy(current_val)
+    return inverse
+
+
 async def reduce_undo(action: Action, state: StateData) -> StateData:
-    """Handle UNDO — pop undo stack, push current app state to redo, restore snapshot."""
-    new_state = copy.deepcopy(state)
+    """Handle UNDO -- pop view's undo stack, apply per-slot diff, push inverse to redo."""
     payload = action["payload"]
 
+    view_id = payload.get("view_id")
     session_id = payload.get("session_id")
-    if not session_id or "sessions" not in new_state or session_id not in new_state["sessions"]:
+    views = state.get("views", {})
+    if not view_id or view_id not in views:
         return state
 
-    session = new_state["sessions"][session_id]
-    undo_stack = session.get("undo_stack", [])
-
+    view = views[view_id]
+    undo_stack = view.get("undo_stack", [])
     if not undo_stack:
         return state
 
-    # Current application state -> redo stack
-    redo_stack = session.get("redo_stack", [])
-    redo_stack.append(copy.deepcopy(new_state.get("application", {})))
+    sessions = state.get("sessions", {})
+    session = sessions.get(session_id) if session_id else None
 
-    # Restore the snapshot from undo stack
-    snapshot = undo_stack.pop()
-    new_state["application"] = snapshot
+    snapshot = undo_stack[-1]
+    new_undo_stack = undo_stack[:-1]
+    undo_diff: Dict[str, Any] = snapshot.get("application_slots", {})
 
-    session["undo_stack"] = undo_stack
-    session["redo_stack"] = redo_stack
+    current_application = state.get("application", {})
+    current_shared = session.get("shared_data", {}) if session else {}
+
+    redo_diff = _build_inverse_diff(current_application, undo_diff.keys())
+    redo_snapshot = {
+        "application_slots": redo_diff,
+        "shared_data": copy.deepcopy(current_shared),
+    }
+    redo_stack = view.get("redo_stack", [])
+    new_redo_stack = [*redo_stack, redo_snapshot]
+
+    new_application = _apply_slot_diff(current_application, undo_diff)
+
+    new_view = {**view, "undo_stack": new_undo_stack, "redo_stack": new_redo_stack}
+    new_state = {
+        **state,
+        "views": {**views, view_id: new_view},
+        "application": new_application,
+    }
+
+    if session is not None:
+        new_session = {**session, "shared_data": snapshot.get("shared_data", {})}
+        new_state["sessions"] = {**sessions, session_id: new_session}
 
     return new_state
 
 
 async def reduce_redo(action: Action, state: StateData) -> StateData:
-    """Handle REDO — pop redo stack, push current app state to undo, restore snapshot."""
-    new_state = copy.deepcopy(state)
+    """Handle REDO -- pop view's redo stack, apply per-slot diff, push inverse to undo."""
     payload = action["payload"]
 
+    view_id = payload.get("view_id")
     session_id = payload.get("session_id")
-    if not session_id or "sessions" not in new_state or session_id not in new_state["sessions"]:
+    views = state.get("views", {})
+    if not view_id or view_id not in views:
         return state
 
-    session = new_state["sessions"][session_id]
-    redo_stack = session.get("redo_stack", [])
-
+    view = views[view_id]
+    redo_stack = view.get("redo_stack", [])
     if not redo_stack:
         return state
 
-    # Current application state -> undo stack
-    undo_stack = session.get("undo_stack", [])
-    undo_stack.append(copy.deepcopy(new_state.get("application", {})))
+    sessions = state.get("sessions", {})
+    session = sessions.get(session_id) if session_id else None
 
-    # Restore the snapshot from redo stack
-    snapshot = redo_stack.pop()
-    new_state["application"] = snapshot
+    snapshot = redo_stack[-1]
+    new_redo_stack = redo_stack[:-1]
+    redo_diff: Dict[str, Any] = snapshot.get("application_slots", {})
 
-    session["undo_stack"] = undo_stack
-    session["redo_stack"] = redo_stack
+    current_application = state.get("application", {})
+    current_shared = session.get("shared_data", {}) if session else {}
+
+    undo_diff = _build_inverse_diff(current_application, redo_diff.keys())
+    undo_snapshot = {
+        "application_slots": undo_diff,
+        "shared_data": copy.deepcopy(current_shared),
+    }
+    undo_stack = view.get("undo_stack", [])
+    new_undo_stack = [*undo_stack, undo_snapshot]
+
+    new_application = _apply_slot_diff(current_application, redo_diff)
+
+    new_view = {**view, "undo_stack": new_undo_stack, "redo_stack": new_redo_stack}
+    new_state = {
+        **state,
+        "views": {**views, view_id: new_view},
+        "application": new_application,
+    }
+
+    if session is not None:
+        new_session = {**session, "shared_data": snapshot.get("shared_data", {})}
+        new_state["sessions"] = {**sessions, session_id: new_session}
 
     return new_state

@@ -7,42 +7,59 @@ Copyright (c) 2024-2026 HollowTheSilver - https://github.com/HollowTheSilver
 # // ========================================( Modules )======================================== // #
 
 
+import logging as _logging
+
+_logging.getLogger(__name__).addHandler(_logging.NullHandler())
+
 from .components.base import StatefulButton, StatefulSelect
-from .components.inputs import Modal, TextInput
-from .components.v1_composition import CompositeComponent, get_component, register_component
-from .components.v1_patterns import (
+from .components.inputs import Checkbox, CheckboxGroup, FileUpload, Modal, RadioGroup, TextInput
+from .components.patterns import (
     ConfirmationButtons,
-    FormLayout,
+    EmojiGrid,
     PaginationControls,
     ProgressBar,
     ToggleGroup,
-)
-from .components.v2_patterns import (
     action_section,
     alert,
+    button_grid,
+    button_row,
     card,
+    confirm_section,
+    cycle_button,
     divider,
+    emoji_grid,
     gallery,
     gap,
     image_section,
     key_value,
+    link_section,
+    progress_bar,
+    stats_card,
+    tab_nav,
+    toggle_button,
     toggle_section,
 )
+from .components.v1_composition import CompositeComponent, get_component, register_component
 from .components.wrappers import with_confirmation, with_cooldown, with_loading_state
-from .devtools import DevToolsCog, InspectorView, StateInspector
+from .devtools import DevToolsCog, InspectorView
 from .state.actions import ActionCreators
 from .state.computed import ComputedValue, computed
-from .state.middleware import DebouncedPersistence, logging_middleware
+from .state.middleware import LoggingMiddleware, PersistenceMiddleware, UndoMiddleware
 
 # Import singleton early to ensure it's available
 from .state.singleton import get_store
+from .state.slots import access_slot, read_slot, slot_property
+from .state.store import StateStore
 from .state.types import StateData
-from .state.undo import UndoMiddleware
+from .views.patterns.types import FormField, FormSchema, WizardSchema, WizardStep
+from .theming.context import get_current_theme
 from .theming.core import Theme, get_default_theme, get_theme, register_theme, set_default_theme
 from .theming.themes import dark_theme, default_theme, light_theme
+from .setup import setup_middleware
 from .utils.decorators import cascade_component, cascade_reducer
 from .utils.errors import safe_execute, with_error_boundary, with_retry
 from .utils.helpers import slugify
+from .utils.logging import setup_logging
 from .utils.tasks import get_task_manager
 from .validation import (
     ValidationResult,
@@ -57,35 +74,90 @@ from .validation import (
 )
 
 # Then import other components that might need the store
-from .views.base import SessionLimitError, StatefulView
-from .views.layout import StatefulLayoutView
-from .views.layout_patterns import TabLayoutView, WizardLayoutView
-from .views.layout_specialized import FormLayoutView, PaginatedLayoutView
-from .views.patterns import TabView, WizardView
-from .views.persistent import PersistentLayoutView, PersistentView, setup_persistence
-from .views.specialized import FormView, PaginatedView
+from .exceptions import (
+    InstanceLimitError,
+    PersistenceConfigError,
+    PersistenceError,
+    PersistenceInitError,
+    PersistenceRehydrateError,
+    PersistenceSchemaError,
+)
+from .views.view import StatefulView
+from .views.layout import DisplayLayoutView, StatefulLayoutView
+from .views.patterns import (
+    FormLayoutView,
+    FormView,
+    LeaderboardLayoutView,
+    MenuLayoutView,
+    MenuView,
+    PaginatedLayoutView,
+    PaginatedView,
+    PersistentLeaderboardLayoutView,
+    TabLayoutView,
+    TabView,
+    WizardLayoutView,
+    WizardView,
+)
+from .persistence import (
+    ApplicationPersistence,
+    Capability,
+    InMemoryBackend,
+    PersistenceBackend,
+    PersistenceManager,
+    RegistryPersistence,
+    SlotPolicy,
+    register_kwargs_migrator,
+    register_migrator,
+)
+from .persistence import __all__ as _persistence_all
+from .views.persistent import PersistentLayoutView, PersistentView
+
+# Optional backend -- only present when aiosqlite is installed
+if "SQLiteBackend" in _persistence_all:
+    from .persistence import SQLiteBackend  # noqa: F401
 
 # // ========================================( Script )======================================== // #
 
 
-__version__ = "2.1.0"
+__version__ = "3.0.0"
 
 # Export public API
 __all__ = [
     # V1 Views
     "StatefulView",
-    "SessionLimitError",
+    "InstanceLimitError",
+    # Persistence exceptions
+    "PersistenceError",
+    "PersistenceConfigError",
+    "PersistenceInitError",
+    "PersistenceSchemaError",
+    "PersistenceRehydrateError",
+    # V1 Views (continued)
     "FormView",
+    "MenuView",
     "PaginatedView",
     "PersistentView",
-    "setup_persistence",
     "TabView",
     "WizardView",
+    # Persistence
+    "PersistenceManager",
+    "PersistenceBackend",
+    "Capability",
+    "InMemoryBackend",
+    "RegistryPersistence",
+    "ApplicationPersistence",
+    "SlotPolicy",
+    "register_kwargs_migrator",
+    "register_migrator",
     # V2 Layout Views
     "StatefulLayoutView",
+    "DisplayLayoutView",
     "PersistentLayoutView",
     "FormLayoutView",
+    "LeaderboardLayoutView",
+    "MenuLayoutView",
     "PaginatedLayoutView",
+    "PersistentLeaderboardLayoutView",
     "TabLayoutView",
     "WizardLayoutView",
     # Components
@@ -94,39 +166,68 @@ __all__ = [
     "CompositeComponent",
     "ConfirmationButtons",
     "PaginationControls",
-    "FormLayout",
     "ToggleGroup",
     "ProgressBar",
     "register_component",
     "get_component",
     # Input Components
     "TextInput",
+    "Checkbox",
+    "CheckboxGroup",
+    "RadioGroup",
+    "FileUpload",
     "Modal",
     # Component Wrappers
     "with_loading_state",
     "with_confirmation",
     "with_cooldown",
-    # V2 Patterns
+    # V2 Cards & Sections
     "card",
     "action_section",
     "toggle_section",
     "image_section",
+    "link_section",
+    "confirm_section",
+    # V2 Buttons & Rows
+    "button_row",
+    "cycle_button",
+    "toggle_button",
+    # V2 Content
     "key_value",
     "alert",
+    "stats_card",
+    "progress_bar",
+    # V2 Separators
     "divider",
     "gap",
+    # V2 Navigation
+    "tab_nav",
+    # V2 Media
     "gallery",
+    # V2 Grids
+    "EmojiGrid",
+    "emoji_grid",
+    "button_grid",
     # State
     "get_store",
+    "StateStore",
     "ActionCreators",
     "StateData",
+    "access_slot",
+    "read_slot",
+    "slot_property",
     # Middleware
-    "DebouncedPersistence",
-    "logging_middleware",
+    "LoggingMiddleware",
+    "PersistenceMiddleware",
     "UndoMiddleware",
     # Computed State
     "computed",
     "ComputedValue",
+    # Typed schemas
+    "FormField",
+    "FormSchema",
+    "WizardStep",
+    "WizardSchema",
     # Validation
     "ValidationResult",
     "validate_field",
@@ -143,9 +244,14 @@ __all__ = [
     "get_theme",
     "set_default_theme",
     "get_default_theme",
+    "get_current_theme",
     "default_theme",
     "dark_theme",
     "light_theme",
+    # Logging
+    "setup_logging",
+    # Middleware install
+    "setup_middleware",
     # Utilities
     "get_task_manager",
     "with_error_boundary",
@@ -155,7 +261,9 @@ __all__ = [
     "cascade_component",
     "slugify",
     # DevTools
-    "StateInspector",
     "InspectorView",
     "DevToolsCog",
 ]
+
+if "SQLiteBackend" in _persistence_all:
+    __all__.append("SQLiteBackend")

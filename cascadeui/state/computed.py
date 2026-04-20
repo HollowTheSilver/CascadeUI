@@ -1,12 +1,19 @@
 # // ========================================( Modules )======================================== // #
 
 
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from .singleton import get_store
 from .types import SelectorFn, StateData
 
 _SENTINEL = object()
+
+# Module-level registry of @computed-decorated functions. Populated at decoration
+# time (module import) so registrations survive store resets: every fresh
+# StateStore seeds its own _computed dict from this registry during __init__.
+# Keyed by function name -> (selector, compute_fn). ComputedValue instances are
+# created per-store (cache is per-store), but the recipe lives here.
+_COMPUTED_REGISTRY: Dict[str, Tuple[SelectorFn, Callable[[Any], Any]]] = {}
 
 
 # // ========================================( Classes )======================================== // #
@@ -17,7 +24,7 @@ class ComputedValue:
 
     Wraps a selector (picks which slice of state to watch) and a compute
     function (transforms that slice into the derived value). On access,
-    the selector output is compared to the last-seen value — if unchanged,
+    the selector output is compared to the last-seen value -- if unchanged,
     the cached result is returned.
     """
 
@@ -58,9 +65,10 @@ def computed(selector: SelectorFn):
     """
 
     def decorator(fn: Callable[[Any], Any]):
+        _COMPUTED_REGISTRY[fn.__name__] = (selector, fn)
         cv = ComputedValue(name=fn.__name__, selector=selector, compute_fn=fn)
         store = get_store()
-        store.register_computed(fn.__name__, cv)
+        store._register_computed(fn.__name__, cv)
         return fn
 
     return decorator

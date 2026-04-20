@@ -108,7 +108,7 @@ class ToggleButton(StatefulButton):
             # Call user callback if provided
             if self.user_callback:
                 await self.user_callback(interaction)
-            else:
+            elif not interaction.response.is_done():
                 await interaction.response.defer()
 
         return toggle_callback

@@ -1,51 +1,72 @@
 name: Bug Report
-description: Report a bug in CascadeUI
+description: Report broken or incorrect behavior in CascadeUI
 labels: ["bug"]
 body:
+  - type: markdown
+    attributes:
+      value: >
+        Thanks for reporting. If you need real-time help, join the
+        [Discord server](https://discord.com/invite/9Xj68BpKRb).
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-report checklist
+      options:
+        - label: I have searched existing issues for duplicates.
+          required: true
+        - label: I am using the latest version of CascadeUI.
+          required: true
+        - label: I have removed any bot tokens or secrets from my snippets.
+          required: true
+
   - type: textarea
     id: description
     attributes:
       label: What happened?
-      description: Describe the bug. What did you expect vs what actually happened?
-      placeholder: "When I call view.push(...), the state doesn't..."
+      description: >
+        Describe the bug. What did you expect to happen vs. what
+        actually happened?
+      placeholder: "When I call view.push(...), the state doesn't carry over to the new view..."
     validations:
       required: true
 
   - type: textarea
     id: reproduce
     attributes:
-      label: Steps to reproduce
-      description: Minimal code snippet or steps that trigger the bug.
+      label: Minimal reproducible example
+      description: >
+        A self-contained code snippet that triggers the bug. The
+        smaller the better. If the bug involves multiple views or
+        cross-view state, include the full view class definitions.
       render: python
     validations:
       required: true
 
-  - type: input
-    id: cascadeui-version
-    attributes:
-      label: CascadeUI version
-      placeholder: "1.0.0"
-    validations:
-      required: true
-
-  - type: input
-    id: discordpy-version
-    attributes:
-      label: discord.py version
-      placeholder: "2.7.1"
-    validations:
-      required: true
-
   - type: dropdown
-    id: python-version
+    id: view-type
     attributes:
-      label: Python version
+      label: View type involved
+      description: Which CascadeUI view type is affected?
       options:
-        - "3.10"
-        - "3.11"
-        - "3.12"
-        - "3.13"
-        - "3.14"
+        - StatefulLayoutView (V2)
+        - DisplayLayoutView (one-shot V2)
+        - StatefulView (V1)
+        - PersistentView / PersistentLayoutView
+        - Pattern view (Tab, Wizard, Form, Paginated, Leaderboard, Menu)
+        - Not view-related (state, persistence, components)
+    validations:
+      required: true
+
+  - type: textarea
+    id: system-info
+    attributes:
+      label: System information
+      description: >
+        Run `python -m cascadeui` and paste the output here. This
+        prints your CascadeUI version, discord.py version, Python
+        version, OS, and installed backends.
+      render: shell
     validations:
       required: true
 
@@ -54,10 +75,26 @@ body:
     attributes:
       label: Log output
       description: >
-        CascadeUI writes logs to `logs/cascadeui-YYYY-MM-DD.log` in your bot's
-        working directory. Paste a short relevant snippet here, or link a
-        GitHub Gist (https://gist.github.com/) for longer logs.
+        CascadeUI is silent by default. If you have called
+        `setup_logging()` in your bot, logs are written to
+        `logs/cascadeui-YYYY-MM-DD.log` in the working directory. Paste
+        relevant entries here, or link a
+        [GitHub Gist](https://gist.github.com/) for longer logs. Include
+        entries from a few seconds before the bug occurred. If logging
+        was not enabled, enable it, reproduce the bug, and attach the
+        captured output.
       render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: traceback
+    attributes:
+      label: Full traceback
+      description: >
+        If the bug produces an exception, paste the complete traceback.
+        Partial tracebacks make bugs much harder to diagnose.
+      render: python
     validations:
       required: false
 
@@ -65,6 +102,8 @@ body:
     id: extra
     attributes:
       label: Additional context
-      description: Anything else that might help (tracebacks, screenshots, etc.)
+      description: >
+        Anything else that might help: screenshots of the Discord UI,
+        related issues, workarounds you have tried, etc.
     validations:
       required: false

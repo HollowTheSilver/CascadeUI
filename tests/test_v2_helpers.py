@@ -4,18 +4,34 @@
 import discord
 import pytest
 from discord.components import MediaGalleryItem
-from discord.ui import Container, MediaGallery, Section, Separator, TextDisplay, Thumbnail
+from discord.ui import (
+    ActionRow,
+    Container,
+    MediaGallery,
+    Section,
+    Separator,
+    TextDisplay,
+    Thumbnail,
+)
 
 from cascadeui import (
     StatefulButton,
     action_section,
     alert,
+    button_row,
     card,
+    confirm_section,
+    cycle_button,
     divider,
     gallery,
     gap,
     image_section,
     key_value,
+    link_section,
+    progress_bar,
+    stats_card,
+    tab_nav,
+    toggle_button,
     toggle_section,
 )
 
@@ -23,6 +39,7 @@ from cascadeui import (
 
 
 class TestCard:
+    """card() wraps content in a Container with accent color and auto-wrapped strings."""
     def test_returns_container(self):
         result = card("Title")
         assert isinstance(result, Container)
@@ -64,6 +81,7 @@ class TestCard:
 
 
 class TestActionSection:
+    """action_section() creates a Section with a StatefulButton accessory."""
     def _noop(self, interaction):
         pass
 
@@ -103,6 +121,7 @@ class TestActionSection:
 
 
 class TestToggleSection:
+    """toggle_section() creates a Section with a green/red toggle button."""
     def _noop(self, interaction):
         pass
 
@@ -142,6 +161,7 @@ class TestToggleSection:
 
 
 class TestImageSection:
+    """image_section() creates a Section with a Thumbnail accessory."""
     def test_returns_section_with_thumbnail(self):
         result = image_section("text", url="https://example.com/img.png")
         assert isinstance(result, Section)
@@ -160,6 +180,7 @@ class TestImageSection:
 
 
 class TestKeyValue:
+    """key_value() renders a dict as bold-key: value TextDisplay lines."""
     def test_returns_text_display(self):
         result = key_value({"A": 1})
         assert isinstance(result, TextDisplay)
@@ -182,6 +203,7 @@ class TestKeyValue:
 
 
 class TestAlert:
+    """alert() creates a colored Container with status-themed accent."""
     def test_returns_container(self):
         result = alert("message")
         assert isinstance(result, Container)
@@ -218,6 +240,7 @@ class TestAlert:
 
 
 class TestSeparators:
+    """divider() and gap() produce Separator components with correct spacing."""
     def test_divider_is_visible(self):
         result = divider()
         assert isinstance(result, Separator)
@@ -257,6 +280,7 @@ class TestSeparators:
 
 
 class TestGallery:
+    """gallery() creates a MediaGallery from one or more URLs."""
     def test_returns_media_gallery(self):
         result = gallery("https://example.com/a.png")
         assert isinstance(result, MediaGallery)
@@ -278,11 +302,256 @@ class TestGallery:
         assert result.items[0].description == "First"
         assert result.items[1].description is None
 
-    def test_partial_descriptions(self):
-        result = gallery(
-            "https://example.com/a.png",
-            "https://example.com/b.png",
-            descriptions=["Only first"],
+    def test_length_mismatch_raises(self):
+        """Descriptions length must match URLs exactly — fail loud like emoji_grid."""
+        with pytest.raises(ValueError, match="descriptions length"):
+            gallery(
+                "https://example.com/a.png",
+                "https://example.com/b.png",
+                descriptions=["Only first"],
+            )
+
+
+# // ========================================( 7.8b — additive helpers )======================================== // #
+
+
+async def _noop(interaction):
+    pass
+
+
+async def _noop_with_value(interaction, value):
+    pass
+
+
+class TestToggleSectionEmoji:
+    """L4 — toggle_section gains emoji kwarg for parity with action_section."""
+
+    def test_emoji_kwarg_passthrough(self):
+        result = toggle_section("Lights", active=True, callback=_noop, emoji="\U0001f4a1")
+        assert isinstance(result, Section)
+        # Emoji lives on the accessory button.
+        button = result.accessory
+        assert button.emoji is not None
+
+
+class TestLinkSection:
+    """C1 — Section with link-style Button accessory."""
+
+    def test_returns_section(self):
+        result = link_section("Docs", label="Open", url="https://example.com")
+        assert isinstance(result, Section)
+
+    def test_accessory_is_link_button(self):
+        result = link_section("Docs", label="Open", url="https://example.com")
+        assert result.accessory.style == discord.ButtonStyle.link
+        assert result.accessory.url == "https://example.com"
+
+    def test_emoji_passthrough(self):
+        result = link_section("Docs", label="Open", url="https://example.com", emoji="\U0001f4d6")
+        assert result.accessory.emoji is not None
+
+
+class TestConfirmSection:
+    """C3 — returns [TextDisplay, ActionRow] for splat-into-card composition."""
+
+    def test_returns_list_of_two(self):
+        result = confirm_section("Sure?", on_confirm=_noop, on_cancel=_noop)
+        assert isinstance(result, list)
+        assert len(result) == 2
+        assert isinstance(result[0], TextDisplay)
+        assert isinstance(result[1], ActionRow)
+
+    def test_confirm_button_is_success(self):
+        result = confirm_section("Sure?", on_confirm=_noop, on_cancel=_noop)
+        buttons = list(result[1].children)
+        assert buttons[0].style == discord.ButtonStyle.success
+        assert buttons[1].style == discord.ButtonStyle.danger
+
+    def test_custom_labels(self):
+        result = confirm_section(
+            "Delete server?",
+            on_confirm=_noop,
+            on_cancel=_noop,
+            confirm_label="Delete",
+            cancel_label="Keep",
         )
-        assert result.items[0].description == "Only first"
-        assert result.items[1].description is None
+        buttons = list(result[1].children)
+        assert buttons[0].label == "Delete"
+        assert buttons[1].label == "Keep"
+
+
+class TestButtonRow:
+    """C2 — dict shorthand for an ActionRow of same-style buttons."""
+
+    def test_returns_action_row(self):
+        result = button_row({"Save": _noop, "Cancel": _noop})
+        assert isinstance(result, ActionRow)
+        assert len(list(result.children)) == 2
+
+    def test_preserves_dict_order(self):
+        result = button_row({"A": _noop, "B": _noop, "C": _noop})
+        labels = [b.label for b in result.children]
+        assert labels == ["A", "B", "C"]
+
+    def test_shared_style(self):
+        result = button_row({"Go": _noop, "Stop": _noop}, style=discord.ButtonStyle.primary)
+        for b in result.children:
+            assert b.style == discord.ButtonStyle.primary
+
+    def test_empty_raises(self):
+        with pytest.raises(ValueError, match="must not be empty"):
+            button_row({})
+
+    def test_overflow_raises(self):
+        with pytest.raises(ValueError, match="5-per-ActionRow"):
+            button_row({str(i): _noop for i in range(6)})
+
+
+class TestCycleButton:
+    """C4 — first stateful v2 helper; index tracked on instance."""
+
+    def test_returns_stateful_button(self):
+        btn = cycle_button(values=["Low", "Med", "High"], on_change=_noop_with_value)
+        assert isinstance(btn, StatefulButton)
+
+    def test_initial_label_matches_start(self):
+        btn = cycle_button(values=["Low", "Med", "High"], on_change=_noop_with_value, start=1)
+        assert btn.label == "Med"
+        assert btn._cycle_index == 1
+
+    def test_custom_labels(self):
+        btn = cycle_button(
+            values=[1, 2, 3],
+            labels=["One", "Two", "Three"],
+            on_change=_noop_with_value,
+        )
+        assert btn.label == "One"
+
+    def test_labels_length_mismatch_raises(self):
+        with pytest.raises(ValueError, match="labels length"):
+            cycle_button(values=[1, 2, 3], labels=["A", "B"], on_change=_noop_with_value)
+
+    def test_empty_values_raises(self):
+        with pytest.raises(ValueError, match="must not be empty"):
+            cycle_button(values=[], on_change=_noop_with_value)
+
+    def test_out_of_range_start_raises(self):
+        with pytest.raises(ValueError, match="out of range"):
+            cycle_button(values=[1, 2], on_change=_noop_with_value, start=5)
+
+
+class TestToggleButton:
+    """C5 — standalone boolean toggle, distinct from toggle_section."""
+
+    def test_active_initial_state(self):
+        btn = toggle_button(active=True, on_toggle=_noop_with_value)
+        assert btn._toggle_active is True
+        assert btn.style == discord.ButtonStyle.success
+        assert btn.label == "Enabled"
+
+    def test_inactive_initial_state(self):
+        btn = toggle_button(active=False, on_toggle=_noop_with_value)
+        assert btn._toggle_active is False
+        assert btn.style == discord.ButtonStyle.danger
+        assert btn.label == "Disabled"
+
+    def test_custom_labels(self):
+        btn = toggle_button(active=True, on_toggle=_noop_with_value, labels=("Dark", "Light"))
+        assert btn.label == "Dark"
+
+
+class TestStatsCard:
+    """C6 — Container composition of heading + divider + key_value."""
+
+    def test_returns_container(self):
+        result = stats_card("Stats", {"Members": 5})
+        assert isinstance(result, Container)
+
+    def test_auto_heading_prefix(self):
+        result = stats_card("Server Info", {"Members": 5})
+        # First child should be a TextDisplay containing "## Server Info"
+        first = list(result.children)[0]
+        assert isinstance(first, TextDisplay)
+        assert "## Server Info" in first.content
+
+    def test_pre_formatted_heading_preserved(self):
+        result = stats_card("### Small Heading", {"Members": 5})
+        first = list(result.children)[0]
+        assert first.content == "### Small Heading"
+
+    def test_footer_appended(self):
+        result = stats_card("Stats", {"K": 1}, footer="Updated now")
+        last = list(result.children)[-1]
+        assert isinstance(last, TextDisplay)
+        assert "-# Updated now" in last.content
+
+    def test_no_footer_by_default(self):
+        result = stats_card("Stats", {"K": 1})
+        children = list(result.children)
+        # heading, divider, key_value → 3 children
+        assert len(children) == 3
+
+
+class TestProgressBar:
+    """C7 — text-based progress bar as TextDisplay."""
+
+    def test_returns_text_display(self):
+        result = progress_bar(5, 10)
+        assert isinstance(result, TextDisplay)
+
+    def test_percent_default(self):
+        result = progress_bar(7, 10, width=10)
+        assert "70%" in result.content
+
+    def test_hide_percent(self):
+        result = progress_bar(7, 10, show_percent=False)
+        assert "%" not in result.content
+
+    def test_clamp_overshoot(self):
+        result = progress_bar(15, 10, width=5)
+        assert "100%" in result.content
+
+    def test_clamp_undershoot(self):
+        result = progress_bar(-5, 10, width=5)
+        assert "0%" in result.content
+
+    def test_zero_max_raises(self):
+        with pytest.raises(ValueError, match="max_value must be positive"):
+            progress_bar(5, 0)
+
+    def test_zero_width_raises(self):
+        with pytest.raises(ValueError, match="width must be positive"):
+            progress_bar(5, 10, width=0)
+
+
+class TestTabNav:
+    """C8 — ActionRow of tab-styled buttons for manual-control views."""
+
+    def test_returns_action_row(self):
+        result = tab_nav({"A": _noop, "B": _noop})
+        assert isinstance(result, ActionRow)
+
+    def test_first_tab_active_by_default(self):
+        result = tab_nav({"A": _noop, "B": _noop})
+        buttons = list(result.children)
+        assert buttons[0].style == discord.ButtonStyle.primary
+        assert buttons[1].style == discord.ButtonStyle.secondary
+
+    def test_explicit_active(self):
+        result = tab_nav({"A": _noop, "B": _noop, "C": _noop}, active="B")
+        buttons = list(result.children)
+        assert buttons[0].style == discord.ButtonStyle.secondary
+        assert buttons[1].style == discord.ButtonStyle.primary
+        assert buttons[2].style == discord.ButtonStyle.secondary
+
+    def test_unknown_active_raises(self):
+        with pytest.raises(ValueError, match="not a key"):
+            tab_nav({"A": _noop}, active="X")
+
+    def test_empty_raises(self):
+        with pytest.raises(ValueError, match="must not be empty"):
+            tab_nav({})
+
+    def test_overflow_raises(self):
+        with pytest.raises(ValueError, match="5-per-ActionRow"):
+            tab_nav({str(i): _noop for i in range(6)})

@@ -17,15 +17,11 @@ Theme(name, styles=None)
 | `secondary_color` | `discord.Color` | `Color.light_grey()` |
 | `success_color` | `discord.Color` | `Color.green()` |
 | `danger_color` | `discord.Color` | `Color.red()` |
-| `info_color` | `discord.Color` | varies by theme |
-| `warning_color` | `discord.Color` | varies by theme |
-| `header_emoji` | `str` | `""` |
-| `footer_text` | `str` | `""` |
 | `accent_colour` | `discord.Color` | same as `primary_color` |
 | `separator_spacing` | `str` | `"small"` |
-| `button_styles` | `dict` | Maps `"primary"`, `"secondary"`, `"success"`, `"danger"`, `"link"` to matching `ButtonStyle` |
 
-Additional properties can be set freely via the `styles` dict.
+Additional properties can be set freely via the `styles` dict (e.g.
+`header_emoji`, `footer_text`, or custom keys).
 
 ### Instance Attributes
 
@@ -56,16 +52,6 @@ Applies the theme to a V2 `Container`:
 
 **Returns:** The modified container.
 
-#### `create_button(label, button_type="primary", **kwargs)`
-
-Creates a `StatefulButton` styled according to the theme's `button_styles` mapping.
-
-- `label` (str): Button label
-- `button_type` (str): Key into `button_styles` (e.g., `"primary"`, `"danger"`)
-- `**kwargs`: Passed through to `StatefulButton` (e.g., `callback`, `custom_id`, `row`)
-
-**Returns:** A `StatefulButton` instance.
-
 ---
 
 ## Functions
@@ -86,14 +72,23 @@ Sets the global default theme. Returns `True` if the theme exists, `False` other
 
 Returns the current default `Theme` instance, or `None` if no default is set.
 
+### `get_current_theme()`
+
+Returns the `Theme` active in the current execution context. Inside a view's
+`build_ui()` method, returns the view's theme. Outside a view context, returns
+`None`.
+
+Builder functions like `card()` and `stats_card()` call this internally as a
+fallback when no explicit `color=` is passed.
+
 ---
 
 ## Built-in Themes
 
 All three are auto-registered on import. `"default"` is set as the default theme.
 
-| Name | Primary Color | Accent Colour | Header Emoji | Footer Text |
-|------|--------------|---------------|--------------|-------------|
-| `default` | Blue | Blue | *(none)* | "Powered by CascadeUI" |
-| `dark` | Purple | Purple | Moon | "Powered by CascadeUI (Dark Theme)" |
-| `light` | Gold | Gold | Sun | "Powered by CascadeUI (Light Theme)" |
+| Name | Primary Color | Accent Colour | Header Emoji |
+|------|--------------|---------------|--------------|
+| `default` | Blue | Blue | *(none)* |
+| `dark` | Purple | Purple | Moon |
+| `light` | Gold | Gold | Sun |

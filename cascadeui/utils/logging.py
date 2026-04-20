@@ -142,7 +142,7 @@ class FormatTemplate:
         "[$ts${asctime}$r$] [$lvl${levelname:<8}$r$] "
         "[$fn${funcName:^21}$r$] $name${name}$r$ {message}"
     )
-    file_fmt: str = "[{asctime}] [{levelname:<8}] [{funcName:^21}] {name}   {message}"
+    file_fmt: str = "[{asctime}] [{levelname:<8}] [{funcName:^21}] [{name}] {message}"
     datefmt: str = "%Y-%m-%d %H:%M:%S"
     capitalize_module: bool = True
 
@@ -152,7 +152,7 @@ FORMAT_TEMPLATES: dict[str, FormatTemplate] = {
     "default": FormatTemplate(),
     "minimal": FormatTemplate(
         stream_fmt="$lvl${levelname:<8}$r$ $name${name}$r$  {message}",
-        file_fmt="{levelname:<8} {name}  {message}",
+        file_fmt="[{levelname:<8}] [{name}] {message}",
     ),
     "detailed": FormatTemplate(
         stream_fmt=(
@@ -161,7 +161,7 @@ FORMAT_TEMPLATES: dict[str, FormatTemplate] = {
             "({filename}:{lineno}) {message}"
         ),
         file_fmt=(
-            "[{asctime}] [{levelname:<8}] [{funcName:^21}] {name}   "
+            "[{asctime}] [{levelname:<8}] [{funcName:^21}] [{name}] "
             "({filename}:{lineno}) {message}"
         ),
     ),
@@ -302,15 +302,15 @@ class AsyncLogger(Logger):
 
     Three levels of customization:
 
-    **Quick** — pick a preset by name::
+    **Quick** -- pick a preset by name::
 
         logger = AsyncLogger("myapp", colors="ocean", template="minimal")
 
-    **Medium** — pass custom scheme / template objects::
+    **Medium** -- pass custom scheme / template objects::
 
         logger = AsyncLogger("myapp", colors=ColorScheme(info="\\x1b[36;1m"))
 
-    **Full** — supply your own ``Formatter`` instances::
+    **Full** -- supply your own ``Formatter`` instances::
 
         logger = AsyncLogger("myapp", stream_formatter=MyFormatter())
 
@@ -325,7 +325,7 @@ class AsyncLogger(Logger):
         max_files:         Maximum log files to keep before purging.
         propagate:         Whether to propagate to parent loggers.
         mode:              File open mode (``"a"`` = append, ``"w"`` = overwrite).
-        prefix:            Filename prefix — e.g. ``"cascadeui"`` → ``cascadeui-2026-03-16.log``.
+        prefix:            Filename prefix -- e.g. ``"cascadeui"`` → ``cascadeui-2026-03-16.log``.
         colors:            ``ColorScheme`` instance or preset name (``"default"``,
                            ``"ocean"``, ``"forest"``, ``"none"``).
         template:          ``FormatTemplate`` instance or preset name (``"default"``,
@@ -336,10 +336,10 @@ class AsyncLogger(Logger):
                            ``template`` for the file handler.
     """
 
-    # \\ singleton registry — same name always returns the same instance
+    # \\ singleton registry -- same name always returns the same instance
     _instances: dict[str, "AsyncLogger"] = {}
 
-    # \\ shared queue — all loggers push here, one listener drains it
+    # \\ shared queue -- all loggers push here, one listener drains it
     _queue: queue.Queue | None = None
     _listener: QueueListener | None = None
 
@@ -435,7 +435,7 @@ class AsyncLogger(Logger):
             atexit.register(AsyncLogger.shutdown)
             AsyncLogger._atexit_registered = True
 
-        # \\ one-time log cleanup on init — only for this prefix
+        # \\ one-time log cleanup on init -- only for this prefix
         if file and self.max_files > 0:
             self._purge_old_logs()
 
@@ -475,7 +475,7 @@ class AsyncLogger(Logger):
 
         Only targets files matching this logger's prefix pattern (e.g.
         ``cascadeui-*.log``), so other log files in the same directory
-        are never touched. Called once during ``__init__`` — no background
+        are never touched. Called once during ``__init__`` -- no background
         tasks or event loop required.
         """
         try:
@@ -534,3 +534,159 @@ class AsyncLogger(Logger):
             self.file_name = new_name
             if hasattr(self, "_file_handler"):
                 self._file_handler.baseFilename = f"{self.log_dir}/{new_name}"
+
+
+# // ========================================( Setup )======================================== // #
+
+
+def setup_logging(
+    *,
+    level: Union[int, str] = logging.INFO,
+    actions: bool = True,
+    file: bool = True,
+    stream: bool = True,
+    trace: bool = False,
+    path: str = "logs",
+    max_files: int = 10,
+    prefix: str = "cascadeui",
+    mode: str = "a",
+    encoding: str = "utf-8",
+    colors: Union[ColorScheme, str, None] = None,
+    template: Union[FormatTemplate, str, None] = None,
+    stream_formatter: Optional[Formatter] = None,
+    file_formatter: Optional[Formatter] = None,
+    handler: Optional[Handler] = None,
+) -> None:
+    """Configure logging for the ``cascadeui`` library.
+
+    Attaches handlers to the ``"cascadeui"`` logger so all library modules
+    produce output. Without calling this, CascadeUI is silent.
+
+    Quick start::
+
+        from cascadeui import setup_logging
+        setup_logging()
+
+    Custom level and color scheme::
+
+        setup_logging(level="WARNING", colors="ocean")
+
+    Disable file output::
+
+        setup_logging(file=False)
+
+    Enable ViewStore dispatch tracing::
+
+        setup_logging(level="DEBUG", trace=True)
+
+    Bring your own handler::
+
+        setup_logging(handler=my_handler, level="DEBUG")
+
+    Standard Python control still works after setup::
+
+        logging.getLogger("cascadeui").setLevel(logging.WARNING)
+        logging.getLogger("cascadeui.state.store").setLevel(logging.DEBUG)
+
+    Action dispatch logging is installed automatically (``actions=True`` by
+    default). Set ``actions=False`` to suppress the action stream in production
+    deployments that only want library-level logs::
+
+        setup_logging(level="INFO", actions=False)
+
+    Args:
+        level:             Log level for the ``"cascadeui"`` logger.
+        actions:           Auto-install ``LoggingMiddleware`` so every
+                           dispatched action is logged to
+                           ``"cascadeui.actions"``. Default ``True``.
+        file:              Whether to write to a date-stamped log file.
+        stream:            Whether to write colored output to the console.
+        trace:             Install the ViewStore dispatch-miss tracer. Wraps
+                           discord.py's ``ViewStore.dispatch_view`` to log
+                           the full dispatch table when an interaction
+                           targets a stale item. Intended for debugging
+                           "View interaction referencing unknown view" errors.
+        path:              Directory for log files.
+        max_files:         Maximum log files before old ones are purged.
+        prefix:            Filename prefix (e.g. ``"cascadeui"`` produces
+                           ``cascadeui-2026-04-16.log``).
+        mode:              File open mode (``"a"`` = append, ``"w"`` = overwrite).
+        encoding:          Log file encoding.
+        colors:            ``ColorScheme`` instance or preset name.
+        template:          ``FormatTemplate`` instance or preset name.
+        stream_formatter:  Custom ``Formatter`` for console output.
+        file_formatter:    Custom ``Formatter`` for file output.
+        handler:           A pre-built handler to attach directly. When provided,
+                           ``file``, ``stream``, ``colors``, ``template``,
+                           ``stream_formatter``, and ``file_formatter`` are ignored.
+    """
+    root_logger = logging.getLogger("cascadeui")
+
+    if isinstance(level, str):
+        level = getattr(logging, level.upper(), logging.INFO)
+    root_logger.setLevel(level)
+
+    if handler is not None:
+        root_logger.addHandler(handler)
+        if trace:
+            from ..tracing import _install_viewstore_trace
+            _install_viewstore_trace()
+        return
+
+    if stream:
+        resolved_stream_fmt = stream_formatter or ColoredStreamFormatter(
+            colors=colors, template=template
+        )
+        sh = StreamHandler(sys.stdout)
+        sh.setFormatter(resolved_stream_fmt)
+        root_logger.addHandler(sh)
+
+    if file:
+        resolved_file_fmt = file_formatter or FileFormatter(template=template)
+        date = str(datetime.now().date())
+        filename = f"{prefix}-{date}.log" if prefix else f"{date}.log"
+        os.makedirs(path, exist_ok=True)
+        fh = FileHandler(
+            filename=f"{path}/{filename}", encoding=encoding, mode=mode
+        )
+        fh.setFormatter(resolved_file_fmt)
+        root_logger.addHandler(fh)
+
+        if max_files > 0:
+            _purge_old_log_files(path, prefix, max_files)
+
+    if trace:
+        from ..tracing import _install_viewstore_trace
+        _install_viewstore_trace()
+
+    if actions:
+        from ..state.middleware import LoggingMiddleware
+        from ..state.singleton import get_store
+
+        store = get_store()
+        if not store.has_middleware(LoggingMiddleware):
+            store._add_middleware(LoggingMiddleware())
+
+
+def _purge_old_log_files(log_dir: str, prefix: Optional[str], max_files: int) -> None:
+    """Remove oldest log files when count exceeds max_files."""
+    try:
+        all_files = os.listdir(log_dir)
+    except OSError:
+        return
+
+    if prefix:
+        matching = [f for f in all_files if f.startswith(prefix) and f.endswith(".log")]
+    else:
+        matching = [f for f in all_files if f.endswith(".log")]
+
+    if len(matching) <= max_files:
+        return
+
+    matching_paths = [os.path.join(log_dir, f) for f in matching]
+    matching_paths.sort(key=os.path.getctime)
+    for filepath in matching_paths[:-max_files]:
+        try:
+            os.unlink(filepath)
+        except (PermissionError, OSError):
+            pass

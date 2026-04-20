@@ -83,3 +83,14 @@ credentials.*
 *.pem
 cascadeui_state.json
 *_state.json
+
+# Persistence Backend Artifacts
+# SQLiteBackend emits three files in WAL mode: the main .db, plus -shm / -wal
+# sidecars. The scaffold in CONTRIBUTING.md uses cascadeui.db by name, so any
+# contributor running the dev bot drops these in the working tree.
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+*.sqlite
+*.sqlite3

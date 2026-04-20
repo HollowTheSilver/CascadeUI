@@ -10,8 +10,8 @@ def reset_state_store():
     The store is cached in two places: StateStore._instance (class-level)
     and singleton._store_instance (module-level). Both must be cleared.
     """
-    from cascadeui.state.store import StateStore
     from cascadeui.state import singleton
+    from cascadeui.state.store import StateStore
 
     StateStore._instance = None
     singleton._store_instance = None

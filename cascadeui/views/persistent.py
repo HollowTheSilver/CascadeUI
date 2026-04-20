@@ -2,55 +2,62 @@
 
 
 import re
-from typing import Any, Dict, List, Optional
+from typing import Dict
 
 import discord
-from discord.ui import ActionRow
+
+import logging
 
 from ..state.actions import ActionCreators
-from ..state.singleton import get_store
-from ..utils.logging import AsyncLogger
-from .base import StatefulView
+from .view import StatefulView
 from .layout import StatefulLayoutView
 
-logger = AsyncLogger(name=__name__, level="DEBUG", path="logs", mode="a", prefix="cascadeui")
+logger = logging.getLogger(__name__)
 
 
 # // ========================================( Registry )======================================== // #
 
 
-# Maps class name -> class for all PersistentView subclasses
+# Maps fully-qualified class path (module.QualName) -> class for all PersistentView subclasses.
+# The qualified key prevents cross-module collisions when two unrelated cogs define a class
+# with the same bare name (e.g. ``TicketPanel`` in two different bots).
 _persistent_view_classes: Dict[str, type] = {}
 
 
-# // ========================================( Classes )======================================== // #
+# // ========================================( Mixin )======================================== // #
 
 
-class PersistentView(StatefulView):
-    """A view that survives bot restarts by re-attaching to its original message.
+class _PersistentMixin:
+    """Shared machinery for PersistentView and PersistentLayoutView.
 
-    Subclass this instead of StatefulView for long-lived UI like role selectors,
-    ticket panels, or dashboards that should stay interactive indefinitely.
+    V1 and V2 persistent views share ~90% of their behavior: subclass
+    auto-registration, timeout coercion, persistence_key validation, duplicate-
+    key cleanup, exit dispatch, and the restore hook. The only genuine
+    divergences are captured as hook methods:
 
-    Requirements:
-        - Must provide a ``state_key`` at init (used to track the view in state).
-        - All components must have an explicit ``custom_id`` (discord.py requirement
-          for persistent views).
-        - ``timeout`` is forced to ``None`` so the view never expires.
-
-    After sending, the view's message location is saved to state. On bot restart,
-    call ``setup_persistence(bot)`` in ``setup_hook`` to re-attach all
-    registered views automatically.
+    - ``_iter_persistent_items``: V1 walks ``self.children``, V2 walks
+      ``self.walk_children()``.
+    - ``_cleanup_orphan_message``: V1 calls ``edit(view=None)``, V2 calls
+      ``delete()`` because V2 messages ARE their components.
     """
 
     # Persistent views are typically shared panels (role selectors, dashboards)
     owner_only: bool = False
     _persistent: bool = True
 
+    # Bump in subclasses when ``__init__`` signature changes, and register
+    # a matching ``register_kwargs_migrator`` to upgrade stored rows from
+    # the previous version. Rows whose stored version is lower than this
+    # with no registered migrator are logged and skipped on rehydrate.
+    kwargs_schema_version: int = 1
+
+    # discord.py auto-generates custom_ids as 32-char hex strings (os.urandom(16).hex())
+    _AUTO_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+
     def __init_subclass__(cls, **kwargs):
         """Auto-register every concrete subclass so restore can find it by name."""
         super().__init_subclass__(**kwargs)
-        _persistent_view_classes[cls.__name__] = cls
+        _persistent_view_classes[cls._class_session_key()] = cls
 
     def __init__(self, *args, **kwargs):
         # Persistent views never time out
@@ -58,17 +65,171 @@ class PersistentView(StatefulView):
 
         super().__init__(*args, **kwargs)
 
-        if self._state_key is None:
+        if self._persistence_key is None:
             raise ValueError(
-                f"{self.__class__.__name__} requires a 'state_key' argument. "
+                f"{self.__class__.__name__} requires a 'persistence_key' argument. "
                 "Persistent views need a stable key to track their message across restarts."
             )
 
-    # discord.py auto-generates custom_ids as 32-char hex strings (os.urandom(16).hex())
-    _AUTO_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+    def _iter_persistent_items(self):
+        """Iterable of items to validate for custom_id presence.
+
+        Subclasses override to use the appropriate traversal for their
+        component model. V1 uses flat ``self.children``; V2 uses
+        ``self.walk_children()`` to descend into Containers and ActionRows.
+        """
+        return self.children
 
     def _validate_custom_ids(self):
-        """Ensure every component has an explicit (non-auto-generated) custom_id."""
+        """Ensure every interactive component has an explicit custom_id.
+
+        Non-interactive items (Container, TextDisplay, Separator) have
+        ``custom_id=None`` and are intentionally skipped -- only items
+        with a discord.py auto-generated ID (32-char hex) indicate a
+        missing explicit custom_id.
+        """
+        for item in self._iter_persistent_items():
+            custom_id = getattr(item, "custom_id", None)
+            if custom_id is None:
+                # V1 treats None as an error; V2 treats None as non-interactive.
+                # The V1 override handles the stricter check before calling super.
+                continue
+            if self._AUTO_ID_PATTERN.match(custom_id):
+                raise ValueError(
+                    f"Component {item!r} in {self.__class__.__name__} is missing a custom_id. "
+                    "All interactive components in a persistent view must have an explicit "
+                    "custom_id so discord.py can re-attach them after a restart."
+                )
+
+    async def _cleanup_orphan_message(self, old_message):
+        """Clean up a stale message left by a previous instance of this persistence_key.
+
+        V1 calls ``edit(view=None)`` (strips buttons, keeps embed/content).
+        V2 calls ``delete()`` because V2 messages ARE their components  -- 
+        ``edit(view=None)`` would produce an empty message (Discord error 50006).
+        """
+        await old_message.edit(view=None)
+
+    async def _register_persistent(self, message) -> None:
+        """Perform duplicate-key cleanup and dispatch PERSISTENT_VIEW_REGISTERED.
+
+        Called by subclass ``send()`` implementations after the message
+        has been successfully sent through the View/LayoutView pipeline.
+        """
+        # If this persistence_key already has a registered view/message, clean up the old
+        # one to prevent orphaned views and messages.
+        registry = self.state_store.state.get("persistent_views", {})
+        existing = registry.get(self.persistence_key)
+        if existing and existing.get("message_id") != str(message.id):
+            # Try to exit the old view instance if it's still alive in this process.
+            # exit() handles the full cleanup: unsubscribe, unregister, disable
+            # components on the message, and dispatch VIEW_DESTROYED.
+            old_view_exited = False
+            for vid, old_view in list(self.state_store._active_views.items()):
+                if (
+                    getattr(old_view, "_persistence_key", None) == self.persistence_key
+                    and old_view.id != self.id
+                ):
+                    await old_view.exit()
+                    old_view_exited = True
+                    logger.info(f"Exited previous view instance for persistence_key '{self.persistence_key}'")
+                    break
+
+            # If the old view wasn't alive (e.g. from a previous bot session that
+            # wasn't restored), fall back to message-only cleanup.
+            if not old_view_exited:
+                old_msg_id = existing["message_id"]
+                old_ch_id = existing["channel_id"]
+                bot = getattr(self.context, "bot", None) or getattr(
+                    self.interaction, "client", None
+                )
+                if bot:
+                    try:
+                        old_channel = bot.get_channel(int(old_ch_id))
+                        if old_channel and isinstance(old_channel, discord.abc.Messageable):
+                            old_message = await old_channel.fetch_message(int(old_msg_id))
+                            await self._cleanup_orphan_message(old_message)
+                            logger.info(
+                                f"Cleaned up previous message {old_msg_id} for "
+                                f"persistence_key '{self.persistence_key}'"
+                            )
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        pass  # Old message already gone, nothing to clean up
+                    except Exception as e:
+                        logger.debug(
+                            f"Could not clean up previous message for '{self.persistence_key}': {e}"
+                        )
+
+        # Record this view in the persistent registry
+        guild_id = None
+        if message.guild:
+            guild_id = str(message.guild.id)
+
+        payload = ActionCreators.persistent_view_registered(
+            persistence_key=self.persistence_key,
+            class_name=type(self)._class_session_key(),
+            message_id=str(message.id),
+            channel_id=str(message.channel.id),
+            guild_id=guild_id,
+            user_id=str(self.user_id) if self.user_id else None,
+        )
+        await self.dispatch("PERSISTENT_VIEW_REGISTERED", payload)
+
+    async def exit(self, delete_message: bool | None = None):
+        """Exit the view and remove it from the persistent registry."""
+        # Unregister before cleanup so the state dispatch still works
+        payload = ActionCreators.persistent_view_unregistered(self.persistence_key)
+        await self.dispatch("PERSISTENT_VIEW_UNREGISTERED", payload)
+
+        return await super().exit(delete_message=delete_message)
+
+    async def on_restore(self, bot):
+        """Called after the view is reconstructed on bot restart.
+
+        Override this to perform post-restore setup like fetching fresh data
+        or updating the embed. The view's ``_message`` is already set when
+        this is called.
+
+        .. warning::
+            If this method raises an exception, the view will be unregistered
+            from CascadeUI's state system but will remain in discord.py's
+            internal view store (there is no public API to remove it). Avoid
+            raising from this method unless recovery is not possible.
+
+        Args:
+            bot: The discord.py Bot instance.
+        """
+        pass
+
+
+# // ========================================( Classes )======================================== // #
+
+
+class PersistentView(_PersistentMixin, StatefulView):
+    """A view that survives bot restarts by re-attaching to its original message.
+
+    Subclass this instead of StatefulView for long-lived UI like role selectors,
+    ticket panels, or dashboards that should stay interactive indefinitely.
+
+    Requirements:
+        - Must provide a ``persistence_key`` at init (used to track the view in state).
+        - All components must have an explicit ``custom_id`` (discord.py requirement
+          for persistent views).
+        - ``timeout`` is forced to ``None`` so the view never expires.
+
+    After sending, the view's message location is saved to state. On bot
+    restart, :class:`~cascadeui.state.middleware.PersistenceMiddleware`
+    constructed with ``bot=self`` re-attaches every registered view during
+    its ``initialize`` pass when passed to
+    :func:`~cascadeui.setup_middleware` from ``setup_hook``.
+    """
+
+    def _validate_custom_ids(self):
+        """V1 override: every child must have an explicit custom_id.
+
+        V1 views are flat -- all children are interactive components, so
+        ``None`` indicates a missing id, not a non-interactive container.
+        """
         for item in self.children:
             custom_id = getattr(item, "custom_id", None)
             if custom_id is None or self._AUTO_ID_PATTERN.match(custom_id):
@@ -93,143 +254,28 @@ class PersistentView(StatefulView):
         if message is None:
             return message
 
-        # If this state_key already has a registered view/message, clean up the old
-        # one to prevent orphaned views and messages.
-        registry = self.state_store.state.get("persistent_views", {})
-        existing = registry.get(self.state_key)
-        if existing and existing.get("message_id") != str(message.id):
-            # Try to exit the old view instance if it's still alive in this process.
-            # exit() handles the full cleanup: unsubscribe, unregister, disable
-            # components on the message, and dispatch VIEW_DESTROYED.
-            old_view_exited = False
-            for vid, old_view in list(self.state_store._active_views.items()):
-                if (
-                    getattr(old_view, "_state_key", None) == self.state_key
-                    and old_view.id != self.id
-                ):
-                    await old_view.exit()
-                    old_view_exited = True
-                    logger.info(f"Exited previous view instance for state_key '{self.state_key}'")
-                    break
-
-            # If the old view wasn't alive (e.g. from a previous bot session that
-            # wasn't restored), fall back to message-only cleanup.
-            if not old_view_exited:
-                old_msg_id = existing["message_id"]
-                old_ch_id = existing["channel_id"]
-                bot = getattr(self.context, "bot", None) or getattr(
-                    self.interaction, "client", None
-                )
-                if bot:
-                    try:
-                        old_channel = bot.get_channel(int(old_ch_id))
-                        if old_channel and isinstance(old_channel, discord.abc.Messageable):
-                            old_message = await old_channel.fetch_message(int(old_msg_id))
-                            await old_message.edit(view=None)
-                            logger.info(
-                                f"Cleaned up previous message {old_msg_id} for "
-                                f"state_key '{self.state_key}'"
-                            )
-                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                        pass  # Old message already gone, nothing to clean up
-                    except Exception as e:
-                        logger.debug(
-                            f"Could not clean up previous message for " f"'{self.state_key}': {e}"
-                        )
-
-        # Record this view in the persistent registry
-        guild_id = None
-        if message.guild:
-            guild_id = str(message.guild.id)
-
-        payload = ActionCreators.persistent_view_registered(
-            state_key=self.state_key,
-            class_name=self.__class__.__name__,
-            message_id=str(message.id),
-            channel_id=str(message.channel.id),
-            guild_id=guild_id,
-            user_id=str(self.user_id) if self.user_id else None,
-        )
-        await self.dispatch("PERSISTENT_VIEW_REGISTERED", payload)
-
+        await self._register_persistent(message)
         return message
 
-    async def exit(self, delete_message=False):
-        """Exit the view and remove it from the persistent registry."""
-        # Unregister before cleanup so the state dispatch still works
-        payload = ActionCreators.persistent_view_unregistered(self.state_key)
-        await self.dispatch("PERSISTENT_VIEW_UNREGISTERED", payload)
 
-        return await super().exit(delete_message=delete_message)
-
-    async def on_restore(self, bot):
-        """Called after the view is reconstructed on bot restart.
-
-        Override this to perform post-restore setup like fetching fresh data
-        or updating the embed. The view's ``_message`` is already set when
-        this is called.
-
-        .. warning::
-            If this method raises an exception, the view will be unregistered
-            from CascadeUI's state system but will remain in discord.py's
-            internal view store (there is no public API to remove it). Avoid
-            raising from this method unless recovery is not possible.
-
-        Args:
-            bot: The discord.py Bot instance.
-        """
-        pass
-
-
-class PersistentLayoutView(StatefulLayoutView):
+class PersistentLayoutView(_PersistentMixin, StatefulLayoutView):
     """A V2 layout view that survives bot restarts.
 
     The V2 equivalent of ``PersistentView``. Subclass this instead of
     ``StatefulLayoutView`` for long-lived V2 UI that should stay interactive
     indefinitely.
 
-    Requirements are the same as ``PersistentView``: ``state_key`` at init,
+    Requirements are the same as ``PersistentView``: ``persistence_key`` at init,
     explicit ``custom_id`` on all interactive components, and no ephemeral sends.
     """
 
-    owner_only: bool = False
-    _persistent: bool = True
+    def _iter_persistent_items(self):
+        """V2 tree traversal: descend into Containers and ActionRows."""
+        return self.walk_children()
 
-    # discord.py auto-generates custom_ids as 32-char hex strings
-    _AUTO_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
-
-    def __init_subclass__(cls, **kwargs):
-        """Auto-register every concrete subclass so restore can find it by name."""
-        super().__init_subclass__(**kwargs)
-        _persistent_view_classes[cls.__name__] = cls
-
-    def __init__(self, *args, **kwargs):
-        kwargs["timeout"] = None
-        super().__init__(*args, **kwargs)
-
-        if self._state_key is None:
-            raise ValueError(
-                f"{self.__class__.__name__} requires a 'state_key' argument. "
-                "Persistent views need a stable key to track their message across restarts."
-            )
-
-    def _validate_custom_ids(self):
-        """Ensure every interactive component has an explicit custom_id.
-
-        V2 views have a tree structure (Container > ActionRow > Button), so
-        this walks all children recursively. Non-interactive items like
-        Container, TextDisplay, and Separator have ``custom_id=None`` and
-        are intentionally skipped — only items with a discord.py auto-generated
-        ID (32-char hex) indicate a missing explicit custom_id.
-        """
-        for item in self.walk_children():
-            custom_id = getattr(item, "custom_id", None)
-            if custom_id is not None and self._AUTO_ID_PATTERN.match(custom_id):
-                raise ValueError(
-                    f"Component {item!r} in {self.__class__.__name__} is missing a custom_id. "
-                    "All interactive components in a PersistentLayoutView must have an "
-                    "explicit custom_id so discord.py can re-attach them after a restart."
-                )
+    async def _cleanup_orphan_message(self, old_message):
+        """V2 messages ARE their components -- delete instead of edit."""
+        await old_message.delete()
 
     async def send(self, *, ephemeral=False):
         """Send the V2 view and register it for persistence."""
@@ -246,241 +292,5 @@ class PersistentLayoutView(StatefulLayoutView):
         if message is None:
             return message
 
-        # Duplicate state_key cleanup (same logic as PersistentView.send)
-        registry = self.state_store.state.get("persistent_views", {})
-        existing = registry.get(self.state_key)
-        if existing and existing.get("message_id") != str(message.id):
-            old_view_exited = False
-            for vid, old_view in list(self.state_store._active_views.items()):
-                if (
-                    getattr(old_view, "_state_key", None) == self.state_key
-                    and old_view.id != self.id
-                ):
-                    await old_view.exit()
-                    old_view_exited = True
-                    logger.info(f"Exited previous view instance for state_key '{self.state_key}'")
-                    break
-
-            if not old_view_exited:
-                old_msg_id = existing["message_id"]
-                old_ch_id = existing["channel_id"]
-                bot = getattr(self.context, "bot", None) or getattr(
-                    self.interaction, "client", None
-                )
-                if bot:
-                    try:
-                        old_channel = bot.get_channel(int(old_ch_id))
-                        if old_channel and isinstance(old_channel, discord.abc.Messageable):
-                            old_message = await old_channel.fetch_message(int(old_msg_id))
-                            # V2 messages ARE their components — edit(view=None)
-                            # would produce an empty message.  Delete instead.
-                            await old_message.delete()
-                            logger.info(
-                                f"Deleted previous message {old_msg_id} for "
-                                f"state_key '{self.state_key}'"
-                            )
-                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                        pass
-                    except Exception as e:
-                        logger.debug(
-                            f"Could not clean up previous message for '{self.state_key}': {e}"
-                        )
-
-        guild_id = None
-        if message.guild:
-            guild_id = str(message.guild.id)
-
-        payload = ActionCreators.persistent_view_registered(
-            state_key=self.state_key,
-            class_name=self.__class__.__name__,
-            message_id=str(message.id),
-            channel_id=str(message.channel.id),
-            guild_id=guild_id,
-            user_id=str(self.user_id) if self.user_id else None,
-        )
-        await self.dispatch("PERSISTENT_VIEW_REGISTERED", payload)
-
+        await self._register_persistent(message)
         return message
-
-    async def exit(self, delete_message=False):
-        """Exit the view and remove it from the persistent registry."""
-        payload = ActionCreators.persistent_view_unregistered(self.state_key)
-        await self.dispatch("PERSISTENT_VIEW_UNREGISTERED", payload)
-
-        return await super().exit(delete_message=delete_message)
-
-    async def on_restore(self, bot):
-        """Called after the view is reconstructed on bot restart."""
-        pass
-
-
-# // ========================================( Restore )======================================== // #
-
-
-async def setup_persistence(
-    bot=None,
-    file_path: str = "cascadeui_state.json",
-    backend=None,
-) -> Dict[str, List[str]]:
-    """Enable state persistence and restore saved state from disk.
-
-    Call this once in your bot's ``setup_hook`` (or ``on_ready`` with a
-    guard). It handles both data persistence and view re-attachment in
-    a single call.
-
-    - **Without** ``bot``: enables data persistence only. Views with a
-      ``state_key`` will find their saved data when re-invoked.
-    - **With** ``bot``: also re-attaches any ``PersistentView`` instances
-      to their original messages so buttons keep working across restarts.
-
-    Args:
-        bot: Optional discord.py Bot instance. Required for re-attaching
-             PersistentView instances; omit if you only need data persistence.
-        file_path: Path to the JSON file for state storage (used when no
-                   ``backend`` is provided).
-        backend: Optional StorageBackend instance (e.g. SQLiteBackend,
-                 RedisBackend). Falls back to FileStorageBackend if omitted.
-
-    Returns:
-        A summary dict with ``restored``, ``skipped``, ``failed``, and
-        ``removed`` lists of state_keys. Skipped entries (unknown class)
-        are kept in state for the next restart; removed entries (deleted
-        message/channel) are permanently cleaned up.
-    """
-    # Validate bot argument early — a wrong type here (e.g. passing a
-    # variable that doesn't exist) would otherwise fail deep in discord.py
-    # with a confusing error or silently break view restoration.
-    if bot is not None:
-        from discord.ext.commands import Bot
-
-        if not isinstance(bot, Bot):
-            raise TypeError(
-                f"setup_persistence() expected a discord.py Bot instance for 'bot', "
-                f"got {type(bot).__name__}. If calling from setup_hook, use 'self' "
-                f"(the bot instance), not an undefined variable."
-            )
-
-    store = get_store()
-
-    # Enable persistence if not already set up
-    if not store.persistence_enabled:
-        if backend is None:
-            from ..persistence.storage import FileStorageBackend
-
-            backend = FileStorageBackend(file_path)
-        store.enable_persistence(backend)
-
-    # Restore state from disk
-    await store.restore_state()
-
-    # If no bot was provided, we're done — data persistence is active
-    if bot is None:
-        logger.info("Persistence enabled (data only, no bot provided)")
-        return {"restored": [], "skipped": [], "failed": [], "removed": []}
-
-    registry = store.state.get("persistent_views", {})
-    if not registry:
-        logger.info("Persistence enabled, no persistent views to restore")
-        return {"restored": [], "skipped": [], "failed": [], "removed": []}
-
-    restored = []
-    failed = []
-    skipped = []
-    removed = []
-
-    for state_key, entry in list(registry.items()):
-        class_name = entry.get("class_name")
-        message_id = entry.get("message_id")
-        channel_id = entry.get("channel_id")
-
-        # Check if the view class is registered — a missing class usually means
-        # the module wasn't imported yet, so we skip without removing the entry.
-        # The entry stays in state so it can be restored on the next restart
-        # once the import is fixed.
-        view_cls = _persistent_view_classes.get(class_name)
-        if view_cls is None:
-            logger.warning(
-                f"Persistent view class '{class_name}' not found for state_key '{state_key}'. "
-                "Make sure the module defining it is imported before calling setup_persistence."
-            )
-            skipped.append(state_key)
-            continue
-
-        # Fetch the channel — NotFound/Forbidden means it's genuinely gone
-        try:
-            channel = bot.get_channel(int(channel_id))
-            if channel is None:
-                channel = await bot.fetch_channel(int(channel_id))
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
-            logger.warning(f"Could not fetch channel {channel_id} for '{state_key}': {e}")
-            removed.append(state_key)
-            continue
-
-        # Guard against non-messageable channels (e.g. CategoryChannel, ForumChannel)
-        if not isinstance(channel, discord.abc.Messageable):
-            logger.warning(
-                f"Channel {channel_id} for '{state_key}' is not messageable "
-                f"({type(channel).__name__}), removing entry"
-            )
-            removed.append(state_key)
-            continue
-
-        # Fetch the message — NotFound means it was deleted while offline
-        try:
-            message = await channel.fetch_message(int(message_id))
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
-            logger.warning(f"Could not fetch message {message_id} for '{state_key}': {e}")
-            removed.append(state_key)
-            continue
-
-        # Construct the view (no context/interaction needed for restoration)
-        view = None
-        try:
-            view = view_cls(state_key=state_key)
-
-            # Validate custom_ids before attaching — catches broken subclass updates
-            view._validate_custom_ids()
-
-            # Set _message directly (not via the property setter) to avoid
-            # firing a VIEW_UPDATED dispatch before _register_state runs.
-            view._message = message
-
-            # Restore identity fields from saved state so session limiting
-            # can index the view properly after restart.
-            if entry.get("user_id"):
-                view.user_id = int(entry["user_id"])
-            if entry.get("guild_id"):
-                view.guild_id = int(entry["guild_id"])
-
-            # Re-attach to discord.py's internal view tracking
-            bot.add_view(view, message_id=message.id)
-
-            # Register in state system
-            await view._register_state()
-            store.register_view(view)
-
-            # Let the view do post-restore work
-            await view.on_restore(bot)
-
-            restored.append(state_key)
-            logger.info(f"Restored persistent view '{state_key}' ({class_name})")
-
-        except Exception as e:
-            logger.error(f"Failed to restore persistent view '{state_key}': {e}", exc_info=True)
-            failed.append(state_key)
-            # Clean up the subscriber, registry, and undo entry that __init__/register registered
-            if view is not None:
-                store.unsubscribe(view.id)
-                store.unregister_view(view.id)
-                store._undo_enabled_views.pop(view.id, None)
-
-    # Clean up entries for deleted messages/channels (but not skipped classes)
-    if removed:
-        for state_key in removed:
-            payload = ActionCreators.persistent_view_unregistered(state_key)
-            await store.dispatch("PERSISTENT_VIEW_UNREGISTERED", payload)
-        logger.info(f"Cleaned up {len(removed)} stale persistent view entries")
-
-    summary = {"restored": restored, "skipped": skipped, "failed": failed, "removed": removed}
-    logger.info(f"Persistent view restore complete: {summary}")
-    return summary

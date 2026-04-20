@@ -47,12 +47,12 @@ class ActionCreators:
         session_id: SessionId, user_id: Optional[UserId] = None, **data
     ) -> ActionPayload:
         """Create a SESSION_CREATED action payload."""
-        return {"session_id": session_id, "user_id": user_id, "data": data}
+        return {"session_id": session_id, "user_id": user_id, "shared_data": data}
 
     @staticmethod
     def session_updated(session_id: SessionId, **data) -> ActionPayload:
         """Create a SESSION_UPDATED action payload."""
-        return {"session_id": session_id, "data": data}
+        return {"session_id": session_id, "shared_data": data}
 
     @staticmethod
     def navigation_replace(destination: str, **params) -> ActionPayload:
@@ -73,7 +73,7 @@ class ActionCreators:
 
     @staticmethod
     def persistent_view_registered(
-        state_key: str,
+        persistence_key: str,
         class_name: str,
         message_id: str,
         channel_id: str,
@@ -82,7 +82,7 @@ class ActionCreators:
     ) -> ActionPayload:
         """Create a PERSISTENT_VIEW_REGISTERED action payload."""
         return {
-            "state_key": state_key,
+            "persistence_key": persistence_key,
             "class_name": class_name,
             "message_id": message_id,
             "channel_id": channel_id,
@@ -91,10 +91,10 @@ class ActionCreators:
         }
 
     @staticmethod
-    def persistent_view_unregistered(state_key: str) -> ActionPayload:
+    def persistent_view_unregistered(persistence_key: str) -> ActionPayload:
         """Create a PERSISTENT_VIEW_UNREGISTERED action payload."""
         return {
-            "state_key": state_key,
+            "persistence_key": persistence_key,
         }
 
     @staticmethod
@@ -122,10 +122,55 @@ class ActionCreators:
         }
 
     @staticmethod
-    def scoped_update(scope: str, scope_id: Any, data: Dict[str, Any]) -> ActionPayload:
-        """Create a SCOPED_UPDATE action payload."""
+    def application_slots_pruned(deleted: int, cutoff: Optional[int] = None) -> ActionPayload:
+        """Create an APPLICATION_SLOTS_PRUNED action payload.
+
+        Fires after the persistence manager deletes expired rows from the
+        application_slots namespace. ``deleted`` is the row count removed;
+        ``cutoff`` is the ``expires_at`` threshold used (epoch seconds) or
+        ``None`` if prune was manual.
+        """
+        return {"deleted": deleted, "cutoff": cutoff}
+
+    @staticmethod
+    def registry_pruned(deleted: int, reason: str) -> ActionPayload:
+        """Create a REGISTRY_PRUNED action payload.
+
+        Fires after the persistence manager deletes rows from the
+        persistent_views namespace. ``deleted`` is the row count removed;
+        ``reason`` is a short tag (e.g. ``"orphan_messages"``,
+        ``"missing_class"``, ``"manual"``) indicating what motivated the
+        prune.
+        """
+        return {"deleted": deleted, "reason": reason}
+
+    @staticmethod
+    def scoped_update(
+        scope: str,
+        identifiers: Dict[str, Any],
+        data: Dict[str, Any],
+        *,
+        slot_name: str = "scoped",
+    ) -> ActionPayload:
+        """Create a SCOPED_UPDATE action payload.
+
+        ``identifiers`` carries the kwargs consumed by
+        ``StateStore._build_scope_key`` for the given ``scope``:
+
+            "user"       -> {"user_id": ...}
+            "guild"      -> {"guild_id": ...}
+            "user_guild" -> {"user_id": ..., "guild_id": ...}
+            "global"     -> {}
+
+        ``slot_name`` routes the write to a named bucket under
+        ``state["application"]``. Defaults to the shared ``"scoped"``
+        bucket so generic callers keep working; views with a
+        ``scoped_slot`` class attribute supply their own bucket for
+        subsystem isolation.
+        """
         return {
             "scope": scope,
-            "scope_id": scope_id,
+            "identifiers": identifiers,
             "data": data,
+            "slot_name": slot_name,
         }

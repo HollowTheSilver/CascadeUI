@@ -3,3 +3,9 @@ contact_links:
   - name: Documentation
     url: https://hollowthesilver.github.io/CascadeUI/
     about: Check the docs before opening an issue.
+  - name: Discord Server
+    url: https://discord.com/invite/9Xj68BpKRb
+    about: Ask questions and get help from the community.
+  - name: Security Vulnerability
+    url: https://github.com/HollowTheSilver/CascadeUI/security/advisories/new
+    about: Report a vulnerability privately. Do NOT file a public issue.

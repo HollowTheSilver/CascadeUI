@@ -52,21 +52,26 @@ nav:
   - Getting Started:
       - Installation: guide/installation.md
       - Quick Start: guide/quickstart.md
+      - Core Concepts: guide/concepts.md
+      - Five Pillars: guide/five-pillars.md
   - Guide:
-      - State Management: guide/state.md
       - Views: guide/views.md
       - Components: guide/components.md
-      - Validation: guide/validation.md
+      - State Management: guide/state.md
+      - View Patterns: guide/patterns.md
       - Persistence: guide/persistence.md
-      - Theming: guide/theming.md
       - Middleware: guide/middleware.md
+      - Theming: guide/theming.md
+      - Validation: guide/validation.md
       - DevTools: guide/devtools.md
+      - Performance: guide/performance.md
       - Known Limitations: guide/known-limitations.md
   - API Reference:
-      - State Store: api/store.md
       - Views: api/views.md
       - Components: api/components.md
-      - Validation: api/validation.md
+      - State Store: api/store.md
+      - Built-in Actions: api/actions.md
       - Persistence: api/persistence.md
       - Theming: api/theming.md
+      - Validation: api/validation.md
   - Examples: examples.md

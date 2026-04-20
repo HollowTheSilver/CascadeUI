@@ -1,12 +1,14 @@
 """Tests for event hooks (on/off lifecycle observation)."""
 
 import copy
+
 import pytest
 
 from cascadeui.state.singleton import get_store
 
 
 class TestEventHooks:
+    """Store on/off hooks fire on matching actions and survive hook failures."""
     async def test_hook_fires_on_matching_action(self):
         store = get_store()
         received = []
@@ -22,7 +24,7 @@ class TestEventHooks:
             new["views"]["test_view"] = {"id": "test_view"}
             return new
 
-        store.register_reducer("VIEW_CREATED", reducer)
+        store._register_reducer("VIEW_CREATED", reducer)
         await store.dispatch("VIEW_CREATED", {"view_id": "test_view"})
 
         assert "VIEW_CREATED" in received
@@ -55,26 +57,33 @@ class TestEventHooks:
 
         # Dispatch should complete without raising
         result = await store.dispatch("MY_ACTION", {})
+        await store._flush_notifications()
         assert result is not None
-        # Subscriber should still have been notified (hooks fire after subscribers)
+        # Subscriber still fires even when a hook raised.
         assert "MY_ACTION" in post_hook_received
 
-    async def test_hooks_fire_after_subscribers(self):
+    async def test_hooks_and_subscribers_both_fire(self):
+        """Under fire-and-forget dispatch, hooks and subscribers run
+        concurrently rather than in a strict order. Both must fire, but
+        the sequence is not guaranteed -- hooks often win the race
+        because they await inline while subscribers are scheduled tasks.
+        """
         store = get_store()
-        order = []
+        fired = set()
 
         async def subscriber(state, action):
-            order.append("subscriber")
+            fired.add("subscriber")
 
         async def hook(action, state):
-            order.append("hook")
+            fired.add("hook")
 
         store.subscribe("order-sub", subscriber)
         store.on("ORDER_TEST", hook)
 
         await store.dispatch("ORDER_TEST", {})
+        await store._flush_notifications()
 
-        assert order == ["subscriber", "hook"]
+        assert fired == {"subscriber", "hook"}
 
     async def test_raw_action_type_as_hook_name(self):
         """You can pass the raw action type directly to on()."""
