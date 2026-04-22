@@ -34,6 +34,8 @@ Usage:
 # // ========================================( Modules )======================================== // #
 
 
+import logging
+
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -43,15 +45,13 @@ from discord.ui import ActionRow
 from cascadeui import (
     StatefulButton,
     StatefulLayoutView,
+    access_slot,
     alert,
     card,
     cascade_reducer,
     divider,
     key_value,
-    access_slot,
 )
-
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +121,7 @@ class LobbyView(StatefulLayoutView):
     instance_limit = 1
     instance_scope = "user"  # one lobby per host across all guilds
     instance_policy = "replace"
-    replace_policy = "delete"    # A lobby is a staging area, not a committed game - replacement is
+    replace_policy = "delete"  # A lobby is a staging area, not a committed game - replacement is
     # expected when the host opens a fresh lobby. protect_attached
     # defaults to True, which would block replacement when participants
     # are present. False allows replacement to proceed, and the
@@ -131,6 +131,7 @@ class LobbyView(StatefulLayoutView):
     # written to the global state tree, not under any built-in scope key.
     state_scope = None
     auto_defer = True
+
     def __init__(self, *args, max_players: int = DEFAULT_MAX_PLAYERS, **kwargs):
         super().__init__(*args, **kwargs)
         # Per-invocation policy override -- runs the same validator
@@ -240,7 +241,9 @@ class LobbyView(StatefulLayoutView):
 
     async def _join(self, interaction: discord.Interaction):
         if interaction.user.id == self.user_id:
-            await self.respond(interaction, "You're already in the lobby as the host.", ephemeral=True)
+            await self.respond(
+                interaction, "You're already in the lobby as the host.", ephemeral=True
+            )
             return
         if interaction.user.id in self.participants:
             await self.respond(interaction, "You're already in the lobby.", ephemeral=True)
@@ -257,7 +260,8 @@ class LobbyView(StatefulLayoutView):
     async def _leave(self, interaction: discord.Interaction):
         if interaction.user.id == self.user_id:
             await self.respond(
-                interaction, "The host can't leave - use Disband to close the lobby.",
+                interaction,
+                "The host can't leave - use Disband to close the lobby.",
                 ephemeral=True,
             )
             return
@@ -271,9 +275,7 @@ class LobbyView(StatefulLayoutView):
 
     async def _start(self, interaction: discord.Interaction):
         if interaction.user.id != self.user_id:
-            await self.respond(
-                interaction, "Only the host can start the game.", ephemeral=True
-            )
+            await self.respond(interaction, "Only the host can start the game.", ephemeral=True)
             return
 
         self._started = True
@@ -290,9 +292,7 @@ class LobbyView(StatefulLayoutView):
 
     async def _disband(self, interaction: discord.Interaction):
         if interaction.user.id != self.user_id:
-            await self.respond(
-                interaction, "Only the host can disband the lobby.", ephemeral=True
-            )
+            await self.respond(interaction, "Only the host can disband the lobby.", ephemeral=True)
             return
 
         await self.dispatch("LOBBY_DISBANDED", {})

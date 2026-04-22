@@ -29,6 +29,8 @@ Usage:
 # // ========================================( Modules )======================================== // #
 
 
+import logging
+
 import discord
 from discord.ext import commands
 from discord.ext.commands import Context
@@ -36,19 +38,17 @@ from discord.ui import ActionRow, TextDisplay
 
 from cascadeui import (
     TabLayoutView,
+    access_slot,
     action_section,
     card,
     cascade_reducer,
     computed,
     divider,
     gap,
-    read_slot,
     key_value,
-    access_slot,
+    read_slot,
     toggle_section,
 )
-
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -219,8 +219,7 @@ class DashboardView(TabLayoutView):
                     "Tab visits (total)": total_visits or "_none yet_",
                     "Tab visits (per tab)": (
                         ", ".join(
-                            f"{tab.split(' ', 1)[-1]} {count}"
-                            for tab, count in visits.items()
+                            f"{tab.split(' ', 1)[-1]} {count}" for tab, count in visits.items()
                         )
                         or "_none yet_"
                     ),

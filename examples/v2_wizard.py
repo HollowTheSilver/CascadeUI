@@ -261,9 +261,7 @@ class CharacterCreatorView(WizardLayoutView):
         Useful for counting retry loops, surfacing stuck users to a
         moderator channel, or gating retries behind a cooldown.
         """
-        self._validation_failures[step_index] = (
-            self._validation_failures.get(step_index, 0) + 1
-        )
+        self._validation_failures[step_index] = self._validation_failures.get(step_index, 0) + 1
 
     # // ========================================( Derived helpers )======================================== // #
 
@@ -560,9 +558,7 @@ class CharacterCreatorView(WizardLayoutView):
         alignment_select = StatefulSelect(
             placeholder="Choose an alignment...",
             options=[
-                discord.SelectOption(
-                    label=a, value=a, default=(a == self._alignment)
-                )
+                discord.SelectOption(label=a, value=a, default=(a == self._alignment))
                 for a in ALIGNMENTS
             ],
             callback=self._on_alignment_selected,
@@ -576,9 +572,7 @@ class CharacterCreatorView(WizardLayoutView):
         language_select = StatefulSelect(
             placeholder="Select languages known...",
             options=[
-                discord.SelectOption(
-                    label=lang, value=lang, default=(lang in selected)
-                )
+                discord.SelectOption(label=lang, value=lang, default=(lang in selected))
                 for lang in LANGUAGES
             ],
             min_values=1,
@@ -741,9 +735,7 @@ class CharacterCreatorView(WizardLayoutView):
             TextDisplay("-# Character created successfully."),
             color=discord.Color.green(),
         )
-        await self.respond(
-            interaction, view=DisplayLayoutView(container=body), ephemeral=True
-        )
+        await self.respond(interaction, view=DisplayLayoutView(container=body), ephemeral=True)
         await self.exit()
 
 

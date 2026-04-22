@@ -29,6 +29,8 @@ Usage:
 # // ========================================( Modules )======================================== // #
 
 
+import logging
+
 import discord
 from discord.ext import commands
 from discord.ext.commands import Context
@@ -41,12 +43,11 @@ from cascadeui import (
     cascade_reducer,
     computed,
     gap,
-    read_slot,
     get_store,
     key_value,
+    read_slot,
     stats_card,
 )
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -170,7 +171,8 @@ class PollView(StatefulLayoutView):
     instance_policy = "replace"
     replace_policy = "delete"
     exit_policy = "delete"
-    auto_defer = True    serialize_interactions = True
+    auto_defer = True
+    serialize_interactions = True
     auto_refresh_ephemeral = False
 
     # Subscribe to POLL_VOTE so the view rebuilds when anyone votes.

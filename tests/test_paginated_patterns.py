@@ -5,16 +5,16 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 import pytest
 from discord.ui import ActionRow, Button, Container, TextDisplay
-
-from cascadeui.views.patterns import PaginatedLayoutView, PaginatedView
 from helpers import make_interaction as _make_interaction
 
+from cascadeui.views.patterns import PaginatedLayoutView, PaginatedView
 
 # // ========================================( Button style validation )======================================== // #
 
 
 class TestPaginatedStyleValidation:
     """Invalid pagination button styles raise at class definition time."""
+
     def test_invalid_style_raises_at_definition(self):
         with pytest.raises(ValueError, match="must be a discord.ButtonStyle"):
 
@@ -37,6 +37,7 @@ class TestPaginatedStyleValidation:
 
 class TestPaginatedLayoutCustomization:
     """Custom labels and styles apply to generated pagination buttons."""
+
     def test_label_overrides_apply_to_buttons(self):
         class CustomPaginated(PaginatedLayoutView):
             prev_button_label = "Back"
@@ -67,6 +68,7 @@ class TestPaginatedLayoutCustomization:
 
 class TestOnPageChangedHook:
     """on_page_changed hook fires on navigation and defaults to no-op."""
+
     async def test_default_hook_is_noop(self):
         view = PaginatedLayoutView(
             interaction=_make_interaction(),

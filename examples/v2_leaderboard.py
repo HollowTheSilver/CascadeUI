@@ -64,11 +64,9 @@ import random
 
 from discord.ext import commands
 from discord.ext.commands import Context
-
 from discord.ui import TextDisplay
 
 from cascadeui import LeaderboardLayoutView, card, divider, key_value, progress_bar
-
 
 # // ========================================( Config )======================================== // #
 
@@ -134,11 +132,7 @@ def _build_entries(real_members) -> tuple:
     empty (intent disabled or cache not populated), the full board
     is synthetic so the example never errors out.
     """
-    real = [
-        (member.id, _mock_stats_for(member.id))
-        for member in real_members
-        if not member.bot
-    ]
+    real = [(member.id, _mock_stats_for(member.id)) for member in real_members if not member.bot]
     real.sort(key=lambda row: row[1]["mmr"], reverse=True)
 
     if not real:
@@ -205,11 +199,7 @@ class ServerLeaderboard(LeaderboardLayoutView):
         games = stats["games"]
         wins = stats["wins"]
         bar = progress_bar(wins, games or 1, width=6, show_percent=True).content
-        return (
-            f"`{stats['mmr']}` MMR \u2022 "
-            f"{wins}W / {games}G \u2022 "
-            f"{bar}"
-        )
+        return f"`{stats['mmr']}` MMR \u2022 " f"{wins}W / {games}G \u2022 " f"{bar}"
 
     async def get_avatar_url(self, user_id: int, stats: dict):
         """Resolve a thumbnail URL for the Section accessory.

@@ -23,6 +23,7 @@ from cascadeui.validation import min_length, regex
 
 class TestTextInputSlug:
     """TextInput._slug converts labels to deterministic custom_id fragments."""
+
     def test_basic_label(self):
         assert TextInput._slug("Username") == "input_username"
 
@@ -47,6 +48,7 @@ class TestTextInputSlug:
 
 class TestTextInputValidators:
     """TextInput stores and exposes validators from the kwarg."""
+
     def test_default_is_empty_list(self):
         field = TextInput(label="Username")
         assert field.validators == []
@@ -74,6 +76,7 @@ class TestTextInputValidators:
 
 class TestModalValidatorAutoCollect:
     """Modal auto-collects validators from all five input wrapper types."""
+
     def test_no_validators_produces_empty_dict(self):
         modal = Modal(
             title="Test",
@@ -131,6 +134,7 @@ class TestModalValidatorAutoCollect:
 
 class TestModalViewIdWiring:
     """Modal stores view_id for callback routing back to the originating view."""
+
     def test_view_id_stored_from_kwargs(self):
         modal = Modal(title="Test", inputs=[TextInput(label="X")], view_id="view_abc")
         assert modal.view_id == "view_abc"
@@ -223,6 +227,7 @@ class TestSubmittedValuePropagation:
 
 class TestCheckbox:
     """Checkbox input derives custom_id from label and stores boolean value."""
+
     def test_custom_id_from_label(self):
         cb = Checkbox(label="Accept Terms")
         assert cb.custom_id == "input_accept_terms"
@@ -254,6 +259,7 @@ class TestCheckbox:
 
 class TestCheckboxGroup:
     """CheckboxGroup input derives custom_id from label and stores multi-values."""
+
     def test_custom_id_from_label(self):
         cg = CheckboxGroup(label="Toppings", options=[])
         assert cg.custom_id == "input_toppings"
@@ -317,6 +323,7 @@ class TestCheckboxGroup:
 
 class TestRadioGroup:
     """RadioGroup input derives custom_id from label and stores single value."""
+
     def test_custom_id_from_label(self):
         rg = RadioGroup(label="Difficulty", options=[])
         assert rg.custom_id == "input_difficulty"
@@ -364,6 +371,7 @@ class TestRadioGroup:
 
 class TestFileUpload:
     """FileUpload input derives custom_id from label and stores file values."""
+
     def test_custom_id_from_label(self):
         fu = FileUpload(label="Avatar")
         assert fu.custom_id == "input_avatar"

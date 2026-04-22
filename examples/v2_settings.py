@@ -28,6 +28,8 @@ Usage:
 # // ========================================( Modules )======================================== // #
 
 
+import logging
+
 import discord
 from discord.ext import commands
 from discord.ext.commands import Context
@@ -47,8 +49,6 @@ from cascadeui import (
     toggle_section,
     with_confirmation,
 )
-
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -306,9 +306,7 @@ class V2SettingsHubView(MenuLayoutView):
             for key, value in DEFAULT_SETTINGS.items():
                 await self.dispatch_scoped_as("SETTINGS_UPDATED", {key: value}, scope="user")
             for key, value in GUILD_DEFAULTS.items():
-                await self.dispatch_scoped_as(
-                    "SETTINGS_UPDATED", {key: value}, scope="user_guild"
-                )
+                await self.dispatch_scoped_as("SETTINGS_UPDATED", {key: value}, scope="user_guild")
 
 
 # // ========================================( Appearance )======================================== // #
@@ -512,9 +510,7 @@ class V2NotificationsView(StatefulLayoutView):
 
         async def callback(interaction):
             s = _read_settings(self.scoped_state)
-            await self.dispatch_scoped_as(
-                "SETTINGS_UPDATED", {key: not s[key]}, scope="user"
-            )
+            await self.dispatch_scoped_as("SETTINGS_UPDATED", {key: not s[key]}, scope="user")
 
         return callback
 
@@ -627,14 +623,10 @@ class V2LocaleView(StatefulLayoutView):
 
     async def on_language(self, interaction, values):
         # auto_defer handles acknowledgment.
-        await self.dispatch_scoped_as(
-            "SETTINGS_UPDATED", {"language": values[0]}, scope="user"
-        )
+        await self.dispatch_scoped_as("SETTINGS_UPDATED", {"language": values[0]}, scope="user")
 
     async def on_timezone(self, interaction, values):
-        await self.dispatch_scoped_as(
-            "SETTINGS_UPDATED", {"timezone": values[0]}, scope="user"
-        )
+        await self.dispatch_scoped_as("SETTINGS_UPDATED", {"timezone": values[0]}, scope="user")
 
     async def go_back(self, interaction):
         await self.pop(interaction, rebuild=lambda v: v.build_ui())
@@ -727,9 +719,7 @@ class V2GuildPrefsView(StatefulLayoutView):
 
         async def callback(interaction):
             s = _read_guild_settings(self.scoped_state)
-            await self.dispatch_scoped_as(
-                "SETTINGS_UPDATED", {key: not s[key]}, scope="user_guild"
-            )
+            await self.dispatch_scoped_as("SETTINGS_UPDATED", {key: not s[key]}, scope="user_guild")
 
         return callback
 

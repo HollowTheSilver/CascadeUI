@@ -10,6 +10,7 @@ from cascadeui.state.store import StateStore
 
 class TestBatchContext:
     """Batched dispatches produce a single subscriber notification."""
+
     async def test_batch_produces_single_notification(self):
         """Two dispatches in a batch should produce one subscriber notification."""
         store = get_store()

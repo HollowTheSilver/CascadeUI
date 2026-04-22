@@ -28,6 +28,7 @@ Usage:
 # // ========================================( Modules )======================================== // #
 
 
+import logging
 from typing import Literal, Optional
 
 import discord
@@ -44,8 +45,6 @@ from cascadeui import (
     emoji_grid,
     gap,
 )
-
-import logging
 
 logger = logging.getLogger(__name__)
 

@@ -41,6 +41,7 @@ def base_state():
 
 class TestViewReducers:
     """VIEW_CREATED, VIEW_UPDATED, VIEW_DESTROYED reducer correctness."""
+
     async def test_view_created_adds_view(self):
         state = base_state()
         action = make_action(
@@ -170,6 +171,7 @@ class TestViewReducers:
 
 class TestSessionReducers:
     """SESSION_CREATED and SESSION_UPDATED reducer correctness."""
+
     async def test_session_created(self):
         state = base_state()
         action = make_action("SESSION_CREATED", {"session_id": "s1", "user_id": 456})
@@ -193,7 +195,9 @@ class TestSessionReducers:
             "updated_at": "t0",
             "shared_data": {"lang": "en"},
         }
-        action = make_action("SESSION_UPDATED", {"session_id": "s1", "shared_data": {"theme": "dark"}})
+        action = make_action(
+            "SESSION_UPDATED", {"session_id": "s1", "shared_data": {"theme": "dark"}}
+        )
         result = await reduce_session_updated(action, state)
         assert result["sessions"]["s1"]["shared_data"] == {"lang": "en", "theme": "dark"}
         assert result["sessions"]["s1"]["updated_at"] == action["timestamp"]
@@ -234,13 +238,16 @@ class TestSessionReducers:
             "updated_at": "t0",
             "shared_data": {"lang": "en"},
         }
-        action = make_action("SESSION_UPDATED", {"session_id": "s1", "shared_data": {"theme": "dark"}})
+        action = make_action(
+            "SESSION_UPDATED", {"session_id": "s1", "shared_data": {"theme": "dark"}}
+        )
         await reduce_session_updated(action, state)
         assert state["sessions"]["s1"]["shared_data"] == {"lang": "en"}
 
 
 class TestComponentInteractionReducer:
     """COMPONENT_INTERACTION records interactions and caps history at 50."""
+
     async def test_records_interaction(self):
         state = base_state()
         action = make_action(
@@ -283,6 +290,7 @@ class TestComponentInteractionReducer:
 
 class TestModalSubmittedReducer:
     """MODAL_SUBMITTED stores submissions and caps history at 50."""
+
     async def test_stores_submission(self):
         state = base_state()
         action = make_action(

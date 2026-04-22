@@ -11,6 +11,7 @@ from cascadeui.state.store import StateStore
 
 class TestStateStoreSingleton:
     """StateStore is a singleton with a well-defined initial state shape."""
+
     def test_returns_same_instance(self):
         a = StateStore()
         b = StateStore()
@@ -82,6 +83,7 @@ class TestGetActiveViews:
 
 class TestDispatch:
     """Dispatch routes actions through registered reducers and records history."""
+
     async def test_dispatch_with_registered_reducer(self):
         store = get_store()
 
@@ -118,6 +120,7 @@ class TestDispatch:
 
 class TestSubscribers:
     """Subscriber registration, notification, action filtering, and unsubscribe."""
+
     async def test_subscriber_receives_notification(self):
         store = get_store()
         received = []
@@ -214,6 +217,7 @@ class TestSubscribers:
 
 class TestSelectors:
     """Selector-based notification skips dispatches where the selected value is unchanged."""
+
     async def test_selector_skips_unchanged(self):
         """Subscriber with selector should NOT be notified when selected value stays the same."""
         store = get_store()
@@ -338,6 +342,7 @@ class TestSelectors:
 
 class TestReducers:
     """Reducer registration, override, and unregistration on the store."""
+
     async def test_register_and_unregister_reducer(self):
         store = get_store()
 
@@ -396,6 +401,7 @@ class TestCascadeReducerCollision:
         from cascadeui.utils import cascade_reducer
 
         with pytest.raises(ValueError, match="built-in action"):
+
             @cascade_reducer("VIEW_CREATED")
             async def _shadow(action, state):
                 return state
@@ -404,6 +410,7 @@ class TestCascadeReducerCollision:
         from cascadeui.utils import cascade_reducer
 
         with pytest.raises(ValueError, match="NAVIGATION_PUSH"):
+
             @cascade_reducer("NAVIGATION_PUSH")
             async def _shadow(action, state):
                 return state
@@ -412,6 +419,7 @@ class TestCascadeReducerCollision:
         from cascadeui.utils import cascade_reducer
 
         with pytest.raises(ValueError, match="middleware"):
+
             @cascade_reducer("UNDO")
             async def _shadow(action, state):
                 return state
@@ -805,7 +813,8 @@ class TestPerfSampling:
             await store.dispatch("PERF_NOTIFY_ERR")
             await store._flush_notifications()
             samples = [
-                s for s in store._notify_samples
+                s
+                for s in store._notify_samples
                 if s["action"] == "PERF_NOTIFY_ERR" and s["subscriber_id"] == "crash"
             ]
             assert len(samples) == 1

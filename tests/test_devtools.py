@@ -122,6 +122,7 @@ class TestInspectorFiltering:
 
 class TestOverviewTab:
     """Overview tab returns containers with store stats and an exit row."""
+
     async def test_returns_list(self):
         interaction = _make_interaction()
         view = InspectorView(interaction=interaction)
@@ -145,6 +146,7 @@ class TestOverviewTab:
 
 class TestViewsTab:
     """Views tab shows an alert when empty and view cards when populated."""
+
     async def test_empty_state_shows_alert(self):
         interaction = _make_interaction()
         view = InspectorView(interaction=interaction)
@@ -177,6 +179,7 @@ class TestViewsTab:
 
 class TestSessionsTab:
     """Sessions tab shows an alert when empty and session cards when populated."""
+
     async def test_empty_state_shows_alert(self):
         interaction = _make_interaction()
         view = InspectorView(interaction=interaction)
@@ -207,6 +210,7 @@ class TestSessionsTab:
 
 class TestHistoryTab:
     """History tab shows an alert when empty and action cards when populated."""
+
     async def test_empty_state_shows_alert(self):
         interaction = _make_interaction()
         view = InspectorView(interaction=interaction)
@@ -231,6 +235,7 @@ class TestHistoryTab:
 
 class TestConfigTab:
     """Config tab shows reducer, middleware, and persistence cards."""
+
     async def test_returns_list_with_cards(self):
         interaction = _make_interaction()
         view = InspectorView(interaction=interaction)
@@ -252,6 +257,7 @@ class TestConfigTab:
 
 class TestTruncate:
     """_truncate joins short lists and adds overflow count for long ones."""
+
     def test_short_list(self):
         interaction = _make_interaction()
         view = InspectorView(interaction=interaction)
@@ -275,6 +281,7 @@ class TestTruncate:
 
 class TestFormatTimestamp:
     """_format_timestamp extracts time from ISO strings and handles N/A."""
+
     def test_iso_timestamp(self):
         interaction = _make_interaction()
         view = InspectorView(interaction=interaction)
@@ -303,6 +310,7 @@ class TestComputedAggregations:
             total_sessions,
             total_views,
         )
+
         assert callable(total_views)
         assert callable(total_sessions)
         assert callable(application_keys)

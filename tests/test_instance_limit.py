@@ -5,10 +5,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from helpers import make_interaction as _make_interaction
 
-from cascadeui.state.singleton import get_store
 from cascadeui import InstanceLimitError
-from cascadeui.views.view import StatefulView
+from cascadeui.state.singleton import get_store
 from cascadeui.views.persistent import PersistentView
+from cascadeui.views.view import StatefulView
 
 
 class _RaiseOnLimit:
@@ -29,6 +29,7 @@ class _RaiseOnLimit:
 
 class TestNoLimitByDefault:
     """Views without instance_limit send without restriction."""
+
     async def test_unlimited_views(self):
         """Views with instance_limit=None should send without restriction."""
         store = get_store()
@@ -99,6 +100,7 @@ class TestReplacePolicy:
 
 class TestRejectPolicy:
     """instance_policy='reject' blocks new views via on_instance_limit."""
+
     async def test_reject_invokes_on_instance_limit(self):
         """Second send() with reject policy should auto-handle via
         on_instance_limit and return None instead of propagating
@@ -132,6 +134,7 @@ class TestRejectPolicy:
 
 class TestScopeIsolation:
     """Instance limits apply independently per scope (user, guild, user_guild, global)."""
+
     async def test_user_scope_isolates_users(self):
         """Two different users should each get their own instance with user scope."""
 
@@ -188,6 +191,7 @@ class TestScopeIsolation:
 
 class TestPersistentProtection:
     """Non-persistent views cannot replace persistent views; persistent-to-persistent is allowed."""
+
     async def test_non_persistent_cannot_replace_persistent(self):
         """A non-persistent view should not be able to replace a persistent view."""
 
@@ -237,6 +241,7 @@ class TestPersistentProtection:
 
 class TestCleanupPaths:
     """exit, timeout, and replace all unregister the view from the instance index."""
+
     async def test_exit_unregisters(self):
         """exit() should remove the view from _active_views."""
 
@@ -291,6 +296,7 @@ class TestCleanupPaths:
 
 class TestMissingIdentity:
     """Enforcement is skipped when scope identifiers are unavailable (e.g. DMs)."""
+
     async def test_dm_with_user_guild_scope_skips_enforcement(self):
         """DM (no guild_id) with instance_scope='user_guild' should skip enforcement."""
 
@@ -337,14 +343,20 @@ class TestNavigationChainTracking:
         store = get_store()
         hub = _HubView(interaction=_make_interaction())
         await hub.send()
-        assert len(store._get_active_views(_HubView._class_session_key(), "user_guild:100:200")) == 1
+        assert (
+            len(store._get_active_views(_HubView._class_session_key(), "user_guild:100:200")) == 1
+        )
 
         # Push to sub-view — _navigate_to registers it, no send() needed
         sub = await hub.push(_SubView)
 
         # Sub-view should be tracked under _HubView, not _SubView
-        assert len(store._get_active_views(_HubView._class_session_key(), "user_guild:100:200")) == 1
-        assert len(store._get_active_views(_SubView._class_session_key(), "user_guild:100:200")) == 0
+        assert (
+            len(store._get_active_views(_HubView._class_session_key(), "user_guild:100:200")) == 1
+        )
+        assert (
+            len(store._get_active_views(_SubView._class_session_key(), "user_guild:100:200")) == 0
+        )
 
     async def test_second_command_replaces_subview(self):
         """A second root command should find and replace the active sub-view."""
@@ -440,7 +452,9 @@ class TestNavigationChainTracking:
         restored = await child.pop()
 
         # Restored view should be tracked under _PopRoot
-        assert len(store._get_active_views(_PopRoot._class_session_key(), "user_guild:100:200")) == 1
+        assert (
+            len(store._get_active_views(_PopRoot._class_session_key(), "user_guild:100:200")) == 1
+        )
         # The restored view IS a _PopRoot — origin is cleared back to None
         assert restored._instance_root_class is None
 
@@ -473,7 +487,8 @@ class TestNavigationChainTracking:
             len(store._get_active_views(_DestView._class_session_key(), "user_guild:100:200")) == 1
         )
         assert (
-            len(store._get_active_views(_SourceView._class_session_key(), "user_guild:100:200")) == 0
+            len(store._get_active_views(_SourceView._class_session_key(), "user_guild:100:200"))
+            == 0
         )
 
 

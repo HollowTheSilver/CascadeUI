@@ -15,11 +15,10 @@ import pytest
 from discord.ui import ActionRow
 from helpers import make_interaction as _make_interaction
 
-from cascadeui.components.base import StatefulButton
+from cascadeui.components.base import StatefulButton, StatefulSelect
 from cascadeui.components.inputs import Modal as CascadeModal
 from cascadeui.components.inputs import TextInput as CascadeTextInput
 from cascadeui.validation import min_length
-from cascadeui.components.base import StatefulSelect
 from cascadeui.views.patterns.form import (
     MAX_TEXT_FIELDS,
     FormLayoutView,
@@ -34,6 +33,7 @@ from cascadeui.views.patterns.form import (
 
 class TestResolveTextEditLabel:
     """Text edit button label resolves from override, single-field default, or generic fallback."""
+
     def test_override_wins(self):
         fields = [{"id": "u", "type": "text", "label": "Username"}]
         assert _resolve_modal_edit_label("Custom", fields) == "Custom"
@@ -59,6 +59,7 @@ class TestResolveTextEditLabel:
 
 class TestTextFieldCeiling:
     """FormView and FormLayoutView enforce the 5-text-field modal limit."""
+
     def _make_text_fields(self, n):
         return [{"id": f"f{i}", "type": "text", "label": f"F{i}"} for i in range(n)]
 
@@ -93,6 +94,7 @@ class TestTextFieldCeiling:
 
 class TestFormViewTextButton:
     """V1 FormView text edit button presence and absence based on field types."""
+
     def _find_text_button(self, view):
         for item in view.children:
             if (
@@ -158,6 +160,7 @@ class TestFormViewTextButton:
 
 class TestFormLayoutViewTextButton:
     """V2 FormLayoutView text edit button presence and absence based on field types."""
+
     def _find_text_button(self, view):
         for item in view.walk_children():
             if (
@@ -191,6 +194,7 @@ class TestFormLayoutViewTextButton:
 
 class TestBuildTextModal:
     """_build_form_modal generates a modal with one TextInput per text field."""
+
     def test_modal_contains_one_input_per_text_field(self):
         view = FormView(
             interaction=_make_interaction(),
@@ -348,6 +352,7 @@ class TestBuildTextModal:
 
 class TestOpenTextModal:
     """_open_text_modal routes through open_modal for both V1 and V2 forms."""
+
     async def test_formview_open_text_modal_calls_send_modal(self):
         view = FormView(
             interaction=_make_interaction(),
@@ -402,7 +407,10 @@ class TestOnFieldChangedHook:
                     "id": "color",
                     "type": "select",
                     "label": "Color",
-                    "options": [{"label": "Red", "value": "red"}, {"label": "Blue", "value": "blue"}],
+                    "options": [
+                        {"label": "Red", "value": "red"},
+                        {"label": "Blue", "value": "blue"},
+                    ],
                 }
             ],
         )
@@ -540,7 +548,10 @@ class TestInlineValidationErrors:
     async def _find_submit_callback(self, view):
         source = view.walk_children() if hasattr(view, "walk_children") else view.children
         for child in source:
-            if isinstance(child, StatefulButton) and getattr(child, "custom_id", None) == "form_submit":
+            if (
+                isinstance(child, StatefulButton)
+                and getattr(child, "custom_id", None) == "form_submit"
+            ):
                 return child.callback
         raise AssertionError("no submit button found")
 
@@ -640,7 +651,8 @@ class TestInlineValidationErrors:
         view._update_form_display = AsyncMock()
 
         yes_btn = next(
-            c for c in view.children
+            c
+            for c in view.children
             if isinstance(c, StatefulButton) and c.custom_id == "form_flag_yes"
         )
         await yes_btn.callback(_make_interaction())
@@ -920,11 +932,13 @@ class TestModalParseErrors:
 
         view = FormView(
             interaction=_make_interaction(),
-            fields=[{
-                "id": "age",
-                "type": "integer",
-                "validators": [tracking_validator],
-            }],
+            fields=[
+                {
+                    "id": "age",
+                    "type": "integer",
+                    "validators": [tracking_validator],
+                }
+            ],
         )
         view._update_form_display = AsyncMock()
 
@@ -1056,7 +1070,8 @@ class TestSubmitShortCircuit:
         view._validate_form = validate_spy
 
         submit_btn = next(
-            c for c in view.children
+            c
+            for c in view.children
             if isinstance(c, StatefulButton) and c.custom_id == "form_submit"
         )
 
@@ -1079,7 +1094,8 @@ class TestSubmitShortCircuit:
         view.exit = AsyncMock()
 
         submit_btn = next(
-            c for c in view.children
+            c
+            for c in view.children
             if isinstance(c, StatefulButton) and c.custom_id == "form_submit"
         )
 
@@ -1102,20 +1118,25 @@ class TestMultiSelect:
     def test_v1_renders_multi_select(self):
         view = FormView(
             interaction=_make_interaction(),
-            fields=[{
-                "id": "tags",
-                "type": "multi_select",
-                "label": "Tags",
-                "options": [
-                    {"label": "Red", "value": "r"},
-                    {"label": "Blue", "value": "b"},
-                    {"label": "Green", "value": "g"},
-                ],
-            }],
+            fields=[
+                {
+                    "id": "tags",
+                    "type": "multi_select",
+                    "label": "Tags",
+                    "options": [
+                        {"label": "Red", "value": "r"},
+                        {"label": "Blue", "value": "b"},
+                        {"label": "Green", "value": "g"},
+                    ],
+                }
+            ],
         )
         select = next(
-            (c for c in view.children
-             if isinstance(c, StatefulSelect) and c.custom_id == "form_tags"),
+            (
+                c
+                for c in view.children
+                if isinstance(c, StatefulSelect) and c.custom_id == "form_tags"
+            ),
             None,
         )
         assert select is not None
@@ -1124,19 +1145,24 @@ class TestMultiSelect:
     def test_v2_renders_multi_select_in_action_row(self):
         view = FormLayoutView(
             interaction=_make_interaction(),
-            fields=[{
-                "id": "tags",
-                "type": "multi_select",
-                "label": "Tags",
-                "options": [
-                    {"label": "Red", "value": "r"},
-                    {"label": "Blue", "value": "b"},
-                ],
-            }],
+            fields=[
+                {
+                    "id": "tags",
+                    "type": "multi_select",
+                    "label": "Tags",
+                    "options": [
+                        {"label": "Red", "value": "r"},
+                        {"label": "Blue", "value": "b"},
+                    ],
+                }
+            ],
         )
         select = next(
-            (item for item in view.walk_children()
-             if isinstance(item, StatefulSelect) and item.custom_id == "form_tags"),
+            (
+                item
+                for item in view.walk_children()
+                if isinstance(item, StatefulSelect) and item.custom_id == "form_tags"
+            ),
             None,
         )
         assert select is not None
@@ -1144,69 +1170,74 @@ class TestMultiSelect:
     def test_required_multi_select_has_min_one(self):
         view = FormView(
             interaction=_make_interaction(),
-            fields=[{
-                "id": "tags",
-                "type": "multi_select",
-                "required": True,
-                "options": [
-                    {"label": "A", "value": "a"},
-                    {"label": "B", "value": "b"},
-                ],
-            }],
+            fields=[
+                {
+                    "id": "tags",
+                    "type": "multi_select",
+                    "required": True,
+                    "options": [
+                        {"label": "A", "value": "a"},
+                        {"label": "B", "value": "b"},
+                    ],
+                }
+            ],
         )
         select = next(
-            c for c in view.children
-            if isinstance(c, StatefulSelect) and c.custom_id == "form_tags"
+            c for c in view.children if isinstance(c, StatefulSelect) and c.custom_id == "form_tags"
         )
         assert select.min_values == 1
 
     def test_optional_multi_select_has_min_zero(self):
         view = FormView(
             interaction=_make_interaction(),
-            fields=[{
-                "id": "tags",
-                "type": "multi_select",
-                "options": [{"label": "A", "value": "a"}],
-            }],
+            fields=[
+                {
+                    "id": "tags",
+                    "type": "multi_select",
+                    "options": [{"label": "A", "value": "a"}],
+                }
+            ],
         )
         select = next(
-            c for c in view.children
-            if isinstance(c, StatefulSelect) and c.custom_id == "form_tags"
+            c for c in view.children if isinstance(c, StatefulSelect) and c.custom_id == "form_tags"
         )
         assert select.min_values == 0
 
     def test_max_values_override_honored(self):
         view = FormView(
             interaction=_make_interaction(),
-            fields=[{
-                "id": "tags",
-                "type": "multi_select",
-                "max_values": 2,
-                "options": [
-                    {"label": "A", "value": "a"},
-                    {"label": "B", "value": "b"},
-                    {"label": "C", "value": "c"},
-                ],
-            }],
+            fields=[
+                {
+                    "id": "tags",
+                    "type": "multi_select",
+                    "max_values": 2,
+                    "options": [
+                        {"label": "A", "value": "a"},
+                        {"label": "B", "value": "b"},
+                        {"label": "C", "value": "c"},
+                    ],
+                }
+            ],
         )
         select = next(
-            c for c in view.children
-            if isinstance(c, StatefulSelect) and c.custom_id == "form_tags"
+            c for c in view.children if isinstance(c, StatefulSelect) and c.custom_id == "form_tags"
         )
         assert select.max_values == 2
 
     def test_default_preservation_marks_selected_options(self):
         view = FormView(
             interaction=_make_interaction(),
-            fields=[{
-                "id": "tags",
-                "type": "multi_select",
-                "options": [
-                    {"label": "A", "value": "a"},
-                    {"label": "B", "value": "b"},
-                    {"label": "C", "value": "c"},
-                ],
-            }],
+            fields=[
+                {
+                    "id": "tags",
+                    "type": "multi_select",
+                    "options": [
+                        {"label": "A", "value": "a"},
+                        {"label": "B", "value": "b"},
+                        {"label": "C", "value": "c"},
+                    ],
+                }
+            ],
         )
         view.values["tags"] = ["a", "c"]
         # Rebuild to pick up the new selection
@@ -1214,8 +1245,7 @@ class TestMultiSelect:
         view._create_form_controls()
 
         select = next(
-            c for c in view.children
-            if isinstance(c, StatefulSelect) and c.custom_id == "form_tags"
+            c for c in view.children if isinstance(c, StatefulSelect) and c.custom_id == "form_tags"
         )
         defaulted = {opt.value for opt in select.options if opt.default}
         assert defaulted == {"a", "c"}
@@ -1223,20 +1253,21 @@ class TestMultiSelect:
     async def test_multi_select_callback_writes_list(self):
         view = FormView(
             interaction=_make_interaction(),
-            fields=[{
-                "id": "tags",
-                "type": "multi_select",
-                "options": [
-                    {"label": "A", "value": "a"},
-                    {"label": "B", "value": "b"},
-                ],
-            }],
+            fields=[
+                {
+                    "id": "tags",
+                    "type": "multi_select",
+                    "options": [
+                        {"label": "A", "value": "a"},
+                        {"label": "B", "value": "b"},
+                    ],
+                }
+            ],
         )
         view._update_form_display = AsyncMock()
 
         select = next(
-            c for c in view.children
-            if isinstance(c, StatefulSelect) and c.custom_id == "form_tags"
+            c for c in view.children if isinstance(c, StatefulSelect) and c.custom_id == "form_tags"
         )
         # Stamp the select with fake user selection
         select._values = ["a", "b"]
@@ -1250,11 +1281,13 @@ class TestMultiSelect:
     def test_format_multi_select_display(self):
         view = FormView(
             interaction=_make_interaction(),
-            fields=[{
-                "id": "tags",
-                "type": "multi_select",
-                "options": [{"label": "A", "value": "a"}],
-            }],
+            fields=[
+                {
+                    "id": "tags",
+                    "type": "multi_select",
+                    "options": [{"label": "A", "value": "a"}],
+                }
+            ],
         )
         rendered = view._format_field_value(view.fields[0], ["a", "b"])
         assert rendered == "a, b"
@@ -1262,23 +1295,27 @@ class TestMultiSelect:
     def test_format_multi_select_empty(self):
         view = FormView(
             interaction=_make_interaction(),
-            fields=[{
-                "id": "tags",
-                "type": "multi_select",
-                "options": [{"label": "A", "value": "a"}],
-            }],
+            fields=[
+                {
+                    "id": "tags",
+                    "type": "multi_select",
+                    "options": [{"label": "A", "value": "a"}],
+                }
+            ],
         )
         assert view._format_field_value(view.fields[0], []) == "Not set"
 
     def test_required_multi_select_empty_list_blocks_submit(self):
         view = FormView(
             interaction=_make_interaction(),
-            fields=[{
-                "id": "tags",
-                "type": "multi_select",
-                "required": True,
-                "options": [{"label": "A", "value": "a"}],
-            }],
+            fields=[
+                {
+                    "id": "tags",
+                    "type": "multi_select",
+                    "required": True,
+                    "options": [{"label": "A", "value": "a"}],
+                }
+            ],
         )
         view.values["tags"] = []
         assert view._is_field_empty(view.fields[0]) is True

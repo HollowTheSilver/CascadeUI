@@ -7,12 +7,13 @@ from helpers import make_interaction as _make_interaction
 
 from cascadeui.state.middleware import UndoMiddleware
 from cascadeui.state.singleton import get_store
-from cascadeui.state.slots import read_slot, access_slot
+from cascadeui.state.slots import access_slot, read_slot
 from cascadeui.views.layout import StatefulLayoutView
 
 
 class TestUndoMiddleware:
     """Undo/redo snapshot creation, restoration, and view-local stack behavior."""
+
     async def test_dispatch_creates_undo_snapshot(self):
         store = get_store()
         undo_mw = UndoMiddleware()
@@ -272,9 +273,7 @@ class TestUndoMiddleware:
         assert read_slot(store.state, "scoped", "user:11")["theme"] == "dark"
 
         # Undo should restore the original theme
-        await store.dispatch(
-            "UNDO", {"view_id": "v_scoped_undo", "session_id": "scoped_undo_s"}
-        )
+        await store.dispatch("UNDO", {"view_id": "v_scoped_undo", "session_id": "scoped_undo_s"})
         assert read_slot(store.state, "scoped", "user:11")["theme"] == "light"
 
     async def test_undo_does_not_corrupt_stacks(self):
@@ -644,6 +643,7 @@ class TestUndoDepthProperties:
 
     async def test_depth_zero_before_any_dispatch(self):
         """A fresh undo-enabled view reports zero depth on both stacks."""
+
         class _V(StatefulLayoutView):
             enable_undo = True
 
@@ -653,6 +653,7 @@ class TestUndoDepthProperties:
 
     async def test_depth_reads_live_stack_lengths(self):
         """The properties read directly from the view's undo_stack / redo_stack slots."""
+
         class _V(StatefulLayoutView):
             enable_undo = True
 
@@ -669,6 +670,7 @@ class TestUndoDepthProperties:
 
     async def test_depth_zero_when_view_missing_from_state(self):
         """Properties return 0 when the view has no state entry yet (pre-send)."""
+
         class _V(StatefulLayoutView):
             pass
 

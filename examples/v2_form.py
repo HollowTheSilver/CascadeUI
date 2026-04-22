@@ -63,6 +63,7 @@ Usage:
 
 
 import asyncio
+import logging
 
 import discord
 from discord.ext import commands
@@ -77,8 +78,6 @@ from cascadeui import (
     min_length,
     regex,
 )
-
-import logging
 
 logger = logging.getLogger(__name__)
 

@@ -45,6 +45,7 @@ Usage:
 # // ========================================( Modules )======================================== // #
 
 
+import logging
 from datetime import datetime, timezone
 
 import discord
@@ -56,16 +57,14 @@ from cascadeui import (
     PersistentLayoutView,
     StatefulButton,
     StatefulLayoutView,
+    access_slot,
     card,
     cascade_reducer,
     divider,
     key_value,
-    slugify,
     slot_property,
-    access_slot,
+    slugify,
 )
-
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -181,8 +180,12 @@ class RoleSelectorPanel(PersistentLayoutView):
                     style=discord.ButtonStyle.secondary,
                     custom_id=f"roles:{slugify(category_name)}:{slugify(role_name)}",
                     callback=self._make_toggle(
-                        role_id, role_name, category_name,
-                        exclusive, required, category_role_ids,
+                        role_id,
+                        role_name,
+                        category_name,
+                        exclusive,
+                        required,
+                        category_role_ids,
                     ),
                 )
                 buttons.append(btn)
@@ -251,9 +254,7 @@ class RoleSelectorPanel(PersistentLayoutView):
                 # The check runs before the API call so no mutation ships
                 # on a rejected request.
                 if required:
-                    current_in_category = [
-                        r for r in member.roles if r.id in category_role_ids
-                    ]
+                    current_in_category = [r for r in member.roles if r.id in category_role_ids]
                     if len(current_in_category) <= 1:
                         await self.respond(
                             interaction,
@@ -285,9 +286,7 @@ class RoleSelectorPanel(PersistentLayoutView):
                         ephemeral=True,
                     )
                 else:
-                    await self.respond(
-                        interaction, f"Gave you **{role.name}**!", ephemeral=True
-                    )
+                    await self.respond(interaction, f"Gave you **{role.name}**!", ephemeral=True)
 
         return callback
 
@@ -375,9 +374,7 @@ class PersonalVisitsView(StatefulLayoutView):
     # ``self.last_visit`` resolve at attribute access against the live
     # store state, falling back to the declared defaults when the slot
     # has no entry for this user yet.
-    count = slot_property(
-        "count", slot="visits", key=lambda self: self.user_id, default=0
-    )
+    count = slot_property("count", slot="visits", key=lambda self: self.user_id, default=0)
     last_visit = slot_property(
         "last_visit", slot="visits", key=lambda self: self.user_id, default=None
     )

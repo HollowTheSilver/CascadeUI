@@ -5,16 +5,16 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 import pytest
 from discord.ui import Container, TextDisplay
-
-from cascadeui.views.patterns import WizardLayoutView, WizardView
 from helpers import make_interaction as _make_interaction
 
+from cascadeui.views.patterns import WizardLayoutView, WizardView
 
 # // ========================================( Button style validation )======================================== // #
 
 
 class TestButtonStyleValidation:
     """Invalid wizard button styles raise at class definition time."""
+
     def test_invalid_wizard_style_raises_at_definition(self):
         with pytest.raises(ValueError, match="must be a discord.ButtonStyle"):
 
@@ -35,6 +35,7 @@ class TestButtonStyleValidation:
 
 class TestWizardLayoutViewCustomization:
     """Custom labels and styles apply to generated wizard navigation buttons."""
+
     async def test_back_button_label_override(self):
         async def builder():
             return [Container(TextDisplay("s"))]
@@ -94,6 +95,7 @@ class TestWizardLayoutViewCustomization:
 
 class TestOnFinishMethodHook:
     """on_finish method override fires when reaching the last step."""
+
     async def test_on_finish_method_override_fires(self):
         async def builder():
             return [Container(TextDisplay("s"))]
@@ -452,6 +454,7 @@ class TestProgressHeader:
 
     async def test_progress_header_hidden_when_one_visible_step(self):
         """Header auto-hides when only a single step is visible."""
+
         async def builder():
             return [Container(TextDisplay("only"))]
 
@@ -488,6 +491,7 @@ class TestProgressHeader:
 
     async def test_progress_header_override_returns_none(self):
         """Returning None from _build_progress_header suppresses the header."""
+
         async def builder():
             return [Container(TextDisplay("s"))]
 
@@ -509,6 +513,7 @@ class TestProgressHeader:
 
     async def test_progress_header_reflects_current_position(self):
         """Header text updates to reflect current step position after nav."""
+
         async def builder():
             return [Container(TextDisplay("s"))]
 

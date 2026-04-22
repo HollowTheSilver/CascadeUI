@@ -6,10 +6,10 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 import pytest
 from discord.ui import Container, TextDisplay
+from helpers import make_interaction as _make_interaction
 
 from cascadeui.views.patterns import TabLayoutView
 from cascadeui.views.patterns.tabs import TabView
-from helpers import make_interaction as _make_interaction
 
 
 async def _builder():
@@ -21,6 +21,7 @@ async def _builder():
 
 class TestTabStyleValidation:
     """Invalid tab button styles raise at class definition time."""
+
     def test_invalid_style_raises_at_definition(self):
         with pytest.raises(ValueError, match="must be a discord.ButtonStyle"):
 
@@ -40,6 +41,7 @@ class TestTabStyleValidation:
 
 class TestTabStyleApplication:
     """Custom active/inactive tab styles apply to generated buttons."""
+
     async def test_initial_styles_follow_customization(self):
         class ThemedTabs(TabLayoutView):
             active_tab_style = discord.ButtonStyle.success
@@ -74,6 +76,7 @@ class TestTabStyleApplication:
 
 class TestOnTabSwitchedHook:
     """on_tab_switched hook fires on tab change and defaults to no-op."""
+
     async def test_default_hook_is_noop(self):
         """Default hook must not raise or mutate state."""
         view = TabLayoutView(

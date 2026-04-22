@@ -416,13 +416,9 @@ class TestStableCustomIds:
 
         view = self._make_view_with_build(build)
         view.build_ui()
-        first = [
-            c.custom_id for c in view.walk_children() if isinstance(c, StatefulButton)
-        ]
+        first = [c.custom_id for c in view.walk_children() if isinstance(c, StatefulButton)]
         view.build_ui()
-        second = [
-            c.custom_id for c in view.walk_children() if isinstance(c, StatefulButton)
-        ]
+        second = [c.custom_id for c in view.walk_children() if isinstance(c, StatefulButton)]
         assert first == second
 
     def test_colliding_content_uses_position_anchor(self):
@@ -464,27 +460,21 @@ class TestStableCustomIds:
             view.clear_items()
             for row in range(3):
                 view.add_item(
-                    ActionRow(
-                        *(StatefulButton(label=marks[row * 3 + c]) for c in range(3))
-                    )
+                    ActionRow(*(StatefulButton(label=marks[row * 3 + c]) for c in range(3)))
                 )
 
         view = self._make_view_with_build(build)
         view.build_ui()
         turn1 = {
             i: c.custom_id
-            for i, c in enumerate(
-                b for b in view.walk_children() if isinstance(b, StatefulButton)
-            )
+            for i, c in enumerate(b for b in view.walk_children() if isinstance(b, StatefulButton))
         }
 
         marks[4] = "X"  # center cell played
         view.build_ui()
         turn2 = {
             i: c.custom_id
-            for i, c in enumerate(
-                b for b in view.walk_children() if isinstance(b, StatefulButton)
-            )
+            for i, c in enumerate(b for b in view.walk_children() if isinstance(b, StatefulButton))
         }
 
         # The played cell's id is allowed to change (it is now disabled
@@ -539,9 +529,9 @@ class TestStableCustomIdsAtRefresh:
         buttons = [c for c in view.walk_children() if isinstance(c, StatefulButton)]
         prefix = view.id[:8]
         for btn in buttons:
-            assert btn.custom_id.startswith(f"{prefix}:"), (
-                f"custom_id {btn.custom_id!r} missing stable prefix"
-            )
+            assert btn.custom_id.startswith(
+                f"{prefix}:"
+            ), f"custom_id {btn.custom_id!r} missing stable prefix"
         assert "Enable" in buttons[0].custom_id
         assert "Clear Samples" in buttons[1].custom_id
 
@@ -641,9 +631,7 @@ class TestRenderHashShortCircuit:
 
         def build(view):
             view.clear_items()
-            view.add_item(
-                ActionRow(StatefulButton(label=marks[0], custom_id="a"))
-            )
+            view.add_item(ActionRow(StatefulButton(label=marks[0], custom_id="a")))
 
         view = self._make_view_with_build(build)
         view.build_ui()
@@ -926,22 +914,26 @@ class TestRefreshThrottling:
         validator rejects it so users don't assume 0 means 'off'.
         """
         with pytest.raises(ValueError, match="refresh_cooldown_ms"):
+
             class _Bad(StatefulLayoutView):
                 refresh_cooldown_ms = 0
 
     def test_cooldown_ms_negative_rejected_at_class_def(self):
         with pytest.raises(ValueError, match="refresh_cooldown_ms"):
+
             class _Bad(StatefulLayoutView):
                 refresh_cooldown_ms = -100
 
     def test_cooldown_ms_none_accepted(self):
         class _OK(StatefulLayoutView):
             refresh_cooldown_ms = None
+
         assert _OK.refresh_cooldown_ms is None
 
     def test_cooldown_ms_positive_int_accepted(self):
         class _OK(StatefulLayoutView):
             refresh_cooldown_ms = 250
+
         assert _OK.refresh_cooldown_ms == 250
 
     async def test_cooldown_off_does_not_advance_throttle(self):
@@ -1239,9 +1231,7 @@ class TestActingViewFastPath:
         view = self._make_view(self._build_simple)
         self._prime(view)
         interaction = self._make_acting_interaction()
-        interaction.response.edit_message = AsyncMock(
-            side_effect=_FakeRateLimit(retry_after=0.75)
-        )
+        interaction.response.edit_message = AsyncMock(side_effect=_FakeRateLimit(retry_after=0.75))
 
         token = _CURRENT_INTERACTION.set(interaction)
         before = time.monotonic()

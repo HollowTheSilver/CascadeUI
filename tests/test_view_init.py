@@ -36,6 +36,7 @@ class TestSnowflakeIdCoercion:
 
 class TestInitKwargs:
     """_init_kwargs captures reconstructible kwargs and excludes internal keys."""
+
     async def test_captures_theme(self):
         """_init_kwargs should include theme when provided."""
         view = StatefulView(theme="dark")
@@ -323,7 +324,6 @@ class TestSetClassAttribute:
         assert view.participant_limit == 8
         assert _OkView.participant_limit == 2
 
-
     def test_method_rejected(self):
         view = StatefulView()
         with pytest.raises(ValueError, match="method or property"):
@@ -337,6 +337,7 @@ class TestSetClassAttribute:
 
 class TestSubscribedActionsOverride:
     """Class-level subscribed_actions overrides control which actions notify the view."""
+
     async def test_default_subscribed_actions(self):
         """Views without a class-level override should get an empty set."""
         view = StatefulView()

@@ -1473,9 +1473,7 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
                     await active[view_id].exit()
                     exited += 1
                 except Exception as exc:
-                    logger.debug(
-                        "clear_session: view %s failed to exit cleanly: %s", view_id, exc
-                    )
+                    logger.debug("clear_session: view %s failed to exit cleanly: %s", view_id, exc)
                     failed += 1
             else:
                 await _cleanup_ghost_view(store, view_id)
@@ -1590,9 +1588,7 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
             if cv is None:
                 return await ctx.send(f"No computed named `{name}`.", ephemeral=True)
             value = cv.get(store.state)
-            return await ctx.send(
-                f"`{name}` = `{value!r}`", ephemeral=True
-            )
+            return await ctx.send(f"`{name}` = `{value!r}`", ephemeral=True)
 
         if not entries:
             return await ctx.send("No @computed values registered.", ephemeral=True)
@@ -1630,9 +1626,7 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
 
     # // ==================( Diagnostic Commands )================== // #
 
-    @cascadeui_group.command(
-        name="history", description="Show recent CascadeUI action history."
-    )
+    @cascadeui_group.command(name="history", description="Show recent CascadeUI action history.")
     async def show_history(self, ctx: Context, limit: int = 20) -> None:
         """Display the most recent entries in ``store.history``.
 
@@ -1653,9 +1647,7 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
             lines.append(f"`{action_type}` src=`{source}`")
         await ctx.send("\n".join(lines)[:1900], ephemeral=True)
 
-    @cascadeui_group.command(
-        name="perf", description="Toggle or inspect CascadeUI perf sampling."
-    )
+    @cascadeui_group.command(name="perf", description="Toggle or inspect CascadeUI perf sampling.")
     async def toggle_perf(self, ctx: Context, action: str = "status") -> None:
         """Control per-dispatch timing sample collection.
 
@@ -1738,12 +1730,8 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
 
         lines = [f"**{len(store.subscribers)} subscriber(s)**"]
         for sid, (_, action_filter, _) in list(store.subscribers.items())[:_LIST_DISPLAY_CAP]:
-            filter_desc = (
-                f"{len(action_filter)} action(s)" if action_filter else "all actions"
-            )
+            filter_desc = f"{len(action_filter)} action(s)" if action_filter else "all actions"
             lines.append(f"`{sid[:20]}...` -- {filter_desc}")
         if len(store.subscribers) > _LIST_DISPLAY_CAP:
-            lines.append(
-                f"*...and {len(store.subscribers) - _LIST_DISPLAY_CAP} more*"
-            )
+            lines.append(f"*...and {len(store.subscribers) - _LIST_DISPLAY_CAP} more*")
         await ctx.send("\n".join(lines), ephemeral=True)

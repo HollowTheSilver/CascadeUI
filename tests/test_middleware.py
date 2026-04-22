@@ -18,6 +18,7 @@ def make_action(action_type, payload=None, source=None):
 
 class TestMiddlewarePipeline:
     """Middleware receives actions, can modify or block them, and chains correctly."""
+
     async def test_middleware_receives_action(self):
         store = get_store()
         received = []

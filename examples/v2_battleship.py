@@ -58,6 +58,7 @@ Usage:
 # // ========================================( Modules )======================================== // #
 
 import asyncio
+import logging
 import random
 
 import discord
@@ -71,10 +72,11 @@ from cascadeui import (
     EmojiGrid,
     InstanceLimitError,
     LeaderboardLayoutView,
-    StateStore,
     StatefulButton,
     StatefulLayoutView,
     StatefulSelect,
+    StateStore,
+    access_slot,
     alert,
     card,
     cascade_reducer,
@@ -82,14 +84,11 @@ from cascadeui import (
     divider,
     emoji_grid,
     gap,
-    read_slot,
     get_store,
     key_value,
-    access_slot,
+    read_slot,
     stats_card,
 )
-
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -297,9 +296,7 @@ def battleship_leaderboards(bucket: dict) -> dict:
     # format and silently skips malformed entries.
     envelope = {"application": {"battleship_stats": bucket}}
     by_guild: dict = {}
-    for ids, stats in StateStore.iter_scoped(
-        envelope, "user_guild", slot_name="battleship_stats"
-    ):
+    for ids, stats in StateStore.iter_scoped(envelope, "user_guild", slot_name="battleship_stats"):
         if stats.get("games", 0) == 0:
             continue
         by_guild.setdefault(ids["guild_id"], []).append((ids["user_id"], stats))
@@ -886,7 +883,8 @@ class BattleshipView(StatefulLayoutView):
         attack = self._attack_1 if self.turn == 1 else self._attack_2
         if attack[target] != WATER:
             await self.respond(
-                interaction, f"You already fired at **{coord}**! Pick a different cell.",
+                interaction,
+                f"You already fired at **{coord}**! Pick a different cell.",
                 ephemeral=True,
             )
             return
@@ -1096,9 +1094,7 @@ class BattleshipView(StatefulLayoutView):
             await self._record_player_stats(loser_id, won=False, forfeit=forfeit)
         await self._cleanup_attached_children()
 
-    async def _record_player_stats(
-        self, player_id: int, *, won: bool, forfeit: bool
-    ) -> None:
+    async def _record_player_stats(self, player_id: int, *, won: bool, forfeit: bool) -> None:
         """Bump a player's lifetime totals via ``user_guild``-scoped state.
 
         Demonstrates the mixed-scope half of the design: shared per-game

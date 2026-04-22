@@ -39,6 +39,8 @@ Usage:
 # // ========================================( Modules )======================================== // #
 
 
+import logging
+
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -49,9 +51,9 @@ from cascadeui import (
     DisplayLayoutView,
     InstanceLimitError,
     LeaderboardLayoutView,
-    StateStore,
     StatefulButton,
     StatefulLayoutView,
+    StateStore,
     alert,
     button_grid,
     card,
@@ -62,8 +64,6 @@ from cascadeui import (
     key_value,
     stats_card,
 )
-
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -269,12 +269,12 @@ class TicTacToeView(StatefulLayoutView):
     unauthorized_message = "You're not part of this game."
     instance_limit = 1
     instance_scope = "user_guild"
-    instance_policy = "replace"    # protect_attached = True is the library default. The challenger
+    instance_policy = "replace"  # protect_attached = True is the library default. The challenger
     # cannot silently abandon an active game -- they must exit the current
     # board before starting a new one. Without this, Player B's game would
     # vanish with no warning when Player A re-challenges someone else.
     protect_attached = True
-    replace_policy = "delete"    # ``state_scope = None`` because the live game board is ephemeral
+    replace_policy = "delete"  # ``state_scope = None`` because the live game board is ephemeral
     # view-local state -- nothing about an in-progress game belongs to
     # one player's profile. Lifetime stats are dispatched separately to
     # ``user_guild`` scope at game end via ``_record_player_stats``.
@@ -289,7 +289,7 @@ class TicTacToeView(StatefulLayoutView):
     # (``state_scope`` is ``None``) so nothing else here depends on disk.
     scoped_slot = "tictactoe_stats"
     persistent_slots = ("tictactoe_stats",)
-    auto_defer = True    # No Redux reactivity -- the board rebuilds from instance state on
+    auto_defer = True  # No Redux reactivity -- the board rebuilds from instance state on
     # every move. Stats dispatches happen at game end and are not
     # observed by this view.
     subscribed_actions = set()
@@ -460,9 +460,7 @@ class TicTacToeView(StatefulLayoutView):
             # Turn enforcement: the other player gets an ephemeral nudge
             current_player = self.player_x if self.turn == "X" else self.player_o
             if interaction.user.id != current_player:
-                await self.respond(
-                    interaction, f"It's <@{current_player}>'s turn!", ephemeral=True
-                )
+                await self.respond(interaction, f"It's <@{current_player}>'s turn!", ephemeral=True)
                 return
 
             # Place the mark
@@ -517,9 +515,7 @@ class TicTacToeView(StatefulLayoutView):
                 await self._record_player_stats(winner_id, outcome="win", forfeit=False)
                 await self._record_player_stats(loser_id, outcome="loss", forfeit=loser_forfeited)
 
-    async def _record_player_stats(
-        self, player_id: int, *, outcome: str, forfeit: bool
-    ) -> None:
+    async def _record_player_stats(self, player_id: int, *, outcome: str, forfeit: bool) -> None:
         """Bump a player's lifetime totals via ``user_guild``-scoped state.
 
         TicTacToe tracks draws as a distinct outcome, so ``outcome`` is
@@ -603,9 +599,7 @@ def tictactoe_leaderboards(bucket: dict) -> dict:
     # format and silently skips malformed entries.
     envelope = {"application": {"tictactoe_stats": bucket}}
     by_guild: dict = {}
-    for ids, stats in StateStore.iter_scoped(
-        envelope, "user_guild", slot_name="tictactoe_stats"
-    ):
+    for ids, stats in StateStore.iter_scoped(envelope, "user_guild", slot_name="tictactoe_stats"):
         if stats.get("games", 0) == 0:
             continue
         by_guild.setdefault(ids["guild_id"], []).append((ids["user_id"], stats))

@@ -6,14 +6,15 @@ import pytest
 from helpers import make_interaction as _make_interaction
 
 from cascadeui.state.singleton import get_store
-from cascadeui.views.view import StatefulView
 from cascadeui.views.persistent import PersistentView
+from cascadeui.views.view import StatefulView
 
 # // ========================================( Owner Can Interact )======================================== // #
 
 
 class TestOwnerCanInteract:
     """The view's owner passes interaction_check without rejection."""
+
     async def test_owner_passes_check(self):
         """The user who created the view should pass interaction_check."""
         view = StatefulView(interaction=_make_interaction(user_id=100))
@@ -36,6 +37,7 @@ class TestOwnerCanInteract:
 
 class TestNonOwnerRejected:
     """Non-owner users are rejected with an ephemeral message."""
+
     async def test_non_owner_fails_check(self):
         """A different user should be rejected by interaction_check."""
         view = StatefulView(interaction=_make_interaction(user_id=100))
@@ -74,6 +76,7 @@ class TestNonOwnerRejected:
 
 class TestOwnerOnlyOptOut:
     """owner_only=False allows any user to interact."""
+
     async def test_owner_only_false_allows_anyone(self):
         """Setting owner_only=False should let any user interact."""
 
@@ -104,6 +107,7 @@ class TestOwnerOnlyOptOut:
 
 class TestPersistentViewDefault:
     """PersistentView defaults to owner_only=False."""
+
     async def test_persistent_view_allows_anyone(self):
         """PersistentView defaults to owner_only=False."""
 
@@ -133,6 +137,7 @@ class TestPersistentViewDefault:
 
 class TestNoneUserId:
     """Views with user_id=None skip ownership checks entirely."""
+
     async def test_none_user_id_skips_check(self):
         """Views with no user_id (e.g. restored) should skip ownership check."""
         view = StatefulView()  # No context or interaction — user_id is None
@@ -156,6 +161,7 @@ class TestNoneUserId:
 
 class TestAllowedUsers:
     """allowed_users set gates interaction access independently of owner_only."""
+
     async def test_allowed_user_passes(self):
         """A user in allowed_users should pass interaction_check."""
         view = StatefulView(interaction=_make_interaction(user_id=100))

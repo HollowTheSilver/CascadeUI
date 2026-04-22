@@ -27,11 +27,11 @@ Usage:
 # // ========================================( Modules )======================================== // #
 
 
+import logging
+
 import discord
 from discord.ext import commands
 from discord.ext.commands import Context
-
-import logging
 
 from cascadeui import (
     MenuView,
@@ -371,13 +371,13 @@ class NotificationsView(StatefulView):
         Mirrors the V2 factories in ``v2_settings.py`` so the three
         settings views read the same way.
         """
+
         async def toggle(interaction):
             s = _read_user_settings(self.scoped_state)
             # auto_defer handles acknowledgment; on_state_changed handles
             # _build_buttons + message.edit via the SETTINGS_UPDATED subscription.
-            await self.dispatch_scoped_as(
-                "SETTINGS_UPDATED", {key: not s[key]}, scope="user"
-            )
+            await self.dispatch_scoped_as("SETTINGS_UPDATED", {key: not s[key]}, scope="user")
+
         return toggle
 
     def _build_buttons(self):
@@ -391,9 +391,7 @@ class NotificationsView(StatefulView):
                 StatefulButton(
                     label=f"{label}: {'ON' if s[key] else 'OFF'}",
                     style=(
-                        discord.ButtonStyle.success
-                        if s[key]
-                        else discord.ButtonStyle.secondary
+                        discord.ButtonStyle.success if s[key] else discord.ButtonStyle.secondary
                     ),
                     callback=self._make_toggle(key),
                 )
@@ -562,14 +560,10 @@ class LocaleView(StatefulView):
 
     async def on_language(self, interaction, values):
         # auto_defer handles acknowledgment.
-        await self.dispatch_scoped_as(
-            "SETTINGS_UPDATED", {"language": values[0]}, scope="user"
-        )
+        await self.dispatch_scoped_as("SETTINGS_UPDATED", {"language": values[0]}, scope="user")
 
     async def on_timezone(self, interaction, values):
-        await self.dispatch_scoped_as(
-            "SETTINGS_UPDATED", {"timezone": values[0]}, scope="user"
-        )
+        await self.dispatch_scoped_as("SETTINGS_UPDATED", {"timezone": values[0]}, scope="user")
 
     async def go_back(self, interaction):
         await self.pop(interaction, rebuild=lambda v: {"embed": v.build_embed()})

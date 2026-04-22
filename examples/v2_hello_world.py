@@ -36,7 +36,6 @@ from discord.ui import ActionRow, TextDisplay
 
 from cascadeui import StatefulButton, StatefulLayoutView, StateStore, card
 
-
 # // ========================================( Counter View )======================================== // #
 
 
