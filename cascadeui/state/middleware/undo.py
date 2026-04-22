@@ -24,7 +24,9 @@ _MISSING: Any = object()
 # observability signals fired after the persistence manager has already
 # deleted rows on disk; there is no user-meaningful in-memory change to
 # undo, and snapshotting every prune would waste memory on a routine
-# maintenance path.
+# maintenance path. INSPECTOR_PURGED_STALE mutates transient
+# component/modal dispatch-log buffers (not ``application`` slots) and
+# is a devtools maintenance sweep that no user would want rewound.
 _SKIP_ACTIONS: Set[str] = {
     "VIEW_CREATED",
     "VIEW_UPDATED",
@@ -40,6 +42,7 @@ _SKIP_ACTIONS: Set[str] = {
     "UNDO",
     "REDO",
     "COMPONENT_INTERACTION",
+    "INSPECTOR_PURGED_STALE",
     "APPLICATION_SLOTS_PRUNED",
     "REGISTRY_PRUNED",
 }

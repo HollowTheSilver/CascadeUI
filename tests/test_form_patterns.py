@@ -1,7 +1,7 @@
 """Tests for FormView and FormLayoutView native ``"text"`` field support.
 
-Covers the Phase 2A library upgrade: FormView / FormLayoutView now render
-``"text"`` fields through a grouped "Edit Text Fields" button that opens a
+FormView and FormLayoutView render ``"text"`` fields through a grouped
+"Edit Text Fields" button that opens a
 single :class:`cascadeui.Modal`. Tests here exercise the construction-time
 5-text-field ceiling, the smart singular/plural label default, the modal
 round-trip (values wiring through ``form.values``), and the rebuild path

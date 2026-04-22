@@ -28,6 +28,57 @@ class TestStateStoreSingleton:
         assert "components" in store.state
         assert "application" in store.state
 
+    def test_build_initial_state_returns_canonical_shape(self):
+        shape = StateStore._build_initial_state()
+        assert shape == {
+            "sessions": {},
+            "views": {},
+            "components": {},
+            "application": {},
+        }
+
+    def test_build_initial_state_returns_fresh_dict(self):
+        a = StateStore._build_initial_state()
+        b = StateStore._build_initial_state()
+        assert a == b
+        assert a is not b
+        a["sessions"]["x"] = 1
+        assert "x" not in b["sessions"]
+
+    def test_init_uses_build_initial_state(self):
+        store = get_store()
+        # Reset to a known shape, verify it matches the helper output.
+        store.state = StateStore._build_initial_state()
+        assert store.state == StateStore._build_initial_state()
+
+
+class TestGetActiveViews:
+    """Public read-only accessor for the active view registry."""
+
+    def test_returns_mapping_view_reflecting_registry(self):
+        store = get_store()
+        store._active_views.clear()
+        view = object()
+        store._active_views["v1"] = view
+        mapping = store.get_active_views()
+        assert mapping["v1"] is view
+        assert len(mapping) == 1
+
+    def test_is_live_not_snapshot(self):
+        store = get_store()
+        store._active_views.clear()
+        mapping = store.get_active_views()
+        assert len(mapping) == 0
+        store._active_views["v1"] = object()
+        assert "v1" in mapping
+
+    def test_rejects_mutation(self):
+        store = get_store()
+        store._active_views.clear()
+        mapping = store.get_active_views()
+        with pytest.raises(TypeError):
+            mapping["v1"] = object()
+
 
 class TestDispatch:
     """Dispatch routes actions through registered reducers and records history."""

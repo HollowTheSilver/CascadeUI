@@ -62,8 +62,14 @@ logger = logging.getLogger(__name__)
 
 # Built-in actions that carry no persistence obligation. Views and
 # sessions are rebuilt from the registry rows on restart, navigation
-# state is ephemeral, and the *_PRUNED actions fire *after* the manager
-# has already deleted rows on disk.
+# state is ephemeral, ``INSPECTOR_PURGED_STALE`` mutates transient
+# component/modal dispatch-log buffers outside the ``application``
+# namespace, and the *_PRUNED actions fire *after* the manager has
+# already deleted rows on disk. ``SCOPED_UPDATE`` and
+# ``PERSISTENT_VIEW_REGISTERED`` / ``PERSISTENT_VIEW_UNREGISTERED`` are
+# deliberately absent -- scoped writes can ride the opt-in
+# ``persistent_slots`` path, and the persistent-view family is the
+# registry-row write signal.
 _BOOKKEEPING_ACTIONS = frozenset(
     {
         "SESSION_CREATED",
@@ -79,6 +85,7 @@ _BOOKKEEPING_ACTIONS = frozenset(
         "UNDO",
         "REDO",
         "BATCH_COMPLETE",
+        "INSPECTOR_PURGED_STALE",
         "APPLICATION_SLOTS_PRUNED",
         "REGISTRY_PRUNED",
     }

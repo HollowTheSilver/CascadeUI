@@ -505,7 +505,7 @@ class TestParticipantSessions:
         assert 300 in view._participants
 
     async def test_register_participant_coerces_snowflake_object(self):
-        """v3.0.0: register_participant accepts Member-shaped objects."""
+        """register_participant accepts Member-shaped objects via snowflake coercion."""
 
         class _GameView(StatefulView):
             instance_limit = 1
@@ -520,7 +520,7 @@ class TestParticipantSessions:
         assert 777 in view._participants
 
     async def test_register_participant_invalid_type_raises(self):
-        """v3.0.0: register_participant rejects non-Snowflake input loudly."""
+        """register_participant rejects non-Snowflake input with TypeError."""
 
         class _GameView(StatefulView):
             instance_limit = 1
@@ -635,9 +635,8 @@ class TestParticipantSessions:
     async def test_participant_blocks_joining_another(self):
         """A participant in game 1 should be blocked from joining game 2.
 
-        v3.0.0: ``register_participant`` returns ``False`` instead of
-        raising ``InstanceLimitError``. The default ``on_instance_limit``
-        hook fires from inside the call.
+        ``register_participant`` returns ``False`` on rejection; the
+        default ``on_instance_limit`` hook fires from inside the call.
         """
 
         class _GameView(StatefulView):
@@ -666,8 +665,8 @@ class TestParticipantSessions:
 
 
 class TestParticipantLimit:
-    """v3.0.0: ``participant_limit`` caps total users (owner + participants)
-    in a single view instance. Distinct from ``instance_limit`` (per-user
+    """``participant_limit`` caps total users (owner + participants) in a
+    single view instance. Distinct from ``instance_limit`` (per-user
     instance cap).
     """
 

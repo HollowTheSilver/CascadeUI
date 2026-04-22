@@ -321,8 +321,7 @@ class BattleshipChallengeView(StatefulLayoutView):
     unauthorized_message = "Only the challenged player can respond."
     exit_policy = "delete"  # disposable prompt -- never freeze
     # No scoped state -- the challenge prompt is a one-shot gate that
-    # reads nothing from the store and writes nothing. Declared
-    # explicitly so the full policy surface is visible in the class body.
+    # reads nothing from the store and writes nothing.
     state_scope = None
 
     def __init__(self, *args, challenger_id: int, opponent: discord.Member, **kwargs):
@@ -456,7 +455,7 @@ class BattleshipView(StatefulLayoutView):
     instance_scope = "user_guild"
     instance_policy = "reject"
     # protect_attached is a no-op under instance_policy="reject" (rejection
-    # means replacement never fires). Declared for policy-surface visibility.
+    # means replacement never fires).
     protect_attached = True
     # ``state_scope = None`` because game state lives under a custom reducer
     # (BATTLESHIP_REROLL) written to the global state tree, not under any of
@@ -471,7 +470,7 @@ class BattleshipView(StatefulLayoutView):
     # nothing in-match is persisted.
     scoped_slot = "battleship_stats"
     persistent_slots = ("battleship_stats",)
-    auto_defer = True  # library default; declared for policy-surface visibility
+    auto_defer = True
     # participant_limit = 2 is technically redundant with allowed_users
     # = {player_1, player_2} -- two specific IDs already cap occupancy
     # at two. Both are set explicitly to show the auth domain

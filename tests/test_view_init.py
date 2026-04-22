@@ -10,7 +10,7 @@ from cascadeui.views.view import StatefulView
 
 
 class TestSnowflakeIdCoercion:
-    """v3.0.0: ``user_id`` and ``guild_id`` accept ``int`` or any
+    """``user_id`` and ``guild_id`` accept ``int`` or any
     ``Snowflake``-shaped object and coerce silently. Invalid input
     raises ``TypeError`` at the call site instead of polluting the
     state store with non-int scope keys.
@@ -166,10 +166,10 @@ class TestInitKwargsAutoCapture:
 
 
 class TestClassAttributeValidation:
-    """v3.0.0: ``__init_subclass__`` validates subclass overrides of
-    CascadeUI class attributes at class-definition time, so typos and
-    type mistakes raise ``ValueError`` at import instead of failing
-    silently or surfacing as confusing runtime errors.
+    """``__init_subclass__`` validates subclass overrides of CascadeUI
+    class attributes at class-definition time, so typos and type
+    mistakes raise ``ValueError`` at import instead of failing silently
+    or surfacing as confusing runtime errors.
     """
 
     def test_invalid_instance_policy_raises(self):
@@ -246,10 +246,10 @@ class TestClassAttributeValidation:
 
 
 class TestSetClassAttribute:
-    """v3.0.0: ``set_class_attribute`` lets a view instance override a
-    class-level policy attribute with a per-invocation value while
-    running the same validator pipeline as ``__init_subclass__``.
-    Reuses the lookup tables — the two paths cannot drift apart.
+    """``set_class_attribute`` lets a view instance override a class-level
+    policy attribute with a per-invocation value while running the same
+    validator pipeline as ``__init_subclass__``. Reuses the lookup tables
+    so the two paths cannot drift apart.
     """
 
     def test_valid_int_override_applied(self):

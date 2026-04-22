@@ -1,4 +1,4 @@
-"""Tests for PaginatedView / PaginatedLayoutView customization and parity (Phase 2B Move 5)."""
+"""Tests for PaginatedView / PaginatedLayoutView customization and parity."""
 
 from unittest.mock import AsyncMock, MagicMock
 

@@ -152,8 +152,7 @@ class TicTacToeChallengeView(StatefulLayoutView):
     unauthorized_message = "Only the challenged player can respond."
     # One pending challenge per challenger per guild. A second
     # ``/tictactoe`` call by the same challenger evicts the old prompt
-    # under ``instance_policy = "replace"``. Both attributes declared
-    # explicitly so the full policy surface is visible in the class body.
+    # under ``instance_policy = "replace"``.
     instance_limit = 1
     instance_scope = "user_guild"
     instance_policy = "replace"
@@ -270,14 +269,12 @@ class TicTacToeView(StatefulLayoutView):
     unauthorized_message = "You're not part of this game."
     instance_limit = 1
     instance_scope = "user_guild"
-    instance_policy = "replace"  # library default; declared for policy-surface visibility
-    # protect_attached = True is the library default. The challenger
+    instance_policy = "replace"    # protect_attached = True is the library default. The challenger
     # cannot silently abandon an active game -- they must exit the current
     # board before starting a new one. Without this, Player B's game would
     # vanish with no warning when Player A re-challenges someone else.
     protect_attached = True
-    replace_policy = "delete"  # library default; declared for policy-surface visibility
-    # ``state_scope = None`` because the live game board is ephemeral
+    replace_policy = "delete"    # ``state_scope = None`` because the live game board is ephemeral
     # view-local state -- nothing about an in-progress game belongs to
     # one player's profile. Lifetime stats are dispatched separately to
     # ``user_guild`` scope at game end via ``_record_player_stats``.
@@ -292,8 +289,7 @@ class TicTacToeView(StatefulLayoutView):
     # (``state_scope`` is ``None``) so nothing else here depends on disk.
     scoped_slot = "tictactoe_stats"
     persistent_slots = ("tictactoe_stats",)
-    auto_defer = True  # library default; declared for policy-surface visibility
-    # No Redux reactivity -- the board rebuilds from instance state on
+    auto_defer = True    # No Redux reactivity -- the board rebuilds from instance state on
     # every move. Stats dispatches happen at game end and are not
     # observed by this view.
     subscribed_actions = set()

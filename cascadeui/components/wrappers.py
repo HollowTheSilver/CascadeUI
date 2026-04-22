@@ -1,11 +1,17 @@
 # // ========================================( Modules )======================================== // #
 
 
-from datetime import datetime, timedelta
-from typing import Any, Callable, Dict, Optional, Tuple
+import time
+from typing import Any, Callable, Dict, Optional
 
 import discord
 from discord import ButtonStyle, Interaction
+
+# // ========================================( Constants )======================================== // #
+
+
+_VALID_COOLDOWN_SCOPES = frozenset({"user", "guild", "user_guild", "global"})
+
 
 # // ========================================( Functions )======================================== // #
 
@@ -18,8 +24,17 @@ def with_loading_state(
     """Add loading state to a component.
 
     While the original callback runs, the component is disabled and its label
-    is replaced with ``loading_label``. The view is edited immediately so the
-    user sees the loading state without delay.
+    is replaced with ``loading_label``. Loading UX requires consuming the
+    interaction response slot to ship the disabled state immediately, which
+    is mutually exclusive with the acting-view fast path in ``refresh()`` --
+    opting into loading feedback opts out of the one-HTTP-call refresh for
+    this click. The subsequent state-driven refresh falls through to the
+    channel endpoint, which is the correct trade for callbacks expected to
+    take long enough to warrant a spinner.
+
+    For ``_StatefulMixin`` views, the pre-edit and restore route through
+    ``view.refresh()`` so rate-limit backoff, render-hash skipping, and
+    cooldown stamping all participate in the wrapper's edits.
 
     The original callback receives an interaction whose response may already
     be consumed. Use ``self.respond(interaction, ...)`` for any replies --
@@ -38,20 +53,29 @@ def with_loading_state(
     async def loading_callback(interaction: Interaction) -> None:
         view = component.view
 
-        # Set loading appearance
         component.disabled = True
         if hasattr(component, "label"):
             component.label = loading_label
         if loading_emoji is not None and hasattr(component, "emoji"):
             component.emoji = loading_emoji
 
-        # Show loading state immediately. When the auto-defer timer has
-        # already consumed the response slot, the loading indicator is
-        # silently skipped -- the callback runs without visual feedback.
-        # The previous fallback (editing via the message endpoint) raced
-        # with state-driven refresh() calls on concurrent dispatches.
-        if not interaction.response.is_done():
-            await interaction.response.edit_message(view=view)
+        # Route pre-edit through view.refresh() for stateful views so the
+        # library's throttle/digest/backoff path handles the edit. Falls
+        # through to direct response.edit_message for plain discord.ui
+        # views, and silently skips when the response slot is already
+        # consumed (auto-defer fired, or the callback opened the slot).
+        from ..views.base import _StatefulMixin
+
+        if isinstance(view, _StatefulMixin) and view._message is not None:
+            try:
+                await view.refresh()
+            except Exception:
+                pass
+        elif not interaction.response.is_done():
+            try:
+                await interaction.response.edit_message(view=view)
+            except discord.InteractionResponded:
+                pass
 
         try:
             await original_callback(interaction)
@@ -62,29 +86,23 @@ def with_loading_state(
                 f"the loading state. Use interaction.followup.send() instead."
             )
         finally:
-            # Reset component state
             component.disabled = False
             if hasattr(component, "label") and original_label is not None:
                 component.label = original_label
             if hasattr(component, "emoji"):
                 component.emoji = original_emoji
 
-            # Update message to show restored state, but only if the
-            # view is still alive (exit/push may have finished it).
-            # CascadeUI views route through refresh() so the restore edit
-            # participates in cooldown throttling + 429 backoff rather
-            # than racing with state-driven refreshes; plain discord.ui
-            # views fall back to the interaction-message edit path.
+            # Restore edit goes through refresh() for stateful views so
+            # the restore participates in cooldown throttling + 429 backoff
+            # rather than racing with state-driven refreshes; plain views
+            # fall back to the interaction-message edit path.
             try:
                 if hasattr(view, "is_finished") and view.is_finished():
                     pass
-                else:
-                    from ..views.base import _StatefulMixin
-
-                    if isinstance(view, _StatefulMixin) and view._message:
-                        await view.refresh()
-                    elif interaction.message:
-                        await interaction.message.edit(view=view)
+                elif isinstance(view, _StatefulMixin) and view._message is not None:
+                    await view.refresh()
+                elif interaction.message:
+                    await interaction.message.edit(view=view)
             except Exception:
                 pass
 
@@ -112,6 +130,9 @@ def with_confirmation(
     If confirmed, the prompt is edited to ``confirmed_message`` and the
     original callback is called. If cancelled, the prompt is edited to
     ``cancelled_message`` and the optional ``on_cancel`` callback is called.
+    Both terminal paths call ``stop()`` on the inner confirmation View so
+    the timeout task is cancelled immediately instead of lingering until
+    the natural expiry.
 
     The original callback (and ``on_cancel``) receive the confirmation
     button's interaction with the response already consumed.
@@ -137,17 +158,23 @@ def with_confirmation(
         confirmation_view = discord.ui.View(timeout=timeout)
 
         async def _on_confirm(confirm_interaction: Interaction) -> None:
-            await confirm_interaction.response.edit_message(
-                content=confirmed_message, embed=None, view=None
-            )
-            await original_callback(confirm_interaction)
+            try:
+                await confirm_interaction.response.edit_message(
+                    content=confirmed_message, embed=None, view=None
+                )
+                await original_callback(confirm_interaction)
+            finally:
+                confirmation_view.stop()
 
         async def _on_cancel(cancel_interaction: Interaction) -> None:
-            await cancel_interaction.response.edit_message(
-                content=cancelled_message, embed=None, view=None
-            )
-            if on_cancel is not None:
-                await on_cancel(cancel_interaction)
+            try:
+                await cancel_interaction.response.edit_message(
+                    content=cancelled_message, embed=None, view=None
+                )
+                if on_cancel is not None:
+                    await on_cancel(cancel_interaction)
+            finally:
+                confirmation_view.stop()
 
         confirm_button = discord.ui.Button(label=confirm_label, style=confirm_style)
         confirm_button.callback = _on_confirm
@@ -160,7 +187,15 @@ def with_confirmation(
 
         embed = discord.Embed(title=title, description=message, color=color)
 
-        if not interaction.response.is_done():
+        # Route the prompt through view.respond() when the parent is a
+        # CascadeUI view so the library's is_done()-absorbing helper does
+        # the branching; plain discord.ui views retain the inline branch.
+        from ..views.base import _StatefulMixin
+
+        view = component.view
+        if isinstance(view, _StatefulMixin):
+            await view.respond(interaction, embed=embed, view=confirmation_view, ephemeral=True)
+        elif not interaction.response.is_done():
             await interaction.response.send_message(
                 embed=embed, view=confirmation_view, ephemeral=True
             )
@@ -188,43 +223,61 @@ def with_cooldown(
         message: Custom cooldown message. Use ``{remaining}`` as a
             placeholder for the time left (e.g. ``"Wait {remaining}s"``).
         scope: Cooldown scope -- ``"user"`` (per-user), ``"guild"``
-            (per-guild, shared across all users in a server), or
-            ``"global"`` (one cooldown for everyone).
+            (per-guild, shared across all users in a server),
+            ``"user_guild"`` (per-user-per-guild, independent cooldowns
+            in each server), or ``"global"`` (one cooldown for everyone).
+            Matches the four-value scope grammar used by
+            ``instance_scope`` and ``state_scope``.
+
+    Raises:
+        ValueError: If ``scope`` is not one of the valid cooldown scopes.
     """
+    if scope not in _VALID_COOLDOWN_SCOPES:
+        raise ValueError(
+            f"with_cooldown(scope={scope!r}) is not a valid cooldown scope. "
+            f"Valid scopes: {sorted(_VALID_COOLDOWN_SCOPES)}"
+        )
+
     original_callback = component.callback
-    cooldowns: Dict[Any, datetime] = {}
+    # Monotonic clock avoids DST / NTP-skew unlocking cooldowns early.
+    cooldowns: Dict[Any, float] = {}
     default_message = "This action is on cooldown. Try again in {remaining} seconds."
 
     def _get_key(interaction: Interaction) -> Any:
         if scope == "guild":
             return interaction.guild_id or interaction.user.id
+        elif scope == "user_guild":
+            return (interaction.user.id, interaction.guild_id)
         elif scope == "global":
             return "__global__"
         return interaction.user.id
 
     async def cooldown_callback(interaction: Interaction) -> None:
         key = _get_key(interaction)
-        now = datetime.now()
+        now = time.monotonic()
 
-        # Evict expired entries to prevent unbounded growth
         expired = [k for k, v in cooldowns.items() if now >= v]
         for k in expired:
             del cooldowns[k]
 
-        cooldown_until = cooldowns.get(key)
+        deadline = cooldowns.get(key)
 
-        if cooldown_until and now < cooldown_until:
-            remaining = (cooldown_until - now).total_seconds()
+        if deadline is not None and now < deadline:
+            remaining = deadline - now
             text = (message or default_message).format(remaining=f"{remaining:.1f}")
-            # Under serialize_interactions, a queued interaction may
-            # already be deferred by the auto-defer timer.
-            if not interaction.response.is_done():
+
+            from ..views.base import _StatefulMixin
+
+            view = component.view
+            if isinstance(view, _StatefulMixin):
+                await view.respond(interaction, text, ephemeral=True)
+            elif not interaction.response.is_done():
                 await interaction.response.send_message(text, ephemeral=True)
             else:
                 await interaction.followup.send(text, ephemeral=True)
             return
 
-        cooldowns[key] = now + timedelta(seconds=seconds)
+        cooldowns[key] = now + seconds
         await original_callback(interaction)
 
     component.callback = cooldown_callback

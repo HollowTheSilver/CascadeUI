@@ -201,7 +201,7 @@ def image_section(
     Example::
 
         image_section(
-            "**HollowTheSilver**\\nAdmin",
+            f"**{member.display_name}**\\nAdmin",
             url=member.display_avatar.url,
         )
     """

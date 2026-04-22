@@ -104,6 +104,26 @@ Returns scoped state for the given scope type and ID.
 
 Sets scoped state for the given scope type and ID.
 
+#### `get_active_views() -> Mapping[str, Any]`
+
+Returns a read-only `MappingProxyType` over the internal active-view
+registry (`view_id -> view instance`). The returned mapping is **live,
+not a snapshot** -- subsequent `register_view` / `unregister_view` calls
+on the store show through -- but mutation raises `TypeError`, so the
+privacy boundary stays intact.
+
+```python
+from cascadeui import get_store
+
+store = get_store()
+for view_id, view in store.get_active_views().items():
+    print(f"{view_id}: {type(view).__name__}")
+```
+
+Used by `DevToolsCog` to avoid reaching into `store._active_views`
+directly. User code that needs to iterate or count live views can
+consume the same accessor.
+
 #### `merge_scoped(state, scope, data, *, slot_name="scoped", subkey=None, **identifiers)`
 
 Reducer-side writer that merges `data` into the scope bucket and returns `state`. Completes the scoped family alongside `get_scoped_from` and `iter_scoped`. Used inside custom reducers to decode the canonical `{"scope", "identifiers", "data"}` payload emitted by `view.dispatch_scoped_as(...)`.

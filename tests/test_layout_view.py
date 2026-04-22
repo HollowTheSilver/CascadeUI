@@ -832,8 +832,8 @@ class TestRenderHashShortCircuit:
 
     async def test_refresh_increments_edit_counter_only_when_editing(self):
         """End-to-end: a real edit bumps the current dispatch's counter,
-        a short-circuited refresh does not. Proves the #165 wiring inside
-        ``refresh()`` feeds the store's ``_perf_edit_stack`` correctly.
+        a short-circuited refresh does not. ``refresh()``'s internal
+        wiring feeds the store's ``_perf_edit_stack`` on every edit.
         """
         label = ["A"]
 

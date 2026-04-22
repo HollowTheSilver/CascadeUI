@@ -7,7 +7,8 @@ import copy
 import logging
 import time
 from datetime import datetime
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
+from types import MappingProxyType
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Set, Tuple, Union
 
 from ..utils.errors import with_error_boundary
 from ..utils.tasks import get_task_manager
@@ -183,6 +184,22 @@ class StateStore:
             cls._instance._initialized = False
         return cls._instance
 
+    @staticmethod
+    def _build_initial_state() -> StateData:
+        """Return the canonical top-level state shape used by ``__init__``.
+
+        Extracted so every seam that rebuilds state from scratch (devtools
+        ``reset``, test fixtures, future snapshot-restore paths) stays
+        structurally aligned with ``__init__``. Adding a new top-level key
+        means editing one place, not hunting every hardcoded literal.
+        """
+        return {
+            "sessions": {},
+            "views": {},
+            "components": {},
+            "application": {},
+        }
+
     def __init__(self):
         if self._initialized:
             return
@@ -192,12 +209,7 @@ class StateStore:
         # at _route_application covers them uniformly -- declaring
         # persistent_slots = ("scoped",) on a view persists scoped data
         # through the same mechanism as any other application slot.
-        self.state: StateData = {
-            "sessions": {},  # User sessions
-            "views": {},  # Active views
-            "components": {},  # Component states
-            "application": {},  # Application-scoped data, including scoped slices
-        }
+        self.state: StateData = self._build_initial_state()
 
         # Callbacks for state changes: {id: (callback, action_filter, selector)}
         self.subscribers: Dict[
@@ -518,12 +530,12 @@ class StateStore:
 
     # // ========================================( Hooks )======================================== // #
 
-    # Mapping from friendly hook names to action types
+    # Mapping from friendly hook names to action types.
     _HOOK_ACTION_MAP = {
         "view_created": "VIEW_CREATED",
         "view_updated": "VIEW_UPDATED",
         "view_destroyed": "VIEW_DESTROYED",
-        "session_start": "SESSION_CREATED",
+        "session_created": "SESSION_CREATED",
         "session_updated": "SESSION_UPDATED",
         "navigation_replace": "NAVIGATION_REPLACE",
         "navigation_push": "NAVIGATION_PUSH",
@@ -532,6 +544,11 @@ class StateStore:
         "modal_submitted": "MODAL_SUBMITTED",
         "batch_complete": "BATCH_COMPLETE",
         "scoped_update": "SCOPED_UPDATE",
+        "undo": "UNDO",
+        "redo": "REDO",
+        "persistent_view_registered": "PERSISTENT_VIEW_REGISTERED",
+        "persistent_view_unregistered": "PERSISTENT_VIEW_UNREGISTERED",
+        "inspector_purged_stale": "INSPECTOR_PURGED_STALE",
         "application_slots_pruned": "APPLICATION_SLOTS_PRUNED",
         "registry_pruned": "REGISTRY_PRUNED",
     }
@@ -901,6 +918,17 @@ class StateStore:
         ids = self._instance_index.get(key, [])
         return [self._active_views[vid] for vid in ids if vid in self._active_views]
 
+    def get_active_views(self) -> Mapping[str, Any]:
+        """Read-only view of the active view registry (view_id -> view instance).
+
+        Callers outside the store (devtools, diagnostics, test harnesses)
+        read through this accessor instead of reaching for ``_active_views``
+        directly. The returned mapping reflects registrations live but
+        rejects mutation -- all bookkeeping goes through ``register_view``
+        and ``unregister_view``.
+        """
+        return MappingProxyType(self._active_views)
+
     def _register_participant(self, view, user_id: int) -> None:
         """Add a participant's scope key to the session index for a view.
 
@@ -1099,8 +1127,8 @@ class StateStore:
         inline after the fan-out loop, so its ``message.edit()`` lands flush
         with the interaction's own ack cycle. Every other subscriber is
         scheduled as a fire-and-forget task under the ``"state_store_notify"``
-        owner -- preserving #161's perf win where a slow cross-view subscriber
-        cannot stall the acting dispatch. Batched regimes (``BATCH_COMPLETE``
+        owner, so a slow cross-view subscriber cannot stall the acting
+        dispatch. Batched regimes (``BATCH_COMPLETE``
         with ``source=None``) fall through to pure fire-and-forget until
         ``BatchContext`` threads a source id through.
         """
@@ -1336,9 +1364,9 @@ class StateStore:
 
         Subscriber callbacks scheduled by ``_notify_subscribers`` run
         fire-and-forget so a slow subscriber never stalls dispatch. Tests
-        and internal code paths that need the pre-#161 "dispatch returns
-        after all subscribers settle" contract call this helper to wait
-        out the fan-out.
+        and internal code paths that need a "dispatch returns after all
+        subscribers settle" contract call this helper to wait out the
+        fan-out.
 
         After tasks drain, walks ``_perf_samples`` to finalize any live
         ``edits`` counter references into plain ints. This is what makes

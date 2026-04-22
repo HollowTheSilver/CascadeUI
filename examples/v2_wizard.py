@@ -161,9 +161,7 @@ class CharacterCreatorView(WizardLayoutView):
     # // ----( Navigation-button customization )---- // #
     # Every navigation button on every wizard step is built from these
     # class attributes. The back, next, and finish triples together form
-    # the full customization surface; each attribute is declared explicitly
-    # (even when the value restates the library default) so the full
-    # grammar is visible in the class body.
+    # the full customization surface.
     back_button_label = "Previous"
     back_button_emoji = "\u2b05\ufe0f"  # ⬅️
     back_button_style = discord.ButtonStyle.secondary
@@ -717,8 +715,8 @@ class CharacterCreatorView(WizardLayoutView):
         echoes the completed sheet back to the user.
 
         The trailing ``await self.exit()`` respects
-        ``exit_policy = "delete"`` declared on the policy surface, so the
-        wizard message is removed after the followup is sent. Setting
+        ``exit_policy = "delete"``, so the wizard message is removed after
+        the followup is sent. Setting
         ``exit_policy = "disable"`` would freeze the final review card
         in place instead of deleting it.
         """

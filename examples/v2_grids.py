@@ -57,17 +57,14 @@ class GridShowcaseView(StatefulLayoutView):
     """Display-only host for a pre-built card of grid components.
 
     The view owns no state and subscribes to no actions -- its only job
-    is to ferry a ready-made component list into a V2 message. Every
-    policy attribute is declared explicitly so the full policy surface
-    is visible in the class body.
+    is to ferry a ready-made component list into a V2 message.
     """
 
     owner_only = True
     # ``instance_limit = None`` leaves the showcase unthrottled so a
     # recording can stack multiple grids in one channel. ``instance_policy``
-    # and ``replace_policy`` are irrelevant while ``instance_limit`` is None
-    # -- the replacement path never fires -- but they are declared so the
-    # policy surface reads completely at a glance.
+    # and ``replace_policy`` have no effect while ``instance_limit`` is None
+    # (the replacement path never fires), but are shown here for reference.
     instance_limit = None
     instance_scope = "user_guild"
     instance_policy = "replace"

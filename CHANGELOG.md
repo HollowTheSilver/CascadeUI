@@ -38,6 +38,67 @@ future version; entries move into a dated release header on ship.
 
 ---
 
+## [3.1.0] - 2026-04-21
+
+### Added
+
+- **`StateStore.get_active_views()`.** Public accessor returning a
+  read-only `MappingProxyType` over the active-view registry
+  (`view_id -> view instance`). The returned mapping is live but rejects
+  mutation, so user code can iterate or count live views without
+  reaching into `store._active_views` and without risk of corrupting
+  registry invariants.
+- **`StateStore._build_initial_state()`.** Single source of truth for
+  the canonical top-level state shape (`sessions`, `views`,
+  `components`, `application`). Both `StateStore.__init__` and
+  `DevToolsCog.reset` consume it, eliminating the "new top-level key
+  added to `__init__` but not to `reset`" drift class.
+- **DevTools command surface expanded from 9 to 17.** Eight new
+  subcommands land under `/cascadeui`:
+  - **Registry introspection:** `/cascadeui persistent` (registered
+    `PersistentView` classes), `/cascadeui scoped [slot]` (scoped bucket
+    contents grouped by scope kind), `/cascadeui computed [name]`
+    (`@computed` registrations with cache-primed status), and
+    `/cascadeui middleware` (installed middleware in dispatch order).
+  - **Diagnostics:** `/cascadeui history [n]` (recent dispatched
+    actions), `/cascadeui perf [action]` (toggle perf sampling:
+    `on`/`off`/`clear`/`status`), `/cascadeui trace [action]` (toggle
+    ViewStore dispatch tracing), and `/cascadeui subscribers` (active
+    subscribers with action-filter breakdown).
+- **`DevToolsCog` group listing auto-derived.** The group's `ctx.invoke`
+  fallback now reads `self.cascadeui_group.commands` at call time
+  instead of a hardcoded listing, so adding a new subcommand does not
+  require a parallel edit to keep the help banner accurate.
+- **`/cascadeui reset` observability.** Reset now invalidates every
+  `@computed` cache (via `ComputedValue.invalidate()`), clears
+  subscriber selector memoization (`store._last_selected`), counts
+  per-view exit failures, and surfaces the failure count in the
+  response. Routes through `StateStore._build_initial_state()` so the
+  reset shape matches `__init__` exactly.
+
+### Breaking
+
+- **`session_start` friendly-name hook removed.** The `SESSION_CREATED`
+  action was previously reachable via `store.on("session_start", cb)`; the
+  friendly name did not match the `view_created` / `view_updated` /
+  `view_destroyed` grammar used elsewhere. Use `session_created` instead.
+  No deprecation alias: the name was a grammar outlier, not a supported
+  surface. Migration: `store.on("session_start", cb)` ->
+  `store.on("session_created", cb)`.
+
+### Fixed
+
+- **Action-registry drift across coupled tables.** `INSPECTOR_PURGED_STALE`
+  was missing from `_BOOKKEEPING_ACTIONS` (persistence middleware) and
+  `_SKIP_ACTIONS` (undo middleware), and five action types
+  (`SCOPED_UPDATE`, `PERSISTENT_VIEW_REGISTERED`,
+  `PERSISTENT_VIEW_UNREGISTERED`, `INSPECTOR_PURGED_STALE`,
+  `APPLICATION_SLOTS_PRUNED`, `REGISTRY_PRUNED`) had no corresponding
+  friendly-name entry in `_HOOK_ACTION_MAP`. Internal table consistency;
+  no user-facing API change beyond the now-reachable friendly names.
+
+---
+
 ## [3.0.0] - 2026-04-16 -- Stable Release
 
 CascadeUI 3.0.0 is the first stable release. The view layer was reorganized

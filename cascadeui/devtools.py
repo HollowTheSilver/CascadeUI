@@ -15,11 +15,20 @@ from .components.base import StatefulButton, StatefulSelect
 from .components.patterns import action_section, alert, card, divider, gap, key_value
 from .exceptions import InstanceLimitError
 from .state.actions import ActionCreators
-from .state.computed import computed
+from .state.computed import _SENTINEL as _SENTINEL_COMPUTED
+from .state.computed import ComputedValue, computed
 from .state.singleton import get_store
+from .state.store import StateStore
 from .views.patterns import TabLayoutView
 
 logger = logging.getLogger(__name__)
+
+
+# Shared display cap for list-style commands (``views``, ``sessions``).
+# Unified so both commands truncate at the same point -- previously
+# ``views`` capped at 15 while ``sessions`` capped at 10, which made the
+# two commands feel inconsistent on a store with many entries.
+_LIST_DISPLAY_CAP = 15
 
 
 # // ========================================( Store Internals )======================================== // #
@@ -1213,6 +1222,14 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
         /cascadeui flush          Force persistence write
         /cascadeui purge          Remove stale component/modal entries
         /cascadeui reset          Reset entire state store (requires confirm)
+        /cascadeui persistent     List registered PersistentView classes
+        /cascadeui scoped [slot]  Inspect a scoped bucket under state.application
+        /cascadeui computed [name] List @computed registrations
+        /cascadeui middleware     List installed middleware in dispatch order
+        /cascadeui history [n]    Show recent action history
+        /cascadeui perf [action]  Toggle perf sampling (on/off/clear/status)
+        /cascadeui trace [action] Toggle ViewStore tracing (on/off/status)
+        /cascadeui subscribers    List active state subscribers
     """
 
     def __init__(self, bot):
@@ -1222,18 +1239,10 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
     @commands.is_owner()
     async def cascadeui_group(self, ctx: Context) -> None:
         """CascadeUI developer tools. Run a subcommand for details."""
-        lines = [
-            "**CascadeUI DevTools**",
-            "`/cascadeui inspect` -- Open the visual state inspector",
-            "`/cascadeui views` -- List active views",
-            "`/cascadeui exit <id>` -- Exit a view by ID",
-            "`/cascadeui exitall` -- Exit all views",
-            "`/cascadeui sessions` -- List sessions",
-            "`/cascadeui clear <id>` -- Clear a session",
-            "`/cascadeui flush` -- Force persistence write",
-            "`/cascadeui purge` -- Remove stale entries",
-            "`/cascadeui reset` -- Reset state store",
-        ]
+        lines = ["**CascadeUI DevTools**"]
+        for sub in sorted(self.cascadeui_group.commands, key=lambda c: c.name):
+            description = sub.description or sub.short_doc or ""
+            lines.append(f"`/cascadeui {sub.name}` -- {description}")
         await ctx.send("\n".join(lines), ephemeral=True)
 
     # // ==================( View Commands )================== // #
@@ -1243,20 +1252,20 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
         """List all active views in the state store."""
         store = get_store()
         views = store.state.get("views", {})
-        active = store._active_views
+        active = store.get_active_views()
 
         if not views:
             return await ctx.send("No active views.", ephemeral=True)
 
         lines = []
-        for view_id, view_data in list(views.items())[:15]:
+        for view_id, view_data in list(views.items())[:_LIST_DISPLAY_CAP]:
             view_type = view_data.get("type", "Unknown")
             user_id = view_data.get("user_id", "N/A")
             is_live = "\U0001f7e2" if view_id in active else "\U0001f534"
             lines.append(f"{is_live} **{view_type}** `{view_id[:12]}...` (user: {user_id})")
 
-        if len(views) > 15:
-            lines.append(f"*...and {len(views) - 15} more*")
+        if len(views) > _LIST_DISPLAY_CAP:
+            lines.append(f"*...and {len(views) - _LIST_DISPLAY_CAP} more*")
 
         header = f"**{len(views)} view(s)** ({len(active)} live)\n"
         await ctx.send(header + "\n".join(lines), ephemeral=True)
@@ -1282,9 +1291,10 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
 
         view_type = store.state.get("views", {}).get(match, {}).get("type", "Unknown")
 
-        if match in store._active_views:
+        active = store.get_active_views()
+        if match in active:
             try:
-                await store._active_views[match].exit()
+                await active[match].exit()
                 await ctx.send(
                     f"\U0001f7e2 Exited live **{view_type}** (`{match[:12]}...`).", ephemeral=True
                 )
@@ -1301,22 +1311,25 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
         """Exit all active views and clean ghost entries."""
         store = get_store()
         views = dict(store.state.get("views", {}))
-        active = dict(store._active_views)
+        active = dict(store.get_active_views())
         exited = 0
+        failed = 0
 
         for view_id, view in list(active.items()):
             try:
                 await view.exit()
                 exited += 1
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("exit_all: view %s failed to exit cleanly: %s", view_id, exc)
+                failed += 1
 
         for view_id in list(views.keys()):
             if view_id not in active:
                 await _cleanup_ghost_view(store, view_id)
                 exited += 1
 
-        await ctx.send(f"Exited {exited} view(s).", ephemeral=True)
+        suffix = f" ({failed} failed)" if failed else ""
+        await ctx.send(f"Exited {exited} view(s){suffix}.", ephemeral=True)
 
     # // ==================( State Commands )================== // #
 
@@ -1357,7 +1370,11 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
             return await ctx.send("No stale entries to purge.", ephemeral=True)
 
         inspector_id = next(
-            (vid for vid, view in store._active_views.items() if isinstance(view, InspectorView)),
+            (
+                vid
+                for vid, view in store.get_active_views().items()
+                if isinstance(view, InspectorView)
+            ),
             None,
         )
         await store.dispatch("INSPECTOR_PURGED_STALE", {"inspector_id": inspector_id})
@@ -1381,27 +1398,38 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
 
         store = get_store()
 
-        # Exit all live views
-        for view in list(store._active_views.values()):
+        # Exit all live views. Failures are debug-logged and counted but
+        # never block the reset -- a broken view's exit() must not leave
+        # state half-torn-down.
+        failed = 0
+        for view_id, view in list(store.get_active_views().items()):
             try:
                 await view.exit()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("reset: view %s failed to exit cleanly: %s", view_id, exc)
+                failed += 1
 
-        # Reset state
-        store.state = {
-            "sessions": {},
-            "views": {},
-            "components": {},
-            "application": {},
-        }
+        # Reset state via the canonical shape helper so new top-level keys
+        # added to ``StateStore.__init__`` flow through here automatically.
+        store.state = StateStore._build_initial_state()
+
+        # Observability: invalidate every @computed so cached aggregates
+        # recompute against the empty state on next access, and clear the
+        # selector memo so subscriber selectors do not short-circuit on
+        # stale identity comparisons post-reset.
+        for cv in store._computed.values():
+            if isinstance(cv, ComputedValue):
+                cv.invalidate()
+        store._last_selected.clear()
 
         manager = getattr(store, "persistence_manager", None)
         if manager is not None:
             await manager.flush_all()
 
+        suffix = f" ({failed} view exit(s) failed)" if failed else ""
         await ctx.send(
-            "\U0001f4a5 State store reset. All views exited, state cleared.", ephemeral=True
+            f"\U0001f4a5 State store reset. All views exited, state cleared.{suffix}",
+            ephemeral=True,
         )
 
     # // ==================( Session Commands )================== // #
@@ -1416,12 +1444,12 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
             return await ctx.send("No active sessions.", ephemeral=True)
 
         lines = []
-        for session_id, data in list(sessions.items())[:10]:
+        for session_id, data in list(sessions.items())[:_LIST_DISPLAY_CAP]:
             member_count = len(data.get("members", []))
             lines.append(f"`{session_id}` - {member_count} member(s)")
 
-        if len(sessions) > 10:
-            lines.append(f"*...and {len(sessions) - 10} more*")
+        if len(sessions) > _LIST_DISPLAY_CAP:
+            lines.append(f"*...and {len(sessions) - _LIST_DISPLAY_CAP} more*")
 
         header = f"**{len(sessions)} session(s)**\n"
         await ctx.send(header + "\n".join(lines), ephemeral=True)
@@ -1436,20 +1464,26 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
             return await ctx.send(f"No session found: `{session_id}`.", ephemeral=True)
 
         session_data = sessions[session_id]
+        active = store.get_active_views()
         exited = 0
+        failed = 0
         for view_id in list(session_data.get("members", [])):
-            if view_id in store._active_views:
+            if view_id in active:
                 try:
-                    await store._active_views[view_id].exit()
+                    await active[view_id].exit()
                     exited += 1
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug(
+                        "clear_session: view %s failed to exit cleanly: %s", view_id, exc
+                    )
+                    failed += 1
             else:
                 await _cleanup_ghost_view(store, view_id)
                 exited += 1
 
+        suffix = f", {failed} failed" if failed else ""
         await ctx.send(
-            f"\U0001f5d1\ufe0f Cleared session `{session_id}` ({exited} view(s) exited).",
+            f"\U0001f5d1\ufe0f Cleared session `{session_id}` ({exited} view(s) exited{suffix}).",
             ephemeral=True,
         )
 
@@ -1468,3 +1502,248 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
             await view.send()
         except InstanceLimitError:
             await ctx.send("Inspector already open.", ephemeral=True)
+
+    # // ==================( Registry Commands )================== // #
+
+    @cascadeui_group.command(
+        name="persistent", description="List registered PersistentView classes."
+    )
+    async def list_persistent(self, ctx: Context) -> None:
+        """Display the module-level registry of PersistentView subclasses.
+
+        The registry maps fully-qualified ``module.QualName`` keys to the
+        class object, populated by ``__init_subclass__`` when a module
+        defining a persistent view is first imported. Useful for verifying
+        that cogs loaded their classes before ``setup_middleware`` ran.
+        """
+        from .views.persistent import _persistent_view_classes
+
+        if not _persistent_view_classes:
+            return await ctx.send("No persistent view classes registered.", ephemeral=True)
+
+        lines = [f"**{len(_persistent_view_classes)} persistent class(es)**"]
+        for qualname, cls in list(_persistent_view_classes.items())[:_LIST_DISPLAY_CAP]:
+            lines.append(f"`{cls.__name__}` -- {qualname}")
+        if len(_persistent_view_classes) > _LIST_DISPLAY_CAP:
+            lines.append(f"*...and {len(_persistent_view_classes) - _LIST_DISPLAY_CAP} more*")
+        await ctx.send("\n".join(lines), ephemeral=True)
+
+    @cascadeui_group.command(
+        name="scoped", description="Inspect a scoped state bucket under state.application."
+    )
+    async def list_scoped(self, ctx: Context, slot_name: str = "scoped") -> None:
+        """Display the keys and sizes of a scoped bucket.
+
+        Walks ``state["application"][slot_name]`` and groups keys by scope
+        kind (user / guild / user_guild / global) based on the key shape.
+        Unknown shapes are bucketed under ``other`` -- useful for spotting
+        keys written by custom reducers that diverged from the library's
+        ``_build_scope_key`` convention.
+        """
+        store = get_store()
+        bucket = store.state.get("application", {}).get(slot_name, {})
+        if not isinstance(bucket, dict) or not bucket:
+            return await ctx.send(
+                f"Slot `{slot_name}` is empty or not a scoped bucket.", ephemeral=True
+            )
+
+        kinds = {"user": 0, "guild": 0, "user_guild": 0, "global": 0, "other": 0}
+        for key in bucket:
+            if key == "global":
+                kinds["global"] += 1
+            elif key.startswith("user:") and ":guild:" in key:
+                kinds["user_guild"] += 1
+            elif key.startswith("user:"):
+                kinds["user"] += 1
+            elif key.startswith("guild:"):
+                kinds["guild"] += 1
+            else:
+                kinds["other"] += 1
+
+        lines = [f"**Slot `{slot_name}`: {len(bucket)} entry(ies)**"]
+        for kind, count in kinds.items():
+            if count:
+                lines.append(f"- `{kind}`: {count}")
+        for key in list(bucket)[:_LIST_DISPLAY_CAP]:
+            value = bucket[key]
+            shape = f"dict[{len(value)}]" if isinstance(value, dict) else type(value).__name__
+            lines.append(f"`{key}` -- {shape}")
+        if len(bucket) > _LIST_DISPLAY_CAP:
+            lines.append(f"*...and {len(bucket) - _LIST_DISPLAY_CAP} more*")
+        await ctx.send("\n".join(lines), ephemeral=True)
+
+    @cascadeui_group.command(
+        name="computed", description="List @computed registrations and their cached values."
+    )
+    async def list_computed(self, ctx: Context, name: str = None) -> None:
+        """List all ``@computed`` values, or detail one by name.
+
+        Without ``name``: shows every registration and whether the cache
+        is primed. With ``name``: forces a read against live state and
+        returns the current value (primes the cache if empty).
+        """
+        store = get_store()
+        entries = store._computed
+
+        if name is not None:
+            cv = entries.get(name)
+            if cv is None:
+                return await ctx.send(f"No computed named `{name}`.", ephemeral=True)
+            value = cv.get(store.state)
+            return await ctx.send(
+                f"`{name}` = `{value!r}`", ephemeral=True
+            )
+
+        if not entries:
+            return await ctx.send("No @computed values registered.", ephemeral=True)
+
+        lines = [f"**{len(entries)} computed value(s)**"]
+        for cv_name, cv in list(entries.items())[:_LIST_DISPLAY_CAP]:
+            if isinstance(cv, ComputedValue):
+                primed = cv._last_input is not _SENTINEL_COMPUTED
+                status = f"cached=`{cv._cached!r}`" if primed else "uncached"
+            else:
+                status = type(cv).__name__
+            lines.append(f"`{cv_name}` -- {status}")
+        if len(entries) > _LIST_DISPLAY_CAP:
+            lines.append(f"*...and {len(entries) - _LIST_DISPLAY_CAP} more*")
+        await ctx.send("\n".join(lines), ephemeral=True)
+
+    @cascadeui_group.command(
+        name="middleware", description="List installed middleware in dispatch order."
+    )
+    async def list_middleware(self, ctx: Context) -> None:
+        """Display ``store._middleware`` in pipeline order.
+
+        Middleware runs top-to-bottom between action dispatch and the
+        reducer. The class name doubles as the identifier because each
+        middleware type is installed at most once by convention.
+        """
+        store = get_store()
+        if not store._middleware:
+            return await ctx.send("No middleware installed.", ephemeral=True)
+
+        lines = [f"**{len(store._middleware)} middleware**"]
+        for idx, mw in enumerate(store._middleware):
+            lines.append(f"{idx + 1}. `{type(mw).__name__}`")
+        await ctx.send("\n".join(lines), ephemeral=True)
+
+    # // ==================( Diagnostic Commands )================== // #
+
+    @cascadeui_group.command(
+        name="history", description="Show recent CascadeUI action history."
+    )
+    async def show_history(self, ctx: Context, limit: int = 20) -> None:
+        """Display the most recent entries in ``store.history``.
+
+        Action history is capped at ``store.history_limit`` (default 100)
+        and rotates oldest-first. ``limit`` clamps the response to the
+        last N entries and is itself clamped to the cap.
+        """
+        store = get_store()
+        if not store.history:
+            return await ctx.send("No actions in history.", ephemeral=True)
+
+        limit = max(1, min(limit, store.history_limit))
+        recent = store.history[-limit:]
+        lines = [f"**Last {len(recent)} action(s)** (of {len(store.history)})"]
+        for action in recent:
+            action_type = action.get("type", "?")
+            source = action.get("source", "-")
+            lines.append(f"`{action_type}` src=`{source}`")
+        await ctx.send("\n".join(lines)[:1900], ephemeral=True)
+
+    @cascadeui_group.command(
+        name="perf", description="Toggle or inspect CascadeUI perf sampling."
+    )
+    async def toggle_perf(self, ctx: Context, action: str = "status") -> None:
+        """Control per-dispatch timing sample collection.
+
+        Actions: ``on`` starts sampling, ``off`` stops (preserves samples),
+        ``clear`` drops all samples, ``status`` reports enabled/sample count.
+        """
+        store = get_store()
+        action = action.lower()
+
+        if action == "on":
+            store.enable_perf()
+            await ctx.send("\U0001f4ca Perf sampling enabled.", ephemeral=True)
+        elif action == "off":
+            store.disable_perf()
+            await ctx.send("\U0001f4ca Perf sampling disabled.", ephemeral=True)
+        elif action == "clear":
+            store.clear_perf()
+            await ctx.send("\U0001f5d1\ufe0f Perf samples cleared.", ephemeral=True)
+        elif action == "status":
+            enabled = getattr(store, "_perf_enabled", False)
+            count = len(getattr(store, "_perf_samples", []))
+            state = "enabled" if enabled else "disabled"
+            await ctx.send(
+                f"\U0001f4ca Perf: {state}, {count} sample(s) retained.",
+                ephemeral=True,
+            )
+        else:
+            await ctx.send(
+                f"Unknown action `{action}`. Use `on`, `off`, `clear`, or `status`.",
+                ephemeral=True,
+            )
+
+    @cascadeui_group.command(
+        name="trace", description="Toggle CascadeUI ViewStore dispatch tracing."
+    )
+    async def toggle_trace(self, ctx: Context, action: str = "status") -> None:
+        """Control ViewStore dispatch tracing for debugging interaction misses.
+
+        When enabled, the library logs full ViewStore contents on any
+        dispatch miss (``item.view is None``) -- the primary diagnostic
+        for "interaction referencing unknown view" warnings. Opt-in
+        because the log output is noisy on busy bots.
+        """
+        from .tracing import (
+            _install_viewstore_trace,
+            _uninstall_viewstore_trace,
+            is_viewstore_trace_enabled,
+        )
+
+        action = action.lower()
+        if action == "on":
+            _install_viewstore_trace()
+            await ctx.send("\U0001f50d ViewStore tracing enabled.", ephemeral=True)
+        elif action == "off":
+            _uninstall_viewstore_trace()
+            await ctx.send("\U0001f50d ViewStore tracing disabled.", ephemeral=True)
+        elif action == "status":
+            state = "enabled" if is_viewstore_trace_enabled() else "disabled"
+            await ctx.send(f"\U0001f50d ViewStore tracing: {state}.", ephemeral=True)
+        else:
+            await ctx.send(
+                f"Unknown action `{action}`. Use `on`, `off`, or `status`.",
+                ephemeral=True,
+            )
+
+    @cascadeui_group.command(
+        name="subscribers", description="List active state subscribers with filters."
+    )
+    async def list_subscribers(self, ctx: Context) -> None:
+        """Display ``store.subscribers`` with action-filter breakdown.
+
+        Each entry shows the subscriber id (truncated) and how many
+        action types it filters on -- ``None`` means the subscriber
+        sees every action. Useful for diagnosing "my view stopped
+        reacting" bugs: a missing subscriber id explains the silence.
+        """
+        store = get_store()
+        if not store.subscribers:
+            return await ctx.send("No subscribers registered.", ephemeral=True)
+
+        lines = [f"**{len(store.subscribers)} subscriber(s)**"]
+        for sid, (_, action_filter, _) in list(store.subscribers.items())[:_LIST_DISPLAY_CAP]:
+            filter_desc = (
+                f"{len(action_filter)} action(s)" if action_filter else "all actions"
+            )
+            lines.append(f"`{sid[:20]}...` -- {filter_desc}")
+        if len(store.subscribers) > _LIST_DISPLAY_CAP:
+            lines.append(
+                f"*...and {len(store.subscribers) - _LIST_DISPLAY_CAP} more*"
+            )
+        await ctx.send("\n".join(lines), ephemeral=True)

@@ -1,4 +1,4 @@
-"""Tests for TabView / TabLayoutView customization and parity (Phase 2B Move 4)."""
+"""Tests for TabView / TabLayoutView customization and parity."""
 
 import logging
 from unittest.mock import AsyncMock, MagicMock

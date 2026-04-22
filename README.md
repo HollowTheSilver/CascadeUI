@@ -17,11 +17,11 @@
 
 <p align="center">
   <strong>Build predictable, state-driven interfaces with <a href="https://github.com/Rapptz/discord.py">discord.py</a>.</strong><br>
-  A flexible, Redux-inspired UI framework that introduces centralized state, composable components, ownership control, and predictable data flow to Discord applications.<br>
+  A flexible, Redux-inspired UI framework that introduces centralized state, access control, lifecycle control, and predictable data flow to Discord applications.<br>
 </p>
 
 <div align="center">
-  <img src="https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-hero.gif" alt="CascadeUI Hero Demo" width="600">
+  <img src="https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-devtools.gif" alt="CascadeUI Hero Demo" width="600">
 </div>
 
 <p align="center">
@@ -87,7 +87,7 @@ CascadeUI ports Redux's mental model onto Discord. Most core primitives have a c
 
 ## When to Use
 
-> Every discord.py view needs ownership control, session cleanup, and interaction safety. CascadeUI handles all of that out of the box with class-level declarations - no boilerplate, no manual checks.
+> Every discord.py view requires access control, session cleanup, and interaction safety. CascadeUI handles all of that out of the box with class-level declarations - no boilerplate, no manual checks.
 
 Even a single-view panel benefits from `owner_only = True` and `instance_limit = 1`. As your interface grows, the same framework scales to:
 
@@ -158,73 +158,7 @@ See the [Quickstart](https://hollowthesilver.github.io/CascadeUI/guide/quickstar
 
 ---
 
-## Features
-
-> For full details, see the official <a href="https://hollowthesilver.github.io/CascadeUI/"><strong>documentation</strong></a>.
-
-### State and Data Flow
-- Centralized store with dispatch and reducer cycle
-- Custom reducers via `@cascade_reducer` decorator with automatic deep copy and built-in collision guards
-- Action batching for grouped, atomic updates; nested batches collapse into one commit and fire a single notification cycle
-- Computed state via `@computed` decorator with selector-based cache invalidation and per-store instances that survive singleton resets (≈ Reselect / React's `useMemo`)
-- Selector-based subscriptions for targeted re-renders (similar to React's selective re-render optimization)
-- Built-in profiler with exportable markdown + JSON reports for dispatch, subscriber, and refresh timings -- measure before you optimize, attach snapshots to PRs and bug reports
-- `access_slot()` / `read_slot()` / `slot_property` helpers for auto-vivifying application buckets without hand-rolling the read/write plumbing
-- Scoped state family: `get_scoped()`, `get_scoped_from()`, `iter_scoped()`, `set_scoped()`, `merge_scoped()` -- one call from inside a reducer, no private key-building required
-- Cross-view reactivity: dispatch from any view, all subscribers update instantly with automatic coalescing under concurrent access
-- Middleware pipeline for logging, persistence, and transformation (Redux-style, async)
-- Event hooks for lifecycle observation and side effects
-
-### Views and Patterns
-- Layout-based V2 system for structured, container-driven interfaces
-- Full support for traditional discord.py Views (V1)
-- Pre-built patterns: menus, tabs, wizards, forms, pagination, leaderboards, persistent leaderboards
-- `PaginatedView.from_cursor()` for lazy cursor-driven pagination with an LRU page cache
-- `DisplayLayoutView` for one-shot V2 sends from a pre-built container, no subclass required
-- Automatic state-driven rebuilds: define `build_ui()` and the library wires it into `on_state_changed()` and `refresh()` for you (declarative render, like React components)
-- One hook for V1 and V2: `build_ui()` returns `None` (V2 mutates the tree) or a dict of edit kwargs like `{"embed": ...}` (V1), and the library splats it into `message.edit()`
-- Theming with per-view overrides, V2 accent colors, and a `ContextVar` that propagates the active theme through `build_ui()` so builders like `card()` and `stats_card()` inherit automatically (like `React.Context`)
-
-### Interaction Control and Sessions
-- Interaction ownership control, owner-only by default and configurable via `allowed_users`
-- Instance limiting per user, guild, user+guild, or globally with replace or reject policies
-- Participant-aware views for multi-user scenarios like challenge flows, lobbies, and games
-- `participant_limit` with `on_participant_limit` hook and `auto_register_participants` for automatic slot claiming during `send()`
-- Navigation stack with `push()`, `pop()`, and `replace()`, sharing one Discord message across the chain (akin to React Router's history API)
-- `check_instance_available()` for fail-fast pre-checks before constructing expensive views
-- Five-pillar architecture: Access Control, Instance Constraints, View Lifecycle, Session Membership, and Navigation -- each attribute belongs to exactly one pillar
-- `session_continuity` opt-in for repeat-open state coalescing; the default isolates every send as its own session
-- Parent and child view lifecycle via `attach_child()` (or `parent=` kwarg) with automatic cleanup
-- Automatic interaction acknowledgement via auto-defer (tunable per view), with `respond()` / `open_modal()` / `_safe_defer()` helpers that transparently route through response or followup
-- Interaction serialization via an `asyncio.Lock` so rapid clicks process sequentially without racing `message.edit()` calls
-- Refresh throttling: opt-in `refresh_cooldown_ms` proactively batches edits, and reactive 429 backoff honors Discord's `retry_after` automatically. Both share a single monotonic cooldown and coalesce on the latest store state at fire time
-- `auto_refresh_ephemeral` flag: bypass Discord's 15-minute ephemeral editability wall with a user-driven token handoff; armed views freeze state-driven rebuilds so the refresh button cannot be clobbered between T+810s and T+900s
-- Automatic message re-fetch after `send()` so long-lived views are not bound to the interaction webhook's 15-minute token window, with a `_webhook_message` dual-reference so embed edits still route through the webhook when the channel endpoint would drop them silently
-
-### Components and Composition
-- Stateful buttons, selects, and modals with state integration
-- Select callbacks can opt into a `values` second parameter, no more `interaction.data["values"][0]`
-- V2 layout builders: `card()`, `stats_card()`, `action_section()`, `toggle_section()`, `image_section()`, `link_section()`, `confirm_section()`, `button_row()`, `cycle_button()`, `toggle_button()`, `tab_nav()`, `key_value()`, `alert()`, `progress_bar()`, `divider()`, `gap()`, `gallery()`
-- Grid helpers: `emoji_grid()` for text-rendered boards with axis labels and mutation API, `button_grid()` for interactive cell grids with Discord's 5x5 limit enforced
-- Built-in form system with typed modal fields (`text`, `integer`, `float`, `date`), inline selects, per-field validation, and declarative `FormSchema` / `WizardSchema` base classes
-- Component wrappers: loading states, confirmation dialogs, cooldowns
-
-### Persistence and Infrastructure
-- Persistent views that survive bot restarts with automatic message re-attachment
-- Two-namespace persistence model (`registry` and `application`) with per-namespace windows, max-age ceiling, and retry backoff on backend failure
-- State persistence backends: built-in SQLite (via `aiosqlite`) and an in-memory backend for tests; custom backends plug in through a capability-flag `Protocol` with documented copy-on-store and NULL-safe TTL contracts
-- Opt-in application slots via `persistent_slots = ("scoped",)`. Only the slots a view declares ride to disk, the rest stay volatile (≈ `redux-persist`, opt-in per slot)
-- Named scoped buckets via `scoped_slot` so each subsystem (e.g. `"battleship_stats"`, `"tictactoe_stats"`) persists into its own flat bucket instead of one monolithic `scoped` tree
-- Debounced `PersistenceMiddleware` installed via `setup_middleware`, with smart filtering so bookkeeping actions do not hit disk and an identity-diff scan that skips no-op writes
-- Undo and redo via snapshot-based state history (opt in with `enable_undo`); batched dispatches collapse to one undo entry per participating view
-- Scoped state isolation (`user`, `guild`, `user_guild`, `global`) with automatic key derivation and a reducer-side `merge_scoped()` writer
-- `DevToolsCog` with a tabbed state inspector and owner-only `/cascadeui` command group for live debugging
-- Silent snowflake coercion at every public boundary (`Member` where `int` is expected just works)
-- Class-attribute validation at subclass-definition time. Typos in `instance_policy`, `participant_limit`, and friends fail at import with a clear error
-
----
-
-## Showcase
+## Feature Showcase
 
 ### Cross-View Reactivity
 
@@ -596,8 +530,6 @@ class CharacterCreator(WizardLayoutView):
 
 ---
 
-## Component Patterns
-
 ### Emoji Grid
 
 > Text-rendered grids with optional axis labels and a mutation API. Plugs directly into `card()` and `Container`.
@@ -611,10 +543,6 @@ grid[(2, 2)] = "\u2764\ufe0f"
 
 view.add_item(card(grid))
 ```
-
-![Emoji Grid](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/pngs/v2-emoji-grid.PNG)
-
----
 
 ### Button Grid
 
@@ -634,6 +562,77 @@ for row in rows:
 
 ![Button Grid](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/pngs/v2-button-grid.PNG)
 
+<div align="center">
+  <img src="https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/pngs/v2-emoji-grid.PNG" width="30%" alt="Emoji Grid" style="border-radius: 8px; margin: 5px;" />
+  <img src="https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/pngs/v2-button-grid.PNG" width="30%" alt="Button Grid" style="border-radius: 8px; margin: 5px;" />
+</div>
+
+---
+
+## Features
+
+> For full details, see the official <a href="https://hollowthesilver.github.io/CascadeUI/"><strong>documentation</strong></a>.
+
+### State
+- Centralized store with dispatch and reducer cycle
+- Custom reducers via `@cascade_reducer` with automatic deep copy and collision guards
+- Action batching with nested-batch collapse and a single notification per commit
+- `@computed` values with selector-based cache invalidation (≈ Reselect / `useMemo`)
+- Selector-based subscriptions for targeted re-renders
+- Scoped state family: `get_scoped()`, `set_scoped()`, `merge_scoped()`, `iter_scoped()`
+- Slot helpers: `access_slot()`, `read_slot()`, `slot_property`
+- Middleware pipeline for logging, persistence, and transformation (Redux-style, async)
+- Event hooks for lifecycle observation
+- Cross-view reactivity: dispatch from any view, all subscribers update instantly
+
+### Views
+- V2 layout-based system for structured, container-driven interfaces
+- Full support for traditional discord.py Views (V1)
+- Pre-built patterns: menus, tabs, wizards, forms, pagination, leaderboards
+- `PaginatedView.from_cursor()` for lazy cursor-driven pagination with LRU page cache
+- `DisplayLayoutView` for one-shot V2 sends from a pre-built container
+- Automatic state-driven rebuilds: define `build_ui()`, the library handles the edit (≈ React `render()`)
+- Theming with per-view overrides and a `ContextVar` that propagates through builders (≈ `React.Context`)
+
+### Components
+- Stateful buttons, selects, and modals with state integration
+- Select callbacks can opt into a `values` second parameter
+- V2 builders: `card()`, `stats_card()`, `action_section()`, `toggle_section()`, `image_section()`, `link_section()`, `confirm_section()`, `button_row()`, `cycle_button()`, `toggle_button()`, `tab_nav()`, `key_value()`, `alert()`, `progress_bar()`, `divider()`, `gap()`, `gallery()`
+- Grid helpers: `emoji_grid()` and `button_grid()`
+- Typed modal fields (`text`, `integer`, `float`, `date`) with per-field validation
+- Declarative `FormSchema` and `WizardSchema` base classes
+- Component wrappers: loading states, confirmation dialogs, cooldowns
+
+### Interaction Control
+- Owner-only views by default; `allowed_users` opens access to specific users
+- Instance limits per user, guild, user+guild, or globally with replace or reject policies
+- `participant_limit` with `on_participant_limit` hook and `auto_register_participants`
+- `check_instance_available()` for fail-fast pre-checks before constructing expensive views
+- Auto-defer with `respond()`, `open_modal()`, and `_safe_defer()` helpers
+- Interaction serialization so rapid clicks process sequentially
+- Refresh throttling via `refresh_cooldown_ms` and reactive 429 backoff
+- Silent snowflake coercion at every public boundary
+- Class-attribute validation at subclass-definition time
+
+### Navigation and Lifecycle
+- Navigation stack: `push()`, `pop()`, `replace()` on one shared message (≈ React Router)
+- Parent/child view lifecycle via `attach_child()` or `parent=` with automatic cleanup
+- `session_continuity` opt-in for repeat-open state coalescing
+- `auto_refresh_ephemeral` for user-driven token handoff past the 15-minute ephemeral wall
+- Automatic message re-fetch so long-lived views survive the interaction token's 15-minute window
+
+### Persistence
+- Persistent views that survive bot restarts with automatic message re-attachment
+- Opt-in per slot via `persistent_slots = (...)` (≈ `redux-persist`)
+- Built-in SQLite and in-memory backends; custom backends via capability-flag `Protocol`
+- Named scoped buckets via `scoped_slot` for per-subsystem persistence
+- Two-namespace model (`registry` and `application`) with per-namespace debounce and retry backoff
+- Undo and redo via snapshot-based state history (opt in with `enable_undo`)
+
+### Developer Tools
+- Built-in profiler with markdown and JSON exports
+- `DevToolsCog` with a tabbed state inspector and owner-only `/cascadeui` command group
+
 ---
 
 ## V1 Components
@@ -645,34 +644,6 @@ Use V1 when you need:
 - Simpler layouts without containers
 
 All core features such as navigation, persistence, and undo/redo are supported.
-
-```python
-from cascadeui import PersistentView, SuccessButton
-import discord
-
-class TicketPanel(PersistentView):
-    persistence_key = "support-ticket-panel"
-    owner_only = False   # Public panel -- anyone can open a ticket
-
-    def build_embed(self):
-        return discord.Embed(
-            title="Support Tickets",
-            description="Click below to open a private support thread.",
-            color=discord.Color.blurple(),
-        )
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.add_item(SuccessButton(
-            label="Open Ticket",
-            custom_id="ticket-panel:open",
-            callback=self._open_ticket,
-        ))
-
-    async def _open_ticket(self, interaction):
-        # ... create private thread, send confirmation ...
-        await self.respond(interaction, "Ticket created!", ephemeral=True)
-```
 
 ![Ticket System](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v1-ticket-system.gif)
 
@@ -721,7 +692,7 @@ isort cascadeui/
 
 ## Developer's Note
 
-> I built CascadeUI with over **ten years** of Python experience behind it. All documentation, docstrings, and the entire testing module were written and designed using my custom **Anthropic Opus 4.6** sub-agents built on **Claude Code**. I don't try to hide that. I'm a proponent of efficient and responsible agent application in software design. That experience is what makes these tools effective. They're amplifiers, not substitutes.
+> I built CascadeUI with over **ten years** of Python, and roughly fifteen years of developement experience. All documentation, docstrings and test modules are written and designed using custom **Anthropic Opus** sub-agents. I do not attempt to conceal this fact. I'm a proponent of efficient and responsible agent application in software design. That experience is what makes these tools effective. They're amplifiers, not substitutes.
 >
 > *-- Hollow*
 

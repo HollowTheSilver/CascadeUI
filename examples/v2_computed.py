@@ -170,8 +170,7 @@ class PollView(StatefulLayoutView):
     instance_policy = "replace"
     replace_policy = "delete"
     exit_policy = "delete"
-    auto_defer = True  # library default; declared for policy-surface visibility
-    serialize_interactions = True
+    auto_defer = True    serialize_interactions = True
     auto_refresh_ephemeral = False
 
     # Subscribe to POLL_VOTE so the view rebuilds when anyone votes.

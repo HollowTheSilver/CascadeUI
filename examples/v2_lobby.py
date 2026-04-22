@@ -121,8 +121,7 @@ class LobbyView(StatefulLayoutView):
     instance_limit = 1
     instance_scope = "user"  # one lobby per host across all guilds
     instance_policy = "replace"
-    replace_policy = "delete"  # library default; declared for policy-surface visibility
-    # A lobby is a staging area, not a committed game - replacement is
+    replace_policy = "delete"    # A lobby is a staging area, not a committed game - replacement is
     # expected when the host opens a fresh lobby. protect_attached
     # defaults to True, which would block replacement when participants
     # are present. False allows replacement to proceed, and the
@@ -131,8 +130,7 @@ class LobbyView(StatefulLayoutView):
     # ``state_scope = None`` because lobby stats live under custom reducers
     # written to the global state tree, not under any built-in scope key.
     state_scope = None
-    auto_defer = True  # library default; declared for policy-surface visibility
-
+    auto_defer = True
     def __init__(self, *args, max_players: int = DEFAULT_MAX_PLAYERS, **kwargs):
         super().__init__(*args, **kwargs)
         # Per-invocation policy override -- runs the same validator

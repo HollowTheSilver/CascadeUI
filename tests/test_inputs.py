@@ -1,6 +1,6 @@
 """Tests for modal input wrappers and Modal construction contracts.
 
-Covers the v3.0.0 canonical validator-attachment API: validators live on
+Covers the canonical validator-attachment API: validators live on
 input wrapper instances (TextInput, Checkbox, CheckboxGroup, RadioGroup,
 FileUpload) and are auto-collected by ``Modal`` at construction time.
 """

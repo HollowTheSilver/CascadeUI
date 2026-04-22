@@ -141,7 +141,6 @@ class V2SettingsHubView(MenuLayoutView):
         - Batched dispatch (multiple state updates in one notification)
     """
 
-    # Full policy surface declared explicitly per CLAUDE.md examples grammar.
     owner_only = True
     instance_limit = 1
     instance_scope = "user_guild"

@@ -176,8 +176,9 @@ class PersistenceManager:
 
     def get_slot_policy(self, name: str) -> SlotPolicy:
         """Return the policy for ``name`` or the :class:`SlotPolicy`
-        default when unregistered. The default-and-log-DEBUG contract
-        matches the design doc's treatment of first-write-without-policy.
+        default when unregistered. First-write-without-policy: the slot
+        is accepted under the namespace default TTL until an explicit
+        policy registers; the fallback case is logged at DEBUG.
         """
         policy = self._slot_policies.get(name)
         if policy is None:

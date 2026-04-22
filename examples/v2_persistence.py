@@ -138,7 +138,6 @@ class RoleSelectorPanel(PersistentLayoutView):
 
     # owner_only = False is the PersistentView default -- role panels
     # are server-wide, anyone in the channel can click to toggle roles.
-    # Set explicitly so the policy surface is visible in one place.
     owner_only = False
     # instance_limit is deliberately not set on a PersistentLayoutView.
     # Persistent views already get deterministic single-panel-per-key
@@ -153,8 +152,7 @@ class RoleSelectorPanel(PersistentLayoutView):
     # ``exit_policy = "disable"`` is the PersistentLayoutView default
     # and the correct choice here -- a role panel is a product surface,
     # not a session; when it times out the buttons should freeze in
-    # place rather than deleting the panel message. Declared explicitly
-    # so the full policy surface is visible at a glance.
+    # place rather than deleting the panel message.
     exit_policy = "disable"
 
     def __init__(self, *args, **kwargs):

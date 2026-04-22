@@ -89,6 +89,8 @@ every subcommand automatically.
 
 ## `/cascadeui` Commands
 
+### Core (lifecycle + visual inspector)
+
 | Command | Description |
 |---------|-------------|
 | `/cascadeui inspect` | Open the visual state inspector (see below) |
@@ -101,14 +103,33 @@ every subcommand automatically.
 | `/cascadeui purge` | Remove stale component and modal interaction entries |
 | `/cascadeui reset` | Reset the entire state store (requires `confirm:True`) |
 
+### Registry introspection
+
+| Command | Description |
+|---------|-------------|
+| `/cascadeui persistent` | List registered `PersistentView` classes (`module.QualName` keys) |
+| `/cascadeui scoped [slot]` | Inspect a scoped bucket under `state["application"]` (default slot: `scoped`); groups keys by scope kind |
+| `/cascadeui computed [name]` | List `@computed` registrations with cache-primed status; pass a name to force a read |
+| `/cascadeui middleware` | List installed middleware in dispatch order |
+
+### Diagnostics
+
+| Command | Description |
+|---------|-------------|
+| `/cascadeui history [n]` | Show the most recent `n` dispatched actions (clamped to `store.history_limit`) |
+| `/cascadeui perf [action]` | Toggle perf sampling: `on`, `off`, `clear`, `status` |
+| `/cascadeui trace [action]` | Toggle ViewStore dispatch tracing: `on`, `off`, `status` |
+| `/cascadeui subscribers` | List active state subscribers with action-filter breakdown |
+
 `exit` supports partial ID matching -- pass the first 8+ characters of
 a view ID. If the view is live, it calls `exit()` for a clean shutdown.
 If only a ghost state entry remains (no live instance), the entry is
 cleaned up directly.
 
-`reset` is a destructive operation that exits all views and clears the
-state dict. It requires `confirm:True` as a parameter to prevent
-accidental use.
+`reset` is a destructive operation that exits all views, clears the
+state dict via `StateStore._build_initial_state()`, invalidates every
+`@computed` cache, and drops all subscriber selector memoization. It
+requires `confirm:True` as a parameter to prevent accidental use.
 
 ---
 
@@ -227,7 +248,7 @@ Sessions tabs:
 | `_filtered_views()` | Inspector's view ID from `state["views"]` |
 | `_filtered_sessions()` | Inspector's session ID from `state["sessions"]` |
 | `_filtered_history()` | Actions where `source` matches the inspector's ID |
-| `_filtered_active_views()` | Inspector from `store._active_views` |
+| `_filtered_active_views()` | Inspector from `store.get_active_views()` |
 
 ---
 

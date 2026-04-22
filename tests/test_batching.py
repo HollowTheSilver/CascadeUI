@@ -162,10 +162,9 @@ class TestTransitiveBatching:
     """store.dispatch() calls inside a batch block queue into the batch."""
 
     async def test_store_dispatch_is_batched_transitively(self):
-        """Calling store.dispatch() inside async with store.batch() must not
-        fire its own notification. This is the bug #166 fixed -- before the
-        fix, store.dispatch() bypassed the batch entirely because only
-        BatchContext.dispatch() was batch-aware.
+        """Calling store.dispatch() inside ``async with store.batch()`` must
+        not fire its own notification. Regression guard: store.dispatch()
+        queues actions into the open batch instead of bypassing it.
         """
         store = get_store()
         received = []
@@ -331,8 +330,9 @@ class TestLibraryInternalBatching:
         await view.send()
         await store._flush_notifications()
 
-        # Before #167: SESSION_CREATED, VIEW_CREATED, VIEW_UPDATED (3).
-        # After #167: BATCH_COMPLETE (covers first two), VIEW_UPDATED (2).
+        # _send_pipeline batches SESSION_CREATED + VIEW_CREATED into
+        # BATCH_COMPLETE, then dispatches VIEW_UPDATED separately -- 2
+        # notifications, not 3.
         assert received.count("BATCH_COMPLETE") == 1
         assert "VIEW_UPDATED" in received
 

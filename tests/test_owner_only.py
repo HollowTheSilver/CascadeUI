@@ -220,11 +220,11 @@ class TestAllowedUsers:
     async def test_allowed_users_runtime_mutation(self):
         """Reassigning allowed_users at runtime should take effect.
 
-        v3.0.0 made ``allowed_users`` a frozenset coerced via the property
-        setter. The supported mutation path is reassignment (which goes
-        through the setter and re-coerces). Direct ``.add()`` is no longer
-        possible — frozen-by-convention prevents the "I mutated the set
-        and nothing happened" footgun.
+        ``allowed_users`` is a frozenset coerced via the property setter.
+        The supported mutation path is reassignment (which goes through
+        the setter and re-coerces). Direct ``.add()`` is not possible --
+        frozen-by-convention prevents the "I mutated the set and nothing
+        happened" footgun.
         """
         view = StatefulView(interaction=_make_interaction(user_id=100))
         view.allowed_users = {100}

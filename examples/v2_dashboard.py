@@ -104,14 +104,13 @@ class DashboardView(TabLayoutView):
     instance_policy = "replace"
     replace_policy = "delete"
     exit_policy = "delete"
-    auto_defer = True  # library default; declared explicitly so the full policy surface is visible
+    auto_defer = True
     # ``state_scope = None`` because module toggles and tab-visit counters
     # live on the instance, not the Redux tree. The dashboard is a layout
     # showcase rather than a state-management tutorial -- see ``v2_settings``
     # for the scoped-state pattern.
     state_scope = None
-    # Non-ephemeral panel; flag has no effect here. Declared explicitly
-    # so the full policy surface is visible in the class body.
+    # Non-ephemeral panel; the flag has no effect here.
     auto_refresh_ephemeral = False
 
     # // ----( Tab styling )---- // #

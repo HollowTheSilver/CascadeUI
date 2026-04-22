@@ -134,9 +134,8 @@ class TestMiddlewarePipeline:
 
 
 class TestHasMiddleware:
-    """v3.0.0: ``StateStore.has_middleware(cls)`` is the public seam
-    for asking whether an instance of a middleware class is installed.
-    Replaces ad-hoc reads of the private ``_middleware`` list.
+    """``StateStore.has_middleware(cls)`` is the public seam for asking
+    whether an instance of a middleware class is installed.
     """
 
     async def test_returns_false_when_not_installed(self):

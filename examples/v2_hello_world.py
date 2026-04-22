@@ -57,8 +57,7 @@ class CounterView(StatefulLayoutView):
 
     # -- Lifecycle --
     # ``"disable"`` freezes components on exit/timeout; ``"delete"`` would
-    # remove the message instead. Declared explicitly per CLAUDE.md so
-    # the full policy surface is visible in one block.
+    # remove the message instead.
     exit_policy = "disable"
 
     # -- State scope --

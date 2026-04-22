@@ -351,7 +351,7 @@ class TestModalSubmittedReducer:
 class TestShallowSpreadInvariants:
     """Reducers use shallow spread, not deepcopy: identity-preserving on
     no-ops, unchanged branches shared by reference, input state never
-    mutated at any depth.  Guards the #153 rewrite against regression.
+    mutated at any depth.
     """
 
     async def test_view_created_shares_unchanged_sessions_branch(self):

@@ -1630,7 +1630,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             # edit response from Discord (latency spike, ephemeral backend
             # under load) would starve the ack past the 3s interaction
             # deadline. The ``wait_for`` guard caps the fast path below
-            # ``auto_defer_delay`` so on stall we cancel and fall through
+            # ``auto_defer_delay`` so a stall cancels the fast path and falls through
             # to the channel endpoint -- the auto-defer timer then ships
             # a standalone ack at ``auto_defer_delay`` seconds, well inside
             # the 3s window. ``_response_type`` is set only after the await

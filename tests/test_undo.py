@@ -914,9 +914,8 @@ class TestUndoSlotIsolation:
     """Per-slot undo diffs -- a view's undo must not clobber sibling slots
     owned by other views.
 
-    The v3.0.0 undo rewrite switched from wholesale
-    ``application`` replacement to per-slot diffs keyed on the slot
-    names an action actually touched. These tests pin the contract.
+    Undo snapshots store per-slot diffs keyed on the slot names an
+    action actually touched. These tests pin the contract.
     """
 
     async def test_undo_does_not_clobber_sibling_slot_owned_by_another_view(self):

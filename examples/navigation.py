@@ -48,14 +48,14 @@ class MainMenuView(StatefulView):
     and can read/write shared session data.
     """
 
-    # Full policy surface declared explicitly per CLAUDE.md examples grammar.
+    # Access, instance, and lifecycle policies for the hub.
     owner_only = True
     instance_limit = 1
     instance_scope = "user"
     instance_policy = "replace"
     replace_policy = "delete"
     exit_policy = "disable"
-    auto_defer = True  # library default; declared for policy-surface visibility
+    auto_defer = True
     # No Redux state -- cross-view preferences live in session data,
     # which is ephemeral and shared across the push/pop chain.
     state_scope = None

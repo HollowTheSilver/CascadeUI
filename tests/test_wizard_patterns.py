@@ -1,4 +1,4 @@
-"""Tests for WizardView / WizardLayoutView customization and parity (Phase 2B Move 3)."""
+"""Tests for WizardView / WizardLayoutView customization and parity."""
 
 from unittest.mock import AsyncMock, MagicMock
 
@@ -118,7 +118,7 @@ class TestOnFinishMethodHook:
         assert calls[0] is nav
 
     async def test_on_finish_kwarg_no_longer_accepted(self):
-        """The old ``on_finish=callable`` kwarg was removed in Phase 2B."""
+        """``on_finish=`` is not a supported WizardView kwarg; overriding ``on_finish()`` is the extension path."""
 
         async def builder():
             return [Container(TextDisplay("s"))]

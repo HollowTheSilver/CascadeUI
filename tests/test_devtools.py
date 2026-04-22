@@ -3,6 +3,8 @@
 # // ========================================( Modules )======================================== // #
 
 
+from unittest.mock import AsyncMock, MagicMock
+
 from discord.ui import ActionRow, Container, LayoutView, TextDisplay
 from helpers import make_interaction as _make_interaction
 
@@ -501,3 +503,397 @@ class TestPurgeStaleReducerNullPath:
 
         await store.dispatch("INSPECTOR_PURGED_STALE", {"inspector_id": "keep_me"})
         assert store.state.get("components") == {"c1": {"view_id": "keep_me"}}
+
+
+# // ========================================( DevToolsCog )======================================== // #
+
+
+class TestDevToolsCogReset:
+    """Reset command correctness: shape helper, observability, failure counting."""
+
+    def _make_ctx(self):
+        ctx = MagicMock()
+        ctx.send = AsyncMock()
+        return ctx
+
+    async def test_reset_uses_build_initial_state_helper(self):
+        from cascadeui.state.store import StateStore
+
+        store = get_store()
+        store.state["sessions"] = {"s1": {"members": []}}
+        store.state["application"]["custom_slot"] = {"x": 1}
+
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = self._make_ctx()
+        await cog.reset.callback(cog, ctx, confirm=True)
+
+        assert store.state == StateStore._build_initial_state()
+
+    async def test_reset_invalidates_computed_cache(self):
+        from cascadeui.state.computed import _SENTINEL, ComputedValue
+
+        store = get_store()
+        cv = ComputedValue("test_reset_cv", lambda s: 1, lambda x: x * 10)
+        store._computed["test_reset_cv"] = cv
+        cv.get(store.state)
+        assert cv._last_input is not _SENTINEL
+
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = self._make_ctx()
+        await cog.reset.callback(cog, ctx, confirm=True)
+
+        assert cv._last_input is _SENTINEL
+        store._computed.pop("test_reset_cv", None)
+
+    async def test_reset_clears_last_selected_memo(self):
+        store = get_store()
+        store._last_selected["sub_x"] = {"stale": True}
+
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = self._make_ctx()
+        await cog.reset.callback(cog, ctx, confirm=True)
+
+        assert "sub_x" not in store._last_selected
+
+    async def test_reset_counts_exit_failures(self):
+        store = get_store()
+        failing_view = MagicMock()
+        failing_view.exit = AsyncMock(side_effect=RuntimeError("boom"))
+        store._active_views["failing_v"] = failing_view
+
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = self._make_ctx()
+        await cog.reset.callback(cog, ctx, confirm=True)
+
+        sent = ctx.send.call_args[0][0]
+        assert "1 view exit(s) failed" in sent
+
+    async def test_reset_requires_confirm(self):
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = self._make_ctx()
+        await cog.reset.callback(cog, ctx, confirm=False)
+
+        sent = ctx.send.call_args[0][0]
+        assert "reset confirm:True" in sent
+
+
+class TestDevToolsCogExitAll:
+    """exit_all failure reporting."""
+
+    def _make_ctx(self):
+        ctx = MagicMock()
+        ctx.send = AsyncMock()
+        return ctx
+
+    async def test_exit_all_reports_failures(self):
+        store = get_store()
+        store._active_views.clear()
+        good = MagicMock()
+        good.exit = AsyncMock()
+        bad = MagicMock()
+        bad.exit = AsyncMock(side_effect=RuntimeError("nope"))
+        store._active_views["good_v"] = good
+        store._active_views["bad_v"] = bad
+
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = self._make_ctx()
+        await cog.exit_all.callback(cog, ctx)
+
+        sent = ctx.send.call_args[0][0]
+        assert "1 failed" in sent
+
+    async def test_exit_all_silent_when_no_failures(self):
+        store = get_store()
+        store._active_views.clear()
+
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = self._make_ctx()
+        await cog.exit_all.callback(cog, ctx)
+
+        sent = ctx.send.call_args[0][0]
+        assert "failed" not in sent
+
+
+class TestDevToolsCogGroupListing:
+    """Group callback auto-derives command listing from cascadeui_group.commands."""
+
+    async def test_listing_includes_every_subcommand(self):
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = MagicMock()
+        ctx.send = AsyncMock()
+
+        await cog.cascadeui_group.callback(cog, ctx)
+
+        sent = ctx.send.call_args[0][0]
+        subcommand_names = {c.name for c in cog.cascadeui_group.commands}
+        assert subcommand_names
+        for name in subcommand_names:
+            assert f"/cascadeui {name}" in sent
+
+
+class TestDevToolsCogListDisplayCap:
+    """_LIST_DISPLAY_CAP is unified across views and sessions commands."""
+
+    def test_cap_constant_is_exported(self):
+        from cascadeui.devtools import _LIST_DISPLAY_CAP
+
+        assert isinstance(_LIST_DISPLAY_CAP, int)
+        assert _LIST_DISPLAY_CAP > 0
+
+
+class TestDevToolsCogRegistryCommands:
+    """persistent / scoped / computed / middleware introspection commands."""
+
+    def _make_ctx(self):
+        ctx = MagicMock()
+        ctx.send = AsyncMock()
+        return ctx
+
+    async def test_persistent_lists_registered_classes(self):
+        from cascadeui.views.persistent import _persistent_view_classes
+
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = self._make_ctx()
+        await cog.list_persistent.callback(cog, ctx)
+
+        sent = ctx.send.call_args[0][0]
+        if _persistent_view_classes:
+            assert str(len(_persistent_view_classes)) in sent
+        else:
+            assert "No persistent view classes" in sent
+
+    async def test_scoped_reports_empty_when_bucket_missing(self):
+        store = get_store()
+        store.state["application"].pop("totally_absent_slot", None)
+
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = self._make_ctx()
+        await cog.list_scoped.callback(cog, ctx, slot_name="totally_absent_slot")
+
+        sent = ctx.send.call_args[0][0]
+        assert "empty" in sent or "not a scoped" in sent
+
+    async def test_scoped_groups_keys_by_scope_kind(self):
+        store = get_store()
+        store.state["application"]["devtool_test_slot"] = {
+            "user:1": {"a": 1},
+            "user:2": {"a": 2},
+            "guild:10": {"b": 3},
+            "user:1:guild:10": {"c": 4},
+            "global": {"d": 5},
+            "weird_key": {"e": 6},
+        }
+
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = self._make_ctx()
+        await cog.list_scoped.callback(cog, ctx, slot_name="devtool_test_slot")
+
+        sent = ctx.send.call_args[0][0]
+        assert "`user`: 2" in sent
+        assert "`guild`: 1" in sent
+        assert "`user_guild`: 1" in sent
+        assert "`global`: 1" in sent
+        assert "`other`: 1" in sent
+
+        store.state["application"].pop("devtool_test_slot", None)
+
+    async def test_computed_lists_registrations(self):
+        store = get_store()
+
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = self._make_ctx()
+        await cog.list_computed.callback(cog, ctx, name=None)
+
+        sent = ctx.send.call_args[0][0]
+        if store._computed:
+            assert "computed value(s)" in sent
+        else:
+            assert "No @computed values registered" in sent
+
+    async def test_computed_detail_by_name(self):
+        from cascadeui.state.computed import ComputedValue
+
+        store = get_store()
+        cv = ComputedValue("devtool_probe", lambda s: 7, lambda x: x + 1)
+        store._computed["devtool_probe"] = cv
+
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = self._make_ctx()
+        await cog.list_computed.callback(cog, ctx, name="devtool_probe")
+
+        sent = ctx.send.call_args[0][0]
+        assert "devtool_probe" in sent
+        assert "8" in sent
+        store._computed.pop("devtool_probe", None)
+
+    async def test_computed_unknown_name_reports_missing(self):
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = self._make_ctx()
+        await cog.list_computed.callback(cog, ctx, name="nonexistent_cv_xyz")
+
+        sent = ctx.send.call_args[0][0]
+        assert "No computed named" in sent
+
+    async def test_middleware_lists_in_pipeline_order(self):
+        store = get_store()
+        store._middleware.clear()
+
+        class Mw1:
+            async def __call__(self, action, state, next_fn):
+                return await next_fn(action, state)
+
+        class Mw2:
+            async def __call__(self, action, state, next_fn):
+                return await next_fn(action, state)
+
+        store._middleware.append(Mw1())
+        store._middleware.append(Mw2())
+
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = self._make_ctx()
+        await cog.list_middleware.callback(cog, ctx)
+
+        sent = ctx.send.call_args[0][0]
+        assert "`Mw1`" in sent
+        assert "`Mw2`" in sent
+        assert sent.index("Mw1") < sent.index("Mw2")
+
+        store._middleware.clear()
+
+    async def test_middleware_empty_reports_none(self):
+        store = get_store()
+        store._middleware.clear()
+
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = self._make_ctx()
+        await cog.list_middleware.callback(cog, ctx)
+
+        sent = ctx.send.call_args[0][0]
+        assert "No middleware" in sent
+
+
+class TestDevToolsCogDiagnosticCommands:
+    """history / perf / trace / subscribers diagnostic commands."""
+
+    def _make_ctx(self):
+        ctx = MagicMock()
+        ctx.send = AsyncMock()
+        return ctx
+
+    async def test_history_empty_reports_none(self):
+        store = get_store()
+        store.history.clear()
+
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = self._make_ctx()
+        await cog.show_history.callback(cog, ctx)
+
+        sent = ctx.send.call_args[0][0]
+        assert "No actions" in sent
+
+    async def test_history_shows_recent_actions(self):
+        store = get_store()
+        store.history.clear()
+        store.history.append({"type": "A", "source": "src1"})
+        store.history.append({"type": "B", "source": "src2"})
+
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = self._make_ctx()
+        await cog.show_history.callback(cog, ctx, limit=10)
+
+        sent = ctx.send.call_args[0][0]
+        assert "`A`" in sent
+        assert "`B`" in sent
+        assert "src1" in sent
+        store.history.clear()
+
+    async def test_history_clamps_limit(self):
+        store = get_store()
+        store.history.clear()
+        for i in range(5):
+            store.history.append({"type": f"T{i}", "source": "s"})
+
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = self._make_ctx()
+        await cog.show_history.callback(cog, ctx, limit=2)
+
+        sent = ctx.send.call_args[0][0]
+        assert "`T4`" in sent
+        assert "`T3`" in sent
+        assert "`T0`" not in sent
+        store.history.clear()
+
+    async def test_perf_on_off_status_clear(self):
+        cog = DevToolsCog(bot=MagicMock())
+
+        for action, expected in [
+            ("on", "enabled"),
+            ("status", "enabled"),
+            ("off", "disabled"),
+            ("status", "disabled"),
+            ("clear", "cleared"),
+        ]:
+            ctx = self._make_ctx()
+            await cog.toggle_perf.callback(cog, ctx, action=action)
+            sent = ctx.send.call_args[0][0].lower()
+            assert expected in sent
+
+    async def test_perf_unknown_action_reports_usage(self):
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = self._make_ctx()
+        await cog.toggle_perf.callback(cog, ctx, action="frobnicate")
+
+        sent = ctx.send.call_args[0][0]
+        assert "Unknown action" in sent
+        assert "on" in sent
+
+    async def test_trace_status_default(self):
+        from cascadeui.tracing import _uninstall_viewstore_trace
+
+        _uninstall_viewstore_trace()
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = self._make_ctx()
+        await cog.toggle_trace.callback(cog, ctx, action="status")
+
+        sent = ctx.send.call_args[0][0]
+        assert "disabled" in sent
+
+    async def test_trace_on_off_cycle(self):
+        from cascadeui.tracing import _uninstall_viewstore_trace
+
+        _uninstall_viewstore_trace()
+        cog = DevToolsCog(bot=MagicMock())
+
+        ctx = self._make_ctx()
+        await cog.toggle_trace.callback(cog, ctx, action="on")
+        assert "enabled" in ctx.send.call_args[0][0]
+
+        ctx = self._make_ctx()
+        await cog.toggle_trace.callback(cog, ctx, action="off")
+        assert "disabled" in ctx.send.call_args[0][0]
+
+    async def test_subscribers_empty(self):
+        store = get_store()
+        store.subscribers.clear()
+
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = self._make_ctx()
+        await cog.list_subscribers.callback(cog, ctx)
+
+        sent = ctx.send.call_args[0][0]
+        assert "No subscribers" in sent
+
+    async def test_subscribers_lists_with_filter_shape(self):
+        store = get_store()
+        store.subscribers.clear()
+        store.subscribers["sub_without_filter"] = (lambda s: None, None, None)
+        store.subscribers["sub_with_filter"] = (lambda s: None, {"A", "B"}, None)
+
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = self._make_ctx()
+        await cog.list_subscribers.callback(cog, ctx)
+
+        sent = ctx.send.call_args[0][0]
+        assert "all actions" in sent
+        assert "2 action(s)" in sent
+        store.subscribers.clear()

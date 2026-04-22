@@ -122,7 +122,7 @@ class RegistrationFormView(FormLayoutView):
     exit_policy = "delete"
     state_scope = None
     owner_only = True
-    auto_defer = True  # library default; declared explicitly so the full policy surface is visible
+    auto_defer = True
 
     def __init__(self, *args, **kwargs):
         # Each field is a ``FormField`` dataclass -- the typed construction
