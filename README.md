@@ -560,8 +560,6 @@ for row in rows:
     view.add_item(row)
 ```
 
-![Button Grid](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/pngs/v2-button-grid.PNG)
-
 <div align="center">
   <img src="https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/pngs/v2-emoji-grid.PNG" width="30%" alt="Emoji Grid" style="border-radius: 8px; margin: 5px;" />
   <img src="https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/pngs/v2-button-grid.PNG" width="30%" alt="Button Grid" style="border-radius: 8px; margin: 5px;" />
@@ -635,20 +633,6 @@ for row in rows:
 
 ---
 
-## V1 Components
-
-> CascadeUI supports traditional discord.py Views and embeds.
-
-Use V1 when you need:
-- Embed-specific features such as fields or timestamps
-- Simpler layouts without containers
-
-All core features such as navigation, persistence, and undo/redo are supported.
-
-![Ticket System](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v1-ticket-system.gif)
-
----
-
 ## Examples
 
 > The <a href="https://hollowthesilver.github.io/CascadeUI/examples/"><strong>documentation</strong></a> includes full implementations demonstrating practical usage:
@@ -660,6 +644,22 @@ All core features such as navigation, persistence, and undo/redo are supported.
 - Persistent views
 - Multi-user games with shared state, hidden information, and challenge flows (TicTacToe, Battleship)
 - Open-join lobbies with capacity caps and host-vs-participant authority (Werewolf-style)
+
+![Examples](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/pngs/v2-hero.gif)
+
+---
+
+## V1 Components
+
+> CascadeUI supports traditional discord.py Views and embeds.
+
+Use V1 when you need:
+- Embed-specific features such as fields or timestamps
+- Simpler layouts without containers
+
+All core features such as navigation, persistence, and undo/redo are supported.
+
+![Ticket System](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v1-ticket-system.gif)
 
 ---
 
