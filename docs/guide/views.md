@@ -384,6 +384,13 @@ class HubView(StatefulLayoutView):
 Passing extra kwargs alongside an instance raises `TypeError` -- the
 instance is already built.
 
+!!! tip "Coming from a paginator gist?"
+    If you're migrating from [@Soheab](https://github.com/Soheab)'s
+    [CV2 paginator gist](https://gist.github.com/Soheab/891c39d7294b1bdbadc7ecf35ce51cc5)
+    or [classic paginator gist](https://gist.github.com/Soheab/f226fc06a3468af01ea3168c95b30af8),
+    see the [migration map in the patterns guide](patterns.md#coming-from-a-paginator-gist)
+    for the full mapping of gist concepts to CascadeUI's grammar.
+
 ### Auto Back Button
 
 ```python

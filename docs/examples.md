@@ -49,7 +49,7 @@ Paginated inventory viewer using `PaginatedLayoutView` with `from_data()`. Conta
 
 ### v2_library.py
 
-Pagination + drill-down navigation. A category hub (`StatefulLayoutView`) pushes a paginated `CategoryListView` per category using `await PaginatedLayoutView.from_data(...)` and `push(instance)`. `nav_inside_container = True` wraps page content + nav row in a single Container per page; `auto_back_button = True` adds a Back button that pops the nav stack and survives page turns. The closest mapping for users coming from Soheab's CV2 paginator gist.
+Pagination + drill-down navigation. A category hub (`StatefulLayoutView`) pushes a paginated `CategoryListView` per category using `await PaginatedLayoutView.from_data(...)` and `push(instance)`. `nav_inside_container = True` wraps page content + nav row in a single Container per page; `auto_back_button = True` adds a Back button that pops the nav stack and survives page turns. The closest mapping for users coming from [@Soheab](https://github.com/Soheab)'s [CV2 paginator gist](https://gist.github.com/Soheab/891c39d7294b1bdbadc7ecf35ce51cc5).
 
 **Command:** `/v2library`
 

@@ -802,7 +802,8 @@ into the rendered page.
 
 ### Coming from a paginator gist?
 
-The discord.py community frequently points new bot authors at Soheab's
+The discord.py community frequently points new bot authors at
+[@Soheab](https://github.com/Soheab)'s
 [CV2 paginator gist](https://gist.github.com/Soheab/891c39d7294b1bdbadc7ecf35ce51cc5)
 and [classic paginator gist](https://gist.github.com/Soheab/f226fc06a3468af01ea3168c95b30af8)
 as reference implementations. CascadeUI's `PaginatedView` and
@@ -835,7 +836,7 @@ CascadeUI adds beyond the gists:
 - Instance limiting + replacement policies
 - Compose with `_PersistentMixin` for paginators that survive bot restarts
 
-Soheab's gists shaped CascadeUI's paginator grammar and remain excellent
+[@Soheab](https://github.com/Soheab)'s gists shaped CascadeUI's paginator grammar and remain excellent
 learning material for the underlying discord.py V1 and V2 primitives.
 
 ---
