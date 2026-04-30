@@ -7,6 +7,8 @@ from typing import Any, Callable, Dict, Optional
 import discord
 from discord import ButtonStyle, Interaction
 
+from .types import EmojiInput
+
 # // ========================================( Constants )======================================== // #
 
 
@@ -19,7 +21,7 @@ _VALID_COOLDOWN_SCOPES = frozenset({"user", "guild", "user_guild", "global"})
 def with_loading_state(
     component: Any,
     loading_label: str = "Loading...",
-    loading_emoji: Optional[str] = None,
+    loading_emoji: EmojiInput = None,
 ) -> Any:
     """Add loading state to a component.
 

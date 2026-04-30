@@ -136,7 +136,7 @@ class InspectorView(TabLayoutView):
     tab_overflow_policy = "pin_first"
 
     def state_selector(self, state):
-        """Return frozensets of filtered view/session IDs.
+        """Return frozensets of filtered view/session signatures.
 
         Identity tuple, not counts. A counts-based selector short-circuits
         during push/pop batches where one view births and another dies in
@@ -144,8 +144,19 @@ class InspectorView(TabLayoutView):
         is identical but the ID set changed. Frozensets expose the identity
         diff and drive ``on_state_changed`` through the _notify_subscribers
         selector gate.
+
+        Each view's tuple bundles ``(view_id, message_id, channel_id)`` so
+        ``VIEW_UPDATED`` writes from the ``_message`` / ``_update_message_state``
+        contract change the selector signature even when the view set is
+        otherwise stable. Without those fields the gate equality-skips the
+        notification and the Views tab's Channel / Msg columns stay null
+        until the user manually refreshes.
         """
-        views = frozenset(k for k in state.get("views", {}) if k != self.id)
+        views = frozenset(
+            (k, v.get("message_id"), v.get("channel_id"))
+            for k, v in state.get("views", {}).items()
+            if k != self.id
+        )
         sessions = frozenset(k for k in state.get("sessions", {}) if k != self.session_id)
         return (views, sessions)
 

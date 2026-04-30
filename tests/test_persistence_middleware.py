@@ -517,7 +517,7 @@ class TestMiddlewareDebounce:
 
         # Dispatch every 20ms; the idle window never elapses but the
         # ceiling eventually clamps wait to 0 and a flush fires.
-        start = asyncio.get_event_loop().time()
+        start = asyncio.get_running_loop().time()
         for n in range(10):
             await middleware(
                 {"type": "TICK", "payload": {}}, store.state, await write(n)
@@ -525,7 +525,7 @@ class TestMiddlewareDebounce:
             await asyncio.sleep(0.02)
 
         await _drain(middleware)
-        elapsed = asyncio.get_event_loop().time() - start
+        elapsed = asyncio.get_running_loop().time() - start
         # Should have flushed within the 0.2s dispatch window plus
         # ceiling overhead; 0.5s ceiling is generous.
         assert elapsed < 0.5

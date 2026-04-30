@@ -1,5 +1,21 @@
 # API: Components
 
+## Type Aliases
+
+### `EmojiInput`
+
+```python
+EmojiInput = Optional[Union[str, discord.Emoji, discord.PartialEmoji]]
+```
+
+Defined in `cascadeui.components.types`. Used by every `emoji=` parameter
+in CascadeUI's typed surface (button builders, pattern ClassVar
+attributes, the refresh handoff). Mirrors the union accepted by
+`discord.ui.Button`. See [Custom Emoji](../guide/components.md#custom-emoji)
+for the three string forms and application emoji setup.
+
+---
+
 ## `StatefulButton`
 
 Extends `discord.ui.Button` with automatic state dispatching.
@@ -10,6 +26,7 @@ StatefulButton(
     style=ButtonStyle.secondary,
     custom_id=None,        # Required for PersistentView
     callback=async_fn,     # async def callback(interaction)
+    owner_only=False,      # When True, only view.user_id can click; non-owner clicks route to view.on_unauthorized
     emoji=None,
     disabled=False,
     row=None,
@@ -70,15 +87,90 @@ Detection happens at creation time via `inspect.signature`. Old single-parameter
 - `UserSelect` -- extends `discord.ui.UserSelect`
 - `MentionableSelect` -- extends `discord.ui.MentionableSelect`
 
+### Pre-populated defaults (specialized selects)
+
+`RoleSelect`, `UserSelect`, `ChannelSelect`, and `MentionableSelect` accept a `default_values=` constructor kwarg and a `set_default_values(values)` method. CascadeUI coerces input to discord.py's `SelectDefaultValue` shape with the right `type` per select class.
+
+```python
+RoleSelect(default_values=[123456789, role_obj])           # auto-typed 'role'
+UserSelect(default_values=[member_obj])                    # auto-typed 'user'
+ChannelSelect(default_values=[channel_id])                 # auto-typed 'channel'
+MentionableSelect(default_values=[member_obj, role_obj])   # type inferred per object
+```
+
+Accepted input per entry:
+
+- Raw `int` IDs (RoleSelect / UserSelect / ChannelSelect only -- `MentionableSelect` rejects bare ints because the type cannot be inferred).
+- Discord.py objects with `.id` attributes (Member, User, Role, GuildChannel).
+- Pre-built `discord.SelectDefaultValue` instances (passed through unchanged).
+
+`set_default_values(values)` replaces the current list. Pass `None` or `[]` to clear.
+
+---
+
+## `DynamicPersistentButton`
+
+Extends `discord.ui.DynamicItem[discord.ui.Button]` for persistent
+buttons whose handler depends only on IDs encoded in the
+`custom_id`. No view-level state involved; each click re-instantiates
+the class from the matched `custom_id`.
+
+```python
+class RoleToggleButton(
+    DynamicPersistentButton,
+    template=r"roles:(?P<category>[a-z_]+):(?P<role_id>[0-9]+)",
+):
+    def __init__(self, *, category: str, role_id: int):
+        button = discord.ui.Button(
+            label=f"Toggle {category}",
+            custom_id=f"roles:{category}:{role_id}",
+            style=discord.ButtonStyle.primary,
+        )
+        super().__init__(button)
+        self.category = category
+        self.role_id = role_id
+
+    async def on_click(self, interaction):
+        ...
+```
+
+`discord.py` requires `template=` on every subclass at class-
+definition time; abstract intermediate bases are not supported.
+
+### `on_click(interaction) -> None`
+
+Override hook for click handling. Default: no-op. Captured values
+from the `custom_id` template are available as instance attributes
+set by the subclass `__init__`.
+
+### `from_custom_id(cls, interaction, item, match) -> cls` (classmethod)
+
+Default reconstructs the instance from a matched `custom_id`.
+Extracts `match.groupdict()`, coerces any capture named `user_id`,
+`guild_id`, `channel_id`, `role_id`, or `message_id` to `int`, and
+calls `cls(**captures)`. Override when the subclass needs custom
+extraction (non-snowflake coercion, combined keys, lookup-based
+restoration).
+
+### Auto-registration
+
+Every subclass declaring a `template=` registers into a module-level
+registry at class-definition time. `setup_middleware(
+PersistenceMiddleware(..., bot=bot))` then calls
+`bot.add_dynamic_items(*subclasses)` once during initialization, so
+every click routes correctly after a restart with no additional
+user setup.
+
 ---
 
 ## `TextInput`
 
-Wraps `discord.ui.TextInput` with a stable `custom_id` derived from the label.
+Wraps `discord.ui.TextInput` with a stable `custom_id` derived from the label. Renders inside a `Modal` as a `discord.ui.Label` containing the inner `discord.ui.TextInput`.
 
 ```python
 TextInput(
-    label=str,               # Required
+    label=str,               # Required; renders as ui.Label.text
+    description=None,        # Optional: ui.Label.description (helper text)
     placeholder=None,
     default=None,
     required=True,
@@ -90,6 +182,8 @@ TextInput(
 ```
 
 The `custom_id` is auto-generated as `"input_{label}"` (lowercased, spaces replaced with underscores). Use `TextInput._slug(label)` to reproduce the same transformation externally.
+
+`description=` populates `ui.Label.description` for an optional secondary helper line beneath the title. Available on every wrapped input type (Checkbox, CheckboxGroup, RadioGroup, FileUpload all accept the same kwarg).
 
 `validators` attaches a list of validator functions directly to the input. `Modal` auto-collects them at construction time, keyed by each input's `custom_id`. This is the canonical attachment shape -- there is no separate modal-level validators dict.
 
@@ -127,6 +221,7 @@ Checkbox(
     label=str,               # Required
     default=False,
     validators=None,
+    description=None,        # Optional: ui.Label.description
 )
 ```
 
@@ -145,6 +240,7 @@ CheckboxGroup(
     min_values=0,
     max_values=None,         # Defaults to len(options)
     validators=None,
+    description=None,        # Optional: ui.Label.description
 )
 ```
 
@@ -162,6 +258,7 @@ RadioGroup(
     label=str,               # Required
     options=[{"label": str, "value": str, "default": bool}, ...],
     validators=None,
+    description=None,        # Optional: ui.Label.description
 )
 ```
 
@@ -178,6 +275,7 @@ FileUpload(
     label=str,               # Required
     max_values=10,
     validators=None,
+    description=None,        # Optional: ui.Label.description
 )
 ```
 

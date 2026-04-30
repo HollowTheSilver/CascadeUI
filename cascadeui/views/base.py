@@ -15,6 +15,7 @@ from discord import Interaction
 from discord.ui import Item, TextDisplay
 
 from ..components.base import StatefulButton
+from ..components.types import EmojiInput
 from ..exceptions import InstanceLimitError
 from ..state.actions import ActionCreators
 from ..state.singleton import get_store
@@ -227,7 +228,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
     auto_refresh_ephemeral: Optional[bool] = None
     refresh_warning_seconds: int = 90  # how early to swap before the 900s wall
     refresh_button_label: str = "Continue Session"
-    refresh_button_emoji: str = "\U0001f504"  # 🔄
+    refresh_button_emoji: EmojiInput = "\U0001f504"  # 🔄
     refresh_button_style: discord.ButtonStyle = discord.ButtonStyle.primary
     # Static message sent when the ephemeral refresh button fails to spawn
     # a replacement view (factory raised or returned None). For dynamic UX
@@ -1659,10 +1660,25 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 except asyncio.TimeoutError:
                     logger.debug(
                         f"Acting-view fast path exceeded {fast_path_timeout:.2f}s "
-                        f"in {type(self).__name__}; falling through to channel endpoint"
+                        f"in {type(self).__name__}; channel-endpoint fall-through "
+                        f"skipped, auto-defer timer handles ack"
                     )
-                    # Fall through to the channel edit below. Auto-defer
-                    # timer handles the interaction ack independently.
+                    # Fast path was cancelled. Channel-endpoint fall-through
+                    # would ship a second edit attempt (~500ms) on top of
+                    # the cancelled fast path, draining the auto-defer
+                    # timer's budget for its own ack call -- under genuine
+                    # Discord-side latency the cumulative cost crosses the
+                    # 3s deadline and the user sees an interaction-failed
+                    # toast. Returning here lets the timer ack at
+                    # ``auto_defer_delay`` seconds with the full remaining
+                    # budget. Whether Discord processed the cancelled edit
+                    # server-side is indeterminate (cancellation race), so
+                    # invalidate the digest -- the next refresh ships
+                    # unconditionally, a redundant edit (when Discord did
+                    # process this one) is cheaper than a stuck UI (when
+                    # it did not).
+                    self._last_tree_digest = None
+                    return
                 except discord.HTTPException as e:
                     if self._handle_rate_limit(e):
                         return

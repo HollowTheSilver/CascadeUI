@@ -53,7 +53,7 @@ body:
         - DisplayLayoutView (one-shot V2)
         - StatefulView (V1)
         - PersistentView / PersistentLayoutView
-        - Pattern view (Tab, Wizard, Form, Paginated, Leaderboard, Menu)
+        - Pattern view (Tab, Wizard, Form, Paginated, Leaderboard, Menu, Roles)
         - Not view-related (state, persistence, components)
     validations:
       required: true

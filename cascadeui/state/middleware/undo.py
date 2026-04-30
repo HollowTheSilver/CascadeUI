@@ -9,6 +9,7 @@ from ..types import Action, StateData
 
 logger = logging.getLogger(__name__)
 
+
 # Sentinel marking "this slot did not exist pre-action" in an undo diff.
 # The UNDO reducer reads ``_MISSING`` as an instruction to ``pop`` the
 # slot from the current application dict (restoring the pre-action
@@ -16,7 +17,39 @@ logger = logging.getLogger(__name__)
 # slot when re-applying a post-action state that did not contain it.
 # Identity comparison (``is _MISSING``) is the contract -- do not
 # substitute a string sentinel that could collide with a real slot value.
-_MISSING: Any = object()
+#
+# The sentinel survives ``copy.deepcopy`` via ``__deepcopy__`` returning
+# self. Without that, ``@cascade_reducer``'s state deep-copy boundary
+# would replace stored ``_MISSING`` references inside undo-stack diffs
+# with fresh ``object()`` instances, breaking the identity check in
+# ``_apply_slot_diff`` -- the deep-copied bare object would land in the
+# else branch and be stored AS the slot value, corrupting the slot for
+# subsequent reducers (e.g. ``state["application"]["scoped"]`` becoming
+# a bare object that fails ``key not in slot`` on the next dispatch).
+class _MissingSentinel:
+    """Singleton sentinel that preserves identity across copy/deepcopy."""
+
+    _instance: Optional["_MissingSentinel"] = None
+
+    def __new__(cls) -> "_MissingSentinel":
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __deepcopy__(self, memo: Any) -> "_MissingSentinel":
+        return self
+
+    def __copy__(self) -> "_MissingSentinel":
+        return self
+
+    def __repr__(self) -> str:
+        return "_MISSING"
+
+    def __bool__(self) -> bool:
+        return False
+
+
+_MISSING: Any = _MissingSentinel()
 
 # Actions that should NOT create undo snapshots (internal lifecycle).
 #

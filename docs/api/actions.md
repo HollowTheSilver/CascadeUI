@@ -299,6 +299,25 @@ registry.
 
 ---
 
+## Inspector
+
+### `INSPECTOR_PURGED_STALE`
+
+Dispatched by `DevToolsCog`'s `/cascadeui purge` subcommand and the Inspector's Purge Stale button when stale view rows are removed from `state["views"]`. A view row is considered stale when its `view_id` is no longer in the live `_active_views` registry (e.g. the view was destroyed externally or its message was deleted while the bot was offline).
+
+**Payload:**
+
+```python
+{
+    "purged_view_ids": list[str],   # IDs of stale rows removed
+    "purged_count": int,            # convenience count
+}
+```
+
+**State change:** Removes the listed entries from `state["views"]`.
+
+---
+
 ## Undo / Redo
 
 ### `UNDO`

@@ -14,12 +14,12 @@ from cascadeui.state.reducers import (
 from cascadeui.state.singleton import get_store
 from cascadeui.views.view import StatefulView
 
-
 # // ========================================( Reducer No-Op Verification )======================================== // #
 
 
 class TestNavigationPushReducer:
     """NAVIGATION_PUSH reducer is a no-op -- nav stack is view-local."""
+
     async def test_push_is_noop(self):
         """NAVIGATION_PUSH reducer returns state unchanged (nav stack is view-local)."""
         state = {
@@ -82,6 +82,7 @@ class TestNavigationPushReducer:
 
 class TestNavigationPopReducer:
     """NAVIGATION_POP reducer is a no-op -- nav stack is view-local."""
+
     async def test_pop_is_noop(self):
         """NAVIGATION_POP reducer returns state unchanged (nav stack is view-local)."""
         state = {
@@ -106,6 +107,7 @@ class TestNavigationPopReducer:
 
 class TestNavigationStackIntegration:
     """Push and pop dispatches complete without error through the store."""
+
     async def test_push_pop_dispatches_succeed(self):
         """Push and pop dispatches through the store complete without error."""
         store = get_store()
@@ -139,6 +141,7 @@ class TestNavigationStackIntegration:
 
 class TestNavigationReplaceReducer:
     """NAVIGATION_REPLACE records history and handles missing source views."""
+
     async def test_replace_records_history(self):
         """NAVIGATION_REPLACE should append to session history."""
         state = {
@@ -344,8 +347,15 @@ class TestKwargsRoundTrip:
         v = _View(interaction=_make_interaction())
         await v.send()
 
-        for key in ("context", "interaction", "message", "state_store",
-                     "session_id", "user_id", "guild_id"):
+        for key in (
+            "context",
+            "interaction",
+            "message",
+            "state_store",
+            "session_id",
+            "user_id",
+            "guild_id",
+        ):
             assert key not in v._init_kwargs
 
 
@@ -455,3 +465,161 @@ class TestNavigationMessageState:
         restored_state = get_store().state["views"][restored.id]
         assert restored_state["message_id"] == original_msg_id
         assert restored_state["channel_id"] is not None
+
+
+# // ========================================( Instance navigation )======================================== // #
+
+
+class TestNavigationInstanceForm:
+    """``push()`` and ``replace()`` accept a pre-constructed view instance
+    in addition to a class. The instance form unblocks composition with
+    async classmethod constructors (``from_data``, ``from_cursor``)
+    where the view is built before the navigation call.
+    """
+
+    async def test_push_accepts_pre_constructed_instance(self):
+        class _Root(StatefulView):
+            pass
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+        parent_session = root.session_id
+
+        # Construct the child outside the navigation call -- mirrors the
+        # ``await CategoryListView.from_data(...)`` path users follow.
+        child = _Sub(interaction=_make_interaction(user_id=1, guild_id=100))
+
+        # Child is not in the state row registry until push runs -- _register_view
+        # and _register_state fire from the navigation path, not __init__.
+        store = get_store()
+        assert child.id not in store.state["views"]
+        assert child.id not in store._active_views
+
+        # The instance arrives with its own auto-derived session_id.
+        assert child.session_id != parent_session
+
+        pushed = await root.push(child)
+
+        # After push, the child is fully registered: state row exists and
+        # the active-view index includes it. Without these calls, the child
+        # is invisible to the state inspector, instance limit enforcement,
+        # and any code reading from state["views"].
+        assert pushed.id in store.state["views"]
+        assert pushed.id in store._active_views
+
+        # Session inherits from the parent. Class-path push behaves
+        # the same way; instance-path push must match so shared_data
+        # and the session lifecycle stay consistent across navigation.
+        assert pushed.session_id == parent_session
+
+    async def test_push_instance_preserves_shared_data(self):
+        """Parent's ``shared_data`` must survive instance-push so the
+        child sees the same session state. Without session inheritance,
+        the parent's session would be deleted when the parent is
+        destroyed (last-member rule) and ``shared_data`` would be lost.
+        """
+
+        class _Root(StatefulView):
+            pass
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=2, guild_id=100))
+        await root.send()
+        await root.update_session(my_data="hello from parent")
+
+        child = _Sub(interaction=_make_interaction(user_id=2, guild_id=100))
+        pushed = await root.push(child)
+
+        assert pushed.shared_data == {"my_data": "hello from parent"}
+
+        assert pushed is child
+        # Nav stack on the pushed view records the parent.
+        assert len(pushed._nav_stack) == 1
+        assert pushed._nav_stack[0]["class_name"] == _Root._class_session_key()
+        # Message reference propagates from parent.
+        assert pushed._message is root._message
+
+    async def test_push_class_form_still_works(self):
+        """Backward compat: push(class) routes through the original
+        construction path."""
+
+        class _Root(StatefulView):
+            pass
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+
+        child = await root.push(_Sub)
+
+        assert isinstance(child, _Sub)
+        assert child is not root
+        assert len(child._nav_stack) == 1
+
+    async def test_push_instance_with_kwargs_raises(self):
+        class _Root(StatefulView):
+            pass
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+
+        child = _Sub(interaction=_make_interaction(user_id=1, guild_id=100))
+
+        with pytest.raises(TypeError, match="pre-constructed view instance"):
+            await root.push(child, user_id=999)
+
+    async def test_replace_accepts_pre_constructed_instance(self):
+        class _Origin(StatefulView):
+            pass
+
+        class _Destination(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        origin = _Origin(interaction=_make_interaction(user_id=1, guild_id=100))
+        await origin.send()
+
+        dest = _Destination(interaction=_make_interaction(user_id=1, guild_id=100))
+        replaced = await origin.replace(dest)
+
+        assert replaced is dest
+        # Replace clears the nav stack -- it is a one-way transition.
+        assert replaced._nav_stack == []
+
+    async def test_pop_back_to_root_via_instance_push(self):
+        """End-to-end: push an instance, then pop, and verify the parent
+        is restored from the saved nav-stack entry."""
+
+        class _Root(StatefulView):
+            pass
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+        original_id = root.id
+
+        child = _Sub(interaction=_make_interaction(user_id=1, guild_id=100))
+        pushed = await root.push(child)
+        assert pushed is child
+
+        restored = await child.pop()
+        assert isinstance(restored, _Root)
+        # New _Root instance reconstructed via the registry, not the original.
+        assert restored.id != original_id

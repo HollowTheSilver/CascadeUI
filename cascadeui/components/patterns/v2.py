@@ -17,6 +17,7 @@ from discord.ui import (
 )
 
 from ..base import StatefulButton
+from ..types import EmojiInput
 
 # Discord content-length ceiling for a single TextDisplay component.
 _TEXTDISPLAY_MAX_CHARS = 4000
@@ -93,7 +94,7 @@ def action_section(
     label: str,
     callback: Callable,
     style: discord.ButtonStyle = discord.ButtonStyle.secondary,
-    emoji: Optional[str] = None,
+    emoji: EmojiInput = None,
     custom_id: Optional[str] = None,
 ) -> Section:
     """Build a Section with a StatefulButton accessory.
@@ -135,7 +136,7 @@ def toggle_section(
     active: bool,
     callback: Callable,
     labels: Tuple[str, str] = ("Enabled", "Disabled"),
-    emoji: Optional[str] = None,
+    emoji: EmojiInput = None,
     custom_id: Optional[str] = None,
 ) -> Section:
     """Build a Section with a green/red toggle button accessory.
@@ -219,7 +220,7 @@ def link_section(
     *,
     label: str,
     url: str,
-    emoji: Optional[str] = None,
+    emoji: EmojiInput = None,
 ) -> Section:
     """Build a Section with a link button accessory.
 
@@ -264,8 +265,8 @@ def confirm_section(
     on_cancel: Callable,
     confirm_label: str = "Confirm",
     cancel_label: str = "Cancel",
-    confirm_emoji: Optional[str] = "\u2705",
-    cancel_emoji: Optional[str] = "\u274c",
+    confirm_emoji: EmojiInput = "\u2705",
+    cancel_emoji: EmojiInput = "\u274c",
 ) -> List:
     """Build a confirm/cancel prompt as a list of V2 children.
 
@@ -329,7 +330,7 @@ def button_row(
     buttons: Dict[str, Callable],
     *,
     style: discord.ButtonStyle = discord.ButtonStyle.secondary,
-    emoji: Optional[str] = None,
+    emoji: EmojiInput = None,
 ) -> ActionRow:
     """Build an ActionRow from a ``{label: callback}`` mapping.
 
@@ -385,7 +386,7 @@ def cycle_button(
     on_change: Callable,
     labels: Optional[Sequence[str]] = None,
     style: discord.ButtonStyle = discord.ButtonStyle.secondary,
-    emoji: Optional[str] = None,
+    emoji: EmojiInput = None,
     start: int = 0,
 ) -> StatefulButton:
     """Build a button that cycles through a fixed list of values.
@@ -462,7 +463,7 @@ def toggle_button(
     active: bool,
     on_toggle: Callable,
     labels: Tuple[str, str] = ("Enabled", "Disabled"),
-    emoji: Optional[str] = None,
+    emoji: EmojiInput = None,
 ) -> StatefulButton:
     """Build a standalone boolean toggle button.
 

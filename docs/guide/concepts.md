@@ -1,8 +1,9 @@
 # Core Concepts
 
-This page covers the mental models behind CascadeUI. Reading it once makes
-every other guide page click. Skim the diagrams, absorb the vocabulary, then
-move on to the [Views](views.md) and [State](state.md) guides when ready.
+This page covers the mental models behind CascadeUI. The diagrams
+and vocabulary here recur across every other guide page; the
+[Views](views.md) and [State](state.md) guides build on the
+concepts introduced below.
 
 ---
 
@@ -12,33 +13,29 @@ CascadeUI follows a **unidirectional data flow** pattern. Every state change
 traces the same path -- no scattered mutation, no surprise side effects:
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                                                                 │
-│   User clicks button / selects option / submits modal           │
-│                         │                                       │
-│                         ▼                                       │
-│               Callback runs (your code)                         │
-│                         │                                       │
-│               self.dispatch("MY_ACTION", {"key": value})        │
-│                         │                                       │
-│                         ▼                                       │
-│           ┌─── Middleware pipeline ───┐                          │
-│           │  logging → persistence →  │                          │
-│           │  undo → custom            │                          │
-│           └───────────┬───────────────┘                          │
-│                       │                                          │
-│                       ▼                                          │
-│             Reducer transforms state                             │
-│             (pure function: old state → new state)               │
-│                       │                                          │
-│                       ▼                                          │
-│         Subscribers notified (filtered by action + selector)     │
-│                       │                                          │
-│                       ▼                                          │
-│         on_state_changed() → build_ui() → refresh()           │
-│                       │                                          │
-│                       ▼                                          │
-│              Discord message edited with new UI                  │
+┌──────────────────────────────────────────────────────────────────┐
+│                                                                  │
+│   User clicks button / selects option / submits modal            │
+│                          │                                       │
+│                          ▼                                       │
+│   Callback runs (your code)                                      │
+│   self.dispatch("MY_ACTION", {"key": value})                     │
+│                          │                                       │
+│                          ▼                                       │
+│   Middleware: logging → persistence → undo → custom              │
+│                          │                                       │
+│                          ▼                                       │
+│   Reducer transforms state                                       │
+│   (pure function: old state → new state)                         │
+│                          │                                       │
+│                          ▼                                       │
+│   Subscribers notified (filtered by action + selector)           │
+│                          │                                       │
+│                          ▼                                       │
+│   on_state_changed() → build_ui() → refresh()                    │
+│                          │                                       │
+│                          ▼                                       │
+│   Discord message edited with new UI                             │
 │                                                                  │
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -48,8 +45,9 @@ UI. The state store is the single source of truth. To change what the user sees:
 dispatch an action, let the reducer transform state, and let the subscriber
 pipeline handle the rest.
 
-For the full details -- custom reducers, subscribers, selectors, batching -- see
-the [State Management](state.md) guide.
+For the full details -- subscribers, selectors, scoped state, batching, and
+custom reducers for shapes that outgrow the slot model -- see the
+[State Management](state.md) guide.
 
 ---
 
@@ -463,9 +461,70 @@ to the channel endpoint (`self._message.edit()`), which has no token
 expiry and works indefinitely. `exit()` always uses the channel endpoint,
 so it works whether or not the interaction has been responded to.
 
+The fast path is also cancelled if the edit itself stalls past
+`auto_defer_delay - 1.0` seconds (default 1.5s). On a stall,
+`refresh()` returns immediately and lets the auto-defer timer ack the
+click; the channel endpoint is NOT engaged, because a second edit on
+top of the cancelled fast path would consume the timer's ack budget
+under genuine Discord latency. The next state-change refresh ships
+the rebuilt tree. See
+[Fast-Path Stall](known-limitations.md#fast-path-stall-under-discord-edit-latency)
+for the trade-off.
+
 This is why pattern component callbacks in CascadeUI deliberately do not
 pre-defer: a manual `defer()` would consume the response slot and force
 every refresh through the slower two-call channel path.
+
+#### Exception: callbacks that genuinely take more than two seconds
+
+The fast-callback rule above assumes the callback's work plus its
+state-driven refresh complete inside `auto_defer_delay` (default 2.5
+seconds). When a callback genuinely needs longer -- a database query
+that blocks for one to two seconds, an `asyncio.gather` over external
+APIs, heavy CPU work that cannot be moved off the event loop -- the
+fast path is unavailable regardless of whether the callback pre-defers.
+The auto-defer timer fires at 2.5 seconds, pre-acks the click, and
+disqualifies the fast path; subsequent refreshes route through the
+channel endpoint anyway.
+
+For callbacks that match this profile, `await self._safe_defer(interaction)`
+at the start of the callback is the right pattern:
+
+```python
+async def slow_callback(self, interaction: discord.Interaction):
+    await self._safe_defer(interaction)        # ack the click immediately
+    data = await fetch_from_database(...)       # 1-2 seconds of work
+    await self.dispatch("DATA_LOADED", {"data": data})
+    # on_state_changed fires; refresh ships via the channel endpoint.
+```
+
+The benefit is timing predictability, not performance: the click acks
+within milliseconds rather than waiting for the auto-defer timer to
+fire at 2.5s. Discord's client never enters the "did the bot
+acknowledge?" state, so no "This interaction failed" toast can fire.
+The refresh still routes through the channel endpoint (the same path
+the auto-defer timer would have produced), so the visible result is
+identical to a slow callback under default behavior -- the difference
+is removing the 2.5-second window where Discord's UI sits in limbo.
+
+The `_safe_defer` helper guards against double-deferring (it checks
+`is_done()` before issuing the actual defer), so it is safe to call
+in any code path that genuinely needs to ack early. The cost is
+unconditional, however: every call to `_safe_defer` flips
+`is_done()` to True, which disqualifies the acting-view fast path on
+every subsequent `refresh()` for that interaction. Calling it
+unnecessarily on a fast callback trades the one-call fast path for
+the two-call channel path with no upside.
+
+The rule of thumb: callbacks whose work routinely runs longer than
+about a second and a half should call `_safe_defer` at the top;
+callbacks that typically complete well under a second should not.
+The threshold is approximate -- it depends on Discord round-trip
+latency, which varies with backend load and the bot's own
+concurrency. Bot authors running at higher load than the development
+bench should profile real callbacks via `/cascadeui perf` and tune
+toward whatever threshold their actual `notify_ms` distribution
+implies.
 
 ### Ephemeral Message Constraints
 
@@ -671,4 +730,4 @@ timeout behavior.
 - **[Views](views.md)** -- lifecycle, navigation, session management, policies in action
 - **[Components](components.md)** -- buttons, selects, modals, builders, grid helpers
 - **[State Management](state.md)** -- reducers, subscribers, scoped state, undo/redo
-- **[View Patterns](patterns.md)** -- forms, wizards, tabs, pagination
+- **[View Patterns](patterns.md)** -- menus, forms, wizards, tabs, pagination, leaderboards, role panels

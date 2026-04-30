@@ -1,9 +1,9 @@
 # View Patterns
 
-CascadeUI ships six pre-built view patterns -- Menu, Form, Wizard, Tab,
-Paginated, and Leaderboard. The first five have V1 (`StatefulView`-based)
-and V2 (`StatefulLayoutView`-based) variants; Leaderboard is V2-only.
-The patterns handle navigation, validation, and content rebuilding
+CascadeUI ships seven pre-built view patterns -- Menu, Form, Wizard, Tab,
+Paginated, Leaderboard, and Roles. The first five have V1 (`StatefulView`-based)
+and V2 (`StatefulLayoutView`-based) variants; Leaderboard and Roles are
+V2-only. The patterns handle navigation, validation, and content rebuilding
 internally; subclasses define content and hooks.
 
 All patterns follow the same customization grammar:
@@ -747,6 +747,97 @@ def _build_extra_items(self):
   children on each page turn. The nav row and extra items keep their
   identity across page changes.
 
+### `nav_inside_container`
+
+V2-only class attribute on `PaginatedLayoutView`. When `True`, the page
+content and the navigation ActionRow are wrapped in a single `Container`
+so the paginator renders as one cohesive card with built-in navigation:
+
+```python
+class CardPaginator(PaginatedLayoutView):
+    nav_inside_container = True
+```
+
+Default is `False`, which keeps the page content and nav row as separate
+top-level children of the view -- the original layout. Items added via
+`_build_extra_items` remain outside the wrapping Container in either
+mode. Single-page views render no nav row, so the flag has no effect
+when only one page is displayed.
+
+### Binding per-instance state to a formatter
+
+The `formatter=` callable receives one chunk and returns the page's V2
+component list. When the formatter needs per-instance state (a category
+name, a per-paginator accent color, a footer string), bind it via a
+closure factory:
+
+```python
+def make_formatter(name: str, accent: discord.Color):
+    def format_page(items):
+        lines = [f"**{i['name']}** -- {i['detail']}" for i in items]
+        return [
+            card(
+                f"## {name}",
+                divider(),
+                TextDisplay("\n".join(lines)),
+                color=accent,
+            )
+        ]
+    return format_page
+
+view = await CategoryListView.from_data(
+    items=items,
+    per_page=3,
+    formatter=make_formatter(name="Books", accent=discord.Color.blurple()),
+    interaction=interaction,
+)
+```
+
+The factory closes over `name` and `accent`, returning a `format_page`
+that the paginator calls per chunk. `examples/v2_library.py` uses this
+pattern with three categories, each binding its own name and color.
+The same shape extends to per-page footers, conditional badges,
+locale-bound strings, or any other data the formatter needs to weave
+into the rendered page.
+
+### Coming from a paginator gist?
+
+The discord.py community frequently points new bot authors at Soheab's
+[CV2 paginator gist](https://gist.github.com/Soheab/891c39d7294b1bdbadc7ecf35ce51cc5)
+and [classic paginator gist](https://gist.github.com/Soheab/f226fc06a3468af01ea3168c95b30af8)
+as reference implementations. CascadeUI's `PaginatedView` and
+`PaginatedLayoutView` cover the same surface and several capabilities
+the gists do not. Migration map for users coming from those gists:
+
+| Soheab's gist | CascadeUI |
+|---|---|
+| `author_id` | `owner_only = True` (default) and the `allowed_users` set |
+| `format_page()` | `formatter=` kwarg on `from_data` / `from_cursor` (sync or async, auto-detected) |
+| Stop button | `add_exit_button()` inside `_build_extra_items()`; cleanup behavior controlled by `exit_policy` |
+| `convert_str_to_text_display` | automatic -- string pages are wrapped in `Container(TextDisplay(s))` |
+| `per_page` | same -- `from_data(items, per_page=N)` |
+| Pages wrapped in a Container with buttons inside | `nav_inside_container = True` |
+| Push paginator from a button click | `await self.push(await Paginator.from_data(...), interaction, ...)` -- `push` accepts the pre-constructed instance directly |
+| Timeout cleanup | `exit_policy = "delete"` / `"disable"` |
+
+CascadeUI adds beyond the gists:
+
+- `from_cursor(fetch_fn, total, ...)` for lazy / streaming pagination
+  with an LRU page cache and current-page eviction protection
+- `refresh_data(items)` and `refresh_pages()` for live updates
+- Render-hash short-circuit so repeat refreshes that compute the same
+  tree skip the Discord REST edit
+- One-HTTP-call refresh path on the acting interaction (combined ack +
+  edit packet)
+- Auto-defer + `serialize_interactions` safety net for rapid clicks
+- Full state-store integration: subscribed actions, undo/redo, persistence
+- Access control via `owner_only`, `allowed_users`, and `participant_limit`
+- Instance limiting + replacement policies
+- Compose with `_PersistentMixin` for paginators that survive bot restarts
+
+Soheab's gists shaped CascadeUI's paginator grammar and remain excellent
+learning material for the underlying discord.py V1 and V2 primitives.
+
 ---
 
 ## LeaderboardLayoutView / PersistentLeaderboardLayoutView
@@ -828,6 +919,10 @@ class MmrBoard(LeaderboardLayoutView):
 - `subtitle` (default `"Rankings"`) -- H3 above the ranked rows. Set to `None` or empty string (or pass `subtitle=None` at construction) to skip the H3 entirely, which pairs naturally with a `build_summary` override that returns a standalone Container.
 - `leaderboard_empty_message` -- static text when no entries exist.
 - `entry_layout` (default `"lines"`) -- controls row rendering. `"lines"` stacks entries as `TextDisplay` rows inside a single card; `"sections"` renders each entry as a `Section` with a `Thumbnail` accessory and a two-line body (`format_primary` + `format_secondary`). Section mode caps `leaderboard_per_page` at `5` -- setting a larger value with `entry_layout = "sections"` raises at class-definition time via `_validate_class_attributes`.
+- `podium_emojis` (default gold/silver/bronze medals) -- dict keyed by rank number. `format_rank` reads this for ranks 1-3; ranks beyond fall back to `f"**{rank}.**"`. Override the dict on a subclass to change the podium glyphs (or extend it past rank 3) without overriding `format_rank` itself.
+- `entry_separator` (default `" -- "`) -- string rendered between the name and stat columns inside `format_entry` (`"lines"` mode). Override on a subclass for visual variety (`" | "`, `" • "`, etc.) without rewriting `format_entry`.
+- `card_color` (default `None`) -- optional accent color for the rankings card. `None` falls through to the active theme's accent. Set to a `discord.Color` on a subclass to give the rankings card its own accent (useful when `build_summary` returns a Container with its own color and a deliberate two-color layout is wanted).
+- `show_title_divider` (default `True`) -- whether to render a horizontal divider below the title and above the rest of the card content. Set to `False` for a more compact card.
 
 ### Section render mode {#section-render-mode}
 
@@ -887,6 +982,205 @@ class ServerStatsBoard(PersistentLeaderboardLayoutView):
 Pair with `persistent_slots = ("...",)` on the subclass (or
 `SlotPolicy(persistent=True)` at setup) to persist the underlying
 data source.
+
+---
+
+## RolesLayoutView / PersistentRolesLayoutView
+
+V2-only role self-assign panel pattern. Each category renders as a
+Container with an accent color, a heading, an optional mode hint, and
+an ActionRow of role toggle buttons. Cardinality (at-most-one /
+at-least-one) is enforced automatically inside the pattern -- clicks
+apply role mutation via the Discord API and send an ephemeral
+response without any per-role callback boilerplate.
+
+Underneath, each role button is a `DynamicPersistentButton` subclass
+declared once at module import. Clicks route by `custom_id` template
+match, so a panel with 50 roles across 6 categories tracks zero
+per-button state and survives bot restarts cleanly.
+
+### Minimal example
+
+```python
+import discord
+from cascadeui import PersistentRolesLayoutView, RoleCategory
+
+
+class ServerRoles(PersistentRolesLayoutView):
+    categories = [
+        RoleCategory(
+            name="Colors",
+            roles={"Red": 111, "Blue": 222, "Green": 333},
+            exclusive=True,
+            color=discord.Color.red(),
+        ),
+    ]
+    title = "Server Roles"
+
+
+view = ServerRoles(
+    context=context,
+    persistence_key=f"roles:{context.guild.id}",
+)
+await view.send()
+```
+
+### Cardinality model
+
+Two orthogonal boolean flags on `RoleCategory` control cardinality:
+
+- **`exclusive=True`** -- at most one role in this category may be
+  active. Selecting another role removes the previously-active one in
+  the same category first (swap). Useful for color roles, pronouns,
+  team affiliation.
+- **`required=True`** -- at least one role in this category must stay
+  active. Removing the last role in the category is rejected.
+  Useful for pronoun / region / team categories where "no selection"
+  is not a meaningful state.
+
+The four combinations (both false / one-or-the-other / both true) all
+produce valid cardinality behavior:
+
+| `exclusive` | `required` | Behavior |
+|-------------|------------|----------|
+| `False` | `False` | Free multi-select. Any combination of roles in the category can be active, including none. |
+| `True` | `False` | Radio button. One role at a time; unchecking is allowed (zero active is valid). |
+| `False` | `True` | Required checkbox. Any number of roles active, but at least one. |
+| `True` | `True` | Required radio. Exactly one role active; removing the last is rejected. |
+
+### Class attributes
+
+**Heading:**
+- `title` (default `"Server Roles"`) -- H2 rendered above all
+  categories. Set to `None` to skip entirely.
+- `subtitle` (default `None`) -- optional H3 rendered below the
+  title. Set to a string to render (the subtitle uses raw text, so
+  users can prefix with `"-# "` for small-text style).
+
+**Mode hints** (rendered as small text under each category heading):
+- `hint_normal` (default `None`) -- hint for free-multi-select
+  categories.
+- `hint_exclusive` (default `"◉"`) -- hint for exclusive-only
+  categories. U+25C9 fisheye, a text-size filled circle.
+- `hint_required` (default `"*"`) -- hint for required-only
+  categories.
+- `hint_exclusive_required` (default `"◉ *"`) -- hint for
+  exclusive+required categories. Both indicators render at
+  text-size so they sit on one line at consistent visual weight,
+  rather than mixing an emoji glyph with a text character.
+
+Each hint attribute accepts any string (including emoji), or `None`
+to suppress the hint entirely. Per-category dynamic hints override
+`format_category_hint(category)` at Tier 2.
+
+**Response messages** (Python `str.format` placeholders: `{role}`,
+`{category}`, `{removed}`, `{error}`):
+- `assigned_message` -- sent after a role is added.
+- `removed_message` -- sent after a role is removed.
+- `required_message` -- sent when a required-category last-role
+  removal is rejected.
+- `swap_message` -- sent after an exclusive-mode swap.
+- `role_error_message` -- sent on role mutation failure (forbidden,
+  HTTP error).
+
+### Override hooks
+
+!!! note "Classmethod hook signature"
+    Hook methods on `RolesLayoutView` / `PersistentRolesLayoutView`
+    use `@classmethod` with a `cls` first argument, not `self`. The
+    dispatch path routes through `DynamicPersistentButton` which has
+    no view instance at click time -- the hook classmethods read
+    class attributes (`cls.assigned_message`, etc.) and respond to
+    the interaction directly. `super()` calls work normally.
+
+| Hook | Purpose |
+|------|---------|
+| `format_category_title(category)` | Category heading line. Default: `f"### {category.name}"` (or prefixed with `category.icon` when set). |
+| `format_category_hint(category)` | Hint rendered below the heading. Default: routes to `hint_*` attribute based on the cardinality flags. Return `None` to skip. |
+| `format_button_label(role_name, role_id, category)` | Button label. Default: `role_name`. |
+| `format_button_emoji(role_name, role_id, category)` | Button emoji. Default: `None`. |
+| `format_button_style(role_name, role_id, category)` | Button style. Default: `category.button_style` or `ButtonStyle.secondary`. |
+| `build_category_card(category)` | Render one category as a Container. Default composes the smaller `format_*` hooks; override for full layout control. |
+| `on_role_assigned(interaction, member, role, category)` | Called after a role is added without a swap. Default: reads `assigned_message`, sends ephemeral response. |
+| `on_role_removed(interaction, member, role, category)` | Called after a role is removed. Default: reads `removed_message`. |
+| `on_role_swap(interaction, member, role_added, roles_removed, category)` | Called after an exclusive-mode swap. Default: reads `swap_message` with `{removed}` formatted as a comma-joined list of removed role names. |
+| `on_role_required_block(interaction, member, role, category)` | Called when a required-category last-role removal is rejected. Default: reads `required_message`. |
+| `on_role_error(interaction, error)` | Called on role mutation failure (`discord.Forbidden`, `discord.HTTPException`, or role-not-found string). Default: reads `role_error_message`. |
+
+### Tier 1 customization (class attributes)
+
+Every visible string is customizable without a method override:
+
+```python
+class CustomRoles(PersistentRolesLayoutView):
+    categories = [...]
+
+    title = "🎨 Pick Your Roles"
+    subtitle = "-# Click any button to toggle."
+
+    hint_exclusive = "🎯 pick one"
+    hint_required = "⚠️ required"
+
+    assigned_message = "✅ Added **{role}**."
+    removed_message = "➖ Removed **{role}**."
+    required_message = "You need at least one **{category}** role."
+```
+
+### Tier 2 customization (method overrides)
+
+Override the smallest format hook that carries the tweak you need:
+
+```python
+class EmojiRoles(PersistentRolesLayoutView):
+    categories = [...]
+
+    @classmethod
+    def format_button_emoji(cls, role_name, role_id, category):
+        emoji_map = {"Red": "🟥", "Blue": "🟦", "Green": "🟩"}
+        return emoji_map.get(role_name)
+```
+
+For richer hook behavior (logging, embeds, conditional responses),
+override the `on_role_*` classmethods:
+
+```python
+class AuditedRoles(PersistentRolesLayoutView):
+    categories = [...]
+
+    @classmethod
+    async def on_role_assigned(cls, interaction, member, role, category):
+        await super().on_role_assigned(interaction, member, role, category)
+        audit = interaction.guild.get_channel(AUDIT_CHANNEL_ID)
+        if audit:
+            await audit.send(f"{member} took {role.name}")
+```
+
+### Persistent variant
+
+`PersistentRolesLayoutView` composes `_PersistentMixin` with
+`RolesLayoutView`. Defaults: `owner_only = False`,
+`exit_policy = "disable"`, `timeout = None`. Requires
+`persistence_key=` at construction. On bot restart, role buttons
+continue routing correctly because each button is a
+`DynamicPersistentButton` subclass registered globally at module
+import -- the panel survives restart independent of view
+re-attachment. The default `on_restore` re-renders the message
+from the current `categories` on every restart, so source-code
+edits to role IDs, category names, or button labels propagate to
+the displayed message on the next bot start. Unchanged panels
+pay zero Discord API cost: `refresh()`'s render-hash short-circuit
+skips the `PATCH` when the rebuilt tree matches what the message
+already shows.
+
+### Category name uniqueness
+
+Category names must be globally unique across every
+`RolesLayoutView` subclass in the process. The pattern registers
+each category's slugified name in a module-level registry at class-
+definition time; collisions raise `ValueError` immediately so the
+error surfaces at import rather than at click time. If two panels
+need similar category names, prefix them (e.g. `"ServerA Colors"` /
+`"ServerB Colors"`).
 
 ---
 

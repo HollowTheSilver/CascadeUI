@@ -386,8 +386,12 @@ class TestInspectorSelector:
             "sessions": {view.session_id: {}, "other_session": {}},
         }
         views, sessions = view.state_selector(state)
-        assert view.id not in views
-        assert "other" in views
+        # Each entry in the views frozenset is a (view_id, message_id, channel_id)
+        # tuple so VIEW_UPDATED writes change the selector signature; sessions
+        # remain bare IDs.
+        view_ids = {entry[0] for entry in views}
+        assert view.id not in view_ids
+        assert "other" in view_ids
         assert view.session_id not in sessions
         assert "other_session" in sessions
 
@@ -402,6 +406,26 @@ class TestInspectorSelector:
 
         before = {"views": {"a": {}, "b": {}}, "sessions": {}}
         after = {"views": {"a": {}, "c": {}}, "sessions": {}}
+
+        assert view.state_selector(before) != view.state_selector(after)
+
+    def test_selector_detects_message_field_writes_at_stable_id_set(self):
+        """VIEW_UPDATED writes message_id / channel_id without changing the
+        view ID set. The selector must still return a different signature so
+        the notification gate proceeds and the Views tab Channel / Msg
+        columns refresh in place.
+        """
+        interaction = _make_interaction()
+        view = InspectorView(interaction=interaction)
+
+        before = {
+            "views": {"leaderboard": {"user_id": 1, "message_id": None, "channel_id": None}},
+            "sessions": {},
+        }
+        after = {
+            "views": {"leaderboard": {"user_id": 1, "message_id": "12345", "channel_id": "67890"}},
+            "sessions": {},
+        }
 
         assert view.state_selector(before) != view.state_selector(after)
 

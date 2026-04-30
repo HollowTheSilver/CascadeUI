@@ -176,6 +176,33 @@ class _PersistentMixin:
         )
         await self.dispatch("PERSISTENT_VIEW_REGISTERED", payload)
 
+    async def send(self, *args, ephemeral: bool = False, **kwargs):
+        """Send the view and register it for persistence.
+
+        Single seam shared by every persistent view -- including
+        composed patterns like ``PersistentRolesLayoutView`` and
+        ``PersistentLeaderboardLayoutView`` whose MRO does not pass
+        through ``PersistentView`` or ``PersistentLayoutView``.
+        ``*args`` / ``**kwargs`` propagate intact to whichever concrete
+        ``send()`` sits below this mixin in MRO (V1 takes
+        ``content``/``embed``/``embeds``; V2 takes only ``ephemeral``).
+        """
+        if ephemeral:
+            raise ValueError(
+                f"{self.__class__.__name__} cannot be sent as ephemeral. "
+                "Persistent views require a real channel message to survive bot restarts. "
+                "Ephemeral messages have no permanent ID and cannot be re-attached."
+            )
+        self._validate_custom_ids()
+
+        message = await super().send(*args, ephemeral=ephemeral, **kwargs)
+
+        if message is None:
+            return message
+
+        await self._register_persistent(message)
+        return message
+
     async def exit(self, delete_message: bool | None = None):
         """Exit the view and remove it from the persistent registry."""
         # Unregister before cleanup so the state dispatch still works
@@ -240,24 +267,6 @@ class PersistentView(_PersistentMixin, StatefulView):
                     "so discord.py can re-attach them after a restart."
                 )
 
-    async def send(self, content=None, *, embed=None, embeds=None, ephemeral=False):
-        """Send the view and register it for persistence."""
-        if ephemeral:
-            raise ValueError(
-                f"{self.__class__.__name__} cannot be sent as ephemeral. "
-                "Persistent views require a real channel message to survive bot restarts. "
-                "Ephemeral messages have no permanent ID and cannot be re-attached."
-            )
-        self._validate_custom_ids()
-
-        message = await super().send(content, embed=embed, embeds=embeds, ephemeral=ephemeral)
-
-        if message is None:
-            return message
-
-        await self._register_persistent(message)
-        return message
-
 
 class PersistentLayoutView(_PersistentMixin, StatefulLayoutView):
     """A V2 layout view that survives bot restarts.
@@ -277,21 +286,3 @@ class PersistentLayoutView(_PersistentMixin, StatefulLayoutView):
     async def _cleanup_orphan_message(self, old_message):
         """V2 messages ARE their components -- delete instead of edit."""
         await old_message.delete()
-
-    async def send(self, *, ephemeral=False):
-        """Send the V2 view and register it for persistence."""
-        if ephemeral:
-            raise ValueError(
-                f"{self.__class__.__name__} cannot be sent as ephemeral. "
-                "Persistent views require a real channel message to survive bot restarts. "
-                "Ephemeral messages have no permanent ID and cannot be re-attached."
-            )
-        self._validate_custom_ids()
-
-        message = await super().send(ephemeral=ephemeral)
-
-        if message is None:
-            return message
-
-        await self._register_persistent(message)
-        return message

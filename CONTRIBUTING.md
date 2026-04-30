@@ -33,10 +33,10 @@ Understanding this upfront saves review cycles.
 ## Design Philosophy
 
 CascadeUI provides building blocks, not opinions. The library ships a small
-set of pre-built patterns (tabs, wizards, forms, pagination) because those
-patterns solve structural problems that every Discord UI eventually hits.
-Each one exists because the alternative is every user reimplementing the same
-state machine independently.
+set of pre-built patterns (menus, tabs, wizards, forms, pagination,
+leaderboards, role panels) because those patterns solve structural problems
+that every Discord UI eventually hits. Each one exists because the alternative
+is every user reimplementing the same state machine independently.
 
 **The bar for inclusion:** a pattern must solve a *structural* problem, not
 an *application* problem. A `TabLayoutView` solves the structural problem

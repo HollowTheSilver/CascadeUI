@@ -184,22 +184,25 @@ class NotificationPanel(StatefulLayoutView):
 > Define `build_ui()` once. The library calls it on every relevant state change and ships the edit for you. No `on_state_changed()` override, no manual `refresh()`, no `message.edit()` plumbing.
 
 ```python
-class SettingsHub(StatefulLayoutView):
+class MyFleetView(StatefulLayoutView):
     state_scope = "user"
-    subscribed_actions = {"SETTINGS_UPDATED"}
+    subscribed_actions = {"FLEET_REROLLED"}
 
     def build_ui(self):
         self.clear_items()
-        settings = self.user_scoped_state()
-        self.add_item(card(
-            "## Settings",
-            key_value({
-                "Theme": settings.get("theme", "default").title(),
-                "Notifications": "On" if settings.get("notify") else "Off",
-            }),
+        grid = emoji_grid(10, 10, fill="\U0001f7e6", row_labels="alpha", col_labels="numeric")
+        for row, col in self.ship_cells():
+            grid[row, col] = "\U0001f6a2"
+
+        self.add_item(card("## My Fleet", divider(), grid, color=discord.Color.blue()))
+        self.add_item(ActionRow(
+            StatefulButton(label="Regenerate", emoji="\U0001f3b2", callback=self._reroll),
         ))
 
-# build_ui() is called automatically on state changes --
+    async def _reroll(self, interaction):
+        await self.dispatch("FLEET_REROLLED", {"cells": random_placement()})
+
+# build_ui() runs automatically on every FLEET_REROLLED dispatch --
 # no manual refresh() or on_state_changed() override needed.
 ```
 
@@ -258,18 +261,14 @@ class BattleshipView(StatefulLayoutView):
 
 ### Lifecycle Control
 
-> Control active sessions per user, guild, or globally with automatic cleanup, replacement policies, and view-capacity caps.
+> Cap active sessions per user, guild, or globally. Pick how a collision resolves and how the old view cleans up when a new one opens.
 
 ```python
-class DashboardView(TabLayoutView):
+class SettingsHubView(MenuLayoutView):
     instance_limit = 1               # Only one open at a time
     instance_scope = "user_guild"    # Per user per guild
     instance_policy = "replace"      # Exit the old one, open the new one
-
-
-class GameView(StatefulLayoutView):
-    participant_limit = 8           # Owner + 7 joiners maximum
-    auto_register_participants = True  # Claim slots from allowed_users on send()
+    exit_policy = "disable"          # Old view's buttons grey out, message stays
 ```
 
 ![V2 Instance Limiting](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-session-limiting.gif)
@@ -290,12 +289,18 @@ async def setup_hook(self):
     )
 ```
 
-Declare `persistent_slots` on any view that should carry application state to disk. The rest stays volatile:
+Subclass `PersistentRolesLayoutView` and declare your categories. The pattern handles button rendering, cardinality enforcement, and restart re-attachment. A stable `persistence_key` is the match identity the middleware uses to find this panel after restart:
 
 ```python
-class BattleshipView(StatefulLayoutView):
-    scoped_slot = "battleship_stats"       # per-subsystem bucket
-    persistent_slots = ("battleship_stats",)  # opt this slot into persistence
+class GuildRoles(PersistentRolesLayoutView):
+    categories = [
+        RoleCategory(name="Color Roles", exclusive=True, roles={"Red": 123, "Blue": 456}),
+        RoleCategory(name="Pronouns", required=True, roles={"He/Him": 789, "She/Her": 12}),
+    ]
+
+# Same key in, same panel out -- across bot restarts.
+panel = GuildRoles(context=ctx, persistence_key=f"roles:{ctx.guild.id}")
+await panel.send()
 ```
 
 ![Persistence](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-persistence-restart.gif)
@@ -307,8 +312,9 @@ class BattleshipView(StatefulLayoutView):
 > Snapshot-based state history per session with built-in undo and redo support.
 
 ```python
-class SettingsHub(StatefulLayoutView):
+class NotificationsView(StatefulLayoutView):
     enable_undo = True   # Every dispatch captures a snapshot
+    undo_limit = 10      # Stack depth cap (self.undo_depth / self.redo_depth read live)
 
     async def _undo(self, interaction):
         await self.undo()   # Restore previous snapshot
@@ -448,7 +454,13 @@ await view.send()
 # Persistent variant -- admin-posted panel that survives bot restarts
 # and re-fetches live data on every restore.
 class PersistentBoard(PersistentLeaderboardLayoutView):
-    persistence_key = "battleship-leaderboard-main"
+    pass
+
+panel = PersistentBoard(
+    context=ctx,
+    persistence_key="battleship-leaderboard-main",
+)
+await panel.send()
 ```
 
 ![Leaderboards](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-leaderboard.gif)
@@ -586,7 +598,7 @@ for row in rows:
 ### Views
 - V2 layout-based system for structured, container-driven interfaces
 - Full support for traditional discord.py Views (V1)
-- Pre-built patterns: menus, tabs, wizards, forms, pagination, leaderboards
+- Pre-built patterns: menus, tabs, wizards, forms, pagination, leaderboards, roles
 - `PaginatedView.from_cursor()` for lazy cursor-driven pagination with LRU page cache
 - `DisplayLayoutView` for one-shot V2 sends from a pre-built container
 - Automatic state-driven rebuilds: define `build_ui()`, the library handles the edit (≈ React `render()`)
@@ -645,7 +657,7 @@ for row in rows:
 - Multi-user games with shared state, hidden information, and challenge flows (TicTacToe, Battleship)
 - Open-join lobbies with capacity caps and host-vs-participant authority (Werewolf-style)
 
-![Examples](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/pngs/v2-hero.gif)
+![Examples](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-hero.gif)
 
 ---
 
@@ -692,7 +704,7 @@ isort cascadeui/
 
 ## Developer's Note
 
-> I built CascadeUI with over **ten years** of Python, and roughly fifteen years of developement experience. All documentation, docstrings and test modules are written and designed using custom **Anthropic Opus** sub-agents. I do not attempt to conceal this fact. I'm a proponent of efficient and responsible agent application in software design. That experience is what makes these tools effective. They're amplifiers, not substitutes.
+> I built CascadeUI with over **ten years** of Python, and roughly fifteen years of development experience. All documentation, docstrings and test modules are written and designed using custom **Anthropic Opus** sub-agents. I do not attempt to conceal this fact. I'm a proponent of efficient and responsible agent application in software design. That experience is what makes these tools effective. They're amplifiers, not substitutes.
 >
 > *-- Hollow*
 

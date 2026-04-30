@@ -302,11 +302,22 @@ class PersistenceMiddleware:
 
         if bot is not None:
             await manager.reattach_persistent_views()
+
+            # Register every DynamicPersistentButton subclass with the
+            # bot so discord.py can route dispatch-time clicks by
+            # ``custom_id`` template match. Lazy import avoids a cycle
+            # with components/base.py through the state -> middleware
+            # chain.
+            from ...components.base import _dynamic_button_classes
+
+            if _dynamic_button_classes:
+                bot.add_dynamic_items(*_dynamic_button_classes.values())
         else:
             # Warn loudly when the bot is absent but PersistentView
             # subclasses are registered. Without a bot, those views
             # will not be reattached on restart. Lazy import avoids
             # a cycle with views/persistent.py.
+            from ...components.base import _dynamic_button_classes
             from ...views.persistent import _persistent_view_classes
 
             if _persistent_view_classes:
@@ -318,6 +329,17 @@ class PersistenceMiddleware:
                     "Without a bot, these views will NOT be reattached "
                     "on restart. Pass the bot instance to enable "
                     "reattachment."
+                )
+
+            if _dynamic_button_classes:
+                logger.warning(
+                    f"PersistenceMiddleware initialized without bot=, "
+                    f"but {len(_dynamic_button_classes)} "
+                    f"DynamicPersistentButton subclass(es) are registered "
+                    f"({', '.join(sorted(_dynamic_button_classes))}). "
+                    "Without a bot, these buttons will NOT route clicks "
+                    "on restart. Pass the bot instance to enable "
+                    "dispatch-time click routing."
                 )
 
         self._initialized = True

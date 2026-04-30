@@ -5,6 +5,7 @@ from .form import FormLayoutView, FormView
 from .leaderboard import LeaderboardLayoutView, PersistentLeaderboardLayoutView
 from .menu import MenuLayoutView, MenuView
 from .paginated import PaginatedLayoutView, PaginatedView
+from .roles import PersistentRolesLayoutView, RolesLayoutView
 from .tabs import TabLayoutView, TabView
 from .wizard import WizardLayoutView, WizardView
 
@@ -20,6 +21,8 @@ __all__ = [
     "PaginatedView",
     "PaginatedLayoutView",
     "PersistentLeaderboardLayoutView",
+    "PersistentRolesLayoutView",
+    "RolesLayoutView",
     "TabView",
     "TabLayoutView",
     "WizardView",

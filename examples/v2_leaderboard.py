@@ -180,11 +180,7 @@ class ServerLeaderboard(LeaderboardLayoutView):
         super().__init__(*args, **kwargs)
 
     def format_primary(self, rank: int, user_id: int, stats: dict) -> str:
-        """Top line of the section: rank + name.
-
-        Mirrors the library default (``format_rank`` + ``format_name``);
-        overridden here so every Section-mode hook sits alongside its siblings.
-        """
+        """Top line of the section: rank + name."""
         return f"{self.format_rank(rank)} {self.format_name(user_id, stats)}"
 
     def format_secondary(self, rank: int, user_id: int, stats: dict) -> str:

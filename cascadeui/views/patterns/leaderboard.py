@@ -4,6 +4,7 @@
 import asyncio
 from typing import ClassVar, Dict, List, Optional, Tuple, Union
 
+import discord
 from discord.ui import Container, Section, TextDisplay, Thumbnail
 
 from ...components.patterns.v2 import card, divider, gap, key_value
@@ -59,6 +60,34 @@ class _BaseLeaderboardMixin:
     # this is ``"sections"`` (enforced at class-definition time).
     entry_layout: str = "lines"
 
+    # Podium emojis keyed by rank (1-indexed). ``format_rank`` reads
+    # this dict to pick the rank-1/2/3 glyph; ranks beyond 3 fall back
+    # to ``f"**{rank}.**"``. Override the dict to change the podium
+    # treatment without overriding ``format_rank`` itself.
+    podium_emojis: ClassVar[Dict[int, str]] = {
+        1: "\U0001f947",  # gold medal
+        2: "\U0001f948",  # silver medal
+        3: "\U0001f949",  # bronze medal
+    }
+
+    # Separator rendered between the name and stat columns inside
+    # ``format_entry`` (``"lines"`` mode). Override on a subclass to
+    # change visual rhythm without overriding ``format_entry``
+    # entirely.
+    entry_separator: str = " -- "
+
+    # Optional accent color for the rankings card. ``None`` falls
+    # through to the theme default. Set to a ``discord.Color`` on a
+    # subclass to give the card its own accent (useful when
+    # ``build_summary`` returns a Container with its own accent and a
+    # deliberate two-color layout is wanted).
+    card_color: Optional[discord.Color] = None
+
+    # Whether to render a horizontal divider below the title and above
+    # the rest of the card content. Disable for a more compact card
+    # without rewriting ``_build_leaderboard_pages``.
+    show_title_divider: bool = True
+
     _POSITIVE_INT_ATTRS: ClassVar[tuple] = (
         *_BasePaginatedMixin._POSITIVE_INT_ATTRS,
         "leaderboard_top_n",
@@ -68,6 +97,10 @@ class _BaseLeaderboardMixin:
         **_StatefulMixin._ENUM_ATTRS,
         "entry_layout": {"lines", "sections"},
     }
+    _BOOL_ATTRS: ClassVar[tuple] = (
+        *_BasePaginatedMixin._BOOL_ATTRS,
+        "show_title_divider",
+    )
 
     @classmethod
     def _validate_class_attributes(cls) -> None:
@@ -103,11 +136,13 @@ class _BaseLeaderboardMixin:
     def format_rank(self, rank: int) -> str:
         """Render the rank column for one entry.
 
-        Default returns a medal emoji for ranks 1-3 (gold, silver, bronze)
-        and a bold number for every lower rank. Override to change the
-        podium treatment or use a different numeric style.
+        Default reads ``self.podium_emojis`` for ranks 1-3 and renders
+        ``f"**{rank}.**"`` for every lower rank. Subclasses change the
+        podium treatment by overriding the ``podium_emojis`` class
+        attribute; override this method only when the rank-glyph
+        choice depends on entry data beyond the rank number.
         """
-        return {1: "\U0001f947", 2: "\U0001f948", 3: "\U0001f949"}.get(rank, f"**{rank}.**")
+        return self.podium_emojis.get(rank, f"**{rank}.**")
 
     def format_name(self, user_id: int, stats: dict) -> str:
         """Render the name column for one entry.
@@ -158,7 +193,7 @@ class _BaseLeaderboardMixin:
         name_str = self.format_name(user_id, stats)
         stats_str = self.format_stats(user_id, stats)
         accessory = self.format_accessory(user_id, stats)
-        base = f"{rank_str} {name_str} -- {stats_str}"
+        base = f"{rank_str} {name_str}{self.entry_separator}{stats_str}"
         return f"{base} {accessory}" if accessory else base
 
     def format_primary(self, rank: int, user_id: int, stats: dict) -> str:
@@ -309,7 +344,9 @@ class _BaseLeaderboardMixin:
             end = start + per_page
             page_entries = top[start:end]
 
-            items: list = [TextDisplay(f"## {self.title}"), divider()]
+            items: list = [TextDisplay(f"## {self.title}")]
+            if self.show_title_divider:
+                items.append(divider())
 
             # Inline page-1 summary only when build_summary returned a
             # dict (not a standalone Container) and the dict is non-empty.
@@ -356,7 +393,7 @@ class _BaseLeaderboardMixin:
                     items.append(gap())
                     items.append(TextDisplay(body))
 
-            page_components: list = [card(*items)]
+            page_components: list = [card(*items, color=self.card_color)]
             if summary_card is not None:
                 page_components.insert(0, summary_card)
             pages.append(page_components)
@@ -456,9 +493,11 @@ class LeaderboardLayoutView(_BaseLeaderboardMixin, PaginatedLayoutView):
         self.pages = await self._build_leaderboard_pages()
         self.clear_items()
         self._build_nav_buttons()
-        self._add_page_content()
-        if len(self.pages) > 1:
-            self.add_item(self._nav_row)
+        # ``_compose_pagination_tree`` adds page content and the nav row
+        # in one shot, matching the pattern used in __init__ and
+        # _update_page so initial render and post-interaction renders
+        # are visually identical.
+        self._compose_pagination_tree()
         for extra in self._extra_items:
             self.add_item(extra)
         return await super().send(**kwargs)

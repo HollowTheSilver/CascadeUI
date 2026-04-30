@@ -17,7 +17,6 @@ from helpers import make_interaction as _make_interaction
 
 from cascadeui.components.base import StatefulButton, StatefulSelect
 from cascadeui.components.inputs import Modal as CascadeModal
-from cascadeui.components.inputs import TextInput as CascadeTextInput
 from cascadeui.validation import min_length
 from cascadeui.views.patterns.form import (
     MAX_TEXT_FIELDS,
@@ -27,6 +26,22 @@ from cascadeui.views.patterns.form import (
     _parse_field_value,
     _resolve_modal_edit_label,
 )
+
+
+def _modal_text_inputs(modal):
+    """Return the ``discord.ui.TextInput`` items inside a Modal.
+
+    Walks the modal's children, unwrapping ``ui.Label`` to reach the
+    inner input, and returns the TextInput instances in declaration
+    order.
+    """
+    out = []
+    for child in modal.children:
+        inner = child.component if isinstance(child, discord.ui.Label) else child
+        if isinstance(inner, discord.ui.TextInput):
+            out.append(inner)
+    return out
+
 
 # // ========================================( _resolve_modal_edit_label )======================================== // #
 
@@ -207,7 +222,7 @@ class TestBuildTextModal:
         modal = _build_form_modal(view, "Edit Text Fields")
         assert isinstance(modal, CascadeModal)
         # One discord TextInput per declared "text" field
-        text_inputs = [c for c in modal.children if isinstance(c, discord.ui.TextInput)]
+        text_inputs = _modal_text_inputs(modal)
         assert len(text_inputs) == 2
 
     def test_modal_view_id_wired_to_form(self):
@@ -225,7 +240,7 @@ class TestBuildTextModal:
         )
         view.values["u"] = "existing_user"
         modal = _build_form_modal(view, "Edit")
-        text_inputs = [c for c in modal.children if isinstance(c, discord.ui.TextInput)]
+        text_inputs = _modal_text_inputs(modal)
         assert text_inputs[0].default == "existing_user"
 
     def test_modal_falls_back_to_field_default_when_value_absent(self):
@@ -246,7 +261,7 @@ class TestBuildTextModal:
         )
         assert "u" not in view.values  # precondition: nothing written yet
         modal = _build_form_modal(view, "Edit")
-        text_inputs = [c for c in modal.children if isinstance(c, discord.ui.TextInput)]
+        text_inputs = _modal_text_inputs(modal)
         assert text_inputs[0].default == "seeded_user"
 
     def test_modal_default_is_none_when_neither_value_nor_default_set(self):
@@ -258,7 +273,7 @@ class TestBuildTextModal:
             fields=[{"id": "u", "type": "text", "label": "Username"}],
         )
         modal = _build_form_modal(view, "Edit")
-        text_inputs = [c for c in modal.children if isinstance(c, discord.ui.TextInput)]
+        text_inputs = _modal_text_inputs(modal)
         assert text_inputs[0].default is None
 
     def test_modal_does_not_carry_validators(self):
@@ -988,7 +1003,7 @@ class TestModalParseErrors:
             fields=[{"id": "d", "type": "date", "label": "Day"}],
         )
         modal = _build_form_modal(view, "Edit")
-        text_input = next(c for c in modal.children if isinstance(c, discord.ui.TextInput))
+        text_input = _modal_text_inputs(modal)[0]
         assert text_input.placeholder == "YYYY-MM-DD"
 
     async def test_modal_placeholder_for_integer_field(self):
@@ -997,7 +1012,7 @@ class TestModalParseErrors:
             fields=[{"id": "n", "type": "integer", "label": "Count"}],
         )
         modal = _build_form_modal(view, "Edit")
-        text_input = next(c for c in modal.children if isinstance(c, discord.ui.TextInput))
+        text_input = _modal_text_inputs(modal)[0]
         assert text_input.placeholder == "0"
 
 
@@ -1018,7 +1033,7 @@ class TestTypedModalAggregation:
             ],
         )
         modal = _build_form_modal(view, "Edit")
-        text_inputs = [c for c in modal.children if isinstance(c, discord.ui.TextInput)]
+        text_inputs = _modal_text_inputs(modal)
         assert len(text_inputs) == 4
 
     def test_six_typed_fields_still_rejected(self):

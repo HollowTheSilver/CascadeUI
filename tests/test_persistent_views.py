@@ -10,11 +10,13 @@ from cascadeui.state.reducers import (
     reduce_persistent_view_registered,
     reduce_persistent_view_unregistered,
 )
+from cascadeui.views.base import _StatefulMixin
 from cascadeui.views.persistent import (
+    PersistentLayoutView,
     PersistentView,
     _persistent_view_classes,
+    _PersistentMixin,
 )
-from cascadeui.views.base import _StatefulMixin
 
 
 def make_action(action_type, payload, source=None):
@@ -35,6 +37,7 @@ def base_state():
 
 class TestClassRegistry:
     """PersistentView subclasses auto-register in the class registry."""
+
     def test_subclass_auto_registered(self):
         """Subclassing PersistentView should auto-register the class."""
 
@@ -82,6 +85,7 @@ class TestClassRegistry:
 
 class TestCustomIdValidation:
     """PersistentView validates that all interactive components have explicit custom_ids."""
+
     async def test_missing_custom_id_raises(self):
         """Components without custom_id should fail validation."""
 
@@ -119,6 +123,7 @@ class TestCustomIdValidation:
 
 class TestPersistentViewReducers:
     """PERSISTENT_VIEW_REGISTERED and UNREGISTERED reducer behavior."""
+
     async def test_register_adds_entry(self):
         state = base_state()
         action = make_action(
@@ -240,8 +245,45 @@ class TestSessionRederivation:
 
         # Manual re-derivation (what the restore code does)
         if view.user_id and not view.session_id:
-            view.session_id = (
-                f"{type(view)._class_session_key()}:user_{view.user_id}"
-            )
+            view.session_id = f"{type(view)._class_session_key()}:user_{view.user_id}"
         assert view.session_id is not None
         assert "user_12345" in view.session_id
+
+
+# // ========================================( Send Composition )======================================== // #
+
+
+class TestSendComposition:
+    """``send()`` must live on ``_PersistentMixin`` so composed persistent
+    views (``_PersistentMixin + ConcreteLayoutView`` shape used by
+    ``PersistentRolesLayoutView`` and ``PersistentLeaderboardLayoutView``)
+    route through the mixin and dispatch ``PERSISTENT_VIEW_REGISTERED``.
+    Locating ``send()`` on the leaf classes (``PersistentView`` /
+    ``PersistentLayoutView``) caused composed subclasses to silently
+    skip registration because their MRO bypassed the leaf override.
+    """
+
+    def test_persistent_layout_view_send_owned_by_mixin(self):
+        owner = next(c for c in PersistentLayoutView.__mro__ if "send" in c.__dict__)
+        assert (
+            owner is _PersistentMixin
+        ), f"PersistentLayoutView.send resolves to {owner.__name__}, expected _PersistentMixin"
+
+    def test_persistent_view_send_owned_by_mixin(self):
+        owner = next(c for c in PersistentView.__mro__ if "send" in c.__dict__)
+        assert (
+            owner is _PersistentMixin
+        ), f"PersistentView.send resolves to {owner.__name__}, expected _PersistentMixin"
+
+    def test_composed_pattern_send_owned_by_mixin(self):
+        """Loaded lazily because the leaderboard / roles pattern modules
+        register module-level state when imported."""
+        from cascadeui.views.patterns.leaderboard import PersistentLeaderboardLayoutView
+        from cascadeui.views.patterns.roles import PersistentRolesLayoutView
+
+        for cls in (PersistentRolesLayoutView, PersistentLeaderboardLayoutView):
+            owner = next(c for c in cls.__mro__ if "send" in c.__dict__)
+            assert owner is _PersistentMixin, (
+                f"{cls.__name__}.send resolves to {owner.__name__}, expected _PersistentMixin "
+                "-- this means composed persistent views skip registration silently."
+            )

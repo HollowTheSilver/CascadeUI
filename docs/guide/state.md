@@ -69,6 +69,13 @@ and middleware interaction, see the
 
 ## Custom Reducers
 
+Most state-management needs are covered by [Application Slots](#application-slots)
+and [Scoped State](#scoped-state) below -- the convenience layer that
+`dispatch_scoped` writes through. Reach for `@cascade_reducer` when the
+state shape genuinely outgrows the slot model: cross-view aggregations,
+complex transitions, derived data that depends on multiple slots, or
+custom action types that need their own dispatch grammar.
+
 Reducers transform state in response to actions. `@cascade_reducer` handles
 deep-copying automatically -- mutate and return directly:
 
@@ -338,6 +345,10 @@ consistently from views, reducers, and selectors:
 | Helper | When to use |
 |--------|-------------|
 | `self.scoped_state` | Property -- the current view's own scope slice. |
+| `self.user_scoped_state(user_id=None)` | Read the `"user"` scope slice; defaults to this view's `user_id`. |
+| `self.guild_scoped_state(guild_id=None)` | Read the `"guild"` scope slice; defaults to this view's `guild_id`. |
+| `self.user_guild_scoped_state(user_id=None, guild_id=None)` | Read the `"user_guild"` composite scope slice. |
+| `self.global_scoped_state()` | Read the `"global"` scope slice. |
 | `self.dispatch_scoped(data)` | Write-through from a view -- merges into the scope slot. |
 | `self.dispatch_scoped_as(scope, data, **ids)` | Write-through from a view with an explicit scope + identifiers. |
 | `store.get_scoped(scope, **ids)` | Read from a live store (subscribers, devtools). |
@@ -632,7 +643,7 @@ filter which state changes trigger its rebuild.
 Force recomputation on next access:
 
 ```python
-store._computed["vote_totals"].invalidate()
+store.computed["vote_totals"].invalidate()
 ```
 
 This is rarely needed -- the selector-based check handles most cases

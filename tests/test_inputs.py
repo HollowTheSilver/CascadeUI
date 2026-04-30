@@ -6,7 +6,6 @@ FileUpload) and are auto-collected by ``Modal`` at construction time.
 """
 
 import discord
-import pytest
 
 from cascadeui.components.inputs import (
     Checkbox,
@@ -100,7 +99,7 @@ class TestModalValidatorAutoCollect:
             inputs=[
                 TextInput(label="Username", validators=[v1]),
                 TextInput(label="Email", validators=[v2]),
-                TextInput(label="Bio"),  # no validators — not in dict
+                TextInput(label="Bio"),  # no validators -- not in dict
             ],
         )
         assert modal.validators == {
@@ -249,9 +248,12 @@ class TestCheckbox:
     def test_create_discord_component(self):
         cb = Checkbox(label="Check", default=True)
         comp = cb.create_discord_component()
-        assert isinstance(comp, discord.ui.Checkbox)
-        assert comp.custom_id == "input_check"
-        assert comp.default is True
+        assert isinstance(comp, discord.ui.Label)
+        assert comp.text == "Check"
+        inner = comp.component
+        assert isinstance(inner, discord.ui.Checkbox)
+        assert inner.custom_id == "input_check"
+        assert inner.default is True
 
 
 # // ========================================( CheckboxGroup )======================================== // #
@@ -293,10 +295,13 @@ class TestCheckboxGroup:
             max_values=3,
         )
         comp = cg.create_discord_component()
-        assert isinstance(comp, discord.ui.CheckboxGroup)
-        assert comp.custom_id == "input_sizes"
-        assert comp.min_values == 1
-        assert comp.max_values == 3
+        assert isinstance(comp, discord.ui.Label)
+        assert comp.text == "Sizes"
+        inner = comp.component
+        assert isinstance(inner, discord.ui.CheckboxGroup)
+        assert inner.custom_id == "input_sizes"
+        assert inner.min_values == 1
+        assert inner.max_values == 3
 
     def test_validators_collected_by_modal(self):
         v = min_length(1)
@@ -352,8 +357,11 @@ class TestRadioGroup:
             ],
         )
         comp = rg.create_discord_component()
-        assert isinstance(comp, discord.ui.RadioGroup)
-        assert comp.custom_id == "input_mode"
+        assert isinstance(comp, discord.ui.Label)
+        assert comp.text == "Mode"
+        inner = comp.component
+        assert isinstance(inner, discord.ui.RadioGroup)
+        assert inner.custom_id == "input_mode"
 
     def test_validators_collected_by_modal(self):
         v = regex(r"^easy$", "must be easy")
@@ -383,16 +391,93 @@ class TestFileUpload:
     def test_create_discord_component(self):
         fu = FileUpload(label="Docs", min_values=1, max_values=5)
         comp = fu.create_discord_component()
-        assert isinstance(comp, discord.ui.FileUpload)
-        assert comp.custom_id == "input_docs"
-        assert comp.min_values == 1
-        assert comp.max_values == 5
+        assert isinstance(comp, discord.ui.Label)
+        assert comp.text == "Docs"
+        inner = comp.component
+        assert isinstance(inner, discord.ui.FileUpload)
+        assert inner.custom_id == "input_docs"
+        assert inner.min_values == 1
+        assert inner.max_values == 5
 
     def test_wrapped_pairs_include_file_upload(self):
         fu = FileUpload(label="Upload")
         modal = Modal(title="T", inputs=[fu])
         assert len(modal._wrapped_pairs) == 1
         assert modal._wrapped_pairs[0][0] is fu
+
+
+# // ========================================( ui.Label description )======================================== // #
+
+
+class TestLabelDescription:
+    """The ``description=`` kwarg lands on ``ui.Label.description`` for every wrapper."""
+
+    def test_text_input_description(self):
+        ti = TextInput(label="Name", description="Your full name")
+        comp = ti.create_discord_component()
+        assert isinstance(comp, discord.ui.Label)
+        assert comp.description == "Your full name"
+
+    def test_checkbox_description(self):
+        cb = Checkbox(label="Agree", description="To the terms")
+        comp = cb.create_discord_component()
+        assert comp.description == "To the terms"
+
+    def test_checkbox_group_description(self):
+        cg = CheckboxGroup(
+            label="Toppings",
+            description="Pick any combination",
+            options=[discord.CheckboxGroupOption(label="A", value="a")],
+        )
+        comp = cg.create_discord_component()
+        assert comp.description == "Pick any combination"
+
+    def test_radio_group_description(self):
+        rg = RadioGroup(
+            label="Mode",
+            description="Choose one",
+            options=[discord.RadioGroupOption(label="A", value="a")],
+        )
+        comp = rg.create_discord_component()
+        assert comp.description == "Choose one"
+
+    def test_file_upload_description(self):
+        fu = FileUpload(label="Docs", description="PDF or DOCX only")
+        comp = fu.create_discord_component()
+        assert comp.description == "PDF or DOCX only"
+
+    def test_description_default_is_none(self):
+        ti = TextInput(label="Name")
+        comp = ti.create_discord_component()
+        assert comp.description is None
+
+
+# // ========================================( Modal child structure )======================================== // #
+
+
+class TestModalChildStructure:
+    """Modal carries ``ui.Label`` children for wrapped inputs; raw items pass through."""
+
+    def test_wrapped_input_renders_as_label_child(self):
+        ti = TextInput(label="Name")
+        modal = Modal(title="T", inputs=[ti])
+        # The modal's first child is a Label wrapping the TextInput
+        children = list(modal.children)
+        assert len(children) == 1
+        assert isinstance(children[0], discord.ui.Label)
+        assert isinstance(children[0].component, discord.ui.TextInput)
+
+    def test_raw_label_passthrough(self):
+        # User constructs ui.Label themselves -- escape hatch path
+        raw_label = discord.ui.Label(
+            text="Custom",
+            component=discord.ui.TextInput(custom_id="raw_field"),
+        )
+        modal = Modal(title="T", inputs=[raw_label])
+        children = list(modal.children)
+        assert children[0] is raw_label
+        # Modal indexes by inner component's custom_id
+        assert "raw_field" in modal.inputs
 
 
 # // ========================================( Modal mixed inputs )======================================== // #

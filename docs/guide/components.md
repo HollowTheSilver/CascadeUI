@@ -43,6 +43,38 @@ self.add_item(ActionRow(
 Convenience subclasses: `PrimaryButton`, `SecondaryButton`, `SuccessButton`,
 `DangerButton`, `LinkButton`, `ToggleButton`.
 
+#### `owner_only=True` per-button host gate
+
+Pairs with view-level `owner_only=False` to express open-view + host-only-button
+flows (lobby Start/Disband, ticket Close, poll End). When set, the button
+callback fires only when `interaction.user.id == view.user_id`; mismatches
+route through `view.on_unauthorized(interaction)` without invoking the
+callback.
+
+```python
+from discord.ui import ActionRow
+
+from cascadeui import StatefulLayoutView, StatefulButton
+
+class LobbyView(StatefulLayoutView):
+    owner_only = False  # everyone in the channel can see the lobby
+
+    def build_ui(self):
+        self.clear_items()
+        self.add_item(ActionRow(
+            StatefulButton(label="Join", callback=self.join),
+            StatefulButton(
+                label="Start",
+                callback=self.start,
+                owner_only=True,  # only the lobby host
+            ),
+        ))
+```
+
+Anonymous views (no `view.user_id`) skip the gate entirely so background
+or system-driven flows still work. Defaults to `False`, so omitting the
+kwarg leaves the standard callback contract unchanged.
+
 ### StatefulSelect
 
 Extends `discord.ui.Select` with state integration:
@@ -93,6 +125,49 @@ async def on_select(interaction, values):
 Detection happens at creation time via `inspect.signature`. Single-parameter
 callbacks still work unchanged.
 
+#### Pre-populated defaults (specialized selects)
+
+`RoleSelect`, `UserSelect`, `ChannelSelect`, and `MentionableSelect`
+each accept a `default_values=` constructor kwarg that pre-marks
+entries as selected when the message first renders. CascadeUI accepts
+a permissive input shape -- raw `int` IDs, Discord objects (Role,
+Member, User, GuildChannel), or pre-built `discord.SelectDefaultValue`
+instances -- and wraps each entry with the right type for the select
+class.
+
+```python
+from cascadeui import RoleSelect, UserSelect, MentionableSelect
+
+# Raw int IDs (auto-typed as 'role')
+moderator_select = RoleSelect(default_values=[123456789, 987654321])
+
+# Discord.Member objects (auto-typed as 'user')
+admin_select = UserSelect(default_values=[ctx.guild.owner])
+
+# MentionableSelect requires typed objects -- bare ints rejected
+mention_select = MentionableSelect(
+    default_values=[
+        ctx.guild.get_role(role_id),       # auto-typed as 'role'
+        ctx.guild.get_member(user_id),     # auto-typed as 'user'
+    ],
+)
+```
+
+Update defaults after construction with `set_default_values(values)`,
+which accepts the same input shape and replaces the existing list:
+
+```python
+select.set_default_values([new_id_1, new_id_2])
+select.set_default_values([])     # clear all defaults
+select.set_default_values(None)   # clear all defaults
+```
+
+`MentionableSelect` cannot infer type from a bare `int` (could be
+either user or role), so raw IDs are rejected with a `TypeError`
+naming the supported input shapes. Callers who only have IDs
+construct `discord.SelectDefaultValue(id=..., type='user')` (or
+`'role'`) explicitly and pass that.
+
 ### Passing Context to Callbacks
 
 Use closures or `functools.partial` to pass extra data:
@@ -121,6 +196,12 @@ All five share the same contract:
 - `custom_id` derived from label via `TextInput._slug()`
 - Optional `validators` list auto-collected by `Modal`
 - Value write-back: `.value` or `.values` populated after submit
+- Each renders as a `discord.ui.Label` wrapping the inner input. The
+  label string moves to `Label.text`; an optional `description=` kwarg
+  populates `Label.description` for a secondary helper line beneath
+  the title. The Modal's child tree carries the `ui.Label` wrappers
+  directly; CascadeUI unwraps them internally during submit
+  collection.
 
 ### TextInput
 
@@ -142,12 +223,18 @@ from cascadeui import TextInput, min_length, regex
 
 name = TextInput(
     label="Username",
+    description="Lowercase letters, numbers, and underscores only.",
     validators=[
         min_length(3),
         regex(r"^[a-zA-Z0-9_]+$", "Alphanumeric only"),
     ],
 )
 ```
+
+The `description=` kwarg renders as `Label.description` -- a secondary
+helper line beneath the field title. Available on all five wrapped
+input types (TextInput, Checkbox, CheckboxGroup, RadioGroup,
+FileUpload).
 
 ### Checkbox
 
@@ -250,6 +337,111 @@ responds with error messages and blocks submission.
 
 Pass `view_id=self.id` to dispatch a `MODAL_SUBMITTED` action for state
 tracking.
+
+---
+
+## Custom Emoji
+
+CascadeUI accepts the same emoji forms as discord.py everywhere a
+component takes an `emoji=` argument. The type alias `EmojiInput`
+(exported from `cascadeui.components.types`) is
+`Optional[Union[str, discord.Emoji, discord.PartialEmoji]]` and matches
+the union accepted by `discord.ui.Button` and `discord.SelectOption`.
+
+### Three string forms
+
+| Form | Example | Source |
+|---|---|---|
+| Unicode | `"⚙️"` or its Python escape form | Standard Unicode emoji |
+| Custom static | `"<:fire:1234567890123456789>"` | Guild-owned or application-owned static emoji |
+| Custom animated | `"<a:dance:1234567890123456789>"` | Guild-owned or application-owned animated emoji |
+
+discord.py parses all three at the component boundary via
+`PartialEmoji.from_str`. A live `discord.Emoji` instance (returned by
+`bot.get_emoji` or `bot.fetch_application_emoji`) and a
+`discord.PartialEmoji` are accepted directly; `str(emoji_obj)` produces
+the matching `<:name:id>` form when a plain string is required.
+
+### Where emoji are accepted
+
+| Surface | Slot |
+|---|---|
+| `StatefulButton(emoji=...)` | inherited from `discord.ui.Button` |
+| `StatefulSelect` option dicts | `"emoji"` key |
+| `action_section`, `toggle_section`, `link_section`, `button_row`, `cycle_button`, `toggle_button` | `emoji=` kwarg |
+| `confirm_section` | `confirm_emoji=` / `cancel_emoji=` |
+| `MenuView` / `MenuLayoutView` category dicts | `"emoji"` key |
+| `RoleCategory(icon=...)` | rendered as a markdown prefix in the category header |
+| `RolesLayoutView` / `PersistentRolesLayoutView` | `format_button_emoji` classmethod returns `EmojiInput` |
+| `LeaderboardLayoutView.podium_emojis` | rank → string used in markdown |
+| `WizardLayoutView` | `back_button_emoji`, `next_button_emoji`, `finish_button_emoji` |
+| `PaginatedLayoutView` | `first_button_emoji` through `last_button_emoji` |
+| `FormLayoutView` | `text_edit_button_emoji` |
+| `with_loading_state(loading_emoji=...)` | wrapper kwarg |
+| Refresh handoff (any view) | `refresh_button_emoji` |
+
+### Application-owned emojis
+
+Custom guild emojis only render where the bot is currently a member of
+the source guild. For bots deployed across many independent guilds,
+guild-owned assets stop rendering once the bot leaves the guild that
+owns them. discord.py supports **application-owned emojis**: emoji
+uploaded directly to the bot's application, which render everywhere
+the bot operates and never expire on guild membership changes.
+
+```python
+# One-time setup. Run once, capture the IDs in config.
+import discord
+
+bot = discord.Client(intents=discord.Intents.default())
+
+@bot.event
+async def on_ready():
+    with open("fire.png", "rb") as f:
+        emoji = await bot.create_application_emoji(name="fire", image=f.read())
+    print(f"Created: {emoji} (id={emoji.id})")
+    await bot.close()
+
+bot.run("TOKEN")
+```
+
+Reference the captured ID in any `emoji=` slot:
+
+```python
+FIRE_EMOJI = "<:fire:1234567890123456789>"  # captured from the setup run
+
+self.add_item(action_section(
+    "Activate trial",
+    label="Start",
+    emoji=FIRE_EMOJI,
+    callback=self._start,
+))
+```
+
+`Client.fetch_application_emojis()` lists existing application emojis
+and `fetch_application_emoji(emoji_id)` retrieves one by ID. Both
+return `discord.Emoji` instances; the rendering pipeline treats them
+identically to guild emojis.
+
+### Pitfalls
+
+- **Missing angle brackets.** Typing `":fire:1234567890123456789"` instead of
+  `"<:fire:1234567890123456789>"` parses as a unicode emoji name and renders
+  as literal text.
+- **Short emoji IDs fall through to unicode.** discord.py's parser
+  requires 13 to 20 digits for the ID portion of a custom emoji string.
+  Real Discord snowflakes are 17 to 19 digits. Anything shorter is
+  treated as a unicode emoji name and renders as literal text -- this
+  catches shortened placeholder values copied without substitution.
+- **Wrong emoji ID.** Discord renders unknown IDs as a placeholder
+  glyph; no exception is raised. Verify IDs match a real emoji in the
+  source guild or application.
+- **Bot not in source guild.** A guild-owned custom emoji string only
+  renders when the bot is currently a member of the guild that owns
+  the emoji. Application emojis avoid this entirely.
+- **Animated flag.** Static custom emoji use `<:name:id>` with no
+  leading `a`. Animated use `<a:name:id>`. Mismatching the flag
+  against the actual asset shows a static frame.
 
 ---
 

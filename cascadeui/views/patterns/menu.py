@@ -175,6 +175,9 @@ class MenuView(_BaseMenuMixin, StatefulView):
         if self.auto_exit_button:
             self.add_exit_button(row=4)
 
+        # Restore the navigation back button if push() added one.
+        self._restore_navigation_artifacts()
+
         return {"embed": self.build_embed()}
 
 
@@ -296,3 +299,6 @@ class MenuLayoutView(_BaseMenuMixin, StatefulLayoutView):
 
         if self.auto_exit_button:
             self.add_item(ActionRow(self.make_exit_button()))
+
+        # Restore the navigation back button if push() added one.
+        self._restore_navigation_artifacts()

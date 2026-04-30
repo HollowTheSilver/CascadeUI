@@ -15,6 +15,7 @@ from cascadeui.components.v1_composition import (
 
 class TestStatefulComponent:
     """StatefulButton and StatefulSelect store original callbacks and pass-through args."""
+
     def test_button_stores_original_callback(self):
         async def my_cb(interaction):
             pass
@@ -137,6 +138,7 @@ class TestStatefulSelectSetSelected:
 
 class TestCompositeComponent:
     """V1 CompositeComponent registration, retrieval, and child management."""
+
     def test_add_and_retrieve_components(self):
         comp = CompositeComponent()
         btn = StatefulButton(label="Child")
@@ -228,3 +230,117 @@ class TestStatefulCallbackTokenDiscipline:
             await stateful_cb(make_interaction())
         assert _CURRENT_INTERACTION.get() is None
         view.dispatch.assert_not_called()
+
+
+class TestButtonOwnerOnly:
+    """``StatefulButton(owner_only=True)`` gates the callback on
+    ``interaction.user.id == view.user_id``. Mismatches route through
+    ``view.on_unauthorized(interaction)`` instead of invoking the
+    user callback. Pairs with view-level ``owner_only=False`` to
+    express open-view + host-only-button (lobby Start/Disband,
+    ticket Close, poll End).
+
+    Tests exercise the inner ``stateful_callback`` directly via a
+    MagicMock component (matching ``TestStatefulCallbackTokenDiscipline``
+    above) -- the gate logic lives there, and bypassing ``StatefulButton``
+    construction avoids mutating the discord.py ``view`` property at
+    the class level.
+    """
+
+    def _make_view(self, owner_id=1):
+        view = MagicMock()
+        view.user_id = owner_id
+        view.id = "view-under-test"
+        view.is_finished = MagicMock(return_value=False)
+        view.dispatch = AsyncMock()
+        view.on_unauthorized = AsyncMock()
+        return view
+
+    def _make_component(self, view, *, owner_only=False):
+        component = MagicMock()
+        component.custom_id = "host-btn"
+        component.view = view
+        component._button_owner_only = owner_only
+        return component
+
+    def _make_interaction(self, user_id):
+        from helpers import make_interaction
+
+        interaction = make_interaction()
+        interaction.user.id = user_id
+        return interaction
+
+    async def test_owner_click_invokes_callback(self):
+        callback_calls = []
+
+        async def user_cb(interaction):
+            callback_calls.append(True)
+
+        view = self._make_view(owner_id=1)
+        component = self._make_component(view, owner_only=True)
+        stateful_cb = StatefulComponent().create_stateful_callback(component, user_cb)
+
+        await stateful_cb(self._make_interaction(user_id=1))
+
+        assert callback_calls == [True]
+        view.on_unauthorized.assert_not_awaited()
+
+    async def test_non_owner_click_routes_to_on_unauthorized(self):
+        callback_calls = []
+
+        async def user_cb(interaction):
+            callback_calls.append(True)
+
+        view = self._make_view(owner_id=1)
+        component = self._make_component(view, owner_only=True)
+        stateful_cb = StatefulComponent().create_stateful_callback(component, user_cb)
+
+        await stateful_cb(self._make_interaction(user_id=999))
+
+        assert callback_calls == []
+        view.on_unauthorized.assert_awaited_once()
+        view.dispatch.assert_not_called()
+
+    async def test_default_owner_only_false_preserves_existing_behavior(self):
+        """Backward compat: omitting owner_only or passing False
+        keeps the pre-v3.2.0 callback contract intact."""
+        callback_calls = []
+
+        async def user_cb(interaction):
+            callback_calls.append(True)
+
+        view = self._make_view(owner_id=1)
+        component = self._make_component(view, owner_only=False)
+        stateful_cb = StatefulComponent().create_stateful_callback(component, user_cb)
+
+        await stateful_cb(self._make_interaction(user_id=999))
+
+        assert callback_calls == [True]
+        view.on_unauthorized.assert_not_awaited()
+
+    async def test_view_without_user_id_skips_check(self):
+        """Anonymous flows (no view.user_id) skip the gate entirely
+        so background or system-driven views still work."""
+        callback_calls = []
+
+        async def user_cb(interaction):
+            callback_calls.append(True)
+
+        view = self._make_view(owner_id=None)
+        component = self._make_component(view, owner_only=True)
+        stateful_cb = StatefulComponent().create_stateful_callback(component, user_cb)
+
+        await stateful_cb(self._make_interaction(user_id=999))
+
+        assert callback_calls == [True]
+        view.on_unauthorized.assert_not_awaited()
+
+    async def test_kwarg_stored_on_button_instance(self):
+        """Verify the kwarg actually lands on the button as
+        ``_button_owner_only`` so the integration path through
+        ``StatefulButton.__init__`` is wired correctly."""
+        btn_default = StatefulButton(label="Default")
+        btn_owner = StatefulButton(label="Host", owner_only=True)
+
+        assert btn_default._button_owner_only is False
+        assert btn_owner._button_owner_only is True

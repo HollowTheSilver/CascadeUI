@@ -11,7 +11,7 @@ import logging as _logging
 
 _logging.getLogger(__name__).addHandler(_logging.NullHandler())
 
-from .components.base import StatefulButton, StatefulSelect
+from .components.base import DynamicPersistentButton, StatefulButton, StatefulSelect
 from .components.inputs import Checkbox, CheckboxGroup, FileUpload, Modal, RadioGroup, TextInput
 from .components.patterns import (
     ConfirmationButtons,
@@ -39,6 +39,7 @@ from .components.patterns import (
     toggle_button,
     toggle_section,
 )
+from .components.types import EmojiInput
 from .components.v1_composition import CompositeComponent, get_component, register_component
 from .components.wrappers import with_confirmation, with_cooldown, with_loading_state
 from .devtools import DevToolsCog, InspectorView
@@ -105,12 +106,20 @@ from .views.patterns import (
     PaginatedLayoutView,
     PaginatedView,
     PersistentLeaderboardLayoutView,
+    PersistentRolesLayoutView,
+    RolesLayoutView,
     TabLayoutView,
     TabView,
     WizardLayoutView,
     WizardView,
 )
-from .views.patterns.types import FormField, FormSchema, WizardSchema, WizardStep
+from .views.patterns.types import (
+    FormField,
+    FormSchema,
+    RoleCategory,
+    WizardSchema,
+    WizardStep,
+)
 from .views.persistent import PersistentLayoutView, PersistentView
 from .views.view import StatefulView
 
@@ -121,7 +130,7 @@ if "SQLiteBackend" in _persistence_all:
 # // ========================================( Script )======================================== // #
 
 
-__version__ = "3.1.0"
+__version__ = "3.2.0"
 
 # Export public API
 __all__ = [
@@ -160,11 +169,14 @@ __all__ = [
     "MenuLayoutView",
     "PaginatedLayoutView",
     "PersistentLeaderboardLayoutView",
+    "PersistentRolesLayoutView",
+    "RolesLayoutView",
     "TabLayoutView",
     "WizardLayoutView",
     # Components
     "StatefulButton",
     "StatefulSelect",
+    "DynamicPersistentButton",
     "CompositeComponent",
     "ConfirmationButtons",
     "PaginationControls",
@@ -183,6 +195,8 @@ __all__ = [
     "with_loading_state",
     "with_confirmation",
     "with_cooldown",
+    # Type aliases
+    "EmojiInput",
     # V2 Cards & Sections
     "card",
     "action_section",
@@ -228,6 +242,7 @@ __all__ = [
     # Typed schemas
     "FormField",
     "FormSchema",
+    "RoleCategory",
     "WizardStep",
     "WizardSchema",
     # Validation

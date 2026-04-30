@@ -563,12 +563,25 @@ class PersistenceManager:
 
             self._bot.add_view(view, message_id=message.id)
 
-            await view._register_state()
-            state_registered = True
-            await view._update_message_state(message)
+            # _register_view first so the instance index is complete before
+            # _register_state's VIEW_CREATED notifies subscribers. Mirrors
+            # the order used by _send_pipeline -- subscribers and instance
+            # limit checks see a consistent state row at every step.
             self._store._register_view(view)
 
-            await view.on_restore(self._bot)
+            # Batch the registration dispatches and ``on_restore`` so the
+            # three startup actions (SESSION_CREATED + VIEW_CREATED + VIEW_UPDATED)
+            # plus any actions the user dispatches inside ``on_restore`` collapse
+            # into a single BATCH_COMPLETE notification per restored view.
+            # Without the batch, a project with N persistent views fires 3N+
+            # standalone notification cycles at startup. Batch source_id is
+            # the view's id so the BATCH_COMPLETE rides the acting-view
+            # inline-notification path, matching the _send_pipeline contract.
+            async with self._store.batch(source_id=view.id):
+                await view._register_state()
+                state_registered = True
+                await view._update_message_state(message)
+                await view.on_restore(self._bot)
 
             logger.info(f"Restored persistent view {persistence_key!r} ({class_name})")
             return "restored"

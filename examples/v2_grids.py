@@ -61,9 +61,10 @@ class GridShowcaseView(StatefulLayoutView):
 
     owner_only = True
     # ``instance_limit = None`` leaves the showcase unthrottled so a
-    # recording can stack multiple grids in one channel. ``instance_policy``
-    # and ``replace_policy`` have no effect while ``instance_limit`` is None
-    # (the replacement path never fires), but are shown here for reference.
+    # recording can stack multiple grids in one channel. The
+    # ``instance_policy`` and ``replace_policy`` values stay inert
+    # while ``instance_limit`` is None -- the replacement path never
+    # fires until the limit is set.
     instance_limit = None
     instance_scope = "user_guild"
     instance_policy = "replace"

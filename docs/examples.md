@@ -8,6 +8,12 @@ Working examples are in the [`examples/`](https://github.com/HollowTheSilver/Cas
 
 These use the V2 component system (`StatefulLayoutView`, Containers, Sections, TextDisplay).
 
+### v2_hello_world.py
+
+The smallest working CascadeUI view: a per-user counter using `state_scope = "user"`, `subscribed_actions = {"SCOPED_UPDATE"}`, a one-line `state_selector` reading the count via `StateStore.get_scoped_from`, and `dispatch_scoped({"count": N})` for writes. Mirrors the [Quick Start](guide/quickstart.md) tutorial as a runnable cog. Open with `/hello`; the same user sees the same counter across every server that shares the bot.
+
+**Command:** `/hello`
+
 ### v2_dashboard.py
 
 Multi-tab server dashboard using `TabLayoutView`. Shows server info, member stats, and module toggles across three tabs. Demonstrates `action_section`, `toggle_section`, `key_value`, `alert`, tab switching, and session limiting.
@@ -40,6 +46,18 @@ Registration form using `FormLayoutView` with native `text` fields, a dropdown s
 Paginated inventory viewer using `PaginatedLayoutView` with `from_data()`. Container-based page content with jump controls (first/last, go-to-page modal). Demonstrates `_build_extra_items()` for an exit button below navigation.
 
 **Command:** `/v2pages`
+
+### v2_library.py
+
+Pagination + drill-down navigation. A category hub (`StatefulLayoutView`) pushes a paginated `CategoryListView` per category using `await PaginatedLayoutView.from_data(...)` and `push(instance)`. `nav_inside_container = True` wraps page content + nav row in a single Container per page; `auto_back_button = True` adds a Back button that pops the nav stack and survives page turns. The closest mapping for users coming from Soheab's CV2 paginator gist.
+
+**Command:** `/v2library`
+
+### v2_computed.py
+
+Quick poll demonstrating `@computed` for global memoized values that multiple views share without recalculating. Two `@computed` values derive vote totals and the current leader; the poll view reads both in `build_ui()` and displays them alongside the raw vote buttons. Contrast with `state_selector` (per-view change detection): computed values are global and shared across all views.
+
+**Command:** `/v2poll`
 
 ### v2_wizard.py
 
@@ -124,12 +142,15 @@ from cascadeui.persistence import SQLiteBackend
 class MyBot(commands.Bot):
     async def setup_hook(self):
         # V2 examples
+        await self.load_extension("examples.v2_hello_world")
         await self.load_extension("examples.v2_dashboard")
         await self.load_extension("examples.v2_settings")
         await self.load_extension("examples.v2_form")
         await self.load_extension("examples.v2_pagination")
+        await self.load_extension("examples.v2_library")
         await self.load_extension("examples.v2_wizard")
         await self.load_extension("examples.v2_persistence")
+        await self.load_extension("examples.v2_computed")
         await self.load_extension("examples.v2_tictactoe")
         await self.load_extension("examples.v2_battleship")
         await self.load_extension("examples.v2_leaderboard")

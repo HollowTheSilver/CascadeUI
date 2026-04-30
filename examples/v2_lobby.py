@@ -203,12 +203,14 @@ class LobbyView(StatefulLayoutView):
                         style=discord.ButtonStyle.primary,
                         emoji="\u25b6",  # play
                         callback=self._start,
+                        owner_only=True,
                     ),
                     StatefulButton(
                         label="Disband",
                         style=discord.ButtonStyle.danger,
                         emoji="\u274c",
                         callback=self._disband,
+                        owner_only=True,
                     ),
                 )
             )
@@ -274,10 +276,10 @@ class LobbyView(StatefulLayoutView):
         await self.refresh()
 
     async def _start(self, interaction: discord.Interaction):
-        if interaction.user.id != self.user_id:
-            await self.respond(interaction, "Only the host can start the game.", ephemeral=True)
-            return
-
+        # Host-only auth is declared on the button via ``owner_only=True``;
+        # by the time this callback runs, the user is guaranteed to be
+        # the host. ``on_unauthorized`` (default: send
+        # ``unauthorized_message``) handles non-host clicks.
         self._started = True
         await self.dispatch("LOBBY_STARTED", {"players": len(self.participants) + 1})
 
@@ -291,10 +293,7 @@ class LobbyView(StatefulLayoutView):
         await self.refresh()
 
     async def _disband(self, interaction: discord.Interaction):
-        if interaction.user.id != self.user_id:
-            await self.respond(interaction, "Only the host can disband the lobby.", ephemeral=True)
-            return
-
+        # Host-only auth declared on the button; see ``_start``.
         await self.dispatch("LOBBY_DISBANDED", {})
         # exit_policy = "delete" handles the deletion -- no inline arg needed.
         await self.exit()

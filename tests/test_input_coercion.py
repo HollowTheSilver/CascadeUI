@@ -15,7 +15,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from cascadeui.utils.coercion import coerce_snowflake_id, coerce_snowflake_id_set
+from cascadeui.utils.coercion import (
+    coerce_snowflake_id,
+    coerce_snowflake_id_set,
+    coerce_snowflake_match,
+)
 
 # // ========================================( Helpers )======================================== // #
 
@@ -32,6 +36,7 @@ def _snowflake(snowflake_id: int) -> MagicMock:
 
 class TestCoerceSnowflakeId:
     """coerce_snowflake_id handles None, int, and .id-bearing objects."""
+
     def test_none_passthrough(self):
         assert coerce_snowflake_id(None) is None
 
@@ -67,6 +72,7 @@ class TestCoerceSnowflakeId:
 
 class TestCoerceSnowflakeIdSet:
     """coerce_snowflake_id_set converts iterables of mixed types to int sets."""
+
     def test_none_returns_empty_set(self):
         assert coerce_snowflake_id_set(None) == set()
 
@@ -83,3 +89,66 @@ class TestCoerceSnowflakeIdSet:
     def test_rejects_invalid_element(self):
         with pytest.raises(TypeError, match="Snowflake"):
             coerce_snowflake_id_set([1, "not-an-id", 3])
+
+
+# // ========================================( coerce_snowflake_match )======================================== // #
+
+
+_SNOWFLAKE_KEYS = frozenset({"user_id", "guild_id", "channel_id", "role_id", "message_id"})
+
+
+class TestCoerceSnowflakeMatch:
+    """coerce_snowflake_match coerces named regex-capture groups to int."""
+
+    def test_snowflake_key_coerced_to_int(self):
+        out = coerce_snowflake_match({"role_id": "123456789"}, _SNOWFLAKE_KEYS)
+        assert out == {"role_id": 123456789}
+        assert isinstance(out["role_id"], int)
+
+    def test_non_snowflake_key_preserved_as_string(self):
+        out = coerce_snowflake_match({"category": "mod_staff", "role_id": "42"}, _SNOWFLAKE_KEYS)
+        assert out == {"category": "mod_staff", "role_id": 42}
+        assert isinstance(out["category"], str)
+        assert isinstance(out["role_id"], int)
+
+    def test_all_five_snowflake_names_coerced(self):
+        raw = {
+            "user_id": "1",
+            "guild_id": "2",
+            "channel_id": "3",
+            "role_id": "4",
+            "message_id": "5",
+        }
+        out = coerce_snowflake_match(raw, _SNOWFLAKE_KEYS)
+        assert out == {
+            "user_id": 1,
+            "guild_id": 2,
+            "channel_id": 3,
+            "role_id": 4,
+            "message_id": 5,
+        }
+        assert all(isinstance(v, int) for v in out.values())
+
+    def test_none_value_preserved(self):
+        # Optional regex groups match as None; coercion must not crash.
+        out = coerce_snowflake_match({"role_id": None}, _SNOWFLAKE_KEYS)
+        assert out == {"role_id": None}
+
+    def test_non_digit_string_raises_value_error(self):
+        # A template like ``(?P<role_id>\w+)`` would capture non-digits
+        # and trip int(); this is a programmer error the helper surfaces
+        # via the natural ValueError rather than silently coercing.
+        with pytest.raises(ValueError):
+            coerce_snowflake_match({"role_id": "not-digits"}, _SNOWFLAKE_KEYS)
+
+    def test_input_dict_not_mutated(self):
+        raw = {"role_id": "42", "category": "mod"}
+        out = coerce_snowflake_match(raw, _SNOWFLAKE_KEYS)
+        assert raw == {"role_id": "42", "category": "mod"}
+        assert out is not raw
+
+    def test_empty_snowflake_keys_passthrough(self):
+        # When no keys are designated as snowflakes, everything stays a string.
+        out = coerce_snowflake_match({"role_id": "42"}, frozenset())
+        assert out == {"role_id": "42"}
+        assert isinstance(out["role_id"], str)

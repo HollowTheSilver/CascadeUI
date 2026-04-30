@@ -504,7 +504,7 @@ class TicTacToeView(StatefulLayoutView):
         """
         if self.guild_id is None:
             return
-        async with self.state_store.batch():
+        async with self.batch():
             if self.winner == "draw":
                 await self._record_player_stats(self.player_x, outcome="draw", forfeit=False)
                 await self._record_player_stats(self.player_o, outcome="draw", forfeit=False)

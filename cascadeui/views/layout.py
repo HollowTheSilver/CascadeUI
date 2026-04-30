@@ -55,12 +55,7 @@ class StatefulLayoutView(_StatefulMixin, LayoutView):
         async def back_callback(interaction):
             await self._safe_defer(interaction)
             prev_view = await self.pop(interaction)
-            if prev_view:
-                try:
-                    await interaction.edit_original_response(view=prev_view)
-                except discord.HTTPException:
-                    pass
-            else:
+            if prev_view is None:
                 # V2 messages ARE their components -- view=None would produce
                 # an empty message.  Freeze instead.
                 try:
@@ -68,18 +63,23 @@ class StatefulLayoutView(_StatefulMixin, LayoutView):
                     await interaction.edit_original_response(view=self)
                 except discord.HTTPException:
                     pass
+            # When prev_view is non-None, pop() routed through _apply_navigation_edit
+            # which already swapped the message to the restored view.
 
-        self.add_item(
-            ActionRow(
-                StatefulButton(
-                    label="Back",
-                    style=discord.ButtonStyle.secondary,
-                    emoji="\u25c0",
-                    custom_id=f"nav_back_{self.id[:8]}",
-                    callback=back_callback,
-                )
+        action_row = ActionRow(
+            StatefulButton(
+                label="Back",
+                style=discord.ButtonStyle.secondary,
+                emoji="\u25c0",
+                custom_id=f"nav_back_{self.id[:8]}",
+                callback=back_callback,
             )
         )
+        # Stash the row so paginated / tabbed / wizard rebuild paths that
+        # call ``clear_items()`` can restore the navigation back button
+        # after recomposing their own component tree.
+        self._auto_back_item = action_row
+        self.add_item(action_row)
 
     def add_exit_button(
         self,

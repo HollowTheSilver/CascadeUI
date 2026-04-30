@@ -98,7 +98,15 @@ Removes an event hook.
 
 #### `get_scoped(scope, *, user_id=None, guild_id=None)`
 
-Returns scoped state for the given scope type and ID.
+Returns scoped state for the given scope type and ID. Reads from the live `self.state`.
+
+#### `get_scoped_from(state, scope, **identifiers)` (staticmethod)
+
+Reads a scoped slice from an explicit `state` dict rather than the live store. Intended for `@computed` selectors (which receive `state` as input) and custom reducers (which mutate deep-copied state). Using `store.get_scoped()` inside a reducer would bypass the deep-copied state — `get_scoped_from(state, ...)` keeps the read aligned with what the reducer is mutating.
+
+#### `iter_scoped(scope, slot_name="scoped")`
+
+Iterates over every entry in the named scoped slot, yielding `(identifier_key, data)` pairs. Used by hub views that aggregate across many users or guilds (leaderboards, dashboards) without reaching into `state["application"]["scoped"]` directly.
 
 #### `set_scoped(scope, data, *, user_id=None, guild_id=None)`
 
@@ -216,7 +224,7 @@ class MyBot(commands.Bot):
 - `*middlewares` -- middleware instances in the order they should appear in the dispatch chain.
 - `store` -- optional explicit store. Defaults to the global singleton from `get_store()`.
 
-**Idempotency.** `initialize` is always awaited, even when the middleware is already installed. Middlewares contract their `initialize` methods as idempotent -- subsequent calls return immediately -- so the always-await policy is safe. Direct `store._add_middleware(...)` calls followed by `setup_middleware` still produce a fully-initialized middleware.
+**Idempotency.** `initialize` is always awaited, even when the middleware is already installed. Middlewares contract their `initialize` methods as idempotent -- subsequent calls return immediately -- so the always-await policy is safe.
 
 ---
 

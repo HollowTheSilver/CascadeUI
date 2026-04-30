@@ -104,15 +104,17 @@ Customization knobs (all class attributes):
 
 See [Auto-Refresh for Long-Lived Ephemerals](../guide/views.md#auto-refresh-for-long-lived-ephemerals) in the guide for the full rationale, advanced customization, and ghost-panel behavior. See [Ephemeral Editability Expires After 15 Minutes](../guide/known-limitations.md#ephemeral-editability-expires-after-15-minutes) for the platform constraint.
 
-#### `replace(view_class, interaction=None, **kwargs)`
+#### `replace(view_or_class, interaction=None, **kwargs)`
 
-Replaces the current view with another view class. One-way (no stack history saved).
+Replaces the current view with another view. One-way (no stack history saved). `view_or_class` accepts either a view class (constructed internally with `**kwargs`) or a pre-constructed view instance (used directly; `**kwargs` must be empty).
 
-#### `push(view_class, interaction, *, rebuild=None, **kwargs)`
+#### `push(view_or_class, interaction, *, rebuild=None, **kwargs)`
 
-Pushes the current view onto the navigation stack and navigates to a new instance of `view_class`. All constructor kwargs are auto-captured so `pop()` can reconstruct the view faithfully.
+Pushes the current view onto the navigation stack and navigates to the next view. `view_or_class` accepts either a view class (constructed internally with `**kwargs`; constructor kwargs auto-captured so `pop()` can reconstruct faithfully) or a pre-constructed view instance (used directly; `**kwargs` must be empty). The instance form pairs with async classmethod constructors like `PaginatedLayoutView.from_data` and `from_cursor`, where the view is built before the navigation call.
 
-The optional `rebuild` callback is called with the new view after construction. For V2, return `None` (e.g., `rebuild=lambda v: v.build_ui()`). For V1, return a dict of kwargs for `edit_original_response` (e.g., `rebuild=lambda v: {"embed": v.build_embed()}`). Can be sync or async.
+Passing extra kwargs alongside an instance raises `TypeError` -- the instance is already initialized.
+
+The Discord message edit fires on every push regardless of whether `rebuild` is supplied. `rebuild` is an optional pre-edit hook for views that need post-construction setup: V2 views with empty trees can run `v.build_ui()`, V1 views can return a dict of edit kwargs (e.g., `rebuild=lambda v: {"embed": v.build_embed()}`). Views built by async classmethods like `from_data` come fully populated and need no rebuild. Sync or async callables both work.
 
 #### `pop(interaction, *, rebuild=None)`
 
@@ -443,6 +445,61 @@ All five navigation buttons (first, previous, indicator, next, last) support lab
 
 ---
 
+### `LeaderboardLayoutView` / `PersistentLeaderboardLayoutView`
+
+V2-only paginated ranked-display pattern. Subclass of `PaginatedLayoutView`. Renders a sorted list of `(user_id, stats_dict)` entries across one or more pages. Each page is a card with ranked entry lines; the summary header appears on page 1 only by default.
+
+```python
+class ServerLeaderboard(LeaderboardLayoutView):
+    leaderboard_top_n = 25
+    leaderboard_per_page = 10
+
+    def format_stats(self, user_id, stats):
+        return f"{stats['wins']}W / {stats['games']}G"
+
+view = ServerLeaderboard(context=ctx, entries=entries, title="Server Rankings")
+await view.send()
+```
+
+#### Class Attributes
+
+| Attribute | Default | Purpose |
+|---|---|---|
+| `leaderboard_top_n` | `10` | Total entries to consider from the data source. |
+| `leaderboard_per_page` | `5` | Entries per page. `None` collapses into a single page equal to `top_n`. |
+| `title` | `"Leaderboard"` | H2 on the rankings card. Constructor `title=` kwarg overrides. |
+| `subtitle` | `"Rankings"` | H3 above the ranked rows. Set to `None` or `""` to skip. |
+| `leaderboard_empty_message` | `"No entries recorded yet."` | Static text when no entries exist. |
+| `entry_layout` | `"lines"` | `"lines"` packs entries into a single TextDisplay; `"sections"` renders each entry as a `Section` with optional avatar Thumbnail. Section mode caps `leaderboard_per_page` at 5. |
+| `podium_emojis` | `{1: "🥇", 2: "🥈", 3: "🥉"}` | Rank-keyed glyphs for `format_rank`. Override the dict to change the podium treatment without overriding `format_rank`. |
+| `entry_separator` | `" -- "` | Separator between name and stat columns inside `format_entry` (lines mode). |
+| `card_color` | `None` | Optional `discord.Color` for the rankings card accent. `None` falls through to the active theme. |
+| `show_title_divider` | `True` | Toggle the divider rendered below the title. |
+
+#### Override Hooks
+
+| Hook | Purpose |
+|---|---|
+| `get_entries()` | Data source. Default returns the constructor `entries=` kwarg. |
+| `format_rank(rank)` | Rank column. Default reads `podium_emojis` for ranks 1-3, falls back to `f"**{rank}.**"`. |
+| `format_name(user_id, stats)` | Name column. Default mentions the user (`<@user_id>`) or returns `stats['display_name']` when present. |
+| `format_stats(user_id, stats)` | Inline stat column. Default `f"{wins}W / {games}G"`. |
+| `format_accessory(user_id, stats)` | Optional right-side accessory. Default `None`. |
+| `format_entry(rank, user_id, stats)` | Composes the four column hooks. Override only when row layout itself needs to change. |
+| `format_primary` / `format_secondary` | Section-mode two-line body. |
+| `get_avatar_url(user_id, stats)` *(async)* | Section-mode `Thumbnail` URL. |
+| `build_summary(entries)` | Returns `dict[str, str]` (rendered inline page 1), a `Container` (standalone card on every page), or `None` (no summary). |
+| `on_leaderboard_empty()` | Returns the V2 component list shown when `entries` is empty. |
+| `on_state_changed(state)` *(async, override)* | Calls `rebuild_pages()` then the paginated refresh; live-data subclasses subscribe to data actions and override `get_entries()`. |
+
+#### Persistent Variant
+
+`PersistentLeaderboardLayoutView` composes `_PersistentMixin` with `LeaderboardLayoutView` for admin-posted permanent panels. Defaults: `owner_only = False`, `exit_policy = "disable"`, `timeout = None`. Requires `persistence_key=` at construction. `on_restore` calls `rebuild_pages()` to refresh from live data after a bot restart.
+
+See [`docs/guide/patterns.md`](../guide/patterns.md#leaderboardlayoutview-persistentleaderboardlayoutview) for cardinality model, customization tiers, and section-mode rendering details.
+
+---
+
 ### `MenuLayoutView`
 
 V2 category-based navigation hub with push/pop drill-down.
@@ -489,6 +546,84 @@ Called before pushing to the selected category's view. Default is a no-op. Overr
 #### Properties
 
 - `categories` (list[dict]): The category list this menu was constructed with.
+
+---
+
+### `RolesLayoutView` / `PersistentRolesLayoutView`
+
+V2-only role self-assign panel pattern. Each category renders as a Container with toggle buttons; cardinality (at-most-one / at-least-one) is enforced inside the pattern without per-role callback boilerplate. Role buttons are `DynamicPersistentButton` subclasses declared once at module import -- clicks route by `custom_id` template match regardless of view lifecycle.
+
+```python
+class MyRoles(PersistentRolesLayoutView):
+    categories = [
+        RoleCategory(
+            name="Colors",
+            roles={"Red": 111, "Blue": 222, "Green": 333},
+            exclusive=True,
+            color=discord.Color.red(),
+        ),
+    ]
+    title = "Server Roles"
+
+view = MyRoles(context=ctx, persistence_key=f"roles:{ctx.guild.id}")
+await view.send()
+```
+
+#### `RoleCategory` (typed schema)
+
+```python
+RoleCategory(
+    name: str,
+    roles: dict[str, int],                         # label -> role_id
+    exclusive: bool = False,                       # at most one active
+    required: bool = False,                        # at least one active
+    color: Optional[discord.Color] = None,         # container accent
+    button_style: Optional[ButtonStyle] = None,    # default secondary
+    icon: Optional[str] = None,                    # title prefix emoji
+    description: Optional[str] = None,             # text between heading and buttons
+)
+```
+
+#### Class Attributes
+
+| Attribute | Default | Purpose |
+|---|---|---|
+| `title` | `"Server Roles"` | H2 above all categories. `None` suppresses. |
+| `subtitle` | `None` | Optional H3 below title. Set to a string to render. |
+| `hint_normal` | `None` | Hint for free-multi-select categories. |
+| `hint_exclusive` | `"◉"` | Hint for exclusive-only categories (U+25C9 fisheye, text-size filled circle). |
+| `hint_required` | `"*"` | Hint for required-only categories. |
+| `hint_exclusive_required` | `"◉ *"` | Hint for exclusive+required categories. Both indicators render at text-size for visual consistency. |
+| `assigned_message` | `"Gave you **{role}**."` | Response after role added (no swap). |
+| `removed_message` | `"Removed **{role}**."` | Response after role removed. |
+| `required_message` | `"You must keep at least one **{category}** role."` | Response when required-last removal rejected. |
+| `swap_message` | `"Switched to **{role}** (removed {removed})."` | Response after exclusive swap. |
+| `role_error_message` | `"Could not update roles: {error}"` | Response on role mutation failure. |
+| `categories` | `[]` | List of `RoleCategory`. Declared on the subclass. |
+
+#### Override Hooks
+
+Hooks on `RolesLayoutView` are `@classmethod` (not instance methods). The dispatch path routes through `DynamicPersistentButton` which has no view instance at click time; hook classmethods read class attributes and respond to the interaction directly. `super()` works normally.
+
+| Hook | Purpose |
+|---|---|
+| `format_category_title(category)` | Heading line for the category. Default: `f"### {category.name}"` plus optional `category.icon` prefix. |
+| `format_category_hint(category)` | Hint rendered below the heading. Default routes to `hint_*` attribute. Return `None` to skip. |
+| `format_button_label(role_name, role_id, category)` | Button label. Default: `role_name`. |
+| `format_button_emoji(role_name, role_id, category)` | Button emoji. Default: `None`. |
+| `format_button_style(role_name, role_id, category)` | Button style. Default: `category.button_style` or `ButtonStyle.secondary`. |
+| `build_category_card(category)` | Render one category as a Container. Default composes the smaller `format_*` hooks. |
+| `on_role_assigned(interaction, member, role, category)` | Response after role added without swap. |
+| `on_role_removed(interaction, member, role, category)` | Response after role removed. |
+| `on_role_swap(interaction, member, role_added, roles_removed, category)` | Response after exclusive-mode swap. |
+| `on_role_required_block(interaction, member, role, category)` | Response when required-category last-role removal rejected. |
+| `on_role_error(interaction, error)` | Response on role mutation failure. |
+
+#### Persistent Variant
+
+`PersistentRolesLayoutView` composes `_PersistentMixin` with `RolesLayoutView`. Defaults: `owner_only = False`, `exit_policy = "disable"`, `timeout = None`. Requires `persistence_key=` at construction. Role buttons survive restart independent of view re-attachment because each is a globally-registered `DynamicPersistentButton` subclass. The default `on_restore` re-renders the message from the current `categories` on every restart so source-code edits propagate to the displayed message; unchanged panels pay zero API cost via the render-hash short-circuit in `refresh()`.
+
+See [`docs/guide/patterns.md`](../guide/patterns.md#roleslayoutview-persistentroleslayoutview) for detailed cardinality behavior, customization tiers, and examples.
 
 ---
 

@@ -1,14 +1,12 @@
 # // ========================================( Modules )======================================== // #
 
 
-import asyncio
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import discord
 from discord import CheckboxGroupOption, Interaction, RadioGroupOption, TextStyle
 
-from ..state.actions import ActionCreators
-from ..validation import ValidationResult, validate_fields
+from ..validation import validate_fields
 from .base import StatefulComponent
 
 # // ========================================( Classes )======================================== // #
@@ -17,17 +15,25 @@ from .base import StatefulComponent
 class TextInput(StatefulComponent):
     """A modal text input with state management and optional validators.
 
+    Renders as a ``discord.ui.Label`` wrapping a ``discord.ui.TextInput``
+    inside a :class:`Modal`. The label string moves to ``ui.Label.text``;
+    the optional ``description`` populates ``ui.Label.description`` for
+    the secondary helper line beneath the title.
+
     Parameters
     ----------
     label:
-        Field label shown above the input.
+        Field label shown above the input (rendered as ``ui.Label.text``).
+    description:
+        Optional secondary helper text beneath the label. Renders as
+        ``ui.Label.description``.
     placeholder, default, required, min_length, max_length, style:
         Standard ``discord.ui.TextInput`` passthroughs.
     validators:
         Optional list of validator callables attached to this field. Each
         callable receives ``(value, field_def, all_values)`` and returns a
         :class:`~cascadeui.ValidationResult` (or an awaitable that resolves
-        to one). :class:`Modal` auto-collects these at construction time  --
+        to one). :class:`Modal` auto-collects these at construction time --
         a ``Modal`` built from ``TextInput`` instances needs no further
         wiring. Reused by :class:`~cascadeui.FormView` and
         :class:`~cascadeui.FormLayoutView` when rendering ``"text"`` fields
@@ -44,8 +50,10 @@ class TextInput(StatefulComponent):
         max_length: Optional[int] = None,
         style: TextStyle = TextStyle.short,
         validators: Optional[List[Callable]] = None,
+        description: Optional[str] = None,
     ):
         self.label = label
+        self.description = description
         self.placeholder = placeholder
         self.default = default
         self.required = required
@@ -71,9 +79,8 @@ class TextInput(StatefulComponent):
         return f"input_{label.lower().replace(' ', '_')}"
 
     def create_discord_component(self):
-        """Create the actual Discord UI component."""
-        return discord.ui.TextInput(
-            label=self.label,
+        """Build a ``ui.Label`` wrapping the inner ``ui.TextInput``."""
+        inner = discord.ui.TextInput(
             placeholder=self.placeholder,
             default=self.default,
             required=self.required,
@@ -82,21 +89,23 @@ class TextInput(StatefulComponent):
             style=self.style,
             custom_id=self.custom_id,
         )
+        return discord.ui.Label(text=self.label, component=inner, description=self.description)
 
 
 class Checkbox(StatefulComponent):
     """A modal checkbox with state management and optional validators.
 
-    Wraps ``discord.ui.Checkbox`` -- a single boolean toggle rendered
-    inside a :class:`Modal`. The submitted ``.value`` is ``True`` or
-    ``False``.
+    Renders as a ``discord.ui.Label`` wrapping a single
+    ``discord.ui.Checkbox`` inside a :class:`Modal`. The submitted
+    ``.value`` is ``True`` or ``False``.
 
     Parameters
     ----------
     label:
-        Field label is not displayed by Discord for standalone checkboxes,
-        but used to derive the ``custom_id`` slug and for validator error
-        messages.
+        Field label rendered as ``ui.Label.text`` and used to derive the
+        ``custom_id`` slug.
+    description:
+        Optional secondary helper text beneath the label.
     default:
         Whether the checkbox is pre-selected. Defaults to ``False``.
     validators:
@@ -110,27 +119,30 @@ class Checkbox(StatefulComponent):
         label: str,
         default: bool = False,
         validators: Optional[List[Callable]] = None,
+        description: Optional[str] = None,
     ):
         self.label = label
+        self.description = description
         self.default = default
         self.validators: List[Callable] = list(validators) if validators else []
         self.custom_id = TextInput._slug(label)
         self.value: Optional[bool] = None
 
     def create_discord_component(self):
-        """Create the actual Discord UI component."""
-        return discord.ui.Checkbox(
+        """Build a ``ui.Label`` wrapping the inner ``ui.Checkbox``."""
+        inner = discord.ui.Checkbox(
             default=self.default,
             custom_id=self.custom_id,
         )
+        return discord.ui.Label(text=self.label, component=inner, description=self.description)
 
 
 class CheckboxGroup(StatefulComponent):
     """A modal checkbox group with state management and optional validators.
 
-    Wraps ``discord.ui.CheckboxGroup`` -- a multi-select list of labeled
-    options rendered inside a :class:`Modal`. The submitted ``.values``
-    is a list of selected option value strings.
+    Renders as a ``discord.ui.Label`` wrapping a
+    ``discord.ui.CheckboxGroup`` inside a :class:`Modal`. The submitted
+    ``.values`` is a list of selected option value strings.
 
     Options can be passed as :class:`discord.CheckboxGroupOption` instances
     or as plain dicts with ``label``, ``value``, ``description``, and
@@ -140,8 +152,10 @@ class CheckboxGroup(StatefulComponent):
     Parameters
     ----------
     label:
-        Used to derive the ``custom_id`` slug and for validator error
-        messages.
+        Field label rendered as ``ui.Label.text`` and used to derive the
+        ``custom_id`` slug.
+    description:
+        Optional secondary helper text beneath the label.
     options:
         List of :class:`discord.CheckboxGroupOption` or dicts.
     required:
@@ -162,8 +176,10 @@ class CheckboxGroup(StatefulComponent):
         min_values: Optional[int] = None,
         max_values: Optional[int] = None,
         validators: Optional[List[Callable]] = None,
+        description: Optional[str] = None,
     ):
         self.label = label
+        self.description = description
         self.options = self._process_options(options, CheckboxGroupOption)
         self.required = required
         self.min_values = min_values
@@ -191,23 +207,23 @@ class CheckboxGroup(StatefulComponent):
         return processed
 
     def create_discord_component(self):
-        """Create the actual Discord UI component."""
-        return discord.ui.CheckboxGroup(
+        """Build a ``ui.Label`` wrapping the inner ``ui.CheckboxGroup``."""
+        inner = discord.ui.CheckboxGroup(
             options=self.options,
             required=self.required,
             min_values=self.min_values,
             max_values=self.max_values,
             custom_id=self.custom_id,
         )
+        return discord.ui.Label(text=self.label, component=inner, description=self.description)
 
 
 class RadioGroup(StatefulComponent):
     """A modal radio group with state management and optional validators.
 
-    Wraps ``discord.ui.RadioGroup`` -- a single-select list of labeled
-    options rendered inside a :class:`Modal`. The submitted ``.value``
-    is the selected option's value string, or ``None`` if nothing was
-    selected.
+    Renders as a ``discord.ui.Label`` wrapping a ``discord.ui.RadioGroup``
+    inside a :class:`Modal`. The submitted ``.value`` is the selected
+    option's value string, or ``None`` if nothing was selected.
 
     Options can be passed as :class:`discord.RadioGroupOption` instances
     or as plain dicts (same shorthand as :class:`CheckboxGroup`).
@@ -215,8 +231,10 @@ class RadioGroup(StatefulComponent):
     Parameters
     ----------
     label:
-        Used to derive the ``custom_id`` slug and for validator error
-        messages.
+        Field label rendered as ``ui.Label.text`` and used to derive the
+        ``custom_id`` slug.
+    description:
+        Optional secondary helper text beneath the label.
     options:
         List of :class:`discord.RadioGroupOption` or dicts.
     required:
@@ -231,8 +249,10 @@ class RadioGroup(StatefulComponent):
         options: List[Union[RadioGroupOption, Dict[str, Any]]],
         required: bool = True,
         validators: Optional[List[Callable]] = None,
+        description: Optional[str] = None,
     ):
         self.label = label
+        self.description = description
         self.options = CheckboxGroup._process_options(options, RadioGroupOption)
         self.required = required
         self.validators: List[Callable] = list(validators) if validators else []
@@ -240,19 +260,20 @@ class RadioGroup(StatefulComponent):
         self.value: Optional[str] = None
 
     def create_discord_component(self):
-        """Create the actual Discord UI component."""
-        return discord.ui.RadioGroup(
+        """Build a ``ui.Label`` wrapping the inner ``ui.RadioGroup``."""
+        inner = discord.ui.RadioGroup(
             options=self.options,
             required=self.required,
             custom_id=self.custom_id,
         )
+        return discord.ui.Label(text=self.label, component=inner, description=self.description)
 
 
 class FileUpload(StatefulComponent):
     """A modal file upload with state management and optional validators.
 
-    Wraps ``discord.ui.FileUpload`` -- a file picker rendered inside a
-    :class:`Modal`. The submitted ``.values`` is a list of
+    Renders as a ``discord.ui.Label`` wrapping a ``discord.ui.FileUpload``
+    inside a :class:`Modal`. The submitted ``.values`` is a list of
     :class:`discord.Attachment` objects.
 
     .. warning::
@@ -265,8 +286,10 @@ class FileUpload(StatefulComponent):
     Parameters
     ----------
     label:
-        Used to derive the ``custom_id`` slug and for validator error
-        messages.
+        Field label rendered as ``ui.Label.text`` and used to derive the
+        ``custom_id`` slug.
+    description:
+        Optional secondary helper text beneath the label.
     required:
         Whether at least one file must be uploaded. Defaults to ``True``.
     min_values:
@@ -284,8 +307,10 @@ class FileUpload(StatefulComponent):
         min_values: Optional[int] = None,
         max_values: Optional[int] = None,
         validators: Optional[List[Callable]] = None,
+        description: Optional[str] = None,
     ):
         self.label = label
+        self.description = description
         self.required = required
         self.min_values = min_values
         self.max_values = max_values
@@ -294,13 +319,14 @@ class FileUpload(StatefulComponent):
         self.values: Optional[List] = None
 
     def create_discord_component(self):
-        """Create the actual Discord UI component."""
-        return discord.ui.FileUpload(
+        """Build a ``ui.Label`` wrapping the inner ``ui.FileUpload``."""
+        inner = discord.ui.FileUpload(
             required=self.required,
             min_values=self.min_values,
             max_values=self.max_values,
             custom_id=self.custom_id,
         )
+        return discord.ui.Label(text=self.label, component=inner, description=self.description)
 
 
 # // ========================================( Wrapper Base )======================================== // #
@@ -309,7 +335,8 @@ class FileUpload(StatefulComponent):
 # RadioGroup, FileUpload) share the same contract:
 #   - ``.custom_id`` derived from label via ``TextInput._slug()``
 #   - ``.validators`` list auto-collected by ``Modal.__init__``
-#   - ``.create_discord_component()`` produces the discord.py item
+#   - ``.create_discord_component()`` produces a ``ui.Label`` wrapping
+#     the inner discord.py item
 #   - ``.value`` or ``.values`` populated by ``Modal.on_submit`` write-back
 #
 # The tuple below is used by ``Modal.__init__`` to recognize any wrapped
@@ -317,23 +344,43 @@ class FileUpload(StatefulComponent):
 _WRAPPED_INPUT_TYPES = (TextInput, Checkbox, CheckboxGroup, RadioGroup, FileUpload)
 
 
+def _unwrap_label(item):
+    """Return the inner component of a ``ui.Label`` or pass through.
+
+    Modal child traversal needs to look inside ``ui.Label`` wrappers to
+    reach the actual input component carrying the submitted value. Raw
+    discord.py items added directly (the escape hatch path) pass through
+    unchanged.
+    """
+    if isinstance(item, discord.ui.Label):
+        return item.component
+    return item
+
+
 class Modal(discord.ui.Modal, StatefulComponent):
     """A modal dialog with stateful inputs and auto-collected validation.
 
-    Validators are attached per-field on each :class:`TextInput` and
-    auto-collected at construction time -- building a ``Modal`` from
-    ``TextInput`` instances requires no further validator wiring. Raw
-    ``discord.ui.TextInput`` items are still accepted as an escape hatch
-    for features the library does not yet wrap, but they cannot carry
-    validators; use :class:`TextInput` with ``validators=[...]`` for any
-    field that needs validation.
+    Validators are attached per-field on each wrapped input (TextInput,
+    Checkbox, CheckboxGroup, RadioGroup, FileUpload) and auto-collected
+    at construction time -- building a ``Modal`` from these instances
+    requires no further validator wiring. Raw ``discord.ui.TextInput``
+    items are still accepted as an escape hatch for features the library
+    does not yet wrap, but they cannot carry validators; use
+    :class:`TextInput` with ``validators=[...]`` for any field that needs
+    validation.
+
+    Each wrapped input renders as a ``discord.ui.Label`` containing the
+    inner component, so the modal's component tree carries
+    ``ui.Label`` children for wrapped inputs and raw items for the
+    escape hatch.
 
     Parameters
     ----------
     title:
         The modal title shown to the user.
     inputs:
-        List of :class:`TextInput` instances or raw ``discord.ui.TextInput`` items.
+        List of wrapped CascadeUI inputs (``TextInput``, ``Checkbox``, ...)
+        or raw ``discord.ui.TextInput`` / ``discord.ui.Label`` items.
     callback:
         Async function called with ``(interaction, values)`` after validation passes.
         If omitted, the interaction is deferred automatically.
@@ -359,8 +406,9 @@ class Modal(discord.ui.Modal, StatefulComponent):
         self.inputs: Dict[str, Any] = {}
         self.validators: Dict[str, List[Callable]] = {}
         # Pairs each wrapped CascadeUI input (TextInput, Checkbox, etc.)
-        # with the discord.py component actually added to the modal, so
-        # ``on_submit`` can write back to the original instances.
+        # with the inner discord.py component (extracted from the
+        # ``ui.Label`` wrapper) so ``on_submit`` can write back to the
+        # original instances without traversing the Label every time.
         self._wrapped_pairs: List[tuple] = []
         # Populated during ``on_submit``: {wrapper instance: submitted value}.
         # Preferred over the slug-keyed ``values`` dict passed to callbacks.
@@ -368,27 +416,36 @@ class Modal(discord.ui.Modal, StatefulComponent):
 
         for input_item in inputs:
             if isinstance(input_item, _WRAPPED_INPUT_TYPES):
-                discord_input = input_item.create_discord_component()
-                self.add_item(discord_input)
+                label_wrapper = input_item.create_discord_component()
+                inner = label_wrapper.component
+                self.add_item(label_wrapper)
                 self.inputs[input_item.custom_id] = input_item
-                self._wrapped_pairs.append((input_item, discord_input))
+                self._wrapped_pairs.append((input_item, inner))
                 if input_item.validators:
                     self.validators[input_item.custom_id] = list(input_item.validators)
             else:
+                # Raw items: ui.Label, ui.TextInput, or any other discord.py
+                # modal-compatible component the user constructed directly.
                 self.add_item(input_item)
-                self.inputs[input_item.custom_id] = input_item
+                inner = _unwrap_label(input_item)
+                self.inputs[inner.custom_id] = input_item
 
         self.user_callback = callback
 
     async def on_submit(self, interaction: Interaction):
         """Handle modal submission with optional validation."""
-        # Collect values from the underlying discord.py components.
+        # Collect values from the underlying discord.py components,
+        # unwrapping ``ui.Label`` to reach the actual input carrying
+        # the submitted value.
         values = {}
         for child in self.children:
-            if isinstance(child, (discord.ui.TextInput, discord.ui.RadioGroup)):
-                values[child.custom_id] = child.value
-            elif isinstance(child, (discord.ui.CheckboxGroup, discord.ui.FileUpload)):
-                values[child.custom_id] = child.values
+            inner = _unwrap_label(child)
+            if isinstance(inner, (discord.ui.TextInput, discord.ui.RadioGroup)):
+                values[inner.custom_id] = inner.value
+            elif isinstance(inner, (discord.ui.CheckboxGroup, discord.ui.FileUpload)):
+                values[inner.custom_id] = inner.values
+            elif isinstance(inner, discord.ui.Checkbox):
+                values[inner.custom_id] = inner.value
 
         # Write submitted values back onto the original CascadeUI wrapper
         # instances so callers can read ``.value`` / ``.values`` directly

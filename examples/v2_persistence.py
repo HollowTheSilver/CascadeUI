@@ -7,8 +7,11 @@ both so the distinction is visible side-by-side.
 
     1. View persistence  -- the view object re-attaches to its message
        on bot restart, so users can keep clicking a panel that was
-       posted days earlier. Requires PersistentLayoutView, timeout=None,
-       and explicit custom_id on every interactive item.
+       posted days earlier. Demonstrated via ``PersistentRolesLayoutView``
+       (role selector panel) -- the pattern wraps a
+       ``PersistentLayoutView`` around cardinality-aware role buttons
+       so the category and mode metadata survive restarts alongside
+       the message.
        Showcased by: /v2roles (role selector panel).
 
     2. Data persistence  -- state-store writes survive restart via
@@ -20,13 +23,20 @@ both so the distinction is visible side-by-side.
 
 Features demonstrated:
 
-    - PersistentLayoutView    (role panel, timeout=None, custom_ids)
-    - PersistenceMiddleware   (installed via setup_middleware in setup_hook)
-    - on_restore() hook       (post-restart logging)
-    - Orphan cleanup          (re-running /v2roles replaces old panel)
-    - persistent_slots        (declarative slot opt-in on the view class)
-    - @cascade_reducer         (user actions mutate the slot)
-    - slot_property           (declarative attribute reads from the slot)
+    - PersistentRolesLayoutView (role panel absorbing cardinality
+                                 + click routing + response messages)
+    - RoleCategory              (typed schema with exclusive / required
+                                 cardinality flags)
+    - DynamicPersistentButton   (under the hood; used by the roles
+                                 pattern for click routing without
+                                 per-button instance tracking)
+    - PersistenceMiddleware     (installed via setup_middleware in
+                                 setup_hook)
+    - persistent_slots          (declarative slot opt-in on the
+                                 ``PersonalVisitsView`` class)
+    - @cascade_reducer           (user actions mutate the slot)
+    - slot_property             (declarative attribute reads from
+                                 the slot)
 
 Commands:
     /v2roles      Post the role selector panel (requires Manage Roles)
@@ -54,7 +64,8 @@ from discord.ext.commands import Context
 from discord.ui import ActionRow
 
 from cascadeui import (
-    PersistentLayoutView,
+    PersistentRolesLayoutView,
+    RoleCategory,
     StatefulButton,
     StatefulLayoutView,
     access_slot,
@@ -63,7 +74,6 @@ from cascadeui import (
     divider,
     key_value,
     slot_property,
-    slugify,
 )
 
 logger = logging.getLogger(__name__)
@@ -72,223 +82,107 @@ logger = logging.getLogger(__name__)
 # // ========================================( Config )======================================== // #
 
 
-# Replace these with your server's actual role IDs.
-# Each category gets its own accent-colored container. Two cardinality
-# flags shape how the buttons behave:
-#   "exclusive": True  -- only one role in the category can be active
-#                         at a time (selecting another swaps off the
-#                         previous one; compare with free multi-select
-#                         when False)
-#   "required":  True  -- at least one role in the category must always
-#                         be active (the user can swap between options,
-#                         but cannot unequip their last one). Useful
-#                         for pronoun / team / region categories where
-#                         "no selection" is not a meaningful state.
-# The two axes are orthogonal: `exclusive=True + required=True` gives
+# Replace these role IDs with your server's actual role IDs. Each
+# category carries its own accent color and cardinality flags:
+#
+#   exclusive=True  one active at a time in this category; selecting
+#                   another swaps off the previous one. Useful for
+#                   color roles, pronouns, team affiliation.
+#   required=True   at least one role in this category must stay
+#                   active. Removing the last one is blocked. Useful
+#                   for pronoun / region / team categories where
+#                   "no selection" is not a meaningful state.
+#
+# The two axes are orthogonal: ``exclusive=True, required=True`` gives
 # radio-button behavior with a mandatory choice.
-ROLE_CATEGORIES = {
-    "Color Roles": {
-        "color": discord.Color.red(),
-        "exclusive": True,
-        "required": False,
-        "roles": {
+ROLE_CATEGORIES = [
+    RoleCategory(
+        name="Color Roles",
+        color=discord.Color.red(),
+        exclusive=True,
+        roles={
             "Red": 123456789012345001,
             "Blue": 123456789012345002,
             "Green": 123456789012345003,
             "Purple": 123456789012345004,
         },
-    },
-    "Gaming Roles": {
-        "color": discord.Color.dark_teal(),
-        "exclusive": False,
-        "required": False,
-        "roles": {
+    ),
+    RoleCategory(
+        name="Gaming Roles",
+        color=discord.Color.dark_teal(),
+        # ``icon`` is a string rendered into the category heading as
+        # markdown, so any string Discord renders inline works: a
+        # unicode glyph, a custom guild emoji as
+        # ``"<:name:1234567890123456789>"``, or an animated one as
+        # ``"<a:name:1234567890123456789>"``. ``discord.Emoji`` and
+        # ``discord.PartialEmoji`` instances are NOT accepted here --
+        # this slot routes through markdown, not the
+        # ``discord.ui.Button(emoji=...)`` parameter. Custom emoji
+        # only render where the bot can see them (shared guild, or an
+        # application-owned emoji created via the discord.py API).
+        icon="🎮",
+        roles={
             "Minecraft": 123456789012345005,
             "Valorant": 123456789012345006,
             "League": 123456789012345007,
         },
-    },
-    "Pronoun Roles": {
-        "color": discord.Color.blurple(),
-        "exclusive": True,
-        "required": True,
-        "roles": {
+    ),
+    RoleCategory(
+        name="Pronoun Roles",
+        color=discord.Color.blurple(),
+        exclusive=True,
+        required=True,
+        roles={
             "He/Him": 123456789012345008,
             "She/Her": 123456789012345009,
             "They/Them": 123456789012345010,
+            "Neopronoun": 123456789012345011,
         },
-    },
-}
+    ),
+]
 
 
-# // ========================================( View )======================================== // #
+# // ========================================( Roles View )======================================== // #
 
 
-class RoleSelectorPanel(PersistentLayoutView):
-    """A multi-category role selector that survives bot restarts.
+class RoleSelectorPanel(PersistentRolesLayoutView):
+    """Multi-category role selector that survives bot restarts.
 
-    Each role category is a Container with an accent color and
-    toggle buttons for each role. Clicking a button gives or
-    removes the role via an ephemeral confirmation.
+    Ships as a subclass of ``PersistentRolesLayoutView`` so the
+    pattern handles panel rendering, button custom-id encoding,
+    cardinality enforcement (exclusive / required), response messages,
+    and restart re-attachment. Users only declare ``categories``; the
+    rest is the pattern's responsibility.
 
-    The panel uses a stable persistence_key so re-running /v2roles
+    The panel uses a stable ``persistence_key`` so re-running /v2roles
     automatically cleans up the previous panel.
     """
 
-    # owner_only = False is the PersistentView default -- role panels
-    # are server-wide, anyone in the channel can click to toggle roles.
+    categories = ROLE_CATEGORIES
+    title = "Server Roles"
+
+    # Role panels are server-wide; anyone in the channel toggles their
+    # own roles. Matches the PersistentRolesLayoutView default.
     owner_only = False
-    # instance_limit is deliberately not set on a PersistentLayoutView.
-    # Persistent views already get deterministic single-panel-per-key
-    # enforcement from the built-in persistence_key dedup path, which
-    # actively cleans up old messages (even externally-deleted ones,
-    # via a NotFound-swallowing fetch_message call). Adding instance_limit
-    # on top is redundant protection with a worse failure mode -- if a
-    # panel message is deleted in Discord while the view is still live
-    # in _active_views, instance_limit = 1 with "reject" would lock the
-    # guild out of re-posting until the next bot restart. persistence_key
-    # dedup handles this edge case; instance_limit does not.
-    # ``exit_policy = "disable"`` is the PersistentLayoutView default
-    # and the correct choice here -- a role panel is a product surface,
-    # not a session; when it times out the buttons should freeze in
-    # place rather than deleting the panel message.
+
+    # ``instance_limit`` is deliberately not set on a
+    # PersistentRolesLayoutView. Persistent views already get
+    # deterministic single-panel-per-key enforcement from the built-in
+    # persistence_key dedup path, which actively cleans up old messages
+    # (even externally-deleted ones, via a NotFound-swallowing
+    # fetch_message call). Adding instance_limit on top is redundant
+    # protection with a worse failure mode -- if a panel message is
+    # deleted in Discord while the view is still live in
+    # _active_views, ``instance_limit = 1`` with ``"reject"`` would
+    # lock the guild out of re-posting until the next bot restart.
+    # persistence_key dedup handles this edge case; instance_limit
+    # does not.
+
+    # ``exit_policy = "disable"`` is the PersistentRolesLayoutView
+    # default and the correct choice here -- a role panel is a product
+    # surface, not a session; when it times out the buttons should
+    # freeze in place rather than deleting the panel message.
     exit_policy = "disable"
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._build_panel()
-
-    def _build_panel(self):
-        """Build the role selector UI from ROLE_CATEGORIES config."""
-        self.clear_items()
-
-        for category_name, category in ROLE_CATEGORIES.items():
-            color = category["color"]
-            roles = category["roles"]
-            exclusive = category.get("exclusive", False)
-            required = category.get("required", False)
-
-            # Collect all role IDs in this category for exclusive / required logic
-            category_role_ids = set(roles.values())
-
-            # Build toggle buttons for this category
-            buttons = []
-            for role_name, role_id in roles.items():
-                # custom_id must be explicit and unique for persistent views
-                btn = StatefulButton(
-                    label=role_name,
-                    style=discord.ButtonStyle.secondary,
-                    custom_id=f"roles:{slugify(category_name)}:{slugify(role_name)}",
-                    callback=self._make_toggle(
-                        role_id,
-                        role_name,
-                        category_name,
-                        exclusive,
-                        required,
-                        category_role_ids,
-                    ),
-                )
-                buttons.append(btn)
-
-            # Label shows selection mode. The four quadrants collapse to
-            # three visible hints because "free checkbox" (exclusive=False,
-            # required=False) needs no hint at all.
-            if exclusive and required:
-                mode_hint = " *(pick one, required)*"
-            elif exclusive:
-                mode_hint = " *(pick one)*"
-            elif required:
-                mode_hint = " *(at least one required)*"
-            else:
-                mode_hint = ""
-
-            # Each category gets its own colored container
-            self.add_item(
-                card(
-                    f"### {category_name}{mode_hint}",
-                    divider(),
-                    ActionRow(*buttons),
-                    color=color,
-                )
-            )
-
-    def _make_toggle(
-        self, role_id, role_name, category_name, exclusive, required, category_role_ids
-    ):
-        """Create a toggle callback for a specific role.
-
-        Cardinality behavior:
-            - ``exclusive=True``  swap-on-assign: selecting a role removes
-              all other roles in the same category first (e.g. pronouns,
-              color roles).
-            - ``required=True``   block-last-removal: a user cannot
-              unequip their only role in the category; they must pick
-              a different one to swap instead. Combines naturally with
-              ``exclusive=True`` to produce required-radio behavior.
-        """
-
-        async def callback(interaction):
-            if interaction.guild is None:
-                await self.respond(
-                    interaction, "This can only be used in a server.", ephemeral=True
-                )
-                return
-
-            role = interaction.guild.get_role(role_id)
-            if role is None:
-                await self.respond(
-                    interaction,
-                    f"Role **{role_name}** not found. An admin needs to update the role IDs.",
-                    ephemeral=True,
-                )
-                return
-
-            member = interaction.user
-
-            # Role API calls precede the response, so the auto-defer
-            # timer may fire if Discord is slow. self.respond() routes
-            # to followup transparently when that happens.
-            if role in member.roles:
-                # Required categories block removal of the last role so
-                # the cardinality invariant ("at least one") is preserved.
-                # The check runs before the API call so no mutation ships
-                # on a rejected request.
-                if required:
-                    current_in_category = [r for r in member.roles if r.id in category_role_ids]
-                    if len(current_in_category) <= 1:
-                        await self.respond(
-                            interaction,
-                            f"You must keep at least one **{category_name}**. "
-                            f"Pick a different one to swap instead.",
-                            ephemeral=True,
-                        )
-                        return
-
-                await member.remove_roles(role)
-                await self.respond(interaction, f"Removed **{role.name}**.", ephemeral=True)
-            else:
-                # In exclusive mode, remove other roles from this category first
-                to_remove = []
-                if exclusive:
-                    to_remove = [
-                        r for r in member.roles if r.id in category_role_ids and r.id != role_id
-                    ]
-                    if to_remove:
-                        await member.remove_roles(*to_remove)
-
-                await member.add_roles(role)
-
-                if exclusive and to_remove:
-                    removed_names = ", ".join(f"**{r.name}**" for r in to_remove)
-                    await self.respond(
-                        interaction,
-                        f"Switched to **{role.name}** (removed {removed_names}).",
-                        ephemeral=True,
-                    )
-                else:
-                    await self.respond(interaction, f"Gave you **{role.name}**!", ephemeral=True)
-
-        return callback
 
     async def on_restore(self, bot):
         """Called after the panel is re-attached on bot restart."""
@@ -335,7 +229,7 @@ class PersonalVisitsView(StatefulLayoutView):
     rehydrate pass on startup puts the data back where the reducers
     expect it.
 
-    Two axes worth seeing side-by-side:
+    Partitioning and persistence are orthogonal axes:
 
         - *Partitioning* decides where a piece of state lives in the
           tree. Scoped state (``state_scope`` + ``dispatch_scoped``)
@@ -414,7 +308,7 @@ class PersonalVisitsView(StatefulLayoutView):
                 StatefulButton(
                     label="Reset",
                     style=discord.ButtonStyle.danger,
-                    emoji="\u267b\ufe0f",  # recycle
+                    emoji="♻️",  # recycle
                     callback=self._reset,
                 ),
                 self.make_exit_button(),
@@ -433,7 +327,7 @@ class PersonalVisitsView(StatefulLayoutView):
 
 
 class V2PersistenceExample(commands.Cog, name="v2_persistence_example"):
-    """V2 persistent role selector panel.
+    """V2 persistent role selector panel + per-user visit counter.
 
     Requires ``PersistenceMiddleware`` installed in the bot's setup_hook::
 

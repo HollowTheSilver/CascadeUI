@@ -10,9 +10,8 @@
 ```bash
 pip install pycascadeui
 
-# With optional backends
+# With the SQLite persistence backend
 pip install pycascadeui[sqlite]
-pip install pycascadeui[redis]
 ```
 
 ### From Source

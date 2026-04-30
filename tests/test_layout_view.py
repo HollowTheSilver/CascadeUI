@@ -969,7 +969,7 @@ class TestRefreshThrottling:
 
         # Cancel the deferred task to avoid leaking into the test runner.
         # Let the event loop pick up the task so its coroutine enters
-        # the sleep before we cancel -- avoids a 'never awaited' warning.
+        # the sleep before cancellation -- avoids a 'never awaited' warning.
         await asyncio.sleep(0)
         view._deferred_refresh_task.cancel()
         try:
@@ -999,7 +999,7 @@ class TestRefreshThrottling:
         except asyncio.CancelledError:
             pass
 
-    async def test_deferred_refresh_reenters_update_from_state(self):
+    async def test_deferred_refresh_reenters_on_state_changed(self):
         """Deferred task runs ``on_state_changed`` so ``build_ui`` sees
         the *latest* store state, not kwargs captured at defer time.
         """
@@ -1270,15 +1270,29 @@ class TestActingViewFastPath:
         interaction.response.edit_message.assert_awaited_once()
         view._message.edit.assert_awaited_once()
 
-    async def test_fast_path_timeout_falls_through(self):
+    async def test_fast_path_timeout_skips_channel_fallthrough(self):
         """Slow ``edit_message`` response (Discord latency spike, ephemeral
         backend under load) would starve the interaction ack past the 3s
         deadline under the fast path's one-HTTP-call contract. The
-        ``wait_for`` guard caps the fast path at ``max(0.5, auto_defer_delay - 1.0)``,
-        cancels the in-flight edit on stall, and falls through to the
-        channel endpoint so the auto-defer timer can ack independently.
-        ``_refresh_not_before`` is NOT armed: a stall is not a rate-limit
-        signal, so the next refresh should not be throttled.
+        ``wait_for`` guard caps the fast path at
+        ``max(0.5, auto_defer_delay - 1.0)`` and cancels the in-flight
+        edit on stall.
+
+        On stall, refresh returns immediately rather than falling through
+        to the channel endpoint. A second edit attempt on top of the
+        cancelled fast path would consume the auto-defer timer's budget
+        for its own ack call, producing the very interaction-failed
+        toast the ack-coupling design exists to prevent. The auto-defer
+        timer fires the standalone ack at ``auto_defer_delay`` seconds
+        with the full remaining budget.
+
+        The render-hash digest is invalidated so the next refresh ships
+        unconditionally; whether Discord processed the cancelled edit
+        server-side is indeterminate, and a redundant edit is cheaper
+        than a stuck UI.
+
+        ``_refresh_not_before`` is NOT armed: a stall is not a
+        rate-limit signal, so the next refresh should not be throttled.
         """
 
         async def _stall_forever(*args, **kwargs):
@@ -1291,6 +1305,14 @@ class TestActingViewFastPath:
         interaction = self._make_acting_interaction()
         interaction.response.edit_message = AsyncMock(side_effect=_stall_forever)
 
+        # Seed the digest to a value that does NOT match the current
+        # tree.  A matching digest would short-circuit refresh before
+        # the fast path engages; a non-matching one lets the fast path
+        # run AND lets the post-refresh ``is None`` assertion below
+        # prove the new code path invalidated it (the old fall-through
+        # code path would have set it to the current digest, not None).
+        view._last_tree_digest = view._compute_tree_digest() + 1
+
         token = _CURRENT_INTERACTION.set(interaction)
         before = time.monotonic()
         try:
@@ -1299,13 +1321,19 @@ class TestActingViewFastPath:
             _CURRENT_INTERACTION.reset(token)
         elapsed = time.monotonic() - before
 
+        # Fast path was attempted and cancelled by wait_for.
         interaction.response.edit_message.assert_awaited_once()
-        view._message.edit.assert_awaited_once()
-        # Fell through within the derived timeout window (0.5s), not the
+        # Channel-endpoint fall-through was SKIPPED.  A second edit on
+        # top of the cancelled fast path would drain the auto-defer
+        # timer's ack budget under genuine Discord-side latency.
+        view._message.edit.assert_not_called()
+        # Returned within the derived timeout window (0.5s), not the
         # 60s sleep -- proves the wait_for guard fired.
         assert elapsed < 2.0
         # Stall is not a rate-limit signal: backoff window stays at zero.
         assert view._refresh_not_before == 0.0
+        # Digest invalidated so the next refresh ships unconditionally.
+        assert view._last_tree_digest is None
 
 
 class TestDisplayLayoutView:

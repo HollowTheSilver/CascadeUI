@@ -530,6 +530,71 @@ on disk for later recovery.
     example, `"roles:main"` for a single shared panel,
     `f"profile:{user_id}"` for a per-user panel).
 
+## Pattern 3: Click routing via `DynamicPersistentButton`
+
+Some persistent buttons do not need a view at all. A role self-assign
+button carries its intent in its `custom_id`: click handling depends
+only on the embedded role ID, not on any session state or view
+lifecycle. `DynamicPersistentButton` is the primitive for that shape.
+
+```python
+import discord
+from cascadeui import DynamicPersistentButton
+
+
+class RoleToggleButton(
+    DynamicPersistentButton,
+    template=r"roles:(?P<category>[a-z_]+):(?P<role_id>[0-9]+)",
+):
+    def __init__(self, *, category: str, role_id: int):
+        button = discord.ui.Button(
+            label=f"Toggle {category}",
+            custom_id=f"roles:{category}:{role_id}",
+            style=discord.ButtonStyle.primary,
+        )
+        super().__init__(button)
+        self.category = category
+        self.role_id = role_id
+
+    async def on_click(self, interaction):
+        member = interaction.user
+        role = interaction.guild.get_role(self.role_id)
+        if role in member.roles:
+            await member.remove_roles(role)
+        else:
+            await member.add_roles(role)
+```
+
+Subclasses auto-register at class-definition time. The same
+`await setup_middleware(PersistenceMiddleware(..., bot=bot))` call
+that reattaches `PersistentView` instances also calls
+`bot.add_dynamic_items(*subclasses)` so every `DynamicPersistentButton`
+routes correctly after a restart. No separate wiring step.
+
+Named capture groups in the template are passed as keyword arguments to
+`__init__` by the default `from_custom_id`. Captures named `user_id`,
+`guild_id`, `channel_id`, `role_id`, or `message_id` auto-coerce to
+`int`; other captures pass through as strings. Override
+`from_custom_id` when the subclass needs custom extraction (non-
+snowflake coercion, combined keys, lookup-based restoration).
+
+### Pattern 2 vs Pattern 3: which to reach for
+
+| If the click... | Reach for | Because |
+|---|---|---|
+| Depends only on IDs encoded in the `custom_id` | `DynamicPersistentButton` | No view means no memory overhead per button and no lifecycle to manage |
+| Needs to read or update Redux state | `PersistentView` | Full `_StatefulMixin` machinery is available; state subscription and `refresh()` are free |
+| Coordinates with other components on the same message | `PersistentView` | Components inside a view share access to the view's state |
+| Is one of N instances that differ only by an embedded ID | `DynamicPersistentButton` | One class + one regex routes every click; no per-instance tracking |
+| Needs a timeout or exit lifecycle | `PersistentView` | `DynamicPersistentButton` has no lifecycle -- clicks route forever once registered |
+
+The two patterns compose: a `PersistentLayoutView` can host
+`DynamicPersistentButton` instances in its ActionRows. Cardinality-
+driven patterns like role-assign panels use exactly this shape -- the
+view owns layout and category organization, while each role button is
+a `DynamicPersistentButton` so buttons differ only by their encoded
+`(category, role_id)` pair.
+
 ## Migrations
 
 Two migrator surfaces exist:
@@ -584,7 +649,7 @@ When any slot declares `ttl_days`, the manager starts a daily background
 sweeper at `install_middleware()` time. It calls `row_delete_where_lt` on
 `application_slots.expires_at` once every 24 hours and drops rows whose
 absolute wall-clock expiration has passed. No cadence configuration is
-exposed -- TTLs are expressed in days, sub-day granularity is meaningless,
+exposed -- TTLs are expressed in days, sub-day precision is meaningless,
 and asking the user to also schedule a prune task is friction the library
 can absorb.
 

@@ -256,10 +256,19 @@ async def battleship_shot_reducer(action, state):
 
 @cascade_reducer("BATTLESHIP_REMATCH")
 async def battleship_rematch_reducer(action, state):
-    """Reset per-match fields for a fresh game; lifetime stats are scoped."""
+    """Reset per-match fields and place fresh ship layouts for both players.
+
+    Lifetime stats live under user_guild scope and survive the
+    rematch untouched. Player IDs ride the payload because the
+    seat swap happens in the view before dispatch.
+    """
     bs = access_slot(state, "battleship")
     bs["phase"] = "setup"
     bs["shots_fired"] = 0
+
+    fleets = access_slot(state, "battleship", "fleets")
+    fleets[action["payload"]["player_1"]] = _place_ships(BOARD_SIZE, SHIPS)
+    fleets[action["payload"]["player_2"]] = _place_ships(BOARD_SIZE, SHIPS)
     return state
 
 
@@ -463,18 +472,17 @@ class BattleshipView(StatefulLayoutView):
     # bucket name also flows through ``persistent_slots`` so only this
     # bucket is write-through to disk -- TicTacToe, Settings, and other
     # views' scoped writes are unaffected. The live game state lives
-    # under the custom ``battleship`` slot (seeded fresh per match) so
+    # under the custom ``battleship`` slot (rebuilt fresh per match) so
     # nothing in-match is persisted.
     scoped_slot = "battleship_stats"
     persistent_slots = ("battleship_stats",)
     auto_defer = True
-    # participant_limit = 2 is technically redundant with allowed_users
-    # = {player_1, player_2} -- two specific IDs already cap occupancy
-    # at two. Both are set explicitly to show the auth domain
-    # (allowed_users / on_unauthorized) and the capacity domain
-    # (participant_limit / on_participant_limit) side by side in one
-    # class body. See "Combining allowed_users and participant_limit"
-    # in docs/guide/views.md.
+    # participant_limit = 2 is redundant with allowed_users = {player_1,
+    # player_2} -- two specific IDs already cap occupancy at two.
+    # ``allowed_users`` / ``on_unauthorized`` governs the auth domain;
+    # ``participant_limit`` / ``on_participant_limit`` governs the
+    # capacity domain. See "Combining allowed_users and
+    # participant_limit" in docs/guide/views.md.
     participant_limit = 2
     auto_register_participants = True
     # exit_policy is not set here -- the choice is phase-dependent, so
@@ -487,7 +495,7 @@ class BattleshipView(StatefulLayoutView):
     # Ship placements live in ``state["application"]["battleship"]["fleets"]``
     # via the BATTLESHIP_REROLL reducer. These properties are the canonical
     # read path; writes happen exclusively through dispatch() or the
-    # _seed_fleets helper below. Making them read-only @property enforces
+    # _place_fresh_fleets helper below. Making them read-only @property enforces
     # that -- any stray ``self.ships_1 = ...`` raises AttributeError at the
     # call site instead of silently desynchronising state from local data.
     @property
@@ -502,14 +510,13 @@ class BattleshipView(StatefulLayoutView):
         return read_slot(self.state_store.state, "battleship", "fleets", default={})
 
     def _place_fresh_fleets(self, state) -> None:
-        """Write a fresh random fleet for each player into the application slot.
+        """Write a randomly-generated ship layout for each player into the slot.
 
-        Called from ``seed_initial_state`` (initial game, runs inside
-        the send-pipeline batch) and from ``_rematch`` (after the
-        BATTLESHIP_REMATCH dispatch resets the per-match fields).
-        Bypasses the BATTLESHIP_REROLL dispatch path because seeding is
-        initialization, not user-driven change -- no fan-out is wanted.
-        The reducer owns every subsequent write.
+        Called from ``seed_initial_state`` only -- that hook runs inside
+        the send-pipeline batch with a deep-copied state arg, so writing
+        into the slot directly is correct. The rematch path runs the
+        same placement logic inside the BATTLESHIP_REMATCH reducer
+        instead, which keeps the write on the standard reducer pipeline.
         """
         fleets = access_slot(state, "battleship", "fleets")
         fleets[self.player_1] = _place_ships(BOARD_SIZE, SHIPS)
@@ -519,7 +526,7 @@ class BattleshipView(StatefulLayoutView):
         """Repaint both defense grids from the current state-stored fleets.
 
         Defense grids visually encode where ships sit; whenever fleets
-        change (initial seed or rematch swap) the grids must be cleared
+        change (initial placement or rematch swap) the grids must be cleared
         and repainted so the visual matches the data.
         """
         self._defense_1.clear()
@@ -565,7 +572,7 @@ class BattleshipView(StatefulLayoutView):
         self._selected_row: int | None = None
         self._selected_col: int | None = None
 
-        # No state seeding or build_ui() here -- both deferred to
+        # No state writes or build_ui() here -- both deferred to
         # seed_initial_state. The hook fires inside _send_pipeline
         # AFTER register_view (so the slot is reachable from other
         # views' selectors) but BEFORE the Discord HTTP send (so the
@@ -574,14 +581,16 @@ class BattleshipView(StatefulLayoutView):
         # state writes, no UI construction.
 
     async def seed_initial_state(self, state):
-        """Seed fleets, paint defense grids, and build the initial component tree.
+        """Place fresh ships, paint defense grids, and build the component tree.
 
         The three steps share a data dependency -- defense grids paint
-        the seeded positions and ``build_ui`` reads ``self.ships_1`` /
+        the ship positions and ``build_ui`` reads ``self.ships_1`` /
         ``self.ships_2`` (which read state) -- so collapsing them into
         one hook keeps the order obvious. Runs once per send: the
-        rematch path reseeds via ``_place_fresh_fleets`` directly
-        because the view is already alive at that point.
+        rematch path skips this hook and goes through the
+        BATTLESHIP_REMATCH reducer (which places fresh ships as part
+        of its own dispatch) because the view is already alive at
+        that point.
         """
         self._place_fresh_fleets(state)
         self._repaint_defense_grids()
@@ -981,20 +990,19 @@ class BattleshipView(StatefulLayoutView):
         self._rematch_votes.add(interaction.user.id)
 
         if len(self._rematch_votes) >= 2:
-            # Swap who goes first, re-randomize ships. Reseed through
-            # the same helper used by seed_initial_state so the
-            # ships_1 / ships_2 properties (which read from state) see
-            # the new placements immediately.
+            # Swap who goes first.  Ship placement for the new match
+            # flows through the reducer pipeline below so the write
+            # rides the standard subscriber / persistence / undo
+            # channels instead of mutating live store state out of band.
             self.player_1, self.player_2 = self.player_2, self.player_1
-            self._place_fresh_fleets(self.state_store.state)
             self.sunk_by_1 = set()
             self.sunk_by_2 = set()
 
-            # Attack grids clear back to all-water; defense grids get
-            # repainted from the freshly seeded fleets.
+            # Attack grids clear back to all-water.  Defense grids are
+            # repainted AFTER the dispatch once the reducer has written
+            # the fresh fleets into application state.
             self._attack_1.clear()
             self._attack_2.clear()
-            self._repaint_defense_grids()
 
             self.turn = 1
             self.winner = None
@@ -1010,11 +1018,20 @@ class BattleshipView(StatefulLayoutView):
             # state snapshot. Players re-open from the new setup card.
             await self._cleanup_attached_children()
 
-            # Reset phase + shot counter in application state so fresh
-            # MyShipsView instances opened post-rematch see clean values
-            # and their state_selector fires correctly on the first
-            # STARTED/SHOT of the new match.
-            await self.dispatch("BATTLESHIP_REMATCH", {})
+            # Reset phase + shot counter and place fresh ships in one
+            # reducer pass.  Player IDs ride the payload because the
+            # reducer is module-level and the swap above has already
+            # happened on the view.
+            await self.dispatch(
+                "BATTLESHIP_REMATCH",
+                {"player_1": self.player_1, "player_2": self.player_2},
+            )
+
+            # Now that state holds the fresh fleets, repaint defense
+            # grids from ``self.ships_1`` / ``self.ships_2`` (which read
+            # state).  Repainting before the dispatch would paint the
+            # old fleets.
+            self._repaint_defense_grids()
 
             self._start_setup_timer()
 
@@ -1085,7 +1102,7 @@ class BattleshipView(StatefulLayoutView):
         """
         winner_id = self.player_1 if self.winner == 1 else self.player_2
         loser_id = self.player_2 if self.winner == 1 else self.player_1
-        async with self.state_store.batch():
+        async with self.batch():
             await self.dispatch(
                 "BATTLESHIP_FINISHED",
                 {"winner": self.winner, "forfeit": forfeit},
@@ -1195,20 +1212,18 @@ class MyShipsView(StatefulLayoutView):
     owner_only = True
     instance_limit = 1
     instance_scope = "user_guild"
-    # Fleet ephemerals should never linger frozen. instance_policy="replace"
-    # is the library default, set explicitly here because the whole dedup
-    # story below depends on it: clicking "View Fleet" again evicts the
-    # previous fleet view via the replace path, which then runs
-    # replace_policy="delete" (also the default) to delete its message.
-    # Every bare exit() path -- close button, timeout, _cleanup_attached_children
-    # on game end -- also deletes via exit_policy="delete".
+    # Fleet ephemerals should never linger frozen. ``instance_policy``
+    # evicts the previous fleet view when "View Fleet" is clicked again;
+    # ``replace_policy`` then deletes that view's message; ``exit_policy``
+    # handles every bare ``exit()`` path -- close button, timeout, and
+    # ``_cleanup_attached_children`` on game end.
     instance_policy = "replace"
     replace_policy = "delete"
     exit_policy = "delete"
 
-    # Library default; restated for visibility. The library installs a
-    # "Continue Session" button shortly before the interaction token
-    # expires, spawning a fresh ephemeral with no visible cliff.
+    # ``auto_refresh_ephemeral`` installs a "Continue Session" button
+    # shortly before the 15-minute interaction token expires, spawning
+    # a fresh ephemeral with no visible cliff.
     auto_refresh_ephemeral = True
     refresh_button_label = "Refresh"
 

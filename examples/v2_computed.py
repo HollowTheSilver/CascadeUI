@@ -39,6 +39,7 @@ from discord.ui import ActionRow, TextDisplay
 from cascadeui import (
     StatefulButton,
     StatefulLayoutView,
+    access_slot,
     card,
     cascade_reducer,
     computed,
@@ -74,8 +75,9 @@ async def poll_vote_reducer(action, state):
     The ``@cascade_reducer`` decorator auto-deepcopies state, so
     mutations here are safe.
     """
-    app = state.setdefault("application", {})
-    poll = app.setdefault("poll", {"votes": {}, "total_voters": 0})
+    poll = access_slot(state, "poll")
+    poll.setdefault("votes", {})
+    poll.setdefault("total_voters", 0)
 
     user_id = str(action["payload"]["user_id"])
     choice = action["payload"]["choice"]

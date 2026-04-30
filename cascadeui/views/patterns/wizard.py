@@ -10,6 +10,7 @@ from discord.ui import ActionRow, Button
 
 from ...components.base import StatefulButton
 from ...components.patterns.v2 import card, progress_bar
+from ...components.types import EmojiInput
 from ..base import _StatefulMixin
 from ..layout import StatefulLayoutView
 from ..view import StatefulView
@@ -36,15 +37,15 @@ class _BaseWizardMixin:
     # // ----( Customization triples )---- // #
 
     back_button_label: ClassVar[Optional[str]] = None
-    back_button_emoji: ClassVar[Optional[str]] = None
+    back_button_emoji: ClassVar[EmojiInput] = None
     back_button_style: ClassVar[discord.ButtonStyle] = discord.ButtonStyle.secondary
 
     next_button_label: ClassVar[Optional[str]] = None
-    next_button_emoji: ClassVar[Optional[str]] = None
+    next_button_emoji: ClassVar[EmojiInput] = None
     next_button_style: ClassVar[discord.ButtonStyle] = discord.ButtonStyle.primary
 
     finish_button_label: ClassVar[Optional[str]] = None
-    finish_button_emoji: ClassVar[Optional[str]] = None
+    finish_button_emoji: ClassVar[EmojiInput] = None
     finish_button_style: ClassVar[discord.ButtonStyle] = discord.ButtonStyle.success
 
     # Callable(current, total) -> str. When None, defaults to "Step {n}/{total}".
@@ -350,8 +351,7 @@ class WizardView(_BaseWizardMixin, StatefulView):
         is_last = self._next_visible_index(self._current_step) is None
         self._next_btn.label = self._resolve_next_label(is_last)
         self._next_btn.style = self.finish_button_style if is_last else self.next_button_style
-        emoji_str = self.finish_button_emoji if is_last else self.next_button_emoji
-        self._next_btn.emoji = discord.PartialEmoji.from_str(emoji_str) if emoji_str else None
+        self._next_btn.emoji = self.finish_button_emoji if is_last else self.next_button_emoji
 
         if self._steps:
             step = self._steps[self._current_step]
@@ -514,6 +514,9 @@ class WizardLayoutView(_BaseWizardMixin, StatefulLayoutView):
 
             for extra in self._extra_items:
                 self.add_item(extra)
+
+            # Restore the navigation back button if push() added one.
+            self._restore_navigation_artifacts()
         finally:
             _current_theme.reset(token)
 
@@ -525,8 +528,7 @@ class WizardLayoutView(_BaseWizardMixin, StatefulLayoutView):
         is_last = self._next_visible_index(self._current_step) is None
         self._next_btn.label = self._resolve_next_label(is_last)
         self._next_btn.style = self.finish_button_style if is_last else self.next_button_style
-        emoji_str = self.finish_button_emoji if is_last else self.next_button_emoji
-        self._next_btn.emoji = discord.PartialEmoji.from_str(emoji_str) if emoji_str else None
+        self._next_btn.emoji = self.finish_button_emoji if is_last else self.next_button_emoji
 
         await self._rebuild_step_content()
         await self.refresh()

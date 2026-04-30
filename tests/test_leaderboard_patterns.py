@@ -1,5 +1,6 @@
 """Tests for LeaderboardLayoutView and PersistentLeaderboardLayoutView."""
 
+import discord
 import pytest
 from discord.ui import Container, LayoutView, Section, TextDisplay, Thumbnail
 from helpers import make_interaction as _make_interaction
@@ -12,7 +13,6 @@ from cascadeui.views.patterns.leaderboard import (
 )
 from cascadeui.views.patterns.paginated import PaginatedLayoutView
 from cascadeui.views.persistent import _PersistentMixin
-
 
 # // ========================================( LeaderboardLayoutView )======================================== // #
 
@@ -29,9 +29,7 @@ def _page_text(view, page_idx=0):
     page = view.pages[page_idx]
     containers = [c for c in page if isinstance(c, Container)]
     texts = list(containers[0].walk_children())
-    return " ".join(
-        getattr(t, "content", "") for t in texts if isinstance(t, TextDisplay)
-    )
+    return " ".join(getattr(t, "content", "") for t in texts if isinstance(t, TextDisplay))
 
 
 async def _make_view(cls=LeaderboardLayoutView, **kwargs):
@@ -94,9 +92,7 @@ class TestLeaderboardLayoutViewInit:
     def test_subtitle_kwarg_none_explicitly_skips(self):
         """Passing ``subtitle=None`` at construction overrides the class default."""
         interaction = _make_interaction()
-        view = LeaderboardLayoutView(
-            interaction=interaction, entries=SAMPLE_ENTRIES, subtitle=None
-        )
+        view = LeaderboardLayoutView(interaction=interaction, entries=SAMPLE_ENTRIES, subtitle=None)
         assert view.subtitle is None
 
     def test_default_policies(self):
@@ -188,9 +184,7 @@ class TestLeaderboardLayoutViewRendering:
 
     async def test_subtitle_kwarg_none_skips_h3_at_construction(self):
         interaction = _make_interaction()
-        view = LeaderboardLayoutView(
-            interaction=interaction, entries=SAMPLE_ENTRIES, subtitle=None
-        )
+        view = LeaderboardLayoutView(interaction=interaction, entries=SAMPLE_ENTRIES, subtitle=None)
         await view.rebuild_pages()
         assert "### " not in _page_text(view)
 
@@ -270,6 +264,7 @@ class TestLeaderboardOverrideHooks:
 
     async def test_build_summary_returning_none_has_no_summary(self):
         """None return: no summary at any placement."""
+
         class NoSummary(LeaderboardLayoutView):
             def build_summary(self, entries):
                 return None
@@ -340,6 +335,7 @@ class TestLeaderboardPagination:
 
     async def test_multi_page_when_entries_exceed_per_page(self):
         """10 entries with per_page=3 produces 4 pages (3+3+3+1)."""
+
         class PagedBoard(LeaderboardLayoutView):
             leaderboard_top_n = 10
             leaderboard_per_page = 3
@@ -348,8 +344,41 @@ class TestLeaderboardPagination:
         view = await _make_view(cls=PagedBoard, entries=entries)
         assert len(view.pages) == 4
 
+    async def test_multi_page_nav_row_attached_once(self):
+        """The navigation ActionRow appears in the view tree exactly once
+        after the send-time tree layout runs.
+
+        ``LeaderboardLayoutView.send`` calls ``_compose_pagination_tree``
+        to lay out the page content + nav row in a single shot. An
+        earlier shape called ``_add_page_content`` and then
+        ``add_item(self._nav_row)`` separately, which double-attached
+        the nav row -- discord.py would render two duplicate button rows.
+        """
+
+        class PagedBoard(LeaderboardLayoutView):
+            leaderboard_top_n = 10
+            leaderboard_per_page = 3
+
+        entries = [(i, {"wins": 100 - i, "games": 100}) for i in range(10)]
+        view = PagedBoard(interaction=_make_interaction(), entries=entries)
+
+        # Mirror the body of send() up to (but not including) super().send()
+        # so the assertion checks the same tree layout the user sees.
+        view.pages = await view._build_leaderboard_pages()
+        view.clear_items()
+        view._build_nav_buttons()
+        view._compose_pagination_tree()
+        for extra in view._extra_items:
+            view.add_item(extra)
+
+        nav_row = view._nav_row
+        assert nav_row is not None
+        nav_count = sum(1 for c in view.children if c is nav_row)
+        assert nav_count == 1, f"Nav row attached {nav_count} times, expected 1"
+
     async def test_per_page_defaults_to_top_n(self):
         """When leaderboard_per_page is None, uses top_n as page size."""
+
         class SmallBoard(LeaderboardLayoutView):
             leaderboard_top_n = 5
             leaderboard_per_page = None
@@ -365,6 +394,7 @@ class TestLeaderboardPagination:
         rank 4+ as bold numbers. Assertions split on that boundary:
         page 1 holds the podium, page 2 holds the bold-number tail.
         """
+
         class PagedBoard(LeaderboardLayoutView):
             leaderboard_top_n = 6
             leaderboard_per_page = 3
@@ -383,6 +413,7 @@ class TestLeaderboardPagination:
 
     async def test_summary_only_on_first_page(self):
         """Summary key_value appears on page 1 only."""
+
         class PagedBoard(LeaderboardLayoutView):
             leaderboard_top_n = 6
             leaderboard_per_page = 3
@@ -394,6 +425,7 @@ class TestLeaderboardPagination:
 
     async def test_title_on_every_page(self):
         """Title heading appears on all pages."""
+
         class PagedBoard(LeaderboardLayoutView):
             leaderboard_top_n = 6
             leaderboard_per_page = 3
@@ -414,6 +446,7 @@ class TestLeaderboardPagination:
 
     async def test_rebuild_pages_clamps_current_page(self):
         """rebuild_pages clamps current_page when entries shrink."""
+
         class PagedBoard(LeaderboardLayoutView):
             leaderboard_top_n = 10
             leaderboard_per_page = 3
@@ -432,6 +465,7 @@ class TestLeaderboardPagination:
         ``__init__``; they simply disable when only one page exists.
         Synchronous check -- no page build required.
         """
+
         class PagedBoard(LeaderboardLayoutView):
             leaderboard_top_n = 10
             leaderboard_per_page = 3
@@ -570,6 +604,7 @@ class TestFormatHooks:
 
     def test_custom_format_rank_reaches_default_format_entry(self):
         """Overriding one hook propagates through the default composition."""
+
         class NumericBoard(LeaderboardLayoutView):
             def format_rank(self, rank):
                 return f"#{rank}"
@@ -591,6 +626,7 @@ class TestFormatHooks:
 
     def test_format_rank_default_inherited_by_battleship_style_subclass(self):
         """A subclass that overrides only format_stats still gets medal ranks."""
+
         class StatOnlyBoard(LeaderboardLayoutView):
             def format_stats(self, user_id, stats):
                 return "CUSTOM"
@@ -650,6 +686,7 @@ class TestEntryLayoutValidation:
 
     def test_sections_accepts_per_page_equal_to_five(self):
         """The cap is inclusive: per_page == 5 is the max permitted with sections."""
+
         class AtCapBoard(LeaderboardLayoutView):
             entry_layout = "sections"
             leaderboard_per_page = 5
@@ -688,6 +725,7 @@ class TestEntryLayoutValidation:
 
     def test_lines_mode_allows_larger_per_page(self):
         """The cap is a sections-only concern; lines mode is unconstrained."""
+
         class WideLinesBoard(LeaderboardLayoutView):
             entry_layout = "lines"
             leaderboard_per_page = 20
@@ -703,6 +741,7 @@ class TestSectionRender:
 
     async def test_sections_render_section_instances_with_avatars(self):
         """Each entry becomes a Section with Thumbnail when avatars resolve."""
+
         class AvatarBoard(LeaderboardLayoutView):
             entry_layout = "sections"
             leaderboard_per_page = 5
@@ -717,6 +756,7 @@ class TestSectionRender:
 
     async def test_sections_primary_and_secondary_content(self):
         """Default format_primary shows rank+name; format_secondary shows stats."""
+
         class AvatarBoard(LeaderboardLayoutView):
             entry_layout = "sections"
             leaderboard_per_page = 5
@@ -735,6 +775,7 @@ class TestSectionRender:
 
     async def test_no_avatar_falls_back_to_stacked_textdisplay(self):
         """Default get_avatar_url returns None: no Section, stacked text instead."""
+
         class SectionsBoard(LeaderboardLayoutView):
             entry_layout = "sections"
             leaderboard_per_page = 5
@@ -754,6 +795,7 @@ class TestSectionRender:
 
     async def test_get_avatar_url_attaches_thumbnail(self):
         """Returning a URL attaches a Thumbnail accessory to the section."""
+
         class AvatarBoard(LeaderboardLayoutView):
             entry_layout = "sections"
             leaderboard_per_page = 5
@@ -768,6 +810,7 @@ class TestSectionRender:
 
     async def test_get_avatar_url_partial_returns_mixed(self):
         """Returning URL for some entries and None for others produces a mixed page."""
+
         class MixedBoard(LeaderboardLayoutView):
             entry_layout = "sections"
             leaderboard_per_page = 5
@@ -782,6 +825,7 @@ class TestSectionRender:
 
     async def test_format_primary_override(self):
         """Overriding format_primary changes the section's top line."""
+
         class CustomPrimary(LeaderboardLayoutView):
             entry_layout = "sections"
             leaderboard_per_page = 5
@@ -800,6 +844,7 @@ class TestSectionRender:
 
     async def test_format_secondary_override(self):
         """Overriding format_secondary changes the section's bottom line."""
+
         class CustomSecondary(LeaderboardLayoutView):
             entry_layout = "sections"
             leaderboard_per_page = 5
@@ -818,6 +863,7 @@ class TestSectionRender:
 
     async def test_sections_mode_pagination(self):
         """Sections mode still paginates when entries exceed per_page."""
+
         class PagedSections(LeaderboardLayoutView):
             entry_layout = "sections"
             leaderboard_top_n = 6
@@ -834,3 +880,111 @@ class TestSectionRender:
             container = [c for c in view.pages[page_idx] if isinstance(c, Container)][0]
             sections = [c for c in container.walk_children() if isinstance(c, Section)]
             assert len(sections) == 3
+
+
+# // ========================================( Tier 1 Modularity Attributes )======================================== // #
+
+
+class TestPodiumEmojis:
+    """podium_emojis class attribute drives format_rank without method override."""
+
+    async def test_default_emojis_for_top_three(self):
+        view = await _make_view(entries=SAMPLE_ENTRIES)
+        assert view.format_rank(1) == "\U0001f947"
+        assert view.format_rank(2) == "\U0001f948"
+        assert view.format_rank(3) == "\U0001f949"
+
+    async def test_default_fallback_for_lower_ranks(self):
+        view = await _make_view(entries=SAMPLE_ENTRIES)
+        assert view.format_rank(4) == "**4.**"
+        assert view.format_rank(99) == "**99.**"
+
+    async def test_subclass_override_changes_podium(self):
+        class TrophyBoard(LeaderboardLayoutView):
+            podium_emojis = {1: "\U0001f3c6", 2: "⭐", 3: "✨"}
+
+        view = await _make_view(cls=TrophyBoard, entries=SAMPLE_ENTRIES)
+        assert view.format_rank(1) == "\U0001f3c6"
+        assert view.format_rank(2) == "⭐"
+        assert view.format_rank(3) == "✨"
+        # Lower ranks still fall through to the bold-number default
+        assert view.format_rank(4) == "**4.**"
+
+    async def test_subclass_can_extend_podium_to_more_ranks(self):
+        class TopFive(LeaderboardLayoutView):
+            podium_emojis = {1: "\U0001f947", 2: "\U0001f948", 3: "\U0001f949", 4: "4️⃣", 5: "5️⃣"}
+
+        view = await _make_view(cls=TopFive, entries=SAMPLE_ENTRIES)
+        assert view.format_rank(4) == "4️⃣"
+        assert view.format_rank(5) == "5️⃣"
+        assert view.format_rank(6) == "**6.**"
+
+
+class TestEntrySeparator:
+    """entry_separator class attribute drives format_entry without method override."""
+
+    async def test_default_separator_is_double_dash(self):
+        view = await _make_view(entries=SAMPLE_ENTRIES)
+        line = view.format_entry(1, 111, {"wins": 10, "games": 15})
+        assert " -- " in line
+
+    async def test_subclass_override_changes_separator(self):
+        class PipeBoard(LeaderboardLayoutView):
+            entry_separator = " | "
+
+        view = await _make_view(cls=PipeBoard, entries=SAMPLE_ENTRIES)
+        line = view.format_entry(1, 111, {"wins": 10, "games": 15})
+        assert " | " in line
+        assert " -- " not in line
+
+
+class TestCardColor:
+    """card_color class attribute changes the rankings card's accent."""
+
+    async def test_default_card_color_is_none(self):
+        view = await _make_view(entries=SAMPLE_ENTRIES)
+        # Default falls through to the theme accent (None at the call site).
+        assert view.card_color is None
+
+    async def test_subclass_override_sets_card_color(self):
+        red = discord.Color.red()
+
+        class RedBoard(LeaderboardLayoutView):
+            card_color = red
+
+        view = await _make_view(cls=RedBoard, entries=SAMPLE_ENTRIES)
+        # The rankings card on each page has the override accent.
+        for page in view.pages:
+            container = [c for c in page if isinstance(c, Container)][-1]
+            assert container.accent_colour == red
+
+
+class TestShowTitleDivider:
+    """show_title_divider class attribute toggles the divider below the title."""
+
+    async def test_default_renders_divider(self):
+        view = await _make_view(entries=SAMPLE_ENTRIES)
+        # First child of the rankings card is the title TextDisplay; the
+        # second is the divider when show_title_divider is True.
+        container = [c for c in view.pages[0] if isinstance(c, Container)][-1]
+        children = list(container.walk_children())
+        # children[0] is title, children[1] should be a Separator (divider).
+        assert isinstance(children[0], TextDisplay)
+        # Divider returns a Separator-like component
+        from discord.ui import Separator
+
+        assert isinstance(children[1], Separator)
+
+    async def test_subclass_can_disable_divider(self):
+        class DenseBoard(LeaderboardLayoutView):
+            show_title_divider = False
+
+        view = await _make_view(cls=DenseBoard, entries=SAMPLE_ENTRIES)
+        container = [c for c in view.pages[0] if isinstance(c, Container)][-1]
+        children = list(container.walk_children())
+        # children[0] is title; with divider disabled, children[1] is whatever
+        # comes next in the build (gap or first content row), not a Separator.
+        from discord.ui import Separator
+
+        assert isinstance(children[0], TextDisplay)
+        assert not isinstance(children[1], Separator)

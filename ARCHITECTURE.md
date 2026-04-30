@@ -104,8 +104,8 @@ component interface remains discord.py.
   constraints, lifecycle, and capacity
 - `_send_pipeline` wrapping the discord.py send/edit cycle with
   three-tier rollback on failure
-- Six pre-built pattern classes (Menu, Form, Wizard, Tab, Paginated,
-  Leaderboard), each with V1 and V2 variants where applicable
+- Seven pre-built pattern classes (Menu, Form, Wizard, Tab, Paginated,
+  Leaderboard, Roles), each with V1 and V2 variants where applicable
 - `PersistenceBackend` Protocol with capability flags and opt-in per-slot
   routing
 - Component convenience wrappers (`StatefulButton`, `StatefulSelect`),
@@ -331,7 +331,7 @@ on the layers below it:
 ```
 ┌─────────────────────────────────────────────────────────┐
 │  Patterns (Menu, Form, Wizard, Tab, Paginated,          │
-│            Leaderboard -- V1 and V2 variants)           │
+│            Leaderboard, Roles -- V1 / V2 variants)      │
 ├─────────────────────────────────────────────────────────┤
 │  StatefulView, StatefulLayoutView, PersistentView       │
 │  (three-tier rollback, auto-defer, refresh throttling)  │

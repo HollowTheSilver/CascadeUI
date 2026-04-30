@@ -415,4 +415,4 @@ Every class attribute, grouped by pillar, with its default value:
   component tiers
 - **[Views](views.md)** -- lifecycle, navigation, and policies in action
 - **[State Management](state.md)** -- reducers, subscribers, scoped state
-- **[View Patterns](patterns.md)** -- forms, wizards, tabs, pagination
+- **[View Patterns](patterns.md)** -- menus, forms, wizards, tabs, pagination, leaderboards, role panels

@@ -1140,3 +1140,101 @@ class TestUndoSlotIsolation:
         # UNDO reducer only touched the 'target' slot, so the identity of
         # 'untouched' carries through.
         assert store.state["application"]["untouched"] == {"deep": "untouched"}
+
+
+class TestMissingSentinelDeepCopy:
+    """``_MISSING`` must survive ``copy.deepcopy`` without losing identity.
+
+    ``@cascade_reducer`` deep-copies state before every reducer. State
+    contains undo-stack diffs that may carry ``_MISSING`` sentinels
+    (marking "this slot did not exist pre-action"). If deepcopy creates
+    fresh ``object()`` instances in place of ``_MISSING``, the identity
+    check ``target_value is _MISSING`` in ``_apply_slot_diff`` fails and
+    the bare ``object()`` lands in the slot value, corrupting state for
+    every subsequent reducer that reads the slot.
+    """
+
+    def test_deepcopy_preserves_identity(self):
+        from cascadeui.state.middleware.undo import _MISSING
+
+        copied = copy.deepcopy(_MISSING)
+        assert copied is _MISSING
+
+    def test_copy_preserves_identity(self):
+        from cascadeui.state.middleware.undo import _MISSING
+
+        copied = copy.copy(_MISSING)
+        assert copied is _MISSING
+
+    def test_deepcopy_inside_nested_dict_preserves_identity(self):
+        from cascadeui.state.middleware.undo import _MISSING
+
+        snapshot = {
+            "application_slots": {"scoped": _MISSING, "settings": {"k": 1}},
+            "shared_data": {"x": "y"},
+        }
+        copied = copy.deepcopy(snapshot)
+        assert copied["application_slots"]["scoped"] is _MISSING
+        assert copied["application_slots"]["settings"] == {"k": 1}
+        assert copied["application_slots"]["settings"] is not snapshot["application_slots"]["settings"]
+
+    async def test_undo_followed_by_dispatch_does_not_corrupt_application_slot(self):
+        """End-to-end regression for the live-bot SETTINGS_UPDATED crash.
+
+        Before the fix: dispatch SCOPED_UPDATE -> dispatch UNDO ->
+        dispatch SCOPED_UPDATE again. The second dispatch would crash
+        because ``state["application"]["scoped"]`` had been replaced
+        with a deepcopy of the ``_MISSING`` sentinel during the
+        intermediate reducer wrappers.
+        """
+        from cascadeui.state.store import StateStore
+        from cascadeui.utils.decorators import cascade_reducer
+
+        store = get_store()
+        undo_mw = UndoMiddleware()
+        store._add_middleware(undo_mw)
+        await undo_mw.initialize(store)
+
+        await store.dispatch("SESSION_CREATED", {"session_id": "regr_s", "user_id": 7})
+        store._undo_enabled_views["regr_v"] = 20
+
+        # First write -- creates the "scoped" slot.
+        await store.dispatch(
+            "SCOPED_UPDATE",
+            {
+                "scope": "user",
+                "identifiers": {"user_id": 7},
+                "data": {"theme": "dark"},
+                "slot_name": "scoped",
+            },
+            source_id="regr_v",
+        )
+
+        # Undo -- should pop the "scoped" slot since it didn't exist
+        # pre-action. The slot should be GONE from state, not replaced
+        # with a bare object().
+        await store.dispatch("UNDO", {"view_id": "regr_v", "session_id": "regr_s"})
+
+        scoped_after_undo = store.state.get("application", {}).get("scoped")
+        # The slot was popped (not present) OR is a real dict (re-created
+        # by a clean reducer call). It must NEVER be a bare object that
+        # fails iteration.
+        assert scoped_after_undo is None or isinstance(scoped_after_undo, dict), (
+            f"slot corruption: state['application']['scoped'] is {type(scoped_after_undo).__name__}"
+        )
+
+        # Subsequent SCOPED_UPDATE must succeed (this is what crashed
+        # in the live bot at v2_settings.py:75).
+        await store.dispatch(
+            "SCOPED_UPDATE",
+            {
+                "scope": "user",
+                "identifiers": {"user_id": 7},
+                "data": {"theme": "light"},
+                "slot_name": "scoped",
+            },
+            source_id="regr_v",
+        )
+
+        result = StateStore.get_scoped_from(store.state, "user", user_id=7)
+        assert result == {"theme": "light"}

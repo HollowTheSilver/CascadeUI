@@ -150,8 +150,8 @@ await view.send(**view.build_ui())
 V1 views use embeds for content with buttons below. `build_ui()` returns a
 dict splatted into `refresh()` by the default `on_state_changed()`.
 
-For pre-built patterns (forms, wizards, tabs, pagination) in both V1 and V2,
-see [View Patterns](patterns.md).
+For pre-built patterns (Menu, Form, Wizard, Tab, Paginated, Leaderboard,
+Roles) in V1 and V2 where applicable, see [View Patterns](patterns.md).
 
 ---
 
@@ -338,14 +338,19 @@ Push views onto a stack and pop them to go back:
 
 ### The `rebuild` Callback
 
-The `rebuild=` parameter eliminates boilerplate:
+The Discord message edit fires on every push and pop. `rebuild=` is an
+optional pre-edit hook for views that need post-construction setup:
 
 1. The interaction is auto-deferred
-2. The callback is called with the new view
-3. The message is edited with the rebuilt view
+2. The optional `rebuild` callback runs against the new view
+3. The message is edited with the new view (plus any kwargs the
+   callback returned)
 
-V2 `rebuild` calls `build_ui()` and returns `None`. V1 `rebuild` returns a
-dict of kwargs (e.g., `{"embed": embed}`). Both sync and async are supported.
+V2 `rebuild` typically calls `build_ui()` to populate views that
+construct empty. V1 `rebuild` returns a dict of edit kwargs
+(e.g., `{"embed": v.build_embed()}`). Sync or async both work. Views
+built by async classmethods like `PaginatedLayoutView.from_data` come
+fully populated -- omit `rebuild` entirely.
 
 ### How It Works
 
@@ -354,12 +359,45 @@ dict of kwargs (e.g., `{"embed": embed}`). Both sync and async are supported.
 - Constructor kwargs are preserved automatically for faithful reconstruction
 - The new view inherits `session_id`, keeping navigation within one session
 
+### Pushing Pre-Constructed Instances
+
+`push()` and `replace()` accept either a view class (the default form
+shown above) or a pre-constructed view instance. The instance form
+pairs with async classmethod constructors -- `PaginatedLayoutView.from_data`
+and `from_cursor` -- where the view is built before the navigation call.
+
+```python
+class HubView(StatefulLayoutView):
+    async def go_inventory(self, interaction):
+        # from_data is async; build the view first, then push it.
+        child = await InventoryView.from_data(
+            items=ITEMS,
+            per_page=10,
+            formatter=format_inventory_page,
+            interaction=interaction,
+        )
+        # No rebuild -- from_data returns a fully-built paginator and
+        # push() edits the message on its own.
+        await self.push(child, interaction)
+```
+
+Passing extra kwargs alongside an instance raises `TypeError` -- the
+instance is already built.
+
 ### Auto Back Button
 
 ```python
 class SettingsView(StatefulLayoutView):
     auto_back_button = True  # Added automatically when pushed
 ```
+
+The auto-added back button survives pattern rebuilds. Paginated page
+turns, tab switches, form re-layout, menu refresh, role panel rebuild,
+and wizard step advance all call `clear_items()` and recompose the
+component tree from scratch. The library re-adds the back button after
+each recomposition via `_restore_navigation_artifacts`, so a view that
+combines `auto_back_button = True` with a pattern's interactive
+controls keeps both reachable across every state-driven rebuild.
 
 ### Push vs. Replace
 

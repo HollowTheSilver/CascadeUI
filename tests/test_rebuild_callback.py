@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 from helpers import make_interaction as _make_interaction
 
-from cascadeui.views.view import StatefulView
 from cascadeui.views.layout import StatefulLayoutView
+from cascadeui.views.view import StatefulView
 
 # // ========================================( Fixtures )======================================== // #
 
@@ -78,15 +78,20 @@ class TestPushRebuild:
 
         interaction.edit_original_response.assert_called_once_with(view=new_view)
 
-    async def test_no_rebuild_skips_defer_and_edit(self):
+    async def test_no_rebuild_still_defers_and_edits(self):
+        """The Discord message edit fires regardless of whether a rebuild
+        callback is supplied. ``rebuild`` is a pre-edit hook for views that
+        need post-construction setup; the navigation contract is that the
+        new view replaces the old on screen.
+        """
         interaction = _make_interaction()
         hub = _HubView(interaction=interaction)
         hub._message = MagicMock(id=1, channel=MagicMock(id=2))
 
-        await hub.push(_SubView, interaction)
+        new_view = await hub.push(_SubView, interaction)
 
-        interaction.response.defer.assert_not_called()
-        interaction.edit_original_response.assert_not_called()
+        interaction.response.defer.assert_called_once()
+        interaction.edit_original_response.assert_called_once_with(view=new_view)
 
     async def test_returns_new_view(self):
         interaction = _make_interaction()
@@ -144,11 +149,14 @@ class TestPopRebuild:
 
         pop_interaction.edit_original_response.assert_called_once_with(view=restored)
 
-    async def test_no_rebuild_skips_defer_and_edit(self):
-        _, pop_interaction = await self._push_then_pop(rebuild=None)
+    async def test_no_rebuild_still_defers_and_edits(self):
+        """Pop matches push: the message edit fires whether or not a
+        rebuild callback is supplied.
+        """
+        restored, pop_interaction = await self._push_then_pop(rebuild=None)
 
-        pop_interaction.response.defer.assert_not_called()
-        pop_interaction.edit_original_response.assert_not_called()
+        pop_interaction.response.defer.assert_called_once()
+        pop_interaction.edit_original_response.assert_called_once_with(view=restored)
 
     async def test_empty_stack_skips_rebuild(self):
         """pop() on empty stack returns None and does not call rebuild."""
@@ -214,17 +222,24 @@ class TestRebuildDictReturn:
 
         interaction.edit_original_response.assert_called_once_with(view=new_view)
 
-    async def test_message_captured_from_edit_response(self):
+    async def test_parent_message_ref_preserved_through_push(self):
+        """The parent's plain ``Message`` ref carries through push.
+        The ``edit_original_response`` return value is interaction-bound
+        with a 15-minute lifetime; the plain ref provides the channel
+        endpoint that subsequent edits need.
+        """
         interaction = _make_interaction()
-        msg_mock = MagicMock(id=42)
-        interaction.edit_original_response = AsyncMock(return_value=msg_mock)
+        edit_response = MagicMock(id=42)
+        interaction.edit_original_response = AsyncMock(return_value=edit_response)
 
+        parent_message = MagicMock(id=1, channel=MagicMock(id=2))
         hub = _HubView(interaction=interaction)
-        hub._message = MagicMock(id=1, channel=MagicMock(id=2))
+        hub._message = parent_message
 
         new_view = await hub.push(_SubView, interaction, rebuild=lambda v: None)
 
-        assert new_view._message is msg_mock
+        assert new_view._message is parent_message
+        assert new_view._message is not edit_response
 
     async def test_async_dict_return(self):
         interaction = _make_interaction()

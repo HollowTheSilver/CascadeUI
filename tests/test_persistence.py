@@ -282,15 +282,15 @@ class TestManagerApplyMigrations:
 
     async def test_missing_migrator_raises(self):
         be = InMemoryBackend()
-        # Pre-set an older version with no migrator registered. Pretend
-        # current is 1 and we have a v0 on disk with no v0->v1 migrator.
+        # Pre-set an older version with no migrator registered. Treat
+        # current as 1 with a v0 on disk and no v0->v1 migrator.
         await be.set_schema_version(TABLE_PERSISTENT_VIEWS, 0)
         # Manually push on-disk below current so the migrator loop runs.
         be._schema_versions[TABLE_PERSISTENT_VIEWS] = -1  # below 0 sentinel
         # The manager treats 0 as "fresh install" and records current
-        # without running migrators. To force the missing-migrator path
-        # we poke _MIGRATORS lookup directly via a value > 0 that has
-        # no registered migrator.
+        # without running migrators. Forcing the missing-migrator path
+        # requires poking _MIGRATORS lookup directly via a value > 0
+        # that has no registered migrator.
         be._schema_versions[TABLE_PERSISTENT_VIEWS] = 0
 
         mgr = PersistenceManager(
@@ -709,6 +709,101 @@ class TestManagerReattachInitKwargsDuplicate:
         assert view.theme is None
 
 
+# // ========================================( Reattach batching )======================================== // #
+
+
+class TestReattachBatching:
+    """``_reattach_one`` wraps the registration dispatches and ``on_restore``
+    in a single ``store.batch()`` so each restored view produces one
+    BATCH_COMPLETE notification instead of three (or more) standalone
+    cycles. With N persistent views the savings scale linearly.
+    """
+
+    async def test_three_dispatches_collapse_to_one_notification(self):
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        class _SilentPanel(PersistentLayoutView):
+            pass
+
+        be = InMemoryBackend()
+        await be.initialize()
+
+        await be.row_upsert(
+            TABLE_PERSISTENT_VIEWS,
+            {
+                "persistence_key": "panel:batch",
+                "view_class": _SilentPanel.__qualname__,
+                "custom_id": None,
+                "message_id": 1,
+                "channel_id": 2,
+                "guild_id": None,
+                "user_id": None,
+                "session_id": None,
+                "init_kwargs": json.dumps({"persistence_key": "panel:batch"}),
+                "kwargs_schema_version": 1,
+                "schema_version": 1,
+                "created_at": 1,
+                "updated_at": 1,
+            },
+            ["persistence_key"],
+        )
+
+        store = get_store()
+
+        mgr = PersistenceManager(
+            store=store,
+            registry=RegistryPersistence(backend=be),
+        )
+        await mgr.rehydrate()
+
+        # A catch-all subscriber (filter=None) records every notification
+        # it receives. Without the batch wrap, _reattach_one's three
+        # dispatches (SESSION_CREATED + VIEW_CREATED + VIEW_UPDATED)
+        # would each trigger a separate notification cycle and the
+        # subscriber would fire three times. With the batch wrap, the
+        # three dispatches collapse into a single BATCH_COMPLETE
+        # notification and the subscriber fires exactly once.
+        notification_actions = []
+
+        async def catch_all(state, action):
+            notification_actions.append(action.get("type"))
+
+        store.subscribe("test_catch_all", catch_all, None)
+
+        try:
+
+            class _Channel:
+                id = 2
+
+            class _Msg:
+                id = 1
+                channel = _Channel()
+
+            class _FakeBot:
+                def add_view(self, view, message_id):
+                    pass
+
+            mgr._bot = _FakeBot()
+
+            outcome = await mgr._reattach_one(
+                row=mgr._registry_rows[0],
+                view_cls=_SilentPanel,
+                init_kwargs={"persistence_key": "panel:batch"},
+                message=_Msg(),
+                class_name=_SilentPanel.__qualname__,
+            )
+
+            await store._flush_notifications()
+
+            assert outcome == "restored"
+            # Single notification cycle: BATCH_COMPLETE carries the three
+            # queued actions in its payload. Without batching, the catch-all
+            # subscriber would have fired three separate times.
+            assert notification_actions == ["BATCH_COMPLETE"]
+        finally:
+            store._unsubscribe("test_catch_all")
+
+
 # // ========================================( PersistenceMiddleware setup )======================================== // #
 
 
@@ -840,7 +935,7 @@ class TestMigratorRegistries:
     """register_migrator / register_kwargs_migrator collision and lookup."""
 
     def teardown_method(self, method):
-        # Clean per-test so we can re-register without raising.
+        # Clean per-test so re-registration succeeds without raising.
         _MIGRATORS.clear()
         _KWARGS_MIGRATORS.clear()
 

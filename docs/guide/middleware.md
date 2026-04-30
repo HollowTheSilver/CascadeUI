@@ -88,7 +88,7 @@ Fans writes across two namespaces (registry, application) with independent debou
 
 Construct `PersistenceMiddleware` directly with the backends and bot reference it needs; `setup_middleware` installs it and its `initialize(store)` method runs the full pipeline (manager build, backend init, migrations, blocking rehydrate, message-cleanup listener, reattach). See [Persistence](persistence.md) for the full setup flow.
 
-The middleware skips built-in bookkeeping actions (`SESSION_CREATED`, `VIEW_CREATED`, `VIEW_UPDATED`, `COMPONENT_INTERACTION`, navigation actions, `UNDO`, `REDO`) entirely, and uses a state identity check to skip dispatch-only actions that don't change state. Only custom reducer actions that actually mutate state trigger debounced writes. Slots default to in-memory; the middleware consults `is_persistent_slot(name)` during its identity-diff scan and only writes slots that have been opted in -- either via the `persistent_slots` class attribute on a `_StatefulMixin` subclass or via `SlotPolicy(persistent=True)` at setup time.
+The middleware uses a state identity check to skip actions that don't mutate state, so dispatch-only or pure-bookkeeping actions never trigger a write. Only state-mutating actions on opted-in slots reach disk. Slots default to in-memory; the middleware consults `is_persistent_slot(name)` during its identity-diff scan and only writes slots that have been opted in -- either via the `persistent_slots` class attribute on a `_StatefulMixin` subclass or via `SlotPolicy(persistent=True)` at setup time.
 
 ### Undo Middleware
 

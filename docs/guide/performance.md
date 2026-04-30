@@ -139,12 +139,19 @@ The split has three consequences:
   channel `PATCH` endpoint with no behavior change. On a 429 the
   reactive backoff arms and the edit is swallowed; on any other HTTP
   error the edit falls through to the channel path so a transient
-  interaction-endpoint failure never loses the refresh. **Pattern
-  callbacks deliberately do NOT pre-defer** because a manual
-  `defer()` consumes the response slot and forces the refresh onto
-  the slower two-call channel path. The post-callback defer in
-  `_scheduled_task` acks the interaction after the callback returns,
-  keeping the fast path engaged for every rebuild+refresh click.
+  interaction-endpoint failure never loses the refresh. On a stall
+  past `auto_defer_delay - 1.0` seconds (default 1.5s), the
+  `wait_for` guard cancels the in-flight edit and `refresh()` returns
+  immediately rather than falling through -- a second edit on top of
+  the cancelled fast path would consume the auto-defer timer's ack
+  budget under genuine Discord latency. See
+  [Fast-Path Stall Under Discord Edit Latency](known-limitations.md#fast-path-stall-under-discord-edit-latency)
+  for the trade-off. **Pattern callbacks deliberately do NOT
+  pre-defer** because a manual `defer()` consumes the response slot
+  and forces the refresh onto the slower two-call channel path. The
+  post-callback defer in `_scheduled_task` acks the interaction after
+  the callback returns, keeping the fast path engaged for every
+  rebuild+refresh click.
 
 The ordering tradeoff: subscriber completion relative to hook
 completion is no longer strict. Hooks are awaited inline after

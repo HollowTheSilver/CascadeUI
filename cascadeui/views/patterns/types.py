@@ -1,13 +1,15 @@
 # // ========================================( Modules )======================================== // #
 
 
-"""Public typed-schema surface for form and wizard patterns.
+"""Public typed-schema surface for form, wizard, and roles patterns.
 
 The dataclasses declared here carry typed ``FormView`` / ``WizardView``
-inputs and validate them at class-definition time. The existing
-``fields=[dict, ...]`` / ``steps=[dict, ...]`` dict APIs remain valid;
-patterns normalize either shape into the same internal dict list at
-construction.
+/ ``RolesLayoutView`` inputs and validate them at class-definition
+time. The existing ``fields=[dict, ...]`` / ``steps=[dict, ...]`` dict
+APIs remain valid for form and wizard; patterns normalize either shape
+into the same internal dict list at construction. Roles uses the
+typed ``RoleCategory`` exclusively because cardinality flags
+(``exclusive``, ``required``) benefit from dataclass validation.
 
 Public exports (also re-exported from ``cascadeui``):
 
@@ -15,6 +17,7 @@ Public exports (also re-exported from ``cascadeui``):
     - ``WizardStep`` -- typed dataclass for a single wizard step
     - ``FormSchema`` -- base class for declarative form definitions
     - ``WizardSchema`` -- base class for declarative wizard definitions
+    - ``RoleCategory`` -- typed dataclass for a role-assign category
 """
 
 from dataclasses import dataclass, field
@@ -222,6 +225,83 @@ class WizardSchema:
         raise NotImplementedError(
             f"{type(self).__name__} must override get_steps() " f"to return a list[WizardStep]."
         )
+
+
+# // ========================================( RoleCategory )======================================== // #
+
+
+@dataclass
+class RoleCategory:
+    """Typed declaration of a single role-assign category.
+
+    Accepted by ``RolesLayoutView`` / ``PersistentRolesLayoutView`` via
+    the class-level ``categories`` attribute::
+
+        class MyRoles(PersistentRolesLayoutView):
+            categories = [
+                RoleCategory(
+                    name="Colors",
+                    roles={"Red": 111, "Blue": 222, "Green": 333},
+                    exclusive=True,
+                    color=discord.Color.red(),
+                ),
+            ]
+
+    Cardinality is controlled by two orthogonal flags:
+
+    - ``exclusive``: at most one role in the category may be active.
+      Selecting another removes the previously-active one (swap).
+    - ``required``: at least one role in the category must stay active.
+      Removing the last role is rejected.
+
+    The four combinations (free / radio-optional / required-checkbox /
+    radio-required) all produce valid cardinality behavior; the pattern
+    enforces whichever constraints are set.
+
+    Validation at class-definition time: ``name`` and ``roles`` are
+    required and non-empty; ``roles`` values must be integers (role
+    IDs); ``exclusive`` and ``required`` must be booleans.
+    """
+
+    name: str
+    roles: Dict[str, int]
+    exclusive: bool = False
+    required: bool = False
+    color: Optional[discord.Color] = None
+    button_style: Optional[discord.ButtonStyle] = None
+    icon: Optional[str] = None
+    description: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name:
+            raise ValueError(f"RoleCategory.name must be a non-empty string (got {self.name!r})")
+        if not isinstance(self.roles, dict) or not self.roles:
+            raise ValueError(
+                f"RoleCategory.roles must be a non-empty dict "
+                f"(category name={self.name!r}, got {type(self.roles).__name__})"
+            )
+        for role_name, role_id in self.roles.items():
+            if not isinstance(role_name, str) or not role_name:
+                raise ValueError(
+                    f"RoleCategory.roles keys must be non-empty strings "
+                    f"(category name={self.name!r}, got key {role_name!r})"
+                )
+            if not isinstance(role_id, int) or isinstance(role_id, bool):
+                raise ValueError(
+                    f"RoleCategory.roles values must be integer role IDs "
+                    f"(category name={self.name!r}, role label={role_name!r}, "
+                    f"got {type(role_id).__name__}: {role_id!r})"
+                )
+        if not isinstance(self.exclusive, bool):
+            raise ValueError(
+                f"RoleCategory.exclusive must be a bool "
+                f"(category name={self.name!r}, got {type(self.exclusive).__name__})"
+            )
+        if not isinstance(self.required, bool):
+            raise ValueError(
+                f"RoleCategory.required must be a bool "
+                f"(category name={self.name!r}, got {type(self.required).__name__})"
+            )
 
 
 # // ========================================( Module Helpers )======================================== // #

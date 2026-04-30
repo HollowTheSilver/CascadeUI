@@ -31,13 +31,40 @@ class _NavigationMixin:
     # // ==================( Navigation Stack )================== // #
 
     async def _navigate_to(
-        self, view_class, interaction=None, *, action_type, action_payload, **kwargs
+        self, view_or_class, interaction=None, *, action_type, action_payload, **kwargs
     ):
-        """Internal: clean up current view, dispatch navigation action, construct next view.
+        """Internal: clean up current view, dispatch navigation action, set up next view.
 
         All navigation methods (push, replace, pop) share this path so cleanup
         and kwarg forwarding stay consistent in one place.
+
+        The first positional argument can be either a view class or a
+        pre-constructed view instance. A class path constructs the view
+        internally via ``view_class(**kwargs)``. An instance path uses
+        the instance directly and rejects extra kwargs -- the instance
+        is already built. Both paths run ``_register_view`` and
+        ``_register_state`` here because ``__init__`` wires the
+        subscriber and stores identity but does not dispatch
+        SESSION_CREATED / VIEW_CREATED; only this method and
+        ``_send_pipeline`` do.
         """
+        is_instance = not isinstance(view_or_class, type)
+        if is_instance:
+            if kwargs:
+                raise TypeError(
+                    f"_navigate_to received a pre-constructed view instance "
+                    f"({type(view_or_class).__name__}) but also extra kwargs "
+                    f"{sorted(kwargs)}. Pre-constructed instances are already "
+                    f"initialized; extra kwargs cannot be applied. Pass the "
+                    f"class plus kwargs, or construct the instance with all "
+                    f"required kwargs upfront."
+                )
+            new_view = view_or_class
+            view_class = type(new_view)
+        else:
+            view_class = view_or_class
+            new_view = None  # constructed inside the batch below
+
         current_interaction = interaction or self.interaction
 
         # Version enforcement for push/pop -- these edit the same message, so
@@ -79,18 +106,47 @@ class _NavigationMixin:
         async with self.state_store.batch() as batch:
             await self.state_store.dispatch(action_type, action_payload, source_id=self.id)
 
-            # Pass through state store, session, and scoping context
-            if "state_store" not in kwargs:
-                kwargs["state_store"] = self.state_store
-            if "session_id" not in kwargs:
-                kwargs["session_id"] = self.session_id
-            if "user_id" not in kwargs:
-                kwargs["user_id"] = self.user_id
-            if "guild_id" not in kwargs:
-                kwargs["guild_id"] = self.guild_id
+            if not is_instance:
+                # Pass through state store, session, and scoping context
+                if "state_store" not in kwargs:
+                    kwargs["state_store"] = self.state_store
+                if "session_id" not in kwargs:
+                    kwargs["session_id"] = self.session_id
+                if "user_id" not in kwargs:
+                    kwargs["user_id"] = self.user_id
+                if "guild_id" not in kwargs:
+                    kwargs["guild_id"] = self.guild_id
 
-            # Create new view
-            new_view = view_class(interaction=current_interaction, **kwargs)
+                # Create new view
+                new_view = view_class(interaction=current_interaction, **kwargs)
+            else:
+                # Pre-constructed instance: __init__ wired the subscriber
+                # and populated session_id / user_id / guild_id /
+                # state_store from whatever interaction or kwargs the
+                # caller passed. _register_state has not run yet (only
+                # _send_pipeline and this method dispatch it), so
+                # rebinding these fields here is safe -- nothing in
+                # state references the instance's auto-derived values.
+                #
+                # session_id rebinds to the parent's session so
+                # shared_data and the session lifecycle behave
+                # identically to the class path. Skipping this would
+                # destroy the parent's session when the parent is
+                # cleaned up (last-member rule), losing parent
+                # shared_data across navigation. user_id, guild_id,
+                # and state_store typically already match because the
+                # instance was constructed from the same interaction
+                # as the parent; rebind defensively for the
+                # cross-interaction edge case.
+                if not new_view._init_kwargs.get("session_id"):
+                    new_view.session_id = self.session_id
+                if not new_view._init_kwargs.get("user_id"):
+                    new_view.user_id = self.user_id
+                if not new_view._init_kwargs.get("guild_id"):
+                    new_view.guild_id = self.guild_id
+                if not new_view._init_kwargs.get("state_store"):
+                    new_view.state_store = self.state_store
+
             new_view._ephemeral = self._ephemeral
 
             # Rebind the batch source so BATCH_COMPLETE carries the new
@@ -138,18 +194,27 @@ class _NavigationMixin:
             # Sub-views from push/pop typically edit the existing message instead
             # of calling send(), so register_view() must happen here -- otherwise
             # the sub-view is invisible to session limit enforcement.
+            # Pre-constructed instances also need this: __init__ wires the
+            # subscriber and stores identity, but register_view fires only
+            # from _send_pipeline or this navigation path.
             self.state_store._register_view(new_view)
 
             # Propagate participants for push/pop (same users, same message).
             # replace() is a one-way transition -- participants don't carry over.
+            # The membership-check guard makes the propagation idempotent for
+            # pre-constructed instances that already hold participants.
             if action_type != "NAVIGATION_REPLACE" and self._participants:
                 for pid in self._participants:
-                    new_view._participants.add(pid)
-                    self.state_store._register_participant(new_view, pid)
+                    if pid not in new_view._participants:
+                        new_view._participants.add(pid)
+                        self.state_store._register_participant(new_view, pid)
 
             # Register the new view in state BEFORE destroying the old one.
             # This keeps session["members"] non-empty during the transition
-            # so the session is not prematurely deleted.
+            # so the session is not prematurely deleted. Both class and
+            # instance paths reach this -- _register_state dispatches the
+            # SESSION_CREATED + VIEW_CREATED actions that populate the
+            # state row, and __init__ does not do this.
             await new_view._register_state()
 
             # Push/pop targets inherit the parent's message without routing
@@ -176,22 +241,35 @@ class _NavigationMixin:
 
         return new_view
 
-    async def push(self, view_class, interaction=None, *, rebuild=None, **kwargs):
+    async def push(self, view_or_class, interaction=None, *, rebuild=None, **kwargs):
         """Push a new view onto the navigation stack.
 
         The current view's class is saved so pop() can reconstruct it later.
         Use this for drill-down UIs where the user needs a "back" path.
 
+        ``view_or_class`` accepts either a view class (constructed
+        internally with ``**kwargs``) or a pre-constructed view instance
+        (used directly; ``**kwargs`` must be empty). The instance form
+        unblocks views built by async classmethods like
+        ``PaginatedLayoutView.from_data`` and ``from_cursor``, where
+        the construction step happens before the navigation call.
+
         Args:
-            view_class: The StatefulView subclass to push to.
+            view_or_class: A StatefulView subclass to construct, or a
+                pre-constructed instance to use directly.
             interaction: Discord interaction for the new view.
-            rebuild: Optional callable(view) to rebuild the new view's UI after
-                construction. When provided, the interaction is auto-deferred
-                and the message is edited with the rebuilt view. Accepts both
-                sync and async callables. If the callable returns a dict, those
-                are passed as extra kwargs to edit_original_response (e.g.
-                ``{"embed": view.build_embed()}`` for V1 views).
+            rebuild: Optional pre-edit hook ``callable(view)`` for views
+                that need post-construction setup (V2 views that build
+                empty and need ``v.build_ui()``; V1 views that need to
+                return an ``embed`` / ``content`` dict for the edit).
+                Accepts sync or async callables. When the callable
+                returns a dict, its contents flow into
+                ``edit_original_response`` as extra kwargs (e.g.
+                ``{"embed": view.build_embed()}``). The Discord message
+                is edited with the new view regardless of whether
+                ``rebuild`` is supplied.
             **kwargs: Additional kwargs passed to the new view constructor.
+                Must be empty when ``view_or_class`` is an instance.
         """
         push_payload = ActionCreators.navigation_push(
             session_id=self.session_id,
@@ -201,7 +279,7 @@ class _NavigationMixin:
         )
 
         new_view = await self._navigate_to(
-            view_class,
+            view_or_class,
             interaction,
             action_type="NAVIGATION_PUSH",
             action_payload=push_payload,
@@ -212,27 +290,7 @@ class _NavigationMixin:
         if new_view.auto_back_button:
             new_view._add_back_button()
 
-        if rebuild is not None:
-            current_interaction = interaction or self.interaction
-            if current_interaction:
-                await self._safe_defer(current_interaction)
-            result = rebuild(new_view)
-            if asyncio.iscoroutine(result):
-                result = await result
-            edit_kwargs = result if isinstance(result, dict) else {}
-            if current_interaction:
-                try:
-                    msg = await current_interaction.edit_original_response(
-                        view=new_view, **edit_kwargs
-                    )
-                    new_view._message = msg
-                except discord.HTTPException:
-                    # Interaction token expired (15-min lifetime). Route the
-                    # channel-endpoint fallback through refresh() so it picks
-                    # up cooldown throttling and 429 backoff instead of
-                    # racing with state-driven refreshes.
-                    if new_view._message:
-                        await new_view.refresh(**edit_kwargs)
+        await self._apply_navigation_edit(new_view, interaction, rebuild)
 
         return new_view
 
@@ -243,12 +301,12 @@ class _NavigationMixin:
 
         Args:
             interaction: Discord interaction.
-            rebuild: Optional callable(view) to rebuild the restored view's UI.
-                When provided, the interaction is auto-deferred and the message
-                is edited with the rebuilt view. Accepts both sync and async
-                callables. If the callable returns a dict, those are passed as
-                extra kwargs to edit_original_response (e.g.
-                ``{"embed": view.build_embed()}`` for V1 views).
+            rebuild: Optional pre-edit hook ``callable(view)`` for the
+                restored view. Same shape as ``push(rebuild=...)``: V2
+                views run ``v.build_ui()``, V1 views return an
+                ``embed`` / ``content`` dict for the edit. The message
+                is edited with the restored view regardless of whether
+                ``rebuild`` is supplied.
         """
         if not self.session_id:
             return None
@@ -282,29 +340,54 @@ class _NavigationMixin:
             **saved_kwargs,
         )
 
+        await self._apply_navigation_edit(new_view, interaction, rebuild)
+
+        return new_view
+
+    async def _apply_navigation_edit(self, new_view, interaction, rebuild):
+        """Defer the interaction, run the optional rebuild hook, edit the message.
+
+        Shared by ``push()`` and ``pop()``. The message edit happens
+        whenever a current interaction is available, regardless of
+        whether a ``rebuild`` callback was supplied -- the navigation
+        contract is that the Discord message reflects the new view.
+
+        ``rebuild`` is an optional pre-edit hook for callers whose
+        views need post-construction setup (V2 views that build empty
+        and need ``v.build_ui()``, V1 views that need to return an
+        ``embed``/``content`` dict). When ``rebuild`` returns a dict,
+        its contents flow into ``edit_original_response`` as extra
+        kwargs.
+        """
+        current_interaction = interaction or self.interaction
+        if current_interaction is None:
+            return
+
+        await self._safe_defer(current_interaction)
+
+        edit_kwargs: dict = {}
         if rebuild is not None:
-            current_interaction = interaction or self.interaction
-            if current_interaction:
-                await self._safe_defer(current_interaction)
             result = rebuild(new_view)
             if asyncio.iscoroutine(result):
                 result = await result
-            edit_kwargs = result if isinstance(result, dict) else {}
-            if current_interaction:
-                try:
-                    msg = await current_interaction.edit_original_response(
-                        view=new_view, **edit_kwargs
-                    )
-                    new_view._message = msg
-                except discord.HTTPException:
-                    # Interaction token expired (15-min lifetime). Route the
-                    # channel-endpoint fallback through refresh() so it picks
-                    # up cooldown throttling and 429 backoff instead of
-                    # racing with state-driven refreshes.
-                    if new_view._message:
-                        await new_view.refresh(**edit_kwargs)
+            if isinstance(result, dict):
+                edit_kwargs = result
 
-        return new_view
+        try:
+            msg = await current_interaction.edit_original_response(view=new_view, **edit_kwargs)
+            # Preserve the parent's plain Message ref. The edit response
+            # is an InteractionMessage / WebhookMessage bound to the
+            # 15-minute interaction token; subsequent edits need the
+            # channel endpoint, which the plain ref provides.
+            if new_view._message is None:
+                new_view._message = msg
+        except discord.HTTPException:
+            # Interaction token expired (15-min lifetime). Route the
+            # channel-endpoint fallback through refresh() so it picks
+            # up cooldown throttling and 429 backoff instead of
+            # racing with state-driven refreshes.
+            if new_view._message:
+                await new_view.refresh(**edit_kwargs)
 
     def _add_back_button(self):
         """Add a back button that pops the nav stack."""
@@ -312,31 +395,45 @@ class _NavigationMixin:
         async def back_callback(interaction):
             await self._safe_defer(interaction)
             prev_view = await self.pop(interaction)
-            if prev_view:
-                try:
-                    # Always edit via the interaction token so the deferred
-                    # response is properly consumed by Discord
-                    await interaction.edit_original_response(view=prev_view)
-                except discord.HTTPException:
-                    pass
-            else:
+            if prev_view is None:
                 # Stack was empty -- pop() already stopped/unsubscribed this view,
                 # so remove the dead components from the message to avoid a broken UI
                 try:
                     await interaction.edit_original_response(view=None)
                 except discord.HTTPException:
                     pass
+            # When prev_view is non-None, pop() routed through _apply_navigation_edit
+            # which already swapped the message to the restored view.
 
-        self.add_item(
-            StatefulButton(
-                label="Back",
-                style=discord.ButtonStyle.secondary,
-                emoji="\u25c0",
-                row=4,
-                custom_id=f"nav_back_{self.id[:8]}",
-                callback=back_callback,
-            )
+        button = StatefulButton(
+            label="Back",
+            style=discord.ButtonStyle.secondary,
+            emoji="\u25c0",
+            row=4,
+            custom_id=f"nav_back_{self.id[:8]}",
+            callback=back_callback,
         )
+        # Stash the item so paginated / tabbed / wizard rebuild paths that
+        # call ``clear_items()`` can restore the navigation back button
+        # after recomposing their own component tree.
+        self._auto_back_item = button
+        self.add_item(button)
+
+    def _restore_navigation_artifacts(self) -> None:
+        """Re-add auto-added navigation items stripped by ``clear_items()``.
+
+        Pattern rebuild paths (paginated page turns, tab switches, form
+        re-layout, menu refresh, role panel rebuild) clear the view's
+        children and recompose the tree from scratch. The auto back
+        button injected by :meth:`_add_back_button` during ``push()``
+        sits as a top-level child and would be lost on every rebuild
+        without this restore step. Idempotent: a no-op when no back
+        button is registered or when the rebuild path already re-added
+        the item by other means.
+        """
+        back_item = getattr(self, "_auto_back_item", None)
+        if back_item is not None and back_item not in self.children:
+            self.add_item(back_item)
 
     # // ==================( Undo/Redo )================== // #
 
@@ -384,18 +481,27 @@ class _NavigationMixin:
 
     # // ==================( Transitions )================== // #
 
-    async def replace(self, view_class, interaction=None, **kwargs):
+    async def replace(self, view_or_class, interaction=None, **kwargs):
         """Replace the current view with a new one (no stack history saved).
 
         Use this for one-way transitions where going "back" doesn't apply,
         such as welcome screen -> main dashboard.
+
+        ``view_or_class`` accepts either a view class (constructed
+        internally with ``**kwargs``) or a pre-constructed view instance
+        (used directly; ``**kwargs`` must be empty). The instance form
+        unblocks views built by async classmethods like
+        ``PaginatedLayoutView.from_data`` and ``from_cursor``.
         """
+        destination_class = (
+            view_or_class if isinstance(view_or_class, type) else type(view_or_class)
+        )
         replace_payload = ActionCreators.navigation_replace(
-            destination=view_class.__name__,
+            destination=destination_class.__name__,
         )
 
         return await self._navigate_to(
-            view_class,
+            view_or_class,
             interaction,
             action_type="NAVIGATION_REPLACE",
             action_payload=replace_payload,

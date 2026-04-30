@@ -170,8 +170,9 @@ cannot receive live updates.
   entries on every pass, so long-lived parents that spawn many refreshed
   children (e.g. a game view across many rounds) do not accumulate stale
   references.
-- The new/refreshed view is fully functional, correctly wired to the
-  store, and receives all live updates.
+- The new/refreshed view does not inherit the dead token -- it carries
+  the click's fresh token, so subsequent edits and live updates land
+  through a working webhook endpoint rather than the expired one.
 
 **Why there is no workaround:** deleting an ephemeral is a
 [documented Discord API](https://discord.com/developers/docs/interactions/receiving-and-responding#edit-followup-message)
@@ -188,6 +189,122 @@ convenience of not having to click the in-panel button.
 **Impact on game/app state:** none. Only the visual presentation is
 affected. Downstream logic that reads `_active_views`, session scope
 keys, subscribers, or `_attached_children` sees consistent, correct data.
+
+---
+
+## Burst-Click Toast Under `serialize_interactions = True`
+
+CascadeUI serializes interactions per view by default
+(`serialize_interactions = True`) so that rapid-fire clicks do not
+race each other's `message.edit()` calls. The lock holds each click's
+callback until the previous click finishes its rebuild and edit.
+Combined with Discord's REST latency (hundreds of milliseconds per
+call, varying with backend load, geography, and the bot's own
+resource pressure), a fast clicker can saturate the queue: enough
+clicks in a short window eventually push a queued click past the
+auto-defer threshold. The exact threshold depends on per-click
+latency, which is itself unstable at scale -- the library has not
+been stress-tested with hundreds of concurrent users on a single
+view. The auto-defer timer pre-acks the queued click, the
+acting-view fast path is then disqualified, the refresh falls
+through to the channel endpoint, and the work completes
+correctly -- but Discord's client may briefly show *"This
+interaction failed"* before the channel-endpoint edit lands.
+
+**What actually happens:** the click DID succeed. State mutated, the
+reducer ran, subscribers fired, the message edited. The toast is a
+Discord UI artifact, not a library failure. The bot's logs show no
+error.
+
+**Mitigations** (per-view, all class-attribute overrides):
+
+- `auto_defer_delay = 2.8` -- gives the queue a wider window before
+  pre-acking. Stay under 3.0s; Discord's hard interaction timeout
+  is the ceiling.
+- `serialize_interactions = False` -- skips the lock entirely on
+  views where parallel rebuilds are safe (read-only displays, views
+  that mutate independent state slices). Race-prone views (game
+  boards, shared lists) should keep the lock.
+
+**Why no library-default fix:** dropping the lock reintroduces
+concurrent rebuild races, where rapid clicks can produce visual
+flicker and occasional state corruption rather than a brief toast.
+Raising the default `auto_defer_delay` past 2.5s reduces the
+defer-call headroom (currently 500ms before Discord's 3s wall);
+under Discord-side latency spikes the defer call could itself land
+past the wall, trading one toast cause for another. The per-view
+knobs let bot authors tune their burst-prone views without weakening
+the global default for views that have different timing
+characteristics.
+
+**On observing this at scale.** CascadeUI ships
+`/cascadeui perf [on|off|status|clear]` (and the Inspector's
+Performance tab) to collect per-dispatch timing samples without
+patching the library. Bot authors running at higher concurrency than
+the development test bench should turn profiling on for a session
+and inspect `notify_ms` p95/max against their actual user load --
+that data, not the development-bench timings cited above, is what
+should drive any per-view tuning.
+
+---
+
+## Fast-Path Stall Under Discord Edit Latency
+
+The acting-view fast path normally combines the message edit and
+the interaction ack into one HTTP round trip in tens of milliseconds.
+Under genuine Discord-side latency on the interaction-edit endpoint
+(latency spike, ephemeral backend under load, geographic routing
+pressure), the same call can take longer than
+`auto_defer_delay - 1.0` seconds. When that happens, the `wait_for`
+guard cancels the stalled edit and `refresh()` returns immediately.
+The auto-defer timer then fires the standalone ack at
+`auto_defer_delay` seconds with the full remaining budget, so the
+click is acked normally and no *"interaction failed"* toast appears.
+
+**The cost is one missed visible UI update for that click.** The
+rebuilt component tree is NOT re-shipped through the channel
+endpoint after the stall, because a second edit attempt on top of
+the cancelled fast path would consume the timer's ack budget and
+reintroduce the very toast the design exists to prevent. The next
+state-change refresh ships the up-to-date tree, so users see the
+cumulative effect of any clicks that landed during stalls.
+
+In practice this matters only on the rare clicks where Discord
+itself is slow. Views that mutate visible state on every click
+(toggles, game boards, settings panels) rarely notice -- the next
+click refreshes the tree.
+
+**Mitigations** (per-view, all class-attribute overrides):
+
+- `auto_defer_delay = 2.8` -- widens both the fast-path budget
+  (1.8s) and the timer fire window. Same trade-off as the
+  burst-click section above; stay under 3.0s.
+- For callbacks where heavy work plus refresh routinely exceeds a
+  second, follow the slow-callback pattern in
+  [`concepts.md`](concepts.md#exception-callbacks-that-genuinely-take-more-than-two-seconds)
+  (`await self._safe_defer(interaction)` at the top of the
+  callback). The click acks immediately and the refresh routes
+  through the channel endpoint deliberately.
+
+**A residual case CascadeUI cannot eliminate.** The auto-defer
+timer's own `defer()` call is itself a Discord HTTP request. Under
+sustained Discord-side latency, the timer's ack call can also take
+longer than expected. If both the fast-path edit AND the timer's
+defer hit the same latency window, the cumulative cost can cross
+the 3-second deadline and a toast appears. This applies to any
+interaction, not just refreshing ones -- a select-menu callback
+that does nothing more than store an instance attribute can still
+hit the toast if Discord's defer endpoint is slow at that moment.
+Geographic distance to Discord's POPs is the dominant variable;
+bots running far from Discord's regions hit this more than ones
+running near them. The framework cannot mitigate platform-wide
+latency.
+
+**On observing this at scale.** Run `/cascadeui perf` against real
+user load. If `notify_ms` p95 routinely exceeds
+`(auto_defer_delay - 1.0) * 1000` ms, the fast path is being
+cancelled often enough to be visible -- tune toward whatever
+threshold the data implies.
 
 ---
 

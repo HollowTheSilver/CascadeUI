@@ -1,7 +1,7 @@
 # // ========================================( Modules )======================================== // #
 
 
-from typing import Iterable, Optional, Set
+from typing import Any, Dict, FrozenSet, Iterable, Optional, Set
 
 # // ========================================( Functions )======================================== // #
 
@@ -70,3 +70,43 @@ def coerce_snowflake_id_set(values: Optional[Iterable]) -> Set[int]:
             raise TypeError("None is not a valid snowflake ID inside a collection")
         result.add(coerce_snowflake_id(v))
     return result
+
+
+def coerce_snowflake_match(
+    match_dict: Dict[str, Any],
+    snowflake_keys: FrozenSet[str],
+) -> Dict[str, Any]:
+    """Coerce named regex capture groups to ``int`` for known snowflake keys.
+
+    Complements :func:`coerce_snowflake_id` / :func:`coerce_snowflake_id_set`
+    for the regex-template case: ``DynamicItem`` subclasses receive a
+    ``match`` object whose ``.groupdict()`` holds string values (or
+    ``None`` for optional groups). This helper converts those strings
+    to ``int`` for any key known to hold a Discord snowflake, leaving
+    non-snowflake keys unchanged.
+
+    Args:
+        match_dict: The raw ``match.groupdict()`` from a regex template
+            match.
+        snowflake_keys: Frozen set of group names to coerce (e.g.
+            ``{"user_id", "role_id"}``).
+
+    Returns:
+        A new ``dict`` with snowflake-named keys coerced to ``int``.
+        Keys not in *snowflake_keys* pass through unchanged. ``None``
+        values survive for optional groups.
+
+    Raises:
+        ValueError: If a snowflake key's value is a non-digit string.
+            A template written as ``(?P<user_id>[0-9]+)`` cannot trip
+            this because the regex guarantees digits; it fires only
+            when a subclass names a capture after a snowflake field
+            but uses a non-digit pattern (a programmer error).
+    """
+    out = dict(match_dict)
+    for key in snowflake_keys & match_dict.keys():
+        raw = match_dict[key]
+        if raw is None:
+            continue
+        out[key] = int(raw)
+    return out

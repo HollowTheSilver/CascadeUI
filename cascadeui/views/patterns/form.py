@@ -12,6 +12,7 @@ from ...components.base import StatefulButton, StatefulSelect
 from ...components.inputs import Modal as CascadeModal
 from ...components.inputs import TextInput as CascadeTextInput
 from ...components.patterns.v2 import alert, card
+from ...components.types import EmojiInput
 from ..base import _StatefulMixin
 from ..layout import StatefulLayoutView
 from ..view import StatefulView
@@ -258,7 +259,7 @@ class _BaseFormMixin:
     """
 
     text_edit_button_label: ClassVar[Optional[str]] = None
-    text_edit_button_emoji: ClassVar[Optional[str]] = "\u270f\ufe0f"
+    text_edit_button_emoji: ClassVar[EmojiInput] = "\u270f\ufe0f"
     text_edit_button_style: ClassVar[discord.ButtonStyle] = discord.ButtonStyle.secondary
     _BUTTON_STYLE_ATTRS: ClassVar[tuple] = (
         *_StatefulMixin._BUTTON_STYLE_ATTRS,
@@ -948,6 +949,8 @@ class FormLayoutView(_BaseFormMixin, StatefulLayoutView):
                 self.add_item(card("\n".join(lines)))
 
             self._create_form_controls()
+            # Restore the navigation back button if push() added one.
+            self._restore_navigation_artifacts()
         finally:
             _current_theme.reset(token)
 

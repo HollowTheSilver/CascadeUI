@@ -432,6 +432,9 @@ class TabLayoutView(_BaseTabMixin, StatefulLayoutView):
         for extra in self._extra_items:
             self.add_item(extra)
 
+        # Restore the navigation back button if push() added one.
+        self._restore_navigation_artifacts()
+
         await self.refresh()
 
     async def send(self, **kwargs):

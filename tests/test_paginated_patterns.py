@@ -244,3 +244,213 @@ class TestPaginatedLayoutSinglePage:
         await view._update_page()
 
         assert view._nav_row not in list(view.children)
+
+
+# // ========================================( nav_inside_container layout )======================================== // #
+
+
+class TestPaginatedLayoutNavInsideContainer:
+    """``nav_inside_container=True`` wraps page content + nav row in a
+    single Container so the paginator renders as one cohesive card.
+    """
+
+    def test_default_keeps_nav_as_sibling(self):
+        view = PaginatedLayoutView(
+            interaction=_make_interaction(),
+            pages=[
+                [Container(TextDisplay("A"))],
+                [Container(TextDisplay("B"))],
+            ],
+        )
+        # Default flag: nav row is a top-level sibling of the page content.
+        children = list(view.children)
+        assert view._nav_row in children
+        assert view.nav_inside_container is False
+
+    def test_flag_wraps_content_and_nav_in_single_container(self):
+        class _Wrapped(PaginatedLayoutView):
+            nav_inside_container = True
+
+        view = _Wrapped(
+            interaction=_make_interaction(),
+            pages=[
+                [TextDisplay("A")],
+                [TextDisplay("B")],
+            ],
+        )
+        children = list(view.children)
+        # Exactly one top-level Container that holds both the page text
+        # and the nav row -- no separate sibling nav row.
+        assert view._nav_row not in children
+        wrappers = [c for c in children if isinstance(c, Container)]
+        assert len(wrappers) == 1
+        wrapper_items = list(wrappers[0].walk_children())
+        assert view._nav_row in wrapper_items
+
+    def test_flag_no_op_on_single_page(self):
+        """Single-page views never render a nav row, so wrapping has nothing
+        to compose -- the page content stays as a normal top-level child.
+        """
+
+        class _Wrapped(PaginatedLayoutView):
+            nav_inside_container = True
+
+        view = _Wrapped(
+            interaction=_make_interaction(),
+            pages=[[Container(TextDisplay("Only"))]],
+        )
+        # No nav row anywhere because there's only one page.
+        children = list(view.children)
+        assert view._nav_row not in children
+        # The single Container in children is the user's page content,
+        # not a wrapper added by the flag.
+        assert children[0] is view.pages[0][0]
+
+    async def test_flag_preserved_through_page_turns(self):
+        class _Wrapped(PaginatedLayoutView):
+            nav_inside_container = True
+
+        view = _Wrapped(
+            interaction=_make_interaction(),
+            pages=[
+                [TextDisplay("A")],
+                [TextDisplay("B")],
+                [TextDisplay("C")],
+            ],
+        )
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+
+        # Initial render: wrapped Container exists.
+        wrappers = [c for c in view.children if isinstance(c, Container)]
+        assert len(wrappers) == 1
+
+        # Turn the page; the wrapping must regenerate.
+        view.current_page = 1
+        await view._update_page()
+
+        wrappers = [c for c in view.children if isinstance(c, Container)]
+        assert len(wrappers) == 1
+        assert view._nav_row not in list(view.children)
+        assert view._nav_row in list(wrappers[0].walk_children())
+
+    def test_flag_no_container_nesting_when_formatter_returns_container(self):
+        """When the formatter returns a single Container per page (e.g. the
+        ``card(...)`` builder for per-page accent color), the wrapping path
+        builds a fresh Container that adopts the source's children + nav row
+        instead of nesting the source Container inside another Container.
+        Discord rejects type-17-inside-type-17 with HTTP 400 "Invalid Form
+        Body" (the field type validator only accepts (1, 9, 10, 12, 13, 14)).
+        """
+        import discord
+
+        class _Wrapped(PaginatedLayoutView):
+            nav_inside_container = True
+
+        page_a = Container(TextDisplay("A"), accent_color=discord.Color.blue())
+        page_b = Container(TextDisplay("B"), accent_color=discord.Color.green())
+
+        view = _Wrapped(
+            interaction=_make_interaction(),
+            pages=[[page_a], [page_b]],
+        )
+
+        children = list(view.children)
+        assert len(children) == 1
+        wrapper = children[0]
+
+        # The wrapper is fresh, NOT the source Container -- the source must
+        # remain pristine in self.pages so revisits do not double-add nav.
+        assert wrapper is not page_a
+
+        # Wrapper inherited the source's accent color.
+        assert wrapper.accent_color == page_a.accent_color
+
+        # No Container-in-Container in the wrapper subtree.
+        for child in wrapper.walk_children():
+            assert not isinstance(child, Container), (
+                f"Container-in-Container detected: {child!r} inside {wrapper!r}"
+            )
+
+        # Nav row is inside the wrapper.
+        assert view._nav_row in list(wrapper.walk_children())
+
+    async def test_back_button_survives_page_turn(self):
+        """``_update_page`` calls ``clear_items()`` to recompose the page
+        tree. The auto back button added by ``push()`` (via the navigation
+        mixin's ``_add_back_button``) sits as a top-level child and would
+        be stripped by the clear; the rebuild path must restore it so the
+        user is not stranded inside the pushed view after a page turn.
+        """
+        from discord.ui import ActionRow
+
+        class _Wrapped(PaginatedLayoutView):
+            nav_inside_container = True
+
+        view = _Wrapped(
+            interaction=_make_interaction(),
+            pages=[
+                [TextDisplay("A")],
+                [TextDisplay("B")],
+                [TextDisplay("C")],
+            ],
+        )
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+
+        # Simulate what _navigate_to does on push: V2 path adds an
+        # ActionRow holding the back button. The seam stashes the row
+        # on the view as ``_auto_back_item``.
+        view._add_back_button()
+        back_row = view._auto_back_item
+
+        # Sanity: the back row is currently a top-level child.
+        assert back_row in list(view.children)
+
+        # Page turn -> clear_items + rebuild.
+        view.current_page = 1
+        await view._update_page()
+
+        # The back row must still be in the tree.
+        assert back_row in list(view.children), (
+            "auto back button was stripped by _update_page rebuild"
+        )
+
+    async def test_flag_does_not_mutate_source_container_across_page_turns(self):
+        """Page turns must not accumulate state on the source Container in
+        ``self.pages``. If a previous render mutated the source by appending
+        the nav row, revisiting that page would re-append it, producing
+        duplicate button ``custom_id``s and tripping Discord's "Component
+        custom id cannot be duplicated" reject (HTTP 400).
+        """
+        import discord
+
+        class _Wrapped(PaginatedLayoutView):
+            nav_inside_container = True
+
+        page_a = Container(TextDisplay("A"), accent_color=discord.Color.blue())
+        page_b = Container(TextDisplay("B"), accent_color=discord.Color.green())
+
+        view = _Wrapped(
+            interaction=_make_interaction(),
+            pages=[[page_a], [page_b]],
+        )
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+
+        # Source pages start with one child each (the TextDisplay).
+        assert len(list(page_a.children)) == 1
+        assert len(list(page_b.children)) == 1
+
+        # Cycle: 0 -> 1 -> 0 -> 1.
+        for target in (1, 0, 1):
+            view.current_page = target
+            await view._update_page()
+
+        # Source pages must still have exactly one child each.
+        assert len(list(page_a.children)) == 1, (
+            f"page_a mutated across renders: {list(page_a.children)}"
+        )
+        assert len(list(page_b.children)) == 1, (
+            f"page_b mutated across renders: {list(page_b.children)}"
+        )

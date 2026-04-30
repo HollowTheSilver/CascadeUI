@@ -23,22 +23,247 @@ future version; entries move into a dated release header on ship.
   Pillow-backed; core install stays lean because the extra is opt-in.
 - **Redis persistence backend.** Capability-flag conformant `RedisBackend`
   with multi-process coordination and pub/sub for scoped invalidation.
-  Deferred from 3.0.0 so the backend Protocol design could settle
-  against real SQLite deployments first.
-- **`RolesLayoutView` / `PersistentRolesLayoutView`.** Multi-category
-  self-assign role panel pattern with typed `RoleCategory` schema and
-  built-in cardinality constraints (`exclusive`, `required`, and the
-  combinations). Absorbs the hand-written category dict + toggle
-  callback currently demonstrated in `v2_persistence.py`. V2-only,
-  mirrors the `LeaderboardLayoutView` / `PersistentLeaderboardLayoutView`
-  shape. The persistent variant is the primary consumer since role
-  panels are posted once and survive restarts. Example-level `required`
-  flag ships in 3.0.0 as a temporary config field; library promotion
-  lands in a later release.
+---
+
+## [3.2.0] - 2026-04-30
+
+### Added
+
+- **`DynamicPersistentButton` primitive.** New
+  `cascadeui.components.base.DynamicPersistentButton` class wrapping
+  `discord.ui.DynamicItem[discord.ui.Button]`. Supports persistent
+  buttons whose handler depends only on IDs encoded in the
+  `custom_id`, with no view-level state involved -- each click
+  re-instantiates the class from the matched template regex. Snowflake
+  capture coercion is automatic for groups named `user_id`,
+  `guild_id`, `channel_id`, `role_id`, or `message_id`. Subclasses
+  auto-register at class-definition time; `setup_middleware(
+  PersistenceMiddleware(..., bot=bot))` calls
+  `bot.add_dynamic_items(*subclasses)` so every subclass routes
+  correctly after a restart with no additional user setup.
+- **`coerce_snowflake_match(match_dict, snowflake_keys)` helper** in
+  `cascadeui.utils.coercion`. Coerces named regex capture groups to
+  `int` for known snowflake keys; complements the existing
+  `coerce_snowflake_id` / `coerce_snowflake_id_set` helpers for the
+  `DynamicPersistentButton` from-custom_id path.
+- **`RolesLayoutView` / `PersistentRolesLayoutView` pattern.** New
+  V2 multi-category role-assign panel built on top of
+  `DynamicPersistentButton`. Cardinality flags on `RoleCategory`
+  (`exclusive`, `required`, and the four combinations) are enforced
+  inside the pattern; users only declare `categories` and the pattern
+  handles button rendering, custom_id encoding, click routing,
+  cardinality logic, response messages, and restart re-attachment.
+  Three-tier customization surface: class attributes for static text /
+  hints / colors (`title`, `subtitle`, four `hint_*`, five `*_message`,
+  per-category `color` / `button_style` / `icon` / `description`),
+  classmethod hooks for dynamic rendering (`format_category_title`,
+  `format_category_hint`, `format_button_label`, `format_button_emoji`,
+  `format_button_style`), and method override for full layout control
+  (`build_category_card`). Five event hooks
+  (`on_role_assigned`, `on_role_removed`, `on_role_swap`,
+  `on_role_required_block`, `on_role_error`).
+- **`RoleCategory` typed schema** in
+  `cascadeui.views.patterns.types`. Dataclass with
+  `__post_init__` validation; required `name` and `roles` (dict
+  mapping role label to role ID), optional `exclusive` / `required`
+  cardinality flags, `color`, `button_style`, `icon`, `description`.
+- **`SelectDefaultValue` adoption** on the four specialized selects
+  (`RoleSelect`, `UserSelect`, `ChannelSelect`, `MentionableSelect`).
+  New `default_values=` constructor kwarg + `set_default_values(values)`
+  method on each select; CascadeUI coerces raw `int` IDs / Discord
+  objects (Member, User, Role, GuildChannel) / pre-built
+  `discord.SelectDefaultValue` instances to the discord.py shape with
+  the right type per select class. `MentionableSelect` infers type
+  from the object class (`Member`/`User` -> `"user"`, `Role` ->
+  `"role"`); raw `int` IDs are rejected because the type cannot be
+  inferred.
+- **Optional `description=` kwarg on every modal input wrapper**
+  (`TextInput`, `Checkbox`, `CheckboxGroup`, `RadioGroup`,
+  `FileUpload`). Populates `discord.ui.Label.description` for an
+  optional secondary helper line beneath the field title.
+- **Four new class attributes on `LeaderboardLayoutView`** for
+  single-line customization of ranking display. Each closes a gap
+  where users previously had to override a whole method to tweak one
+  literal:
+  - `podium_emojis: Dict[int, str]` -- rank-keyed glyphs (default
+    gold/silver/bronze). Override the dict to change podium treatment
+    or extend past rank 3 without overriding `format_rank`.
+  - `entry_separator: str = " -- "` -- separator between name and
+    stat columns inside `format_entry`.
+  - `card_color: Optional[discord.Color] = None` -- accent color for
+    the rankings card; `None` falls through to the active theme.
+  - `show_title_divider: bool = True` -- toggle the divider rendered
+    below the title.
+- **`EmojiInput` type alias** in `cascadeui.components.types`,
+  defined as `Optional[Union[str, discord.Emoji, discord.PartialEmoji]]`.
+  Mirrors the union accepted by `discord.ui.Button` and
+  `discord.SelectOption`. Adopted across every typed `emoji=` slot
+  in the library (button builders, pattern ClassVar attributes,
+  the refresh handoff). Strings, live `Emoji` instances, and
+  `PartialEmoji` instances all flow through unchanged.
+- **Custom emoji documentation** in the components guide and a
+  `Type Aliases` entry in the API reference covering the three
+  string forms (unicode, custom static, custom animated) and
+  application-owned emojis.
+- **`nav_inside_container` ClassVar on `PaginatedLayoutView`**
+  (V2-only, default `False`). When `True`, the page content and the
+  navigation `ActionRow` are wrapped in a single `Container` so the
+  paginator renders as one cohesive card with built-in navigation.
+  Items added via `_build_extra_items` remain outside the wrapping
+  Container in either mode. Single-page views render no nav row, so
+  the flag has no effect when only one page is displayed.
+- **Migration guide for users coming from Soheab's
+  [CV2 paginator gist](https://gist.github.com/Soheab/891c39d7294b1bdbadc7ecf35ce51cc5)
+  and [classic paginator gist](https://gist.github.com/Soheab/f226fc06a3468af01ea3168c95b30af8)**
+  in the patterns guide, mapping the gist API to CascadeUI's grammar.
+- **`push()` and `replace()` accept pre-constructed view instances**
+  in addition to view classes. The instance form pairs with async
+  classmethod constructors (`PaginatedLayoutView.from_data`,
+  `from_cursor`) where the view is built before the navigation
+  call. Extra kwargs alongside an instance raise `TypeError` --
+  the instance is already initialized. Backward compat preserved:
+  passing a class continues to construct the view via
+  `view_class(**kwargs)`.
+- **`StatefulButton` and `StatefulSelect` accept `owner_only=False`
+  kwarg.** When `True`, mismatched clicks route through
+  `view.on_unauthorized(interaction)` instead of the user callback.
+  Pairs with view-level `owner_only=False` to express open-view +
+  host-only-button -- the canonical shape for lobby Start/Disband
+  buttons, ticket Close buttons, poll End buttons.
+- **Closure-factory subsection** in the patterns guide for paginator
+  formatters that need per-instance state.
+- **`push()` and `pop()` now edit the Discord message regardless of
+  whether `rebuild` is supplied.** Previously, omitting `rebuild` left
+  the message showing the parent view -- the navigation transition
+  completed in state but the user saw no change. The `rebuild` kwarg
+  is now an optional pre-edit hook for views that need
+  post-construction setup (V2 views with empty trees that need
+  `v.build_ui()`; V1 views that return an `embed` / `content` dict for
+  the edit). Views built by async classmethods like `from_data` come
+  fully populated and need no rebuild. The shared
+  `_apply_navigation_edit` helper handles the defer + optional rebuild
+  + edit cycle for both `push` and `pop`. The new view's `_message`
+  ref preserves the parent's plain `Message` (no 15-minute interaction
+  token cliff) -- the edit response is dropped on the floor when a
+  ref is already present.
+- **`examples/v2_library.py`** demonstrating pagination + drill-down
+  navigation with auto back buttons.
+
+### Changed
+
+- **Modal input wrappers now render through `discord.ui.Label`**
+  (discord.py 2.5+ pattern). Each of the five wrappers
+  (`TextInput`, `Checkbox`, `CheckboxGroup`, `RadioGroup`,
+  `FileUpload`) produces a `ui.Label` containing the inner discord.py
+  input via `create_discord_component()`. The label string moves to
+  `Label.text`; the new `description=` kwarg populates
+  `Label.description`. User-facing API unchanged: wrapper construction
+  still takes `label=` as the first positional arg, validators still
+  attach to the wrapper, `Modal.on_submit` still writes back
+  `.value` / `.values` on the wrapper. Only difference visible to
+  user code: `modal.children` carries `ui.Label` wrappers around
+  inputs instead of raw inputs at the top level. CascadeUI internally
+  unwraps via `_unwrap_label` during submit collection.
+- **`v2_persistence.py` example rewritten** to use
+  `PersistentRolesLayoutView`. The hand-written cardinality logic
+  collapses from ~200 lines to ~60 with no behavior change.
+- **Every typed `emoji=` slot widened from `Optional[str]` to
+  `EmojiInput`.** No runtime behavior change -- discord.py was
+  already accepting the wider union at the boundary; only the type
+  annotations were narrower than reality. Markdown-routed sites
+  (`LeaderboardLayoutView.podium_emojis`, `RoleCategory.icon`)
+  stay `str`-typed because they render into TextDisplay markdown
+  rather than piping to `discord.ui.Button`'s `emoji=` parameter.
+- **`WizardLayoutView` next-button emoji assignment simplified.**
+  Previously wrapped the class-attribute string in
+  `discord.PartialEmoji.from_str` before assigning to
+  `Button.emoji`. With `EmojiInput`, the wider union is assigned
+  directly and discord.py's `Button.emoji` setter performs the
+  type discrimination internally.
+- **`_reattach_one` batches the registration dispatches and
+  `on_restore`** in `store.batch(source_id=view.id)`. The three
+  startup actions (`SESSION_CREATED + VIEW_CREATED + VIEW_UPDATED`)
+  plus any `on_restore` dispatches collapse into one
+  `BATCH_COMPLETE` notification per restored view; previously each
+  fired its own subscriber fan-out cycle. Linear savings as
+  persistent-view count scales. Also tightens rollback atomicity --
+  failed reattach no longer leaks partial-state notifications to
+  subscribers.
+
+### Fixed
+
+- **Acting-view fast-path stall no longer falls through to the
+  channel endpoint.** The previous fall-through consumed the
+  auto-defer timer's ack budget and produced visible *"interaction
+  failed"* toasts under Discord-side latency. `refresh()` now
+  returns on `wait_for` cancellation; the timer acks with full
+  remaining budget and the visible UI update arrives on the next
+  state-change refresh.
+- **`format_rank` and `format_entry` previously hardcoded literals**
+  that subclasses could only change by overriding the entire method.
+  Both methods now read class attributes (`podium_emojis` and
+  `entry_separator` respectively) so subclasses change one literal
+  with a one-line attribute override.
+- **`LeaderboardLayoutView.send()` no longer double-attaches the
+  navigation ActionRow.** The send-time tree layout used to call
+  `_add_page_content()` (which after the `_compose_pagination_tree`
+  refactor adds the nav row inline) and then `add_item(self._nav_row)`
+  separately, attaching the row twice. Switched the send path to a
+  single `_compose_pagination_tree()` call matching the pattern in
+  `__init__` and `_update_page`.
+- **Back button no longer ships a redundant `edit_original_response`
+  call.** After the push/pop unconditional-edit decoupling,
+  `_add_back_button`'s `back_callback` was still calling
+  `interaction.edit_original_response(view=prev_view)` after `pop()`
+  had already routed through `_apply_navigation_edit` (which performs
+  the same edit). Both V1 (`_navigation.py`) and V2 (`layout.py`)
+  back-button callbacks now only edit when `pop()` returns `None`
+  (empty stack cleanup); successful pops let `_apply_navigation_edit`
+  handle the message swap.
+- **`_reattach_one` registration order corrected.** Persistent view
+  rehydration now registers the view in `_active_views` before
+  dispatching `VIEW_CREATED` via `_register_state`, mirroring the
+  `_send_pipeline` ordering contract. The reversed order created a
+  window where the view existed in `state["views"]` but not in the
+  instance index, so concurrent `send()` from another shard could
+  bypass the instance-limit check during the brief reattach gap.
+- **`InspectorView.state_selector` signature widened** to
+  `(view_id, message_id, channel_id)` tuples per view. The previous
+  ID-only signature equality-skipped `VIEW_UPDATED` notifications at
+  the subscriber gate, so the Views tab's `Channel / Msg` columns
+  rendered as `None / None` until the user manually refreshed.
+- **Auto back button survives pattern rebuilds.** Paginated page
+  turns, tab switches, form re-layout, menu refresh, role panel
+  rebuild, and wizard step advance all call `clear_items()` and
+  recompose. The auto back button injected by `push()` was lost on
+  every rebuild. Added `_restore_navigation_artifacts()` on
+  `_NavigationMixin` (idempotent, no-op when no back button is
+  registered); each pattern's rebuild path calls it after recomposing.
+- **Quickstart counter example was missing `subscribed_actions`**,
+  so the reducer ran but `on_state_changed` never fired and the
+  message stayed stale. The V2 and V1 examples now declare the
+  attribute, and the data-flow diagram surfaces the subscriber
+  filter step.
+- **Undo + slot-touching reducer chain no longer crashes** with
+  `TypeError: argument of type 'object' is not iterable`. The undo
+  middleware's `_MISSING` sentinel now survives `@cascade_reducer`'s
+  state deep-copy boundary; previously the deep copy invalidated the
+  `is _MISSING` identity check, leaving a bare object as the slot
+  value for the next reducer to read.
 
 ---
 
 ## [3.1.0] - 2026-04-21
+
+### Breaking
+
+- **`session_start` friendly-name hook removed.** The `SESSION_CREATED`
+  action was previously reachable via `store.on("session_start", cb)`; the
+  friendly name did not match the `view_created` / `view_updated` /
+  `view_destroyed` grammar used elsewhere. Use `session_created` instead.
+  No deprecation alias: the name was a grammar outlier, not a supported
+  surface. Migration: `store.on("session_start", cb)` ->
+  `store.on("session_created", cb)`.
 
 ### Added
 
@@ -75,16 +300,6 @@ future version; entries move into a dated release header on ship.
   per-view exit failures, and surfaces the failure count in the
   response. Routes through `StateStore._build_initial_state()` so the
   reset shape matches `__init__` exactly.
-
-### Breaking
-
-- **`session_start` friendly-name hook removed.** The `SESSION_CREATED`
-  action was previously reachable via `store.on("session_start", cb)`; the
-  friendly name did not match the `view_created` / `view_updated` /
-  `view_destroyed` grammar used elsewhere. Use `session_created` instead.
-  No deprecation alias: the name was a grammar outlier, not a supported
-  surface. Migration: `store.on("session_start", cb)` ->
-  `store.on("session_created", cb)`.
 
 ### Fixed
 

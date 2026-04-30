@@ -146,7 +146,7 @@ class CharacterCreatorView(WizardLayoutView):
     # state_scope = None because character sheet state lives on instance
     # attributes (_name, _race, etc.), not the Redux tree.
     state_scope = None
-    auto_refresh_ephemeral = False  # Non-ephemeral view; no effect, declared for visibility.
+    auto_refresh_ephemeral = False  # Non-ephemeral view; the refresh handoff never arms.
     instance_limit_message = (
         "You already have a character creator open. Finish or exit it before starting another."
     )

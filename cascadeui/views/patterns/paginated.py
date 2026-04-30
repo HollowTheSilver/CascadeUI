@@ -10,6 +10,7 @@ from discord import Interaction
 from discord.ui import ActionRow, Button, Container, TextDisplay
 
 from ...components.base import StatefulButton
+from ...components.types import EmojiInput
 from ..base import _StatefulMixin
 from ..layout import StatefulLayoutView
 from ..view import StatefulView
@@ -41,23 +42,23 @@ class _BasePaginatedMixin:
     # // ----( Customization triples - nav buttons )---- // #
 
     first_button_label: ClassVar[Optional[str]] = "\u23ee"
-    first_button_emoji: ClassVar[Optional[str]] = None
+    first_button_emoji: ClassVar[EmojiInput] = None
     first_button_style: ClassVar[discord.ButtonStyle] = discord.ButtonStyle.secondary
 
     prev_button_label: ClassVar[Optional[str]] = "\u25c0"
-    prev_button_emoji: ClassVar[Optional[str]] = None
+    prev_button_emoji: ClassVar[EmojiInput] = None
     prev_button_style: ClassVar[discord.ButtonStyle] = discord.ButtonStyle.secondary
 
     indicator_button_label: ClassVar[Optional[str]] = None  # default uses "Page {n}/{t}"
-    indicator_button_emoji: ClassVar[Optional[str]] = None
+    indicator_button_emoji: ClassVar[EmojiInput] = None
     indicator_button_style: ClassVar[discord.ButtonStyle] = discord.ButtonStyle.primary
 
     next_button_label: ClassVar[Optional[str]] = "\u25b6"
-    next_button_emoji: ClassVar[Optional[str]] = None
+    next_button_emoji: ClassVar[EmojiInput] = None
     next_button_style: ClassVar[discord.ButtonStyle] = discord.ButtonStyle.secondary
 
     last_button_label: ClassVar[Optional[str]] = "\u23ed"
-    last_button_emoji: ClassVar[Optional[str]] = None
+    last_button_emoji: ClassVar[EmojiInput] = None
     last_button_style: ClassVar[discord.ButtonStyle] = discord.ButtonStyle.secondary
 
     _BUTTON_STYLE_ATTRS: ClassVar[tuple] = (
@@ -67,6 +68,11 @@ class _BasePaginatedMixin:
         "indicator_button_style",
         "next_button_style",
         "last_button_style",
+    )
+
+    _BOOL_ATTRS: ClassVar[tuple] = (
+        *_StatefulMixin._BOOL_ATTRS,
+        "nav_inside_container",
     )
 
     # // ----( Override hook )---- // #
@@ -637,7 +643,17 @@ class PaginatedLayoutView(_BasePaginatedMixin, StatefulLayoutView):
     - A ``str`` wrapped in a Container + TextDisplay automatically
 
     Customization + override hook mirror ``PaginatedView``.
+
+    V2-only attribute:
+        nav_inside_container: When ``True``, page content and the nav row
+            are wrapped in a single ``Container`` so the paginator renders
+            as one cohesive card. When ``False`` (default), page content
+            and the nav row are separate top-level children of the view --
+            the original layout. ``_build_extra_items`` items remain
+            outside the wrapping Container in either mode.
     """
+
+    nav_inside_container: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -665,13 +681,14 @@ class PaginatedLayoutView(_BasePaginatedMixin, StatefulLayoutView):
         self._extra_items: List = []
         self._nav_row: Optional[ActionRow] = None
 
-        # Page content first, nav row second -- matches the ordering in
-        # _update_page() so initial render and post-interaction renders
+        # Build nav row first so the composition helper can reference it.
+        # Then compose: page content + nav row in the configured layout
+        # (separate siblings or wrapped in one Container per
+        # ``nav_inside_container``). Single seam shared with ``send`` and
+        # ``_update_page`` so initial render and post-interaction renders
         # are visually identical.
-        self._add_page_content()
         self._build_nav_buttons()
-        if len(self.pages) > 1:
-            self.add_item(self._nav_row)
+        self._compose_pagination_tree()
 
         # Snapshot extras: anything added by the subclass in
         # _build_extra_items() is preserved through page turns.
@@ -710,8 +727,25 @@ class PaginatedLayoutView(_BasePaginatedMixin, StatefulLayoutView):
             return [result]
         return [page]
 
-    def _add_page_content(self):
-        """Append current page's V2 components and track them for later removal."""
+    def _compose_pagination_tree(self):
+        """Add page content + nav row to the view in the configured layout.
+
+        Single seam shared by ``__init__``, ``send``, and ``_update_page``
+        so the three call sites stay structurally identical and the
+        ``nav_inside_container`` flag governs every render path.
+
+        With ``nav_inside_container=False`` (default): page content items
+        are added as separate top-level children, then the nav row is
+        appended as a sibling -- the original layout.
+
+        With ``nav_inside_container=True`` AND multiple pages exist: page
+        content + nav row are wrapped in one ``Container`` and that
+        Container is the only child added here. Pages of one (no nav row)
+        and the empty-pages placeholder are unaffected -- nothing to wrap.
+
+        Extras from ``_build_extra_items`` stay outside the wrapping
+        Container; the caller adds them after this method returns.
+        """
         self._page_content_items = []
         if not self.pages:
             placeholder = Container(TextDisplay("No pages."))
@@ -720,9 +754,54 @@ class PaginatedLayoutView(_BasePaginatedMixin, StatefulLayoutView):
             return
 
         items = self._resolve_page(self.pages[self.current_page])
+        show_nav = len(self.pages) > 1
+
+        if self.nav_inside_container and show_nav:
+            # Discord rejects Container-in-Container (type 17 inside type 17)
+            # with HTTP 400 "Invalid Form Body". When the formatter already
+            # returned a single Container -- common when callers reach for
+            # ``card(...)`` to set a per-page accent color -- build a fresh
+            # wrapper that copies the source Container's metadata (accent,
+            # spoiler) and adopts its children alongside the nav row.
+            #
+            # The source Container in ``self.pages`` is never mutated. Page
+            # turns rebuild the wrapper from scratch each render, so the
+            # nav row never accumulates across visits to the same source
+            # page (which would duplicate its button custom_ids and trip
+            # Discord's "Component custom id cannot be duplicated" reject).
+            if len(items) == 1 and isinstance(items[0], Container):
+                source = items[0]
+                wrapper = Container(
+                    *list(source.children),
+                    self._nav_row,
+                    accent_color=source.accent_color,
+                    spoiler=source.spoiler,
+                )
+            else:
+                wrapper = Container(*items, self._nav_row)
+            self.add_item(wrapper)
+            self._page_content_items.append(wrapper)
+            return
+
         for item in items:
             self.add_item(item)
             self._page_content_items.append(item)
+        if show_nav:
+            self.add_item(self._nav_row)
+
+    def _add_page_content(self):
+        """Append current page's V2 components and track them for later removal.
+
+        Retained as a thin wrapper around ``_compose_pagination_tree`` for
+        any subclass that overrode this method before
+        ``nav_inside_container`` landed. The composition path now flows
+        through ``_compose_pagination_tree``; subclasses that need to
+        customize the page-content render shape should override that
+        method instead.
+        """
+        # Collapsed call: the helper handles every shape including the
+        # empty-pages placeholder and the wrapped/unwrapped split.
+        self._compose_pagination_tree()
 
     def _build_nav_buttons(self):
         """Build nav buttons into a fresh ``self._nav_row`` ActionRow.
@@ -815,19 +894,17 @@ class PaginatedLayoutView(_BasePaginatedMixin, StatefulLayoutView):
     async def send(self, *args, **kwargs):
         """Preload page 0 in cursor mode, then rebuild and ship.
 
-        The sync ``__init__`` already ran ``_add_page_content`` against the
-        ``None`` placeholder (cursor mode fills ``pages`` with ``None`` slots
-        until fetched), so the tree currently shows a transient "Loading..."
-        card. Fetch page 0, then clear and re-add content in the same order
+        The sync ``__init__`` already ran ``_compose_pagination_tree`` against
+        the ``None`` placeholder (cursor mode fills ``pages`` with ``None``
+        slots until fetched), so the tree currently shows a transient
+        "Loading..." card. Fetch page 0, then clear and re-add content in the same order
         ``_update_page`` uses so the first ship is visually identical to
         every subsequent page turn.
         """
         if self._is_cursor_mode and self.pages and self.pages[0] is None:
             await self._ensure_page_loaded(0)
             self.clear_items()
-            self._add_page_content()
-            if len(self.pages) > 1:
-                self.add_item(self._nav_row)
+            self._compose_pagination_tree()
             for extra in self._extra_items:
                 self.add_item(extra)
         return await super().send(*args, **kwargs)
@@ -862,14 +939,18 @@ class PaginatedLayoutView(_BasePaginatedMixin, StatefulLayoutView):
         else:
             self._indicator_btn.label = self._resolve_indicator_label()
 
-        # Clear and re-add in order: page content, nav row, extras.
-        # Skip the nav row when only one page remains -- rebuild_pages()
-        # can shrink past that boundary, so the check is per-refresh.
+        # Clear and re-compose. The helper handles the nav-row inclusion
+        # based on len(self.pages) and ``nav_inside_container``;
+        # rebuild_pages() can shrink past the multi-page boundary so the
+        # check is per-refresh inside the helper.
         self.clear_items()
-        self._add_page_content()
-        if total > 1:
-            self.add_item(self._nav_row)
+        self._compose_pagination_tree()
         for extra in self._extra_items:
             self.add_item(extra)
+
+        # Restore the navigation back button if push() added one. Without
+        # this, ``clear_items()`` strips the back button on every page turn
+        # and the user is stranded in the pushed view with no way back.
+        self._restore_navigation_artifacts()
 
         await self.refresh()
