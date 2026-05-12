@@ -7,7 +7,6 @@ import pytest
 from cascadeui.state.store import StateStore
 from cascadeui.views.view import StatefulView
 
-
 # // ========================================( Helpers )======================================== // #
 
 
@@ -20,6 +19,7 @@ def _make_bot():
         def decorator(func):
             bot._listeners[event_name] = func
             return func
+
         return decorator
 
     bot.listen = _listen
@@ -46,6 +46,7 @@ def _make_view(store, *, message_id=12345, user_id=100, guild_id=200):
 
 class TestInstallMessageCleanup:
     """_install_message_cleanup registers gateway listeners idempotently."""
+
     def test_sets_flag(self):
         store = StateStore()
         bot = _make_bot()
@@ -78,6 +79,7 @@ class TestInstallMessageCleanup:
 
 class TestSingleMessageDelete:
     """on_raw_message_delete triggers on_message_delete for matching views."""
+
     async def test_matching_message_triggers_hook(self):
         store = StateStore()
         bot = _make_bot()
@@ -121,6 +123,7 @@ class TestSingleMessageDelete:
 
 class TestBulkMessageDelete:
     """on_raw_bulk_message_delete triggers cleanup for all matching views."""
+
     async def test_bulk_triggers_matching_views(self):
         store = StateStore()
         bot = _make_bot()
@@ -146,6 +149,7 @@ class TestBulkMessageDelete:
 
 class TestOnMessageDeleteHook:
     """Default on_message_delete calls exit(delete_message=False)."""
+
     async def test_default_calls_exit(self):
         store = StateStore()
         view = _make_view(store)

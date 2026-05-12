@@ -2,24 +2,29 @@
 V2 Grids -- CascadeUI Dynamic Grid Display Showcase
 ===================================================
 
-A display-only showcase for the grid helpers:
+A display-only showcase for the grid helpers plus the V2 media builders:
 
-    - emoji_grid()  -- live TextDisplay subclass with mutable cells,
-                      optional axis labels, and bulk assignment
-    - button_grid() -- (row, col) -> Button factory packed into ActionRows,
-                      enforcing Discord's 5x5 component cap
+    - emoji_grid()    -- live TextDisplay subclass with mutable cells,
+                        optional axis labels, and bulk assignment
+    - button_grid()   -- (row, col) -> Button factory packed into ActionRows,
+                        enforcing Discord's 5x5 component cap
+    - gallery()       -- MediaGallery from URL strings or discord.File objects
+    - image_section() -- Section with a Thumbnail accessory
 
-This cog demonstrates that grids are a standalone primitive: they can
-be assembled from slash-command arguments and dropped into any V2 card
-without surrounding game logic. The buttons produced by /button_grid
-are disabled on purpose -- the showcase only exercises the rendering
-path, not interaction handling. For interactive grid usage, see
+This cog demonstrates that grids and media components are standalone
+primitives: they can be assembled from slash-command arguments and dropped
+into any V2 card without surrounding game logic. The buttons produced by
+/button_grid are disabled on purpose -- the showcase only exercises the
+rendering path, not interaction handling. For interactive grid usage, see
 `v2_battleship.py` and `v2_tictactoe.py`.
 
 Commands:
-    /emoji_grid    Render an EmojiGrid from slash arguments
-    /button_grid   Render a disabled button grid from slash arguments
-    /grid_gallery  Fire eight preset variations across three messages
+    /emoji_grid     Render an EmojiGrid from slash arguments
+    /button_grid    Render a disabled button grid from slash arguments
+    /grid_gallery   Eight grid-layout variants (uses card() + emoji_grid();
+                    for the gallery() media builder see /image_gallery)
+    /image_gallery  Render a MediaGallery + Thumbnail Section from
+                    invoker/bot avatars to demonstrate the media builders
 
 Usage:
     Load this cog in your bot. Requires: pip install pycascadeui discord.py
@@ -43,7 +48,9 @@ from cascadeui import (
     card,
     divider,
     emoji_grid,
+    gallery,
     gap,
+    image_section,
 )
 
 logger = logging.getLogger(__name__)
@@ -71,6 +78,14 @@ class GridShowcaseView(StatefulLayoutView):
     replace_policy = "delete"
     exit_policy = "disable"
     timeout = 180.0
+    # Pre-flight V2 placement validation runs on every ``send``,
+    # ``refresh``, and navigation edit, catching invalid trees (nesting,
+    # accessory misuse, Modal-only types, size-bound violations) before
+    # Discord 400s. Set ``validate_placement = False`` to opt out when
+    # the validator's matrix lags a Discord or discord.py update and a
+    # subclass intentionally builds a tree the validator rejects. The
+    # showcase routes through library builders end-to-end so the default
+    # (``True``) is correct.
 
     def __init__(self, *args, items=None, **kwargs):
         super().__init__(*args, **kwargs)
@@ -372,6 +387,71 @@ class V2GridsExample(commands.Cog, name="v2_grids_example"):
             color=discord.Color.green(),
         )
         await _send_showcase(context, [coord_header, gap(), *coord_rows])
+
+    # // ==================( /image_gallery )================== // #
+
+    @commands.hybrid_command(
+        name="image_gallery",
+        description="Render a MediaGallery + Thumbnail Section from avatars.",
+    )
+    @app_commands.describe(
+        layout="``gallery`` renders a side-by-side MediaGallery; "
+        "``section`` renders one Thumbnail Section per avatar.",
+    )
+    async def image_gallery_cmd(
+        self,
+        context: Context,
+        layout: Literal["gallery", "section"] = "gallery",
+    ) -> None:
+        """Render the V2 media builders from a small set of stable URLs.
+
+        The invoker and the bot supply their own avatar URLs, which Discord
+        serves indefinitely from its CDN -- no external host needed. The
+        builders both accept the ``MediaInput`` union (URL string OR a
+        live ``discord.File`` whose ``.uri`` is read internally); this
+        showcase uses URL strings so the example runs without local file
+        assets. For the ``discord.File`` form plus ``view.send(files=[...])``
+        pairing, see ``docs/guide/components.md#local-file-attachments``.
+        """
+        invoker_url = context.author.display_avatar.url
+        bot_user = context.bot.user
+        bot_url = bot_user.display_avatar.url if bot_user is not None else invoker_url
+
+        if layout == "gallery":
+            showcase = card(
+                "## MediaGallery",
+                TextDisplay(
+                    "-# Two avatars side by side via `gallery(*urls)`. "
+                    "Each accepts a URL string or a `discord.File`."
+                ),
+                divider(),
+                gallery(
+                    invoker_url,
+                    bot_url,
+                    descriptions=[f"{context.author.display_name}", "Bot"],
+                ),
+                color=discord.Color.purple(),
+            )
+        else:
+            showcase = card(
+                "## Image Sections",
+                TextDisplay(
+                    "-# `image_section(text, url=...)` pairs caption text "
+                    "with a Thumbnail accessory."
+                ),
+                divider(),
+                image_section(
+                    f"**{context.author.display_name}**\nInvoker",
+                    url=invoker_url,
+                ),
+                image_section(
+                    f"**{bot_user.name if bot_user else 'Bot'}**\nBot",
+                    url=bot_url,
+                ),
+                color=discord.Color.purple(),
+            )
+
+        await _send_showcase(context, [showcase])
 
 
 async def setup(bot) -> None:

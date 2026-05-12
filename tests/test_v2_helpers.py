@@ -1,12 +1,15 @@
 # // ========================================( Modules )======================================== // #
 
 
+from io import BytesIO
+
 import discord
 import pytest
 from discord.components import MediaGalleryItem
 from discord.ui import (
     ActionRow,
     Container,
+    File,
     MediaGallery,
     Section,
     Separator,
@@ -23,6 +26,7 @@ from cascadeui import (
     confirm_section,
     cycle_button,
     divider,
+    file_attachment,
     gallery,
     gap,
     image_section,
@@ -35,11 +39,34 @@ from cascadeui import (
     toggle_section,
 )
 
+# // ========================================( Re-Export Symmetry )======================================== // #
+
+
+class TestComponentReExports:
+    """``cascadeui.components`` re-exports the same V2 surface as the
+    package root. The two `MediaInput` / `EmojiInput` aliases ship as a
+    matched pair; the same applies to `gallery` / `file_attachment`.
+    """
+
+    def test_emoji_input_importable_from_components(self):
+        from cascadeui.components import EmojiInput  # noqa: F401
+
+    def test_media_input_importable_from_components(self):
+        from cascadeui.components import MediaInput  # noqa: F401
+
+    def test_gallery_importable_from_components(self):
+        from cascadeui.components import gallery  # noqa: F401
+
+    def test_file_attachment_importable_from_components(self):
+        from cascadeui.components import file_attachment  # noqa: F401
+
+
 # // ========================================( Card )======================================== // #
 
 
 class TestCard:
     """card() wraps content in a Container with accent color and auto-wrapped strings."""
+
     def test_returns_container(self):
         result = card("Title")
         assert isinstance(result, Container)
@@ -82,6 +109,7 @@ class TestCard:
 
 class TestActionSection:
     """action_section() creates a Section with a StatefulButton accessory."""
+
     def _noop(self, interaction):
         pass
 
@@ -122,6 +150,7 @@ class TestActionSection:
 
 class TestToggleSection:
     """toggle_section() creates a Section with a green/red toggle button."""
+
     def _noop(self, interaction):
         pass
 
@@ -162,6 +191,7 @@ class TestToggleSection:
 
 class TestImageSection:
     """image_section() creates a Section with a Thumbnail accessory."""
+
     def test_returns_section_with_thumbnail(self):
         result = image_section("text", url="https://example.com/img.png")
         assert isinstance(result, Section)
@@ -175,12 +205,20 @@ class TestImageSection:
         result = image_section("text", url="https://example.com/img.png", spoiler=True)
         assert result.accessory.spoiler is True
 
+    def test_accepts_discord_file(self):
+        """``url=`` accepts a ``discord.File`` and resolves through ``.uri``."""
+        photo = discord.File(BytesIO(b"fake bytes"), filename="avatar.png")
+        result = image_section("text", url=photo)
+        assert isinstance(result.accessory, Thumbnail)
+        assert result.accessory.media.url == "attachment://avatar.png"
+
 
 # // ========================================( Key Value )======================================== // #
 
 
 class TestKeyValue:
     """key_value() renders a dict as bold-key: value TextDisplay lines."""
+
     def test_returns_text_display(self):
         result = key_value({"A": 1})
         assert isinstance(result, TextDisplay)
@@ -204,6 +242,7 @@ class TestKeyValue:
 
 class TestAlert:
     """alert() creates a colored Container with status-themed accent."""
+
     def test_returns_container(self):
         result = alert("message")
         assert isinstance(result, Container)
@@ -241,6 +280,7 @@ class TestAlert:
 
 class TestSeparators:
     """divider() and gap() produce Separator components with correct spacing."""
+
     def test_divider_is_visible(self):
         result = divider()
         assert isinstance(result, Separator)
@@ -281,6 +321,7 @@ class TestSeparators:
 
 class TestGallery:
     """gallery() creates a MediaGallery from one or more URLs."""
+
     def test_returns_media_gallery(self):
         result = gallery("https://example.com/a.png")
         assert isinstance(result, MediaGallery)
@@ -310,6 +351,80 @@ class TestGallery:
                 "https://example.com/b.png",
                 descriptions=["Only first"],
             )
+
+    def test_accepts_discord_file(self):
+        """``*media`` accepts a ``discord.File`` and resolves through ``.uri``."""
+        photo = discord.File(BytesIO(b"fake bytes"), filename="a.png")
+        result = gallery(photo)
+        assert len(result.items) == 1
+        assert result.items[0].media.url == "attachment://a.png"
+
+    def test_accepts_mixed_string_and_file(self):
+        """A mix of URL strings and ``discord.File`` instances coexists in one call."""
+        photo = discord.File(BytesIO(b"local bytes"), filename="local.png")
+        result = gallery(
+            "https://example.com/remote.png",
+            photo,
+            descriptions=["Remote", "Local"],
+        )
+        assert result.items[0].media.url == "https://example.com/remote.png"
+        assert result.items[1].media.url == "attachment://local.png"
+        assert result.items[0].description == "Remote"
+        assert result.items[1].description == "Local"
+
+    def test_zero_items_raises(self):
+        """Empty gallery() rejected at construction (Discord requires 1-10)."""
+        with pytest.raises(ValueError, match="at least one media reference"):
+            gallery()
+
+    def test_too_many_items_raises(self):
+        """Gallery with 11+ items rejected at construction."""
+        urls = [f"https://example.com/img{i}.png" for i in range(11)]
+        with pytest.raises(ValueError, match="too many media references"):
+            gallery(*urls)
+
+
+class TestFileAttachment:
+    """file_attachment() wraps the V2 File primitive for inline attachment cards."""
+
+    def test_returns_file(self):
+        result = file_attachment("attachment://report.pdf")
+        assert isinstance(result, File)
+
+    def test_url_passthrough(self):
+        result = file_attachment("attachment://report.pdf")
+        # File stores media as an UnfurledMediaItem with the original URL.
+        assert result.media.url == "attachment://report.pdf"
+
+    def test_remote_url_accepted(self):
+        result = file_attachment("https://example.com/report.pdf")
+        assert result.media.url == "https://example.com/report.pdf"
+
+    def test_spoiler_default_false(self):
+        result = file_attachment("attachment://report.pdf")
+        assert result.spoiler is False
+
+    def test_spoiler_flag(self):
+        result = file_attachment("attachment://report.pdf", spoiler=True)
+        assert result.spoiler is True
+
+    def test_composes_into_card(self):
+        """file_attachment integrates with card() the same way gallery does."""
+        c = card(
+            "## Report",
+            file_attachment("attachment://report.pdf"),
+            "Released April 15.",
+        )
+        assert isinstance(c, Container)
+        assert len(c.children) == 3
+        assert isinstance(c.children[1], File)
+
+    def test_accepts_discord_file(self):
+        """``url=`` accepts a ``discord.File`` and resolves through ``.uri``."""
+        report = discord.File(BytesIO(b"pdf bytes"), filename="report.pdf")
+        result = file_attachment(report)
+        assert isinstance(result, File)
+        assert result.media.url == "attachment://report.pdf"
 
 
 # // ========================================( 7.8b — additive helpers )======================================== // #

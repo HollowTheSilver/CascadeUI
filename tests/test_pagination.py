@@ -34,6 +34,7 @@ def _get_item(view, custom_id):
 
 class TestBasicPages:
     """PaginatedView accepts embed and string pages and tracks current_page."""
+
     async def test_embed_pages(self):
         """PaginatedView accepts Embed pages."""
         pages = _make_embeds(3)
@@ -80,6 +81,7 @@ class TestBasicPages:
 
 class TestButtonVisibility:
     """Jump buttons appear when page count reaches jump_threshold or above."""
+
     async def test_no_jump_buttons_below_threshold(self):
         """First/last/go-to buttons hidden when pages < jump_threshold."""
         pages = _make_embeds(3)
@@ -144,6 +146,7 @@ class TestButtonVisibility:
 
 class TestButtonStates:
     """Prev/next buttons disable at page boundaries."""
+
     async def test_prev_disabled_at_first_page(self):
         """Previous button is disabled on the first page."""
         pages = _make_embeds(3)
@@ -207,6 +210,7 @@ class TestButtonStates:
 
 class TestNavigation:
     """First, last, prev, next button callbacks navigate to correct pages."""
+
     async def test_first_button_goes_to_page_zero(self):
         """Clicking first button sets current_page to 0."""
         pages = _make_embeds(10)
@@ -289,6 +293,7 @@ class TestNavigation:
 
 class TestGotoModal:
     """Go-to button opens a modal for direct page number input."""
+
     async def test_goto_button_opens_modal(self):
         """Clicking the go-to button calls send_modal."""
         pages = _make_embeds(10)
@@ -314,6 +319,7 @@ class TestGotoModal:
 
 class TestFromData:
     """from_data classmethod chunks items and applies sync/async formatters."""
+
     async def test_sync_formatter(self):
         """from_data works with a sync formatter."""
         items = list(range(9))
@@ -386,6 +392,7 @@ class TestFromData:
 
 class TestUpdatePage:
     """_update_page edits the message with the correct page content type."""
+
     async def test_update_page_with_embed(self):
         """_update_page edits with embed for Embed pages — no content key sent."""
         pages = _make_embeds(3)
@@ -466,6 +473,7 @@ class TestFromCursor:
         When ``track_calls`` is supplied it records each ``(offset, limit)``
         tuple, letting individual tests assert which pages fetched.
         """
+
         async def fetch(offset: int, limit: int):
             if track_calls is not None:
                 track_calls.append((offset, limit))
@@ -664,6 +672,7 @@ class TestFromCursor:
 
     async def test_async_formatter(self):
         """Async formatters are awaited, not double-wrapped."""
+
         async def async_formatter(chunk):
             return discord.Embed(title=f"Async: {chunk}")
 
@@ -824,3 +833,46 @@ class TestFromCursor:
 
         with pytest.raises(ValueError, match="new_total must be a non-negative int"):
             await view.refresh_pages(new_total=-1)
+
+
+# // ========================================( Send Kwargs Propagation )======================================== // #
+
+
+class TestSendKwargsPropagation:
+    """V1 ``PaginatedView.send`` forwards ``file=``/``files=`` to ``super().send()``.
+
+    The patches target ``cascadeui.views.view.StatefulView.send`` (the V1
+    base) rather than ``PaginatedView.send`` (the override) because
+    ``PaginatedView.send`` invokes ``super().send(...)`` whose MRO
+    resolves to ``StatefulView.send``. Patching the override would not
+    intercept the super-call; the base is the only seam where the
+    forwarded kwargs land. Each ``with`` block scopes the patch to the
+    test, so cross-test pollution stays contained.
+    """
+
+    async def test_files_forwarded_to_super_send(self):
+        """``files=`` reaches the V1 base ``send`` call alongside the page kwargs."""
+        view = PaginatedView(pages=_make_embeds(3), interaction=_make_interaction())
+        photo = MagicMock(spec=discord.File)
+
+        with patch(
+            "cascadeui.views.view.StatefulView.send",
+            new=AsyncMock(return_value=MagicMock()),
+        ) as mock_super_send:
+            await view.send(files=[photo])
+
+        mock_super_send.assert_called_once()
+        assert mock_super_send.call_args.kwargs["files"] == [photo]
+
+    async def test_single_file_forwarded_to_super_send(self):
+        """``file=`` (singular) reaches the V1 base ``send`` call."""
+        view = PaginatedView(pages=_make_embeds(3), interaction=_make_interaction())
+        photo = MagicMock(spec=discord.File)
+
+        with patch(
+            "cascadeui.views.view.StatefulView.send",
+            new=AsyncMock(return_value=MagicMock()),
+        ) as mock_super_send:
+            await view.send(file=photo)
+
+        assert mock_super_send.call_args.kwargs["file"] is photo

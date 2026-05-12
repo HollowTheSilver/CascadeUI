@@ -9,6 +9,7 @@ from discord.enums import SeparatorSpacing
 from discord.ui import (
     ActionRow,
     Container,
+    File,
     MediaGallery,
     Section,
     Separator,
@@ -17,10 +18,32 @@ from discord.ui import (
 )
 
 from ..base import StatefulButton
-from ..types import EmojiInput
+from ..types import EmojiInput, MediaInput
 
 # Discord content-length ceiling for a single TextDisplay component.
 _TEXTDISPLAY_MAX_CHARS = 4000
+
+
+def _coerce_media_ref(value: MediaInput) -> str:
+    """Resolve a ``MediaInput`` to the URL string Discord's API consumes.
+
+    Strings pass through unchanged. A :class:`discord.File` resolves to
+    its ``.uri`` (the ``"attachment://<filename>"`` reference built from
+    the normalized filename). The builder emits only the reference
+    string; the bytes travel separately through
+    ``view.send(files=[...])``.
+
+    Only the ``.uri`` is extracted -- the ``description`` and ``spoiler``
+    attributes of the source :class:`discord.File` are NOT forwarded.
+    Builders that wrap the reference in a component carrying those
+    fields (``image_section``, ``file_attachment``) accept them as
+    explicit kwargs, so the metadata is never silently lost on the
+    documented call paths.
+    """
+    if isinstance(value, discord.File):
+        return value.uri
+    return value
+
 
 # Regional indicator emoji for alpha axis preset (🇦 through 🇿, 26 glyphs).
 _ALPHA_LABELS = [chr(0x1F1E6 + i) for i in range(26)]
@@ -181,7 +204,7 @@ def toggle_section(
 def image_section(
     text: str,
     *,
-    url: str,
+    url: MediaInput,
     description: Optional[str] = None,
     spoiler: bool = False,
 ) -> Section:
@@ -192,7 +215,11 @@ def image_section(
 
     Args:
         text: Display text (supports markdown).
-        url: Image URL for the thumbnail.
+        url: Image reference for the thumbnail. Accepts either a URL
+            string (remote or ``attachment://`` form) or a
+            :class:`discord.File` instance whose ``.uri`` is used.
+            File-backed references require the same ``discord.File`` to
+            be passed via ``view.send(files=[...])``.
         description: Optional alt text for the thumbnail (up to 256 chars).
         spoiler: Whether the thumbnail is hidden behind a spoiler.
 
@@ -206,7 +233,7 @@ def image_section(
             url=member.display_avatar.url,
         )
     """
-    kwargs = {"media": url, "spoiler": spoiler}
+    kwargs = {"media": _coerce_media_ref(url), "spoiler": spoiler}
     if description is not None:
         kwargs["description"] = description
     return Section(
@@ -790,18 +817,22 @@ def tab_nav(
 
 
 def gallery(
-    *urls: str,
+    *media: MediaInput,
     descriptions: Optional[Sequence[Optional[str]]] = None,
 ) -> MediaGallery:
-    """Build a MediaGallery from image URLs.
+    """Build a MediaGallery from image references.
 
     Simplifies the ``MediaGallery(MediaGalleryItem(...), ...)`` nesting
-    into a flat call with URLs.
+    into a flat call.
 
     Args:
-        *urls: Image URLs (up to 10).
+        *media: Image references (up to 10). Each accepts either a URL
+            string (remote or ``attachment://`` form) or a
+            :class:`discord.File` instance whose ``.uri`` is used.
+            File-backed references require the same ``discord.File``
+            objects to be passed via ``view.send(files=[...])``.
         descriptions: Optional sequence of descriptions matching each
-            URL positionally. Use ``None`` for items without a
+            reference positionally. Use ``None`` for items without a
             description.
 
     Returns:
@@ -815,21 +846,67 @@ def gallery(
             descriptions=["First image", None],
         )
     """
-    if descriptions is not None and len(descriptions) != len(urls):
+    if not media:
+        raise ValueError(
+            "gallery: at least one media reference is required. Discord "
+            "rejects empty MediaGallery components with HTTP 400 (1-10 "
+            "items required)."
+        )
+    if len(media) > 10:
+        raise ValueError(
+            f"gallery: too many media references ({len(media)}). Discord "
+            f"caps MediaGallery at 10 items. Split into multiple gallery() "
+            f"calls."
+        )
+    if descriptions is not None and len(descriptions) != len(media):
         raise ValueError(
             f"gallery: descriptions length ({len(descriptions)}) must match "
-            f"urls length ({len(urls)}). Pad with None for URLs that should "
-            f"have no description."
+            f"media length ({len(media)}). Pad with None for references that "
+            f"should have no description."
         )
 
     items = []
-    for i, url in enumerate(urls):
+    for i, ref in enumerate(media):
         desc = descriptions[i] if descriptions is not None else None
-        kwargs = {"media": url}
+        kwargs = {"media": _coerce_media_ref(ref)}
         if desc is not None:
             kwargs["description"] = desc
         items.append(MediaGalleryItem(**kwargs))
     return MediaGallery(*items)
+
+
+def file_attachment(
+    url: MediaInput,
+    *,
+    spoiler: bool = False,
+) -> File:
+    """Build a File component for attachment display.
+
+    Completes the V2 media family alongside ``gallery()``. Discord
+    renders the file as a downloadable card inline with the rest of the
+    V2 content.
+
+    Args:
+        url: File reference. Accepts either a remote URL, the
+            ``attachment://<filename>`` form, or a
+            :class:`discord.File` instance whose ``.uri`` is used. When
+            a file-backed reference is supplied, the same
+            ``discord.File`` must travel via ``view.send(files=[...])``.
+        spoiler: Whether to flag the file as a spoiler.
+
+    Returns:
+        A ``File`` component ready to be added to a Container or
+        ``StatefulLayoutView``.
+
+    Example::
+
+        card(
+            "## Quarterly Report",
+            file_attachment("attachment://q1_2026.pdf"),
+            "Released April 15.",
+        )
+    """
+    return File(media=_coerce_media_ref(url), spoiler=spoiler)
 
 
 # // ========================================( Grids )======================================== // #

@@ -1,6 +1,8 @@
 # // ========================================( Modules )======================================== // #
 
 
+from typing import Any, Dict, Optional, Sequence
+
 import discord
 from discord.ui import ActionRow, Item, LayoutView
 
@@ -21,7 +23,30 @@ class StatefulLayoutView(_StatefulMixin, LayoutView):
     ``ActionRow`` before being added to the view.
     """
 
-    async def send(self, *, ephemeral=False):
+    # Subclass config: V2 placement validation. When ``True`` (default),
+    # ``_send_pipeline`` walks the assembled component tree and raises
+    # ``ValueError`` on placements that Discord's API would reject with
+    # HTTP 400 (Container nesting, standalone Button at top level,
+    # Section accessory not in {Button, Thumbnail}, Modal-only types in
+    # a LayoutView, Section nested inside Section, etc). The check runs
+    # before the Discord round-trip, so the violation surfaces with a
+    # clear path string instead of a terse 400 response. Set to
+    # ``False`` only when discord.py / Discord has updated an
+    # enforcement rule the validator has not caught up to yet.
+    validate_placement: bool = True
+
+    # ``validate_placement`` is V2-only -- ``_BOOL_ATTRS`` extends the
+    # mixin's tuple so the validator's class-time bool check fires for
+    # ``StatefulLayoutView`` subclasses without touching the V1 surface.
+    _BOOL_ATTRS = _StatefulMixin._BOOL_ATTRS + ("validate_placement",)
+
+    async def send(
+        self,
+        *,
+        file: Optional[discord.File] = None,
+        files: Optional[Sequence[discord.File]] = None,
+        ephemeral: bool = False,
+    ):
         """Send this V2 view as a message.
 
         Unlike V1's ``send()``, there are no
@@ -33,6 +58,14 @@ class StatefulLayoutView(_StatefulMixin, LayoutView):
         contract and rollback semantics.
 
         Args:
+            file: Single attachment uploaded with the message. Pair with
+                ``"attachment://<filename>"`` references inside
+                ``gallery()``, ``image_section()``, or
+                ``file_attachment()`` to render local files inline.
+                Mutually exclusive with ``files``.
+            files: Sequence of attachments uploaded with the message.
+                Mutually exclusive with ``file``. discord.py raises
+                ``TypeError`` when both are supplied.
             ephemeral: Whether the message should be ephemeral
                 (interaction-context only).
 
@@ -41,7 +74,12 @@ class StatefulLayoutView(_StatefulMixin, LayoutView):
             policy gate blocked the send and the library handled the
             user response internally.
         """
-        return await self._send_pipeline({"view": self}, ephemeral=ephemeral)
+        send_kwargs: Dict[str, Any] = {"view": self}
+        if file is not None:
+            send_kwargs["file"] = file
+        if files is not None:
+            send_kwargs["files"] = files
+        return await self._send_pipeline(send_kwargs, ephemeral=ephemeral)
 
     def _install_refresh_button(self, button: StatefulButton) -> None:
         """V2 wraps the refresh button in an ActionRow before adding it."""

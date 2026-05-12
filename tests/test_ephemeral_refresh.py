@@ -15,14 +15,15 @@ import pytest
 from helpers import make_interaction as _make_interaction
 
 from cascadeui import InstanceLimitError
-from cascadeui.views.view import StatefulView
 from cascadeui.views.layout import StatefulLayoutView
+from cascadeui.views.view import StatefulView
 
 # // ========================================( Default Emoji Validity )======================================== // #
 
 
 class TestDefaultRefreshEmoji:
     """Default refresh_button_emoji is a valid Unicode emoji accepted by Discord."""
+
     def test_default_emoji_is_in_emoji_range(self):
         """The default refresh_button_emoji must be a Unicode emoji code
         point (U+1F000+), not an arrow symbol like U+21BB which Discord
@@ -67,6 +68,7 @@ def _make_emoji_error() -> discord.HTTPException:
 
 class TestArmRefreshButton:
     """Arming the ephemeral refresh button installs a working reopen mechanism."""
+
     async def test_arm_with_default_emoji_succeeds(self):
         """Arming with the default (valid) emoji should not raise and
         should leave the view with a single refresh button installed.
@@ -246,6 +248,7 @@ class TestReplacePolicyExitBehavior:
 
 class TestExitPolicy:
     """exit_policy controls whether bare exit() freezes or deletes the message."""
+
     def test_default_is_disable(self):
         """exit_policy should default to "disable" on StatefulView so
         bare exit() calls preserve the historical safe-by-default
@@ -333,16 +336,12 @@ class TestExitPolicy:
         view = _View(interaction=_make_interaction())
         view._message = MagicMock()
         response = MagicMock(status=404, reason="Not Found")
-        view._message.delete = AsyncMock(
-            side_effect=discord.NotFound(response, "Unknown Message")
-        )
+        view._message.delete = AsyncMock(side_effect=discord.NotFound(response, "Unknown Message"))
 
         with caplog.at_level(logging.ERROR, logger="cascadeui.views.base"):
             await view.exit()
 
-        assert not any(
-            "Error cleaning up message" in record.message for record in caplog.records
-        )
+        assert not any("Error cleaning up message" in record.message for record in caplog.records)
 
     async def test_exit_debug_logs_ephemeral_token_expired(self, caplog):
         """401 on ephemeral cleanup is the webhook-token cliff -- expected
@@ -390,7 +389,8 @@ class TestExitPolicy:
             await view.exit()
 
         assert any(
-            "Error cleaning up message" in r.message for r in caplog.records
+            "Error cleaning up message" in r.message
+            for r in caplog.records
             if r.levelname == "ERROR"
         )
 
@@ -400,6 +400,7 @@ class TestExitPolicy:
 
 class TestOnInstanceLimit:
     """on_instance_limit hook sends ephemeral rejection with default or custom messages."""
+
     async def test_default_sends_ephemeral_with_default_message(self):
         """The default on_instance_limit should send error.default_message
         as an ephemeral on the originating interaction when no

@@ -24,7 +24,7 @@ These methods are available on all view classes (V1 and V2):
 
 #### `send(...)`
 
-Sends the view as a message. V1 accepts `content`, `embed`, `embeds`, `ephemeral`. V2 sends the view as its own content (no content/embed params).
+Sends the view as a message. V1 accepts `content`, `embed`, `embeds`, `file`, `files`, `ephemeral`. V2 accepts `file`, `files`, `ephemeral` (V2 sends the view as its own content, so no content/embed params). The `file` / `files` pair mirrors discord.py's `Messageable.send` signature and pairs with the V2 media builders (`gallery`, `image_section`, `file_attachment`) for `attachment://` references. See [Local file attachments](../guide/components.md#local-file-attachments).
 
 **Return value:** the sent `discord.Message` on success, or `None` when the view was blocked before reaching Discord. Two conditions produce `None`:
 
@@ -290,6 +290,10 @@ StatefulLayoutView(context=None, **kwargs)
 ```
 
 V2 views ARE the message content -- `send()` takes no `content` or `embed` params. Build the component tree in `__init__` or an async builder, then call `send()`.
+
+#### V2-Specific Class Attributes
+
+- `validate_placement` (bool): Run the V2 placement validator before every Discord round-trip. When `True` (default), the assembled component tree is walked at three seams -- the initial `send()`, every state-driven `refresh()` after the render-hash short-circuit, and the in-place edits from `push()` / `pop()` navigation -- and any composition Discord rejects with HTTP 400 raises `ValueError` with a path string identifying the violation node and a suggested fix. Type rejections cover Container nesting, Section nesting, Section accessory not in `{Button, Thumbnail}`, standalone `Button` / `Select` / `Thumbnail` at LayoutView or Container level, Modal-only types (`Label`, `RadioGroup`, `CheckboxGroup`, `Checkbox`, `FileUpload`) anywhere in the tree, and ActionRow children outside the Button/Select union. Size rejections cover empty Containers, empty Sections, empty ActionRows, and MediaGallery items outside the 1-10 range. Set to `False` only when the validator's matrix lags a discord.py or Discord update; opting out otherwise signals an actual placement bug, prefer fixing the tree. See [V2 Placement Rules](../guide/components.md#v2-placement-rules) for the full matrix and the builders-as-guardrails framing.
 
 #### V2-Specific Methods
 

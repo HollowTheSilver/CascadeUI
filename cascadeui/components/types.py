@@ -23,3 +23,21 @@ A live :class:`discord.Emoji` (returned by ``bot.get_emoji`` or
 ``bot.fetch_application_emoji``) and a :class:`discord.PartialEmoji`
 instance are also accepted directly.
 """
+
+
+MediaInput = Union[str, discord.File]
+"""Anything CascadeUI accepts where a media reference is required.
+
+Mirrors the union accepted by :class:`discord.ui.MediaGallery`,
+:class:`discord.ui.Thumbnail`, and :class:`discord.ui.File`. Two forms:
+
+* A URL string -- either an arbitrary remote URL
+  (``"https://cdn.example.com/img.png"``) or the
+  ``"attachment://<filename>"`` reference scheme for files uploaded
+  alongside the same message.
+* A :class:`discord.File` instance, in which case the underlying
+  ``.uri`` (``"attachment://<filename>"``) is used. The same file
+  object must also be passed via ``view.send(files=[...])`` (or
+  ``refresh(attachments=[...])`` for in-place swaps) so the bytes
+  travel with the message.
+"""

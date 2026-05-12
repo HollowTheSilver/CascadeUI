@@ -23,6 +23,7 @@ from .patterns import (
     confirm_section,
     cycle_button,
     divider,
+    file_attachment,
     gallery,
     gap,
     image_section,
@@ -35,7 +36,7 @@ from .patterns import (
     toggle_section,
 )
 from .selects import ChannelSelect, Dropdown, MentionableSelect, RoleSelect, UserSelect
-from .types import EmojiInput
+from .types import EmojiInput, MediaInput
 from .v1_composition import CompositeComponent, get_component, register_component
 from .wrappers import with_confirmation, with_cooldown, with_loading_state
 
@@ -102,6 +103,8 @@ __all__ = [
     "tab_nav",
     # V2 media
     "gallery",
+    "file_attachment",
     # Type aliases
     "EmojiInput",
+    "MediaInput",
 ]

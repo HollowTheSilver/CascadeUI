@@ -9,8 +9,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from helpers import make_interaction as _make_interaction
 
-from cascadeui.state.singleton import get_store
 from cascadeui import InstanceLimitError
+from cascadeui.state.singleton import get_store
 from cascadeui.views.view import StatefulView
 
 

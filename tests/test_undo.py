@@ -1176,7 +1176,9 @@ class TestMissingSentinelDeepCopy:
         copied = copy.deepcopy(snapshot)
         assert copied["application_slots"]["scoped"] is _MISSING
         assert copied["application_slots"]["settings"] == {"k": 1}
-        assert copied["application_slots"]["settings"] is not snapshot["application_slots"]["settings"]
+        assert (
+            copied["application_slots"]["settings"] is not snapshot["application_slots"]["settings"]
+        )
 
     async def test_undo_followed_by_dispatch_does_not_corrupt_application_slot(self):
         """End-to-end regression for the live-bot SETTINGS_UPDATED crash.
@@ -1219,9 +1221,9 @@ class TestMissingSentinelDeepCopy:
         # The slot was popped (not present) OR is a real dict (re-created
         # by a clean reducer call). It must NEVER be a bare object that
         # fails iteration.
-        assert scoped_after_undo is None or isinstance(scoped_after_undo, dict), (
-            f"slot corruption: state['application']['scoped'] is {type(scoped_after_undo).__name__}"
-        )
+        assert scoped_after_undo is None or isinstance(
+            scoped_after_undo, dict
+        ), f"slot corruption: state['application']['scoped'] is {type(scoped_after_undo).__name__}"
 
         # Subsequent SCOPED_UPDATE must succeed (this is what crashed
         # in the live bot at v2_settings.py:75).

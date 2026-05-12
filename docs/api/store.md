@@ -102,7 +102,7 @@ Returns scoped state for the given scope type and ID. Reads from the live `self.
 
 #### `get_scoped_from(state, scope, **identifiers)` (staticmethod)
 
-Reads a scoped slice from an explicit `state` dict rather than the live store. Intended for `@computed` selectors (which receive `state` as input) and custom reducers (which mutate deep-copied state). Using `store.get_scoped()` inside a reducer would bypass the deep-copied state — `get_scoped_from(state, ...)` keeps the read aligned with what the reducer is mutating.
+Reads a scoped slice from an explicit `state` dict rather than the live store. Intended for `@computed` selectors (which receive `state` as input) and custom reducers (which mutate deep-copied state). Using `store.get_scoped()` inside a reducer would bypass the deep-copied state -- `get_scoped_from(state, ...)` keeps the read aligned with what the reducer is mutating.
 
 #### `iter_scoped(scope, slot_name="scoped")`
 

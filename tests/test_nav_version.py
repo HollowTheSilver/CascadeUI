@@ -5,8 +5,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from helpers import make_interaction as _make_interaction
 
-from cascadeui.views.view import StatefulView
 from cascadeui.views.layout import StatefulLayoutView
+from cascadeui.views.view import StatefulView
 
 
 class _V1View(StatefulView):

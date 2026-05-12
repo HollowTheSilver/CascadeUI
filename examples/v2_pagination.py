@@ -15,8 +15,21 @@ V2 advantages shown here:
     - Jump buttons and go-to-page modal for large page counts
     - _build_extra_items() hook for adding an exit button
 
+Two construction modes:
+
+    - ``from_data(items, per_page, formatter)`` -- eager mode. The full
+      list is in memory; the paginator chunks and formats up front.
+    - ``from_cursor(fetch, total, per_page, formatter)`` -- cursor mode.
+      The paginator fetches one page at a time via an async callable,
+      caches the result in an LRU keyed on page index, and protects
+      the currently-displayed page from eviction. Use when the dataset
+      is large enough that eager load would waste bandwidth/memory, or
+      when the data lives behind an async source (database, HTTP API).
+
 Commands:
-    /v2pages   Browse a paginated item list
+    /v2pages    Browse the inventory in eager mode (from_data)
+    /v2cursor   Browse the inventory in cursor mode (from_cursor with
+                a simulated database fetch callable)
 
 Usage:
     Load this cog in your bot. Requires: pip install pycascadeui discord.py
@@ -25,6 +38,7 @@ Usage:
 # // ========================================( Modules )======================================== // #
 
 
+import asyncio
 import logging
 
 import discord
@@ -168,6 +182,44 @@ class V2PaginationExample(commands.Cog, name="v2_pagination_example"):
         """
         view = await InventoryView.from_data(
             items=SAMPLE_ITEMS,
+            per_page=4,
+            formatter=format_page,
+            context=context,
+        )
+        await view.send()
+
+    @commands.hybrid_command(
+        name="v2cursor",
+        description="Browse the inventory in cursor mode (lazy page fetch).",
+    )
+    async def v2cursor(self, context: Context) -> None:
+        """Browse the same inventory through a simulated database cursor.
+
+        ``from_cursor`` accepts a ``fetch(offset, limit) -> list``
+        callable plus a ``total`` count. The paginator calls ``fetch``
+        on demand, caches the result keyed on page index, and protects
+        the currently-displayed page from LRU eviction so navigation
+        never re-fetches the page the user is looking at.
+
+        Real bots back ``fetch`` with a database query or HTTP API call.
+        Here the callable slices ``SAMPLE_ITEMS`` and sleeps briefly to
+        simulate I/O latency, so the network-bound pattern is visible
+        without a database.
+        """
+
+        async def fetch_inventory_page(offset: int, limit: int) -> list:
+            # Simulated round-trip cost. Real implementations replace this
+            # with an ``await session.execute(stmt)`` or HTTP fetch.
+            await asyncio.sleep(0.05)
+            return SAMPLE_ITEMS[offset : offset + limit]
+
+        # ``from_cursor`` is a synchronous classmethod, unlike ``from_data``
+        # which awaits its formatter during initial chunking. Cursor mode
+        # defers the first fetch until ``send()``, so the constructor has
+        # nothing to await.
+        view = InventoryView.from_cursor(
+            fetch_inventory_page,
+            total=len(SAMPLE_ITEMS),
             per_page=4,
             formatter=format_page,
             context=context,

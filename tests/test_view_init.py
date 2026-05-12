@@ -1,9 +1,17 @@
-"""Tests for StatefulView initialization: _init_kwargs capture and subscribed_actions override."""
+"""Tests for StatefulView initialization: _init_kwargs capture and subscribed_actions override.
 
-from unittest.mock import MagicMock
+Also hosts ``TestStatefulViewSend`` for V1 base-class send-time behavior
+(file/files forwarding, rollback close), the V1 sibling of
+``TestStatefulLayoutViewSend`` in ``test_layout_view.py``.
+"""
 
+from unittest.mock import AsyncMock, MagicMock
+
+import discord
 import pytest
+from helpers import make_interaction as _make_interaction
 
+from cascadeui.state.singleton import get_store
 from cascadeui.views.view import StatefulView
 
 # // ========================================( Snowflake Coercion )======================================== // #
@@ -369,3 +377,84 @@ class TestSubscribedActionsOverride:
 
         view = PlainSubclass()
         assert view.subscribed_actions == set()
+
+
+class TestStatefulViewSend:
+    """V1 ``StatefulView.send()`` file/files forwarding and rollback close.
+
+    Sibling of ``TestStatefulLayoutViewSend`` in ``test_layout_view.py``;
+    same shape, V1 base path.
+    """
+
+    async def test_send_forwards_files_to_discord(self):
+        """``files=`` reaches the underlying send call alongside ``view=``."""
+        interaction = _make_interaction()
+        view = StatefulView(interaction=interaction)
+        photo = MagicMock(spec=discord.File)
+
+        await view.send(files=[photo])
+
+        call_kwargs = interaction.response.send_message.call_args.kwargs
+        assert call_kwargs["files"] == [photo]
+        assert call_kwargs["view"] is view
+
+    async def test_send_forwards_single_file_to_discord(self):
+        """``file=`` (singular) reaches the underlying send call."""
+        interaction = _make_interaction()
+        view = StatefulView(interaction=interaction)
+        photo = MagicMock(spec=discord.File)
+
+        await view.send(file=photo)
+
+        call_kwargs = interaction.response.send_message.call_args.kwargs
+        assert call_kwargs["file"] is photo
+
+    async def test_send_omits_files_when_unset(self):
+        """Send-kwargs carry no ``file``/``files`` keys unless callers supplied them."""
+        interaction = _make_interaction()
+        view = StatefulView(interaction=interaction)
+
+        await view.send()
+
+        call_kwargs = interaction.response.send_message.call_args.kwargs
+        assert "files" not in call_kwargs
+        assert "file" not in call_kwargs
+
+    async def test_send_failure_closes_file_handles(self):
+        """Caller-supplied file handles get closed when the send raises before HTTP."""
+        interaction = _make_interaction()
+        interaction.response.send_message = AsyncMock(side_effect=Exception("fail"))
+        view = StatefulView(interaction=interaction)
+        photo1 = MagicMock(spec=discord.File)
+        photo2 = MagicMock(spec=discord.File)
+
+        with pytest.raises(Exception, match="fail"):
+            await view.send(files=[photo1, photo2])
+
+        photo1.close.assert_called_once()
+        photo2.close.assert_called_once()
+
+    async def test_send_failure_closes_singular_file(self):
+        """``file=`` (singular) also gets closed on rollback."""
+        interaction = _make_interaction()
+        interaction.response.send_message = AsyncMock(side_effect=Exception("fail"))
+        view = StatefulView(interaction=interaction)
+        photo = MagicMock(spec=discord.File)
+
+        with pytest.raises(Exception, match="fail"):
+            await view.send(file=photo)
+
+        photo.close.assert_called_once()
+
+    async def test_send_rollback_unregisters_view(self):
+        """Failed send still routes through the existing rollback registry cleanup."""
+        interaction = _make_interaction()
+        interaction.response.send_message = AsyncMock(side_effect=Exception("fail"))
+        view = StatefulView(interaction=interaction)
+        store = get_store()
+        photo = MagicMock(spec=discord.File)
+
+        with pytest.raises(Exception, match="fail"):
+            await view.send(files=[photo])
+
+        assert view.id not in store._active_views

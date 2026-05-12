@@ -17,9 +17,8 @@ import pytest
 
 from cascadeui.components.base import StatefulButton
 from cascadeui.state.store import StateStore
-from cascadeui.views.view import StatefulView
 from cascadeui.views.layout import StatefulLayoutView
-
+from cascadeui.views.view import StatefulView
 
 # // ========================================( Helpers )======================================== // #
 
@@ -38,6 +37,7 @@ def _make_view(store, *, cls=None):
 
 class TestUpdateCoalescing:
     """Concurrent state notifications coalesce into a single on_state_changed call."""
+
     async def test_single_notification_runs_normally(self):
         store = StateStore()
         view = _make_view(store)

@@ -9,6 +9,7 @@ from cascadeui.state.singleton import get_store
 
 class TestEventHooks:
     """Store on/off hooks fire on matching actions and survive hook failures."""
+
     async def test_hook_fires_on_matching_action(self):
         store = get_store()
         received = []

@@ -24,6 +24,7 @@ def _make_item(callback):
 
 class TestAutoDeferFires:
     """Auto-defer timer fires when callbacks take longer than the delay threshold."""
+
     async def test_timer_defers_slow_callback(self):
         """Auto-defer fires when callback hasn't responded in time."""
         view = StatefulView(interaction=_make_interaction())
@@ -90,6 +91,7 @@ class TestAutoDeferFires:
 
 class TestPostCallbackDefer:
     """Post-callback defer catches fast callbacks that never touch the interaction response."""
+
     async def test_fast_callback_deferred_after_completion(self):
         """Fast callbacks that don't respond are deferred after completion.
 
@@ -153,6 +155,7 @@ class TestPostCallbackDefer:
 
 class TestAutoDeferSkipped:
     """Auto-defer timer is skipped or cancelled when the callback responds first."""
+
     async def test_timer_skipped_when_callback_responds_fast(self):
         """If the callback responds before the timer, defer is not called by auto-defer."""
         view = StatefulView(interaction=_make_interaction())
@@ -213,6 +216,7 @@ class TestAutoDeferSkipped:
 
 class TestAutoDeferErrorHandling:
     """Auto-defer handles expired interactions and callback errors gracefully."""
+
     async def test_handles_expired_interaction_gracefully(self):
         """If the interaction expired, the auto-defer timer catches the error."""
         view = StatefulView(interaction=_make_interaction())
@@ -254,6 +258,7 @@ class TestAutoDeferErrorHandling:
 
 class TestAutoDeferDefaults:
     """Default auto-defer configuration values and subclass overrides."""
+
     async def test_default_auto_defer_enabled(self):
         """Auto-defer is enabled by default."""
         view = StatefulView(interaction=_make_interaction())
@@ -279,6 +284,7 @@ class TestAutoDeferDefaults:
 
 class TestRespond:
     """respond() routes to interaction.response or followup based on is_done state."""
+
     async def test_uses_response_when_not_done(self):
         """respond() routes to interaction.response.send_message when available."""
         view = StatefulView(interaction=_make_interaction())
@@ -319,9 +325,7 @@ class TestRespond:
 
         await view.respond(interaction, embed=mock_embed, ephemeral=True)
 
-        interaction.followup.send.assert_called_once_with(
-            None, ephemeral=True, embed=mock_embed
-        )
+        interaction.followup.send.assert_called_once_with(None, ephemeral=True, embed=mock_embed)
 
     async def test_non_ephemeral(self):
         """respond() works for public (non-ephemeral) responses."""
@@ -330,9 +334,7 @@ class TestRespond:
 
         await view.respond(interaction, "public message")
 
-        interaction.response.send_message.assert_called_once_with(
-            "public message", ephemeral=False
-        )
+        interaction.response.send_message.assert_called_once_with("public message", ephemeral=False)
 
     async def test_content_only(self):
         """respond() works with just content, no kwargs."""
@@ -346,6 +348,7 @@ class TestRespond:
 
 class TestOpenModal:
     """open_modal() sends modal or ephemeral fallback based on response slot availability."""
+
     async def test_sends_modal_when_slot_available(self):
         """open_modal() sends the modal when the response slot is free."""
         view = StatefulView(interaction=_make_interaction())

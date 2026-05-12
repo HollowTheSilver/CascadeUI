@@ -25,7 +25,6 @@ from cascadeui.persistence import (
     RegistryPersistence,
     SlotPolicy,
 )
-from cascadeui.state.middleware.persistence import PersistenceMiddleware
 from cascadeui.persistence.migrations import (
     _KWARGS_MIGRATORS,
     _MIGRATORS,
@@ -37,6 +36,7 @@ from cascadeui.persistence.schema import (
     TABLE_APPLICATION_SLOTS,
     TABLE_PERSISTENT_VIEWS,
 )
+from cascadeui.state.middleware.persistence import PersistenceMiddleware
 from cascadeui.state.singleton import get_store
 
 # // ========================================( Fake / limited backends )======================================== // #
@@ -111,9 +111,7 @@ class TestRegistryPersistenceValidation:
     def test_accepts_fully_capable_backend(self):
         cfg = RegistryPersistence(backend=InMemoryBackend())
         assert cfg.backend is not None
-        assert cfg._required_capabilities == (
-            Capability.RELATIONAL | Capability.SCHEMA_META
-        )
+        assert cfg._required_capabilities == (Capability.RELATIONAL | Capability.SCHEMA_META)
 
     def test_rejects_kv_only_backend(self):
         with pytest.raises(PersistenceConfigError):
@@ -129,18 +127,22 @@ class TestApplicationPersistenceValidation:
 
     def test_no_slots_requires_relational_and_schema_meta(self):
         cfg = ApplicationPersistence(backend=InMemoryBackend())
-        assert cfg._required_capabilities == (
-            Capability.RELATIONAL | Capability.SCHEMA_META
-        )
+        assert cfg._required_capabilities == (Capability.RELATIONAL | Capability.SCHEMA_META)
 
     def test_non_ttl_slot_does_not_require_ttl_index(self):
         # A persistent slot without ttl_days only needs RELATIONAL + SCHEMA_META.
         cfg = ApplicationPersistence(
-            backend=_KVOnlyBackend.__new__(type("_NoTTL", (), {
-                "capabilities": Capability.RELATIONAL | Capability.SCHEMA_META,
-                "initialize": _KVOnlyBackend.initialize,
-                "close": _KVOnlyBackend.close,
-            })),
+            backend=_KVOnlyBackend.__new__(
+                type(
+                    "_NoTTL",
+                    (),
+                    {
+                        "capabilities": Capability.RELATIONAL | Capability.SCHEMA_META,
+                        "initialize": _KVOnlyBackend.initialize,
+                        "close": _KVOnlyBackend.close,
+                    },
+                )
+            ),
             slots={"prefs": SlotPolicy(persistent=True)},
         )
         assert Capability.TTL_INDEX not in cfg._required_capabilities
@@ -824,8 +826,10 @@ class TestPersistenceMiddlewareSetup:
             # apply_migrations -> rehydrate) has real methods to call; lie
             # about capabilities so ApplicationPersistence validation passes.
             capabilities = (
-                Capability.KV | Capability.RELATIONAL
-                | Capability.SCHEMA_META | Capability.TTL_INDEX
+                Capability.KV
+                | Capability.RELATIONAL
+                | Capability.SCHEMA_META
+                | Capability.TTL_INDEX
             )
 
             def __init__(self, path):
@@ -923,9 +927,7 @@ class TestPersistenceMiddlewareSetup:
         be = InMemoryBackend()
         await setup_middleware(PersistenceMiddleware(backend=be))
         store = get_store()
-        assert any(
-            isinstance(mw, PersistenceMiddleware) for mw in store._middleware
-        )
+        assert any(isinstance(mw, PersistenceMiddleware) for mw in store._middleware)
 
 
 # // ========================================( Migrator registries )======================================== // #

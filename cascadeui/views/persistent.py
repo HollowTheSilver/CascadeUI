@@ -224,6 +224,17 @@ class _PersistentMixin:
             internal view store (there is no public API to remove it). Avoid
             raising from this method unless recovery is not possible.
 
+        .. note::
+            ``attachment://`` references already present in the persisted
+            component tree resolve from Discord's stored copy of the
+            original upload -- the bytes survive bot restarts as long as
+            the message itself does. New ``attachment://`` references
+            introduced inside this hook (or any subsequent rebuild) need a
+            matching ``discord.File`` passed to
+            ``view.refresh(attachments=[...])`` so the bytes travel with
+            the edit; otherwise Discord reports the reference as
+            unresolved.
+
         Args:
             bot: The discord.py Bot instance.
         """

@@ -11,8 +11,8 @@ from cascadeui.theming.core import (
     register_theme,
     set_default_theme,
 )
-from cascadeui.views.view import StatefulView
 from cascadeui.views.layout import StatefulLayoutView
+from cascadeui.views.view import StatefulView
 
 
 @pytest.fixture(autouse=True)
@@ -29,6 +29,7 @@ def reset_themes():
 
 class TestTheme:
     """Theme stores styles, applies them to embeds, and falls back for missing keys."""
+
     def test_theme_has_default_colors(self):
         t = Theme("test")
         assert t.get_style("primary_color") is not None
@@ -51,6 +52,7 @@ class TestTheme:
 
 class TestThemeRegistry:
     """Global theme registry: register, retrieve, and set default theme."""
+
     def test_register_and_retrieve(self):
         t = Theme("my_theme")
         register_theme(t)

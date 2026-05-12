@@ -11,10 +11,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from helpers import make_interaction as _make_interaction
 
-from cascadeui.state.singleton import get_store
 from cascadeui import InstanceLimitError
+from cascadeui.state.singleton import get_store
 from cascadeui.views.view import StatefulView
-
 
 # // ========================================( Pillar 1 vs 2 )======================================== // #
 
@@ -55,9 +54,7 @@ class TestAccessControlDoesNotAffectInstanceLimits:
         await v.send()
 
         # Only 1 instance index entry (the owner's), not 5
-        active = store._get_active_views(
-            _TeamView._class_session_key(), "user_guild:1:100"
-        )
+        active = store._get_active_views(_TeamView._class_session_key(), "user_guild:1:100")
         assert len(active) == 1
 
     async def test_unauthorized_message_independent_of_instance_limit_message(self):
@@ -141,17 +138,13 @@ class TestInstanceConstraintsDoNotAffectNavigation:
         await root.send()
 
         # Count before push
-        before = len(
-            store._get_active_views(_Root._class_session_key(), "user_guild:100:200")
-        )
+        before = len(store._get_active_views(_Root._class_session_key(), "user_guild:100:200"))
         assert before == 1
 
         child = await root.push(_Sub)
 
         # Count after push -- still 1 (sub is tracked under root)
-        after = len(
-            store._get_active_views(_Root._class_session_key(), "user_guild:100:200")
-        )
+        after = len(store._get_active_views(_Root._class_session_key(), "user_guild:100:200"))
         assert after == 1
 
     async def test_nav_stack_independent_of_instance_scope(self):

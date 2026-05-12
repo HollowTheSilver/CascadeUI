@@ -17,6 +17,7 @@ from cascadeui.validation import (
 
 class TestBuiltInValidators:
     """Built-in validator factories (min_length, max_length, regex, etc.) produce correct results."""
+
     def test_min_length_pass(self):
         v = min_length(3)
         result = v("hello", {}, {})
@@ -96,6 +97,7 @@ class TestBuiltInValidators:
 
 class TestValidateField:
     """validate_field runs multiple validators against a single field value."""
+
     async def test_multiple_validators_on_one_field(self):
         field_def = {
             "id": "username",
@@ -135,6 +137,7 @@ class TestValidateField:
 
 class TestValidateFields:
     """validate_fields runs validators across multiple fields and collects all errors."""
+
     async def test_mixed_pass_and_fail(self):
         field_defs = [
             {"id": "name", "validators": [min_length(3)]},

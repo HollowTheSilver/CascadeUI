@@ -911,6 +911,14 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             The sent ``discord.Message`` on success, or ``None`` when a
             policy gate blocked the send.
         """
+        # -- Pre-flight check: V2 placement validation --
+        # Walks the assembled component tree and rejects placements
+        # Discord would 400 on. Runs before any state mutation so a
+        # rejected tree leaves zero side effects. The helper gates on
+        # ``validate_placement`` so V1 views (which lack the attribute)
+        # skip naturally.
+        self._check_placement()
+
         # -- Stage 1: instance enforcement --
         try:
             await self._enforce_instance_limit()
@@ -966,6 +974,18 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     self.auto_refresh_ephemeral = False
 
         # -- Stage 5: Discord send --
+        # Capture any caller-supplied attachments before the send so the
+        # rollback path can close their underlying file pointers if the
+        # send raises before discord.py's own ``finally`` runs (e.g.
+        # validation failures inside discord.py reject the payload before
+        # the HTTP layer is reached, and the file objects opened by the
+        # caller are otherwise leaked).
+        files_to_close = []
+        if send_kwargs.get("file") is not None:
+            files_to_close.append(send_kwargs["file"])
+        if send_kwargs.get("files"):
+            files_to_close.extend(send_kwargs["files"])
+
         class_name = type(self).__name__
         try:
             if self.context and hasattr(self.context, "send"):
@@ -986,6 +1006,15 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     f"{class_name}.send() requires either 'context' or 'interaction' to be set."
                 )
         except Exception:
+            for f in files_to_close:
+                # Defensive double-close: discord.py closes attachments in
+                # its own finally when the HTTP layer is reached. Calling
+                # close() on an already-closed File is a no-op, so this
+                # only changes behavior on the pre-HTTP failure path.
+                try:
+                    f.close()
+                except Exception:
+                    pass
             self.stop()
             self.task_manager.cancel_tasks(self.id)
             self.state_store._unsubscribe(self.id)
@@ -1615,6 +1644,15 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     skipped = True
                     return
 
+            # Pre-flight check on the assembled tree before any of the
+            # three edit paths ships. Skipped refreshes (digest match
+            # above) bypass this -- nothing changed, the previous send
+            # already validated. Catches mid-session shape changes
+            # (Wizard step swaps, Form section toggles, Tab body
+            # rebuilds) that would otherwise surface as HTTP 400 from
+            # Discord rather than a clear ``ValueError`` at the seam.
+            self._check_placement()
+
             # Acting-view fast path. When the currently-handled interaction
             # targets this view's message and its response slot is still open,
             # the edit piggybacks onto the interaction ack packet via
@@ -1741,6 +1779,23 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         retry = getattr(error, "retry_after", 1.0)
         self._refresh_not_before = time.monotonic() + retry
         return True
+
+    def _check_placement(self) -> None:
+        """Run the V2 placement validator on this view if enabled.
+
+        Single helper consumed by every seam that ships a tree to
+        Discord: ``_send_pipeline`` (initial send), ``refresh`` (in-place
+        edits), and ``_apply_navigation_edit`` (push/pop edits). V1
+        views lack the ``validate_placement`` attribute so the
+        ``getattr`` default of ``False`` makes the check a no-op for
+        them. The validator import is lazy to keep ``base.py``'s import
+        graph thin -- the check fires often (one walk per edit) but
+        loads its module once.
+        """
+        if getattr(self, "validate_placement", False):
+            from ._placement import validate_placement
+
+            validate_placement(self)
 
     def _stamp_cooldown(self) -> None:
         """Arm the proactive cooldown window after a successful edit.

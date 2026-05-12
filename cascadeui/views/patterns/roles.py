@@ -10,7 +10,7 @@ from discord.ui import ActionRow, Container, TextDisplay
 from ...components.base import DynamicPersistentButton
 from ...components.patterns.v2 import card, divider
 from ...components.types import EmojiInput
-from ...utils.helpers import slugify
+from ...utils.strings import slugify
 from ..layout import StatefulLayoutView
 from ..persistent import _PersistentMixin
 from .types import RoleCategory

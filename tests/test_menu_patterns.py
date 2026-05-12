@@ -5,9 +5,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import discord
 import pytest
 from discord.ui import Container, TextDisplay
+from helpers import make_interaction as _make_interaction
 
 from cascadeui.views.patterns import MenuLayoutView, MenuView
-from helpers import make_interaction as _make_interaction
 
 
 class _DummySubView(MenuView):
@@ -27,6 +27,7 @@ class _DummySubLayoutView(MenuLayoutView):
 
 class TestMenuViewInit:
     """V1 MenuView initialization, validation, and category storage."""
+
     def test_creates_buttons_from_categories(self):
         categories = [
             {"label": "Alpha", "view": _DummySubView},
@@ -72,6 +73,7 @@ class TestMenuViewInit:
 
 class TestMenuViewStyles:
     """V1 MenuView button style validation and customization."""
+
     def test_default_style_applied(self):
         view = MenuView(
             interaction=_make_interaction(),
@@ -107,6 +109,7 @@ class TestMenuViewStyles:
 
 class TestMenuViewHooks:
     """V1 MenuView hook overrides fire on category selection."""
+
     async def test_on_category_selected_fires_before_push(self):
         hook_calls = []
 
@@ -161,6 +164,7 @@ class TestMenuViewHooks:
 
 class TestMenuViewBuildUi:
     """V1 MenuView embed builder and extra-items hook."""
+
     def test_build_ui_rebuilds_categories(self):
         view = MenuView(
             interaction=_make_interaction(),
@@ -192,6 +196,7 @@ class TestMenuViewBuildUi:
 
 class TestMenuViewPush:
     """V1 MenuView category push callback wiring."""
+
     async def test_push_callback_calls_push_with_view_class(self):
         view = MenuView(
             interaction=_make_interaction(),
@@ -231,6 +236,7 @@ class TestMenuViewPush:
 
 class TestMenuLayoutViewInit:
     """V2 MenuLayoutView initialization, validation, and category storage."""
+
     def test_creates_action_sections_from_categories(self):
         categories = [
             {
@@ -291,6 +297,7 @@ class TestMenuLayoutViewInit:
 
 class TestMenuLayoutViewStyles:
     """V2 MenuLayoutView button style validation and customization."""
+
     def test_default_style(self):
         assert MenuLayoutView.menu_style is discord.ButtonStyle.primary
 
@@ -309,6 +316,7 @@ class TestMenuLayoutViewStyles:
 
 class TestMenuLayoutViewHooks:
     """V2 MenuLayoutView hook overrides fire on category selection."""
+
     def test_build_header_default_empty(self):
         view = MenuLayoutView(interaction=_make_interaction(), categories=[])
         assert view._build_header() == []
@@ -366,6 +374,7 @@ class TestMenuLayoutViewHooks:
 
 class TestMenuLayoutViewBuildUi:
     """V2 MenuLayoutView card builder and header/footer hooks."""
+
     def test_build_ui_rebuilds_full_tree(self):
         view = MenuLayoutView(
             interaction=_make_interaction(),
@@ -413,6 +422,7 @@ class TestMenuLayoutViewBuildUi:
 
 class TestMenuLayoutViewPush:
     """V2 MenuLayoutView category push callback wiring."""
+
     async def test_push_callback_calls_push(self):
         view = MenuLayoutView(
             interaction=_make_interaction(),

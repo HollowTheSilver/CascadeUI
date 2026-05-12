@@ -152,7 +152,10 @@ class TestStatefulLayoutViewDispatch:
 
 
 class TestStatefulLayoutViewSend:
-    """Send method tests."""
+    """V2 ``StatefulLayoutView.send()`` basic routing, file forwarding,
+    and rollback close. Sibling of ``TestStatefulViewSend`` in
+    ``test_view_init.py``; same shape, V2 base path.
+    """
 
     async def test_send_via_interaction(self):
         interaction = _make_interaction()
@@ -198,6 +201,66 @@ class TestStatefulLayoutViewSend:
 
         with pytest.raises(RuntimeError, match="requires either"):
             await view.send()
+
+    async def test_send_forwards_files_to_discord(self):
+        """``files=`` reaches the underlying send call alongside ``view=``."""
+        interaction = _make_interaction()
+        view = StatefulLayoutView(interaction=interaction)
+        photo = MagicMock(spec=discord.File)
+
+        await view.send(files=[photo])
+
+        call_kwargs = interaction.response.send_message.call_args.kwargs
+        assert call_kwargs["files"] == [photo]
+        assert call_kwargs["view"] is view
+
+    async def test_send_forwards_single_file_to_discord(self):
+        """``file=`` (singular) reaches the underlying send call."""
+        interaction = _make_interaction()
+        view = StatefulLayoutView(interaction=interaction)
+        photo = MagicMock(spec=discord.File)
+
+        await view.send(file=photo)
+
+        call_kwargs = interaction.response.send_message.call_args.kwargs
+        assert call_kwargs["file"] is photo
+
+    async def test_send_omits_files_when_unset(self):
+        """Send-kwargs carry no ``file``/``files`` keys unless callers supplied them."""
+        interaction = _make_interaction()
+        view = StatefulLayoutView(interaction=interaction)
+
+        await view.send()
+
+        call_kwargs = interaction.response.send_message.call_args.kwargs
+        assert "files" not in call_kwargs
+        assert "file" not in call_kwargs
+
+    async def test_send_failure_closes_file_handles(self):
+        """Caller-supplied file handles get closed when the send raises before HTTP."""
+        interaction = _make_interaction()
+        interaction.response.send_message = AsyncMock(side_effect=Exception("fail"))
+        view = StatefulLayoutView(interaction=interaction)
+        photo1 = MagicMock(spec=discord.File)
+        photo2 = MagicMock(spec=discord.File)
+
+        with pytest.raises(Exception, match="fail"):
+            await view.send(files=[photo1, photo2])
+
+        photo1.close.assert_called_once()
+        photo2.close.assert_called_once()
+
+    async def test_send_failure_closes_singular_file(self):
+        """``file=`` (singular) also gets closed on rollback."""
+        interaction = _make_interaction()
+        interaction.response.send_message = AsyncMock(side_effect=Exception("fail"))
+        view = StatefulLayoutView(interaction=interaction)
+        photo = MagicMock(spec=discord.File)
+
+        with pytest.raises(Exception, match="fail"):
+            await view.send(file=photo)
+
+        photo.close.assert_called_once()
 
 
 class TestSeedInitialState:
