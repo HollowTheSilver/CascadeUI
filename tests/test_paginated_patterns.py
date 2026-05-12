@@ -1,6 +1,6 @@
 """Tests for PaginatedView / PaginatedLayoutView customization and parity."""
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 import pytest
@@ -368,9 +368,9 @@ class TestPaginatedLayoutNavInsideContainer:
 
         # No Container-in-Container in the wrapper subtree.
         for child in wrapper.walk_children():
-            assert not isinstance(child, Container), (
-                f"Container-in-Container detected: {child!r} inside {wrapper!r}"
-            )
+            assert not isinstance(
+                child, Container
+            ), f"Container-in-Container detected: {child!r} inside {wrapper!r}"
 
         # Nav row is inside the wrapper.
         assert view._nav_row in list(wrapper.walk_children())
@@ -412,9 +412,9 @@ class TestPaginatedLayoutNavInsideContainer:
         await view._update_page()
 
         # The back row must still be in the tree.
-        assert back_row in list(view.children), (
-            "auto back button was stripped by _update_page rebuild"
-        )
+        assert back_row in list(
+            view.children
+        ), "auto back button was stripped by _update_page rebuild"
 
     async def test_flag_does_not_mutate_source_container_across_page_turns(self):
         """Page turns must not accumulate state on the source Container in
@@ -448,9 +448,59 @@ class TestPaginatedLayoutNavInsideContainer:
             await view._update_page()
 
         # Source pages must still have exactly one child each.
-        assert len(list(page_a.children)) == 1, (
-            f"page_a mutated across renders: {list(page_a.children)}"
+        assert (
+            len(list(page_a.children)) == 1
+        ), f"page_a mutated across renders: {list(page_a.children)}"
+        assert (
+            len(list(page_b.children)) == 1
+        ), f"page_b mutated across renders: {list(page_b.children)}"
+
+
+# // ========================================( V2 Send Kwargs Propagation )======================================== // #
+
+
+class TestPaginatedLayoutSendKwargsPropagation:
+    """V2 ``PaginatedLayoutView.send`` forwards ``file=``/``files=`` to ``super().send()``.
+
+    Sibling of ``TestSendKwargsPropagation`` in ``test_pagination.py``;
+    same shape, V2 base path. Patches target the V2 base class
+    (``cascadeui.views.layout.StatefulLayoutView.send``) for the same
+    reason: the override calls ``super().send()`` and MRO resolves to
+    the base, so the base is the only seam where forwarded kwargs land.
+    """
+
+    def _make_page(self, label: str):
+        return Container(TextDisplay(label))
+
+    async def test_files_forwarded_to_super_send(self):
+        """``files=`` reaches the V2 base ``send`` call alongside paginator kwargs."""
+        view = PaginatedLayoutView(
+            pages=[self._make_page("A"), self._make_page("B")],
+            interaction=_make_interaction(),
         )
-        assert len(list(page_b.children)) == 1, (
-            f"page_b mutated across renders: {list(page_b.children)}"
+        photo = MagicMock(spec=discord.File)
+
+        with patch(
+            "cascadeui.views.layout.StatefulLayoutView.send",
+            new=AsyncMock(return_value=MagicMock()),
+        ) as mock_super_send:
+            await view.send(files=[photo])
+
+        mock_super_send.assert_called_once()
+        assert mock_super_send.call_args.kwargs["files"] == [photo]
+
+    async def test_single_file_forwarded_to_super_send(self):
+        """``file=`` (singular) reaches the V2 base ``send`` call."""
+        view = PaginatedLayoutView(
+            pages=[self._make_page("A"), self._make_page("B")],
+            interaction=_make_interaction(),
         )
+        photo = MagicMock(spec=discord.File)
+
+        with patch(
+            "cascadeui.views.layout.StatefulLayoutView.send",
+            new=AsyncMock(return_value=MagicMock()),
+        ) as mock_super_send:
+            await view.send(file=photo)
+
+        assert mock_super_send.call_args.kwargs["file"] is photo

@@ -13,6 +13,7 @@ from .v2 import (
     cycle_button,
     divider,
     emoji_grid,
+    file_attachment,
     gallery,
     gap,
     image_section,
@@ -57,6 +58,7 @@ __all__ = [
     "tab_nav",
     # V2 media
     "gallery",
+    "file_attachment",
     # V2 grids
     "EmojiGrid",
     "emoji_grid",

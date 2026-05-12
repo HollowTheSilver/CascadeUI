@@ -109,7 +109,8 @@ pip install pycascadeui
 Optional dependencies:
 
 ```bash
-pip install pycascadeui[sqlite]
+pip install pycascadeui[sqlite]      # single-process persistence
+pip install pycascadeui[postgres]    # multi-process persistence with LISTEN/NOTIFY
 ```
 
 Requirements:
@@ -607,7 +608,7 @@ for row in rows:
 ### Components
 - Stateful buttons, selects, and modals with state integration
 - Select callbacks can opt into a `values` second parameter
-- V2 builders: `card()`, `stats_card()`, `action_section()`, `toggle_section()`, `image_section()`, `link_section()`, `confirm_section()`, `button_row()`, `cycle_button()`, `toggle_button()`, `tab_nav()`, `key_value()`, `alert()`, `progress_bar()`, `divider()`, `gap()`, `gallery()`
+- V2 builders: `card()`, `stats_card()`, `action_section()`, `toggle_section()`, `image_section()`, `link_section()`, `confirm_section()`, `button_row()`, `cycle_button()`, `toggle_button()`, `tab_nav()`, `key_value()`, `alert()`, `progress_bar()`, `divider()`, `gap()`, `gallery()`, `file_attachment()`
 - Grid helpers: `emoji_grid()` and `button_grid()`
 - Typed modal fields (`text`, `integer`, `float`, `date`) with per-field validation
 - Declarative `FormSchema` and `WizardSchema` base classes
@@ -634,7 +635,8 @@ for row in rows:
 ### Persistence
 - Persistent views that survive bot restarts with automatic message re-attachment
 - Opt-in per slot via `persistent_slots = (...)` (≈ `redux-persist`)
-- Built-in SQLite and in-memory backends; custom backends via capability-flag `Protocol`
+- Built-in SQLite, PostgreSQL, and in-memory backends; custom backends via capability-flag `Protocol`
+- Cross-process scoped invalidation through PostgreSQL `LISTEN`/`NOTIFY` (multi-worker bots)
 - Named scoped buckets via `scoped_slot` for per-subsystem persistence
 - Two-namespace model (`registry` and `application`) with per-namespace debounce and retry backoff
 - Undo and redo via snapshot-based state history (opt in with `enable_undo`)

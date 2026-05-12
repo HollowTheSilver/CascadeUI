@@ -10,6 +10,7 @@ from cascadeui.state.singleton import get_store
 
 class TestComputedValue:
     """ComputedValue caches derived state and invalidates on input change."""
+
     def test_correct_value_on_first_access(self):
         store = get_store()
 

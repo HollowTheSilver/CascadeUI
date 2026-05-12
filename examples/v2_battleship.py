@@ -1531,4 +1531,9 @@ async def setup(bot) -> None:
     #     await setup_middleware(
     #         PersistenceMiddleware(backend=SQLiteBackend("cascadeui.db"), bot=self),
     #     )
+    #
+    # v2_persistence.py is the full reference for the persistence surface:
+    # data persistence via persistent_slots, view persistence via
+    # PersistentView, and the bot=self argument that re-attaches persistent
+    # panels on restart.
     await bot.add_cog(BattleshipExample(bot=bot))

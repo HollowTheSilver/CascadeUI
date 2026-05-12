@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 import pytest
 from helpers import make_interaction as _make_interaction
 
-from cascadeui import read_slot, slot_property, access_slot
+from cascadeui import access_slot, read_slot, slot_property
 from cascadeui.state.singleton import get_store
 from cascadeui.views.layout import StatefulLayoutView
 
@@ -32,9 +32,7 @@ class TestAccessSlotHelper:
 
     def test_default_factory_seeds_missing_key(self):
         state = {}
-        keyed = access_slot(
-            state, "battleship", 999, default_factory=lambda: {"phase": "setup"}
-        )
+        keyed = access_slot(state, "battleship", 999, default_factory=lambda: {"phase": "setup"})
         assert keyed == {"phase": "setup"}
 
     def test_default_factory_only_runs_on_first_access(self):
@@ -128,9 +126,7 @@ class TestSlotProperty:
         interaction = _make_interaction(user_id=400)
 
         class PartialSeedView(StatefulLayoutView):
-            score = slot_property(
-                "score", slot="ps", key=lambda self: self.user_id, default=0
-            )
+            score = slot_property("score", slot="ps", key=lambda self: self.user_id, default=0)
 
             async def seed_initial_state(self, state):
                 access_slot(state, "ps", self.user_id)["other_field"] = "x"
@@ -147,9 +143,7 @@ class TestSlotProperty:
         store = get_store()
 
         class LiveView(StatefulLayoutView):
-            score = slot_property(
-                "score", slot="live", key=lambda self: self.user_id, default=0
-            )
+            score = slot_property("score", slot="live", key=lambda self: self.user_id, default=0)
 
             async def seed_initial_state(self, state):
                 access_slot(state, "live", self.user_id)["score"] = 10
@@ -165,9 +159,7 @@ class TestSlotProperty:
         # Accessing through the class (no instance) returns the descriptor
         # itself -- standard Python descriptor protocol.
         class V(StatefulLayoutView):
-            phase = slot_property(
-                "phase", slot="x", key=lambda self: 1, default=None
-            )
+            phase = slot_property("phase", slot="x", key=lambda self: 1, default=None)
 
         assert isinstance(V.phase, slot_property)
 
@@ -338,35 +330,23 @@ class TestReadSlot:
                 }
             }
         }
-        assert (
-            read_slot(state, "stats", "guild1", "user1", "combat", "wins") == 99
-        )
+        assert read_slot(state, "stats", "guild1", "user1", "combat", "wins") == 99
 
     def test_returns_default_on_missing_intermediate(self):
         state = {"application": {"stats": {100: {"combat": {}}}}}
-        assert (
-            read_slot(state, "stats", 100, "combat", "wins", default=0) == 0
-        )
-        assert (
-            read_slot(state, "stats", 100, "missing", "wins", default=0) == 0
-        )
+        assert read_slot(state, "stats", 100, "combat", "wins", default=0) == 0
+        assert read_slot(state, "stats", 100, "missing", "wins", default=0) == 0
 
     def test_returns_default_when_intermediate_is_not_dict(self):
         state = {"application": {"flags": {42: "enabled"}}}
         # "enabled" is not a dict -- walking past it must fall back.
-        assert (
-            read_slot(state, "flags", 42, "nested", default="fallback")
-            == "fallback"
-        )
+        assert read_slot(state, "flags", 42, "nested", default="fallback") == "fallback"
 
     def test_distinguishes_literal_none_from_missing(self):
         # A stored None is a valid value; a missing key returns the default.
         state = {"application": {"flags": {42: {"active": None}}}}
         assert read_slot(state, "flags", 42, "active", default="fallback") is None
-        assert (
-            read_slot(state, "flags", 42, "absent", default="fallback")
-            == "fallback"
-        )
+        assert read_slot(state, "flags", 42, "absent", default="fallback") == "fallback"
 
 
 # // ========================================( persistent_slots attribute )======================================== // #

@@ -11,10 +11,7 @@ preserved below for historical reference but are not the supported baseline.
 
 ## [Unreleased]
 
-Designs locked for upcoming releases. Implementation work lands in a
-future version; entries move into a dated release header on ship.
-
-### Planned
+### Added
 
 - **Image Renderer for leaderboards.** Optional `[images]` extra shipping
   `ImageLeaderboardLayoutView` with a `render: Callable[[entries, page],
@@ -23,6 +20,43 @@ future version; entries move into a dated release header on ship.
   Pillow-backed; core install stays lean because the extra is opt-in.
 - **Redis persistence backend.** Capability-flag conformant `RedisBackend`
   with multi-process coordination and pub/sub for scoped invalidation.
+
+---
+
+## [3.3.0] - 2026-05-12
+
+### Added
+
+- **`PostgresBackend` for PostgreSQL persistence** via the new
+  `pycascadeui[postgres]` extra. asyncpg-backed connection pool with
+  `LISTEN` / `NOTIFY` for cross-process scoped invalidation. Configure
+  with `PostgresBackend(dsn=...)`; tuning kwargs and deployment hints
+  in the persistence guide.
+- **Backend extensibility via `Capability.RAW_SQL`.** SQL-capable
+  backends (`SQLiteBackend`, `PostgresBackend`) declare the capability
+  and expose `execute` / `fetch` / `executemany` / `fetch_one` / async
+  `transaction()` for user domain tables and vendor-specific features.
+  `placeholder_style` ClassVar reports the parameter syntax for
+  portable SQL. `InMemoryBackend` does not declare the capability.
+- **V2 placement validator on `StatefulLayoutView`.** Walks the
+  component tree before every Discord round-trip and raises
+  `ValueError` with a path string + fix on placements Discord 400s on
+  (nesting, accessory misuse, Modal-only types, size bound violations).
+  Opt out with `validate_placement = False`.
+- **`file_attachment(url, *, spoiler=False)` V2 builder.** Wraps the
+  `File` primitive for inline attachment cards; completes the V2 media
+  family alongside `gallery()`.
+- **Local file attachments on `view.send()` and `view.refresh()`.** Both
+  V1 and V2 send accept `file=` / `files=`; mid-session swaps go through
+  `refresh(attachments=[...])`. V2 media builders (`gallery`,
+  `image_section`, `file_attachment`) accept `discord.File` directly and
+  resolve through `.uri`. New `MediaInput` type alias
+  (`Union[str, discord.File]`) exported at the package root. New
+  `cascadeui.fetch_as_file(url, filename, *, session=None, spoiler=False,
+  description=None)` helper absorbs the aiohttp + BytesIO + discord.File
+  construction pattern. New `examples/v2_attachments.py` covers all four
+  shapes end-to-end.
+
 ---
 
 ## [3.2.0] - 2026-04-30

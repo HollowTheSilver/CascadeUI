@@ -478,8 +478,9 @@ Enforces a cooldown between clicks. Expired entries are automatically cleaned up
 Converts display strings to safe `custom_id` fragments.
 
 ```python
-slugify("Color Roles")    # "color-roles"
-slugify("He/Him")         # "hehim"
+slugify("Color Roles")    # "color_roles"
+slugify("He/Him")         # "he_him"
+slugify("Tickets #1")     # "tickets_1"
 ```
 
 ### `@cascade_component(component_id=None)`

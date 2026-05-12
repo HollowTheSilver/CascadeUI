@@ -37,22 +37,44 @@ except ImportError:
     SQLiteBackend = None  # type: ignore[assignment]
 
 
+postgres_available = False
+try:
+    import asyncpg  # noqa: F401
+    from testcontainers.postgres import PostgresContainer  # noqa: F401
+
+    from cascadeui.persistence.backends.postgres import PostgresBackend
+
+    postgres_available = True
+except ImportError:
+    PostgresBackend = None  # type: ignore[assignment]
+
+
 def _backend_ids():
     ids = ["InMemoryBackend"]
     if sqlite_available:
         ids.append("SQLiteBackend")
+    if postgres_available:
+        ids.append("PostgresBackend")
     return ids
 
 
 @pytest.fixture(params=_backend_ids())
 async def backend(request, tmp_path):
     """Protocol-parametrized backend instance, initialized and closed
-    around each test. Skips SQLiteBackend when aiosqlite is unavailable.
+    around each test. Skips SQLiteBackend when aiosqlite is unavailable
+    and PostgresBackend when asyncpg / testcontainers / Docker are
+    unavailable.
     """
     if request.param == "InMemoryBackend":
         inst = InMemoryBackend()
     elif request.param == "SQLiteBackend":
         inst = SQLiteBackend(str(tmp_path / "proto.db"))
+    elif request.param == "PostgresBackend":
+        # Postgres path defers fixture lookup so the InMemory and SQLite
+        # branches do not pay the testcontainers spin-up cost when the
+        # Postgres branch is skipped.
+        dsn = request.getfixturevalue("postgres_dsn")
+        inst = PostgresBackend(dsn)
     else:
         pytest.skip(f"Unknown backend: {request.param}")
     await inst.initialize()
@@ -127,7 +149,7 @@ class TestBackendProtocolConformance:
         await backend.row_upsert(TABLE_APPLICATION_SLOTS, base, ["slot_name"])
         await backend.row_upsert(
             TABLE_APPLICATION_SLOTS,
-            {**base, "payload": "{\"v\": 2}", "updated_at": 200},
+            {**base, "payload": '{"v": 2}', "updated_at": 200},
             ["slot_name"],
         )
         rows = await backend.row_select(TABLE_APPLICATION_SLOTS)
@@ -148,9 +170,7 @@ class TestBackendProtocolConformance:
                 },
                 ["slot_name"],
             )
-        rows = await backend.row_select(
-            TABLE_APPLICATION_SLOTS, {"slot_name": "b"}
-        )
+        rows = await backend.row_select(TABLE_APPLICATION_SLOTS, {"slot_name": "b"})
         assert len(rows) == 1
         assert rows[0]["slot_name"] == "b"
 
@@ -183,17 +203,13 @@ class TestBackendProtocolConformance:
                 },
                 ["slot_name"],
             )
-        deleted = await backend.row_delete(
-            TABLE_APPLICATION_SLOTS, {"slot_name": "b"}
-        )
+        deleted = await backend.row_delete(TABLE_APPLICATION_SLOTS, {"slot_name": "b"})
         assert deleted == 1
         rows = await backend.row_select(TABLE_APPLICATION_SLOTS)
         assert {r["slot_name"] for r in rows} == {"a", "c"}
 
     async def test_row_delete_nonexistent_returns_zero(self, backend):
-        deleted = await backend.row_delete(
-            TABLE_APPLICATION_SLOTS, {"slot_name": "never"}
-        )
+        deleted = await backend.row_delete(TABLE_APPLICATION_SLOTS, {"slot_name": "never"})
         assert deleted == 0
 
     async def test_row_delete_where_lt_ttl_prune(self, backend):
@@ -211,9 +227,7 @@ class TestBackendProtocolConformance:
                 },
                 ["slot_name"],
             )
-        deleted = await backend.row_delete_where_lt(
-            TABLE_APPLICATION_SLOTS, "expires_at", 150
-        )
+        deleted = await backend.row_delete_where_lt(TABLE_APPLICATION_SLOTS, "expires_at", 150)
         assert deleted == 1
         rows = await backend.row_select(TABLE_APPLICATION_SLOTS)
         assert {r["slot_name"] for r in rows} == {"mid", "new"}
@@ -242,13 +256,13 @@ class TestBackendCopyOnStore:
         await backend.initialize()
         row = {
             "slot_name": "pref",
-            "payload": "{\"v\": 1}",
+            "payload": '{"v": 1}',
             "schema_version": 1,
             "updated_at": 1,
             "expires_at": None,
         }
         await backend.row_upsert(TABLE_APPLICATION_SLOTS, row, ["slot_name"])
-        row["payload"] = "{\"v\": 999}"  # caller mutation after store
+        row["payload"] = '{"v": 999}'  # caller mutation after store
         rows = await backend.row_select(TABLE_APPLICATION_SLOTS)
         assert rows[0]["payload"] == '{"v": 1}'
 
@@ -306,9 +320,7 @@ class TestBackendNullSafeTTLPrune:
             },
             ["slot_name"],
         )
-        deleted = await backend.row_delete_where_lt(
-            TABLE_APPLICATION_SLOTS, "expires_at", 10_000
-        )
+        deleted = await backend.row_delete_where_lt(TABLE_APPLICATION_SLOTS, "expires_at", 10_000)
         assert deleted == 1
         rows = await backend.row_select(TABLE_APPLICATION_SLOTS)
         assert rows[0]["slot_name"] == "forever"
@@ -352,7 +364,7 @@ class TestSQLiteBackendPersistence:
             TABLE_APPLICATION_SLOTS,
             {
                 "slot_name": "prefs",
-                "payload": "{\"k\":1}",
+                "payload": '{"k":1}',
                 "schema_version": 1,
                 "updated_at": 1,
                 "expires_at": None,
@@ -380,4 +392,3 @@ class TestSQLiteBackendPersistence:
         v = await b.get_schema_version(TABLE_PERSISTENT_VIEWS)
         await b.close()
         assert v == 2
-

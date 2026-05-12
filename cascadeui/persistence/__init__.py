@@ -29,3 +29,8 @@ if "SQLiteBackend" in _backends_all:
     from .backends import SQLiteBackend  # noqa: F401
 
     __all__.append("SQLiteBackend")
+
+if "PostgresBackend" in _backends_all:
+    from .backends import PostgresBackend  # noqa: F401
+
+    __all__.append("PostgresBackend")

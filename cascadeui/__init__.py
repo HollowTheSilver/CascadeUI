@@ -28,6 +28,7 @@ from .components.patterns import (
     cycle_button,
     divider,
     emoji_grid,
+    file_attachment,
     gallery,
     gap,
     image_section,
@@ -39,7 +40,7 @@ from .components.patterns import (
     toggle_button,
     toggle_section,
 )
-from .components.types import EmojiInput
+from .components.types import EmojiInput, MediaInput
 from .components.v1_composition import CompositeComponent, get_component, register_component
 from .components.wrappers import with_confirmation, with_cooldown, with_loading_state
 from .devtools import DevToolsCog, InspectorView
@@ -82,8 +83,9 @@ from .theming.core import Theme, get_default_theme, get_theme, register_theme, s
 from .theming.themes import dark_theme, default_theme, light_theme
 from .utils.decorators import cascade_component, cascade_reducer
 from .utils.errors import safe_execute, with_error_boundary, with_retry
-from .utils.helpers import slugify
+from .utils.fetch import fetch_as_file
 from .utils.logging import setup_logging
+from .utils.strings import slugify
 from .utils.tasks import get_task_manager
 from .validation import (
     ValidationResult,
@@ -130,7 +132,7 @@ if "SQLiteBackend" in _persistence_all:
 # // ========================================( Script )======================================== // #
 
 
-__version__ = "3.2.0"
+__version__ = "3.3.0"
 
 # Export public API
 __all__ = [
@@ -197,6 +199,7 @@ __all__ = [
     "with_cooldown",
     # Type aliases
     "EmojiInput",
+    "MediaInput",
     # V2 Cards & Sections
     "card",
     "action_section",
@@ -220,6 +223,7 @@ __all__ = [
     "tab_nav",
     # V2 Media
     "gallery",
+    "file_attachment",
     # V2 Grids
     "EmojiGrid",
     "emoji_grid",
@@ -277,6 +281,7 @@ __all__ = [
     "cascade_reducer",
     "cascade_component",
     "slugify",
+    "fetch_as_file",
     # DevTools
     "InspectorView",
     "DevToolsCog",

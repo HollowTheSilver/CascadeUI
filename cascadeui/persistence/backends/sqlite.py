@@ -10,10 +10,10 @@ Requires the ``aiosqlite`` extra::
     pip install pycascadeui[sqlite]
 
 One physical database serves all three namespaces plus the generic KV
-surface -- table names (``cascadeui/persistence/schema.py``) are the
-partitioning key. A single persistent connection is opened in
-:meth:`initialize` and reused; the :class:`~asyncio.Lock` on the
-connection guards SQLite's single-writer semantics.
+surface; shared table-name constants are the partitioning key. A single
+persistent connection is opened in :meth:`initialize` and reused; the
+:class:`~asyncio.Lock` on the connection guards SQLite's single-writer
+semantics.
 """
 
 # // ========================================( Modules )======================================== // #
@@ -22,7 +22,7 @@ connection guards SQLite's single-writer semantics.
 import asyncio
 import logging
 import time
-from typing import Any, AsyncIterator, ClassVar
+from typing import Any, AsyncIterator, ClassVar, Optional
 
 import aiosqlite  # hard import -- backends/__init__.py catches ImportError
 
@@ -41,7 +41,14 @@ def _quote_ident(name: str) -> str:
     library ever passes through (constants from ``schema.py`` and row
     keys from namespace configs), but cheap insurance for user-authored
     namespace configs that might slip an odd name past review.
+
+    Rejects NUL bytes outright -- SQLite silently accepts NUL in
+    identifiers and produces a corrupt schema, while PostgreSQL
+    rejects them. The ValueError surfaces at the seam rather than
+    letting the bad identifier propagate to the engine.
     """
+    if "\x00" in name:
+        raise ValueError(f"identifier contains NUL byte: {name!r}")
     return '"' + name.replace('"', '""') + '"'
 
 
@@ -78,13 +85,20 @@ class SQLiteBackend:
     """
 
     capabilities: ClassVar[Capability] = (
-        Capability.KV | Capability.RELATIONAL | Capability.TTL_INDEX | Capability.SCHEMA_META
+        Capability.KV
+        | Capability.RELATIONAL
+        | Capability.TTL_INDEX
+        | Capability.SCHEMA_META
+        | Capability.RAW_SQL
     )
+
+    placeholder_style: ClassVar[str] = "qmark"
 
     def __init__(self, db_path: str = "cascadeui.db") -> None:
         self.db_path = db_path
         self._conn: aiosqlite.Connection | None = None
         self._write_lock = asyncio.Lock()
+        self._txn_depth: int = 0
 
     # // ========================================( Lifecycle )======================================== // #
 
@@ -101,8 +115,30 @@ class SQLiteBackend:
         conn = await aiosqlite.connect(self.db_path)
         conn.row_factory = aiosqlite.Row  # dict-like access via column name
 
-        await conn.execute("PRAGMA journal_mode=WAL")
+        # WAL mode requires SQLite 3.7.0+. The PRAGMA returns the new
+        # journal mode as a string -- "wal" on success, the prior mode
+        # if the engine could not switch. Fail loud rather than running
+        # silently in DELETE mode with degraded concurrency.
+        cursor = await conn.execute("PRAGMA journal_mode=WAL")
+        mode_row = await cursor.fetchone()
+        await cursor.close()
+        if mode_row is None or str(mode_row[0]).lower() != "wal":
+            await conn.close()
+            raise RuntimeError(
+                f"SQLiteBackend could not enable WAL journal mode "
+                f"(got {mode_row[0] if mode_row else None!r}). "
+                f"WAL requires SQLite 3.7.0+ (released 2010-07-21)."
+            )
         await conn.execute("PRAGMA foreign_keys=ON")
+        # synchronous=NORMAL is corruption-safe under WAL per
+        # sqlite.org/pragma.html#pragma_synchronous and substantially
+        # faster than the FULL default for commit-heavy workloads.
+        await conn.execute("PRAGMA synchronous=NORMAL")
+        # busy_timeout=5000 (5s) lets concurrent writers wait for the
+        # lock instead of raising OperationalError immediately. Important
+        # when an external SQLite process (devtools, ad-hoc scripts)
+        # holds the write lock briefly.
+        await conn.execute("PRAGMA busy_timeout=5000")
 
         for stmt in ALL_DDL:
             await conn.execute(stmt)
@@ -334,3 +370,164 @@ class SQLiteBackend:
                 (table, version, applied_at),
             )
             await db.commit()
+
+    # // ========================================( Raw SQL surface )======================================== // #
+
+    async def execute(self, sql: str, *params: Any) -> int:
+        """Execute an SQL statement. Caller-supplied SQL runs verbatim
+        with the provided positional ``params`` bound through aiosqlite.
+        Use ``?`` placeholders to match SQLite's parameter style.
+
+        Returns the affected-row count for INSERT/UPDATE/DELETE; returns
+        ``0`` for DDL (CREATE/ALTER/DROP) statements that don't report
+        row counts. Inside a ``transaction()`` block the call participates
+        in the transaction; outside one it auto-commits under the write
+        lock.
+        """
+        if not sql:
+            raise ValueError("execute requires a non-empty sql string")
+        db = self._db()
+        if self._txn_depth > 0:
+            cursor = await db.execute(sql, params)
+            rowcount = cursor.rowcount
+            await cursor.close()
+        else:
+            async with self._write_lock:
+                cursor = await db.execute(sql, params)
+                rowcount = cursor.rowcount
+                await cursor.close()
+                await db.commit()
+        return rowcount or 0
+
+    async def fetch(self, sql: str, *params: Any) -> list[dict[str, Any]]:
+        """Execute an SQL query and return all rows as dicts. Returns an
+        empty list for queries that yield no rows. Each dict's keys are
+        column names from the query (or aliases via ``AS``); rows are
+        defensive copies independent of cursor state.
+        """
+        if not sql:
+            raise ValueError("fetch requires a non-empty sql string")
+        db = self._db()
+        cursor = await db.execute(sql, params)
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return [dict(r) for r in rows]
+
+    async def executemany(self, sql: str, params_list: list[tuple]) -> int:
+        """Execute an SQL statement against multiple parameter sets in
+        one call. Returns ``len(params_list)`` as a best-effort
+        approximation -- aiosqlite's ``cursor.rowcount`` after
+        ``executemany`` reflects only the LAST statement in the batch
+        (per Python's ``sqlite3`` module behavior), not the aggregate.
+        Empty ``params_list`` is a no-op returning ``0``. Inside a
+        transaction the call participates in the transaction; outside
+        one it auto-commits under the write lock.
+
+        The return value matches ``PostgresBackend.executemany`` for
+        cross-backend consistency.
+        """
+        if not sql:
+            raise ValueError("executemany requires a non-empty sql string")
+        if not params_list:
+            return 0
+        db = self._db()
+        if self._txn_depth > 0:
+            cursor = await db.executemany(sql, params_list)
+            await cursor.close()
+        else:
+            async with self._write_lock:
+                cursor = await db.executemany(sql, params_list)
+                await cursor.close()
+                await db.commit()
+        return len(params_list)
+
+    async def fetch_one(self, sql: str, *params: Any) -> Optional[dict[str, Any]]:
+        """Execute an SQL query and return the first row as a dict, or
+        ``None`` if the query yields no rows. The empty-result return is
+        the contract; callers enforce single-row constraints explicitly.
+        """
+        if not sql:
+            raise ValueError("fetch_one requires a non-empty sql string")
+        db = self._db()
+        cursor = await db.execute(sql, params)
+        row = await cursor.fetchone()
+        await cursor.close()
+        return dict(row) if row is not None else None
+
+    def transaction(self) -> "_SQLiteTransaction":
+        """Open an explicit transaction context. Outermost entries issue
+        ``BEGIN``/``COMMIT``/``ROLLBACK`` and hold the backend's write
+        lock; nested entries issue ``SAVEPOINT``/``RELEASE
+        SAVEPOINT``/``ROLLBACK TO SAVEPOINT``.
+
+        Only the raw-SQL methods (``execute``, ``fetch``, ``executemany``,
+        ``fetch_one``) participate in the transaction. Namespace API
+        methods (``row_upsert``, ``row_select``, ``kv_*``) auto-commit
+        per call regardless of transaction state.
+        """
+        return _SQLiteTransaction(self)
+
+
+# // ========================================( Transaction helper )======================================== // #
+
+
+class _SQLiteTransaction:
+    """SQLite transaction context. Outermost entries take the backend's
+    write lock and issue BEGIN/COMMIT; nested entries issue SAVEPOINT
+    statements that compose with asyncpg-style nesting (rollback to
+    savepoint isolates inner failures from the outer transaction).
+
+    Depth tracking lives on ``backend._txn_depth`` (the connection is a
+    singleton on SQLiteBackend, so per-instance state is correct). The
+    write lock is held for the lifetime of the outermost transaction --
+    long-running transactions starve concurrent writes; keep transaction
+    bodies short.
+    """
+
+    def __init__(self, backend: "SQLiteBackend") -> None:
+        self._backend = backend
+        self._savepoint_name: str | None = None
+        self._holds_lock: bool = False
+
+    async def __aenter__(self) -> "_SQLiteTransaction":
+        depth = self._backend._txn_depth
+        db = self._backend._db()
+        if depth == 0:
+            await self._backend._write_lock.acquire()
+            self._holds_lock = True
+            try:
+                await db.execute("BEGIN")
+            except Exception:
+                self._backend._write_lock.release()
+                self._holds_lock = False
+                raise
+        else:
+            self._savepoint_name = f"cascadeui_sp_{depth}"
+            await db.execute(f"SAVEPOINT {self._savepoint_name}")
+        self._backend._txn_depth = depth + 1
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: Optional[type],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[Any],
+    ) -> None:
+        self._backend._txn_depth -= 1
+        db = self._backend._db()
+        try:
+            if exc_type is None:
+                if self._savepoint_name is None:
+                    await db.execute("COMMIT")
+                else:
+                    await db.execute(f"RELEASE SAVEPOINT {self._savepoint_name}")
+            else:
+                if self._savepoint_name is None:
+                    await db.execute("ROLLBACK")
+                else:
+                    await db.execute(f"ROLLBACK TO SAVEPOINT {self._savepoint_name}")
+                    await db.execute(f"RELEASE SAVEPOINT {self._savepoint_name}")
+        finally:
+            if self._holds_lock:
+                self._backend._write_lock.release()
+                self._holds_lock = False

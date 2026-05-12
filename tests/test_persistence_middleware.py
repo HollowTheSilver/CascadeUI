@@ -36,7 +36,6 @@ from cascadeui.state.middleware.persistence import PersistenceMiddleware
 from cascadeui.state.singleton import get_store
 from cascadeui.state.slots import access_slot
 
-
 # // ========================================( Fixtures )======================================== // #
 
 
@@ -143,9 +142,7 @@ class TestMiddlewareRoutesApplication:
             store.state = new
             return new
 
-        await middleware(
-            {"type": "SET_PREFS", "payload": {}}, state_before, mutate_app
-        )
+        await middleware({"type": "SET_PREFS", "payload": {}}, state_before, mutate_app)
 
         assert "prefs" in middleware._ns_application.dirty_rows
         row = middleware._ns_application.dirty_rows["prefs"]
@@ -204,9 +201,7 @@ class TestMiddlewareRoutesApplication:
             store.state = new
             return new
 
-        await middleware(
-            {"type": "BUMP_SCRATCH", "payload": {}}, store.state, bump
-        )
+        await middleware({"type": "BUMP_SCRATCH", "payload": {}}, store.state, bump)
 
         assert "scratch" not in middleware._ns_application.dirty_rows
 
@@ -217,9 +212,7 @@ class TestMiddlewareRoutesApplication:
         store = middleware._store
 
         store.state = {"application": {}, "sessions": {}}
-        access_slot(
-            store.state, "user_prefs", "42", default_factory=dict, persistent=True
-        )
+        access_slot(store.state, "user_prefs", "42", default_factory=dict, persistent=True)
 
         async def write(action, state):
             new = dict(state)
@@ -229,9 +222,7 @@ class TestMiddlewareRoutesApplication:
             store.state = new
             return new
 
-        await middleware(
-            {"type": "UPDATE_PREFS", "payload": {}}, store.state, write
-        )
+        await middleware({"type": "UPDATE_PREFS", "payload": {}}, store.state, write)
 
         assert "user_prefs" in middleware._ns_application.dirty_rows
 
@@ -519,9 +510,7 @@ class TestMiddlewareDebounce:
         # ceiling eventually clamps wait to 0 and a flush fires.
         start = asyncio.get_running_loop().time()
         for n in range(10):
-            await middleware(
-                {"type": "TICK", "payload": {}}, store.state, await write(n)
-            )
+            await middleware({"type": "TICK", "payload": {}}, store.state, await write(n))
             await asyncio.sleep(0.02)
 
         await _drain(middleware)
@@ -562,9 +551,7 @@ class TestMiddlewareRetryBackoff:
             store.state = new
             return new
 
-        await middleware(
-            {"type": "WRITE", "payload": {}}, store.state, write
-        )
+        await middleware({"type": "WRITE", "payload": {}}, store.state, write)
 
         # Let the first flush fail and bump retry_count.
         await asyncio.sleep(0.05)

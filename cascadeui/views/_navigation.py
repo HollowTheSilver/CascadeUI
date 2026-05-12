@@ -373,6 +373,12 @@ class _NavigationMixin:
             if isinstance(result, dict):
                 edit_kwargs = result
 
+        # Pre-flight check on the new view's assembled tree. Catches the
+        # same class of HTTP 400 the validator catches in send/refresh:
+        # invalid placements introduced by a rebuild callback that
+        # populates the tree post-init.
+        new_view._check_placement()
+
         try:
             msg = await current_interaction.edit_original_response(view=new_view, **edit_kwargs)
             # Preserve the parent's plain Message ref. The edit response

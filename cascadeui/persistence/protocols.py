@@ -13,27 +13,31 @@ Design contracts
 ----------------
 
 **All library-owned persistence operations are idempotent.** Rehydrate,
-prune, and schema migration are designed to produce the same end state
-whether they run once or many times. This is deliberate: the Protocol
-does not expose a transaction primitive, so crash-mid-operation recovery
-relies on re-running the operation rather than rolling back. Future
-additions to this surface must preserve the property -- any new method
-that mutates state should either be safely repeatable or gated behind
-an optional :class:`Capability` flag that transactional backends declare.
+prune, and schema migration produce the same end state whether they
+run once or many times. The namespace API does not expose a transaction
+primitive, so crash-mid-operation recovery relies on re-running the
+operation rather than rolling back. Methods that mutate state are
+safely repeatable; backends offering atomic grouping declare
+:data:`Capability.RAW_SQL` and expose the explicit
+:meth:`PersistenceBackend.transaction` context manager.
 
-**The Protocol is backend-agnostic.** Methods operate on namespaces
-(logical tables), rows (dicts), keys (strings), and values (bytes).
-Raw SQL is not exposed. A :data:`Capability.RAW_SQL` flag plus optional
-``execute(sql)`` method will be added when the first library migration
-needs DDL -- until then, schema evolution lives in ``schema.py`` for
-fresh installs and data rewrites via the row API for existing installs.
+**The Protocol is backend-agnostic at the namespace level.** Methods
+operate on namespaces (logical tables), rows (dicts), keys (strings),
+and values (bytes). SQL backends that declare :data:`Capability.RAW_SQL`
+expose an additional escape hatch (``execute``, ``fetch``,
+``executemany``, ``fetch_one``, ``transaction()``) for user-managed
+tables, vendor-specific features (PostgreSQL JSONB GIN queries, SQLite
+FTS5), and ad-hoc DDL. Backends without ``Capability.RAW_SQL``
+(in-memory, key-value-only) do not implement this surface; user code
+that requires raw SQL checks the capability flag first.
 """
 
 # // ========================================( Modules )======================================== // #
 
 
+from contextlib import AbstractAsyncContextManager
 from enum import Flag, auto
-from typing import Any, AsyncIterator, ClassVar, Protocol, runtime_checkable
+from typing import Any, AsyncIterator, ClassVar, Optional, Protocol, runtime_checkable
 
 # // ========================================( Capability Flag )======================================== // #
 
@@ -56,12 +60,18 @@ class Capability(Flag):
     - ``SCHEMA_META`` -- supports the ``cascadeui_schema`` metadata
       table for migrator bookkeeping. All library-shipped backends
       declare this.
+    - ``RAW_SQL`` -- exposes the raw-SQL escape hatch (``execute``,
+      ``fetch``, ``executemany``, ``fetch_one``, ``transaction()``)
+      for user-managed tables and vendor-specific features. SQL
+      backends declare this; in-memory and key-value-only backends
+      do not.
     """
 
     KV = auto()
     RELATIONAL = auto()
     TTL_INDEX = auto()
     SCHEMA_META = auto()
+    RAW_SQL = auto()
 
 
 # // ========================================( Backend Protocol )======================================== // #
@@ -82,6 +92,24 @@ class PersistenceBackend(Protocol):
     """
 
     capabilities: ClassVar[Capability]
+    placeholder_style: ClassVar[str]
+    """PEP 249 paramstyle the backend's raw-SQL methods expect.
+
+    Meaningful only when ``Capability.RAW_SQL`` is declared. Standard
+    values: ``"qmark"`` (``?`` placeholders, SQLite via aiosqlite),
+    ``"numeric"`` (``$1``/``$2`` placeholders, PostgreSQL via asyncpg).
+    Backends without raw-SQL support set this to ``"n/a"`` for
+    informational consistency.
+
+    Portable user code reads this property and formats SQL accordingly::
+
+        ph = backend.placeholder_style
+        sql = (
+            "INSERT INTO t VALUES (?, ?)" if ph == "qmark"
+            else "INSERT INTO t VALUES ($1, $2)"
+        )
+        await backend.execute(sql, val1, val2)
+    """
 
     # Lifecycle
 
@@ -169,3 +197,105 @@ class PersistenceBackend(Protocol):
         ``table``. Written atomically with the migration that produced
         it."""
         ...
+
+    # Raw SQL surface (Capability.RAW_SQL)
+
+    async def execute(self, sql: str, *params: Any) -> int:
+        """Execute an SQL statement. Returns the affected-row count for
+        ``INSERT``/``UPDATE``/``DELETE``; returns ``0`` for DDL
+        statements that do not report row counts.
+
+        The placeholder style of ``sql`` must match the backend's
+        :attr:`placeholder_style` ClassVar. Caller-supplied SQL is
+        executed verbatim; identifier quoting, SQL injection prevention,
+        and dialect compatibility are caller responsibilities.
+
+        Raises :class:`ValueError` if ``sql`` is empty. Backend-specific
+        exceptions on SQL errors propagate unwrapped so callers can
+        pattern-match on vendor error codes.
+        """
+        ...
+
+    async def fetch(self, sql: str, *params: Any) -> list[dict[str, Any]]:
+        """Execute an SQL query and return all rows as a list of dicts.
+
+        Empty result returns an empty list. Each dict's keys are the
+        column names from the query (or aliases via ``AS``). Rows are
+        defensive copies -- caller mutation of the returned list cannot
+        affect backend state.
+        """
+        ...
+
+    async def executemany(self, sql: str, params_list: list[tuple]) -> int:
+        """Execute an SQL statement against multiple parameter sets in
+        a single round trip. Returns ``len(params_list)`` as a
+        best-effort approximation of affected rows.
+
+        Drivers do not consistently expose per-batch row counts (aiosqlite
+        reports the last-row count only; asyncpg returns no count from
+        ``executemany``), so implementations return the input length
+        rather than an aggregate from the engine. All parameter tuples
+        must have the same arity. Empty ``params_list`` is a no-op
+        returning ``0``. Intended for bulk ``INSERT``/``UPDATE``/``DELETE``
+        patterns; DDL statements that take no parameters use
+        :meth:`execute` instead.
+        """
+        ...
+
+    async def fetch_one(self, sql: str, *params: Any) -> Optional[dict[str, Any]]:
+        """Execute an SQL query and return the first row as a dict, or
+        ``None`` if the query returns no rows. The empty-result return
+        is the contract; callers enforce single-row constraints
+        explicitly.
+        """
+        ...
+
+    def transaction(self) -> AbstractAsyncContextManager["Transaction"]:
+        """Open an explicit transaction for atomic raw-SQL grouping.
+
+        Operations within the ``async with`` block run on the same
+        underlying connection and commit or roll back atomically.
+        Nested transactions create savepoints natively (asyncpg and
+        aiosqlite both support this).
+
+        The returned object is an async context manager. Users do not
+        inspect it directly; consumption is via ``async with``::
+
+            async with backend.transaction():
+                await backend.execute("INSERT INTO t VALUES (?, ?)", 1, "a")
+                await backend.execute("INSERT INTO t VALUES (?, ?)", 2, "b")
+            # Both committed atomically; either raised => both rolled back.
+
+        Constraint: only the raw-SQL methods (``execute``, ``fetch``,
+        ``executemany``, ``fetch_one``) participate in the transaction.
+        The namespace API (``row_upsert``, ``row_select``, ``kv_*``)
+        continues to auto-commit per call. To group namespace operations
+        atomically, use raw SQL inside the transaction body.
+
+        Raises :class:`NotImplementedError` if the backend does not
+        declare ``Capability.RAW_SQL``.
+        """
+        ...
+
+
+# // ========================================( Transaction Protocol )======================================== // #
+
+
+@runtime_checkable
+class Transaction(Protocol):
+    """Async context manager returned by :meth:`PersistenceBackend.transaction`.
+
+    Backends return implementations of this Protocol from their
+    :meth:`~PersistenceBackend.transaction` method. Users consume them
+    via ``async with``; the object itself has no public methods beyond
+    the context-manager dunder pair.
+    """
+
+    async def __aenter__(self) -> "Transaction": ...
+
+    async def __aexit__(
+        self,
+        exc_type: Optional[type],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[Any],
+    ) -> None: ...

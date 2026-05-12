@@ -149,17 +149,20 @@ summary = await store.persistence_manager.reattach_persistent_views()
 
 ### Built-in backends
 
-The library ships two backends:
+The library ships three backends:
 
 | Backend | Import | Capabilities |
 |---------|--------|--------------|
 | `InMemoryBackend` | `cascadeui.persistence` | KV, RELATIONAL, TTL_INDEX, SCHEMA_META |
 | `SQLiteBackend` | `cascadeui.persistence` (requires `aiosqlite`) | KV, RELATIONAL, TTL_INDEX, SCHEMA_META |
+| `PostgresBackend` | `cascadeui.persistence` (requires `asyncpg`) | KV, RELATIONAL, TTL_INDEX, SCHEMA_META |
 
 `InMemoryBackend` is the reference implementation. It matches the Protocol
 exactly and is useful for tests. `SQLiteBackend` is the recommended
-production default: WAL mode for concurrent reads, `ON CONFLICT` upsert,
-NULL-safe TTL prune, and LIKE-ESCAPE safe scan.
+single-process production default: WAL mode for concurrent reads,
+`ON CONFLICT` upsert, NULL-safe TTL prune, and LIKE-ESCAPE safe scan.
+`PostgresBackend` adds cross-process coordination via `LISTEN`/`NOTIFY`
+and is the right choice for multi-process deployments.
 
 ```bash
 pip install pycascadeui[sqlite]
@@ -174,6 +177,266 @@ await setup_middleware(
     PersistenceMiddleware(backend=SQLiteBackend("cascadeui.db"), bot=bot),
 )
 ```
+
+### PostgreSQL backend
+
+`PostgresBackend` ships full Protocol surface against PostgreSQL via
+`asyncpg`. Install the optional dependency:
+
+```bash
+pip install pycascadeui[postgres]
+```
+
+Configure with a connection string:
+
+```python
+import os
+
+from cascadeui import setup_middleware
+from cascadeui.state.middleware import PersistenceMiddleware
+from cascadeui.persistence import PostgresBackend
+
+backend = PostgresBackend(dsn=os.environ["CASCADEUI_DATABASE_URL"])
+await setup_middleware(
+    PersistenceMiddleware(backend=backend, bot=bot),
+)
+```
+
+The `dsn` accepts the standard libpq URL format. Production deployments
+use `sslmode=verify-full` for full TLS certificate verification:
+
+```text
+postgresql://user:pass@host:port/db?sslmode=verify-full&sslrootcert=/path/to/ca.crt
+```
+
+#### Required database privileges
+
+The CascadeUI database user needs minimal `GRANT`s:
+
+```sql
+GRANT CONNECT ON DATABASE cascadeui TO cascadeui_app;
+GRANT USAGE ON SCHEMA public TO cascadeui_app;
+GRANT SELECT, INSERT, UPDATE, DELETE
+    ON persistent_views, application_slots, cascadeui_kv, cascadeui_schema
+    TO cascadeui_app;
+```
+
+#### Cross-process invalidation
+
+`PostgresBackend` uses `LISTEN`/`NOTIFY` to broadcast slot invalidations
+to other CascadeUI processes connected to the same database. Bots
+running multiple workers automatically observe each other's writes. The
+listener connection sits outside the connection pool (LISTEN
+registrations are session-scoped per the PostgreSQL contract) and
+auto-reconnects on drop.
+
+Register a per-process callback to consume the invalidation stream:
+
+```python
+def on_invalidate(namespace: str, key: str) -> None:
+    # Drop any local cache entry keyed by (namespace, key)
+    cache.invalidate(namespace, key)
+
+backend.set_invalidation_callback(on_invalidate)
+```
+
+#### Pool tuning
+
+Library defaults: `min_size=2`, `max_size=10`, `statement_cache_size=1024`.
+Override via `pool_kwargs`:
+
+```python
+backend = PostgresBackend(
+    dsn="postgresql://...",
+    pool_kwargs={"min_size": 5, "max_size": 20},
+)
+```
+
+#### pgbouncer compatibility
+
+`asyncpg`'s prepared-statement cache requires session-mode pooling.
+Operators running pgbouncer in `transaction` or `statement` mode set
+`statement_cache_size=0`:
+
+```python
+backend = PostgresBackend(
+    dsn="postgresql://...",
+    pool_kwargs={"statement_cache_size": 0},
+)
+```
+
+### Custom tables and raw SQL
+
+CascadeUI's namespace API (`row_upsert` / `row_select` / `kv_*`)
+covers the common cases. For everything else -- domain tables in the
+same database, vendor-specific features (PostgreSQL JSONB GIN queries,
+SQLite FTS5), custom indexes, ad-hoc analytics queries -- backends that
+declare `Capability.RAW_SQL` expose a raw-SQL escape hatch.
+
+Three patterns to choose from:
+
+#### Pattern A: Separate database (recommended for unrelated domain data)
+
+If your bot's domain data has nothing to do with CascadeUI state,
+keep them apart. Open your own database connection, run your own
+migrations, manage your own schema. CascadeUI's persistence layer
+stays focused; your domain code stays portable across CascadeUI
+versions.
+
+#### Pattern B: KV escape hatch (recommended for opaque blobs)
+
+Use the existing KV surface with a custom namespace:
+
+```python
+backend = store.persistence_manager.application.backend
+if backend is None:
+    raise RuntimeError("Application namespace has no backend configured")
+
+await backend.kv_write("ticket_threads", "guild:42:thread:99", json.dumps(data).encode())
+ticket_data = await backend.kv_read("ticket_threads", "guild:42:thread:99")
+async for key, value in backend.kv_scan("ticket_threads", prefix="guild:42:"):
+    ...
+```
+
+Zero schema work, full integration with the persistence pipeline,
+cross-backend portable. Limited to opaque bytes payloads (no
+relational queries, no joins).
+
+!!! note "When `backend` may be `None`"
+    `store.persistence_manager.application.backend` is `None` when the
+    application namespace was opted out (`application=ApplicationPersistence(backend=None)`).
+    Patterns B and C apply only when the application namespace is
+    backed; guard with the `is None` check above before reaching for
+    the escape hatch.
+
+#### Pattern C: Raw SQL escape (for SQL-rich data co-located with CascadeUI)
+
+Backends declaring `Capability.RAW_SQL` expose four query methods plus
+an explicit transaction primitive. Check the capability first:
+
+```python
+from cascadeui.persistence import Capability
+
+backend = store.persistence_manager.application.backend
+if backend is None:
+    raise RuntimeError("Application namespace has no backend configured")
+if Capability.RAW_SQL not in backend.capabilities:
+    raise RuntimeError("Backend does not support raw SQL")
+```
+
+Each backend reports its parameter syntax through `placeholder_style`
+(PEP 249 paramstyle): `"qmark"` for SQLite, `"numeric"` for PostgreSQL.
+Portable code adapts at write time:
+
+```python
+ph = backend.placeholder_style
+
+# Create a custom table
+await backend.execute("""
+    CREATE TABLE IF NOT EXISTS tickets (
+        id INTEGER PRIMARY KEY,
+        user_id BIGINT NOT NULL,
+        content TEXT NOT NULL,
+        created_at BIGINT NOT NULL
+    )
+""")
+
+# Insert with portable placeholder formatting
+sql = (
+    "INSERT INTO tickets VALUES (?, ?, ?, ?)" if ph == "qmark"
+    else "INSERT INTO tickets VALUES ($1, $2, $3, $4)"
+)
+await backend.execute(sql, 1, user_id, content, int(time.time()))
+
+# Query
+rows = await backend.fetch(
+    "SELECT * FROM tickets WHERE user_id = ?" if ph == "qmark"
+    else "SELECT * FROM tickets WHERE user_id = $1",
+    user_id,
+)
+
+# Single-row lookup
+row = await backend.fetch_one(
+    "SELECT * FROM tickets WHERE id = ?" if ph == "qmark"
+    else "SELECT * FROM tickets WHERE id = $1",
+    ticket_id,
+)
+if row is None:
+    raise LookupError(f"Ticket {ticket_id} not found")
+```
+
+#### Atomic groups: transactions
+
+Multiple operations that must succeed or fail together go inside an
+explicit transaction:
+
+```python
+async with backend.transaction():
+    await backend.execute("INSERT INTO tickets VALUES (...)", ...)
+    await backend.execute("UPDATE counters SET ...", ...)
+# Both committed atomically. Either raised -- both rolled back.
+```
+
+Nested transactions create savepoints. Inner failures roll back to the
+savepoint without affecting the outer transaction:
+
+```python
+async with backend.transaction():            # outer
+    await backend.execute(...)
+    try:
+        async with backend.transaction():    # inner (SAVEPOINT)
+            await backend.execute(...)
+            raise SomeError()
+    except SomeError:
+        pass  # inner rolled back to savepoint, outer continues
+    await backend.execute(...)                # outer commits cleanly
+```
+
+Only the raw-SQL methods (`execute`, `fetch`, `executemany`,
+`fetch_one`) participate in the transaction. The namespace API
+(`row_upsert`, `kv_*`, etc.) auto-commits per call regardless of
+transaction state -- to group namespace operations atomically, use raw
+SQL inside the transaction body.
+
+The transaction holds an underlying connection for the lifetime of the
+`async with` block. Long-running transactions starve the pool; keep
+transaction bodies short.
+
+#### Portability vs vendor-specific code
+
+CascadeUI does not translate or rewrite SQL. Code targeting a specific
+backend uses that backend's dialect directly:
+
+```python
+# PostgreSQL-specific (will not work on SQLite)
+await backend.execute(
+    "CREATE INDEX CONCURRENTLY ix_tickets_user ON tickets(user_id)"
+)
+```
+
+For portability across backends, use the documented subset:
+
+- **Types:** `INTEGER`/`BIGINT`, `TEXT`, `BLOB`/`BYTEA` (different
+  names, same semantic), `REAL`/`DOUBLE PRECISION`. Avoid `JSONB`,
+  `TIMESTAMPTZ`, `ARRAY`, `ENUM` (PostgreSQL-only).
+- **Functions:** `COALESCE`, `LOWER`, `UPPER`, `COUNT`, `MAX`, `MIN`,
+  `SUM`, `AVG` are portable. Date/time functions diverge -- store
+  epoch integers and convert at the application layer.
+- **Operators:** `=`, `<>`, `<`, `>`, `<=`, `>=`, `LIKE`, `IS NULL` are
+  portable. Vendor operators (`@>`, `?` JSONB containment in
+  PostgreSQL; `GLOB` in SQLite) are not.
+
+#### When raw SQL is wrong
+
+Reach for raw SQL when the namespace API genuinely cannot express what
+you need. Anything CascadeUI's UI state covers -- `persistent_views`,
+`application_slots`, `cascadeui_kv` -- should flow through the
+namespace API. The escape hatch is for code outside that domain.
+
+`InMemoryBackend` does not declare `Capability.RAW_SQL`; tests against
+in-memory storage cannot use the raw-SQL surface. Code paths that
+require raw SQL skip in-memory testing or use a real-DB fixture
+(testcontainers for PostgreSQL, a temp file for SQLite).
 
 ### Writing a custom backend
 

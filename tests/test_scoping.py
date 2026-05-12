@@ -11,6 +11,7 @@ from cascadeui.state.slots import read_slot
 
 class TestStateScopingUser:
     """User-scoped state isolates and merges per user_id."""
+
     async def test_user_scope_isolation(self):
         store = get_store()
 
@@ -43,6 +44,7 @@ class TestStateScopingUser:
 
 class TestStateScopingGuild:
     """Guild-scoped state isolates per guild_id."""
+
     async def test_guild_scope_isolation(self):
         store = get_store()
 
@@ -61,6 +63,7 @@ class TestStateScopingGuild:
 
 class TestStateScopingUserGuild:
     """Composite user_guild scope isolates per (user_id, guild_id) pair."""
+
     async def test_user_guild_composite_isolation(self):
         """A user's preference is independent across different guilds."""
         store = get_store()
@@ -107,6 +110,7 @@ class TestStateScopingUserGuild:
 
 class TestStateScopingGlobal:
     """Global scope is a single shared slot visible to all callers."""
+
     async def test_global_scope_single_slot(self):
         """Global scope is a single shared slot visible to all callers."""
         store = get_store()
@@ -143,6 +147,7 @@ class TestStateScopingGlobal:
 
 class TestScopeEdgeCasesAndValidation:
     """Scoped dispatch does not affect flat state; invalid scopes and missing identifiers raise."""
+
     async def test_flat_state_unaffected(self):
         store = get_store()
         store.state["application"]["global_val"] = 42
@@ -244,14 +249,10 @@ class TestGetScopedFrom:
     def test_independent_of_self_state(self):
         # Reads ONLY the passed state, ignores the store's own state.
         store = get_store()
-        store.state.setdefault("application", {})["scoped"] = {
-            "user:1": {"from": "store"}
-        }
+        store.state.setdefault("application", {})["scoped"] = {"user:1": {"from": "store"}}
 
         other_state = {"application": {"scoped": {"user:1": {"from": "argument"}}}}
-        assert store.get_scoped_from(other_state, "user", user_id=1) == {
-            "from": "argument"
-        }
+        assert store.get_scoped_from(other_state, "user", user_id=1) == {"from": "argument"}
 
 
 # // ========================================( iter_scoped staticmethod )======================================== // #
@@ -275,8 +276,7 @@ class TestIterScoped:
                 }
             }
         }
-        results = sorted(StateStore.iter_scoped(state, "user"),
-                         key=lambda pair: pair[0]["user_id"])
+        results = sorted(StateStore.iter_scoped(state, "user"), key=lambda pair: pair[0]["user_id"])
         assert results == [
             ({"user_id": 1}, {"credits": 10}),
             ({"user_id": 2}, {"credits": 20}),
@@ -292,8 +292,9 @@ class TestIterScoped:
                 }
             }
         }
-        results = sorted(StateStore.iter_scoped(state, "guild"),
-                         key=lambda pair: pair[0]["guild_id"])
+        results = sorted(
+            StateStore.iter_scoped(state, "guild"), key=lambda pair: pair[0]["guild_id"]
+        )
         assert results == [
             ({"guild_id": 100}, {"prefix": "!"}),
             ({"guild_id": 200}, {"prefix": "?"}),
@@ -309,8 +310,9 @@ class TestIterScoped:
                 }
             }
         }
-        results = sorted(StateStore.iter_scoped(state, "user_guild"),
-                         key=lambda pair: pair[0]["user_id"])
+        results = sorted(
+            StateStore.iter_scoped(state, "user_guild"), key=lambda pair: pair[0]["user_id"]
+        )
         assert results == [
             ({"user_id": 1, "guild_id": 500}, {"wins": 3}),
             ({"user_id": 2, "guild_id": 500}, {"wins": 1}),
@@ -373,9 +375,7 @@ class TestIterScoped:
                 }
             }
         }
-        results = list(
-            StateStore.iter_scoped(state, "user_guild", user_id=1, guild_id=500)
-        )
+        results = list(StateStore.iter_scoped(state, "user_guild", user_id=1, guild_id=500))
         assert results == [({"user_id": 1, "guild_id": 500}, {"wins": 3})]
 
     def test_custom_slot_name_is_scanned(self):
@@ -392,7 +392,10 @@ class TestIterScoped:
         }
         results = list(
             StateStore.iter_scoped(
-                state, "user_guild", slot_name="battleship_stats", guild_id=500,
+                state,
+                "user_guild",
+                slot_name="battleship_stats",
+                guild_id=500,
             )
         )
         assert results == [({"user_id": 1, "guild_id": 500}, {"games": 5})]
@@ -806,9 +809,7 @@ class TestDispatchScopedAs:
 
         async def custom_reducer(action, state):
             payload = action["payload"]
-            scope_key = StateStore._build_scope_key(
-                payload["scope"], **payload["identifiers"]
-            )
+            scope_key = StateStore._build_scope_key(payload["scope"], **payload["identifiers"])
             access_slot(state, "scoped", scope_key).update({"ns": payload["data"]})
             return state
 
@@ -890,9 +891,7 @@ class TestScopedSlotRouting:
 
     async def test_get_scoped_reads_named_bucket(self):
         store = get_store()
-        store.set_scoped(
-            "guild", {"prefix": "!"}, slot_name="settings", guild_id=42
-        )
+        store.set_scoped("guild", {"prefix": "!"}, slot_name="settings", guild_id=42)
         assert store.get_scoped("guild", slot_name="settings", guild_id=42) == {"prefix": "!"}
         assert store.get_scoped("guild", guild_id=42) == {}
 
@@ -907,9 +906,7 @@ class TestScopedSlotRouting:
 
     async def test_view_scoped_slot_threads_through_read(self):
         store = get_store()
-        store.set_scoped(
-            "user", {"coins": 50}, slot_name="economy", user_id=11
-        )
+        store.set_scoped("user", {"coins": 50}, slot_name="economy", user_id=11)
 
         view = _DispatchStubView(state_scope="user", user_id=11)
         view.scoped_slot = "economy"
@@ -1056,22 +1053,14 @@ class TestMergeScoped:
 
     def test_merges_under_subkey_when_provided(self):
         state = {"application": {}}
-        StateStore.merge_scoped(
-            state, "user", {"theme": "dark"}, subkey="settings", user_id=1
-        )
+        StateStore.merge_scoped(state, "user", {"theme": "dark"}, subkey="settings", user_id=1)
         assert state["application"]["scoped"]["user:1"] == {"settings": {"theme": "dark"}}
 
     def test_subkey_setdefault_preserves_existing(self):
         state = {
-            "application": {
-                "scoped": {
-                    "user:1": {"settings": {"theme": "dark", "language": "en"}}
-                }
-            }
+            "application": {"scoped": {"user:1": {"settings": {"theme": "dark", "language": "en"}}}}
         }
-        StateStore.merge_scoped(
-            state, "user", {"theme": "light"}, subkey="settings", user_id=1
-        )
+        StateStore.merge_scoped(state, "user", {"theme": "light"}, subkey="settings", user_id=1)
         # Existing "language" key untouched; "theme" overwritten.
         assert state["application"]["scoped"]["user:1"]["settings"] == {
             "theme": "light",
@@ -1099,9 +1088,7 @@ class TestMergeScoped:
 
     def test_user_guild_scope(self):
         state = {"application": {}}
-        StateStore.merge_scoped(
-            state, "user_guild", {"wins": 3}, user_id=1, guild_id=100
-        )
+        StateStore.merge_scoped(state, "user_guild", {"wins": 3}, user_id=1, guild_id=100)
         assert state["application"]["scoped"]["user_guild:1:100"] == {"wins": 3}
 
     def test_global_scope(self):

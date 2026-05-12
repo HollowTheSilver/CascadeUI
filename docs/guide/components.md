@@ -506,7 +506,9 @@ self.add_item(toggle_section(
 
 ### `image_section(text, *, url)`
 
-A `Section` with a `Thumbnail` image.
+A `Section` with a `Thumbnail` image. `url` accepts a remote URL string,
+the `attachment://name.ext` form, or a `discord.File` instance whose
+`.uri` is read internally. See [Local file attachments](#local-file-attachments).
 
 ### `link_section(text, *, label, url, emoji=None)`
 
@@ -603,9 +605,29 @@ Override `filled` / `empty` for alternative glyphs, or set
 `divider()` creates a thin line separator. `gap()` creates spacing without a
 visible line.
 
-### `gallery(urls)`
+### `gallery(*media, descriptions=None)`
 
-A `MediaGallery` from a list of image URLs.
+A `MediaGallery` from one or more image references. Each reference is
+either a URL string, the `attachment://name.ext` form, or a `discord.File`
+instance whose `.uri` is read internally. See
+[Local file attachments](#local-file-attachments) for the send-time pairing.
+
+### `file_attachment(url, *, spoiler=False)`
+
+A `File` component for inline attachment display. Accepts either a remote
+URL, the `attachment://name.ext` form, or a `discord.File` instance:
+
+```python
+from cascadeui import card, file_attachment
+
+card(
+    "## Quarterly Report",
+    file_attachment("attachment://q1_2026.pdf"),
+    "Released April 15.",
+)
+```
+
+Use `file_attachment` for downloadable files; use `gallery` for inline image previews.
 
 ### `button_row(buttons, *, style=..., emoji=None)`
 
@@ -704,6 +726,235 @@ The tab matching `active` renders with `active_style` (primary by default);
 all others render with `inactive_style` (secondary). If `active` is
 omitted, the first tab is marked active. Capped at Discord's 5-per-row
 limit -- use `TabLayoutView` for views that need more tabs.
+
+---
+
+## Local file attachments
+
+V2 builders that take a media reference (`gallery`, `image_section`,
+`file_attachment`) accept three input shapes:
+
+- A remote URL (`"https://cdn.example.com/img.png"`)
+- The `attachment://<filename>` reference scheme, when the file travels
+  with the message as a `discord.File`
+- A `discord.File` instance directly -- the builder reads its `.uri`
+  property and emits the same `attachment://<filename>` reference
+
+The reference and the bytes are independent: the builder emits the
+reference into the component tree; the `discord.File` carries the bytes
+to Discord.
+
+!!! warning "Both halves must travel together"
+
+    An `attachment://<filename>` reference inside a builder is meaningless
+    on its own. The matching `discord.File` must reach the same payload
+    via `view.send(files=[...])` (initial send) or
+    `view.refresh(attachments=[...])` (in-place edit), or Discord renders
+    the reference as an unresolved placeholder.
+
+### Initial send
+
+`StatefulView.send()` and `StatefulLayoutView.send()` accept `file=`
+(singular) and `files=` (sequence) for the initial upload:
+
+```python
+import discord
+from cascadeui import StatefulLayoutView, card, gallery
+
+class GalleryView(StatefulLayoutView):
+    def __init__(self, *, photo_uri: str, **kwargs):
+        super().__init__(**kwargs)
+        self.add_item(card("## Gallery", gallery(photo_uri)))
+
+photo = discord.File("assets/photo.png")
+view = GalleryView(context=ctx, photo_uri=photo.uri)
+await view.send(files=[photo])
+```
+
+Mixing `file=` and `files=` raises `TypeError` from discord.py at the send
+boundary. If the send fails before the bytes reach Discord, the library
+closes the supplied file handles as part of its rollback so callers do
+not leak file pointers.
+
+### Fetching remote assets
+
+For attachments sourced from a URL (avatars, CDN-hosted images, attachment
+proxy URLs), `cascadeui.fetch_as_file()` absorbs the standard
+`aiohttp` GET + `BytesIO` + `discord.File` construction:
+
+```python
+from cascadeui import fetch_as_file
+
+photo = await fetch_as_file(
+    ctx.author.display_avatar.url,
+    "avatar.png",
+)
+await view.send(files=[photo])
+```
+
+Pass a shared `session=` for any command that fetches multiple URLs so
+the requests share one TCP pool:
+
+```python
+import aiohttp
+
+async with aiohttp.ClientSession() as session:
+    photo_a = await fetch_as_file(url_a, "a.png", session=session)
+    photo_b = await fetch_as_file(url_b, "b.png", session=session)
+await view.send(files=[photo_a, photo_b])
+```
+
+`fetch_as_file` forwards `spoiler=` and `description=` to the
+`discord.File` constructor, so attachment metadata travels through the
+helper without an extra wrapper. See `examples/v2_attachments.py` for a
+runnable four-command walkthrough.
+
+### Mid-session attachment swaps
+
+`view.refresh()` forwards arbitrary kwargs to the underlying
+`message.edit()` call, so a swap goes through the standard `attachments=`
+parameter -- a replacement list, not additive. Pair it with `build_ui()`
+so the component tree rebuilds against the new reference at the same
+time the new bytes ship:
+
+```python
+class GalleryView(StatefulLayoutView):
+    def __init__(self, *, photo_uri: str, **kwargs):
+        super().__init__(**kwargs)
+        self._photo_uri = photo_uri
+        self.build_ui()
+
+    def build_ui(self):
+        self.clear_items()
+        self.add_item(card("## Gallery", gallery(self._photo_uri)))
+
+    async def swap_photo(self, new_photo: discord.File):
+        self._photo_uri = new_photo.uri
+        self.build_ui()
+        await self.refresh(attachments=[new_photo])
+```
+
+`build_ui()` clears the tree and re-adds the rebuilt card; `refresh()`
+ships the new component bytes plus the replacement attachments in a
+single edit. `attachments=` replaces the message's complete attachment
+list -- previously-attached files not present in the new list are
+removed. Use an empty list (`attachments=[]`) to clear all attachments
+without uploading new ones.
+
+### Persistent views
+
+`PersistentLayoutView` and `PersistentView` survive bot restarts.
+`attachment://` references already present in the persisted component
+tree resolve from Discord's stored copy of the original upload -- the
+bytes survive as long as the message itself does, so no re-upload is
+required at restart.
+
+References introduced *after* restart (inside `on_restore` or any later
+rebuild) need a matching `discord.File` passed through
+`refresh(attachments=[...])`; otherwise Discord renders the reference as
+unresolved.
+
+---
+
+## V2 Placement Rules
+
+Discord's V2 component system has strict rules about which component types
+can nest inside which. discord.py only enforces a small subset of those rules
+at construction time -- the rest are enforced by Discord's API server when
+`send()` runs, returning HTTP 400 with terse error text far from the
+construction site. CascadeUI's V2 builders sidestep this entire problem
+because each builder hardcodes a known-safe shape, and an opt-out send-time
+validator catches violations in any tree built outside the builders.
+
+### What discord.py enforces at construction
+
+- V1 `View` rejects V2 items (`TextDisplay`, `Container`, `Section`, etc).
+- `Section` allows at most 3 children.
+- `Section` requires an `accessory=` kwarg.
+- `ActionRow` width budget = 5 (Button = 1 unit, Select = 5 units).
+- `add_item` rejects non-Item, non-str types.
+
+Everything else passes construction silently. Discord rejects the message
+when you call `send()`.
+
+### What Discord enforces at send time
+
+| Composition | discord.py | Discord API |
+|---|---|---|
+| `Section` accessory must be `Button` or `Thumbnail` | accepts | rejects |
+| `Section` children must all be `TextDisplay` | accepts | rejects |
+| `Container` children must be `ActionRow`, `TextDisplay`, `Section`, `MediaGallery`, `File`, or `Separator` | accepts | rejects |
+| Containers cannot nest | accepts | rejects |
+| Sections cannot nest | accepts | rejects |
+| Standalone `Button` / `Select` / `Thumbnail` at LayoutView top level | accepts | rejects |
+| `ActionRow` children must be `Button` or `Select` | accepts | rejects |
+| `Thumbnail` outside a `Section` accessory slot | accepts | rejects |
+| `Label` / `RadioGroup` / `CheckboxGroup` / `Checkbox` / `FileUpload` at any LayoutView position | accepts | rejects (Modal-only) |
+| `Container` must hold at least 1 child (empty) | accepts | rejects |
+| `Section` must hold 1-3 children (empty) | accepts (empty) | rejects |
+| `ActionRow` must hold at least 1 child (empty) | accepts | rejects |
+| `MediaGallery` must hold 1-10 items | accepts | rejects |
+
+### Builders are guardrails
+
+Routing through CascadeUI's V2 builders sidesteps every rule in the table
+above. Each builder hardcodes a Discord-API-valid shape:
+
+- `card()` always produces a top-level `Container` with valid children.
+- `image_section()` always produces `Section(TextDisplay, accessory=Thumbnail)`.
+- `action_section()` / `toggle_section()` / `link_section()` always produce
+  `Section(TextDisplay, accessory=Button-variant)`.
+- `button_row()` always produces `ActionRow(Button, Button, ...)` capped at 5.
+- `gallery()` / `file_attachment()` always produce a properly-wrapped media component.
+
+A user who composes views entirely from builders cannot construct a tree
+Discord rejects (size limits aside). The escape hatch is dropping to raw
+`discord.ui` primitives -- where the validator below picks up the slack.
+
+### Pre-flight validation
+
+Every V2 view (`StatefulLayoutView` and subclasses) gets a placement
+validator that runs before every Discord round-trip. Three seams call
+it: the initial send (`_send_pipeline`), every state-driven `refresh()`
+after the render-hash short-circuit, and the in-place edits emitted by
+`push()` / `pop()` navigation. Mid-session shape changes (Wizard step
+swaps, Form section toggles, Tab body rebuilds) get caught at the
+seam instead of surfacing as terse HTTP 400 from `message.edit()`.
+
+When the assembled component tree contains a composition Discord would
+400 on, the validator raises a clear `ValueError` naming the violation
+node, the path through the tree, and the suggested fix:
+
+```
+ValueError: Invalid V2 placement: Container cannot be a child of Container.
+  Path: MyDashboard -> Container[0] -> Container[0]
+  Discord rejects this composition with HTTP 400.
+  Fix: Containers cannot nest. Move the inner Container's children up to
+       the outer Container, or split into a separate top-level Container.
+```
+
+The path uses bracket indices on each segment so the offending node is
+unambiguous when the same type appears multiple times at the same depth.
+
+Skipped refreshes (the render-hash digest matches the previous send)
+bypass validation entirely -- nothing changed, the previous send
+already validated the tree. The cost on every other refresh is one
+linear walk over the component tree, microseconds for typical views.
+
+### Opting out
+
+Set `validate_placement = False` on the view class for a documented escape
+hatch:
+
+```python
+class MyDashboard(StatefulLayoutView):
+    validate_placement = False  # tree uses a composition Discord accepts
+                                # that the built-in validator rejects
+```
+
+The recommended use case is narrow: the validator's matrix lags a Discord
+or discord.py update. Any other reason to opt out signals an actual
+placement bug -- prefer fixing the tree.
 
 ---
 
@@ -839,5 +1090,7 @@ Converts display strings to safe `custom_id` fragments:
 ```python
 from cascadeui import slugify
 
-slugify("Color Roles")  # "color-roles"
+slugify("Color Roles")  # "color_roles"
+slugify("He/Him")       # "he_him"
+slugify("Tickets #1")   # "tickets_1"
 ```

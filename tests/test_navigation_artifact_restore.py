@@ -33,7 +33,6 @@ from cascadeui.views.patterns import (
 from cascadeui.views.patterns.menu import MenuView
 from cascadeui.views.patterns.types import RoleCategory
 
-
 # // ========================================( Helpers )======================================== // #
 
 

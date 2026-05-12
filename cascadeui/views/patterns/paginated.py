@@ -584,7 +584,16 @@ class PaginatedView(_BasePaginatedMixin, StatefulView):
             result["content"] = page
         return result
 
-    async def send(self, content=None, *, embed=None, embeds=None, ephemeral=False):
+    async def send(
+        self,
+        content=None,
+        *,
+        embed=None,
+        embeds=None,
+        file=None,
+        files=None,
+        ephemeral=False,
+    ):
         """Send the view, using the first page as initial content if not specified."""
         # Cursor mode: page 0 is not yet loaded at construction; fetch it before
         # extracting initial content so the first Discord message ships with
@@ -596,7 +605,14 @@ class PaginatedView(_BasePaginatedMixin, StatefulView):
             page_kwargs = self._extract_page(self.pages[0])
             embed = page_kwargs.get("embed")
             content = page_kwargs.get("content")
-        return await super().send(content=content, embed=embed, embeds=embeds, ephemeral=ephemeral)
+        return await super().send(
+            content=content,
+            embed=embed,
+            embeds=embeds,
+            file=file,
+            files=files,
+            ephemeral=ephemeral,
+        )
 
     async def _update_page(self):
         """Mutate nav buttons in place and refresh the page content."""

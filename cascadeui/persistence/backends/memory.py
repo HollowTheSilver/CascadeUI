@@ -45,8 +45,16 @@ class InMemoryBackend:
     """
 
     capabilities: ClassVar[Capability] = (
-        Capability.KV | Capability.RELATIONAL | Capability.TTL_INDEX | Capability.SCHEMA_META
+        Capability.KV
+        | Capability.RELATIONAL
+        | Capability.TTL_INDEX
+        | Capability.SCHEMA_META
+        # Capability.RAW_SQL deliberately omitted -- in-memory storage
+        # has no SQL engine to escape to. Code paths that require raw SQL
+        # must check `Capability.RAW_SQL in backend.capabilities` first.
     )
+
+    placeholder_style: ClassVar[str] = "n/a"
 
     def __init__(self) -> None:
         self._kv: dict[str, dict[str, bytes]] = {}
@@ -155,3 +163,34 @@ class InMemoryBackend:
 
     async def set_schema_version(self, table: str, version: int) -> None:
         self._schema_versions[table] = version
+
+    # // ========================================( Raw SQL opt-out stubs )======================================== // #
+
+    # Capability.RAW_SQL is deliberately not declared on this backend --
+    # in-memory storage has no SQL engine to escape to. The five methods
+    # below raise NotImplementedError with a clear remediation message
+    # rather than producing AttributeError, so callers who reach for the
+    # escape hatch against InMemoryBackend get a directed error pointing
+    # them at SQLiteBackend or PostgresBackend.
+
+    _RAW_SQL_ERROR: ClassVar[str] = (
+        "InMemoryBackend does not support Capability.RAW_SQL. "
+        "Use SQLiteBackend or PostgresBackend for raw-SQL operations, "
+        "or check `Capability.RAW_SQL in backend.capabilities` before "
+        "reaching for the escape hatch."
+    )
+
+    async def execute(self, sql: str, *params: Any) -> int:
+        raise NotImplementedError(self._RAW_SQL_ERROR)
+
+    async def fetch(self, sql: str, *params: Any) -> list[dict[str, Any]]:
+        raise NotImplementedError(self._RAW_SQL_ERROR)
+
+    async def executemany(self, sql: str, params_list: list[tuple]) -> int:
+        raise NotImplementedError(self._RAW_SQL_ERROR)
+
+    async def fetch_one(self, sql: str, *params: Any) -> dict[str, Any] | None:
+        raise NotImplementedError(self._RAW_SQL_ERROR)
+
+    def transaction(self) -> Any:
+        raise NotImplementedError(self._RAW_SQL_ERROR)
