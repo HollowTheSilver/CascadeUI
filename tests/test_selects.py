@@ -224,3 +224,40 @@ class TestMentionableSelect:
         existing = discord.SelectDefaultValue(id=999, type="user")
         select = MentionableSelect(default_values=[existing])
         assert _ids_and_types(select.default_values) == [(999, "user")]
+
+
+# // ========================================( Serialization )======================================== // #
+
+
+class TestDefaultValueSerialization:
+    """default_values survive to_component_dict() on discord.py 2.7.
+
+    SelectDefaultValue.to_dict() reads ``self._type.value``, so a bare string
+    type passed at construction raises AttributeError at serialization time.
+    The _ids_and_types assertions above never reach serialization, so these
+    tests drive to_component_dict() directly to exercise the enum coercion.
+    """
+
+    @pytest.mark.parametrize(
+        "select_cls, type_name",
+        [(RoleSelect, "role"), (UserSelect, "user"), (ChannelSelect, "channel")],
+    )
+    def test_typed_select_serializes_raw_int_defaults(self, select_cls, type_name):
+        select = select_cls(default_values=[111, 222])
+        payload = select.to_component_dict()
+        assert payload["default_values"] == [
+            {"id": 111, "type": type_name},
+            {"id": 222, "type": type_name},
+        ]
+
+    def test_mentionable_serializes_inferred_defaults(self):
+        member = MagicMock(spec=discord.Member)
+        member.id = 300
+        role = MagicMock(spec=discord.Role)
+        role.id = 400
+        select = MentionableSelect(default_values=[member, role])
+        payload = select.to_component_dict()
+        assert payload["default_values"] == [
+            {"id": 300, "type": "user"},
+            {"id": 400, "type": "role"},
+        ]

@@ -37,7 +37,12 @@ def _wrap_default_values(
             out.append(value)
             continue
         snowflake_id = coerce_snowflake_id(value)
-        out.append(discord.SelectDefaultValue(id=snowflake_id, type=default_type))
+        # SelectDefaultValue stores type verbatim; a bare string breaks to_dict().
+        out.append(
+            discord.SelectDefaultValue(
+                id=snowflake_id, type=discord.SelectDefaultValueType[default_type]
+            )
+        )
     return out
 
 
@@ -63,15 +68,20 @@ def _wrap_mentionable_defaults(
         if isinstance(value, discord.SelectDefaultValue):
             out.append(value)
         elif isinstance(value, discord.Role):
-            out.append(discord.SelectDefaultValue(id=value.id, type="role"))
+            out.append(
+                discord.SelectDefaultValue(id=value.id, type=discord.SelectDefaultValueType.role)
+            )
         elif isinstance(value, (discord.Member, discord.User)):
-            out.append(discord.SelectDefaultValue(id=value.id, type="user"))
+            out.append(
+                discord.SelectDefaultValue(id=value.id, type=discord.SelectDefaultValueType.user)
+            )
         else:
             raise TypeError(
                 f"MentionableSelect default values must be Member, User, Role, "
                 f"or SelectDefaultValue (got {type(value).__name__}: {value!r}). "
                 f"Raw int IDs cannot be auto-typed; construct "
-                f"discord.SelectDefaultValue(id=..., type='user' or 'role') "
+                f"discord.SelectDefaultValue(id=..., "
+                f"type=discord.SelectDefaultValueType.user or .role) "
                 f"explicitly for those."
             )
     return out

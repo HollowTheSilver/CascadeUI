@@ -23,6 +23,17 @@ preserved below for historical reference but are not the supported baseline.
 
 ---
 
+## [3.3.1] - 2026-06-09
+
+### Fixed
+
+- **Typed select `default_values` broke serialization on discord.py 2.7.**
+  `RoleSelect`, `UserSelect`, `ChannelSelect`, and `MentionableSelect`
+  raised `AttributeError` when `default_values` were supplied; fixed by
+  coercing the type argument to `SelectDefaultValueType` at construction.
+
+---
+
 ## [3.3.0] - 2026-05-12
 
 ### Added
