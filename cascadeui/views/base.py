@@ -195,6 +195,20 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
     # Discord returns an escalated rate-limit.
     refresh_cooldown_ms: Optional[int] = None
 
+    # Subclass config: edit timeout ceiling
+    # discord.py issues HTTP edits with no total timeout (aiohttp defaults to
+    # total=None), so a connection that stalls without a response would pin
+    # the awaiting code -- and, on the interaction-locked refresh/navigation
+    # paths, the view itself -- until the socket drops. This ceiling bounds
+    # every live-view and teardown edit through ``_bounded``: a stall is
+    # cancelled after this many seconds and the view recovers on the next
+    # interaction. The default clears realistic attachment uploads while
+    # still capping a true hang. ``None`` disables the ceiling (unbounded
+    # awaits, matching discord.py's own default). The acting-view fast path
+    # keeps its own tighter bound, which protects the 3s ack deadline rather
+    # than guarding against a hang.
+    edit_timeout: Optional[float] = 60.0
+
     # Subclass config: interaction serialization
     # When True, rapid button clicks are processed one at a time to prevent
     # racing message edits that cause "This interaction failed" errors.
@@ -283,6 +297,8 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
     )
     # Attributes that must be a positive float/int.
     _POSITIVE_NUMBER_ATTRS: ClassVar[tuple] = ("auto_defer_delay",)
+    # Attributes that must be a positive float/int or None (None = disabled).
+    _OPTIONAL_POSITIVE_NUMBER_ATTRS: ClassVar[tuple] = ("edit_timeout",)
     # Attributes that must be a bool.
     _BOOL_ATTRS: ClassVar[tuple] = (
         "owner_only",
@@ -337,6 +353,14 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         if name in cls._POSITIVE_NUMBER_ATTRS:
             if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"{cls.__name__}.{name} must be a positive number, got {value!r}")
+            return
+        if name in cls._OPTIONAL_POSITIVE_NUMBER_ATTRS:
+            if value is None:
+                return
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+                raise ValueError(
+                    f"{cls.__name__}.{name} must be a positive number or None, got {value!r}"
+                )
             return
         if name in cls._BOOL_ATTRS:
             if not isinstance(value, bool):
@@ -424,6 +448,9 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             if attr in own:
                 cls._validate_attribute_value(attr, own[attr])
         for attr in cls._POSITIVE_NUMBER_ATTRS:
+            if attr in own:
+                cls._validate_attribute_value(attr, own[attr])
+        for attr in cls._OPTIONAL_POSITIVE_NUMBER_ATTRS:
             if attr in own:
                 cls._validate_attribute_value(attr, own[attr])
         for attr in cls._BOOL_ATTRS:
@@ -1465,9 +1492,14 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
 
         if self._message:
             try:
-                await self._message.edit(view=self)
+                await self._bounded(self._message.edit(view=self))
             except discord.NotFound:
                 pass  # Message was already deleted
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"Timed out disabling components on timeout for "
+                    f"{type(self).__name__}; continuing teardown."
+                )
             except Exception as e:
                 hint = ""
                 if self._ephemeral:
@@ -1664,6 +1696,9 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             # value. Disqualified cases (modal interactions, cross-view
             # message mismatch, already-deferred response, missing message
             # ref) fall through to the existing webhook/channel paths.
+            # Ephemeral acting views take the ack-first branch instead: a
+            # webhook-only edit runs too slowly to double as the ack without
+            # risking the 3s deadline.
             #
             # The fast path couples ack to edit in one HTTP call. A slow
             # edit response from Discord (latency spike, ephemeral backend
@@ -1677,13 +1712,14 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             # done" and the fall-through paths behave as if the fast path
             # was never attempted.
             interaction = _CURRENT_INTERACTION.get()
-            if (
+            acting = (
                 interaction is not None
                 and interaction.type == discord.InteractionType.component
                 and interaction.message is not None
                 and interaction.message.id == self._message.id
                 and not interaction.response.is_done()
-            ):
+            )
+            if acting and not self._ephemeral:
                 fast_path_timeout = max(0.5, self.auto_defer_delay - 1.0)
                 try:
                     await asyncio.wait_for(
@@ -1723,6 +1759,18 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     # Any other HTTP error falls through to the channel path
                     # so a transient failure on the interaction endpoint does
                     # not lose the edit entirely.
+            elif acting and self._ephemeral:
+                # Ephemeral messages edit only through the interaction webhook,
+                # which runs slower than a channel PATCH. The edit-as-ack fast
+                # path couples the ack to that edit, so a slow webhook response
+                # starves the 3s ack deadline: the panel misses its ack (the
+                # interaction-failed toast) and loses the edit (a frozen body).
+                # Acknowledge first with a deferred update, then fall through to
+                # the webhook edit below. self._message is the
+                # InteractionMessage/WebhookMessage, whose .edit() routes through
+                # the webhook and stays valid for the token's 15-minute life with
+                # no 3s deadline on the edit itself.
+                await self._safe_defer(interaction)
 
             # Interaction-response messages ignore embed edits via the channel
             # endpoint (PATCH /channels/{id}/messages/{id}).  When the caller
@@ -1731,11 +1779,18 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             # update embeds.  Falls back to the plain Message on token expiry.
             if ("embed" in kwargs or "embeds" in kwargs) and self._webhook_message:
                 try:
-                    await self._webhook_message.edit(view=self, **kwargs)
+                    await self._bounded(self._webhook_message.edit(view=self, **kwargs))
                     self._last_tree_digest = self._compute_tree_digest()
                     if perf_on:
                         store._record_edit()
                     self._stamp_cooldown()
+                    return
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"Webhook edit stalled past {self.edit_timeout}s in "
+                        f"{type(self).__name__}; the next refresh re-ships."
+                    )
+                    self._last_tree_digest = None
                     return
                 except discord.HTTPException as e:
                     if self._handle_rate_limit(e):
@@ -1744,13 +1799,19 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     self._webhook_message = None
 
             try:
-                await self._message.edit(view=self, **kwargs)
+                await self._bounded(self._message.edit(view=self, **kwargs))
                 self._last_tree_digest = self._compute_tree_digest()
                 if perf_on:
                     store._record_edit()
                 self._stamp_cooldown()
             except discord.NotFound:
                 pass
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"Edit stalled past {self.edit_timeout}s in {type(self).__name__}; "
+                    f"the next refresh re-ships."
+                )
+                self._last_tree_digest = None
             except discord.HTTPException as e:
                 if not self._handle_rate_limit(e):
                     raise
@@ -1779,6 +1840,20 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         retry = getattr(error, "retry_after", 1.0)
         self._refresh_not_before = time.monotonic() + retry
         return True
+
+    async def _bounded(self, coro):
+        """Await a Discord HTTP coroutine under the ``edit_timeout`` ceiling.
+
+        ``asyncio.wait_for`` cancels the request when it stalls past
+        ``edit_timeout`` seconds; aiohttp closes the connection on
+        cancellation, so a hung socket cannot pin the awaiting code.
+        ``edit_timeout = None`` awaits the coroutine directly with no
+        ceiling. Raises ``asyncio.TimeoutError`` on stall so the caller
+        can release the interaction lock and recover on the next edit.
+        """
+        if self.edit_timeout is None:
+            return await coro
+        return await asyncio.wait_for(coro, self.edit_timeout)
 
     def _check_placement(self) -> None:
         """Run the V2 placement validator on this view if enabled.
@@ -2413,19 +2488,27 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         if self._message:
             try:
                 if delete_message:
-                    await self._message.delete()
+                    await self._bounded(self._message.delete())
                 elif self._is_layout():
                     # V2 messages ARE their components -- edit(view=None) would
                     # produce an empty message (error 50006).  Freeze instead.
                     self._freeze_components()
-                    await self._message.edit(view=self)
+                    await self._bounded(self._message.edit(view=self))
                 else:
-                    await self._message.edit(view=None)
+                    await self._bounded(self._message.edit(view=None))
             except discord.NotFound:
                 # Expected lifecycle: user dismissed the ephemeral, an
                 # admin deleted the message, or the channel was deleted.
                 # Nothing left to clean up on Discord's side.
                 pass
+            except asyncio.TimeoutError:
+                # Visual cleanup stalled past edit_timeout. State teardown
+                # already ran above, so the view is gone regardless of the
+                # stale message on screen.
+                logger.warning(
+                    f"Exit cleanup edit stalled past {self.edit_timeout}s for "
+                    f"{type(self).__name__}; view torn down regardless."
+                )
             except discord.HTTPException as e:
                 if self._ephemeral and getattr(e, "status", None) == 401:
                     # Expected lifecycle for ephemerals past the 15-minute

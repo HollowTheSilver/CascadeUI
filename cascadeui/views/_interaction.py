@@ -88,6 +88,22 @@ class _InteractionMixin:
                 if self.auto_defer and not interaction.response.is_done():
                     try:
                         await interaction.response.defer()
+                    except discord.HTTPException as e:
+                        # 40060 means Discord acknowledged a request the
+                        # acting-view fast path cancelled locally (cancellation
+                        # race) -- the interaction is already acked, so this is
+                        # benign and routine. Any other status is a genuine ack
+                        # failure the user saw as an interaction-failed toast.
+                        if e.code == 40060:
+                            logger.debug(
+                                f"Post-callback defer raced an existing ack in "
+                                f"{self.__class__.__name__} (40060)"
+                            )
+                        else:
+                            logger.warning(
+                                f"Post-callback defer failed in {self.__class__.__name__}: "
+                                f"status={e.status} code={e.code}"
+                            )
                     except Exception:
                         logger.debug(
                             f"Post-callback defer failed in {self.__class__.__name__} "
@@ -189,9 +205,24 @@ class _InteractionMixin:
         send operations. Prevents double-defer when auto-defer or
         ``serialize_interactions`` has already acknowledged the
         interaction before the callback runs.
+
+        The ack is bounded by ``auto_defer_delay``: this call runs inside
+        the interaction lock, and a Discord ack endpoint that stalls past
+        the ack window would pin the lock on a hung socket. A defer that
+        cannot land in time is useless anyway -- the auto-defer timer,
+        running outside the lock, is the backstop -- so the stall is
+        cancelled and swallowed rather than propagated.
         """
         if not interaction.response.is_done():
-            await interaction.response.defer()
+            try:
+                await asyncio.wait_for(
+                    interaction.response.defer(), timeout=max(0.5, self.auto_defer_delay)
+                )
+            except asyncio.TimeoutError:
+                logger.debug(
+                    f"Ack defer stalled past {self.auto_defer_delay}s in "
+                    f"{type(self).__name__}; auto-defer timer backstops the ack."
+                )
 
     # // ==================( Ephemeral Refresh )================== // #
 
@@ -341,11 +372,11 @@ class _InteractionMixin:
         # panel becomes a harmless orphan the user can dismiss.
         if self._message:
             try:
-                await self._message.delete()
-            except (discord.NotFound, discord.HTTPException):
+                await self._bounded(self._message.delete())
+            except (discord.NotFound, discord.HTTPException, asyncio.TimeoutError):
                 try:
-                    await self._message.edit(view=self)
-                except (discord.NotFound, discord.HTTPException):
+                    await self._bounded(self._message.edit(view=self))
+                except (discord.NotFound, discord.HTTPException, asyncio.TimeoutError):
                     pass
 
         await self.exit()

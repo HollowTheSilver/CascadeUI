@@ -1,8 +1,11 @@
 """Tests for auto-defer safety net on StatefulView."""
 
 import asyncio
+import logging
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import discord
 import pytest
 from helpers import make_interaction as _make_interaction
 
@@ -17,6 +20,23 @@ def _make_item(callback):
     item._run_checks = AsyncMock(return_value=True)
     item._refresh_state = MagicMock()
     return item
+
+
+def _http_error(status, code):
+    """Build a ``discord.HTTPException`` carrying a specific status/code.
+
+    The post-callback defer classifies errors by ``code`` (40060 is the
+    benign already-acknowledged race), so tests need to control it directly.
+    """
+
+    class _Err(discord.HTTPException):
+        def __init__(self):
+            Exception.__init__(self, str(status))
+            self.status = status
+            self.code = code
+            self.retry_after = 0
+
+    return _Err()
 
 
 # // ========================================( Timer Fires )======================================== // #
@@ -149,6 +169,55 @@ class TestPostCallbackDefer:
 
         interaction.response.defer.assert_not_called()
 
+    async def test_post_defer_40060_race_logged_at_debug(self, caplog):
+        """A 40060 (already acknowledged) on the post-callback defer is the
+        benign cancellation race the acting-view fast path can produce.
+        Logged at debug, never warning, so a successful fast-path edit does
+        not spam warnings on every interaction.
+        """
+        view = StatefulView(interaction=_make_interaction())
+        view.auto_defer_delay = 10
+        view.owner_only = False
+
+        interaction = _make_interaction(is_done=False)
+        interaction.response.defer = AsyncMock(side_effect=_http_error(400, 40060))
+
+        async def silent_callback(inter):
+            pass
+
+        item = _make_item(silent_callback)
+        with caplog.at_level(logging.DEBUG, logger="cascadeui.views._interaction"):
+            await view._scheduled_task(item, interaction)
+
+        assert any(
+            rec.levelno == logging.DEBUG and "40060" in rec.getMessage() for rec in caplog.records
+        )
+        assert not any(rec.levelno >= logging.WARNING for rec in caplog.records)
+
+    async def test_post_defer_genuine_failure_logged_at_warning(self, caplog):
+        """A non-40060 HTTP failure is a real ack failure -- the user saw an
+        interaction-failed toast -- so it surfaces at warning with the
+        status and code instead of vanishing at debug.
+        """
+        view = StatefulView(interaction=_make_interaction())
+        view.auto_defer_delay = 10
+        view.owner_only = False
+
+        interaction = _make_interaction(is_done=False)
+        interaction.response.defer = AsyncMock(side_effect=_http_error(404, 10062))
+
+        async def silent_callback(inter):
+            pass
+
+        item = _make_item(silent_callback)
+        with caplog.at_level(logging.WARNING, logger="cascadeui.views._interaction"):
+            await view._scheduled_task(item, interaction)
+
+        assert any(
+            rec.levelno == logging.WARNING and "status=404" in rec.getMessage()
+            for rec in caplog.records
+        )
+
 
 # // ========================================( Timer Skipped )======================================== // #
 
@@ -231,6 +300,28 @@ class TestAutoDeferErrorHandling:
 
         # Timer should not crash
         await view._auto_defer_timer(interaction)
+
+    async def test_safe_defer_bounds_a_stalled_ack(self):
+        """``_safe_defer`` cancels a stalled defer at ``auto_defer_delay`` and
+        swallows the timeout, so a hung Discord ack endpoint cannot pin the
+        interaction lock on the socket lifetime.
+        """
+        view = StatefulView(interaction=_make_interaction())
+        view.auto_defer_delay = 0.05
+        view.owner_only = False
+
+        interaction = _make_interaction(is_done=False)
+
+        async def stall(*args, **kwargs):
+            await asyncio.sleep(60)
+
+        interaction.response.defer = AsyncMock(side_effect=stall)
+
+        before = time.monotonic()
+        await view._safe_defer(interaction)  # must return, not hang
+        elapsed = time.monotonic() - before
+
+        assert elapsed < 2.0  # bounded by auto_defer_delay, not the 60s stall
 
     async def test_callback_error_still_triggers_on_error(self):
         """When the callback raises, on_error is called even with auto-defer active."""

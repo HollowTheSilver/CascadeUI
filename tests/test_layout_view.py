@@ -1,6 +1,7 @@
 """Tests for StatefulLayoutView (V2 base class)."""
 
 import asyncio
+import logging
 import time
 from unittest.mock import AsyncMock, MagicMock
 
@@ -1397,6 +1398,160 @@ class TestActingViewFastPath:
         assert view._refresh_not_before == 0.0
         # Digest invalidated so the next refresh ships unconditionally.
         assert view._last_tree_digest is None
+
+
+class TestEphemeralActingRefresh:
+    """Ephemeral acting views ack first, then edit through the webhook.
+
+    Ephemeral messages edit only through the interaction webhook, which
+    runs slower than a channel PATCH. The edit-as-ack fast path couples
+    the ack to that edit, so a slow webhook response starves the 3s ack
+    deadline and the panel both misses its ack and freezes. For ephemeral
+    acting views ``refresh()`` defers first (a near-instant ack) and then
+    ships the edit through ``self._message.edit()`` -- the
+    ``InteractionMessage`` / ``WebhookMessage`` whose ``.edit()`` routes
+    through the webhook with no 3s deadline. The one-call fast path stays
+    in force for non-ephemeral views, where the edit is fast enough to
+    double as the ack.
+    """
+
+    def _make_ephemeral_view(self):
+        class _V(StatefulLayoutView):
+            def build_ui(self):
+                self.clear_items()
+                self.add_item(ActionRow(StatefulButton(label="Fire", custom_id="a")))
+
+        view = _V(interaction=_make_interaction())
+        view._ephemeral = True
+        view.build_ui()
+        view._message = MagicMock()
+        view._message.id = 555
+        view._message.edit = AsyncMock()
+        view._last_tree_digest = None
+        return view
+
+    def _make_acting_interaction(self, message_id=555, is_done=False):
+        interaction = _make_interaction()
+        interaction.type = discord.InteractionType.component
+        interaction.message = MagicMock()
+        interaction.message.id = message_id
+        interaction.response.is_done.return_value = is_done
+        return interaction
+
+    async def test_acting_ephemeral_defers_then_webhook_edits(self):
+        """Ack-first contract: defer once, skip the edit-as-ack fast path,
+        and ship the edit through the webhook handle (``self._message``).
+        """
+        view = self._make_ephemeral_view()
+        interaction = self._make_acting_interaction()
+
+        token = _CURRENT_INTERACTION.set(interaction)
+        try:
+            await view.refresh()
+        finally:
+            _CURRENT_INTERACTION.reset(token)
+
+        # Ack landed first via a deferred update.
+        interaction.response.defer.assert_awaited_once()
+        # The edit-as-ack fast path is reserved for non-ephemeral views.
+        interaction.response.edit_message.assert_not_called()
+        # The edit shipped through the webhook handle.
+        view._message.edit.assert_awaited_once_with(view=view)
+
+    async def test_non_acting_ephemeral_edits_without_a_defer(self):
+        """Background ephemeral refreshes (no bound interaction) edit straight
+        through the webhook handle -- no deferred ack fires because there is
+        nothing to acknowledge.
+        """
+        view = self._make_ephemeral_view()
+
+        assert _CURRENT_INTERACTION.get() is None
+        await view.refresh()
+
+        view._message.edit.assert_awaited_once_with(view=view)
+
+
+class TestEditTimeout:
+    """``edit_timeout`` bounds every live-view and teardown edit through
+    ``_bounded``.
+
+    discord.py issues HTTP edits with no total timeout, so a connection
+    that stalls without a response would pin the awaiting code -- and, on
+    the interaction-locked refresh/navigation paths, the view itself. The
+    ceiling cancels the stalled request and the view recovers on the next
+    interaction. ``edit_timeout = None`` restores unbounded awaits.
+    """
+
+    def _make_view(self, **class_attrs):
+        class _V(StatefulLayoutView):
+            def build_ui(self):
+                self.clear_items()
+                self.add_item(ActionRow(StatefulButton(label="Fire", custom_id="a")))
+
+        for name, value in class_attrs.items():
+            setattr(_V, name, value)
+        view = _V(interaction=_make_interaction())
+        view.build_ui()
+        view._message = MagicMock()
+        view._message.id = 555
+        view._message.edit = AsyncMock()
+        view._last_tree_digest = None
+        return view
+
+    async def test_default_timeout_is_sixty(self):
+        view = self._make_view()
+        assert view.edit_timeout == 60.0
+
+    async def test_bounded_awaits_directly_when_disabled(self):
+        view = self._make_view(edit_timeout=None)
+
+        async def quick():
+            return "done"
+
+        assert await view._bounded(quick()) == "done"
+
+    async def test_bounded_returns_result_within_ceiling(self):
+        view = self._make_view(edit_timeout=5.0)
+
+        async def quick():
+            return "done"
+
+        assert await view._bounded(quick()) == "done"
+
+    async def test_bounded_raises_on_stall(self):
+        view = self._make_view(edit_timeout=0.05)
+
+        async def stall():
+            await asyncio.sleep(60)
+
+        with pytest.raises(asyncio.TimeoutError):
+            await view._bounded(stall())
+
+    async def test_refresh_stall_logs_and_invalidates_digest(self, caplog):
+        """A stalled channel edit is cancelled at ``edit_timeout``; refresh
+        logs a warning, invalidates the digest so the next refresh re-ships,
+        and returns instead of hanging on the socket.
+        """
+        view = self._make_view(edit_timeout=0.05)
+
+        async def stall(*args, **kwargs):
+            await asyncio.sleep(60)
+
+        view._message.edit = AsyncMock(side_effect=stall)
+        # Seed a non-matching, non-None digest so refresh skips neither the
+        # short-circuit-on-match nor the edit; after the stall the timeout
+        # branch should have reset it to None.
+        view._last_tree_digest = view._compute_tree_digest() + 1
+
+        assert _CURRENT_INTERACTION.get() is None  # background path, no fast path
+        before = time.monotonic()
+        with caplog.at_level(logging.WARNING, logger="cascadeui.views.base"):
+            await view.refresh()
+        elapsed = time.monotonic() - before
+
+        assert elapsed < 2.0  # bounded by edit_timeout, not the 60s stall
+        assert view._last_tree_digest is None
+        assert any("stalled" in r.getMessage() for r in caplog.records)
 
 
 class TestDisplayLayoutView:

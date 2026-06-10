@@ -229,6 +229,33 @@ class TestClassAttributeValidation:
             class _Bad(StatefulView):
                 auto_defer_delay = -1.0
 
+    def test_edit_timeout_default_is_sixty(self):
+        assert StatefulView.edit_timeout == 60.0
+
+    def test_edit_timeout_negative_raises(self):
+        with pytest.raises(ValueError, match="edit_timeout"):
+
+            class _Bad(StatefulView):
+                edit_timeout = -5.0
+
+    def test_edit_timeout_zero_raises(self):
+        with pytest.raises(ValueError, match="edit_timeout"):
+
+            class _Bad(StatefulView):
+                edit_timeout = 0
+
+    def test_edit_timeout_none_allowed(self):
+        class _Ok(StatefulView):
+            edit_timeout = None
+
+        assert _Ok.edit_timeout is None
+
+    def test_edit_timeout_positive_allowed(self):
+        class _Ok(StatefulView):
+            edit_timeout = 30.0
+
+        assert _Ok.edit_timeout == 30.0
+
     def test_subscribed_actions_non_set_raises(self):
         with pytest.raises(ValueError, match="subscribed_actions"):
 
@@ -285,6 +312,21 @@ class TestSetClassAttribute:
         view = StatefulView()
         with pytest.raises(ValueError, match="participant_limit"):
             view.set_class_attribute("participant_limit", 0)
+
+    def test_edit_timeout_override_applied(self):
+        view = StatefulView()
+        view.set_class_attribute("edit_timeout", 10.0)
+        assert view.edit_timeout == 10.0
+
+    def test_edit_timeout_none_override_applied(self):
+        view = StatefulView()
+        view.set_class_attribute("edit_timeout", None)
+        assert view.edit_timeout is None
+
+    def test_edit_timeout_zero_override_raises(self):
+        view = StatefulView()
+        with pytest.raises(ValueError, match="edit_timeout"):
+            view.set_class_attribute("edit_timeout", 0)
 
     def test_int_attr_string_raises(self):
         view = StatefulView()

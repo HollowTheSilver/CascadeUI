@@ -380,13 +380,24 @@ class _NavigationMixin:
         new_view._check_placement()
 
         try:
-            msg = await current_interaction.edit_original_response(view=new_view, **edit_kwargs)
+            msg = await self._bounded(
+                current_interaction.edit_original_response(view=new_view, **edit_kwargs)
+            )
             # Preserve the parent's plain Message ref. The edit response
             # is an InteractionMessage / WebhookMessage bound to the
             # 15-minute interaction token; subsequent edits need the
             # channel endpoint, which the plain ref provides.
             if new_view._message is None:
                 new_view._message = msg
+        except asyncio.TimeoutError:
+            # Edit stalled past edit_timeout. The destination view is
+            # already registered with a fresh digest, so the next
+            # interaction re-renders it; re-attempting inline would stack
+            # a second wait on the same stalled endpoint.
+            logger.warning(
+                f"Navigation edit stalled past {self.edit_timeout}s in "
+                f"{type(self).__name__}; destination re-renders on next interaction."
+            )
         except discord.HTTPException:
             # Interaction token expired (15-min lifetime). Route the
             # channel-endpoint fallback through refresh() so it picks
@@ -405,9 +416,17 @@ class _NavigationMixin:
                 # Stack was empty -- pop() already stopped/unsubscribed this view,
                 # so remove the dead components from the message to avoid a broken UI
                 try:
-                    await interaction.edit_original_response(view=None)
-                except discord.HTTPException:
-                    pass
+                    await self._bounded(interaction.edit_original_response(view=None))
+                except asyncio.TimeoutError:
+                    logger.debug(
+                        f"Back-navigation clear stalled past {self.edit_timeout}s "
+                        f"in {type(self).__name__}."
+                    )
+                except discord.HTTPException as e:
+                    logger.debug(
+                        f"Back-navigation clear failed in {type(self).__name__}: "
+                        f"status={e.status} code={e.code}"
+                    )
             # When prev_view is non-None, pop() routed through _apply_navigation_edit
             # which already swapped the message to the restored view.
 
