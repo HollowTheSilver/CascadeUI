@@ -1,6 +1,8 @@
 # // ========================================( Modules )======================================== // #
 
 
+import asyncio
+import logging
 from typing import Any, Dict, Optional, Sequence
 
 import discord
@@ -8,6 +10,8 @@ from discord.ui import ActionRow, Item, LayoutView
 
 from ..components.base import StatefulButton
 from .base import _StatefulMixin
+
+logger = logging.getLogger(__name__)
 
 # // ========================================( Classes )======================================== // #
 
@@ -98,9 +102,17 @@ class StatefulLayoutView(_StatefulMixin, LayoutView):
                 # an empty message.  Freeze instead.
                 try:
                     self._freeze_components()
-                    await interaction.edit_original_response(view=self)
-                except discord.HTTPException:
-                    pass
+                    await self._bounded(interaction.edit_original_response(view=self))
+                except asyncio.TimeoutError:
+                    logger.debug(
+                        f"Back-navigation freeze stalled past {self.edit_timeout}s "
+                        f"in {type(self).__name__}."
+                    )
+                except discord.HTTPException as e:
+                    logger.debug(
+                        f"Back-navigation freeze failed in {type(self).__name__}: "
+                        f"status={e.status} code={e.code}"
+                    )
             # When prev_view is non-None, pop() routed through _apply_navigation_edit
             # which already swapped the message to the restored view.
 

@@ -622,6 +622,7 @@ for row in rows:
 - Auto-defer with `respond()`, `open_modal()`, and `_safe_defer()` helpers
 - Interaction serialization so rapid clicks process sequentially
 - Refresh throttling via `refresh_cooldown_ms` and reactive 429 backoff
+- `edit_timeout` ceiling that cancels stalled Discord edits before they pin a view
 - Silent snowflake coercion at every public boundary
 - Class-attribute validation at subclass-definition time
 

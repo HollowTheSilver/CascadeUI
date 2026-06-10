@@ -161,6 +161,7 @@ dies with its last member.
 | `auto_defer` | `True` | Auto-defer unacknowledged interactions |
 | `auto_defer_delay` | `2.5` | Seconds before auto-defer fires |
 | `serialize_interactions` | `True` | Process clicks sequentially via asyncio.Lock |
+| `edit_timeout` | `60.0` | Max seconds a Discord edit may stall before cancellation; `None` disables |
 
 ### Undo/redo
 
@@ -381,6 +382,7 @@ Every class attribute, grouped by pillar, with its default value:
     auto_defer = True
     auto_defer_delay = 2.5
     serialize_interactions = True
+    edit_timeout = 60.0  # per-edit Discord HTTP ceiling; None = unbounded
     auto_refresh_ephemeral = None  # derives from timeout; pin with True/False
     reopen_failure_message = "Could not refresh this view..."
     enable_undo = False

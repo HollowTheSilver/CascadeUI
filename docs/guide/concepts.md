@@ -228,6 +228,7 @@ complete list with defaults.
 | `enable_undo` | `False` | Track undo/redo history for this view |
 | `undo_limit` | `20` | Max undo snapshots |
 | `refresh_cooldown_ms` | `None` | Proactive edit cooldown in milliseconds; refreshes during the window schedule one deferred edit and re-read store state at fire time |
+| `edit_timeout` | `60.0` | Max seconds any single Discord edit (refresh, exit, navigation) may stall before being cancelled; `None` disables the bound |
 
 ### The three-tier precedence model
 

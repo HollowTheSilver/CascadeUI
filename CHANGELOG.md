@@ -23,6 +23,26 @@ preserved below for historical reference but are not the supported baseline.
 
 ---
 
+## [3.3.2] - 2026-06-10
+
+### Added
+
+- **`edit_timeout` ceiling on every view.** Bounds each Discord edit the
+  library issues after the initial send (refresh, navigation, teardown)
+  with `asyncio.wait_for`, so a stalled connection is cancelled instead of
+  pinning the view -- discord.py issues edits with no total HTTP timeout.
+  Default `60.0` seconds; set `None` to restore unbounded awaits.
+
+### Fixed
+
+- **Ephemeral views could freeze under rapid clicking.** An ephemeral
+  `StatefulLayoutView` that refreshed itself in component callbacks could
+  intermittently show "This interaction failed" and go stale under latency.
+  Ephemeral acting refreshes now acknowledge first and edit through the
+  webhook, decoupling the ack from the slower ephemeral edit.
+
+---
+
 ## [3.3.1] - 2026-06-09
 
 ### Fixed

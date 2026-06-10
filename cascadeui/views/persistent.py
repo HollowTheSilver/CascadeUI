@@ -1,6 +1,7 @@
 # // ========================================( Modules )======================================== // #
 
 
+import asyncio
 import logging
 import re
 from typing import Dict
@@ -107,7 +108,7 @@ class _PersistentMixin:
         V2 calls ``delete()`` because V2 messages ARE their components  --
         ``edit(view=None)`` would produce an empty message (Discord error 50006).
         """
-        await old_message.edit(view=None)
+        await self._bounded(old_message.edit(view=None))
 
     async def _register_persistent(self, message) -> None:
         """Perform duplicate-key cleanup and dispatch PERSISTENT_VIEW_REGISTERED.
@@ -154,7 +155,12 @@ class _PersistentMixin:
                                 f"Cleaned up previous message {old_msg_id} for "
                                 f"persistence_key '{self.persistence_key}'"
                             )
-                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    except (
+                        discord.NotFound,
+                        discord.Forbidden,
+                        discord.HTTPException,
+                        asyncio.TimeoutError,
+                    ):
                         pass  # Old message already gone, nothing to clean up
                     except Exception as e:
                         logger.debug(
@@ -296,4 +302,4 @@ class PersistentLayoutView(_PersistentMixin, StatefulLayoutView):
 
     async def _cleanup_orphan_message(self, old_message):
         """V2 messages ARE their components -- delete instead of edit."""
-        await old_message.delete()
+        await self._bounded(old_message.delete())

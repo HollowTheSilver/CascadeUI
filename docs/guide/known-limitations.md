@@ -300,6 +300,18 @@ bots running far from Discord's regions hit this more than ones
 running near them. The framework cannot mitigate platform-wide
 latency.
 
+**Distinct from a hung connection.** Everything above concerns slow
+*responses* -- Discord eventually replies. A connection that opens
+but never responds (a TCP-level hang) is a different failure, and
+discord.py issues edits with no total HTTP timeout. `edit_timeout`
+(default `60.0` seconds) bounds every refresh, navigation, and
+teardown edit so a hung socket is cancelled and the view recovers on
+the next interaction rather than pinning indefinitely. It does not
+change the fast path, which keeps its own sub-`auto_defer_delay`
+bound. Set `edit_timeout = None` to restore unbounded awaits, or
+raise it (e.g. `120.0`) for views that routinely upload large
+attachments.
+
 **On observing this at scale.** Run `/cascadeui perf` against real
 user load. If `notify_ms` p95 routinely exceeds
 `(auto_defer_delay - 1.0) * 1000` ms, the fast path is being
