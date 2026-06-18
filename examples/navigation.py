@@ -200,6 +200,10 @@ class NestedView(StatefulView):
     auto_defer = True
     state_scope = None
     auto_back_button = False
+    # Reads shared_data on push and displays it -- never rebuilds on an external
+    # dispatch. Subscribe to nothing so the default refresh-on-notify does not
+    # re-edit the message on every action in the session.
+    subscribed_actions = set()
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -240,6 +244,8 @@ class AboutView(StatefulView):
     auto_defer = True
     state_scope = None
     auto_back_button = False
+    # Static page -- no Redux state to react to, so subscribe to nothing.
+    subscribed_actions = set()
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

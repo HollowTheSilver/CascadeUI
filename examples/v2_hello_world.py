@@ -59,6 +59,13 @@ class CounterView(StatefulLayoutView):
     # remove the message instead.
     exit_policy = "disable"
 
+    # -- Interaction acking --
+    # ``auto_defer`` (the default) acknowledges every interaction for you, so
+    # callbacks like ``_increment`` need no ``await interaction.response.defer()``.
+    # Adding a manual defer would disqualify the one-call edit-as-ack fast path
+    # and add a per-click pause -- leave the acking to the library.
+    auto_defer = True
+
     # -- State scope --
     # Count is stored per user, independent of guild. The same user
     # sees the same counter across every server that shares this bot.

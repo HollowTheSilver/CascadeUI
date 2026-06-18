@@ -29,7 +29,7 @@ class _SubView(StatefulLayoutView):
 
 
 class TestPushRebuild:
-    """push() with rebuild= should defer, call rebuild, and edit the message."""
+    """push() with rebuild= calls rebuild and edits + acks in one round-trip."""
 
     async def test_sync_rebuild_called(self):
         interaction = _make_interaction()
@@ -51,14 +51,16 @@ class TestPushRebuild:
 
         tracker.assert_called_once_with(new_view)
 
-    async def test_interaction_deferred(self):
+    async def test_interaction_acked_via_edit_message(self):
         interaction = _make_interaction(is_done=False)
         hub = _HubView(interaction=interaction)
         hub._message = MagicMock(id=1, channel=MagicMock(id=2))
 
         await hub.push(_SubView, interaction, rebuild=lambda v: None)
 
-        interaction.response.defer.assert_called_once()
+        # Fast path acks via edit_message, not a separate defer.
+        interaction.response.edit_message.assert_awaited_once()
+        interaction.response.defer.assert_not_called()
 
     async def test_already_deferred_not_double_deferred(self):
         interaction = _make_interaction(is_done=True)
@@ -76,9 +78,9 @@ class TestPushRebuild:
 
         new_view = await hub.push(_SubView, interaction, rebuild=lambda v: None)
 
-        interaction.edit_original_response.assert_called_once_with(view=new_view)
+        interaction.response.edit_message.assert_called_once_with(view=new_view)
 
-    async def test_no_rebuild_still_defers_and_edits(self):
+    async def test_no_rebuild_still_edits(self):
         """The Discord message edit fires regardless of whether a rebuild
         callback is supplied. ``rebuild`` is a pre-edit hook for views that
         need post-construction setup; the navigation contract is that the
@@ -90,8 +92,7 @@ class TestPushRebuild:
 
         new_view = await hub.push(_SubView, interaction)
 
-        interaction.response.defer.assert_called_once()
-        interaction.edit_original_response.assert_called_once_with(view=new_view)
+        interaction.response.edit_message.assert_called_once_with(view=new_view)
 
     async def test_returns_new_view(self):
         interaction = _make_interaction()
@@ -107,7 +108,7 @@ class TestPushRebuild:
 
 
 class TestPopRebuild:
-    """pop() with rebuild= should defer, call rebuild, and edit the message."""
+    """pop() with rebuild= calls rebuild and edits + acks in one round-trip."""
 
     async def _push_then_pop(self, *, rebuild=None):
         """Helper: send hub, push sub, then pop with rebuild.
@@ -139,24 +140,24 @@ class TestPopRebuild:
 
         tracker.assert_called_once_with(restored)
 
-    async def test_interaction_deferred(self):
+    async def test_interaction_acked_via_edit_message(self):
         _, pop_interaction = await self._push_then_pop(rebuild=lambda v: None)
 
-        pop_interaction.response.defer.assert_called_once()
+        pop_interaction.response.edit_message.assert_awaited_once()
+        pop_interaction.response.defer.assert_not_called()
 
     async def test_message_edited_with_restored_view(self):
         restored, pop_interaction = await self._push_then_pop(rebuild=lambda v: None)
 
-        pop_interaction.edit_original_response.assert_called_once_with(view=restored)
+        pop_interaction.response.edit_message.assert_called_once_with(view=restored)
 
-    async def test_no_rebuild_still_defers_and_edits(self):
+    async def test_no_rebuild_still_edits(self):
         """Pop matches push: the message edit fires whether or not a
         rebuild callback is supplied.
         """
         restored, pop_interaction = await self._push_then_pop(rebuild=None)
 
-        pop_interaction.response.defer.assert_called_once()
-        pop_interaction.edit_original_response.assert_called_once_with(view=restored)
+        pop_interaction.response.edit_message.assert_called_once_with(view=restored)
 
     async def test_empty_stack_skips_rebuild(self):
         """pop() on empty stack returns None and does not call rebuild."""
@@ -201,7 +202,7 @@ class TestRebuildV1:
 
 
 class TestRebuildDictReturn:
-    """When rebuild returns a dict, extra kwargs are passed to edit_original_response."""
+    """When rebuild returns a dict, extra kwargs are passed to the message edit."""
 
     async def test_dict_kwargs_merged_into_edit(self):
         interaction = _make_interaction()
@@ -211,7 +212,7 @@ class TestRebuildDictReturn:
         embed = MagicMock()
         new_view = await hub.push(_SubView, interaction, rebuild=lambda v: {"embed": embed})
 
-        interaction.edit_original_response.assert_called_once_with(view=new_view, embed=embed)
+        interaction.response.edit_message.assert_called_once_with(view=new_view, embed=embed)
 
     async def test_none_return_no_extra_kwargs(self):
         interaction = _make_interaction()
@@ -220,7 +221,7 @@ class TestRebuildDictReturn:
 
         new_view = await hub.push(_SubView, interaction, rebuild=lambda v: None)
 
-        interaction.edit_original_response.assert_called_once_with(view=new_view)
+        interaction.response.edit_message.assert_called_once_with(view=new_view)
 
     async def test_parent_message_ref_preserved_through_push(self):
         """The parent's plain ``Message`` ref carries through push.
@@ -253,6 +254,6 @@ class TestRebuildDictReturn:
 
         new_view = await hub.push(_SubView, interaction, rebuild=async_rebuild)
 
-        interaction.edit_original_response.assert_called_once_with(
+        interaction.response.edit_message.assert_called_once_with(
             view=new_view, embed=embed, content="hello"
         )

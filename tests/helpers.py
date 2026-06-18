@@ -2,6 +2,8 @@
 
 from unittest.mock import AsyncMock, MagicMock
 
+import discord
+
 
 def make_interaction(user_id=100, guild_id=200, is_done=False):
     """Create a mock discord.Interaction for testing.
@@ -18,6 +20,10 @@ def make_interaction(user_id=100, guild_id=200, is_done=False):
     interaction.user = MagicMock(id=user_id)
     interaction.guild = MagicMock(id=guild_id)
     interaction.guild_id = guild_id
+    # Default to a component interaction (the common navigation/click case) so
+    # the acting-view and navigation fast paths, which gate on interaction type,
+    # engage by default.
+    interaction.type = discord.InteractionType.component
     # InteractionResponse.is_done() is sync in discord.py — use MagicMock
     # so the return value is a plain bool, not a coroutine.
     interaction.response = MagicMock()

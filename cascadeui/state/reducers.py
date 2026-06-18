@@ -76,6 +76,7 @@ async def reduce_view_created(action: Action, state: StateData) -> StateData:
         "id": view_id,
         "type": payload.get("view_type"),
         "user_id": payload.get("user_id"),
+        "guild_id": payload.get("guild_id"),
         "session_id": payload.get("session_id"),
         "created_at": action["timestamp"],
         "updated_at": action["timestamp"],
@@ -182,6 +183,7 @@ async def reduce_session_created(action: Action, state: StateData) -> StateData:
     new_session = {
         "id": session_id,
         "user_id": payload.get("user_id"),
+        "guild_id": payload.get("guild_id"),
         "created_at": action["timestamp"],
         "updated_at": action["timestamp"],
         "members": [],

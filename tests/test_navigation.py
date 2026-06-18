@@ -3,9 +3,11 @@
 import copy
 from unittest.mock import AsyncMock, MagicMock
 
+import discord
 import pytest
 from helpers import make_interaction as _make_interaction
 
+from cascadeui.state.actions import ActionCreators
 from cascadeui.state.reducers import (
     reduce_navigation_pop,
     reduce_navigation_push,
@@ -465,6 +467,168 @@ class TestNavigationMessageState:
         restored_state = get_store().state["views"][restored.id]
         assert restored_state["message_id"] == original_msg_id
         assert restored_state["channel_id"] is not None
+
+
+class TestNavigationFastPath:
+    """Push/pop edit + ack in one call via interaction.response.edit_message
+    when the response slot is open; defer + edit_original_response otherwise."""
+
+    async def test_push_uses_edit_message_when_slot_open(self):
+        class _Root(StatefulView):
+            pass
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+
+        nav = _make_interaction(user_id=1, guild_id=100, is_done=False)
+        await root.push(_Sub, interaction=nav)
+
+        # One round-trip: edit + ack together, no separate defer.
+        nav.response.edit_message.assert_awaited_once()
+        nav.response.defer.assert_not_called()
+
+    async def test_push_falls_back_to_deferred_edit_when_acked(self):
+        class _Root(StatefulView):
+            pass
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+
+        # Interaction already acknowledged (e.g. the auto-defer timer fired).
+        nav = _make_interaction(user_id=1, guild_id=100, is_done=True)
+        nav.edit_original_response = AsyncMock(
+            return_value=MagicMock(id=777, channel=MagicMock(id=666))
+        )
+        await root.push(_Sub, interaction=nav)
+
+        nav.response.edit_message.assert_not_called()
+        nav.edit_original_response.assert_awaited_once()
+
+    async def test_push_non_component_interaction_skips_fast_path(self):
+        """A non-component interaction (e.g. a slash command) is ineligible for
+        the edit_message fast path -- it silently no-ops there in discord.py, so
+        navigation must fall to the deferred edit instead."""
+
+        class _Root(StatefulView):
+            pass
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+
+        nav = _make_interaction(user_id=1, guild_id=100, is_done=False)
+        nav.type = discord.InteractionType.application_command
+        nav.edit_original_response = AsyncMock(
+            return_value=MagicMock(id=5, channel=MagicMock(id=6))
+        )
+        await root.push(_Sub, interaction=nav)
+
+        nav.response.edit_message.assert_not_called()
+        nav.edit_original_response.assert_awaited_once()
+
+
+class TestNavigationUndoTransfer:
+    """Push/pop forward-transfer the undo/redo stacks to the new view's state
+    row so the undo timeline stays continuous across navigation. The transfer
+    routes through a VIEW_UPDATED dispatch (the reducer), never an in-place
+    write to the live state["views"] row."""
+
+    async def test_push_transfers_undo_and_redo_stacks(self):
+        class _Root(StatefulView):
+            pass
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+
+        # Seed the root's state row the way UndoMiddleware would after recorded
+        # actions, then push and confirm the stacks land on the child's row.
+        store = get_store()
+        await store.dispatch(
+            "VIEW_UPDATED",
+            ActionCreators.view_updated(
+                root.id,
+                undo_stack=[{"application_slots": {}, "shared_data": {}}],
+                redo_stack=[{"application_slots": {}, "shared_data": {}}],
+            ),
+        )
+
+        child = await root.push(_Sub)
+
+        child_state = store.state["views"][child.id]
+        assert len(child_state.get("undo_stack", [])) == 1
+        assert len(child_state.get("redo_stack", [])) == 1
+
+    async def test_transfer_routes_through_view_updated_dispatch(self):
+        class _Root(StatefulView):
+            pass
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+
+        store = get_store()
+        await store.dispatch(
+            "VIEW_UPDATED",
+            ActionCreators.view_updated(
+                root.id, undo_stack=[{"application_slots": {}, "shared_data": {}}]
+            ),
+        )
+
+        child = await root.push(_Sub)
+
+        # The transfer is a VIEW_UPDATED action carrying the stacks, proving it
+        # went through the reducer rather than mutating the row in place.
+        transfers = [
+            a
+            for a in store.history
+            if a["type"] == "VIEW_UPDATED"
+            and a["payload"].get("view_id") == child.id
+            and "undo_stack" in a["payload"]
+        ]
+        assert len(transfers) == 1
+
+    async def test_push_without_undo_history_emits_no_transfer(self):
+        class _Root(StatefulView):
+            pass
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+
+        store = get_store()
+        child = await root.push(_Sub)
+
+        # No undo/redo stacks on the root -> the guard skips the transfer
+        # dispatch entirely, so the child's row carries no stack keys.
+        transfers = [
+            a
+            for a in store.history
+            if a["type"] == "VIEW_UPDATED"
+            and a["payload"].get("view_id") == child.id
+            and ("undo_stack" in a["payload"] or "redo_stack" in a["payload"])
+        ]
+        assert transfers == []
 
 
 # // ========================================( Instance navigation )======================================== // #

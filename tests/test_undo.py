@@ -5,6 +5,7 @@ import copy
 import pytest
 from helpers import make_interaction as _make_interaction
 
+from cascadeui.state.actions import ActionCreators
 from cascadeui.state.middleware import UndoMiddleware
 from cascadeui.state.singleton import get_store
 from cascadeui.state.slots import access_slot, read_slot
@@ -613,7 +614,9 @@ class TestUndoMiddleware:
         await store.dispatch("SET_VAL", {"val": "changed"}, source_id="v_src")
         assert store.state["application"]["val"] == "changed"
 
-        # Simulate push: create destination view, transfer undo stacks
+        # Simulate push: create destination view, transfer undo stacks through
+        # a VIEW_UPDATED dispatch (the same reducer-routed path _navigate_to
+        # uses), not an in-place write to the state row.
         await store.dispatch(
             "VIEW_CREATED",
             {"view_id": "v_dst", "view_type": "Test", "user_id": 30, "session_id": "xfer_s"},
@@ -621,9 +624,14 @@ class TestUndoMiddleware:
         store._undo_enabled_views["v_dst"] = 20
 
         src_state = store.state["views"]["v_src"]
-        dst_state = store.state["views"]["v_dst"]
-        dst_state["undo_stack"] = list(src_state.get("undo_stack", []))
-        dst_state["redo_stack"] = list(src_state.get("redo_stack", []))
+        await store.dispatch(
+            "VIEW_UPDATED",
+            ActionCreators.view_updated(
+                "v_dst",
+                undo_stack=list(src_state.get("undo_stack", [])),
+                redo_stack=list(src_state.get("redo_stack", [])),
+            ),
+        )
 
         # Destroy old view (simulates VIEW_DESTROYED during push)
         await store.dispatch("VIEW_DESTROYED", {"view_id": "v_src"})

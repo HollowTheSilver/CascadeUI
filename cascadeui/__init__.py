@@ -12,6 +12,14 @@ import logging as _logging
 _logging.getLogger(__name__).addHandler(_logging.NullHandler())
 
 from .components.base import DynamicPersistentButton, StatefulButton, StatefulSelect
+from .components.buttons import (
+    DangerButton,
+    LinkButton,
+    PrimaryButton,
+    SecondaryButton,
+    SuccessButton,
+    ToggleButton,
+)
 from .components.inputs import Checkbox, CheckboxGroup, FileUpload, Modal, RadioGroup, TextInput
 from .components.patterns import (
     ConfirmationButtons,
@@ -39,6 +47,13 @@ from .components.patterns import (
     tab_nav,
     toggle_button,
     toggle_section,
+)
+from .components.selects import (
+    ChannelSelect,
+    Dropdown,
+    MentionableSelect,
+    RoleSelect,
+    UserSelect,
 )
 from .components.types import EmojiInput, MediaInput
 from .components.v1_composition import CompositeComponent, get_component, register_component
@@ -132,7 +147,7 @@ if "SQLiteBackend" in _persistence_all:
 # // ========================================( Script )======================================== // #
 
 
-__version__ = "3.3.2"
+__version__ = "3.3.3"
 
 # Export public API
 __all__ = [
@@ -179,6 +194,17 @@ __all__ = [
     "StatefulButton",
     "StatefulSelect",
     "DynamicPersistentButton",
+    "PrimaryButton",
+    "SecondaryButton",
+    "SuccessButton",
+    "DangerButton",
+    "LinkButton",
+    "ToggleButton",
+    "Dropdown",
+    "RoleSelect",
+    "ChannelSelect",
+    "UserSelect",
+    "MentionableSelect",
     "CompositeComponent",
     "ConfirmationButtons",
     "PaginationControls",

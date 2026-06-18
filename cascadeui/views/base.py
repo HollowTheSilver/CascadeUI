@@ -894,7 +894,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
 
         if self.session_id:
             payload = ActionCreators.session_created(
-                session_id=self.session_id, user_id=self.user_id
+                session_id=self.session_id, user_id=self.user_id, guild_id=self.guild_id
             )
             await self.state_store.dispatch("SESSION_CREATED", payload)
 
@@ -904,6 +904,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             view_type=self.__class__.__name__,
             user_id=self.user_id,
             session_id=self.session_id,
+            guild_id=self.guild_id,
         )
         await self.state_store.dispatch("VIEW_CREATED", payload)
 
@@ -979,9 +980,8 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     self.stop()
                     self.task_manager.cancel_tasks(self.id)
                     self.state_store._unsubscribe(self.id)
-                    self.state_store._unregister_view(self.id)
                     self.state_store._undo_enabled_views.pop(self.id, None)
-                    await self.dispatch("VIEW_DESTROYED", ActionCreators.view_destroyed(self.id))
+                    await self.state_store._destroy_view(self.id, source_id=self.id)
                     return None
 
         # -- Stage 4: ephemeral refresh-handoff derivation --
@@ -1045,9 +1045,8 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             self.stop()
             self.task_manager.cancel_tasks(self.id)
             self.state_store._unsubscribe(self.id)
-            self.state_store._unregister_view(self.id)
             self.state_store._undo_enabled_views.pop(self.id, None)
-            await self.dispatch("VIEW_DESTROYED", ActionCreators.view_destroyed(self.id))
+            await self.state_store._destroy_view(self.id, source_id=self.id)
             raise
 
         # -- Stage 6: message re-fetch for token-free editing --
@@ -1509,13 +1508,15 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     )
                 logger.warning(f"Could not disable components on timeout: {e}.{hint}")
 
-        # Cancel tasks and clean up state, mirroring exit()
+        # Cancel tasks and clean up state, mirroring exit(). _destroy_view folds
+        # in the active-registry removal so it commits only after the
+        # VIEW_DESTROYED state removal lands, keeping the two registries
+        # consistent when the dispatch fails.
         self.task_manager.cancel_tasks(self.id)
         self.state_store._unsubscribe(self.id)
-        self.state_store._unregister_view(self.id)
         self.state_store._undo_enabled_views.pop(self.id, None)
 
-        await self.dispatch("VIEW_DESTROYED", ActionCreators.view_destroyed(self.id))
+        await self.state_store._destroy_view(self.id, source_id=self.id)
 
     async def on_message_delete(self) -> None:
         """Called when the view's message is deleted externally.
@@ -1760,17 +1761,17 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     # so a transient failure on the interaction endpoint does
                     # not lose the edit entirely.
             elif acting and self._ephemeral:
-                # Ephemeral messages edit only through the interaction webhook,
-                # which runs slower than a channel PATCH. The edit-as-ack fast
-                # path couples the ack to that edit, so a slow webhook response
-                # starves the 3s ack deadline: the panel misses its ack (the
-                # interaction-failed toast) and loses the edit (a frozen body).
-                # Acknowledge first with a deferred update, then fall through to
-                # the webhook edit below. self._message is the
-                # InteractionMessage/WebhookMessage, whose .edit() routes through
-                # the webhook and stays valid for the token's 15-minute life with
-                # no 3s deadline on the edit itself.
-                await self._safe_defer(interaction)
+                # Ephemeral acting refreshes are NOT pre-deferred here. The edit
+                # below ships through the webhook handle (self._message.edit()),
+                # which rides the original send's interaction token -- independent
+                # of this click's ack -- so it lands without first waiting on a
+                # deferred-update round-trip. The click is acknowledged after the
+                # callback by the post-callback defer in _scheduled_task, or at
+                # auto_defer_delay by the auto-defer timer (which runs outside the
+                # interaction lock) when the edit is slow. The edit-as-ack fast
+                # path stays gated to non-ephemeral views above, where the edit
+                # is fast enough to double as the ack.
+                pass
 
             # Interaction-response messages ignore embed edits via the channel
             # endpoint (PATCH /channels/{id}/messages/{id}).  When the caller
@@ -1854,6 +1855,19 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         if self.edit_timeout is None:
             return await coro
         return await asyncio.wait_for(coro, self.edit_timeout)
+
+    async def _ack_bounded(self, coro):
+        """Await an ack-coupled ``interaction.response.edit_message`` under the
+        3s ack deadline.
+
+        When the ack rides the same request as the edit, a stall must not pin
+        the interaction past Discord's 3s deadline, so the bound is derived from
+        ``auto_defer_delay`` (not ``edit_timeout``, which can be 60s). Raises
+        ``asyncio.TimeoutError`` on stall so the caller falls through to the
+        deferred path; the auto-defer timer (outside the lock) acks. Mirrors the
+        bound the acting-view fast path in ``refresh()`` uses.
+        """
+        return await asyncio.wait_for(coro, timeout=max(0.5, self.auto_defer_delay - 1.0))
 
     def _check_placement(self) -> None:
         """Run the V2 placement validator on this view if enabled.
@@ -2478,13 +2492,21 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         # Stop this view
         self.stop()
 
-        # Unsubscribe BEFORE dispatching VIEW_DESTROYED so the view's own
-        # subscriber doesn't re-render after component removal.
+        # Unsubscribe before tearing down so the view's own subscriber does
+        # not react to its own VIEW_DESTROYED.
         self.state_store._unsubscribe(self.id)
-        self.state_store._unregister_view(self.id)
         self.state_store._undo_enabled_views.pop(self.id, None)
 
-        # Clean up the message
+        # Tear down both registries before the cosmetic message edit.
+        # _destroy_view frees the instance-limit slot up front so a concurrent
+        # send() does not count this exiting view, and removes the state entry
+        # before the active entry so a failed dispatch cannot strand a ghost.
+        # The up-to-edit_timeout edit below then runs with the view already
+        # gone from state and _active_views.
+        await self.state_store._destroy_view(self.id, source_id=self.id)
+
+        # Clean up the message: freeze the V2 tree, strip V1 buttons, or delete
+        # outright on Discord's side.
         if self._message:
             try:
                 if delete_message:
@@ -2524,8 +2546,6 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     logger.error(f"Error cleaning up message: {e}")
             except Exception as e:
                 logger.error(f"Error cleaning up message: {e}")
-
-        await self.dispatch("VIEW_DESTROYED", ActionCreators.view_destroyed(self.id))
 
         return True
 

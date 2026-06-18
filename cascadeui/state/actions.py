@@ -3,7 +3,7 @@
 
 from typing import Any, Dict, List, Optional
 
-from .types import ComponentId, SessionId, UserId, ViewId
+from .types import ComponentId, GuildId, SessionId, UserId, ViewId
 
 # Type alias for action payloads
 ActionPayload = Dict[str, Any]
@@ -21,6 +21,7 @@ class ActionCreators:
         view_type: str,
         user_id: Optional[UserId] = None,
         session_id: Optional[SessionId] = None,
+        guild_id: GuildId = None,
         **props,
     ) -> ActionPayload:
         """Create a VIEW_CREATED action payload."""
@@ -29,6 +30,7 @@ class ActionCreators:
             "view_type": view_type,
             "user_id": user_id,
             "session_id": session_id,
+            "guild_id": guild_id,
             "props": props,
         }
 
@@ -44,10 +46,18 @@ class ActionCreators:
 
     @staticmethod
     def session_created(
-        session_id: SessionId, user_id: Optional[UserId] = None, **data
+        session_id: SessionId,
+        user_id: Optional[UserId] = None,
+        guild_id: GuildId = None,
+        **data,
     ) -> ActionPayload:
         """Create a SESSION_CREATED action payload."""
-        return {"session_id": session_id, "user_id": user_id, "shared_data": data}
+        return {
+            "session_id": session_id,
+            "user_id": user_id,
+            "guild_id": guild_id,
+            "shared_data": data,
+        }
 
     @staticmethod
     def session_updated(session_id: SessionId, **data) -> ActionPayload:

@@ -117,6 +117,85 @@ class TestInspectorFiltering:
         assert "other_id" in filtered
 
 
+class TestInspectorGuildScope:
+    """The inspector scopes Views / Sessions to a guild and excludes every
+    inspector, not just its own."""
+
+    def test_filtered_views_scopes_to_guild(self):
+        view = InspectorView(interaction=_make_interaction(), scope_guild_id=100)
+        store = get_store()
+        store.state["views"] = {
+            "v_here": {"id": "v_here", "type": "CounterView", "guild_id": 100},
+            "v_other": {"id": "v_other", "type": "CounterView", "guild_id": 200},
+            "v_dm": {"id": "v_dm", "type": "CounterView", "guild_id": None},
+        }
+        assert set(view._filtered_views()) == {"v_here"}
+
+    def test_filtered_views_global_scope_shows_all_guilds(self):
+        view = InspectorView(interaction=_make_interaction(), scope_guild_id=None)
+        store = get_store()
+        store.state["views"] = {
+            "v100": {"id": "v100", "type": "CounterView", "guild_id": 100},
+            "v200": {"id": "v200", "type": "CounterView", "guild_id": 200},
+        }
+        assert set(view._filtered_views()) == {"v100", "v200"}
+
+    def test_filtered_views_excludes_other_guild_inspectors(self):
+        view = InspectorView(interaction=_make_interaction(), scope_guild_id=None)
+        store = get_store()
+        store.state["views"] = {
+            "other_inspector": {
+                "id": "other_inspector",
+                "type": "InspectorView",
+                "guild_id": 999,
+            },
+            "v_real": {"id": "v_real", "type": "CounterView", "guild_id": 100},
+        }
+        filtered = view._filtered_views()
+        assert "other_inspector" not in filtered
+        assert "v_real" in filtered
+
+    def test_filtered_sessions_scopes_to_guild(self):
+        view = InspectorView(interaction=_make_interaction(), scope_guild_id=100)
+        store = get_store()
+        store.state["views"] = {}
+        store.state["sessions"] = {
+            "s_here": {"id": "s_here", "guild_id": 100, "members": ["a"]},
+            "s_other": {"id": "s_other", "guild_id": 200, "members": ["b"]},
+        }
+        assert set(view._filtered_sessions()) == {"s_here"}
+
+
+class TestResolveInspectScope:
+    """DevToolsCog._resolve_inspect_scope maps the optional argument to a guild
+    id (or None for global)."""
+
+    def _ctx(self, guild_id=777):
+        ctx = MagicMock()
+        if guild_id is None:
+            ctx.guild = None
+        else:
+            ctx.guild = MagicMock()
+            ctx.guild.id = guild_id
+        return ctx
+
+    def test_no_arg_defaults_to_command_guild(self):
+        assert DevToolsCog._resolve_inspect_scope(self._ctx(777), None) == 777
+
+    def test_global_returns_none(self):
+        assert DevToolsCog._resolve_inspect_scope(self._ctx(777), "global") is None
+        assert DevToolsCog._resolve_inspect_scope(self._ctx(777), "all") is None
+
+    def test_guild_id_string_parsed(self):
+        assert DevToolsCog._resolve_inspect_scope(self._ctx(777), "12345") == 12345
+
+    def test_dm_no_guild_defaults_none(self):
+        assert DevToolsCog._resolve_inspect_scope(self._ctx(None), None) is None
+
+    def test_unrecognized_falls_back_to_command_guild(self):
+        assert DevToolsCog._resolve_inspect_scope(self._ctx(777), "garbage") == 777
+
+
 # // ========================================( Tab Builders )======================================== // #
 
 
@@ -459,11 +538,13 @@ class TestInspectorSubscribedActions:
 
 
 class TestCleanupGhostView:
-    """_cleanup_ghost_view runs the three-step registry + subscriber + state mop-up.
+    """_cleanup_ghost_view removes the subscriber slot, then tears the ghost
+    down through the atomic _destroy_view seam (state removal, then
+    active-registry removal).
 
     Tests target the ghost case (state row exists, no live instance) since
-    that is the helper's documented purpose. The live-instance branch of
-    _unregister_view is covered in test_state_store.
+    that is the helper's documented purpose. The _destroy_view seam itself
+    is covered in test_state_store.
     """
 
     async def test_removes_subscriber_entry(self):
@@ -615,6 +696,7 @@ class TestDevToolsCogExitAll:
     def _make_ctx(self):
         ctx = MagicMock()
         ctx.send = AsyncMock()
+        ctx.guild = None  # DM / no guild scope -- exercise the exit-all path
         return ctx
 
     async def test_exit_all_reports_failures(self):
@@ -644,6 +726,61 @@ class TestDevToolsCogExitAll:
 
         sent = ctx.send.call_args[0][0]
         assert "failed" not in sent
+
+
+class TestDevToolsCogGuildScope:
+    """views / sessions / exitall scope to the executing guild."""
+
+    def _ctx(self, guild_id=100):
+        ctx = MagicMock()
+        ctx.send = AsyncMock()
+        if guild_id is None:
+            ctx.guild = None
+        else:
+            ctx.guild = MagicMock()
+            ctx.guild.id = guild_id
+        return ctx
+
+    def test_scope_guild_returns_id(self):
+        assert DevToolsCog._scope_guild(self._ctx(42)) == 42
+
+    def test_scope_guild_dm_returns_none(self):
+        assert DevToolsCog._scope_guild(self._ctx(None)) is None
+
+    async def test_list_views_scopes_to_guild(self):
+        store = get_store()
+        store._active_views.clear()
+        store.state["views"] = {
+            "v_here": {"id": "v_here", "type": "CounterView", "guild_id": 100},
+            "v_other": {"id": "v_other", "type": "CounterView", "guild_id": 200},
+        }
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = self._ctx(100)
+        await cog.list_views.callback(cog, ctx)
+        sent = ctx.send.call_args[0][0]
+        assert "1 view(s)" in sent
+        assert "v_here" in sent
+        assert "v_other" not in sent
+
+    async def test_exitall_scopes_to_guild(self):
+        store = get_store()
+        store._active_views.clear()
+        store.state["views"] = {}
+        here = MagicMock()
+        here.guild_id = 100
+        here.exit = AsyncMock()
+        other = MagicMock()
+        other.guild_id = 200
+        other.exit = AsyncMock()
+        store._active_views["here"] = here
+        store._active_views["other"] = other
+
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = self._ctx(100)
+        await cog.exit_all.callback(cog, ctx)
+
+        here.exit.assert_awaited_once()
+        other.exit.assert_not_called()
 
 
 class TestDevToolsCogGroupListing:

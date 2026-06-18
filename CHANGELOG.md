@@ -23,6 +23,44 @@ preserved below for historical reference but are not the supported baseline.
 
 ---
 
+## [3.3.3] - 2026-06-18
+
+### Added
+
+- **`/cascadeui inspect` guild scoping.** The inspector takes an optional
+  `scope` argument: pass a guild id to target one guild, or `global` (or `all`)
+  to show every guild. View and session state rows now carry a `guild_id` field
+  so the inspector can filter by guild.
+- **Convenience components importable from the top level.** `PrimaryButton`,
+  `ToggleButton`, `Dropdown`, and the other button/select subclasses now import
+  directly from `cascadeui` (previously only from `cascadeui.components`).
+
+### Changed
+
+- **DevTools default to the current guild.** `/cascadeui inspect`, `views`,
+  `sessions`, and `exitall` previously spanned every guild; they now scope to
+  the guild where the command runs, and `exitall` no longer reaches other
+  guilds' views. Pass `/cascadeui inspect global` for the all-guilds view.
+- **Ephemeral views refresh more responsively.** A self-refreshing ephemeral
+  message no longer shows a brief pause after each interaction. The edit now
+  ships immediately and the interaction is acknowledged in the background,
+  removing a per-interaction round-trip.
+- **Navigation is more responsive.** `push()` and `pop()` (and the auto Back
+  button) now edit the message and acknowledge the interaction in one round-trip
+  instead of deferring first, removing a per-step pause on menu and wizard
+  navigation.
+
+### Fixed
+
+- **Ghost views no longer accumulate in the inspector.** Finite-timeout and
+  dismissed views could leak permanently into `/cascadeui inspect` (present in
+  state, absent from the live registry) when a teardown step failed partway
+  through. Teardown is now atomic: the state entry is removed before the
+  registry entry, so a failed or cancelled teardown leaves both intact and
+  self-heals instead of stranding a ghost.
+
+---
+
 ## [3.3.2] - 2026-06-10
 
 ### Added

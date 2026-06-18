@@ -596,33 +596,20 @@ class PersistenceManager:
                 # subscriber + registry entry + undo-tracking row, all
                 # of which must go back before the next row is tried.
                 self._store._unsubscribe(view.id)
-                self._store._unregister_view(view.id)
                 self._store._undo_enabled_views.pop(view.id, None)
-                # If state registration succeeded before the failure,
-                # the SESSION_CREATED + VIEW_CREATED actions already
-                # landed in store state. Dispatch VIEW_DESTROYED to
-                # tear those down -- otherwise the session and view
-                # entries would persist as zombies for the rest of
-                # the process lifetime. ``reduce_view_destroyed``
-                # cleans up the session entry too when its members
-                # list empties.
                 if state_registered:
-                    # Late import: ``state.actions`` would not introduce
-                    # a circular dep, but the file's convention is to
-                    # late-import every state-domain symbol (matches the
-                    # ``PersistenceMiddleware`` import below).
-                    from ..state.actions import ActionCreators
-
-                    try:
-                        await self._store.dispatch(
-                            "VIEW_DESTROYED",
-                            ActionCreators.view_destroyed(view.id),
-                        )
-                    except Exception as cleanup_exc:
-                        logger.error(
-                            f"Rollback dispatch failed for {persistence_key!r}: " f"{cleanup_exc}",
-                            exc_info=True,
-                        )
+                    # State registration landed SESSION_CREATED + VIEW_CREATED,
+                    # so tear them down through the atomic seam: _destroy_view
+                    # dispatches VIEW_DESTROYED, then clears the active-registry
+                    # entry only after state confirms the removal. A failed
+                    # dispatch leaves both registries intact instead of
+                    # stranding a ghost; _destroy_view catches and logs the
+                    # dispatch failure internally. ``reduce_view_destroyed``
+                    # cleans up the session entry too when its members empty.
+                    await self._store._destroy_view(view.id)
+                else:
+                    # State never registered; just drop the active entry.
+                    self._store._unregister_view(view.id)
             return "failed"
 
     # // ========================================( Middleware install )======================================== // #

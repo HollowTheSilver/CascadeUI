@@ -2,6 +2,7 @@
 
 import asyncio
 import copy
+from types import SimpleNamespace
 
 import pytest
 
@@ -79,6 +80,128 @@ class TestGetActiveViews:
         mapping = store.get_active_views()
         with pytest.raises(TypeError):
             mapping["v1"] = object()
+
+
+class TestDestroyView:
+    """Atomic teardown orders state removal before the active-registry removal.
+
+    A ghost is the divergence ``view_id in state["views"] and view_id not in
+    _active_views`` -- what the inspector paints red. _destroy_view clears the
+    active entry only after VIEW_DESTROYED confirms the state removal, so a
+    failed dispatch can never produce that divergence.
+    """
+
+    def _seed(self, store, vid):
+        """Put a view in both registries the way a live send would."""
+        store._active_views.clear()
+        store.subscribers = {}
+        store.state = StateStore._build_initial_state()
+        store.state["views"][vid] = {"view_type": "FakeView", "user_id": "u1"}
+        # _unregister_view reads these; instance_scope="user" + user_id=None
+        # yields a None scope key, so no _instance_index entry is touched.
+        store._active_views[vid] = SimpleNamespace(
+            _instance_root_class="FakeView",
+            instance_scope="user",
+            user_id=None,
+            guild_id=None,
+            _participants=set(),
+        )
+
+    async def test_happy_path_removes_from_both_registries(self):
+        store = get_store()
+        saved_mw = store._middleware
+        store._middleware = []
+        try:
+            self._seed(store, "v-happy")
+            result = await store._destroy_view("v-happy")
+            assert result is True
+            assert "v-happy" not in store.state["views"]
+            assert "v-happy" not in store._active_views
+        finally:
+            store._middleware = saved_mw
+
+    async def test_middleware_failure_retains_active_entry_no_ghost(self):
+        store = get_store()
+        saved_mw = store._middleware
+
+        async def failing_mw(action, state, next_fn):
+            if action["type"] == "VIEW_DESTROYED":
+                raise RuntimeError("middleware failed before reducer")
+            return await next_fn(action, state)
+
+        store._middleware = [failing_mw]
+        try:
+            self._seed(store, "v-mw")
+            result = await store._destroy_view("v-mw")
+            assert result is False
+            # Both registries retained -> present in both -> NOT a ghost.
+            assert "v-mw" in store.state["views"]
+            assert "v-mw" in store._active_views
+        finally:
+            store._middleware = saved_mw
+
+    async def test_state_not_removed_retains_active_entry_no_ghost(self):
+        store = get_store()
+        saved_mw = store._middleware
+
+        # Short-circuits without calling next_fn: dispatch returns normally but
+        # the reducer never runs, so state["views"] is unchanged. This models
+        # the swallowed-reducer branch where dispatch does not raise yet the
+        # state removal silently did not happen.
+        async def swallow_mw(action, state, next_fn):
+            if action["type"] == "VIEW_DESTROYED":
+                return state
+            return await next_fn(action, state)
+
+        store._middleware = [swallow_mw]
+        try:
+            self._seed(store, "v-swallow")
+            result = await store._destroy_view("v-swallow")
+            assert result is False
+            assert "v-swallow" in store.state["views"]
+            assert "v-swallow" in store._active_views
+        finally:
+            store._middleware = saved_mw
+
+    async def test_cancelled_dispatch_after_state_removal_clears_active(self):
+        store = get_store()
+        saved_mw = store._middleware
+
+        # Reducer runs (state entry removed), then the dispatch is cancelled
+        # before _destroy_view reaches its active-registry removal. CancelledError
+        # is a BaseException, so it bypasses the except Exception guard; the
+        # finally clause must still clear the active entry to avoid stranding
+        # the view in _active_views (the reverse of a ghost).
+        async def cancel_after_reducer(action, state, next_fn):
+            result = await next_fn(action, state)
+            if action["type"] == "VIEW_DESTROYED":
+                raise asyncio.CancelledError()
+            return result
+
+        store._middleware = [cancel_after_reducer]
+        try:
+            self._seed(store, "v-cancel")
+            with pytest.raises(asyncio.CancelledError):
+                await store._destroy_view("v-cancel")
+            assert "v-cancel" not in store.state["views"]
+            assert "v-cancel" not in store._active_views
+        finally:
+            store._middleware = saved_mw
+
+    async def test_idempotent_under_double_teardown(self):
+        store = get_store()
+        saved_mw = store._middleware
+        store._middleware = []
+        try:
+            self._seed(store, "v-double")
+            assert await store._destroy_view("v-double") is True
+            # Second call: view already gone from state -> not in views -> the
+            # idempotent _unregister_view runs as a no-op and it returns True.
+            assert await store._destroy_view("v-double") is True
+            assert "v-double" not in store.state["views"]
+            assert "v-double" not in store._active_views
+        finally:
+            store._middleware = saved_mw
 
 
 class TestDispatch:

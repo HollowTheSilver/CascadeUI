@@ -8,6 +8,7 @@ ViewId = str
 SessionId = str
 ComponentId = str
 UserId = Optional[int]
+GuildId = Optional[int]
 Timestamp = str
 
 # Simple action type

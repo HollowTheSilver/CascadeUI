@@ -14,7 +14,6 @@ from discord.ui import ActionRow, TextDisplay
 from .components.base import StatefulButton, StatefulSelect
 from .components.patterns import action_section, alert, card, divider, gap, key_value
 from .exceptions import InstanceLimitError
-from .state.actions import ActionCreators
 from .state.computed import _SENTINEL as _SENTINEL_COMPUTED
 from .state.computed import ComputedValue, computed
 from .state.singleton import get_store
@@ -43,15 +42,15 @@ _LIST_DISPLAY_CAP = 15
 async def _cleanup_ghost_view(store, view_id: str) -> None:
     """Drop a ghost view (state row with no live instance) from the store.
 
-    Three-step mop-up: remove from the active-view registry, remove the
-    subscriber slot, dispatch VIEW_DESTROYED so the state-tree reducer
-    trims ``state["views"][view_id]`` and session membership. Used when
-    an instance dies without routing through ``exit()`` -- the state
-    row outlives the object and only the inspector can clean it.
+    Removes the subscriber slot, then tears the view down through the atomic
+    ``_destroy_view`` seam: VIEW_DESTROYED trims ``state["views"][view_id]``
+    and session membership, and the active-registry entry is cleared only
+    after state confirms the removal. Used when an instance dies without
+    routing through ``exit()`` -- the state row outlives the object and only
+    the inspector can clean it.
     """
-    store._unregister_view(view_id)
     store._unsubscribe(view_id)
-    await store.dispatch("VIEW_DESTROYED", ActionCreators.view_destroyed(view_id))
+    await store._destroy_view(view_id)
 
 
 # // ========================================( Computed Aggregations )======================================== // #
@@ -152,15 +151,33 @@ class InspectorView(TabLayoutView):
         notification and the Views tab's Channel / Msg columns stay null
         until the user manually refreshes.
         """
+        # Filter to the same rows the Views / Sessions tabs display (exclude
+        # every inspector, honor the guild scope) so a guild-scoped inspector
+        # does not rebuild on out-of-scope cross-guild activity.
         views = frozenset(
             (k, v.get("message_id"), v.get("channel_id"))
             for k, v in state.get("views", {}).items()
             if k != self.id
+            and v.get("type") != "InspectorView"
+            and self._in_scope(v.get("guild_id"))
         )
-        sessions = frozenset(k for k in state.get("sessions", {}) if k != self.session_id)
+        view_rows = state.get("views", {})
+        inspector_sessions = {
+            v.get("session_id") for v in view_rows.values() if v.get("type") == "InspectorView"
+        }
+        inspector_sessions.add(self.session_id)
+        sessions = frozenset(
+            k
+            for k, v in state.get("sessions", {}).items()
+            if k not in inspector_sessions and self._in_scope(v.get("guild_id"))
+        )
         return (views, sessions)
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, scope_guild_id=None, **kwargs):
+        # scope_guild_id: an int restricts the Views / Sessions tabs to that
+        # guild; None shows every guild. The /cascadeui inspect command
+        # defaults this to the executing guild.
+        self._scope_guild_id = scope_guild_id
         tabs = {
             "\U0001f4ca Overview": self.build_overview,
             "\U0001f441\ufe0f Views": self.build_views,
@@ -173,15 +190,46 @@ class InspectorView(TabLayoutView):
 
     # // ==================( Filtering )================== // #
 
+    def _in_scope(self, guild_id) -> bool:
+        """Whether a row's guild belongs to the inspector's scope.
+
+        A ``None`` scope is global -- every guild passes. A guildless row
+        (DM-originated, ``guild_id`` is ``None``) only passes the global scope.
+        """
+        return self._scope_guild_id is None or guild_id == self._scope_guild_id
+
     def _filtered_views(self):
-        """Return state views excluding the inspector's own entry."""
+        """State views, excluding every inspector and rows outside the scope.
+
+        Filtering by ``type`` rather than ``self.id`` drops other inspectors
+        open in other guilds too, not just this one -- they are observer-effect
+        noise wherever they appear.
+        """
         views = self.state_store.state.get("views", {})
-        return {k: v for k, v in views.items() if k != self.id}
+        return {
+            k: v
+            for k, v in views.items()
+            if k != self.id
+            and v.get("type") != "InspectorView"
+            and self._in_scope(v.get("guild_id"))
+        }
 
     def _filtered_sessions(self):
-        """Return state sessions excluding the inspector's own session."""
+        """State sessions, excluding inspector sessions and out-of-scope guilds."""
+        views = self.state_store.state.get("views", {})
+        # Drop this inspector's own session plus any session whose view is
+        # another inspector. self.session_id covers the common case where the
+        # inspector's own view row is not present in the probed state.
+        inspector_sessions = {
+            v.get("session_id") for v in views.values() if v.get("type") == "InspectorView"
+        }
+        inspector_sessions.add(self.session_id)
         sessions = self.state_store.state.get("sessions", {})
-        return {k: v for k, v in sessions.items() if k != self.session_id}
+        return {
+            k: v
+            for k, v in sessions.items()
+            if k not in inspector_sessions and self._in_scope(v.get("guild_id"))
+        }
 
     def _filtered_history(self):
         """Return action history excluding the inspector's own dispatches."""
@@ -242,30 +290,36 @@ class InspectorView(TabLayoutView):
         components = self._filtered_components()
         modals = self._filtered_modals()
 
-        # Total counts come from the module-level @computed aggregations; the
-        # inspector subtracts its own contribution only when registered.
-        # TabLayoutView.send() calls build_overview() before super().send()
-        # dispatches VIEW_CREATED / SESSION_CREATED, so on first render the
-        # inspector's own ids are not yet in state -- subtracting 1
-        # unconditionally would under-count every other view by one.
-        # Probing state membership picks the right subtraction every render.
-        state_views = store.state.get("views", {})
-        state_sessions = store.state.get("sessions", {})
-        self_view_present = self.id in state_views
-        self_session_present = self.session_id in state_sessions
-        view_count = max(0, store.computed["total_views"] - (1 if self_view_present else 0))
-        session_count = max(
-            0,
-            store.computed["total_sessions"] - (1 if self_session_present else 0),
-        )
+        # Scoped counts come from the filtered helpers so the Overview agrees
+        # with the Views / Sessions tabs -- both exclude inspectors and honor
+        # the guild scope.
+        view_count = len(self._filtered_views())
+        session_count = len(self._filtered_sessions())
 
+        scope_label = (
+            f"Guild `{self._scope_guild_id}`"
+            if self._scope_guild_id is not None
+            else "Global (all guilds)"
+        )
         stats = {
+            "Scope": scope_label,
             "Views": view_count,
             "Sessions": session_count,
             "Components": len(components),
         }
         if modals:
             stats["Modals"] = len(modals)
+        if self._scope_guild_id is not None:
+            # All-guilds totals from the @computed aggregates. TabLayoutView.send()
+            # builds this tab before VIEW_CREATED / SESSION_CREATED dispatch, so
+            # the inspector's own ids may not be in state yet -- probe membership
+            # to subtract its own contribution only once registered.
+            views_state = store.state.get("views", {})
+            sessions_state = store.state.get("sessions", {})
+            self_view = 1 if self.id in views_state else 0
+            self_session = 1 if self.session_id in sessions_state else 0
+            stats["Views (all guilds)"] = max(0, store.computed["total_views"] - self_view)
+            stats["Sessions (all guilds)"] = max(0, store.computed["total_sessions"] - self_session)
 
         overview = card(
             "## State Inspector",
@@ -1258,11 +1312,25 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
 
     # // ==================( View Commands )================== // #
 
+    @staticmethod
+    def _scope_guild(ctx: Context):
+        """Guild id the text commands scope to, or None in a DM (all guilds).
+
+        The listing and bulk-exit commands filter to this guild; None passes
+        every row.
+        """
+        return ctx.guild.id if ctx.guild else None
+
     @cascadeui_group.command(name="views", description="List active CascadeUI views.")
     async def list_views(self, ctx: Context) -> None:
-        """List all active views in the state store."""
+        """List active views in the executing guild."""
         store = get_store()
-        views = store.state.get("views", {})
+        gid = self._scope_guild(ctx)
+        views = {
+            k: v
+            for k, v in store.state.get("views", {}).items()
+            if gid is None or v.get("guild_id") == gid
+        }
         active = store.get_active_views()
 
         if not views:
@@ -1278,7 +1346,8 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
         if len(views) > _LIST_DISPLAY_CAP:
             lines.append(f"*...and {len(views) - _LIST_DISPLAY_CAP} more*")
 
-        header = f"**{len(views)} view(s)** ({len(active)} live)\n"
+        live = sum(1 for vid in views if vid in active)
+        header = f"**{len(views)} view(s)** ({live} live)\n"
         await ctx.send(header + "\n".join(lines), ephemeral=True)
 
     @cascadeui_group.command(name="exit", description="Exit a specific CascadeUI view by ID.")
@@ -1319,14 +1388,17 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
 
     @cascadeui_group.command(name="exitall", description="Exit all active CascadeUI views.")
     async def exit_all(self, ctx: Context) -> None:
-        """Exit all active views and clean ghost entries."""
+        """Exit active views in the executing guild and clean their ghosts."""
         store = get_store()
+        gid = self._scope_guild(ctx)
         views = dict(store.state.get("views", {}))
         active = dict(store.get_active_views())
         exited = 0
         failed = 0
 
         for view_id, view in list(active.items()):
+            if gid is not None and getattr(view, "guild_id", None) != gid:
+                continue
             try:
                 await view.exit()
                 exited += 1
@@ -1334,10 +1406,13 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
                 logger.debug("exit_all: view %s failed to exit cleanly: %s", view_id, exc)
                 failed += 1
 
-        for view_id in list(views.keys()):
-            if view_id not in active:
-                await _cleanup_ghost_view(store, view_id)
-                exited += 1
+        for view_id, view_data in list(views.items()):
+            if view_id in active:
+                continue
+            if gid is not None and view_data.get("guild_id") != gid:
+                continue
+            await _cleanup_ghost_view(store, view_id)
+            exited += 1
 
         suffix = f" ({failed} failed)" if failed else ""
         await ctx.send(f"Exited {exited} view(s){suffix}.", ephemeral=True)
@@ -1447,9 +1522,14 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
 
     @cascadeui_group.command(name="sessions", description="List active CascadeUI sessions.")
     async def list_sessions(self, ctx: Context) -> None:
-        """List all sessions in the state store."""
+        """List sessions in the executing guild."""
         store = get_store()
-        sessions = store.state.get("sessions", {})
+        gid = self._scope_guild(ctx)
+        sessions = {
+            k: v
+            for k, v in store.state.get("sessions", {}).items()
+            if gid is None or v.get("guild_id") == gid
+        }
 
         if not sessions:
             return await ctx.send("No active sessions.", ephemeral=True)
@@ -1499,18 +1579,39 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
     # // ==================( Inspector Command )================== // #
 
     @cascadeui_group.command(name="inspect", description="Open the CascadeUI state inspector.")
-    async def inspect(self, ctx: Context) -> None:
+    async def inspect(self, ctx: Context, scope: str = None) -> None:
         """Open the visual state inspector.
 
         A tabbed V2 dashboard showing the live state tree, active views,
         sessions, action history, and store configuration with interactive
         controls for managing views, sessions, and state.
+
+        Scope defaults to the current guild. Pass ``global`` (or ``all``) to
+        inspect every guild, or a guild id to target a specific guild.
         """
+        scope_guild_id = self._resolve_inspect_scope(ctx, scope)
         try:
-            view = InspectorView(context=ctx)
+            view = InspectorView(context=ctx, scope_guild_id=scope_guild_id)
             await view.send()
         except InstanceLimitError:
             await ctx.send("Inspector already open.", ephemeral=True)
+
+    @staticmethod
+    def _resolve_inspect_scope(ctx: Context, scope: str = None):
+        """Map the optional scope argument to a guild id, or None for global.
+
+        No argument defaults to the executing guild (None in a DM). ``global``
+        or ``all`` widen to every guild. A numeric string targets that guild
+        id. Anything unrecognized falls back to the executing guild.
+        """
+        if scope is None:
+            return ctx.guild.id if ctx.guild else None
+        normalized = scope.strip().lower()
+        if normalized in ("global", "all"):
+            return None
+        if normalized.isdigit():
+            return int(normalized)
+        return ctx.guild.id if ctx.guild else None
 
     # // ==================( Registry Commands )================== // #
 

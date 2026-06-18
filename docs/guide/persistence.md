@@ -164,6 +164,15 @@ single-process production default: WAL mode for concurrent reads,
 `PostgresBackend` adds cross-process coordination via `LISTEN`/`NOTIFY`
 and is the right choice for multi-process deployments.
 
+!!! note "Inspecting the database directly"
+    CascadeUI partitions its state across dedicated tables, not one blob.
+    `persistent_views` holds the `PersistentView` registry -- one row per
+    posted panel, written through immediately on registration.
+    `application_slots` holds persisted application and scoped slots.
+    `cascadeui_kv` is a generic key-value surface for the KV Protocol methods
+    and does **not** hold view registry rows. To confirm a panel's row
+    exists, query `persistent_views`, not `cascadeui_kv`.
+
 ```bash
 pip install pycascadeui[sqlite]
 ```
