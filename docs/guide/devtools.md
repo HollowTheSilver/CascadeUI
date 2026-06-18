@@ -93,11 +93,11 @@ every subcommand automatically.
 
 | Command | Description |
 |---------|-------------|
-| `/cascadeui inspect` | Open the visual state inspector (see below) |
-| `/cascadeui views` | List active views with live/ghost status indicators |
+| `/cascadeui inspect [scope]` | Open the visual state inspector, scoped to the current guild; pass a guild id or `global` to widen it (see below) |
+| `/cascadeui views` | List active views in the current guild with live/ghost status indicators |
 | `/cascadeui exit <id>` | Exit a specific view by ID (partial match, 8+ chars) |
-| `/cascadeui exitall` | Exit all live views and clean ghost state entries |
-| `/cascadeui sessions` | List active sessions with view counts and nav depth |
+| `/cascadeui exitall` | Exit live views in the current guild and clean their ghost state entries |
+| `/cascadeui sessions` | List active sessions in the current guild with view counts and nav depth |
 | `/cascadeui clear <id>` | Clear a session -- exits all views and removes the entry |
 | `/cascadeui flush` | Force an immediate persistence write to disk |
 | `/cascadeui purge` | Remove stale component and modal interaction entries |
@@ -237,18 +237,27 @@ metric means and how to use selectors to reduce subscriber fan-out.
 
 ---
 
-## Self-Filtering
+## Scope and Filtering
 
-The inspector excludes its own view and session from all displayed data.
-Opening the inspector does not add an extra entry to the Views or
-Sessions tabs:
+By default the inspector shows only the views and sessions in the guild
+where `/cascadeui inspect` ran. Pass a `scope` argument to widen or
+retarget it: a guild id for a specific guild, or `global` (or `all`) for
+every guild. View and session state rows carry a `guild_id` field that
+drives this filtering. Run in a DM (no executing guild) and the default
+is global; under a guild scope, DM-originated rows (no `guild_id`) are
+excluded. The `views`, `sessions`, and `exitall` text commands share this
+executing-guild default.
 
-| Filter | Excludes |
-|--------|----------|
-| `_filtered_views()` | Inspector's view ID from `state["views"]` |
-| `_filtered_sessions()` | Inspector's session ID from `state["sessions"]` |
-| `_filtered_history()` | Actions where `source` matches the inspector's ID |
-| `_filtered_active_views()` | Inspector from `store.get_active_views()` |
+The inspector also excludes every inspector (its own and any others open
+in other guilds) from the displayed data, so opening one never adds an
+entry to the Views or Sessions tabs:
+
+| Displayed data | Excludes |
+|----------------|----------|
+| View rows | Every `InspectorView` row, and rows outside the guild scope |
+| Session rows | Inspector sessions, and sessions outside the guild scope |
+| History entries | Actions whose `source` is this inspector |
+| Active view registry | This inspector's live instance |
 
 ---
 

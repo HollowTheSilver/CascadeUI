@@ -87,10 +87,14 @@ class _NavigationMixin:
         # Cancel background tasks owned by this view before stopping
         self.task_manager.cancel_tasks(self.id)
 
-        # Stop this view and clean up its Python-level registration
+        # Stop this view and clean up its Python-level registration. The
+        # active-registry removal is deferred to _destroy_view at the end of
+        # the batch (below) so it commits only after this view's VIEW_DESTROYED
+        # state removal lands. Deferring past the new-view construction keeps
+        # the old view's active entry intact if construction raises before the
+        # dispatch.
         self.stop()
         self.state_store._unsubscribe(self.id)
-        self.state_store._unregister_view(self.id)
         self.state_store._undo_enabled_views.pop(self.id, None)
 
         # Batch the full navigation sequence: NAVIGATION_* + SESSION_CREATED
@@ -225,19 +229,27 @@ class _NavigationMixin:
                 await new_view._update_message_state(new_view._message)
 
             # Forward-transfer undo/redo stacks through push/pop chain so the
-            # undo timeline stays continuous across navigation.
+            # undo timeline stays continuous across navigation. Routed through a
+            # VIEW_UPDATED dispatch so the transfer runs through the reducer like
+            # every other state mutation, rather than writing into the live
+            # state["views"] row in place.
             if action_type in ("NAVIGATION_PUSH", "NAVIGATION_POP"):
                 old_view_state = self.state_store.state.get("views", {}).get(self.id, {})
-                new_view_state = self.state_store.state.get("views", {}).get(new_view.id, {})
+                stack_updates = {}
                 if old_view_state.get("undo_stack"):
-                    new_view_state["undo_stack"] = list(old_view_state["undo_stack"])
+                    stack_updates["undo_stack"] = list(old_view_state["undo_stack"])
                 if old_view_state.get("redo_stack"):
-                    new_view_state["redo_stack"] = list(old_view_state["redo_stack"])
+                    stack_updates["redo_stack"] = list(old_view_state["redo_stack"])
+                if stack_updates:
+                    await new_view.dispatch(
+                        "VIEW_UPDATED",
+                        ActionCreators.view_updated(new_view.id, **stack_updates),
+                    )
 
-            # Now safe to remove the old view from state
-            await self.state_store.dispatch(
-                "VIEW_DESTROYED", ActionCreators.view_destroyed(self.id), source_id=self.id
-            )
+            # Remove the old view from state. _destroy_view drops its
+            # active-registry entry once the state removal confirms, completing
+            # the teardown deferred from the top of this method.
+            await self.state_store._destroy_view(self.id, source_id=self.id)
 
         return new_view
 
@@ -345,7 +357,7 @@ class _NavigationMixin:
         return new_view
 
     async def _apply_navigation_edit(self, new_view, interaction, rebuild):
-        """Defer the interaction, run the optional rebuild hook, edit the message.
+        """Run the optional rebuild hook, then edit the message to the new view.
 
         Shared by ``push()`` and ``pop()``. The message edit happens
         whenever a current interaction is available, regardless of
@@ -356,14 +368,18 @@ class _NavigationMixin:
         views need post-construction setup (V2 views that build empty
         and need ``v.build_ui()``, V1 views that need to return an
         ``embed``/``content`` dict). When ``rebuild`` returns a dict,
-        its contents flow into ``edit_original_response`` as extra
-        kwargs.
+        its contents flow into the edit as extra kwargs.
+
+        The destination tree is built BEFORE the interaction is acked so
+        the fast path can edit + ack in one round-trip via
+        ``interaction.response.edit_message`` -- the same one-request shape the
+        acting-view fast path in ``refresh()`` uses. A slow rebuild lets the
+        auto-defer timer ack first
+        (``is_done()`` becomes True), routing to the deferred edit path.
         """
         current_interaction = interaction or self.interaction
         if current_interaction is None:
             return
-
-        await self._safe_defer(current_interaction)
 
         edit_kwargs: dict = {}
         if rebuild is not None:
@@ -379,6 +395,42 @@ class _NavigationMixin:
         # populates the tree post-init.
         new_view._check_placement()
 
+        # Fast path: a component/modal interaction whose response slot is still
+        # open edits + acks in one request -- no separate defer round-trip, which
+        # was the source of the navigation pause. Bounded at the ack deadline via
+        # _ack_bounded (not edit_timeout) because the ack rides this call. Gated
+        # on interaction type because edit_message silently no-ops for
+        # slash-command interactions (e.g. a programmatic push() with no explicit
+        # interaction, which falls back to self.interaction).
+        fast_eligible = current_interaction.type in (
+            discord.InteractionType.component,
+            discord.InteractionType.modal_submit,
+        )
+        if fast_eligible and not current_interaction.response.is_done():
+            try:
+                await self._ack_bounded(
+                    current_interaction.response.edit_message(view=new_view, **edit_kwargs)
+                )
+                return
+            except asyncio.TimeoutError:
+                # Ack window blown -- fall through to the deferred path (the
+                # auto-defer timer has likely acked by now) to recover the edit
+                # via the original-response endpoint.
+                logger.warning(
+                    f"Navigation fast path stalled in {type(self).__name__}; "
+                    f"falling back to the deferred edit."
+                )
+            except discord.HTTPException as e:
+                # 429: stamp the backoff and bail rather than hammering the rate
+                # limit; the message re-renders on the next interaction. Other
+                # transient failures fall through to the deferred path.
+                if self._handle_rate_limit(e):
+                    return
+
+        # Deferred path: the interaction is already acked (auto-defer timer, a
+        # caller pre-defer, or a fast-path fall-through). Edit through the
+        # original-response endpoint.
+        await self._safe_defer(current_interaction)
         try:
             msg = await self._bounded(
                 current_interaction.edit_original_response(view=new_view, **edit_kwargs)
@@ -390,10 +442,6 @@ class _NavigationMixin:
             if new_view._message is None:
                 new_view._message = msg
         except asyncio.TimeoutError:
-            # Edit stalled past edit_timeout. The destination view is
-            # already registered with a fresh digest, so the next
-            # interaction re-renders it; re-attempting inline would stack
-            # a second wait on the same stalled endpoint.
             logger.warning(
                 f"Navigation edit stalled past {self.edit_timeout}s in "
                 f"{type(self).__name__}; destination re-renders on next interaction."
@@ -410,13 +458,20 @@ class _NavigationMixin:
         """Add a back button that pops the nav stack."""
 
         async def back_callback(interaction):
-            await self._safe_defer(interaction)
+            # No pre-defer: pop() routes through _apply_navigation_edit, whose
+            # fast path edits + acks in one round-trip. Deferring here would
+            # consume the response slot and force the slow two-call path.
             prev_view = await self.pop(interaction)
             if prev_view is None:
-                # Stack was empty -- pop() already stopped/unsubscribed this view,
-                # so remove the dead components from the message to avoid a broken UI
+                # Stack was empty -- pop() stopped/unsubscribed this view without
+                # navigating, so the interaction is still unacked. Clear the dead
+                # components in one call (edit + ack) while the response slot is
+                # open; fall back to the original-response endpoint otherwise.
                 try:
-                    await self._bounded(interaction.edit_original_response(view=None))
+                    if not interaction.response.is_done():
+                        await self._ack_bounded(interaction.response.edit_message(view=None))
+                    else:
+                        await self._bounded(interaction.edit_original_response(view=None))
                 except asyncio.TimeoutError:
                     logger.debug(
                         f"Back-navigation clear stalled past {self.edit_timeout}s "
@@ -428,7 +483,7 @@ class _NavigationMixin:
                         f"status={e.status} code={e.code}"
                     )
             # When prev_view is non-None, pop() routed through _apply_navigation_edit
-            # which already swapped the message to the restored view.
+            # which already swapped the message and acked the interaction.
 
         button = StatefulButton(
             label="Back",

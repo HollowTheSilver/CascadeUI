@@ -95,14 +95,21 @@ class StatefulLayoutView(_StatefulMixin, LayoutView):
         """Add a back button wrapped in an ActionRow for V2 layout views."""
 
         async def back_callback(interaction):
-            await self._safe_defer(interaction)
+            # No pre-defer: pop() routes through _apply_navigation_edit, whose
+            # fast path edits + acks in one round-trip. Deferring here would
+            # consume the response slot and force the slow two-call path.
             prev_view = await self.pop(interaction)
             if prev_view is None:
                 # V2 messages ARE their components -- view=None would produce
-                # an empty message.  Freeze instead.
+                # an empty message.  Freeze instead. The interaction is unacked
+                # (pop() returned without navigating), so edit + ack in one call
+                # while the response slot is open.
                 try:
                     self._freeze_components()
-                    await self._bounded(interaction.edit_original_response(view=self))
+                    if not interaction.response.is_done():
+                        await self._ack_bounded(interaction.response.edit_message(view=self))
+                    else:
+                        await self._bounded(interaction.edit_original_response(view=self))
                 except asyncio.TimeoutError:
                     logger.debug(
                         f"Back-navigation freeze stalled past {self.edit_timeout}s "
@@ -114,7 +121,7 @@ class StatefulLayoutView(_StatefulMixin, LayoutView):
                         f"status={e.status} code={e.code}"
                     )
             # When prev_view is non-None, pop() routed through _apply_navigation_edit
-            # which already swapped the message to the restored view.
+            # which already swapped the message and acked the interaction.
 
         action_row = ActionRow(
             StatefulButton(

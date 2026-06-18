@@ -64,6 +64,15 @@ class TestViewReducers:
         assert "v1" not in state["views"]
         assert "v1" in result["views"]
 
+    async def test_view_created_stores_guild_id(self):
+        state = base_state()
+        action = make_action(
+            "VIEW_CREATED",
+            {"view_id": "v1", "view_type": "CounterView", "guild_id": 555},
+        )
+        result = await reduce_view_created(action, state)
+        assert result["views"]["v1"]["guild_id"] == 555
+
     async def test_view_updated_changes_fields(self):
         state = base_state()
         state["views"]["v1"] = {"id": "v1", "updated_at": None, "message_id": None}
@@ -178,6 +187,14 @@ class TestSessionReducers:
         result = await reduce_session_created(action, state)
         assert "s1" in result["sessions"]
         assert result["sessions"]["s1"]["user_id"] == 456
+
+    async def test_session_created_stores_guild_id(self):
+        state = base_state()
+        action = make_action(
+            "SESSION_CREATED", {"session_id": "s1", "user_id": 456, "guild_id": 555}
+        )
+        result = await reduce_session_created(action, state)
+        assert result["sessions"]["s1"]["guild_id"] == 555
 
     async def test_session_not_overwritten_on_duplicate(self):
         state = base_state()

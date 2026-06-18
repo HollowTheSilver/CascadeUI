@@ -1401,18 +1401,17 @@ class TestActingViewFastPath:
 
 
 class TestEphemeralActingRefresh:
-    """Ephemeral acting views ack first, then edit through the webhook.
+    """Ephemeral acting views edit through the webhook without pre-deferring.
 
-    Ephemeral messages edit only through the interaction webhook, which
-    runs slower than a channel PATCH. The edit-as-ack fast path couples
-    the ack to that edit, so a slow webhook response starves the 3s ack
-    deadline and the panel both misses its ack and freezes. For ephemeral
-    acting views ``refresh()`` defers first (a near-instant ack) and then
-    ships the edit through ``self._message.edit()`` -- the
+    The edit ships through ``self._message.edit()`` -- the
     ``InteractionMessage`` / ``WebhookMessage`` whose ``.edit()`` routes
-    through the webhook with no 3s deadline. The one-call fast path stays
-    in force for non-ephemeral views, where the edit is fast enough to
-    double as the ack.
+    through the webhook on the original send's token, independent of the
+    click's ack -- so it lands without first waiting on a deferred-update
+    round-trip. ``refresh()`` does not defer; the click is acknowledged
+    after the callback by the post-callback defer in ``_scheduled_task``
+    (or by the auto-defer timer when the edit is slow). The edit-as-ack
+    fast path stays in force for non-ephemeral views, where the edit is
+    fast enough to double as the ack.
     """
 
     def _make_ephemeral_view(self):
@@ -1438,9 +1437,10 @@ class TestEphemeralActingRefresh:
         interaction.response.is_done.return_value = is_done
         return interaction
 
-    async def test_acting_ephemeral_defers_then_webhook_edits(self):
-        """Ack-first contract: defer once, skip the edit-as-ack fast path,
-        and ship the edit through the webhook handle (``self._message``).
+    async def test_acting_ephemeral_edits_through_webhook_without_predefer(self):
+        """No pre-defer in refresh(): skip the edit-as-ack fast path and ship
+        the edit straight through the webhook handle (``self._message``). The
+        click's ack is delegated to _scheduled_task's post-callback defer.
         """
         view = self._make_ephemeral_view()
         interaction = self._make_acting_interaction()
@@ -1451,8 +1451,8 @@ class TestEphemeralActingRefresh:
         finally:
             _CURRENT_INTERACTION.reset(token)
 
-        # Ack landed first via a deferred update.
-        interaction.response.defer.assert_awaited_once()
+        # refresh() does not ack -- no deferred update fires here.
+        interaction.response.defer.assert_not_called()
         # The edit-as-ack fast path is reserved for non-ephemeral views.
         interaction.response.edit_message.assert_not_called()
         # The edit shipped through the webhook handle.

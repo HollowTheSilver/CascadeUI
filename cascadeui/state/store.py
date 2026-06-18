@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterator, List, Mapping, Optional, Set, Tuple, Uni
 
 from ..utils.errors import with_error_boundary
 from ..utils.tasks import get_task_manager
+from .actions import ActionCreators
 from .slots import access_slot, read_slot
 from .types import Action, HookFn, MiddlewareFn, ReducerFn, SelectorFn, StateData, SubscriberFn
 
@@ -911,6 +912,57 @@ class StateStore:
                 p_key = self._build_instance_scope_key(view, user_id=pid)
                 if p_key is not None and p_key != scope_key:
                     self._remove_from_instance_index(view_id, view_type, p_key)
+
+    async def _destroy_view(self, view_id: str, *, source_id: Optional[str] = None) -> bool:
+        """Atomic view teardown: dispatch ``VIEW_DESTROYED``, then drop the active entry.
+
+        A live view occupies two registries: ``state["views"]`` (the Redux
+        source of truth, mutated only through the reducer) and ``_active_views``
+        (the sync instance-limit and inspector index). This method tears them
+        down in a fixed order. The async ``VIEW_DESTROYED`` dispatch removes the
+        ``state["views"]`` entry first; ``_unregister_view`` clears the
+        ``_active_views`` entry only once state confirms the view is gone.
+
+        The ordering keeps the two registries consistent under failure. A
+        raising middleware, a reducer error the dispatch chain logs and
+        absorbs, or a cancellation mid-dispatch all leave both registries
+        intact rather than producing the inspector-flagged divergence (a view
+        present in ``state["views"]`` but absent from ``_active_views``).
+        Over-retention is transient and self-heals on the next teardown or
+        restart.
+
+        Idempotent and safe under double-teardown. Returns ``True`` when the
+        view was fully removed, ``False`` when the state removal did not land
+        and the active-registry entry was retained.
+        """
+        try:
+            await self.dispatch(
+                "VIEW_DESTROYED", ActionCreators.view_destroyed(view_id), source_id=source_id
+            )
+        except Exception:
+            # Log and fall through to the post-dispatch state check below: if
+            # the reducer ran before the exception (state already clean), the
+            # finally clears the active entry and the check returns True; if not,
+            # the check returns False and retains both registries.
+            logger.exception(
+                f"VIEW_DESTROYED dispatch failed for {view_id}; "
+                f"checking whether the state entry was removed."
+            )
+        finally:
+            # Clear the active entry only once state confirms the removal. The
+            # finally clause also covers a cancellation mid-dispatch: when the
+            # reducer already removed the state entry before the await was
+            # cancelled, the active entry still gets cleared, so a cancelled
+            # teardown cannot leave the view stranded in _active_views.
+            if view_id not in self.state.get("views", {}):
+                self._unregister_view(view_id)
+        if view_id not in self.state.get("views", {}):
+            return True
+        logger.warning(
+            f"VIEW_DESTROYED did not remove {view_id} from state; "
+            f"retaining active-registry entry to avoid a ghost."
+        )
+        return False
 
     def _get_active_views(self, view_type: str, scope_key: str) -> list:
         """Return active view instances for a type+scope, oldest-first. Internal plumbing."""
