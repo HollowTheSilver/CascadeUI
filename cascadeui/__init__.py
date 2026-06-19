@@ -147,7 +147,7 @@ if "SQLiteBackend" in _persistence_all:
 # // ========================================( Script )======================================== // #
 
 
-__version__ = "3.3.3"
+__version__ = "3.3.4"
 
 # Export public API
 __all__ = [

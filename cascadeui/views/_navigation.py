@@ -395,6 +395,39 @@ class _NavigationMixin:
         # populates the tree post-init.
         new_view._check_placement()
 
+        # Push/pop reuse the parent's Discord message, carried onto
+        # new_view._message in the navigation batch above. That message --
+        # not the acting interaction's -- is the navigation edit target.
+        target_message = new_view._message or self._message
+
+        # The acting interaction normally IS a click on target_message. A
+        # with_confirmation wrapper, though, runs the original callback with
+        # the confirm-button interaction, whose message is the ephemeral
+        # prompt -- a different message. Both interaction-coupled paths below
+        # (response.edit_message and edit_original_response) would then render
+        # the new view onto the prompt and leave target_message stale. When
+        # the interaction carries a message that differs from the view's,
+        # edit target_message directly through the channel endpoint instead.
+        # Interactions with no message (slash commands) keep the
+        # edit_original_response path -- their original response IS the view's
+        # message.
+        interaction_msg_id = getattr(getattr(current_interaction, "message", None), "id", None)
+        if (
+            target_message is not None
+            and interaction_msg_id is not None
+            and interaction_msg_id != target_message.id
+        ):
+            # Ack the foreign interaction so the click does not error
+            # (_safe_defer no-ops when a wrapper already consumed the slot),
+            # then edit the view's own message. refresh() carries the
+            # cooldown/backoff/digest machinery and its own acting-fast-path
+            # gate re-confirms the message match, so it cannot misfire here.
+            await self._safe_defer(current_interaction)
+            if new_view._message is None:
+                new_view._message = target_message
+            await new_view.refresh(**edit_kwargs)
+            return
+
         # Fast path: a component/modal interaction whose response slot is still
         # open edits + acks in one request -- no separate defer round-trip, which
         # was the source of the navigation pause. Bounded at the ack deadline via

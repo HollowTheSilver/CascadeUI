@@ -10,7 +10,7 @@ import pytest
 from discord.ui import ActionRow, LayoutView, TextDisplay
 from helpers import make_interaction as _make_interaction
 
-from cascadeui.components.base import StatefulButton
+from cascadeui.components.base import StatefulButton, StatefulSelect
 from cascadeui.state.singleton import get_store
 from cascadeui.state.store import _CURRENT_INTERACTION
 from cascadeui.views.base import _StatefulMixin, _view_class_registry
@@ -760,6 +760,75 @@ class TestRenderHashShortCircuit:
 
         # Mutate the same object in place -- no rebind, no new instance.
         shared_text.content = "blue"
+        view.build_ui()
+        after = view._compute_tree_digest()
+        assert before != after
+
+    def test_digest_reflects_select_selection(self):
+        """A select's rendered selection lives in opt.default, which the
+        scalar wire attributes (placeholder/disabled/...) do not capture.
+        A selection-only rebuild must change the digest, or refresh()
+        short-circuits and the re-render is silently dropped -- the client
+        keeps the stale selection and the next interaction submits stale
+        values.
+        """
+        selected = ["a"]
+
+        def build(view):
+            view.clear_items()
+            view.add_item(
+                ActionRow(
+                    StatefulSelect(
+                        placeholder="Pick",
+                        options=[
+                            discord.SelectOption(
+                                label="A", value="a", default=(selected[0] == "a")
+                            ),
+                            discord.SelectOption(
+                                label="B", value="b", default=(selected[0] == "b")
+                            ),
+                        ],
+                        min_values=0,
+                        max_values=1,
+                    )
+                )
+            )
+
+        view = self._make_view_with_build(build)
+        view.build_ui()
+        before = view._compute_tree_digest()
+
+        selected[0] = "b"
+        view.build_ui()
+        after = view._compute_tree_digest()
+        assert before != after
+
+    def test_digest_reflects_set_selected(self):
+        """set_selected() is the canonical selection-mutation API; it
+        rewrites opt.default in place without rebuilding the component.
+        The digest must reflect the change so the same select object
+        flipped to a new selection re-renders.
+        """
+        select = StatefulSelect(
+            placeholder="Pick",
+            options=[
+                discord.SelectOption(label="A", value="a"),
+                discord.SelectOption(label="B", value="b"),
+            ],
+            min_values=0,
+            max_values=1,
+        )
+
+        def build(view):
+            view.clear_items()
+            view.add_item(ActionRow(select))
+
+        view = self._make_view_with_build(build)
+        select.set_selected("a")
+        view.build_ui()
+        before = view._compute_tree_digest()
+
+        select.set_selected("b")
         view.build_ui()
         after = view._compute_tree_digest()
         assert before != after

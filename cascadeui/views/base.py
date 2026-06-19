@@ -1452,6 +1452,17 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 parts.append(("t", item.content))
             # Buttons and selects: record the wire-visible attributes.
             elif hasattr(item, "custom_id"):
+                # A select's rendered selection lives in opt.default, which
+                # none of the scalar attributes above capture. set_selected()
+                # mutates exactly that field, so a selection-only rebuild
+                # would otherwise hash identical and refresh() would drop the
+                # re-render. Walk options (string selects only -- auto-populated
+                # UserSelect/RoleSelect/etc. expose no .options, so the getattr
+                # returns None for them and for buttons).
+                options = getattr(item, "options", None)
+                option_state = (
+                    tuple((opt.value, opt.default) for opt in options) if options else None
+                )
                 parts.append(
                     (
                         "i",
@@ -1463,6 +1474,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                         getattr(item, "url", None),
                         getattr(item, "placeholder", None),
                         str(getattr(item, "emoji", None)) if getattr(item, "emoji", None) else None,
+                        option_state,
                     )
                 )
             # Other layout items (Separator, MediaGallery, Thumbnail) do

@@ -538,6 +538,69 @@ class TestNavigationFastPath:
         nav.edit_original_response.assert_awaited_once()
 
 
+class TestNavigationForeignInteraction:
+    """A with_confirmation wrapper runs the navigation callback with the
+    confirm-button interaction, whose message is the ephemeral prompt --
+    a different message than the view's dashboard. Navigation must edit the
+    view's own message via the channel endpoint, not the foreign prompt."""
+
+    async def test_push_with_foreign_interaction_edits_view_message(self):
+        class _Root(StatefulView):
+            pass
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+        # Pin a concrete dashboard message id for the foreign comparison.
+        dashboard = MagicMock(id=555, channel=MagicMock(id=2))
+        dashboard.edit = AsyncMock()
+        root._message = dashboard
+
+        # Confirm-button click on the ephemeral prompt (different message id),
+        # slot already consumed by the prompt edit -- the with_confirmation shape.
+        prompt = MagicMock(id=999)
+        confirm = _make_interaction(user_id=1, guild_id=100, is_done=True, message=prompt)
+        confirm.edit_original_response = AsyncMock()
+
+        sub = await root.push(_Sub, interaction=confirm)
+
+        # The view's own message is edited; the foreign prompt is untouched.
+        dashboard.edit.assert_awaited()
+        confirm.edit_original_response.assert_not_called()
+        confirm.response.edit_message.assert_not_called()
+        assert sub._message is dashboard
+
+    async def test_pop_with_foreign_interaction_edits_view_message(self):
+        class _Root(StatefulView):
+            pass
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+        dashboard = MagicMock(id=555, channel=MagicMock(id=2))
+        dashboard.edit = AsyncMock()
+        root._message = dashboard
+
+        sub = await root.push(_Sub)
+
+        prompt = MagicMock(id=999)
+        confirm = _make_interaction(user_id=1, guild_id=100, is_done=True, message=prompt)
+        confirm.edit_original_response = AsyncMock()
+
+        restored = await sub.pop(confirm)
+
+        assert restored is not None
+        dashboard.edit.assert_awaited()
+        confirm.edit_original_response.assert_not_called()
+        confirm.response.edit_message.assert_not_called()
+
+
 class TestNavigationUndoTransfer:
     """Push/pop forward-transfer the undo/redo stacks to the new view's state
     row so the undo timeline stays continuous across navigation. The transfer
