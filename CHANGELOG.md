@@ -23,6 +23,23 @@ preserved below for historical reference but are not the supported baseline.
 
 ---
 
+## [3.3.4] - 2026-06-19
+
+### Fixed
+
+- **Select selection changes now re-render.** A `StatefulSelect` rebuilt with
+  only its selected option changed (via `set_selected()` or `default=`) was
+  treated as unchanged and the message edit was skipped, so the client kept
+  showing the old selection and the next interaction submitted stale values.
+  The render check now accounts for which options are selected.
+- **In-callback navigation no longer edits the wrong message.** Calling
+  `push()` or `pop()` from inside a `with_confirmation`-wrapped callback edited
+  the ephemeral confirmation prompt instead of the view's own message, leaving
+  the original message stale. Navigation now edits the view's message when the
+  acting interaction belongs to a different one.
+
+---
+
 ## [3.3.3] - 2026-06-18
 
 ### Added
