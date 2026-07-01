@@ -80,8 +80,9 @@ class _BasePaginatedMixin:
     async def on_page_changed(self, page: int) -> None:
         """Called after ``self.current_page`` updates, before the refresh.
 
-        Default is a no-op. Override for analytics, async prefetch,
-        or per-page validation that should fire on every page turn.
+        ``page`` is the zero-based index of the new current page. Default
+        is a no-op. Override for analytics, async prefetch, or per-page
+        validation that should fire on every page turn.
         """
         return None
 

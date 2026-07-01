@@ -646,6 +646,78 @@ class TestUndoMiddleware:
         assert store.state["application"]["val"] == "changed"
 
 
+class TestUndoSnapshotPurity:
+    """``_views_with_undo_pushed`` builds a fresh ``views`` mapping and never
+    mutates the input state. The batch-commit path rebinds ``store.state``
+    rather than writing the committed live dict in place."""
+
+    def test_helper_does_not_mutate_input_state(self):
+        undo_mw = UndoMiddleware()
+        original_view = {"undo_stack": [], "redo_stack": ["old"]}
+        original_views = {"v1": original_view}
+        state = {"views": original_views}
+
+        new_views = undo_mw._views_with_undo_pushed(state, "v1", {"snap": 1}, 20)
+
+        # Input is untouched -- same object identities, no pushed snapshot.
+        assert state["views"] is original_views
+        assert state["views"]["v1"] is original_view
+        assert original_view["undo_stack"] == []
+        assert original_view["redo_stack"] == ["old"]
+        # Return is a fresh mapping carrying the snapshot, redo cleared.
+        assert new_views is not original_views
+        assert new_views["v1"] is not original_view
+        assert new_views["v1"]["undo_stack"] == [{"snap": 1}]
+        assert new_views["v1"]["redo_stack"] == []
+
+    def test_helper_returns_none_for_absent_view(self):
+        undo_mw = UndoMiddleware()
+        assert undo_mw._views_with_undo_pushed({"views": {}}, "ghost", {}, 20) is None
+
+    def test_helper_honors_limit(self):
+        undo_mw = UndoMiddleware()
+        state = {"views": {"v1": {"undo_stack": [1, 2, 3], "redo_stack": []}}}
+        new_views = undo_mw._views_with_undo_pushed(state, "v1", 4, limit=3)
+        assert new_views["v1"]["undo_stack"] == [2, 3, 4]
+
+    async def test_batch_finalize_rebinds_state_object(self):
+        """A batched undo-enabled dispatch must leave the pre-batch state
+        object unmutated -- the undo write lands on a newly-bound
+        ``store.state``, never on the dict a subscriber may already hold."""
+        store = get_store()
+        undo_mw = UndoMiddleware()
+        store._add_middleware(undo_mw)
+        await undo_mw.initialize(store)
+        await store.dispatch("SESSION_CREATED", {"session_id": "rb_s", "user_id": 1})
+        store._undo_enabled_views["rb_view"] = 20
+        await store.dispatch(
+            "VIEW_CREATED",
+            {"view_id": "rb_view", "view_type": "T", "user_id": 1, "session_id": "rb_s"},
+        )
+
+        async def set_val(action, state):
+            new = copy.deepcopy(state)
+            new["application"]["val"] = action["payload"]["v"]
+            return new
+
+        store._register_reducer("SET_VAL", set_val)
+
+        async with store.batch(source_id="rb_view"):
+            await store.dispatch("SET_VAL", {"v": 1}, source_id="rb_view")
+
+        # The undo snapshot landed in the live state.
+        assert len(store.state["views"]["rb_view"]["undo_stack"]) == 1
+        captured = store.state
+
+        # A second batch must not retro-mutate the previously-captured dict.
+        async with store.batch(source_id="rb_view"):
+            await store.dispatch("SET_VAL", {"v": 2}, source_id="rb_view")
+
+        assert store.state is not captured
+        assert len(captured["views"]["rb_view"]["undo_stack"]) == 1
+        assert len(store.state["views"]["rb_view"]["undo_stack"]) == 2
+
+
 class TestUndoDepthProperties:
     """Public view.undo_depth / view.redo_depth mirror the stored snapshot counts."""
 

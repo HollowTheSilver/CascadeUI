@@ -219,9 +219,12 @@ class _BaseLeaderboardMixin:
         """Return a URL for the per-entry thumbnail in section mode.
 
         Default returns ``None``. Override in bot-context subclasses to
-        resolve an avatar URL -- typically via
-        ``bot.fetch_user(user_id).display_avatar.url``. Async so
-        implementations can await user-fetch. Only called when
+        resolve an avatar URL. Prefer the synchronous user cache
+        (``bot.get_user(user_id).display_avatar.url``) so the resolve stays
+        off the render path -- a per-entry ``fetch_user`` issues one serial
+        HTTP round-trip per ranked row before the first render, adding latency
+        proportional to entry count. Async so an implementation that genuinely
+        must await a non-cache source still can. Only called when
         ``entry_layout = "sections"``.
 
         Discord's ``Section`` requires a non-None accessory, so entries
@@ -326,10 +329,12 @@ class _BaseLeaderboardMixin:
         heading = f"### {self.subtitle}" if self.subtitle else None
 
         # Resolve every avatar URL across the full top-N slice in one
-        # concurrent fan-out. Overrides that await ``bot.fetch_user``
-        # (or any other HTTP round-trip) collapse N serial RTTs into
-        # one -- the page-build loop below stays synchronous and reads
-        # from the pre-resolved list by absolute entry index.
+        # fan-out, so the page-build loop below stays synchronous and reads
+        # from the pre-resolved list by absolute entry index. A cache-first
+        # override (``bot.get_user``) resolves with no HTTP at all. An
+        # override that awaits ``bot.fetch_user`` per entry does NOT
+        # parallelize across this gather -- those calls share one rate-limit
+        # bucket and run serially -- so keep HTTP off this path.
         if self.entry_layout == "sections":
             avatar_urls = await asyncio.gather(
                 *(self.get_avatar_url(uid, stats) for uid, stats in top),
@@ -471,44 +476,52 @@ class LeaderboardLayoutView(_BaseLeaderboardMixin, PaginatedLayoutView):
         if subtitle is not _UNSET:
             self.subtitle = subtitle
         self._entries = entries or []
-        # Pages build moved into ``send()`` so the async ``get_avatar_url``
+        # Pages build lives in ``on_load()`` so the async ``get_avatar_url``
         # hook can resolve thumbnails before the first render. ``__init__``
-        # hands the paginated base an empty list; the real page set lands
-        # when ``send()`` runs. Mirrors ``TabLayoutView`` / ``WizardLayoutView``.
+        # hands the paginated base an empty list until then.
         kwargs["pages"] = []
         super().__init__(*args, **kwargs)
 
-    async def send(self, **kwargs):
-        """Build pages before shipping the initial message.
+    async def on_load(self) -> None:
+        """Fetch entries and rebuild the page tree before display.
+
+        Called automatically before the initial send (via the send
+        pipeline), on every push/pop edit, and by :meth:`reload`. Fetches
+        through :meth:`rebuild_pages` (which short-circuits when the entry
+        signature is unchanged), then recomposes the nav buttons and page
+        tree in the canonical order (page content -> nav row -> extras) so
+        the first render and every :meth:`reload` call are visually
+        identical. The render-hash short-circuit in :meth:`refresh` skips
+        the message edit when the recomposed tree matches the displayed one,
+        so a no-change ``reload()`` ships nothing.
 
         The paginated base initializes with an empty page list (see
-        ``__init__``), so the component tree currently holds a "No pages."
-        placeholder. Build the real pages, clear the placeholder, rebuild
-        the nav row against the final page count (so ``_show_jump`` and
-        the initial ``disabled`` state match the real total, not the
-        empty-list snapshot taken at ``__init__``), and re-lay out the
-        item tree (page content -> nav row -> extras) in the canonical
-        order before ``super().send()`` ships the message.
+        ``__init__``), so the component tree holds a "No pages."
+        placeholder until this runs. Rebuilding the nav row against the
+        final page count keeps ``_show_jump`` and the initial ``disabled``
+        state matched to the real total, not the empty-list ``__init__``
+        snapshot.
         """
-        self.pages = await self._build_leaderboard_pages()
+        await self.rebuild_pages()
         self.clear_items()
         self._build_nav_buttons()
-        # ``_compose_pagination_tree`` adds page content and the nav row
-        # in one shot, matching the pattern used in __init__ and
-        # _update_page so initial render and post-interaction renders
-        # are visually identical.
         self._compose_pagination_tree()
         for extra in self._extra_items:
             self.add_item(extra)
-        return await super().send(**kwargs)
+        # clear_items() above stripped the auto back button push() injects,
+        # and on_load runs on every push/pop edit -- restore it or a pushed
+        # leaderboard strands the user with no way back. Subclasses that
+        # override on_load must keep this call after recomposing the tree.
+        self._restore_navigation_artifacts()
 
-    async def rebuild_pages(self) -> None:
+    async def rebuild_pages(self, *, force: bool = False) -> None:
         """Re-fetch entries and rebuild the page list.
 
         Called automatically by ``on_state_changed`` whenever a subscribed
         action fires, so subscription-driven boards refresh without any
-        extra plumbing. Call directly only for out-of-band refreshes
-        (e.g. ``on_restore`` after a bot restart). Updates the current
+        extra plumbing. For an out-of-band refresh (a manual button,
+        ``on_restore``), call :meth:`reload`, which rebuilds and ships the
+        edit; this method only rebuilds the page list. Updates the current
         page if entry count shrinks. Async because page construction
         awaits ``get_avatar_url`` under ``entry_layout = "sections"``.
 
@@ -516,18 +529,34 @@ class LeaderboardLayoutView(_BaseLeaderboardMixin, PaginatedLayoutView):
         matches the signature captured on the previous rebuild. State
         dispatches that do not touch leaderboard data (e.g. the
         ``COMPONENT_INTERACTION`` fired by a page-flip button) return
-        without re-resolving avatars. Force a rebuild by clearing
-        ``self._entries_signature`` or calling ``rebuild_pages`` after
-        mutating the data source out-of-band.
+        without re-resolving avatars. ``force=True`` bypasses the signature
+        check -- for when something outside the entry data changed the
+        rendered pages (a filter, or a select's highlighted option folded
+        into ``build_summary``).
         """
         entries = self.get_entries()
         signature = self._entries_signature_for(entries)
-        if signature == getattr(self, "_entries_signature", None) and self.pages:
+        if not force and signature == getattr(self, "_entries_signature", None) and self.pages:
             return
         self._entries_signature = signature
         self.pages = await self._build_leaderboard_pages()
         if self.current_page >= len(self.pages):
             self.current_page = max(0, len(self.pages) - 1)
+
+    async def reload(self, *, force: bool = False) -> None:
+        """Re-fetch entries, re-render, and re-store the board out of band.
+
+        The inherited :meth:`reload` runs ``on_load`` then ``refresh``.
+        ``on_load`` fetches through ``rebuild_pages``, which short-circuits
+        when the entry signature is unchanged. ``force=True`` clears that
+        signature first, so a change outside the entry data (a filter, or a
+        select's highlighted option folded into ``build_summary``) still
+        rebuilds the pages. Call this rather than ``rebuild_pages`` directly
+        when triggering an out-of-band refresh.
+        """
+        if force:
+            self._entries_signature = None
+        await super().reload()
 
     @staticmethod
     def _entries_signature_for(entries) -> tuple:
@@ -588,4 +617,18 @@ class PersistentLeaderboardLayoutView(_PersistentMixin, LeaderboardLayoutView):
     exit_policy = "disable"
 
     async def on_restore(self, bot):
-        await self.rebuild_pages()
+        """Re-render the board from live data on every restart.
+
+        Reattach registered the lazily-built ``"No pages."`` placeholder
+        tree, because ``on_load`` had not run yet, so the real ranking
+        selects and nav buttons are absent from discord.py's view store
+        until a render ships. :meth:`reload` runs ``on_load`` (which fetches
+        through ``rebuild_pages`` and recomposes the tree, warm now that the
+        gateway is ready) and then edits the message, and that edit re-stores
+        the real components so clicks route immediately. Without the render
+        the panel's controls drop clicks until the next state change. The
+        restore always ships one edit: a freshly restored view has no
+        render-hash baseline to short-circuit against, though an unchanged
+        entry set still spares the avatar re-fetch.
+        """
+        await self.reload()

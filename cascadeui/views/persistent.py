@@ -2,6 +2,7 @@
 
 
 import asyncio
+import inspect
 import logging
 import re
 from typing import Dict
@@ -201,6 +202,10 @@ class _PersistentMixin:
             )
         self._validate_custom_ids()
 
+        # Bind runtime deps before the render pipeline so on_load and the
+        # first render have them. No-op when the context resolves no bot.
+        await self._bind_from_context()
+
         message = await super().send(*args, ephemeral=ephemeral, **kwargs)
 
         if message is None:
@@ -217,12 +222,67 @@ class _PersistentMixin:
 
         return await super().exit(delete_message=delete_message)
 
+    async def on_bind(self, bot):
+        """Inject non-serializable runtime dependencies from ``bot``.
+
+        A persistent view often needs runtime handles -- a database pool, the
+        bot, a service client -- that cannot ride the constructor through the
+        persistence round-trip, because the registry row is JSON and these
+        objects are not serializable. ``on_bind`` is the seam for supplying
+        them from ``bot``, the one handle available both when the view is sent
+        and when it is restored. Default is a no-op::
+
+            async def on_bind(self, bot):
+                self.db = bot.db
+                self.bot = bot
+
+        The library calls ``on_bind(bot)`` automatically at two points: during
+        ``send()`` (when ``bot`` is derivable from the construction context)
+        and during restore on restart, before :meth:`on_restore`. A view
+        posted with a bare channel context carries no ``.bot``, so ``send()``
+        cannot derive it -- such a view calls ``await view.on_bind(bot)``
+        itself before ``send()``. The hook stays idempotent so the occasional
+        double call is harmless. A sync override is also accepted.
+
+        ``on_bind`` is for attribute assignment, not UI side effects: the
+        view is not displayed yet when it runs (the first render and
+        :meth:`on_restore` both run after it), so a ``refresh()`` or
+        ``send()`` call from the hook is premature. Load data in
+        :meth:`on_load` or :meth:`on_restore`.
+
+        Args:
+            bot: The discord.py Bot instance.
+        """
+        return None
+
+    async def _bind_from_context(self):
+        """Call ``on_bind`` with the bot when the context can resolve it.
+
+        Runs at the top of :meth:`send`, before the render pipeline, so the
+        view's dependencies are in place for ``on_load`` and the first render.
+        A channel-context send resolves no bot and is left to the caller's own
+        ``on_bind`` call.
+        """
+        bot = getattr(self.interaction, "client", None) or getattr(self.context, "bot", None)
+        if bot is None:
+            return
+        result = self.on_bind(bot)
+        if inspect.isawaitable(result):
+            await result
+
     async def on_restore(self, bot):
         """Called after the view is reconstructed on bot restart.
 
         Override this to perform post-restore setup like fetching fresh data
         or updating the embed. The view's ``_message`` is already set when
-        this is called.
+        this is called, and any attributes ``on_bind`` injects are set.
+
+        Runs after ``bot.wait_until_ready()`` -- on a background task, off the
+        ``setup_hook`` critical path -- so the gateway cache (``get_user``,
+        guild members, channels) is warm. A render that reads those caches
+        resolves real values instead of cold defaults. Interaction
+        routing is registered earlier, during reattach, so the view is
+        clickable before this render runs.
 
         .. warning::
             If this method raises an exception, the view will be unregistered
@@ -270,12 +330,19 @@ class PersistentView(_PersistentMixin, StatefulView):
     """
 
     def _validate_custom_ids(self):
-        """V1 override: every child must have an explicit custom_id.
+        """V1 override: every interactive child must have an explicit custom_id.
 
-        V1 views are flat -- all children are interactive components, so
-        ``None`` indicates a missing id, not a non-interactive container.
+        V1 views are flat, so a ``None`` custom_id normally indicates a
+        missing id rather than a non-interactive container. Link and premium
+        buttons are the exception: they carry no custom_id and need none, so
+        they are skipped.
         """
         for item in self.children:
+            # Link and premium buttons have no custom_id and need none: the
+            # platform handles them, so there is nothing for discord.py to
+            # re-attach after a restart.
+            if getattr(item, "url", None) is not None or getattr(item, "sku_id", None) is not None:
+                continue
             custom_id = getattr(item, "custom_id", None)
             if custom_id is None or self._AUTO_ID_PATTERN.match(custom_id):
                 raise ValueError(

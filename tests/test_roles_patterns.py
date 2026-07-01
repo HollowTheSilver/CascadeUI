@@ -156,6 +156,20 @@ class TestSubclassRegistration:
             class _BadRoles(RolesLayoutView):  # noqa: F841
                 categories = [{"name": "raw-dict", "roles": {"A": 111}}]  # type: ignore
 
+    def test_category_over_five_roles_raises(self, clean_role_registries):
+        # A category renders as one ActionRow (max 5 buttons); >5 roles is
+        # caught at class-definition time with a directed error, not deferred
+        # to discord.py's terser construction error inside build_ui().
+        with pytest.raises(ValueError, match="at most 5 buttons"):
+
+            class _TooMany(RolesLayoutView):  # noqa: F841
+                categories = [
+                    RoleCategory(
+                        name="SixColors",
+                        roles={"R": 1, "O": 2, "Y": 3, "G": 4, "B": 5, "V": 6},
+                    )
+                ]
+
 
 # // ========================================( Format Hooks ) ======================================== // #
 

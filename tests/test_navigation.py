@@ -14,6 +14,7 @@ from cascadeui.state.reducers import (
     reduce_navigation_replace,
 )
 from cascadeui.state.singleton import get_store
+from cascadeui.views.layout import StatefulLayoutView
 from cascadeui.views.view import StatefulView
 
 # // ========================================( Reducer No-Op Verification )======================================== // #
@@ -469,6 +470,101 @@ class TestNavigationMessageState:
         assert restored_state["channel_id"] is not None
 
 
+class TestNavigationOnLoad:
+    """push/pop run on_load on the destination view before the edit, so a
+    view re-reads its data source on navigation -- the reload-on-render
+    contract that supersedes rebuild=lambda v: v.load_and_build()."""
+
+    async def test_push_runs_on_load_on_new_view(self):
+        loads = []
+
+        class _Root(StatefulView):
+            pass
+
+        class _Sub(StatefulView):
+            async def on_load(self):
+                loads.append("sub")
+
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+
+        await root.push(_Sub)
+
+        assert loads == ["sub"]
+
+    async def test_pop_runs_on_load_on_restored_view(self):
+        loads = []
+
+        class _Root(StatefulView):
+            async def on_load(self):
+                loads.append("root")
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+        # on_load fired once on the initial send.
+        assert loads == ["root"]
+
+        child = await root.push(_Sub)
+        await child.pop()
+
+        # The restored root re-ran on_load before the pop edit.
+        assert loads == ["root", "root"]
+
+    async def test_push_runs_on_load_without_rebuild_callback(self):
+        # on_load fires even when no rebuild= is passed, so a consumer drops
+        # rebuild=lambda v: v.load_and_build() and just defines on_load.
+        loads = []
+
+        class _Root(StatefulView):
+            pass
+
+        class _Sub(StatefulView):
+            async def on_load(self):
+                loads.append("sub")
+
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+
+        await root.push(_Sub)  # no rebuild=
+
+        assert loads == ["sub"]
+
+    async def test_on_load_runs_before_explicit_rebuild(self):
+        # When both are present, on_load (data load) runs before the
+        # rebuild hook (post-construction setup).
+        order = []
+
+        class _Root(StatefulView):
+            pass
+
+        class _Sub(StatefulView):
+            async def on_load(self):
+                order.append("on_load")
+
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+
+        def _rebuild(v):
+            order.append("rebuild")
+
+        await root.push(_Sub, rebuild=_rebuild)
+
+        assert order == ["on_load", "rebuild"]
+
+
 class TestNavigationFastPath:
     """Push/pop edit + ack in one call via interaction.response.edit_message
     when the response slot is open; defer + edit_original_response otherwise."""
@@ -537,6 +633,67 @@ class TestNavigationFastPath:
         nav.response.edit_message.assert_not_called()
         nav.edit_original_response.assert_awaited_once()
 
+    async def test_push_fast_path_handles_ack_race(self):
+        """The auto-defer timer can ack in the window between the is_done()
+        guard and edit_message's own internal guard, so edit_message raises
+        InteractionResponded -- a sibling of HTTPException, not a subclass, so
+        the HTTP handler would miss it. The fast path must catch it and fall
+        through to the deferred edit rather than crash the navigation."""
+
+        class _Root(StatefulView):
+            pass
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+
+        nav = _make_interaction(user_id=1, guild_id=100, is_done=False)
+        nav.response.edit_message = AsyncMock(side_effect=discord.InteractionResponded(MagicMock()))
+        nav.edit_original_response = AsyncMock(
+            return_value=MagicMock(id=7, channel=MagicMock(id=8))
+        )
+
+        sub = await root.push(_Sub, interaction=nav)
+
+        # Raced ack -> fell through to the deferred edit, navigation completed.
+        nav.edit_original_response.assert_awaited_once()
+        assert sub is not None
+
+    async def test_clear_on_empty_back_handles_ack_race_v1(self):
+        """_clear_on_empty_back's fast-path edit hits the same auto-defer ack
+        race as the navigation fast path: edit_message can raise
+        InteractionResponded (a sibling of HTTPException, not a subclass). The
+        empty-stack clear must catch it and fall through to the deferred edit
+        rather than escape to on_error."""
+        view = StatefulView(interaction=_make_interaction(user_id=1, guild_id=100))
+        await view.send()
+
+        nav = _make_interaction(user_id=1, guild_id=100, is_done=False)
+        nav.response.edit_message = AsyncMock(side_effect=discord.InteractionResponded(MagicMock()))
+        nav.edit_original_response = AsyncMock()
+
+        await view._clear_on_empty_back(nav)  # must not raise
+
+        # V1 fallback edits to view=None (strips buttons, keeps embed).
+        nav.edit_original_response.assert_awaited_once_with(view=None)
+
+    async def test_clear_on_empty_back_handles_ack_race_v2(self):
+        """Same race on the V2 freeze path (edits view=self, not view=None)."""
+        view = StatefulLayoutView(interaction=_make_interaction(user_id=1, guild_id=100))
+        await view.send()
+
+        nav = _make_interaction(user_id=1, guild_id=100, is_done=False)
+        nav.response.edit_message = AsyncMock(side_effect=discord.InteractionResponded(MagicMock()))
+        nav.edit_original_response = AsyncMock()
+
+        await view._clear_on_empty_back(nav)  # must not raise
+
+        # V2 fallback edits with the frozen view, not view=None (50006 guard).
+        nav.edit_original_response.assert_awaited_once_with(view=view)
+
 
 class TestNavigationForeignInteraction:
     """A with_confirmation wrapper runs the navigation callback with the
@@ -599,6 +756,212 @@ class TestNavigationForeignInteraction:
         dashboard.edit.assert_awaited()
         confirm.edit_original_response.assert_not_called()
         confirm.response.edit_message.assert_not_called()
+
+
+class TestNavigationEditFailureContainment:
+    """A failed navigation edit (dead ack, expired token, transient HTTP error)
+    must never escape push()/pop() into the callback's error path: the
+    navigation completes without raising even when every edit/ack endpoint
+    fails."""
+
+    @staticmethod
+    def _dead_ack():
+        return discord.NotFound(MagicMock(), "")
+
+    @staticmethod
+    def _http_error(status=500):
+        return discord.HTTPException(MagicMock(status=status), "boom")
+
+    async def test_pop_survives_dead_ack_10062(self):
+        """The reported incident: a Back/pop whose ack and edit both 10062.
+        The deferred-path ack routes through _safe_defer, which must absorb
+        the dead interaction rather than propagate it."""
+
+        class _Root(StatefulView):
+            pass
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+        # The reused message also rejects edits (the channel-endpoint fallback).
+        root._message.edit = AsyncMock(side_effect=self._dead_ack())
+
+        sub = await root.push(_Sub)
+
+        nav = _make_interaction(user_id=1, guild_id=100, is_done=False)
+        nav.response.edit_message = AsyncMock(side_effect=self._dead_ack())
+        nav.response.defer = AsyncMock(side_effect=self._dead_ack())
+        nav.edit_original_response = AsyncMock(side_effect=self._dead_ack())
+
+        # Must complete without raising despite every endpoint failing.
+        restored = await sub.pop(interaction=nav)
+        assert restored is not None
+
+    async def test_push_survives_dead_ack_10062(self):
+        class _Root(StatefulView):
+            pass
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+        root._message.edit = AsyncMock(side_effect=self._dead_ack())
+
+        nav = _make_interaction(user_id=1, guild_id=100, is_done=False)
+        nav.response.edit_message = AsyncMock(side_effect=self._dead_ack())
+        nav.response.defer = AsyncMock(side_effect=self._dead_ack())
+        nav.edit_original_response = AsyncMock(side_effect=self._dead_ack())
+
+        sub = await root.push(_Sub, interaction=nav)
+        assert sub is not None
+
+    async def test_foreign_msg_edit_failure_is_contained(self):
+        """The with_confirmation shape: the foreign-message branch routes through
+        refresh(), whose non-429 re-raise must be contained at the nav seam."""
+
+        class _Root(StatefulView):
+            pass
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+        dashboard = MagicMock(id=555, channel=MagicMock(id=2))
+        dashboard.edit = AsyncMock(side_effect=self._http_error(500))
+        root._message = dashboard
+
+        prompt = MagicMock(id=999)
+        confirm = _make_interaction(user_id=1, guild_id=100, is_done=True, message=prompt)
+        confirm.edit_original_response = AsyncMock()
+
+        sub = await root.push(_Sub, interaction=confirm)
+        assert sub is not None
+        dashboard.edit.assert_awaited()  # the view's own message edit was attempted
+
+    async def test_deferred_token_expiry_fallback_is_contained(self):
+        """Deferred path: edit_original_response 401s (token expired), the
+        channel-endpoint fallback refresh() then 500s -- both contained."""
+
+        class _Root(StatefulView):
+            pass
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+        root._message.edit = AsyncMock(side_effect=self._http_error(500))
+
+        # Already acked -> fast path skipped, deferred path taken.
+        nav = _make_interaction(user_id=1, guild_id=100, is_done=True)
+        nav.edit_original_response = AsyncMock(side_effect=self._http_error(401))
+
+        sub = await root.push(_Sub, interaction=nav)
+        assert sub is not None
+
+
+class TestNavigationEditFailureRecovery:
+    """When the destination edit genuinely cannot land (Discord 5xx on every
+    endpoint), the deferred source teardown rolls back: the source view stays
+    live and re-clickable, and the unshown destination is torn down. A
+    successful edit commits the source teardown as before."""
+
+    @staticmethod
+    def _http_error(status=503):
+        return discord.HTTPException(MagicMock(status=status), "boom")
+
+    def _break_all_edits(self, interaction, source_message):
+        interaction.response.edit_message = AsyncMock(side_effect=self._http_error())
+        interaction.response.defer = AsyncMock(side_effect=self._http_error())
+        interaction.edit_original_response = AsyncMock(side_effect=self._http_error())
+        if source_message is not None:
+            source_message.edit = AsyncMock(side_effect=self._http_error())
+
+    async def test_push_failed_edit_keeps_source_live(self):
+        store = get_store()
+
+        class _Root(StatefulView):
+            pass
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+
+        nav = _make_interaction(user_id=1, guild_id=100, is_done=False)
+        self._break_all_edits(nav, root._message)
+
+        sub = await root.push(_Sub, interaction=nav)
+
+        # Source stays live + re-clickable (never stopped), subscribed, and
+        # registered. The destination never reached the screen -> torn down.
+        assert root.is_finished() is False
+        assert root.id in store.subscribers
+        assert root.id in store._active_views
+        assert root.id in store.state["views"]
+        assert sub.id not in store._active_views
+        assert sub.id not in store.state["views"]
+
+    async def test_pop_failed_edit_keeps_source_live(self):
+        store = get_store()
+
+        class _Root(StatefulView):
+            pass
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+        sub = await root.push(_Sub)  # now on the child
+
+        nav = _make_interaction(user_id=1, guild_id=100, is_done=False)
+        self._break_all_edits(nav, sub._message)
+
+        restored = await sub.pop(interaction=nav)
+
+        # The child (the pop's source) stays live; the restored parent
+        # (the destination) is rolled back.
+        assert sub.is_finished() is False
+        assert sub.id in store.subscribers
+        assert sub.id in store._active_views
+        assert sub.id in store.state["views"]
+        assert restored.id not in store._active_views
+
+    async def test_push_successful_edit_commits_source_teardown(self):
+        store = get_store()
+
+        class _Root(StatefulView):
+            pass
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+
+        nav = _make_interaction(user_id=1, guild_id=100, is_done=False)
+        sub = await root.push(_Sub, interaction=nav)
+
+        # Happy path: the edit confirmed, so the source teardown commits and
+        # the destination is the live view.
+        assert root.is_finished() is True
+        assert root.id not in store.subscribers
+        assert root.id not in store._active_views
+        assert sub.id in store._active_views
+        assert sub.id in store.state["views"]
 
 
 class TestNavigationUndoTransfer:
@@ -742,6 +1105,32 @@ class TestNavigationInstanceForm:
         # the same way; instance-path push must match so shared_data
         # and the session lifecycle stay consistent across navigation.
         assert pushed.session_id == parent_session
+
+    async def test_push_accepts_from_data_instance(self):
+        # The literal composition the instance form exists for: a real
+        # from_data() result pushed onto a parent, covering the from_data ->
+        # push registration path end to end (not just push(instance) alone).
+        from cascadeui import PaginatedLayoutView, StatefulLayoutView
+
+        class _Root(StatefulLayoutView):
+            def build_ui(self):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+
+        child = await PaginatedLayoutView.from_data(
+            ["a", "b", "c"],
+            per_page=1,
+            formatter=lambda chunk: [discord.ui.TextDisplay(str(chunk))],
+        )
+        store = get_store()
+        assert child.id not in store.state["views"]  # unregistered until push
+
+        pushed = await root.push(child)
+        assert pushed.id in store.state["views"]
+        assert pushed.id in store._active_views
+        assert pushed.session_id == root.session_id
 
     async def test_push_instance_preserves_shared_data(self):
         """Parent's ``shared_data`` must survive instance-push so the

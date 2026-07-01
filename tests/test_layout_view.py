@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import discord
 import pytest
-from discord.ui import ActionRow, LayoutView, TextDisplay
+from discord.ui import ActionRow, Container, LayoutView, TextDisplay
 from helpers import make_interaction as _make_interaction
 
 from cascadeui.components.base import StatefulButton, StatefulSelect
@@ -91,6 +91,112 @@ class TestMakeExitButton:
         assert after == before + 1  # ActionRow wrapper added
 
 
+class TestMakeBackButton:
+    """``make_back_button`` returns an unattached Back button (V1 + V2)."""
+
+    def test_returns_unattached_button(self):
+        interaction = _make_interaction()
+        view = StatefulLayoutView(interaction=interaction)
+        before = len(list(view.children))
+        btn = view.make_back_button()
+        after = len(list(view.children))
+
+        assert isinstance(btn, StatefulButton)
+        assert btn.label == "Back"
+        assert after == before  # not attached
+
+    def test_custom_label_and_custom_id(self):
+        interaction = _make_interaction()
+        view = StatefulLayoutView(interaction=interaction)
+        btn = view.make_back_button(label="Return", custom_id="nav_back")
+
+        assert btn.label == "Return"
+        assert btn.custom_id == "nav_back"
+
+    def test_add_back_button_uses_helper(self):
+        # The auto back button is built via make_back_button, so it carries
+        # the same Back label and is stashed for rebuild restoration.
+        interaction = _make_interaction()
+        view = StatefulLayoutView(interaction=interaction)
+        view._add_back_button()
+
+        assert view._auto_back_item in list(view.children)
+
+
+class TestMakeNavRow:
+    """``make_nav_row`` combines Back + Exit into one ActionRow (V2)."""
+
+    def test_returns_actionrow_with_both(self):
+        interaction = _make_interaction()
+        view = StatefulLayoutView(interaction=interaction)
+        row = view.make_nav_row()
+
+        assert isinstance(row, ActionRow)
+        assert [c.label for c in row.children] == ["Back", "Exit"]
+
+    def test_back_only(self):
+        interaction = _make_interaction()
+        view = StatefulLayoutView(interaction=interaction)
+        row = view.make_nav_row(exit=False)
+
+        assert [c.label for c in row.children] == ["Back"]
+
+    def test_exit_only(self):
+        interaction = _make_interaction()
+        view = StatefulLayoutView(interaction=interaction)
+        row = view.make_nav_row(back=False)
+
+        assert [c.label for c in row.children] == ["Exit"]
+
+    def test_custom_labels(self):
+        interaction = _make_interaction()
+        view = StatefulLayoutView(interaction=interaction)
+        row = view.make_nav_row(back_label="Prev", exit_label="Close")
+
+        assert [c.label for c in row.children] == ["Prev", "Close"]
+
+    def test_custom_emoji_and_style(self):
+        import discord
+
+        interaction = _make_interaction()
+        view = StatefulLayoutView(interaction=interaction)
+        row = view.make_nav_row(
+            back_label="Leagues",
+            back_emoji="\U0001f3e0",
+            back_style=discord.ButtonStyle.primary,
+        )
+        back = list(row.children)[0]
+        assert back.label == "Leagues"
+        assert str(back.emoji) == "\U0001f3e0"
+        assert back.style == discord.ButtonStyle.primary
+
+    def test_default_emoji_matches_button_helpers(self):
+        # The defaults mirror make_back_button / make_exit_button so the
+        # shorthand and the manual composition render identically.
+        interaction = _make_interaction()
+        view = StatefulLayoutView(interaction=interaction)
+        row = view.make_nav_row()
+        back, exit_ = list(row.children)
+        assert str(back.emoji) == str(view.make_back_button().emoji)
+        assert str(exit_.emoji) == str(view.make_exit_button().emoji)
+
+    def test_both_false_raises(self):
+        interaction = _make_interaction()
+        view = StatefulLayoutView(interaction=interaction)
+
+        with pytest.raises(ValueError, match="at least one"):
+            view.make_nav_row(back=False, exit=False)
+
+    def test_not_attached(self):
+        interaction = _make_interaction()
+        view = StatefulLayoutView(interaction=interaction)
+        before = len(list(view.children))
+        view.make_nav_row()
+        after = len(list(view.children))
+
+        assert after == before  # returns the row, does not attach
+
+
 class TestStatefulLayoutViewSubclass:
     """Subclass registration and kwargs auto-capture."""
 
@@ -126,6 +232,45 @@ class TestStatefulLayoutViewSubclass:
         # interaction is non-reconstructible, should be excluded
         assert "interaction" not in view._init_kwargs
         assert view._init_kwargs == {"label": "test"}
+
+
+class TestStatefulLayoutViewComponentBudget:
+    """add_item re-messages discord.py's 40-component cap in the library's style."""
+
+    def test_under_40_adds_normally(self):
+        view = StatefulLayoutView()
+        view.add_item(Container(*[TextDisplay(f"t{i}") for i in range(10)]))
+        assert view._total_children == 11
+
+    def test_over_40_raises_friendly_message(self):
+        view = StatefulLayoutView()
+        view.add_item(Container(*[TextDisplay(f"a{i}") for i in range(10)]))  # 11 nodes
+        with pytest.raises(ValueError) as exc_info:
+            view.add_item(Container(*[TextDisplay(f"b{i}") for i in range(40)]))
+        msg = str(exc_info.value)
+        assert "40-component" in msg
+        assert "control_buttons" in msg
+        assert "already at 11 components" in msg
+
+    def test_chains_discord_py_error(self):
+        # The friendly error chains discord.py's terse original via `from`.
+        view = StatefulLayoutView()
+        with pytest.raises(ValueError) as exc_info:
+            view.add_item(Container(*[TextDisplay(f"x{i}") for i in range(41)]))
+        cause = exc_info.value.__cause__
+        assert isinstance(cause, ValueError)
+        assert "maximum number of children exceeded" in str(cause)
+
+    def test_unrelated_value_error_passes_through(self, monkeypatch):
+        # A ValueError that is NOT the component-budget cap is re-raised
+        # untouched -- the override only re-messages the 40-component error.
+        def _boom(self, item):
+            raise ValueError("some unrelated problem")
+
+        monkeypatch.setattr(LayoutView, "add_item", _boom)
+        view = StatefulLayoutView()
+        with pytest.raises(ValueError, match="some unrelated problem"):
+            view.add_item(TextDisplay("hi"))
 
 
 class TestStatefulLayoutViewDispatch:
@@ -350,6 +495,343 @@ class TestSeedInitialState:
             await view.send()
 
 
+class TestOnLoadHook:
+    """The on_load hook runs an async preload before the view is displayed.
+
+    Sibling of seed_initial_state, but earlier in the pipeline: on_load
+    fires before placement validation and the Discord send so the first
+    render reflects loaded data, where seed_initial_state seeds state
+    slots after registration.
+    """
+
+    async def test_default_hook_is_no_op(self):
+        # Views without async preload ship unchanged -- the default does nothing.
+        interaction = _make_interaction()
+        view = StatefulLayoutView(interaction=interaction)
+
+        message = await view.send()
+        assert message is not None
+
+    async def test_hook_runs_during_send(self):
+        interaction = _make_interaction()
+        observed = {}
+
+        class LoadingView(StatefulLayoutView):
+            async def on_load(self):
+                observed["loaded"] = True
+
+        view = LoadingView(interaction=interaction)
+        await view.send()
+
+        assert observed.get("loaded") is True
+
+    async def test_hook_runs_before_message_ships(self):
+        # The preload completes before the Discord send, so a view can
+        # build its tree against loaded data and have that be what ships.
+        interaction = _make_interaction()
+        order = []
+
+        original_send = interaction.response.send_message
+
+        async def _tracking_send(*args, **kwargs):
+            order.append("send")
+            return await original_send(*args, **kwargs)
+
+        interaction.response.send_message = AsyncMock(side_effect=_tracking_send)
+
+        class LoadingView(StatefulLayoutView):
+            async def on_load(self):
+                order.append("on_load")
+
+        view = LoadingView(interaction=interaction)
+        await view.send()
+
+        assert order == ["on_load", "send"]
+
+    async def test_hook_runs_before_placement_check(self):
+        # on_load builds the tree, so it must run before _check_placement
+        # validates it. Adding a child in on_load and asserting the
+        # placement check saw it proves the ordering.
+        interaction = _make_interaction()
+        seen_children = {}
+
+        class LoadingView(StatefulLayoutView):
+            async def on_load(self):
+                self.add_item(ActionRow(StatefulButton(label="Loaded")))
+
+            def _check_placement(self):
+                seen_children["count"] = len(list(self.children))
+                return super()._check_placement()
+
+        view = LoadingView(interaction=interaction)
+        await view.send()
+
+        assert seen_children.get("count", 0) >= 1
+
+    async def test_hook_failure_propagates(self):
+        # A broken preload breaks the send so the subclass author sees it.
+        interaction = _make_interaction()
+
+        class BrokenLoadView(StatefulLayoutView):
+            async def on_load(self):
+                raise RuntimeError("load broke")
+
+        view = BrokenLoadView(interaction=interaction)
+        with pytest.raises(RuntimeError, match="load broke"):
+            await view.send()
+
+    async def test_reload_runs_on_load_then_refresh(self):
+        # reload() is the out-of-band convenience: on_load, then refresh.
+        interaction = _make_interaction()
+        order = []
+
+        class LoadingView(StatefulLayoutView):
+            async def on_load(self):
+                order.append("on_load")
+
+            async def refresh(self, **kwargs):
+                order.append("refresh")
+
+        view = LoadingView(interaction=interaction)
+        await view.send()
+        order.clear()
+
+        await view.reload()
+
+        assert order == ["on_load", "refresh"]
+
+
+class TestOnLoadDurationWarning:
+    """A slow on_load (over auto_defer_delay) logs a one-per-class warning so a
+    render-path preload that competes with interaction acks becomes visible. The
+    no-op default is skipped entirely (zero overhead).
+    """
+
+    async def test_slow_on_load_warns_once(self, caplog):
+        from cascadeui.views import base as base_mod
+
+        base_mod._slow_on_load_warned.clear()
+
+        class SlowView(StatefulLayoutView):
+            auto_defer_delay = 0.01  # tight budget so a small real delay overruns
+
+            async def on_load(self):
+                await asyncio.sleep(0.05)  # reliably over 0.01s
+
+        view = SlowView(interaction=_make_interaction())
+        with caplog.at_level(logging.WARNING, logger="cascadeui.views.base"):
+            await view._run_on_load()
+
+        warns = [r for r in caplog.records if "on_load() took" in r.message]
+        assert len(warns) == 1
+        assert "SlowView" in warns[0].message
+
+    async def test_fast_on_load_no_warning(self, caplog):
+        from cascadeui.views import base as base_mod
+
+        base_mod._slow_on_load_warned.clear()
+
+        class QuickView(StatefulLayoutView):
+            async def on_load(self):  # near-instant, under the 2.5s default budget
+                pass
+
+        view = QuickView(interaction=_make_interaction())
+        with caplog.at_level(logging.WARNING, logger="cascadeui.views.base"):
+            await view._run_on_load()
+
+        assert not [r for r in caplog.records if "on_load() took" in r.message]
+
+    async def test_dedup_per_class(self, caplog):
+        from cascadeui.views import base as base_mod
+
+        base_mod._slow_on_load_warned.clear()
+
+        class SlowView(StatefulLayoutView):
+            auto_defer_delay = 0.01
+
+            async def on_load(self):
+                await asyncio.sleep(0.05)
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui.views.base"):
+            await SlowView(interaction=_make_interaction())._run_on_load()
+            await SlowView(interaction=_make_interaction())._run_on_load()
+
+        warns = [r for r in caplog.records if "on_load() took" in r.message]
+        assert len(warns) == 1  # second slow run, same class -> no second warning
+
+    async def test_default_noop_no_warning(self, caplog):
+        # The default no-op on_load is skipped entirely -- no timing, no warning,
+        # even with a tight budget that a timed no-op might trip.
+        from cascadeui.views import base as base_mod
+
+        base_mod._slow_on_load_warned.clear()
+
+        class DefaultView(StatefulLayoutView):
+            auto_defer_delay = 0.0001  # default on_load -- never timed, so never warns
+
+        view = DefaultView(interaction=_make_interaction())
+        with caplog.at_level(logging.WARNING, logger="cascadeui.views.base"):
+            await view._run_on_load()
+
+        assert not [r for r in caplog.records if "on_load() took" in r.message]
+
+
+class TestOnPreSendHook:
+    """on_pre_send is the pre-send veto gate: it runs first in the send
+    pipeline and aborts the send cleanly when it returns False.
+    """
+
+    async def test_default_hook_allows_send(self):
+        # The default returns True, so a view without an override sends normally.
+        interaction = _make_interaction()
+        view = StatefulLayoutView(interaction=interaction)
+
+        message = await view.send()
+        assert message is not None
+
+    async def test_veto_aborts_send(self):
+        # Returning False aborts: no message ships, send() returns None.
+        interaction = _make_interaction()
+
+        class GatedView(StatefulLayoutView):
+            async def on_pre_send(self, interaction):
+                return False
+
+        view = GatedView(interaction=interaction)
+        message = await view.send()
+
+        assert message is None
+        interaction.response.send_message.assert_not_called()
+
+    async def test_falsy_non_false_return_also_vetoes(self):
+        # The gate is `if not await on_pre_send(...)`, so any falsy value
+        # (None, 0) vetoes, not only an explicit False.
+        interaction = _make_interaction()
+
+        class GatedView(StatefulLayoutView):
+            async def on_pre_send(self, interaction):
+                return None
+
+        view = GatedView(interaction=interaction)
+        message = await view.send()
+
+        assert message is None
+        interaction.response.send_message.assert_not_called()
+
+    async def test_veto_runs_before_on_load(self):
+        # The gate runs first, so a veto skips the on_load preload entirely.
+        interaction = _make_interaction()
+        order = []
+
+        class GatedView(StatefulLayoutView):
+            async def on_pre_send(self, interaction):
+                order.append("pre_send")
+                return False
+
+            async def on_load(self):
+                order.append("on_load")
+
+        view = GatedView(interaction=interaction)
+        await view.send()
+
+        assert order == ["pre_send"]  # on_load never ran
+
+    async def test_hook_receives_triggering_interaction(self):
+        interaction = _make_interaction()
+        seen = {}
+
+        class GatedView(StatefulLayoutView):
+            async def on_pre_send(self, interaction):
+                seen["interaction"] = interaction
+                return True
+
+        view = GatedView(interaction=interaction)
+        await view.send()
+
+        assert seen["interaction"] is interaction
+
+    async def test_veto_leaves_no_state(self):
+        # A vetoed send leaves zero side effects: the view stops, its
+        # subscriber is removed, and it never registers in either registry.
+        interaction = _make_interaction()
+        store = get_store()
+
+        class GatedView(StatefulLayoutView):
+            async def on_pre_send(self, interaction):
+                return False
+
+        view = GatedView(interaction=interaction)
+        await view.send()
+
+        assert view.is_finished()
+        assert view.id not in store.subscribers
+        assert view.id not in store.state["views"]
+        assert view.id not in store._active_views
+
+    async def test_override_can_respond_through_open_slot(self):
+        # The response slot is still open inside on_pre_send, so an override
+        # can tell the user why the send was vetoed.
+        interaction = _make_interaction()
+
+        class GatedView(StatefulLayoutView):
+            async def on_pre_send(self, interaction):
+                await self.respond(interaction, "Not allowed", ephemeral=True)
+                return False
+
+        view = GatedView(interaction=interaction)
+        message = await view.send()
+
+        assert message is None
+        interaction.response.send_message.assert_called_once()
+
+
+class TestOnTimeoutLogLevel:
+    """on_timeout downgrades the expected ephemeral token-expiry edit
+    failure to DEBUG; a non-ephemeral edit failure stays WARNING. The
+    branch is gated on ``_ephemeral``, so any edit exception exercises it.
+    """
+
+    async def test_ephemeral_edit_failure_logs_debug(self, caplog):
+        interaction = _make_interaction()
+        view = StatefulLayoutView(interaction=interaction)
+        await view.send()
+        view._ephemeral = True
+        view._message = MagicMock()
+        view._message.edit = AsyncMock(side_effect=RuntimeError("Invalid Webhook Token"))
+
+        with caplog.at_level(logging.DEBUG, logger="cascadeui.views.base"):
+            await view.on_timeout()
+
+        debug_records = [
+            r for r in caplog.records if "Skipped disabling components" in r.getMessage()
+        ]
+        assert debug_records
+        assert all(r.levelno == logging.DEBUG for r in debug_records)
+        # The old WARNING line must not fire for the ephemeral case.
+        assert not [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING and "disable components" in r.getMessage()
+        ]
+
+    async def test_non_ephemeral_edit_failure_logs_warning(self, caplog):
+        interaction = _make_interaction()
+        view = StatefulLayoutView(interaction=interaction)
+        await view.send()
+        view._ephemeral = False
+        view._message = MagicMock()
+        view._message.edit = AsyncMock(side_effect=RuntimeError("boom"))
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui.views.base"):
+            await view.on_timeout()
+
+        warning_records = [
+            r for r in caplog.records if "Could not disable components on timeout" in r.getMessage()
+        ]
+        assert warning_records
+        assert all(r.levelno == logging.WARNING for r in warning_records)
+
+
 class TestStatefulLayoutViewInteraction:
     """Interaction check and owner_only tests."""
 
@@ -443,6 +925,31 @@ class TestStableCustomIds:
         # ActionRow first, button second
         button = [c for c in view.walk_children() if isinstance(c, StatefulButton)][0]
         assert button.custom_id == "user_chosen_id"
+
+    def test_link_and_premium_buttons_not_stabilized(self):
+        # Link (url) and premium (sku_id) buttons forbid a custom_id; the
+        # stabilizer must skip both, or Discord 400s (code 50035, "custom id
+        # and url cannot both be specified").
+        import discord
+
+        def build(view):
+            view.clear_items()
+            view.add_item(ActionRow(discord.ui.Button(label="Docs", url="https://example.com")))
+            view.add_item(
+                ActionRow(discord.ui.Button(style=discord.ButtonStyle.premium, sku_id=123456789))
+            )
+            view.add_item(ActionRow(StatefulButton(label="Fire")))
+
+        view = self._make_view_with_build(build)
+        view.build_ui()
+
+        buttons = [c for c in view.walk_children() if isinstance(c, discord.ui.Button)]
+        link = next(b for b in buttons if b.url)
+        premium = next(b for b in buttons if getattr(b, "sku_id", None))
+        interactive = next(b for b in buttons if not b.url and not getattr(b, "sku_id", None))
+        assert link.custom_id is None
+        assert premium.custom_id is None
+        assert interactive.custom_id is not None
 
     def test_auto_generated_id_rewritten_with_content_anchor(self):
         def build(view):
@@ -1341,6 +1848,30 @@ class TestActingViewFastPath:
 
         interaction.response.edit_message.assert_not_called()
         view._message.edit.assert_awaited_once()
+
+    async def test_ack_race_interaction_responded_falls_through(self):
+        """The is_done() guard passes, but the auto-defer timer acks in the
+        window before edit_message's own internal guard, so edit_message raises
+        InteractionResponded -- a sibling of HTTPException, not a subclass, so
+        the HTTP handler would miss it. The guard raises before any HTTP (no
+        edit shipped) and the interaction is already acked, so the fast path
+        must fall through to the channel endpoint to ship the edit.
+        """
+        view = self._make_view(self._build_simple)
+        self._prime(view)
+        interaction = self._make_acting_interaction()
+        interaction.response.edit_message = AsyncMock(
+            side_effect=discord.InteractionResponded(MagicMock())
+        )
+
+        token = _CURRENT_INTERACTION.set(interaction)
+        try:
+            await view.refresh()
+        finally:
+            _CURRENT_INTERACTION.reset(token)
+
+        interaction.response.edit_message.assert_awaited_once()
+        view._message.edit.assert_awaited_once()  # fell through to channel
 
     async def test_no_bound_interaction_falls_through(self):
         """Programmatic dispatch (persistence rehydrate, hook-driven

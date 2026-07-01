@@ -35,6 +35,17 @@ logger = logging.getLogger(__name__)
 # Maps class name -> class for navigation stack resolution
 _view_class_registry: Dict[str, type] = {}
 
+# Class names already warned about an explicit user_id kwarg that diverged
+# from the interaction user. Dedupes the construction-time warning to once
+# per class so push/pop reconstruction (which re-injects user_id) and repeat
+# opens do not spam the log.
+_user_id_divergence_warned: set = set()
+
+# Tracks view classes whose on_load() has overrun the interaction-timing budget.
+# Deduped per class so a consistently-slow preload warns once, not on every
+# send/navigation.
+_slow_on_load_warned: set = set()
+
 # Kwargs that are ephemeral per-invocation and must NOT be saved for
 # push/pop reconstruction.  _navigate_to() re-supplies these when
 # building the next view, so persisting them would be wrong.
@@ -654,6 +665,11 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         self.state_store = kwargs.pop("state_store", None) or get_store()
         self.session_id = kwargs.pop("session_id", None)
         self.user_id = kwargs.pop("user_id", None)
+        # Whether user_id was explicitly supplied (vs framework-derived below
+        # from the interaction/context). Drives the divergence warning after
+        # coercion so a consumer repurposing this reserved kwarg for their own
+        # data is flagged at the point of the mistake.
+        _user_id_supplied = self.user_id is not None
         self.guild_id = kwargs.pop("guild_id", None)
         self.context = kwargs.pop("context", None)
         self.interaction = kwargs.pop("interaction", None)
@@ -697,6 +713,10 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         self._message = None
         self._webhook_message = None
         self._ephemeral = False
+        # Monotonic deadline for the ephemeral refresh-button arming (set at
+        # send when the handoff engages). Lets a re-schedule after a failed
+        # navigation rollback sleep the REMAINING time, not a fresh window.
+        self._ephemeral_arm_deadline = None
 
         # Render-hash short-circuit. Stores a structural digest of the
         # component tree as it was last shipped to Discord. refresh()
@@ -791,6 +811,35 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         self.user_id = coerce_snowflake_id(self.user_id)
         self.guild_id = coerce_snowflake_id(self.guild_id)
 
+        # Reserved-kwarg footgun: user_id is a framework-managed identity
+        # field (access control, session derivation, instance scoping) that
+        # push/pop reconstruction re-derives from the interaction. A consumer
+        # who passes their own non-interaction value (e.g. an internal account
+        # id) gets it on the first construction but a silently-diverged value
+        # after navigation, so the failure surfaces far from the mistake. The
+        # warning fires once per class at construction and names the fix --
+        # application ids belong on a non-reserved kwarg name. (The
+        # admin-subject case -- an explicit user_id naming a different subject
+        # than the clicker -- also trips this; the warning is informational,
+        # not an error.)
+        if (
+            _user_id_supplied
+            and self.interaction is not None
+            and self.user_id is not None
+            and self.user_id != self.interaction.user.id
+        ):
+            cls_name = type(self).__qualname__
+            if cls_name not in _user_id_divergence_warned:
+                _user_id_divergence_warned.add(cls_name)
+                logger.warning(
+                    f"{cls_name} received an explicit user_id={self.user_id} that "
+                    f"differs from the interaction user ({self.interaction.user.id}). "
+                    f"'user_id' is a framework-managed identity kwarg -- it is "
+                    f"re-derived from the interaction on push/pop, so a custom value "
+                    f"silently diverges after navigation. Use a non-reserved kwarg "
+                    f"name for application ids."
+                )
+
         if self.session_id is None and self.user_id is not None:
             # The fully-qualified class path isolates view hierarchies
             # (separate nav stacks, undo history, etc.) so sibling
@@ -814,10 +863,15 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
 
         # Action types this view cares about -- subclasses override at
         # class level (e.g. subscribed_actions = {"MY_ACTION", ...}).
-        # Default is an empty set: the view receives no notifications
-        # unless it opts in.  Set to None to receive all actions.
-        if "subscribed_actions" not in type(self).__dict__:
+        # Resolved through the MRO, not the leaf __dict__, so a value declared
+        # on a base class is inherited; copied into a fresh per-instance set so
+        # sibling instances never share a mutable. Default is an empty set (no
+        # notifications); None opts in to all actions.
+        if not hasattr(type(self), "subscribed_actions"):
             self.subscribed_actions: Optional[Set[str]] = set()
+        else:
+            declared = type(self).subscribed_actions
+            self.subscribed_actions = None if declared is None else set(declared)
 
         # Build selector from the view's state_selector method (if overridden)
         selector = self._build_selector()
@@ -939,13 +993,44 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             The sent ``discord.Message`` on success, or ``None`` when a
             policy gate blocked the send.
         """
-        # -- Pre-flight check: V2 placement validation --
-        # Walks the assembled component tree and rejects placements
-        # Discord would 400 on. Runs before any state mutation so a
-        # rejected tree leaves zero side effects. The helper gates on
-        # ``validate_placement`` so V1 views (which lack the attribute)
-        # skip naturally.
-        self._check_placement()
+        # -- Stage 0: pre-send gate --
+        # on_pre_send() is the public veto hook: a permission or data check
+        # that runs FIRST, before any preload, placement walk, state
+        # mutation, or Discord call. Returning False aborts cleanly: no
+        # message ships and no state registers. It runs while the interaction
+        # response slot is still open, so an override can respond() to explain
+        # the veto -- and, when it proceeds, the slot stays available for the
+        # actual send (no forced defer). Default returns True.
+        if not await self.on_pre_send(self.interaction):
+            self.stop()
+            self.state_store._unsubscribe(self.id)
+            self.state_store._undo_enabled_views.pop(self.id, None)
+            return None
+
+        # -- Stage 0a: async preload --
+        # on_load() is the public hook where a view fetches from a
+        # database or other async source and builds its tree against the
+        # result. It runs before placement validation and the Discord
+        # send so the first render reflects loaded data, not the
+        # synchronous-__init__ placeholder. Default is a no-op, so views
+        # without async preload pay nothing. Matches where the built-in
+        # pattern overrides (leaderboard, paginated cursor mode) already
+        # preload -- before the tree is validated and shipped.
+        await self._run_on_load()
+
+        # -- Stage 0b: pre-flight tree validation --
+        # Catches two Discord-400 conditions before send: duplicate
+        # custom_ids (V1 and V2) and, for V2, invalid component placements.
+        # Runs before any state mutation, but the __init__ subscriber and
+        # undo entry already exist, so a rejection rolls them back before
+        # re-raising, keeping the send() rollback contract intact even here.
+        try:
+            self._check_placement()
+        except ValueError:
+            self.stop()
+            self.state_store._unsubscribe(self.id)
+            self.state_store._undo_enabled_views.pop(self.id, None)
+            raise
 
         # -- Stage 1: instance enforcement --
         try:
@@ -1079,6 +1164,9 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 self.state_store._install_message_cleanup(bot)
 
         if ephemeral and self.auto_refresh_ephemeral:
+            self._ephemeral_arm_deadline = time.monotonic() + max(
+                1, 900 - self.refresh_warning_seconds
+            )
             self.create_task(self._schedule_ephemeral_refresh())
 
         if self._pending_parent is not None:
@@ -1388,6 +1476,14 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     continue
                 if item._provided_custom_id:
                     continue
+                # Link and premium buttons carry a url / sku_id and never a
+                # custom_id; Discord rejects a button that has a custom_id
+                # alongside either, so neither kind is stabilized.
+                if (
+                    getattr(item, "url", None) is not None
+                    or getattr(item, "sku_id", None) is not None
+                ):
+                    continue
                 callback = getattr(item, "original_callback", None)
                 callback_name = callback.__qualname__ if callback else "none"
                 label = getattr(item, "label", "") or ""
@@ -1512,13 +1608,21 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     f"{type(self).__name__}; continuing teardown."
                 )
             except Exception as e:
-                hint = ""
+                # An ephemeral view that outlived its 15-minute interaction
+                # token cannot be edited -- the 401 is expected and
+                # unavoidable, not an error, so it logs at DEBUG. The view is
+                # already dead; there is nothing left to disable. A
+                # non-ephemeral edit failure is genuinely unexpected and
+                # stays at WARNING.
                 if self._ephemeral:
-                    hint = (
-                        " This is likely because the interaction token expired (15-minute limit). "
-                        "Ephemeral messages cannot be edited after the token expires."
+                    logger.debug(
+                        f"Skipped disabling components on timeout for "
+                        f"{type(self).__name__}: {e}. The interaction token "
+                        f"likely expired (15-minute limit); ephemeral messages "
+                        f"cannot be edited afterward."
                     )
-                logger.warning(f"Could not disable components on timeout: {e}.{hint}")
+                else:
+                    logger.warning(f"Could not disable components on timeout: {e}.")
 
         # Cancel tasks and clean up state, mirroring exit(). _destroy_view folds
         # in the active-registry removal so it commits only after the
@@ -1548,6 +1652,33 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         # skips the edit/delete block entirely (no stale NotFound error).
         self._message = None
         await self.exit(delete_message=False)
+
+    async def on_message_gone(self) -> None:
+        """Called when an edit observes the view's message is already gone.
+
+        ``refresh()`` issues the edit that fails with ``discord.NotFound``
+        when the message was deleted out from under the view (admin delete,
+        bulk purge, channel delete). The library nulls ``self._message`` and
+        calls this hook so a consumer that records the message elsewhere (its
+        own database row, an external index) can reconcile that reference.
+        Key the reconciliation on the view's stable identity, such as
+        ``persistence_key``, since ``self._message`` is already nulled.
+
+        Default is a no-op. This is the edit-path counterpart to two existing
+        deletion signals: ``on_message_delete`` fires from the gateway
+        ``MESSAGE_DELETE`` event for a message removed while the bot runs, and
+        the ``REGISTRY_PRUNED`` action fires when reattach finds a persistent
+        view's message gone after a restart. Unlike ``on_message_delete``,
+        this hook does not exit the view: the gateway event owns teardown, and
+        decoupling the signal keeps it safe to fire from the reactive refresh
+        path. Make the reconciliation idempotent, since this hook and
+        ``on_message_delete`` can both fire for the same deletion. The hook
+        may run while the view's update lock is held, so an override may
+        safely do I/O (reconcile a database row, call an external service)
+        but should not dispatch a state change back into this view, which
+        would re-enter the lock.
+        """
+        return
 
     async def _handle_state_notification(self, state, action):
         """React to state changes with update coalescing.
@@ -1581,6 +1712,89 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 await self.on_state_changed(self.state_store.state)
                 if not self._update_pending:
                     break
+
+    async def on_pre_send(self, interaction: Optional[Interaction]) -> bool:
+        """Pre-send veto hook -- gate the send before any work happens.
+
+        Override to run a permission or data check (a database lookup, a
+        cooldown, an entitlement gate) and decide whether the view should be
+        sent at all. Return ``True`` to proceed (the default) or ``False`` to
+        abort. An abort is clean: no Discord message ships and no state is
+        registered, so a vetoed send leaves zero side effects.
+
+        It runs first in the send pipeline -- before :meth:`on_load`,
+        placement validation, instance enforcement, and the Discord call --
+        so a veto skips all of that cost. The interaction's response slot is
+        still open here, so an override can :meth:`respond` to explain the
+        veto, and, when the send proceeds, the slot stays available for the
+        actual delivery (no forced ``defer``).
+
+        The slot-open guarantee assumes the hook completes within the ack
+        budget. When ``send()`` runs inside a component callback and the hook
+        itself takes longer than ``auto_defer_delay``, the auto-defer timer
+        acks first and the send falls back to a followup -- still correct,
+        just one round-trip slower. A fast check (a cache read, an
+        in-memory lookup) preserves the single-round-trip path.
+
+        ``interaction`` is the interaction that triggered the send, or
+        ``None`` for a channel or context send (a prefix command). An
+        override that needs the interaction guards for ``None``.
+        """
+        return True
+
+    async def on_load(self) -> None:
+        """Async data preload and tree rebuild before the view is displayed.
+
+        Override to fetch from a database, an API, or any other async
+        source and build the component tree against the result. The
+        library calls it automatically at three seams so a view never
+        renders against stale or placeholder data:
+
+        - :meth:`send` -- before the initial Discord message ships (and
+          before placement validation), so the first render reflects
+          loaded data.
+        - :meth:`push` / :meth:`pop` -- on the destination view before the
+          navigation edit, so navigating to a child or back to a parent
+          re-reads its source (the reload-on-render pattern). Defining
+          ``on_load`` supersedes passing ``rebuild=lambda v:
+          v.load_and_build()`` -- the navigation calls run it automatically.
+        - :meth:`reload` -- the out-of-band convenience (``on_load`` then
+          ``refresh``) for re-fetching from inside a callback.
+
+        The synchronous ``__init__`` builds against a placeholder (an
+        empty list, a "Loading..." card) so construction stays
+        inspectable; ``on_load`` is where the only genuinely async work
+        happens. Default is a no-op, so views without async preload pay
+        nothing.
+        """
+        return
+
+    async def _run_on_load(self) -> None:
+        """Run ``on_load()``, warning once per class if it overruns the budget.
+
+        ``on_load`` runs on the render path -- the initial send, every push/pop
+        navigation, and ``reload()``. A preload slower than ``auto_defer_delay``
+        delays navigation and competes with the interaction ack, so a slow
+        ``on_load`` is the usual silent cause of a sluggish panel. The warning
+        surfaces it at the seam; behavior is unchanged (``on_load`` still runs
+        identically, and the timing wrapper is skipped entirely for the no-op
+        default).
+        """
+        if type(self).on_load is _StatefulMixin.on_load:
+            return  # Default no-op -- skip the timing wrapper.
+        start = time.monotonic()
+        await self.on_load()
+        elapsed = time.monotonic() - start
+        if elapsed > self.auto_defer_delay:
+            cls_name = type(self).__name__
+            if cls_name not in _slow_on_load_warned:
+                _slow_on_load_warned.add(cls_name)
+                logger.warning(
+                    f"{cls_name}.on_load() took {elapsed:.1f}s, over auto_defer_delay "
+                    f"({self.auto_defer_delay}s). Slow preloads on the render path delay "
+                    f"navigation and compete with interaction acks. Keep HTTP off the "
+                    f"render path -- resolve from cache or batch fetches into one round-trip."
+                )
 
     async def seed_initial_state(self, state):
         """Initialize per-view state slots before the first subscriber notification.
@@ -1627,6 +1841,19 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 result = await result
             kwargs = result if isinstance(result, dict) else {}
             await self.refresh(**kwargs)
+
+    async def reload(self) -> None:
+        """Re-run :meth:`on_load`, then edit the message to show the result.
+
+        The out-of-band counterpart to the automatic ``on_load`` calls on
+        send/push/pop: use it inside a callback that mutates the view's
+        data source and needs the display to re-fetch and re-render
+        immediately (a create/edit/archive action, a manual refresh
+        button). Equivalent to ``await self.on_load()`` followed by
+        ``await self.refresh()``.
+        """
+        await self._run_on_load()
+        await self.refresh()
 
     async def refresh(self, **kwargs) -> None:
         """Edit the view's message to reflect the current component state.
@@ -1766,6 +1993,16 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     # it did not).
                     self._last_tree_digest = None
                     return
+                except discord.InteractionResponded:
+                    # The auto-defer timer acked in the window between the
+                    # is_done() guard and edit_message's own internal guard.
+                    # InteractionResponded is a sibling of HTTPException (not a
+                    # subclass), so it would otherwise escape the handler below.
+                    # The guard raises before any HTTP, so no edit shipped and
+                    # the interaction is already acked -- fall through to the
+                    # channel path to ship the edit (no ack-budget concern,
+                    # unlike the cancelled-fast-path TimeoutError case above).
+                    pass
                 except discord.HTTPException as e:
                     if self._handle_rate_limit(e):
                         return
@@ -1818,7 +2055,22 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     store._record_edit()
                 self._stamp_cooldown()
             except discord.NotFound:
-                pass
+                # The message was deleted out from under the view (admin
+                # delete, purge, channel delete) and this edit just observed
+                # the 404. Null the ref so the top-of-method guard short-
+                # circuits later refreshes instead of re-issuing doomed edits,
+                # then fire the reconcile hook so a consumer tracking this
+                # message externally can clear it. The hook is guarded because
+                # refresh() must stay non-raising -- the navigation fallbacks
+                # rely on it absorbing NotFound.
+                self._message = None
+                try:
+                    await self.on_message_gone()
+                except Exception as exc:
+                    logger.error(
+                        f"on_message_gone failed for {type(self).__name__}: {exc}",
+                        exc_info=exc,
+                    )
             except asyncio.TimeoutError:
                 logger.warning(
                     f"Edit stalled past {self.edit_timeout}s in {type(self).__name__}; "
@@ -1882,17 +2134,22 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         return await asyncio.wait_for(coro, timeout=max(0.5, self.auto_defer_delay - 1.0))
 
     def _check_placement(self) -> None:
-        """Run the V2 placement validator on this view if enabled.
+        """Validate the component tree before shipping it to Discord.
 
         Single helper consumed by every seam that ships a tree to
         Discord: ``_send_pipeline`` (initial send), ``refresh`` (in-place
-        edits), and ``_apply_navigation_edit`` (push/pop edits). V1
-        views lack the ``validate_placement`` attribute so the
-        ``getattr`` default of ``False`` makes the check a no-op for
-        them. The validator import is lazy to keep ``base.py``'s import
-        graph thin -- the check fires often (one walk per edit) but
-        loads its module once.
+        edits), and ``_apply_navigation_edit`` (push/pop edits). Two
+        checks run here. The custom_id-uniqueness pass runs for every
+        view (V1 and V2) because Discord rejects a duplicate custom_id on
+        either with HTTP 400. The structural placement walk is V2-only:
+        V1 views lack the ``validate_placement`` attribute so the
+        ``getattr`` default of ``False`` skips it. Both imports are lazy
+        to keep ``base.py``'s import graph thin. The checks fire often
+        (one walk per edit) but load their module once.
         """
+        from ._placement import validate_unique_custom_ids
+
+        validate_unique_custom_ids(self)
         if getattr(self, "validate_placement", False):
             from ._placement import validate_placement
 
@@ -2620,6 +2877,49 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         )
         self.add_item(button)
         return button
+
+    def make_back_button(
+        self,
+        label="Back",
+        style=discord.ButtonStyle.secondary,
+        emoji="◀",
+        custom_id=None,
+        row=None,
+    ):
+        """Return a back button without attaching it to the view.
+
+        Mirrors :meth:`make_exit_button`. The callback pops the navigation
+        stack via :meth:`pop`; when the stack is empty (this is the root
+        view), it clears the dead components in place via
+        ``_clear_on_empty_back`` rather than navigating. Pack the returned
+        button into a caller-owned container -- an ``ActionRow`` or a tab
+        builder's return list (V2 views can also use ``make_nav_row`` to
+        build the Back+Exit footer in one call).
+
+        When the destination view defines :meth:`on_load`, the restored
+        parent reloads its data automatically on pop, so the back button
+        needs no rebuild wiring.
+
+        For ``PersistentView``/``PersistentLayoutView`` subclasses, pass
+        ``custom_id`` so the button survives a restart.
+        """
+
+        async def back_callback(interaction):
+            # No pre-defer: pop() routes through _apply_navigation_edit, whose
+            # fast path edits + acks in one round-trip. Deferring here would
+            # consume the response slot and force the slow two-call path.
+            prev_view = await self.pop(interaction)
+            if prev_view is None:
+                await self._clear_on_empty_back(interaction)
+
+        return StatefulButton(
+            label=label,
+            style=style,
+            row=row,
+            emoji=emoji,
+            custom_id=custom_id,
+            callback=back_callback,
+        )
 
     def clear_row(self, row: int):
         """Remove all components on the given row number.

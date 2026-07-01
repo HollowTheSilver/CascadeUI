@@ -18,6 +18,8 @@ pattern with V2 components:
     - ``unregister_participant`` for the Leave path -- the library owns
       both the join and leave directions, so users never touch
       ``_participants`` or the session index directly
+    - ``on_pre_send`` veto gate -- aborts the open in a DM before any
+      work happens, with the response slot still open to explain why
     - ``protect_attached = False`` -- a lobby is a staging area, not
       a committed game. When the host opens a new lobby, the old one is
       replaced and ``on_replaced`` pings each waiting participant
@@ -121,11 +123,11 @@ class LobbyView(StatefulLayoutView):
     instance_limit = 1
     instance_scope = "user"  # one lobby per host across all guilds
     instance_policy = "replace"
-    replace_policy = "delete"  # A lobby is a staging area, not a committed game - replacement is
-    # expected when the host opens a fresh lobby. protect_attached
-    # defaults to True, which would block replacement when participants
-    # are present. False allows replacement to proceed, and the
-    # on_replaced hook below notifies waiting players.
+    replace_policy = "delete"  # replacing a lobby deletes the old message
+    # A lobby is a staging area, not a committed game, so replacement is
+    # expected when the host opens a fresh one. ``protect_attached`` defaults to
+    # True, which would block replacement while participants are present; False
+    # lets it proceed, and the ``on_replaced`` hook below notifies them.
     protect_attached = False
     # ``state_scope = None`` because lobby stats live under custom reducers
     # written to the global state tree, not under any built-in scope key.
@@ -216,6 +218,22 @@ class LobbyView(StatefulLayoutView):
             )
 
     # // ==================( Hooks )================== // #
+
+    async def on_pre_send(self, interaction):
+        """Veto the open in a DM -- a lobby is a multi-user staging area that
+        requires a channel. Returning False aborts cleanly (no message, no
+        state registered) while the response slot is still open, so the
+        override can explain via respond(). interaction is None for a
+        prefix-command open; the None guard prevents a respond() call there."""
+        if self.guild_id is None:
+            if interaction is not None:
+                await self.respond(
+                    interaction,
+                    "Lobbies can only be opened in a server, not a DM.",
+                    ephemeral=True,
+                )
+            return False
+        return True
 
     async def on_participant_limit(self, user_id, interaction=None):
         """Custom rejection mentioning the joiner."""
@@ -324,7 +342,7 @@ class LobbyExample(commands.Cog, name="v2_lobby_example"):
             guild_id=context.guild.id if context.guild else None,
             max_players=max_players,
         )
-        await view.send()
+        await view.send()  # send() returns None if on_pre_send vetoes (returns False); the hook already responded
 
 
 async def setup(bot) -> None:

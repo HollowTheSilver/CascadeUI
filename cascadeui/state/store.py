@@ -1274,7 +1274,7 @@ class StateStore:
         # Fire-and-forget for cross-view subscribers: they are scheduled and
         # tracked under the "state_store_notify" owner but not awaited here,
         # so a slow peer never stalls the store. Errors surface through
-        # ``_safe_notify`` + ``TaskManager._wrap_task`` logging.
+        # ``_safe_notify`` + ``TaskManager._on_task_done`` logging.
         #
         # The acting view (if any) is awaited inline below so its refresh
         # lands flush with the button re-enable -- preserving visual

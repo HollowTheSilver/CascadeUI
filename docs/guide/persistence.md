@@ -128,22 +128,52 @@ await setup_middleware(
 ```
 
 Data-only mode still restores any slots marked `persistent=True`.
-Full mode logs a reattach summary with four buckets, and callers that
+Full mode logs a reattach summary with five buckets, and callers that
 need the structured result can await `reattach_persistent_views()`
 directly on the manager:
 
 ```python
 summary = await store.persistence_manager.reattach_persistent_views()
-# {"restored": [...], "skipped": [...], "failed": [...], "removed": [...]}
+# {"restored": [...], "skipped": [...], "failed": [...], "removed": [...], "unreachable": [...]}
 ```
 
 - `restored`: view reattached successfully.
 - `skipped`: view class not imported, or kwargs migrator missing. Row stays
   on disk so the next restart retries.
-- `failed`: construction, kwargs migrator, or `on_restore` raised. Row
-  stays on disk for manual recovery.
-- `removed`: channel or message deleted while the bot was offline. Row
-  removed via `prune_registry` (which dispatches `REGISTRY_PRUNED`).
+- `failed`: construction or kwargs migrator raised during reattach.
+  (`on_restore` runs later, after the bot is ready; its failures are logged
+  there, not reflected in this bucket.) Row stays on disk for manual recovery.
+- `removed`: channel or message returned a definitive 404 (`discord.NotFound`)
+  while the bot was offline. Row removed via `prune_registry` (which dispatches
+  `REGISTRY_PRUNED`).
+- `unreachable`: channel or message could not be fetched for a transient reason
+  (`Forbidden`, `HTTPException`, or a non-messageable channel). The row is left on
+  disk so a clean restart retries; nothing is pruned. Do not reconcile external
+  records from this bucket: the panel may still exist.
+
+The middleware runs `reattach_persistent_views()` inside `setup_middleware`,
+after cogs are loaded but before `on_ready` fires. A `REGISTRY_PRUNED`
+subscription registered in a cog's `setup(bot)` is already in place and does
+observe the action. Code that subscribes only in `on_ready` or later misses it
+(the action dispatches once at startup, with no replay). To reconcile records
+kept outside the registry, read the stashed summary after startup instead:
+
+```python
+from cascadeui import get_store
+
+@bot.event
+async def on_ready():
+    summary = get_store().persistence_manager.last_reattach_summary
+    if summary:
+        for key in summary["removed"]:
+            ...  # clear your own row for this persistence_key
+```
+
+`last_reattach_summary` holds the most recent reattach summary (`None` until the
+first reattach). Reconcile only from `removed` (a definitive 404); a key in
+`unreachable` may still exist and should be left alone. The `keys` list on the
+`REGISTRY_PRUNED` action carries the same `removed` data for a consumer that
+subscribes before `setup_middleware`.
 
 ## Backends
 
@@ -154,8 +184,8 @@ The library ships three backends:
 | Backend | Import | Capabilities |
 |---------|--------|--------------|
 | `InMemoryBackend` | `cascadeui.persistence` | KV, RELATIONAL, TTL_INDEX, SCHEMA_META |
-| `SQLiteBackend` | `cascadeui.persistence` (requires `aiosqlite`) | KV, RELATIONAL, TTL_INDEX, SCHEMA_META |
-| `PostgresBackend` | `cascadeui.persistence` (requires `asyncpg`) | KV, RELATIONAL, TTL_INDEX, SCHEMA_META |
+| `SQLiteBackend` | `cascadeui.persistence` (requires `aiosqlite`) | KV, RELATIONAL, TTL_INDEX, SCHEMA_META, RAW_SQL |
+| `PostgresBackend` | `cascadeui.persistence` (requires `asyncpg`) | KV, RELATIONAL, TTL_INDEX, SCHEMA_META, RAW_SQL |
 
 `InMemoryBackend` is the reference implementation. It matches the Protocol
 exactly and is useful for tests. `SQLiteBackend` is the recommended
@@ -748,8 +778,94 @@ drives the reattach pipeline during startup:
 5. Constructs the view, sets `_message`, restores `user_id` / `guild_id`,
    re-derives `session_id`, and calls `bot.add_view(view, message_id=...)`.
 6. Registers the view in state, installs the message-deletion listener
-   (eagerly, since restored views skip `send()`), and calls
-   `on_restore(bot)`.
+   (eagerly, since restored views skip `send()`), and calls `on_bind(bot)` so
+   runtime dependencies are injected. Interaction routing is live from this
+   point; the view is clickable.
+7. After `setup_hook` returns and the gateway connects, a background task
+   awaits `bot.wait_until_ready()` and then calls `on_restore(bot)` on each
+   restored view. The gateway cache is warm at that point, so renders resolve
+   real users, members, and channels instead of cold defaults.
+
+### View identity: `user_id` and `session_id` follow the construction context
+
+What identity a persistent view carries -- and whether it has a session -- is
+decided by the context it is constructed with:
+
+- **An interaction or command context** (`context=ctx`) derives the invoker's
+  `user_id`. A `user_id` keys a *session*: the navigation context that holds the
+  push/pop chain, its `shared_data`, and the undo timeline. This is the shape for a
+  per-user persistent panel re-attached to its owner.
+- **A bare channel** (`context=channel`) derives no `user_id` -- a
+  `discord.TextChannel` has no `.author`. The view is an ownerless guild artifact
+  with no session. This is the shape for a public board anyone in the channel uses:
+  a leaderboard, a role panel, a status display.
+
+Both round-trip through restore intact: the registry row stores `user_id` when there
+is one, and reattach restores it and re-derives `session_id` from it (step 5 above).
+A channel-posted panel restores ownerless by design -- nothing to attach, nothing to
+key a session on.
+
+!!! note "Restored session IDs use the coalesced form"
+    Normal `__init__` derivation appends a per-instance UUID suffix (e.g.
+    `MyPanel:user_123:a1b2c3d4`). Reattach re-derives without the suffix
+    (`MyPanel:user_123`), because the original session ended when the bot
+    stopped. The restored view starts a new session under the coalesced shape.
+    This matters if any code compares a stored `session_id` against the
+    restored view's `session_id` -- they will not match. Read session identity
+    from the live `view.session_id` property, not from a value captured before
+    a restart.
+
+`owner_only` and `user_id` are independent axes: `owner_only` governs *who may
+interact* (a public board sets `owner_only = False`), while `user_id` governs
+*identity and session*. A public board can still record its posting admin -- pass
+`user_id=ctx.author.id` explicitly alongside the channel; the explicit value is kept,
+because derivation only fills a `None` `user_id`. Leaving it ownerless is usually the
+honest model: the panel belongs to the channel, not a person.
+
+### Runtime dependencies via `on_bind`
+
+A persistent view often needs runtime handles -- a database pool, the bot
+itself, a service client -- to load its data. These cannot ride the
+constructor: the registry row is JSON, and a pool or bot is not
+serializable. Passing one as a constructor kwarg declines the registry write
+(with a directed error naming the kwarg and pointing here), so the view would
+silently drop on the next restart.
+
+Inject them in `on_bind(bot)` instead:
+
+```python
+class LeaderboardPanel(PersistentLeaderboardLayoutView):
+    async def on_bind(self, bot):
+        self.db = bot.db
+        self.bot = bot
+
+    async def on_load(self):
+        # self.db is set -- on_bind ran first
+        self.entries = await self.db.fetch_standings()
+```
+
+The library calls `on_bind(bot)` automatically at two points: during `send()`
+(when the bot is derivable from the construction context) and during restore,
+before `on_restore`. A view posted with a bare channel context carries no
+`.bot`, so `send()` cannot derive it. That view calls `on_bind` itself before
+`send()`:
+
+```python
+view = LeaderboardPanel(context=channel, persistence_key=f"board:{board_id}")
+await view.on_bind(bot)   # channel context: no derivable bot
+await view.send()
+```
+
+Keep `on_bind` idempotent; it may run more than once. A sync override
+(`def on_bind`) is also accepted.
+
+!!! warning "Set attributes, not UI side effects"
+    `on_bind` runs *before* the view is displayed -- ahead of the first
+    render at `send()` time and ahead of `on_restore` at restore time. A
+    `refresh()` or `send()` from inside `on_bind` is premature: at send time
+    there is no message to edit yet, and at restore time it ships an edit
+    before `on_restore` has rebuilt the view. Assign the dependencies in this
+    hook; do the data load and render in `on_load` or `on_restore`.
 
 ### Kwargs migrations for PersistentView subclasses
 
@@ -778,11 +894,12 @@ on disk for later recovery.
 
 | Scenario | Outcome |
 |----------|---------|
-| Message deleted externally | Row removed, reattach summary logs as `removed` |
-| Channel deleted or non-messageable | Row removed, reattach summary logs as `removed` |
+| Message or channel returns a definitive 404 (`discord.NotFound`) | Row removed, reattach summary logs as `removed` |
+| Message or channel transiently unreachable (`Forbidden`, `HTTPException`, or non-messageable) | Row kept, reattach summary logs as `unreachable` |
 | View class not imported | Row kept, reattach summary logs as `skipped` |
 | Kwargs migrator raises or returns non-dict | Row kept, reattach summary logs as `failed` |
-| Construction or `on_restore` raises | Row kept, reattach summary logs as `failed` |
+| Construction raises during reattach | Row kept, reattach summary logs as `failed` |
+| `on_restore` raises (post-ready render) | View stays registered; failure is logged, not in the summary |
 
 **Requirements for `PersistentView`:**
 

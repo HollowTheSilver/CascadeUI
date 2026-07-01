@@ -22,8 +22,11 @@ from .components.buttons import (
 )
 from .components.inputs import Checkbox, CheckboxGroup, FileUpload, Modal, RadioGroup, TextInput
 from .components.patterns import (
+    Choice,
+    Collapsible,
     ConfirmationButtons,
     EmojiGrid,
+    PaginatedRegion,
     PaginationControls,
     ProgressBar,
     ToggleGroup,
@@ -32,6 +35,7 @@ from .components.patterns import (
     button_grid,
     button_row,
     card,
+    choice_row,
     confirm_section,
     cycle_button,
     divider,
@@ -55,7 +59,7 @@ from .components.selects import (
     RoleSelect,
     UserSelect,
 )
-from .components.types import EmojiInput, MediaInput
+from .components.types import MAX_SELECT_OPTIONS, EmojiInput, MediaInput
 from .components.v1_composition import CompositeComponent, get_component, register_component
 from .components.wrappers import with_confirmation, with_cooldown, with_loading_state
 from .devtools import DevToolsCog, InspectorView
@@ -100,11 +104,12 @@ from .utils.decorators import cascade_component, cascade_reducer
 from .utils.errors import safe_execute, with_error_boundary, with_retry
 from .utils.fetch import fetch_as_file
 from .utils.logging import setup_logging
-from .utils.strings import slugify
+from .utils.strings import is_emoji, slugify
 from .utils.tasks import get_task_manager
 from .validation import (
     ValidationResult,
     choices,
+    emoji,
     max_length,
     max_value,
     min_length,
@@ -147,7 +152,7 @@ if "SQLiteBackend" in _persistence_all:
 # // ========================================( Script )======================================== // #
 
 
-__version__ = "3.3.4"
+__version__ = "3.4.0"
 
 # Export public API
 __all__ = [
@@ -226,6 +231,7 @@ __all__ = [
     # Type aliases
     "EmojiInput",
     "MediaInput",
+    "MAX_SELECT_OPTIONS",
     # V2 Cards & Sections
     "card",
     "action_section",
@@ -237,6 +243,9 @@ __all__ = [
     "button_row",
     "cycle_button",
     "toggle_button",
+    # V2 Choices
+    "Choice",
+    "choice_row",
     # V2 Content
     "key_value",
     "alert",
@@ -247,6 +256,10 @@ __all__ = [
     "gap",
     # V2 Navigation
     "tab_nav",
+    # V2 Pagination
+    "PaginatedRegion",
+    # V2 Collapsible
+    "Collapsible",
     # V2 Media
     "gallery",
     "file_attachment",
@@ -279,6 +292,7 @@ __all__ = [
     "ValidationResult",
     "validate_field",
     "validate_fields",
+    "emoji",
     "min_length",
     "max_length",
     "regex",
@@ -307,6 +321,7 @@ __all__ = [
     "cascade_reducer",
     "cascade_component",
     "slugify",
+    "is_emoji",
     "fetch_as_file",
     # DevTools
     "InspectorView",

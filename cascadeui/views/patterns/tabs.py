@@ -461,4 +461,9 @@ class TabLayoutView(_BaseTabMixin, StatefulLayoutView):
             for extra in self._extra_items:
                 self.add_item(extra)
 
+            # Restore the auto-back button if push() added one -- matches
+            # _refresh_tabs so a tab view used as a push() rebuild target
+            # keeps its back button instead of stranding the user.
+            self._restore_navigation_artifacts()
+
         return await super().send(**kwargs)

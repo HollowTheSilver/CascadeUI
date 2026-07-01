@@ -16,7 +16,7 @@ The smallest working CascadeUI view: a per-user counter using `state_scope = "us
 
 ### v2_dashboard.py
 
-Multi-tab server dashboard using `TabLayoutView`. Shows server info, member stats, and module toggles across three tabs. Demonstrates `action_section`, `toggle_section`, `key_value`, `alert`, tab switching, and session limiting.
+Full V2 builder showcase using `TabLayoutView`. A Controls tab demonstrates `tab_nav` inner navigation, `button_row`, `toggle_button`, `cycle_button`, and `choice_row`; the Modules tab shows a `Collapsible` reset confirm; the About tab uses `link_section` links. Also covers `action_section`, `toggle_section`, `key_value`, `alert`, and session limiting.
 
 **Command:** `/v2dashboard`
 
@@ -52,6 +52,18 @@ Paginated inventory viewer using `PaginatedLayoutView` with `from_data()`. Conta
 Pagination + drill-down navigation. A category hub (`StatefulLayoutView`) pushes a paginated `CategoryListView` per category using `await PaginatedLayoutView.from_data(...)` and `push(instance)`. `nav_inside_container = True` wraps page content + nav row in a single Container per page; `auto_back_button = True` adds a Back button that pops the nav stack and survives page turns. The closest mapping for users coming from [@Soheab](https://github.com/Soheab)'s [CV2 paginator gist](https://gist.github.com/Soheab/891c39d7294b1bdbadc7ecf35ce51cc5).
 
 **Command:** `/v2library`
+
+### v2_db_navigation.py
+
+Database-backed navigation via `on_load()`. Views hold a repo handle as a
+non-reserved constructor kwarg and define `on_load()` to fetch rows before
+each render. Push and pop re-fetch the destination's source automatically
+(reload-on-render), so no `rebuild=` callback is needed; `make_nav_row()`
+builds the Back plus Exit footer. The row list is paged by a
+`PaginatedRegion` fed from `on_load()`, so a page turn re-slices against the
+current repo data.
+
+**Command:** `/tasks`
 
 ### v2_computed.py
 
@@ -148,6 +160,7 @@ class MyBot(commands.Bot):
         await self.load_extension("examples.v2_form")
         await self.load_extension("examples.v2_pagination")
         await self.load_extension("examples.v2_library")
+        await self.load_extension("examples.v2_db_navigation")
         await self.load_extension("examples.v2_wizard")
         await self.load_extension("examples.v2_persistence")
         await self.load_extension("examples.v2_computed")

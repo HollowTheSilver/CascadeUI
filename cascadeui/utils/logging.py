@@ -539,10 +539,42 @@ class AsyncLogger(Logger):
 # // ========================================( Setup )======================================== // #
 
 
+_NO_COLOR_SCHEME = ColorScheme(
+    debug="",
+    info="",
+    warning="",
+    error="",
+    critical="",
+    timestamp="",
+    function="",
+    name="",
+    reset="",
+)
+
+
+def _stream_supports_color(stream) -> bool:
+    """Whether ``stream`` can render ANSI color.
+
+    Honors ``NO_COLOR`` / ``FORCE_COLOR``, then delegates to discord.py's own
+    detector (tty plus Windows-terminal capability), with an ``isatty``
+    fallback if that helper is unavailable.
+    """
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    try:
+        import discord.utils
+
+        return discord.utils.stream_supports_colour(stream)
+    except Exception:
+        return bool(getattr(stream, "isatty", lambda: False)())
+
+
 def setup_logging(
     *,
     level: Union[int, str] = logging.INFO,
-    actions: bool = True,
+    actions: Union[bool, str] = True,
     file: bool = True,
     stream: bool = True,
     trace: bool = False,
@@ -552,6 +584,7 @@ def setup_logging(
     mode: str = "a",
     encoding: str = "utf-8",
     colors: Union[ColorScheme, str, None] = None,
+    color: Optional[bool] = None,
     template: Union[FormatTemplate, str, None] = None,
     stream_formatter: Optional[Formatter] = None,
     file_formatter: Optional[Formatter] = None,
@@ -589,16 +622,22 @@ def setup_logging(
         logging.getLogger("cascadeui.state.store").setLevel(logging.DEBUG)
 
     Action dispatch logging is installed automatically (``actions=True`` by
-    default). Set ``actions=False`` to suppress the action stream in production
-    deployments that only want library-level logs::
+    default, emitting at ``INFO``). Set ``actions=False`` to drop the action
+    stream entirely, or pass a level string to place it lower so it stays out
+    of INFO logs and surfaces only when that level is enabled::
 
-        setup_logging(level="INFO", actions=False)
+        setup_logging(level="INFO", actions=False)       # no action stream
+        setup_logging(level="DEBUG", actions="DEBUG")    # action stream only at DEBUG
 
     Args:
         level:             Log level for the ``"cascadeui"`` logger.
         actions:           Auto-install ``LoggingMiddleware`` so every
                            dispatched action is logged to
-                           ``"cascadeui.actions"``. Default ``True``.
+                           ``"cascadeui.actions"``. ``True`` (default)
+                           installs it at ``INFO``; pass a level string
+                           (e.g. ``"DEBUG"``) to set the action stream's
+                           emission level so it hides under INFO logging and
+                           surfaces only at that level; ``False`` skips it.
         file:              Whether to write to a date-stamped log file.
         stream:            Whether to write colored output to the console.
         trace:             Install the ViewStore dispatch-miss tracer. Wraps
@@ -613,12 +652,19 @@ def setup_logging(
         mode:              File open mode (``"a"`` = append, ``"w"`` = overwrite).
         encoding:          Log file encoding.
         colors:            ``ColorScheme`` instance or preset name.
+        color:             Force console color on (``True``) or off (``False``).
+                           Default ``None`` auto-detects: color is emitted only
+                           when the stream supports ANSI (a tty with terminal
+                           color capability), and never when ``NO_COLOR`` is set,
+                           so a raw Windows console shows plain text instead of
+                           literal escape codes.
         template:          ``FormatTemplate`` instance or preset name.
         stream_formatter:  Custom ``Formatter`` for console output.
         file_formatter:    Custom ``Formatter`` for file output.
         handler:           A pre-built handler to attach directly. When provided,
-                           ``file``, ``stream``, ``colors``, ``template``,
-                           ``stream_formatter``, and ``file_formatter`` are ignored.
+                           ``file``, ``stream``, ``colors``, ``color``,
+                           ``template``, ``stream_formatter``, and
+                           ``file_formatter`` are ignored.
     """
     root_logger = logging.getLogger("cascadeui")
 
@@ -635,9 +681,17 @@ def setup_logging(
         return
 
     if stream:
-        resolved_stream_fmt = stream_formatter or ColoredStreamFormatter(
-            colors=colors, template=template
-        )
+        if stream_formatter is not None:
+            resolved_stream_fmt = stream_formatter
+        else:
+            # Emit color only when the console can render it: an explicit
+            # ``color=`` wins, otherwise detect. A no-color scheme keeps the
+            # same layout so a raw Windows console shows plain text instead of
+            # literal ``^[[31m`` escapes, matching the plain file handler.
+            use_color = color if color is not None else _stream_supports_color(sys.stdout)
+            resolved_stream_fmt = ColoredStreamFormatter(
+                colors=colors if use_color else _NO_COLOR_SCHEME, template=template
+            )
         sh = StreamHandler(sys.stdout)
         sh.setFormatter(resolved_stream_fmt)
         root_logger.addHandler(sh)
@@ -665,7 +719,8 @@ def setup_logging(
 
         store = get_store()
         if not store.has_middleware(LoggingMiddleware):
-            store._add_middleware(LoggingMiddleware())
+            action_level = actions if isinstance(actions, str) else "INFO"
+            store._add_middleware(LoggingMiddleware(level=action_level))
 
 
 def _purge_old_log_files(log_dir: str, prefix: Optional[str], max_files: int) -> None:

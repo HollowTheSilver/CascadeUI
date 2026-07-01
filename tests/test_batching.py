@@ -337,10 +337,12 @@ class TestLibraryInternalBatching:
         assert received.count("BATCH_COMPLETE") == 1
         assert "VIEW_UPDATED" in received
 
-    async def test_navigate_to_collapses_four_dispatches(self):
-        """_navigate_to issues NAVIGATION_PUSH + SESSION_CREATED +
-        VIEW_CREATED + VIEW_DESTROYED. All four collapse into one
-        BATCH_COMPLETE under the library's batch() wrap.
+    async def test_navigate_to_batches_construction_then_commits_teardown(self):
+        """push() batches its construction dispatches (NAVIGATION_PUSH +
+        SESSION_CREATED + VIEW_CREATED) into one BATCH_COMPLETE. The source's
+        VIEW_DESTROYED commits separately afterward, in _commit_source_teardown,
+        once the destination edit confirms -- the deferral that lets a failed
+        edit roll back to a live source.
         """
         from helpers import make_interaction
 
@@ -358,7 +360,7 @@ class TestLibraryInternalBatching:
         await source.send()
 
         # Drop pre-push notifications so the count is scoped to the
-        # _navigate_to() call itself.
+        # push() call itself.
         received = []
 
         async def handler(state, action):
@@ -369,8 +371,10 @@ class TestLibraryInternalBatching:
         await source.push(Target, interaction=interaction)
         await store._flush_notifications()
 
-        # Exactly one BATCH_COMPLETE, no raw NAVIGATION_PUSH /
-        # SESSION_CREATED / VIEW_CREATED / VIEW_DESTROYED leaks.
+        # The construction dispatches collapse into one BATCH_COMPLETE with no
+        # raw leaks; VIEW_DESTROYED arrives separately as the post-edit
+        # source-teardown commit.
         assert received.count("BATCH_COMPLETE") == 1
-        for leaked in ("NAVIGATION_PUSH", "SESSION_CREATED", "VIEW_CREATED", "VIEW_DESTROYED"):
+        for leaked in ("NAVIGATION_PUSH", "SESSION_CREATED", "VIEW_CREATED"):
             assert leaked not in received, f"{leaked} leaked outside the batch"
+        assert "VIEW_DESTROYED" in received

@@ -5,6 +5,7 @@ Also hosts ``TestStatefulViewSend`` for V1 base-class send-time behavior
 ``TestStatefulLayoutViewSend`` in ``test_layout_view.py``.
 """
 
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import discord
@@ -40,6 +41,69 @@ class TestSnowflakeIdCoercion:
     async def test_user_id_string_raises_typeerror(self):
         with pytest.raises(TypeError, match="Snowflake"):
             StatefulView(user_id="123")
+
+
+class TestUserIdDivergenceWarning:
+    """An explicit user_id kwarg that diverges from the interaction user is
+    a reserved-kwarg footgun: user_id is framework-managed and re-derived on
+    push/pop. Construction warns once per class and names the fix.
+    """
+
+    async def test_divergent_user_id_warns(self, caplog):
+        class _DivergentView(StatefulView):
+            pass
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui.views.base"):
+            _DivergentView(interaction=_make_interaction(user_id=100), user_id=999)
+
+        msgs = [
+            r.getMessage()
+            for r in caplog.records
+            if "framework-managed identity kwarg" in r.getMessage()
+        ]
+        assert msgs
+        assert "user_id=999" in msgs[0]
+        assert "non-reserved kwarg" in msgs[0]
+
+    async def test_matching_user_id_no_warning(self, caplog):
+        class _MatchView(StatefulView):
+            pass
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui.views.base"):
+            _MatchView(interaction=_make_interaction(user_id=100), user_id=100)
+
+        assert not [
+            r for r in caplog.records if "framework-managed identity kwarg" in r.getMessage()
+        ]
+
+    async def test_derived_user_id_no_warning(self, caplog):
+        # No explicit user_id -- derived from the interaction, no divergence.
+        class _DerivedView(StatefulView):
+            pass
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui.views.base"):
+            _DerivedView(interaction=_make_interaction(user_id=100))
+
+        assert not [
+            r for r in caplog.records if "framework-managed identity kwarg" in r.getMessage()
+        ]
+
+    async def test_warns_once_per_class(self, caplog):
+        # push/pop reconstruction re-injects user_id; the per-class dedupe
+        # keeps that from spamming the log on every navigation hop.
+        from cascadeui.views.base import _user_id_divergence_warned
+
+        class _OnceView(StatefulView):
+            pass
+
+        _user_id_divergence_warned.discard(_OnceView.__qualname__)
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui.views.base"):
+            _OnceView(interaction=_make_interaction(user_id=100), user_id=1)
+            _OnceView(interaction=_make_interaction(user_id=100), user_id=2)
+
+        msgs = [r for r in caplog.records if "framework-managed identity kwarg" in r.getMessage()]
+        assert len(msgs) == 1  # deduped to once per class
 
 
 class TestInitKwargs:
@@ -419,6 +483,33 @@ class TestSubscribedActionsOverride:
 
         view = PlainSubclass()
         assert view.subscribed_actions == set()
+
+    async def test_base_class_value_inherited(self):
+        """A subscribed_actions declared on a BASE class is inherited by a child
+        that doesn't re-declare it. Resolved through the MRO, not the leaf
+        __dict__, so a shared base value is not silently dropped."""
+
+        class Base(StatefulView):
+            subscribed_actions = {"MY_ACTION"}
+
+        class Child(Base):  # does not re-declare
+            pass
+
+        view = Child()
+        assert view.subscribed_actions == {"MY_ACTION"}
+
+    async def test_declared_value_is_fresh_per_instance(self):
+        """Two instances of a class declaring subscribed_actions do not share
+        the same set object, and neither aliases the class attribute."""
+
+        class CustomView(StatefulView):
+            subscribed_actions = {"A"}
+
+        v1 = CustomView()
+        v2 = CustomView()
+        assert v1.subscribed_actions == v2.subscribed_actions == {"A"}
+        assert v1.subscribed_actions is not v2.subscribed_actions
+        assert v1.subscribed_actions is not CustomView.subscribed_actions
 
 
 class TestStatefulViewSend:

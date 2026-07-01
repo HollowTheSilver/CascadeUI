@@ -43,6 +43,7 @@ corresponding bookkeeping action (:data:`APPLICATION_SLOTS_PRUNED`,
 
 
 import asyncio
+import inspect
 import json
 import logging
 import time
@@ -91,9 +92,15 @@ class PersistenceManager:
         registry: Optional[RegistryPersistence] = None,
         application: Optional[ApplicationPersistence] = None,
         bot: Any = None,
+        restore_concurrency: int = 8,
     ) -> None:
         self._store = store
         self._bot = bot
+        # Maximum concurrent fetch_channel / fetch_message calls during
+        # reattach_persistent_views. Bounds the per-row Discord round-trips
+        # so a many-panel deployment overlaps them within Discord's rate
+        # budget on startup.
+        self.restore_concurrency = restore_concurrency
 
         # Default to opted-out configs so every namespace has a config
         # object. Avoids None-branching at every call site.
@@ -113,6 +120,13 @@ class PersistenceManager:
         self._rehydrated: bool = False
         self._closed: bool = False
         self._registry_rows: list[dict[str, Any]] = []
+        # Summary from the most recent reattach_persistent_views() (restored /
+        # skipped / failed / removed key lists). Stashed so a consumer can read
+        # which persistence_keys were pruned for gone messages after
+        # setup_middleware returns: REGISTRY_PRUNED fires once during reattach,
+        # inside setup_middleware, so code that subscribes only after setup_hook
+        # (e.g. on_ready) misses it. None until the first reattach.
+        self.last_reattach_summary: Optional[dict[str, list[str]]] = None
 
         # Slot policy registry, seeded from ApplicationPersistence.slots
         # and extended at runtime by register_slot_policy.
@@ -121,6 +135,10 @@ class PersistenceManager:
         # TTL sweeper task. Started by install_middleware() only when at
         # least one slot declares ttl_days > 0. Cancelled by close().
         self._ttl_sweeper_task: Optional[asyncio.Task] = None
+        # Post-ready on_restore render tasks. Each reattach call schedules its
+        # own and tracks it here (mirrors PersistenceMiddleware._tasks), so a
+        # second reattach never drops a batch. Cancelled by close().
+        self._post_ready_restore_tasks: set = set()
 
         # Observability hooks for operators/devtools. Read by the
         # persistence middleware via _fire_hook(). Empty by default;
@@ -334,16 +352,23 @@ class PersistenceManager:
         """Reconstruct PersistentView instances from the rows rehydrated
         by :meth:`_rehydrate_registry`.
 
-        Returns a summary dict with four lists of ``persistence_key`` values:
+        Returns a summary dict with five lists of ``persistence_key`` values:
 
         - ``restored`` -- reattached successfully.
         - ``skipped`` -- view class not imported OR missing kwargs
           migrator. Row stays on disk so the next restart can pick it
           up once the import or migrator is fixed.
-        - ``failed`` -- construction, migrator, or ``on_restore`` raised.
-          Row stays on disk for manual recovery.
-        - ``removed`` -- channel or message gone. Row deleted from disk
-          via :meth:`prune_registry` and its bookkeeping action dispatched.
+        - ``failed`` -- construction or migrator raised during reattach.
+          (``on_restore`` runs later, in a post-ready background task; its
+          failures are logged there, not reflected in this bucket.) Row stays
+          on disk for manual recovery.
+        - ``removed`` -- channel or message returned a definitive 404
+          (``discord.NotFound``). Row deleted from disk via :meth:`prune_registry`
+          and its bookkeeping action dispatched.
+        - ``unreachable`` -- channel or message could not be fetched for a
+          transient reason (``Forbidden``, ``HTTPException``, or a non-messageable
+          channel). The row is left on disk so a clean restart retries; nothing
+          is pruned.
 
         Requires ``self._bot``. No-op when bot is absent (data-only
         persistence mode).
@@ -353,7 +378,13 @@ class PersistenceManager:
             "skipped": [],
             "failed": [],
             "removed": [],
+            "unreachable": [],
         }
+        # Publish the summary now (a live reference, mutated in place below) so
+        # it is reachable even on the early returns. A consumer reads
+        # last_reattach_summary["removed"] after setup_middleware to reconcile
+        # records for messages deleted while the bot was down.
+        self.last_reattach_summary = summary
         if self._bot is None:
             return summary
 
@@ -368,36 +399,72 @@ class PersistenceManager:
         from ..views.persistent import _persistent_view_classes
 
         removed_keys: list[str] = []
+        unreachable_keys: list[str] = []
 
-        for row in rows:
-            persistence_key = row["persistence_key"]
-            class_name = row["view_class"]
+        # Phase 1 (concurrent): resolve the view class, migrate kwargs, and
+        # fetch the Discord channel + message for every row. These are the
+        # per-row Discord round-trips that dominate startup; running them
+        # concurrently (bounded by ``restore_concurrency``) overlaps the
+        # network latency within Discord's rate budget instead of paying it
+        # serially on the setup_hook critical path. The per-row helpers
+        # already isolate failures (skipped / removed / failed land in the
+        # summary), so a bad row never aborts the fan-out.
+        sem = asyncio.Semaphore(self.restore_concurrency)
 
-            view_cls = _persistent_view_classes.get(class_name)
-            if view_cls is None:
-                logger.warning(
-                    f"Persistent view class {class_name!r} not found for "
-                    f"persistence_key {persistence_key!r}. Ensure the module is imported "
-                    "before PersistenceMiddleware.initialize()."
+        async def _prepare(row: dict[str, Any]) -> Optional[tuple]:
+            # ``persistence_key`` is read defensively for the failure log;
+            # the strict ``row[...]`` reads happen inside the try so a
+            # malformed row (missing key) lands in summary["failed"] instead
+            # of escaping the gather and aborting every other row's reattach.
+            persistence_key = row.get("persistence_key", "<unknown>")
+            try:
+                persistence_key = row["persistence_key"]
+                class_name = row["view_class"]
+                view_cls = _persistent_view_classes.get(class_name)
+                if view_cls is None:
+                    logger.warning(
+                        f"Persistent view class {class_name!r} not found for "
+                        f"persistence_key {persistence_key!r}. Ensure the module is imported "
+                        "before PersistenceMiddleware.initialize()."
+                    )
+                    summary["skipped"].append(persistence_key)
+                    return None
+
+                migrated = await self._migrate_init_kwargs(row, view_cls, summary)
+                if migrated is None:
+                    # Summary list already populated by _migrate_init_kwargs.
+                    return None
+
+                async with sem:
+                    fetched = await self._fetch_restore_message(row, removed_keys, unreachable_keys)
+                if fetched is None:
+                    # Already appended to removed_keys or unreachable_keys.
+                    return None
+                _channel, message = fetched
+                return (row, view_cls, migrated, message)
+            except Exception as exc:
+                logger.error(
+                    f"Failed to prepare persistent view {persistence_key!r}: {exc}",
+                    exc_info=True,
                 )
-                summary["skipped"].append(persistence_key)
-                continue
+                summary["failed"].append(persistence_key)
+                return None
 
-            migrated = await self._migrate_init_kwargs(row, view_cls, summary)
-            if migrated is None:
-                # Summary list already populated by _migrate_init_kwargs
-                continue
-            init_kwargs = migrated
+        prepared = await asyncio.gather(*(_prepare(row) for row in rows))
 
-            fetched = await self._fetch_restore_message(row, removed_keys)
-            if fetched is None:
-                # Already appended to removed_keys; row deletion happens
-                # in one batch at end of loop.
+        # Phase 2 (serial): construct + register each prepared view. Store
+        # mutation (add_view, _register_view, the registration batch) must
+        # stay serial -- concurrent dispatches would race the shared
+        # registries and the store's batch state.
+        restored_views: list = []
+        for item in prepared:
+            if item is None:
                 continue
-            _channel, message = fetched
-
-            outcome = await self._reattach_one(row, view_cls, init_kwargs, message, class_name)
-            summary[outcome].append(persistence_key)
+            row, view_cls, init_kwargs, message = item
+            outcome = await self._reattach_one(
+                row, view_cls, init_kwargs, message, row["view_class"], restored_views
+            )
+            summary[outcome].append(row["persistence_key"])
 
         # Delete rows whose channel or message disappeared while the bot
         # was offline. prune_registry dispatches REGISTRY_PRUNED so
@@ -405,8 +472,30 @@ class PersistenceManager:
         if removed_keys:
             await self.prune_registry(persistence_keys=removed_keys)
             summary["removed"].extend(removed_keys)
+        # Transiently unreachable rows are NOT pruned -- they stay on disk so a
+        # clean restart retries the fetch. Reported separately so a consumer
+        # does not mistake a momentary glitch for a definitive deletion.
+        if unreachable_keys:
+            summary["unreachable"].extend(unreachable_keys)
 
-        logger.info(f"Persistent view reattach complete: {summary}")
+        # Defer every restored view's on_restore render to after the gateway
+        # is ready. on_restore reads the bot cache (avatars, members,
+        # channels), cold on the setup_hook critical path; rendering there
+        # paints defaults. Registration above is live, so the views route
+        # interactions immediately while their render waits.
+        if restored_views:
+            task = asyncio.create_task(self._run_post_ready_restore(restored_views))
+            task.add_done_callback(self._on_post_ready_restore_done)
+            self._post_ready_restore_tasks.add(task)
+
+        # One aggregate summary (counts, not the full key lists) so a bot with
+        # hundreds of persistent views does not flood startup; per-view detail
+        # is at DEBUG.
+        logger.info(
+            f"Persistent view reattach complete: {len(summary['restored'])} restored, "
+            f"{len(summary['skipped'])} skipped, {len(summary['failed'])} failed, "
+            f"{len(summary['removed'])} removed, {len(summary['unreachable'])} unreachable"
+        )
         return summary
 
     async def _migrate_init_kwargs(
@@ -473,10 +562,17 @@ class PersistenceManager:
         self,
         row: dict[str, Any],
         removed_keys: list[str],
+        unreachable_keys: list[str],
     ) -> Optional[tuple[Any, Any]]:
         """Fetch the target channel and message for a registry row.
-        Appends to ``removed_keys`` and returns ``None`` when either is
-        gone or the channel is not messageable."""
+
+        Returns ``None`` when the channel or message cannot be fetched. A
+        definitive ``discord.NotFound`` appends to ``removed_keys`` and the row
+        is pruned. A transient failure (``Forbidden``, ``HTTPException``, or a
+        non-messageable channel) appends to ``unreachable_keys`` instead, which
+        leaves the row on disk so a clean restart can retry it. A momentary
+        permission change or 5xx during the startup mass-fetch must not delete a
+        still-existing panel."""
         import discord
 
         persistence_key = row["persistence_key"]
@@ -487,24 +583,38 @@ class PersistenceManager:
             channel = self._bot.get_channel(int(channel_id))
             if channel is None:
                 channel = await self._bot.fetch_channel(int(channel_id))
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
-            logger.warning(f"Could not fetch channel {channel_id} for {persistence_key!r}: {exc}")
+        except discord.NotFound:
+            logger.warning(f"Channel {channel_id} for {persistence_key!r} is gone; pruning entry.")
             removed_keys.append(persistence_key)
+            return None
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            logger.warning(
+                f"Could not reach channel {channel_id} for {persistence_key!r} "
+                f"({type(exc).__name__}); leaving the entry for the next restart."
+            )
+            unreachable_keys.append(persistence_key)
             return None
 
         if not isinstance(channel, discord.abc.Messageable):
             logger.warning(
                 f"Channel {channel_id} for {persistence_key!r} is not messageable "
-                f"({type(channel).__name__}); removing entry"
+                f"({type(channel).__name__}); leaving the entry for the next restart."
             )
-            removed_keys.append(persistence_key)
+            unreachable_keys.append(persistence_key)
             return None
 
         try:
             message = await channel.fetch_message(int(message_id))
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
-            logger.warning(f"Could not fetch message {message_id} for {persistence_key!r}: {exc}")
+        except discord.NotFound:
+            logger.warning(f"Message {message_id} for {persistence_key!r} is gone; pruning entry.")
             removed_keys.append(persistence_key)
+            return None
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            logger.warning(
+                f"Could not reach message {message_id} for {persistence_key!r} "
+                f"({type(exc).__name__}); leaving the entry for the next restart."
+            )
+            unreachable_keys.append(persistence_key)
             return None
 
         return channel, message
@@ -516,13 +626,21 @@ class PersistenceManager:
         init_kwargs: dict[str, Any],
         message: Any,
         class_name: str,
+        restored_views: list,
     ) -> str:
         """Construct + register a single view. Returns the summary
-        bucket name (``"restored"`` or ``"failed"``)."""
+        bucket name (``"restored"`` or ``"failed"``).
+
+        ``on_restore`` is NOT run here. It reads the gateway cache, which is
+        cold on the ``setup_hook`` critical path, so it is deferred to a
+        post-ready background task (see :meth:`_run_post_ready_restore`). A
+        successfully registered view is appended to ``restored_views`` for
+        that deferred render.
+        """
         persistence_key = row["persistence_key"]
         view = None
         # Tracks whether ``_register_state`` succeeded -- if a downstream
-        # step (``_update_message_state``, ``register_view``, ``on_restore``)
+        # step (``_update_message_state``, ``register_view``, ``on_bind``)
         # raises, the rollback dispatches ``VIEW_DESTROYED`` to undo the
         # ``SESSION_CREATED`` + ``VIEW_CREATED`` actions and prevent
         # zombie entries.
@@ -569,21 +687,32 @@ class PersistenceManager:
             # limit checks see a consistent state row at every step.
             self._store._register_view(view)
 
-            # Batch the registration dispatches and ``on_restore`` so the
-            # three startup actions (SESSION_CREATED + VIEW_CREATED + VIEW_UPDATED)
-            # plus any actions the user dispatches inside ``on_restore`` collapse
-            # into a single BATCH_COMPLETE notification per restored view.
-            # Without the batch, a project with N persistent views fires 3N+
-            # standalone notification cycles at startup. Batch source_id is
-            # the view's id so the BATCH_COMPLETE rides the acting-view
-            # inline-notification path, matching the _send_pipeline contract.
+            # Batch the registration dispatches so the three startup actions
+            # (SESSION_CREATED + VIEW_CREATED + VIEW_UPDATED) collapse into a
+            # single BATCH_COMPLETE notification per restored view. Without the
+            # batch, a project with N persistent views fires 3N+ standalone
+            # notification cycles at startup. Batch source_id is the view's id
+            # so the BATCH_COMPLETE rides the acting-view inline-notification
+            # path, matching the _send_pipeline contract.
             async with self._store.batch(source_id=view.id):
                 await view._register_state()
                 state_registered = True
                 await view._update_message_state(message)
-                await view.on_restore(self._bot)
+                # on_bind runs here so runtime deps are available before the
+                # deferred on_restore render. Supports sync or async overrides.
+                bind_result = view.on_bind(self._bot)
+                if inspect.isawaitable(bind_result):
+                    await bind_result
 
-            logger.info(f"Restored persistent view {persistence_key!r} ({class_name})")
+            # on_restore is deferred to _run_post_ready_restore (after
+            # wait_until_ready) so its gateway-cache reads land warm.
+            # Registration above already ran, so the view routes interactions
+            # immediately; only the render waits.
+            restored_views.append(view)
+            # DEBUG, not INFO: at scale (hundreds of guilds x many views) a
+            # per-view INFO line floods startup. reattach_persistent_views
+            # logs one aggregate summary instead.
+            logger.debug(f"Reattached persistent view {persistence_key!r} ({class_name})")
             return "restored"
 
         except Exception as exc:
@@ -683,6 +812,46 @@ class PersistenceManager:
             logger.error(f"TTL sweeper crashed: {exc}", exc_info=exc)
         self._ttl_sweeper_task = None
 
+    # // ========================================( Post-ready restore )======================================== // #
+
+    async def _run_post_ready_restore(self, views: list) -> None:
+        """Run ``on_restore`` for reattached views once the gateway is ready.
+
+        ``on_restore`` is documented for post-restore rendering and fresh-data
+        fetch, both of which read the gateway cache (``get_user``, members,
+        channels). That cache is empty on the ``setup_hook`` critical path
+        where reattach runs, so rendering there paints cold -- default avatars,
+        missing member names. This waits for ``wait_until_ready`` off the
+        critical path (in a background task, so ``setup_hook`` returns and the
+        gateway can connect), then renders warm. Each view is already
+        registered, so interactions route during the wait. ``on_restore``
+        failures are logged per view and never abort the rest.
+        """
+        try:
+            await self._bot.wait_until_ready()
+        except Exception:
+            return
+        for view in views:
+            if view.is_finished():
+                continue
+            persistence_key = getattr(view, "_persistence_key", "?")
+            try:
+                async with self._store.batch(source_id=view.id):
+                    await view.on_restore(self._bot)
+            except Exception as exc:
+                logger.error(
+                    f"on_restore failed for persistent view {persistence_key!r}: {exc}",
+                    exc_info=exc,
+                )
+
+    def _on_post_ready_restore_done(self, task: asyncio.Task) -> None:
+        self._post_ready_restore_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(f"Post-ready restore render crashed: {exc}", exc_info=exc)
+
     async def _ttl_sweeper_loop(self) -> None:
         """24-hour sleep loop that sweeps expired application slots.
 
@@ -769,21 +938,34 @@ class PersistenceManager:
             return 0
 
         deleted = 0
+        # Collect the keys actually removed (row_delete reported a row) so a
+        # subscriber can reconcile its own records surgically, instead of
+        # sweeping its whole domain against the registry. A key passed in but
+        # absent on disk is not reported.
+        pruned: list[str] = []
         if persistence_keys is None:
             # Clear all: row_select + row_delete per row. Callers who
             # hit this path are rare (test cleanup, admin tooling).
             rows = await backend.row_select(TABLE_PERSISTENT_VIEWS)
             for r in rows:
-                deleted += await backend.row_delete(
+                if await backend.row_delete(
                     TABLE_PERSISTENT_VIEWS, {"persistence_key": r["persistence_key"]}
-                )
+                ):
+                    pruned.append(r["persistence_key"])
+                    deleted += 1
         else:
             for sk in persistence_keys:
-                deleted += await backend.row_delete(TABLE_PERSISTENT_VIEWS, {"persistence_key": sk})
+                if await backend.row_delete(TABLE_PERSISTENT_VIEWS, {"persistence_key": sk}):
+                    pruned.append(sk)
+                    deleted += 1
 
         await self._store.dispatch(
             "REGISTRY_PRUNED",
-            {"deleted": deleted, "reason": "explicit" if persistence_keys else "clear_all"},
+            {
+                "deleted": deleted,
+                "keys": pruned,
+                "reason": "explicit" if persistence_keys else "clear_all",
+            },
         )
         return deleted
 
@@ -824,6 +1006,17 @@ class PersistenceManager:
             except (asyncio.CancelledError, Exception):
                 pass
             self._ttl_sweeper_task = None
+
+        # Cancel any post-ready restore renders still waiting on the gateway
+        # (or mid-render) when shutdown begins. Iterate a copy -- the done
+        # callback discards from the set as each cancelled task settles.
+        for task in list(self._post_ready_restore_tasks):
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._post_ready_restore_tasks.clear()
 
         if self._middleware is not None:
             try:

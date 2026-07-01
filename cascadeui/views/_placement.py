@@ -9,6 +9,7 @@ from discord.ui import (
     Checkbox,
     CheckboxGroup,
     Container,
+    DynamicItem,
     File,
     FileUpload,
     Label,
@@ -436,3 +437,47 @@ def _raise_placement_error(path: List[str], child_type: str, parent_type: str, f
         f"  Discord rejects this composition with HTTP 400.\n"
         f"  Fix: {fix}"
     )
+
+
+# // ========================================( custom_id Uniqueness )======================================== // #
+
+
+def validate_unique_custom_ids(view) -> None:
+    """Raise ``ValueError`` when two components share a custom_id.
+
+    Discord rejects a message whose component tree carries a duplicate
+    custom_id with HTTP 400 (code 50035, "component custom id cannot be
+    duplicated"). The duplicate otherwise surfaces at render, far from the
+    call site, and never in a non-rendering test. Runs for both V1 and V2
+    views: ``walk_children`` yields every descendant in either tree, and
+    interactive leaves are discriminated by type (``Button``, ``Select``,
+    or ``DynamicItem``), not by a ``custom_id`` attribute, which discord.py
+    injects onto display items once they are attached. Auto-generated ids
+    are effectively unique (random hex, or position-anchored by
+    ``_stabilize_custom_ids``); the collisions this catches are
+    caller-supplied ids sharing a string value.
+
+    Args:
+        view: Any ``View`` / ``LayoutView`` about to ship its tree.
+
+    Raises:
+        ValueError: The first repeated custom_id, naming the id and fix.
+    """
+    seen = set()
+    for item in view.walk_children():
+        if not isinstance(item, (Button, BaseSelect, DynamicItem)):
+            continue
+        custom_id = getattr(item, "custom_id", None)
+        if custom_id is None:
+            continue
+        if custom_id in seen:
+            raise ValueError(
+                f"Duplicate component custom_id: {custom_id!r} appears more than once "
+                f"in {type(view).__name__}.\n"
+                f"  Discord rejects this message with HTTP 400 "
+                f"(code 50035: component custom id cannot be duplicated).\n"
+                f"  Fix: Give each component a distinct custom_id. A builder used more "
+                f"than once (choice_row, PaginatedRegion, Collapsible) needs a distinct "
+                f"custom_id=/key= per call."
+            )
+        seen.add(custom_id)

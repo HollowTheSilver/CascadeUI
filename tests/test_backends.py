@@ -157,6 +157,61 @@ class TestBackendProtocolConformance:
         assert rows[0]["payload"] == '{"v": 2}'
         assert rows[0]["updated_at"] == 200
 
+    async def test_row_upsert_many_inserts_batch(self, backend):
+        rows = [
+            {
+                "slot_name": n,
+                "payload": "{}",
+                "schema_version": 1,
+                "updated_at": 1,
+                "expires_at": None,
+            }
+            for n in ("a", "b", "c")
+        ]
+        await backend.row_upsert_many(TABLE_APPLICATION_SLOTS, rows, ["slot_name"])
+        got = await backend.row_select(TABLE_APPLICATION_SLOTS)
+        assert {r["slot_name"] for r in got} == {"a", "b", "c"}
+
+    async def test_row_upsert_many_mixes_insert_and_update(self, backend):
+        base = {
+            "slot_name": "pref",
+            "payload": "{}",
+            "schema_version": 1,
+            "updated_at": 1,
+            "expires_at": None,
+        }
+        await backend.row_upsert(TABLE_APPLICATION_SLOTS, base, ["slot_name"])
+        await backend.row_upsert_many(
+            TABLE_APPLICATION_SLOTS,
+            [
+                {**base, "payload": '{"v": 2}', "updated_at": 2},  # conflict -> update
+                {**base, "slot_name": "new"},  # insert
+            ],
+            ["slot_name"],
+        )
+        got = {r["slot_name"]: r for r in await backend.row_select(TABLE_APPLICATION_SLOTS)}
+        assert got["pref"]["payload"] == '{"v": 2}'
+        assert got["pref"]["updated_at"] == 2
+        assert "new" in got
+
+    async def test_row_upsert_many_empty_is_noop(self, backend):
+        await backend.row_upsert_many(TABLE_APPLICATION_SLOTS, [], ["slot_name"])
+        assert await backend.row_select(TABLE_APPLICATION_SLOTS) == []
+
+    async def test_row_upsert_many_copy_on_store(self, backend):
+        # Mutating the caller's dict after the batch must not change the row.
+        row = {
+            "slot_name": "z",
+            "payload": "{}",
+            "schema_version": 1,
+            "updated_at": 1,
+            "expires_at": None,
+        }
+        await backend.row_upsert_many(TABLE_APPLICATION_SLOTS, [row], ["slot_name"])
+        row["payload"] = "MUTATED"
+        got = await backend.row_select(TABLE_APPLICATION_SLOTS)
+        assert got[0]["payload"] == "{}"
+
     async def test_row_select_where_filters(self, backend):
         for name, payload in [("a", "{}"), ("b", "{}"), ("c", "{}")]:
             await backend.row_upsert(
@@ -379,6 +434,34 @@ class TestSQLiteBackendPersistence:
         await b.close()
         assert len(rows) == 1
         assert rows[0]["payload"] == '{"k":1}'
+
+
+@pytest.mark.skipif(not sqlite_available, reason="aiosqlite not installed")
+class TestSQLiteBatchAtomicity:
+    """row_upsert_many rolls back the whole batch on a mid-batch failure."""
+
+    async def test_partial_batch_does_not_leak(self, tmp_path):
+        backend = SQLiteBackend(str(tmp_path / "atomic.db"))
+        await backend.initialize()
+        good = {
+            "slot_name": "A",
+            "payload": "{}",
+            "schema_version": 1,
+            "updated_at": 1,
+            "expires_at": None,
+        }
+        # A second column-signature group carrying a non-existent column fails
+        # the second executemany; the first group must not stay committed.
+        bad = {**good, "slot_name": "B", "NOPE": 1}
+        with pytest.raises(Exception):
+            await backend.row_upsert_many(TABLE_APPLICATION_SLOTS, [good, bad], ["slot_name"])
+
+        assert await backend.row_select(TABLE_APPLICATION_SLOTS) == []  # atomic rollback
+
+        # The connection recovers for the next write after the rollback.
+        await backend.row_upsert(TABLE_APPLICATION_SLOTS, good, ["slot_name"])
+        assert len(await backend.row_select(TABLE_APPLICATION_SLOTS)) == 1
+        await backend.close()
 
     async def test_schema_version_survives_reopen(self, tmp_path):
         path = str(tmp_path / "schemav.db")

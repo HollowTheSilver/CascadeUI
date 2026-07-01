@@ -31,7 +31,14 @@ class _NavigationMixin:
     # // ==================( Navigation Stack )================== // #
 
     async def _navigate_to(
-        self, view_or_class, interaction=None, *, action_type, action_payload, **kwargs
+        self,
+        view_or_class,
+        interaction=None,
+        *,
+        action_type,
+        action_payload,
+        defer_teardown=False,
+        **kwargs,
     ):
         """Internal: clean up current view, dispatch navigation action, set up next view.
 
@@ -87,15 +94,22 @@ class _NavigationMixin:
         # Cancel background tasks owned by this view before stopping
         self.task_manager.cancel_tasks(self.id)
 
-        # Stop this view and clean up its Python-level registration. The
-        # active-registry removal is deferred to _destroy_view at the end of
-        # the batch (below) so it commits only after this view's VIEW_DESTROYED
-        # state removal lands. Deferring past the new-view construction keeps
-        # the old view's active entry intact if construction raises before the
-        # dispatch.
-        self.stop()
+        # Quiesce the source: unsubscribe so it cannot race the destination
+        # edit. The rest of the teardown -- stop(), undo de-registration, and
+        # (in the batch below) VIEW_DESTROYED -- splits on ``defer_teardown``:
+        #
+        # - replace() and the default path commit it here and in the batch,
+        #   the long-standing one-way behavior.
+        # - push()/pop() defer it to a post-edit commit (_commit_source_teardown)
+        #   so a failed destination edit can roll back to a live, re-clickable
+        #   source instead of stranding a dead view behind a message that never
+        #   swapped. The active-registry removal stays deferred to _destroy_view
+        #   either way so it commits only after the VIEW_DESTROYED state
+        #   removal lands.
         self.state_store._unsubscribe(self.id)
-        self.state_store._undo_enabled_views.pop(self.id, None)
+        if not defer_teardown:
+            self.stop()
+            self.state_store._undo_enabled_views.pop(self.id, None)
 
         # Batch the full navigation sequence: NAVIGATION_* + SESSION_CREATED
         # (via _register_state) + VIEW_CREATED (via _register_state) +
@@ -248,8 +262,11 @@ class _NavigationMixin:
 
             # Remove the old view from state. _destroy_view drops its
             # active-registry entry once the state removal confirms, completing
-            # the teardown deferred from the top of this method.
-            await self.state_store._destroy_view(self.id, source_id=self.id)
+            # the teardown deferred from the top of this method. push()/pop()
+            # hold this until the destination edit confirms (see defer_teardown
+            # above); _commit_source_teardown runs it on success.
+            if not defer_teardown:
+                await self.state_store._destroy_view(self.id, source_id=self.id)
 
         return new_view
 
@@ -295,6 +312,7 @@ class _NavigationMixin:
             interaction,
             action_type="NAVIGATION_PUSH",
             action_payload=push_payload,
+            defer_teardown=True,
             **kwargs,
         )
 
@@ -302,7 +320,7 @@ class _NavigationMixin:
         if new_view.auto_back_button:
             new_view._add_back_button()
 
-        await self._apply_navigation_edit(new_view, interaction, rebuild)
+        await self._settle_navigation(new_view, interaction, rebuild)
 
         return new_view
 
@@ -349,20 +367,25 @@ class _NavigationMixin:
             interaction,
             action_type="NAVIGATION_POP",
             action_payload=pop_payload,
+            defer_teardown=True,
             **saved_kwargs,
         )
 
-        await self._apply_navigation_edit(new_view, interaction, rebuild)
+        await self._settle_navigation(new_view, interaction, rebuild)
 
         return new_view
 
-    async def _apply_navigation_edit(self, new_view, interaction, rebuild):
+    async def _apply_navigation_edit(self, new_view, interaction, rebuild) -> bool:
         """Run the optional rebuild hook, then edit the message to the new view.
 
-        Shared by ``push()`` and ``pop()``. The message edit happens
-        whenever a current interaction is available, regardless of
-        whether a ``rebuild`` callback was supplied -- the navigation
-        contract is that the Discord message reflects the new view.
+        Called by ``_settle_navigation`` (the push()/pop() tail). Returns
+        ``True`` when the destination reached the message and ``False`` when
+        every edit endpoint failed -- ``_settle_navigation`` commits the
+        deferred source teardown on ``True`` and rolls back to the live source
+        on ``False``. The message edit happens whenever a current interaction
+        is available, regardless of whether a ``rebuild`` callback was
+        supplied -- the navigation contract is that the Discord message
+        reflects the new view.
 
         ``rebuild`` is an optional pre-edit hook for callers whose
         views need post-construction setup (V2 views that build empty
@@ -379,7 +402,19 @@ class _NavigationMixin:
         """
         current_interaction = interaction or self.interaction
         if current_interaction is None:
-            return
+            # No interaction to edit through (a programmatic push/pop). The
+            # caller owns display; treat the state transition as committed so
+            # the source teardown proceeds, matching the pre-deferral behavior.
+            return True
+
+        # Async preload on the destination view before the edit ships, so
+        # navigating to a child (push) or back to a parent (pop) re-reads
+        # its data source -- the reload-on-render contract. on_load()
+        # defaults to a no-op; a view that overrides it no longer needs
+        # rebuild=lambda v: v.load_and_build(). The explicit rebuild hook
+        # below still runs for views that use it for post-construction
+        # setup other than data loading.
+        await new_view._run_on_load()
 
         edit_kwargs: dict = {}
         if rebuild is not None:
@@ -421,12 +456,24 @@ class _NavigationMixin:
             # (_safe_defer no-ops when a wrapper already consumed the slot),
             # then edit the view's own message. refresh() carries the
             # cooldown/backoff/digest machinery and its own acting-fast-path
-            # gate re-confirms the message match, so it cannot misfire here.
+            # gate re-confirms the message match.
             await self._safe_defer(current_interaction)
             if new_view._message is None:
                 new_view._message = target_message
-            await new_view.refresh(**edit_kwargs)
-            return
+            try:
+                await new_view.refresh(**edit_kwargs)
+                return True
+            except discord.HTTPException as e:
+                # refresh() already absorbs NotFound and 429; a remaining
+                # HTTP error means the view's own message could not be
+                # edited. Report failure so the navigation rolls back to the
+                # live source instead of stranding a dead view.
+                logger.warning(
+                    f"Navigation edit to the view's own message failed in "
+                    f"{type(self).__name__}: status={getattr(e, 'status', '?')} "
+                    f"code={getattr(e, 'code', '?')}; rolling back to source."
+                )
+                return False
 
         # Fast path: a component/modal interaction whose response slot is still
         # open edits + acks in one request -- no separate defer round-trip, which
@@ -444,7 +491,7 @@ class _NavigationMixin:
                 await self._ack_bounded(
                     current_interaction.response.edit_message(view=new_view, **edit_kwargs)
                 )
-                return
+                return True
             except asyncio.TimeoutError:
                 # Ack window blown -- fall through to the deferred path (the
                 # auto-defer timer has likely acked by now) to recover the edit
@@ -453,12 +500,24 @@ class _NavigationMixin:
                     f"Navigation fast path stalled in {type(self).__name__}; "
                     f"falling back to the deferred edit."
                 )
+            except discord.InteractionResponded:
+                # The auto-defer timer (or another path) acked in the narrow
+                # window between the is_done() guard above and edit_message's
+                # own internal guard. InteractionResponded is a sibling of
+                # HTTPException, not a subclass, so it would otherwise escape
+                # the handler below. The slot is consumed -- fall through to the
+                # deferred original-response edit, which shows the destination.
+                logger.debug(
+                    f"Navigation fast path raced an ack in {type(self).__name__}; "
+                    f"using the deferred edit."
+                )
             except discord.HTTPException as e:
-                # 429: stamp the backoff and bail rather than hammering the rate
-                # limit; the message re-renders on the next interaction. Other
-                # transient failures fall through to the deferred path.
+                # 429: stamp the backoff and report failure so the navigation
+                # rolls back to the live source rather than hammering the rate
+                # limit; the user re-clicks to retry. Other transient failures
+                # fall through to the deferred path.
                 if self._handle_rate_limit(e):
-                    return
+                    return False
 
         # Deferred path: the interaction is already acked (auto-defer timer, a
         # caller pre-defer, or a fast-path fall-through). Edit through the
@@ -474,58 +533,131 @@ class _NavigationMixin:
             # channel endpoint, which the plain ref provides.
             if new_view._message is None:
                 new_view._message = msg
+            return True
         except asyncio.TimeoutError:
             logger.warning(
                 f"Navigation edit stalled past {self.edit_timeout}s in "
-                f"{type(self).__name__}; destination re-renders on next interaction."
+                f"{type(self).__name__}; rolling back to source."
             )
+            return False
         except discord.HTTPException:
             # Interaction token expired (15-min lifetime). Route the
-            # channel-endpoint fallback through refresh() so it picks
-            # up cooldown throttling and 429 backoff instead of
-            # racing with state-driven refreshes.
+            # channel-endpoint fallback through refresh() so cooldown
+            # throttling, 429 backoff, and the render-hash short-circuit
+            # all participate in the edit.
             if new_view._message:
-                await new_view.refresh(**edit_kwargs)
+                try:
+                    await new_view.refresh(**edit_kwargs)
+                    return True
+                except discord.HTTPException as e:
+                    # refresh() already absorbs NotFound and 429; remaining
+                    # HTTP errors mean the channel endpoint also failed.
+                    logger.warning(
+                        f"Navigation channel-endpoint fallback failed in "
+                        f"{type(self).__name__}: status={getattr(e, 'status', '?')} "
+                        f"code={getattr(e, 'code', '?')}; rolling back to source."
+                    )
+            return False
+
+    async def _settle_navigation(self, new_view, interaction, rebuild) -> None:
+        """Edit the message to the destination, then commit or roll back.
+
+        Shared tail of push()/pop(). ``_apply_navigation_edit`` reports whether
+        the destination reached the message; on success the deferred source
+        teardown commits, on failure -- a contained edit error or a raising
+        preload/rebuild -- the navigation rolls back to the live source view.
+        """
+        try:
+            edited = await self._apply_navigation_edit(new_view, interaction, rebuild)
+        except Exception:
+            # A raising on_load()/rebuild()/placement check left the
+            # destination unshowable. Recover the source, then re-raise so
+            # the error still reaches on_error.
+            await self._rollback_navigation(new_view)
+            raise
+        if edited:
+            await self._commit_source_teardown()
+        else:
+            await self._rollback_navigation(new_view)
+
+    async def _commit_source_teardown(self) -> None:
+        """Complete the source view's teardown after a confirmed navigation edit.
+
+        push()/pop() defer the source teardown past the destination edit (see
+        ``defer_teardown`` in ``_navigate_to``). Once the edit confirms, the
+        destination owns the message, so the source stops, drops its undo
+        registration, and leaves state. The source was already unsubscribed
+        during ``_navigate_to``.
+        """
+        self.stop()
+        self.state_store._undo_enabled_views.pop(self.id, None)
+        await self.state_store._destroy_view(self.id, source_id=self.id)
+
+    async def _rollback_navigation(self, new_view) -> None:
+        """Recover the source view after a failed navigation edit.
+
+        The destination never reached the message, so its state registration is
+        torn down and the source is re-subscribed. The source was never stopped
+        or destroyed (its teardown was deferred), so it stays live and
+        re-clickable on the message it still owns.
+        """
+        await self.state_store._destroy_view(new_view.id, source_id=new_view.id)
+        self.state_store.subscribe(
+            self.id,
+            self._handle_state_notification,
+            self.subscribed_actions,
+            self._build_selector(),
+        )
+        # _navigate_to cancelled the source's tasks ahead of the (now-failed)
+        # teardown. Re-arm the ephemeral refresh handoff so a recovered
+        # long-lived ephemeral source still swaps in its refresh button before
+        # the 900s token cliff. A non-None deadline means the handoff engaged at
+        # send; the re-scheduled timer sleeps only the remaining time to it.
+        if (
+            self._ephemeral_arm_deadline is not None
+            and not self._refresh_armed
+            and not self.is_finished()
+        ):
+            self.create_task(self._schedule_ephemeral_refresh())
+
+    async def _clear_on_empty_back(self, interaction) -> None:
+        """Clear the view when Back is pressed at the root of the stack.
+
+        Called by the back-button callback when :meth:`pop` returns
+        ``None`` (empty stack), with the interaction still unacked. The V1
+        default edits to ``view=None`` -- strips the buttons, keeps any
+        embed. The response slot is still open, so edit + ack ship in one
+        call; the original-response endpoint is the fallback. V2 overrides
+        this to freeze components instead, since a V2 message IS its
+        components and ``view=None`` would empty it.
+        """
+        try:
+            if not interaction.response.is_done():
+                await self._ack_bounded(interaction.response.edit_message(view=None))
+            else:
+                await self._bounded(interaction.edit_original_response(view=None))
+        except asyncio.TimeoutError:
+            logger.debug(
+                f"Back-navigation clear stalled past {self.edit_timeout}s "
+                f"in {type(self).__name__}."
+            )
+        except discord.InteractionResponded:
+            # The auto-defer timer raced the is_done() guard and acked the
+            # interaction before edit_message's own guard. The ack landed but
+            # the clear did not ship -- send it through the deferred endpoint.
+            try:
+                await self._bounded(interaction.edit_original_response(view=None))
+            except (asyncio.TimeoutError, discord.HTTPException):
+                pass
+        except discord.HTTPException as e:
+            logger.debug(
+                f"Back-navigation clear failed in {type(self).__name__}: "
+                f"status={e.status} code={e.code}"
+            )
 
     def _add_back_button(self):
         """Add a back button that pops the nav stack."""
-
-        async def back_callback(interaction):
-            # No pre-defer: pop() routes through _apply_navigation_edit, whose
-            # fast path edits + acks in one round-trip. Deferring here would
-            # consume the response slot and force the slow two-call path.
-            prev_view = await self.pop(interaction)
-            if prev_view is None:
-                # Stack was empty -- pop() stopped/unsubscribed this view without
-                # navigating, so the interaction is still unacked. Clear the dead
-                # components in one call (edit + ack) while the response slot is
-                # open; fall back to the original-response endpoint otherwise.
-                try:
-                    if not interaction.response.is_done():
-                        await self._ack_bounded(interaction.response.edit_message(view=None))
-                    else:
-                        await self._bounded(interaction.edit_original_response(view=None))
-                except asyncio.TimeoutError:
-                    logger.debug(
-                        f"Back-navigation clear stalled past {self.edit_timeout}s "
-                        f"in {type(self).__name__}."
-                    )
-                except discord.HTTPException as e:
-                    logger.debug(
-                        f"Back-navigation clear failed in {type(self).__name__}: "
-                        f"status={e.status} code={e.code}"
-                    )
-            # When prev_view is non-None, pop() routed through _apply_navigation_edit
-            # which already swapped the message and acked the interaction.
-
-        button = StatefulButton(
-            label="Back",
-            style=discord.ButtonStyle.secondary,
-            emoji="\u25c0",
-            row=4,
-            custom_id=f"nav_back_{self.id[:8]}",
-            callback=back_callback,
-        )
+        button = self.make_back_button(custom_id=f"nav_back_{self.id[:8]}", row=4)
         # Stash the item so paginated / tabbed / wizard rebuild paths that
         # call ``clear_items()`` can restore the navigation back button
         # after recomposing their own component tree.

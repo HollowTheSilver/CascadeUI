@@ -331,6 +331,55 @@ class TestConfigTab:
         assert isinstance(result[-1], ActionRow)
 
 
+# // ========================================( Pre-defer Discipline )======================================== // #
+
+
+class TestInspectorPreDeferDiscipline:
+    """Light, refresh-only inspector callbacks do NOT pre-defer -- they ride
+    the acting-view fast path. The genuinely-slow callbacks keep ack-first
+    _safe_defer because their work can exceed the 3s interaction window."""
+
+    def _view(self):
+        view = InspectorView(interaction=_make_interaction())
+        view._refresh_tabs = AsyncMock()
+        return view
+
+    async def test_refresh_skips_predefer(self):
+        view = self._view()
+        interaction = _make_interaction()
+        await view._refresh(interaction)
+        interaction.response.defer.assert_not_called()
+        view._refresh_tabs.assert_awaited_once()
+
+    async def test_clear_history_skips_predefer(self):
+        view = self._view()
+        interaction = _make_interaction()
+        await view._clear_history(interaction)
+        interaction.response.defer.assert_not_called()
+        view._refresh_tabs.assert_awaited_once()
+
+    async def test_perf_toggle_skips_predefer(self):
+        view = self._view()
+        interaction = _make_interaction()
+        await view._perf_toggle(interaction)
+        interaction.response.defer.assert_not_called()
+        view._refresh_tabs.assert_awaited_once()
+
+    async def test_perf_clear_skips_predefer(self):
+        view = self._view()
+        interaction = _make_interaction()
+        await view._perf_clear(interaction)
+        interaction.response.defer.assert_not_called()
+        view._refresh_tabs.assert_awaited_once()
+
+    async def test_slow_callback_keeps_predefer(self):
+        """Contrast: exit-all (N view exits) acks first via _safe_defer."""
+        view = self._view()
+        interaction = _make_interaction()
+        await view._exit_all_views(interaction)
+        interaction.response.defer.assert_called_once()
+
+
 # // ========================================( Helpers )======================================== // #
 
 
@@ -798,6 +847,27 @@ class TestDevToolsCogGroupListing:
         assert subcommand_names
         for name in subcommand_names:
             assert f"/cascadeui {name}" in sent
+
+
+class TestDevToolsCogOwnerToolMarker:
+    """DevToolsCog carries a readable owner-tool marker for consumer routing."""
+
+    def test_class_marker_is_true(self):
+        assert DevToolsCog.is_owner_tool is True
+
+    def test_instance_marker_via_getattr(self):
+        cog = DevToolsCog(bot=MagicMock())
+        # Consumers read it without subclassing or matching the class name.
+        assert getattr(cog, "is_owner_tool", False) is True
+
+    def test_slash_commands_hidden_from_non_admins(self):
+        import discord
+
+        # default_permissions() (= Permissions.none) hides /cascadeui from
+        # non-admin members in the slash picker; is_owner() still gates
+        # execution and the prefix form stays available to the owner.
+        app_command = DevToolsCog.cascadeui_group.app_command
+        assert app_command.default_permissions == discord.Permissions.none()
 
 
 class TestDevToolsCogListDisplayCap:

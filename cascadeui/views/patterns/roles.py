@@ -2,7 +2,7 @@
 
 
 import logging
-from typing import ClassVar, Dict, List, Optional
+from typing import ClassVar, Dict, List, Optional, Union
 
 import discord
 from discord.ui import ActionRow, Container, TextDisplay
@@ -144,8 +144,8 @@ class _BaseRolesMixin:
     categories: ClassVar[List[RoleCategory]] = []
 
     # === Heading ===
-    title: Optional[str] = "Server Roles"
-    subtitle: Optional[str] = None
+    title: ClassVar[Optional[str]] = "Server Roles"
+    subtitle: ClassVar[Optional[str]] = None
 
     # === Mode hints ===
     # Text-size Unicode glyphs (not emoji) so all four hints render at the
@@ -153,17 +153,17 @@ class _BaseRolesMixin:
     # BUTTON et al.) trigger Discord's emoji renderer and produce a glyph
     # noticeably larger than adjacent text characters, breaking visual
     # alignment when paired with the asterisk.
-    hint_normal: Optional[str] = None
-    hint_exclusive: Optional[str] = "◉"  # ◉ fisheye -- "select one"
-    hint_required: Optional[str] = "*"
-    hint_exclusive_required: Optional[str] = "◉ *"  # ◉ *
+    hint_normal: ClassVar[Optional[str]] = None
+    hint_exclusive: ClassVar[Optional[str]] = "◉"  # ◉ fisheye -- "select one"
+    hint_required: ClassVar[Optional[str]] = "*"
+    hint_exclusive_required: ClassVar[Optional[str]] = "◉ *"  # ◉ *
 
     # === Response messages (format placeholders: {role}, {category}, {removed}) ===
-    assigned_message: str = "Gave you **{role}**."
-    removed_message: str = "Removed **{role}**."
-    required_message: str = "You must keep at least one **{category}** role."
-    swap_message: str = "Switched to **{role}** (removed {removed})."
-    role_error_message: str = "Could not update roles: {error}"
+    assigned_message: ClassVar[str] = "Gave you **{role}**."
+    removed_message: ClassVar[str] = "Removed **{role}**."
+    required_message: ClassVar[str] = "You must keep at least one **{category}** role."
+    swap_message: ClassVar[str] = "Switched to **{role}** (removed {removed})."
+    role_error_message: ClassVar[str] = "Could not update roles: {error}"
 
     # === Registration ===
 
@@ -189,6 +189,13 @@ class _BaseRolesMixin:
                 raise TypeError(
                     f"{cls.__name__}.categories entries must be RoleCategory "
                     f"instances (got {type(category).__name__})"
+                )
+            if len(category.roles) > 5:
+                raise ValueError(
+                    f"{cls.__name__}.categories: RoleCategory {category.name!r} has "
+                    f"{len(category.roles)} roles, but a category renders as one "
+                    f"ActionRow, which holds at most 5 buttons. Split it across "
+                    f"multiple categories."
                 )
             slug = _category_slug(category.name)
             existing_cls = _role_view_class_registry.get(slug)
@@ -254,10 +261,12 @@ class _BaseRolesMixin:
     def build_category_card(cls, category: RoleCategory) -> Container:
         """Render one category as a Container with title, hint, and buttons.
 
-        Default composes the smaller ``format_*`` hooks. Override only
-        when the whole card layout needs to change (different structure,
-        multiple rows, custom components); override ``format_*`` hooks
-        for decorative tweaks.
+        A classmethod (like every render hook here) because the
+        ``DynamicPersistentButton`` dispatch path has no view instance at
+        click time. Default composes the smaller ``format_*`` hooks. Override
+        only when the whole card layout needs to change (different structure,
+        multiple rows, custom components); override ``format_*`` hooks for
+        decorative tweaks.
         """
         items: list = [TextDisplay(cls.format_category_title(category))]
 
@@ -412,7 +421,7 @@ class _BaseRolesMixin:
     async def on_role_error(
         cls,
         interaction: discord.Interaction,
-        error,
+        error: Union[Exception, str],
     ) -> None:
         """Called when role mutation fails. Default: ephemeral role_error_message.
 
@@ -527,12 +536,11 @@ class PersistentRolesLayoutView(_PersistentMixin, RolesLayoutView):
         displayed message on the next bot start instead of remaining
         frozen at the values that were live when ``send()`` first ran.
 
-        Cost is zero when nothing changed: ``refresh()``'s render-hash
-        short-circuit skips the Discord ``PATCH`` when the rebuilt tree
-        is byte-identical to what the message already shows. Bots whose
-        configuration has not changed pay nothing per restart; bots
-        whose configuration has changed pay one edit per persistent
-        role panel.
+        The restore always ships one edit per panel: a freshly restored
+        view has no render-hash baseline, so this first ``refresh()`` never
+        short-circuits. Source-code edits to the configuration therefore
+        reach the displayed message at a cost of one ``PATCH`` per persistent
+        role panel per restart.
         """
         self.build_ui()
         await self.refresh()

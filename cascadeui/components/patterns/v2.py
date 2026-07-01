@@ -1,7 +1,21 @@
 # // ========================================( Modules )======================================== // #
 
 
-from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Sequence, Tuple, Union
+import inspect
+from typing import (
+    Any,
+    Callable,
+    ClassVar,
+    Dict,
+    Iterable,
+    List,
+    Literal,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import discord
 from discord.components import MediaGalleryItem
@@ -17,8 +31,8 @@ from discord.ui import (
     Thumbnail,
 )
 
-from ..base import StatefulButton
-from ..types import EmojiInput, MediaInput
+from ..base import StatefulButton, StatefulSelect
+from ..types import MAX_SELECT_OPTIONS, EmojiInput, MediaInput
 
 # Discord content-length ceiling for a single TextDisplay component.
 _TEXTDISPLAY_MAX_CHARS = 4000
@@ -119,10 +133,11 @@ def action_section(
     style: discord.ButtonStyle = discord.ButtonStyle.secondary,
     emoji: EmojiInput = None,
     custom_id: Optional[str] = None,
+    disabled: bool = False,
 ) -> Section:
     """Build a Section with a StatefulButton accessory.
 
-    V2's signature pattern -- text and an action button on the same line  --
+    V2's signature pattern -- text and an action button on the same line --
     as a one-liner instead of 5+ lines.
 
     Args:
@@ -131,6 +146,10 @@ def action_section(
         callback: Async callback ``(interaction) -> None``.
         style: Button style (default: secondary).
         emoji: Optional button emoji.
+        disabled: Render the accessory button greyed out and
+            non-interactive (default: ``False``). Use for a card-embedded
+            action that is not yet available (an incomplete form, a no-op
+            transition) instead of accepting the click and rejecting it.
 
     Returns:
         A ``Section`` with a ``TextDisplay`` and ``StatefulButton`` accessory.
@@ -144,7 +163,13 @@ def action_section(
             style=discord.ButtonStyle.primary,
         )
     """
-    button_kwargs = {"label": label, "style": style, "emoji": emoji, "callback": callback}
+    button_kwargs = {
+        "label": label,
+        "style": style,
+        "emoji": emoji,
+        "callback": callback,
+        "disabled": disabled,
+    }
     if custom_id is not None:
         button_kwargs["custom_id"] = custom_id
     return Section(
@@ -161,6 +186,7 @@ def toggle_section(
     labels: Tuple[str, str] = ("Enabled", "Disabled"),
     emoji: EmojiInput = None,
     custom_id: Optional[str] = None,
+    disabled: bool = False,
 ) -> Section:
     """Build a Section with a green/red toggle button accessory.
 
@@ -175,6 +201,9 @@ def toggle_section(
         callback: Async callback ``(interaction) -> None``.
         labels: ``(active_label, inactive_label)`` tuple. Defaults to
             ``("Enabled", "Disabled")``.
+        disabled: Render the toggle button greyed out and non-interactive
+            (default: ``False``). Use when the toggle is locked by another
+            condition (a parent setting that gates it).
 
     Returns:
         A ``Section`` with toggle button accessory.
@@ -192,6 +221,7 @@ def toggle_section(
         "style": discord.ButtonStyle.success if active else discord.ButtonStyle.danger,
         "emoji": emoji,
         "callback": callback,
+        "disabled": disabled,
     }
     if custom_id is not None:
         button_kwargs["custom_id"] = custom_id
@@ -297,9 +327,9 @@ def confirm_section(
 ) -> List:
     """Build a confirm/cancel prompt as a list of V2 children.
 
-    Returns a ``[Section, ActionRow]`` pair rather than a single
+    Returns a ``[TextDisplay, ActionRow]`` pair rather than a single
     component so the caller can splat it into ``card(...)`` or add
-    it directly to a view alongside other content. The Section holds
+    it directly to a view alongside other content. The TextDisplay holds
     the prompt text; the ActionRow holds the paired success/danger
     buttons.
 
@@ -541,6 +571,279 @@ def toggle_button(
     )
     button._toggle_active = active
     return button
+
+
+# // ========================================( Choices )======================================== // #
+
+
+class Choice(NamedTuple):
+    """One option in a :func:`choice_row`.
+
+    The rich form of a choice. ``choice_row`` also accepts a plain
+    ``{label: value}`` dict for the common case; ``Choice`` adds a
+    per-option emoji and a per-option dropdown description.
+
+    Attributes:
+        label: Display text for the option.
+        value: The value handed to ``on_select`` when this option is
+            picked. Any Python object -- the builder maps it to and from
+            the string Discord requires on select option values, so the
+            callback always receives the real value.
+        emoji: Optional emoji shown on the button or select option.
+        description: Optional second line shown on the select option.
+            Ignored when the control renders as buttons (buttons have no
+            description slot).
+    """
+
+    label: str
+    value: Any
+    emoji: EmojiInput = None
+    description: Optional[str] = None
+
+
+def _normalize_choices(options: Union[Dict[str, Any], Sequence[Choice]]) -> List[Choice]:
+    """Resolve dict or Choice-sequence input into a list of ``Choice``."""
+    if isinstance(options, dict):
+        return [Choice(label=str(label), value=value) for label, value in options.items()]
+    resolved: List[Choice] = []
+    for opt in options:
+        if not isinstance(opt, Choice):
+            raise TypeError(
+                f"choice_row options must be a dict or a sequence of Choice; "
+                f"got {type(opt).__name__}"
+            )
+        resolved.append(opt)
+    return resolved
+
+
+def _selected_set(selected: Any, multi: bool) -> set:
+    """Normalize ``selected`` into a set of active values.
+
+    Single-select treats ``selected`` as one value; multi-select treats
+    it as a collection. ``str``/``bytes`` are never iterated apart (a
+    string value is one choice, not a set of characters).
+    """
+    if selected is None:
+        return set()
+    if not multi:
+        if isinstance(selected, (list, tuple, set, frozenset)):
+            raise TypeError(
+                "choice_row: with multi=False, selected must be a single value "
+                f"(not a {type(selected).__name__}). Pass multi=True to select several."
+            )
+        return {selected}
+    if isinstance(selected, (str, bytes)) or not hasattr(selected, "__iter__"):
+        raise TypeError(
+            "choice_row: with multi=True, selected must be a collection of "
+            f"values (set/list/tuple), got {type(selected).__name__}"
+        )
+    return set(selected)
+
+
+def choice_row(
+    options: Union[Dict[str, Any], Sequence[Choice]],
+    *,
+    on_select: Callable,
+    selected: Any = None,
+    multi: bool = False,
+    disabled: bool = False,
+    button_threshold: int = 5,
+    active_style: discord.ButtonStyle = discord.ButtonStyle.primary,
+    inactive_style: discord.ButtonStyle = discord.ButtonStyle.secondary,
+    placeholder: Optional[str] = None,
+    custom_id: str = "choice",
+) -> ActionRow:
+    """Build a "choose one" (or "choose any") control from a set of options.
+
+    Collapses the hand-rolled segmented control -- a row of buttons where
+    the active option is styled differently and disabled, each wired to set
+    its value -- into one call, and switches to a dropdown automatically
+    when the option count outgrows a button row.
+
+    The active option(s) render highlighted. In single-select the active
+    button is also disabled (re-picking it is a no-op); in multi-select the
+    buttons become toggles, so an active option can be clicked to turn it
+    off. ``on_select`` receives the picked value (single) or the full list
+    of currently-selected values (multi). Discord requires select option
+    values to be strings; the builder maps to and from that string form, so
+    ``on_select`` always sees the real Python value.
+
+    The builder is stateless -- it reads ``selected`` at build time and
+    renders the active option(s) from it. The host view owns the selection:
+    the ``on_select`` callback stores the new value and rebuilds the row
+    (``build_ui()`` then ``refresh()``, or a state dispatch) so the next
+    render reflects the pick. Without a rebuild the control snaps back to the
+    build-time ``selected`` on the following click.
+
+    Args:
+        options: Either a ``{label: value}`` dict (the common case) or a
+            sequence of :class:`Choice` (when an option needs an emoji or
+            a dropdown description). Insertion order is preserved.
+        on_select: Async callback. Single-select: ``(interaction, value)``.
+            Multi-select: ``(interaction, values)`` where ``values`` is the
+            full list of selected values after the toggle.
+        selected: The active value (single-select) or a collection of
+            active values (multi-select). ``None`` means nothing selected.
+        multi: When ``True``, multiple options can be active at once.
+        disabled: When ``True``, the whole control renders greyed out and
+            non-interactive (every button, or the dropdown). Use it for a
+            read-only state -- a locked or closed choice -- where the
+            selection still shows but cannot change.
+        button_threshold: Render as buttons when the option count is at or
+            below this (default 5, Discord's per-row button cap); render as
+            a dropdown above it. ``0`` forces a dropdown for every count.
+            Must be an int in ``0..5``.
+        active_style: Button style for active options (default primary).
+            Applies only to the button form; dropdowns have no style.
+        inactive_style: Button style for inactive options (default
+            secondary). Applies only to the button form.
+        placeholder: Placeholder text for the dropdown form.
+        custom_id: Base custom_id for the control. Defaults to ``"choice"``;
+            pass a distinct value to every ``choice_row`` in the same view,
+            or their buttons (and the dropdown) collide in Discord's
+            dispatch table.
+
+    Returns:
+        A single ``ActionRow`` holding either the buttons or the dropdown.
+
+    Raises:
+        ValueError: ``options`` is empty, exceeds Discord's 25-option limit
+            for a single control, or ``button_threshold`` is out of ``0..5``.
+        TypeError: ``on_select`` is not callable, an option is neither a
+            ``Choice`` nor part of a dict, or a multi-select ``selected`` is
+            not a collection.
+
+    Example::
+
+        choice_row(
+            {"Easy": Difficulty.EASY, "Hard": Difficulty.HARD},
+            selected=self.difficulty,
+            on_select=self._set_difficulty,
+        )
+    """
+    choices = _normalize_choices(options)
+    if not choices:
+        raise ValueError("choice_row: options must not be empty.")
+    if len(choices) > MAX_SELECT_OPTIONS:
+        raise ValueError(
+            f"choice_row: {len(choices)} options exceeds Discord's "
+            f"{MAX_SELECT_OPTIONS}-option limit for a single control. "
+            f"Paginate or split the choices."
+        )
+    if (
+        not isinstance(button_threshold, int)
+        or isinstance(button_threshold, bool)
+        or not 0 <= button_threshold <= 5
+    ):
+        raise ValueError(
+            f"choice_row: button_threshold must be an int in 0..5, got {button_threshold!r}"
+        )
+    if not callable(on_select):
+        raise TypeError(f"choice_row: on_select must be callable, got {type(on_select).__name__}")
+
+    active = _selected_set(selected, multi)
+    if len(choices) <= button_threshold:
+        return _choice_button_row(
+            choices, active, on_select, multi, active_style, inactive_style, custom_id, disabled
+        )
+    return _choice_select_row(choices, active, on_select, multi, placeholder, custom_id, disabled)
+
+
+def _make_single_choice_callback(value: Any, on_select: Callable):
+    async def callback(interaction: discord.Interaction):
+        await on_select(interaction, value)
+
+    return callback
+
+
+def _make_multi_choice_callback(value: Any, active: set, on_select: Callable):
+    # active is the build-time snapshot; clicking toggles this value in or
+    # out and hands the host the full new set. The host stores it and
+    # rebuilds, so the next render's buttons capture the updated set.
+    async def callback(interaction: discord.Interaction):
+        new = set(active)
+        new.discard(value) if value in new else new.add(value)
+        await on_select(interaction, list(new))
+
+    return callback
+
+
+def _choice_button_row(
+    choices: List[Choice],
+    active: set,
+    on_select: Callable,
+    multi: bool,
+    active_style: discord.ButtonStyle,
+    inactive_style: discord.ButtonStyle,
+    custom_id: str,
+    disabled: bool,
+) -> ActionRow:
+    buttons = []
+    for i, choice in enumerate(choices):
+        is_active = choice.value in active
+        if multi:
+            callback = _make_multi_choice_callback(choice.value, active, on_select)
+            # Whole-control disable only; a multi toggle is never self-disabled.
+            button_disabled = disabled
+        else:
+            callback = _make_single_choice_callback(choice.value, on_select)
+            # The active option is disabled (re-picking is a no-op), and the
+            # whole control is disabled when the caller passes disabled=True.
+            button_disabled = disabled or is_active
+        buttons.append(
+            StatefulButton(
+                label=choice.label,
+                emoji=choice.emoji,
+                style=active_style if is_active else inactive_style,
+                disabled=button_disabled,
+                custom_id=f"{custom_id}_{i}",
+                callback=callback,
+            )
+        )
+    return ActionRow(*buttons)
+
+
+def _choice_select_row(
+    choices: List[Choice],
+    active: set,
+    on_select: Callable,
+    multi: bool,
+    placeholder: Optional[str],
+    custom_id: str,
+    disabled: bool,
+) -> ActionRow:
+    idx_to_value = [choice.value for choice in choices]
+    options = [
+        discord.SelectOption(
+            label=choice.label,
+            value=str(i),
+            emoji=choice.emoji,
+            description=choice.description,
+            default=choice.value in active,
+        )
+        for i, choice in enumerate(choices)
+    ]
+
+    async def callback(interaction: discord.Interaction, values: List[str]):
+        # StatefulSelect's 2-param protocol passes the raw Discord string
+        # values (the str(i) option values), not the real choices. Resolve
+        # each back to its Python value before handing it to on_select.
+        resolved = [idx_to_value[int(v)] for v in values]
+        if multi:
+            await on_select(interaction, resolved)
+        else:
+            await on_select(interaction, resolved[0] if resolved else None)
+
+    select = StatefulSelect(
+        options=options,
+        custom_id=custom_id,
+        placeholder=placeholder,
+        min_values=0 if multi else 1,
+        max_values=len(choices) if multi else 1,
+        disabled=disabled,
+        callback=callback,
+    )
+    return ActionRow(select)
 
 
 # // ========================================( Content )======================================== // #
@@ -811,6 +1114,719 @@ def tab_nav(
             for label, callback in tabs.items()
         )
     )
+
+
+# // ========================================( Pagination )======================================== // #
+
+
+async def _rerender_host(view) -> None:
+    """Re-run a host view's render path, then ship the edit.
+
+    Shared by the V2 stateful composites (``PaginatedRegion``,
+    ``Collapsible``). Host views rebuild through different seams, and the
+    probe matches each in turn:
+
+    - ``build_ui``-based views rebuild the tree from already-loaded data
+      (cheap, no refetch), then ``refresh``.
+    - ``TabLayoutView`` rebuilds the active tab through ``_refresh_tabs``,
+      which re-runs the tab builder and ships the edit itself.
+    - ``on_load``-based views rebuild inside ``on_load`` -- ``reload()`` is
+      ``on_load`` + ``refresh``.
+    - A bare ``refresh`` re-ships the current tree when the host matches
+      none of the above.
+
+    Probed by duck typing rather than ``isinstance`` so the component layer
+    stays free of a ``views`` import.
+    """
+    if view is None or view.is_finished():
+        return
+    build = getattr(view, "build_ui", None)
+    if build is not None:
+        result = build()
+        if inspect.isawaitable(result):
+            await result
+        await view.refresh()
+        return
+    refresh_tabs = getattr(view, "_refresh_tabs", None)
+    if refresh_tabs is not None:
+        await refresh_tabs()
+        return
+    reload = getattr(view, "reload", None)
+    if reload is not None:
+        await reload()
+        return
+    await view.refresh()
+
+
+class PaginatedRegion:
+    """A stateful pager for ONE region of a V2 layout view.
+
+    The V2 sibling of the V1 :class:`PaginationControls` composite. Where
+    :class:`~cascadeui.PaginatedLayoutView` owns the whole message and
+    paginates it end to end, a ``PaginatedRegion`` paginates a single slice
+    of items *inside* a host view's ``build_ui()`` and leaves the rest of
+    the tree -- headers, other cards, even a second region -- to the host.
+    Each instance holds its own page index, so two regions can live in one
+    view without sharing a cursor.
+
+    The host owns the data and the per-item rendering; the region owns the
+    page index, the slice math, and the navigation row. Inside the host's
+    ``build_ui()`` the host sets the current item list on the region, reads
+    the page slice, renders each item however it likes, and asks the region
+    for its controls::
+
+        class TaskListView(StatefulLayoutView):
+            def __init__(self, tasks, **kwargs):
+                super().__init__(**kwargs)
+                self.tasks = tasks
+                self.pager = PaginatedRegion(per_page=6)
+
+            def build_ui(self):
+                self.clear_items()
+                self.pager.items = self.tasks
+                rows = [
+                    action_section(t.title, label="Open", callback=self._open(t))
+                    for t in self.pager.page_items
+                ]
+                self.add_item(card("## Tasks", *rows, *self.pager.controls(self)))
+
+    On a Prev/Next/jump click the region updates its index, re-runs the
+    host's render path, and ships the edit. A host that builds its tree in
+    ``build_ui()`` is rebuilt there (sync or async); a host that builds in
+    ``on_load()`` is rebuilt through ``reload()``. Either way the new
+    page's slice is rendered before the refresh. Beyond the bare
+    three-button pager, first/last jump buttons and a go-to-page modal
+    appear once the page count reaches ``jump_threshold``, matching the
+    navigation surface of :class:`~cascadeui.PaginatedLayoutView`.
+
+    Customization mirrors ``PaginatedLayoutView`` exactly. Each of the five
+    navigation buttons (``first``, ``prev``, ``indicator``, ``next``,
+    ``last``) exposes a ``{label, emoji, style}`` class-attribute triple,
+    and ``jump_threshold`` is a class attribute. Subclass and override the
+    ones to change::
+
+        class WideRegion(PaginatedRegion):
+            jump_threshold = 3
+            prev_button_label = "Prev"
+            next_button_label = "Next"
+
+    The ``async def on_page_changed(self, page)`` hook runs after the page
+    index updates and before the refresh -- the seam for analytics, async
+    prefetch, or per-page validation. It mirrors the same hook on
+    ``PaginatedView`` / ``PaginatedLayoutView``.
+
+    Two regions in one view need distinct ``key`` values so their button
+    custom_ids do not collide::
+
+        self.left = PaginatedRegion(per_page=5, key="left")
+        self.right = PaginatedRegion(per_page=5, key="right")
+
+    Set ``per_page=1`` for a carousel that shows one item at a time.
+
+    Args:
+        items: Initial item list. May be omitted and set later via the
+            ``items`` property (the usual path for data that loads in
+            ``on_load``).
+        per_page: Items per page. Must be a positive int. ``1`` produces
+            a one-item-at-a-time carousel.
+        key: Disambiguator baked into the nav button custom_ids. Two
+            regions in the same view must use distinct keys.
+    """
+
+    # Page count at which first/last and go-to-page buttons appear.
+    jump_threshold: ClassVar[int] = 5
+
+    first_button_label: ClassVar[Optional[str]] = "⏮"
+    first_button_emoji: ClassVar[EmojiInput] = None
+    first_button_style: ClassVar[discord.ButtonStyle] = discord.ButtonStyle.secondary
+
+    prev_button_label: ClassVar[Optional[str]] = "◀"
+    prev_button_emoji: ClassVar[EmojiInput] = None
+    prev_button_style: ClassVar[discord.ButtonStyle] = discord.ButtonStyle.secondary
+
+    indicator_button_label: ClassVar[Optional[str]] = None  # default uses "Page {n}/{t}"
+    indicator_button_emoji: ClassVar[EmojiInput] = None
+    indicator_button_style: ClassVar[discord.ButtonStyle] = discord.ButtonStyle.primary
+
+    next_button_label: ClassVar[Optional[str]] = "▶"
+    next_button_emoji: ClassVar[EmojiInput] = None
+    next_button_style: ClassVar[discord.ButtonStyle] = discord.ButtonStyle.secondary
+
+    last_button_label: ClassVar[Optional[str]] = "⏭"
+    last_button_emoji: ClassVar[EmojiInput] = None
+    last_button_style: ClassVar[discord.ButtonStyle] = discord.ButtonStyle.secondary
+
+    def __init_subclass__(cls, **kwargs) -> None:
+        super().__init_subclass__(**kwargs)
+        threshold = cls.__dict__.get("jump_threshold")
+        if threshold is not None and (
+            not isinstance(threshold, int) or isinstance(threshold, bool) or threshold < 1
+        ):
+            raise ValueError(
+                f"{cls.__name__}.jump_threshold must be a positive int, got {threshold!r}"
+            )
+        for attr in (
+            "first_button_style",
+            "prev_button_style",
+            "indicator_button_style",
+            "next_button_style",
+            "last_button_style",
+        ):
+            style = cls.__dict__.get(attr)
+            if style is not None and not isinstance(style, discord.ButtonStyle):
+                raise TypeError(
+                    f"{cls.__name__}.{attr} must be a discord.ButtonStyle, got {style!r}"
+                )
+        for attr in (
+            "first_button_label",
+            "prev_button_label",
+            "indicator_button_label",
+            "next_button_label",
+            "last_button_label",
+        ):
+            label = cls.__dict__.get(attr)
+            if label is not None and not isinstance(label, str):
+                raise TypeError(f"{cls.__name__}.{attr} must be a str or None, got {label!r}")
+        for attr in (
+            "first_button_emoji",
+            "prev_button_emoji",
+            "indicator_button_emoji",
+            "next_button_emoji",
+            "last_button_emoji",
+        ):
+            emoji = cls.__dict__.get(attr)
+            if emoji is not None and not isinstance(
+                emoji, (str, discord.Emoji, discord.PartialEmoji)
+            ):
+                raise TypeError(
+                    f"{cls.__name__}.{attr} must be a str, discord.Emoji, "
+                    f"discord.PartialEmoji, or None, got {emoji!r}"
+                )
+
+    def __init__(
+        self,
+        *,
+        items: Optional[Sequence[Any]] = None,
+        per_page: int = 10,
+        key: str = "page",
+    ) -> None:
+        if not isinstance(per_page, int) or isinstance(per_page, bool) or per_page < 1:
+            raise ValueError(f"per_page must be a positive int, got {per_page!r}")
+        if not isinstance(key, str) or not key:
+            raise ValueError(f"key must be a non-empty str, got {key!r}")
+
+        self._items: List[Any] = list(items) if items is not None else []
+        self._per_page = per_page
+        self._key = key
+
+        self._page = 0
+        # Captured by controls() so click callbacks can rebuild + refresh
+        # the host view (mirrors ToggleGroup.add_to_view).
+        self._view = None
+
+    # // ----( Override hook )---- // #
+
+    async def on_page_changed(self, page: int) -> None:
+        """Called after the page index updates, before the refresh.
+
+        ``page`` is the zero-based index of the new current page. Default
+        is a no-op. Override for analytics, async prefetch, or per-page
+        validation that should fire on every page turn.
+        """
+        return None
+
+    # // ----( Data + slice )---- // #
+
+    @property
+    def items(self) -> List[Any]:
+        """The full item list the region paginates."""
+        return self._items
+
+    @items.setter
+    def items(self, value: Sequence[Any]) -> None:
+        self._items = list(value)
+        self._clamp()
+
+    @property
+    def page(self) -> int:
+        """Current zero-based page index."""
+        return self._page
+
+    @property
+    def page_count(self) -> int:
+        """Total number of pages for the current item list (minimum 1)."""
+        return max(1, (len(self._items) + self._per_page - 1) // self._per_page)
+
+    @property
+    def page_items(self) -> List[Any]:
+        """The slice of items on the current page."""
+        self._clamp()
+        start = self._page * self._per_page
+        return self._items[start : start + self._per_page]
+
+    def set_page(self, index: int) -> None:
+        """Jump to a zero-based page index, clamped to the valid range."""
+        self._page = index
+        self._clamp()
+
+    def _clamp(self) -> None:
+        self._page = max(0, min(self._page, self.page_count - 1))
+
+    # // ----( Controls )---- // #
+
+    def controls(self, view, *, compact: bool = False) -> List[ActionRow]:
+        """Capture the host view and return the navigation row.
+
+        Returns an empty list when the item list fits on a single page
+        (nothing to navigate), so the result splats into a ``card(...)``
+        or a sequence of ``add_item`` calls without adding stray rows::
+
+            card("## Tasks", *rows, *self.pager.controls(self))
+
+        ``view`` must be the host ``StatefulLayoutView``; the region calls
+        its ``build_ui`` / ``refresh`` / ``open_modal`` on navigation.
+
+        ``compact=True`` builds a three-button row -- prev, go-to-page,
+        next -- dropping first/last and the standalone indicator. It trims
+        the pager's own row to three nodes; to fuse the pager buttons into
+        a host-owned row with Back/Exit, see :meth:`control_buttons`.
+        """
+        self._view = view
+        if self.page_count <= 1:
+            return []
+        return [ActionRow(*self._build_nav_buttons(compact=compact))]
+
+    def control_buttons(self, view, *, compact: bool = False) -> List:
+        """Capture the host view and return the nav buttons unwrapped.
+
+        The button-level counterpart to :meth:`controls`: the same wired
+        prev / next / jump buttons, returned as a bare list instead of an
+        ``ActionRow``, so a node-tight host packs them into a row it owns
+        alongside its own Back / Exit buttons::
+
+            ActionRow(
+                *self.pager.control_buttons(self, compact=True),
+                self.make_back_button(),
+                self.make_exit_button(),
+            )
+
+        Mirrors the :meth:`~cascadeui.StatefulLayoutView.make_back_button`
+        (primitive) / :meth:`~cascadeui.StatefulLayoutView.make_nav_row`
+        (wrapper) split, with ``controls`` as the wrapper. Returns an empty
+        list on a single page.
+
+        ``compact=True`` returns three buttons (prev, go-to-page, next),
+        the shape that fuses with Back + Exit inside one five-button
+        ActionRow (3 + 2 = 5). The full set is up to five buttons and is
+        meant for a row of its own; fusing it with other buttons overflows
+        the per-row budget.
+        """
+        self._view = view
+        if self.page_count <= 1:
+            return []
+        return self._build_nav_buttons(compact=compact)
+
+    def _build_nav_buttons(self, compact: bool = False) -> List:
+        """Build the navigation buttons unwrapped.
+
+        ``compact`` drops first/last and forces the middle node to the
+        clickable go-to button, leaving prev + go-to + next -- three
+        nodes a node-tight host can fuse with its own Back/Exit row.
+
+        The return list is mixed: the below-threshold full-mode indicator
+        is a bare ``discord.ui.Button``, not a ``StatefulButton``, which is
+        why the annotation stays the unparameterized ``List``.
+        """
+        total = self.page_count
+        show_jump = (not compact) and total >= self.jump_threshold
+        at_first = self._page == 0
+        at_last = self._page >= total - 1
+
+        buttons: List = []
+
+        if show_jump:
+            buttons.append(
+                StatefulButton(
+                    label=self.first_button_label or "⏮",
+                    emoji=self.first_button_emoji,
+                    style=self.first_button_style,
+                    custom_id=f"region_{self._key}_first",
+                    disabled=at_first,
+                    callback=self._make_jump(lambda: 0),
+                )
+            )
+
+        buttons.append(
+            StatefulButton(
+                label=self.prev_button_label or "◀",
+                emoji=self.prev_button_emoji,
+                style=self.prev_button_style,
+                custom_id=f"region_{self._key}_prev",
+                disabled=at_first,
+                callback=self._make_step(-1),
+            )
+        )
+
+        # Middle node: clickable go-to when jumps are available (full mode
+        # at or above jump_threshold, or any compact row), else a
+        # non-interactive page indicator. The indicator uses secondary
+        # regardless of indicator_button_style, matching _BasePaginatedMixin.
+        if show_jump or compact:
+            buttons.append(
+                StatefulButton(
+                    label=self._resolve_goto_label(),
+                    emoji=self.indicator_button_emoji,
+                    style=self.indicator_button_style,
+                    custom_id=f"region_{self._key}_goto",
+                    callback=self._open_goto_modal,
+                )
+            )
+        else:
+            buttons.append(
+                discord.ui.Button(
+                    label=self._resolve_indicator_label(),
+                    style=discord.ButtonStyle.secondary,
+                    custom_id=f"region_{self._key}_indicator",
+                    disabled=True,
+                )
+            )
+
+        buttons.append(
+            StatefulButton(
+                label=self.next_button_label or "▶",
+                emoji=self.next_button_emoji,
+                style=self.next_button_style,
+                custom_id=f"region_{self._key}_next",
+                disabled=at_last,
+                callback=self._make_step(1),
+            )
+        )
+
+        if show_jump:
+            buttons.append(
+                StatefulButton(
+                    label=self.last_button_label or "⏭",
+                    emoji=self.last_button_emoji,
+                    style=self.last_button_style,
+                    custom_id=f"region_{self._key}_last",
+                    disabled=at_last,
+                    callback=self._make_jump(lambda: self.page_count - 1),
+                )
+            )
+
+        return buttons
+
+    # // ----( Labels )---- // #
+
+    def _resolve_indicator_label(self) -> str:
+        if self.indicator_button_label is not None:
+            return self.indicator_button_label
+        return f"Page {self._page + 1}/{self.page_count}"
+
+    def _resolve_goto_label(self) -> str:
+        if self.indicator_button_label is not None:
+            return self.indicator_button_label
+        return f"{self._page + 1}/{self.page_count}"
+
+    # // ----( Callbacks )---- // #
+
+    def _make_step(self, delta: int):
+        async def callback(interaction: discord.Interaction):
+            self._page += delta
+            self._clamp()
+            await self.on_page_changed(self._page)
+            await self._rerender()
+
+        return callback
+
+    def _make_jump(self, target_fn: Callable[[], int]):
+        # target_fn re-resolves at click time so "last" tracks the live
+        # item count, not the count captured when the row was built.
+        async def callback(interaction: discord.Interaction):
+            self._page = target_fn()
+            self._clamp()
+            await self.on_page_changed(self._page)
+            await self._rerender()
+
+        return callback
+
+    async def _open_goto_modal(self, interaction: discord.Interaction):
+        region = self
+        view = self._view
+        total = self.page_count
+
+        class _GotoModal(discord.ui.Modal, title="Go to Page"):
+            page_input = discord.ui.TextInput(
+                label=f"Page number (1–{total})",
+                placeholder=str(region._page + 1),
+                min_length=1,
+                max_length=len(str(total)),
+                required=True,
+            )
+
+            async def on_submit(modal_self, modal_interaction: discord.Interaction):
+                value = modal_self.page_input.value.strip()
+                try:
+                    page_num = int(value)
+                except ValueError:
+                    await view.respond(
+                        modal_interaction,
+                        f"'{value}' is not a valid page number.",
+                        ephemeral=True,
+                    )
+                    return
+                region.set_page(max(1, min(page_num, total)) - 1)
+                await view._safe_defer(modal_interaction)
+                await region.on_page_changed(region.page)
+                await region._rerender()
+
+        await view.open_modal(interaction, _GotoModal())
+
+    async def _rerender(self) -> None:
+        # Re-run the host's render path and ship the edit; shared with
+        # Collapsible via _rerender_host.
+        await _rerender_host(self._view)
+
+
+# // ========================================( Collapsible )======================================== // #
+
+
+class Collapsible:
+    """A trigger button that toggles an inline region of revealed content.
+
+    The V2 collapsible (disclosure / expander) primitive. A button shows
+    one label while collapsed; clicking it reveals a region of content -- a
+    ``choice_row``, a select, a card, more buttons -- and swaps the trigger
+    to its expanded label. Clicking again collapses. Each instance holds
+    its own collapsed/expanded state, so two collapsibles in one view are
+    independent.
+
+    The collapsible owns the toggle mechanism (the boolean, the trigger,
+    the rebuild) and leaves the content and the collapse policy to the
+    host. The host supplies a ``reveal`` callable that returns the
+    components to show while expanded, and renders the collapsible inside
+    its ``build_ui()`` (or ``on_load()``)::
+
+        class FilterView(StatefulLayoutView):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.league_picker = Collapsible(
+                    label="Edit Leagues",
+                    expanded_label="Done",
+                    reveal=lambda: choice_row(
+                        LEAGUES, selected=self.league, on_select=self._pick_league
+                    ),
+                )
+
+            def build_ui(self):
+                self.clear_items()
+                self.add_item(card("## Filters", key_value(self._filter_summary())))
+                for item in self.league_picker.render(self):
+                    self.add_item(item)
+
+            async def _pick_league(self, interaction, value):
+                self.league = value
+                self.league_picker.collapse()   # collapse after the pick
+                self.build_ui()
+                await self.refresh()
+
+    A click toggles the state and re-runs the host's render path (the same
+    ``build_ui``-or-``reload`` seam ``PaginatedRegion`` uses). Collapse
+    policy stays the host's: call ``collapse()`` when a revealed action
+    completes, or leave it expanded. The companion stateful composite to
+    ``PaginatedRegion``: where ``PaginatedRegion.controls(view)`` contributes
+    only a nav row, ``Collapsible.render(view)`` contributes its whole widget.
+
+    The same trigger covers every shape of the pattern: a single button
+    that opens and closes the region, a relabeled "Cancel"/"Done" while
+    open, or a styled state swap. Configure via ``expanded_label`` /
+    ``expanded_style`` / ``expanded_emoji``. Pass ``summary`` to fuse the
+    trigger into a Section beside a line of summary text (an
+    ``action_section``) instead of a bare button row -- the shape a
+    card-based disclosure wants.
+
+    Args:
+        label: Trigger label while collapsed.
+        reveal: Zero-argument synchronous callable returning the revealed
+            content -- a single component or a list. Called on every render
+            while expanded, so its callbacks stay fresh across rebuilds.
+            Async sources load in the host's ``on_load`` and ``reveal`` reads
+            the result synchronously.
+        summary: Optional zero-argument synchronous callable returning the
+            trigger's body text. When set, ``render`` emits the trigger as an
+            ``action_section`` (a Section carrying the text, with the trigger
+            button as its accessory) instead of a bare ``ActionRow(button)``,
+            so a card-based disclosure fuses the trigger beside its summary.
+            Falls back to the bare button when the callable returns an empty
+            value. Default ``None`` keeps the bare button row.
+        expanded_label: Trigger label while expanded. Defaults to ``label``
+            (the trigger keeps its text); set it to ``"Done"`` / ``"Cancel"``
+            for a relabel-on-open.
+        style: Trigger style while collapsed (default secondary).
+        expanded_style: Trigger style while expanded (default secondary).
+        emoji: Trigger emoji while collapsed.
+        expanded_emoji: Trigger emoji while expanded. Defaults to ``emoji``.
+        expanded: Initial state (default collapsed).
+        trigger_first: When ``True`` (default), the trigger renders above
+            the revealed content; when ``False``, below it (a "Cancel"
+            button under the region).
+        key: Disambiguator baked into the trigger custom_id. Two
+            collapsibles in one view need distinct keys.
+    """
+
+    def __init__(
+        self,
+        *,
+        label: str,
+        reveal: Callable,
+        summary: Optional[Callable[[], str]] = None,
+        expanded_label: Optional[str] = None,
+        style: discord.ButtonStyle = discord.ButtonStyle.secondary,
+        expanded_style: discord.ButtonStyle = discord.ButtonStyle.secondary,
+        emoji: EmojiInput = None,
+        expanded_emoji: EmojiInput = None,
+        expanded: bool = False,
+        trigger_first: bool = True,
+        key: str = "collapsible",
+    ) -> None:
+        if not isinstance(label, str) or not label:
+            raise ValueError(f"label must be a non-empty str, got {label!r}")
+        if expanded_label is not None and (
+            not isinstance(expanded_label, str) or not expanded_label
+        ):
+            raise ValueError(
+                f"expanded_label must be a non-empty str or None, got {expanded_label!r}"
+            )
+        if not callable(reveal):
+            raise TypeError(f"reveal must be callable, got {type(reveal).__name__}")
+        if inspect.iscoroutinefunction(reveal):
+            raise TypeError(
+                "reveal must be synchronous; load async data in the host's "
+                "on_load() and have reveal read the result synchronously"
+            )
+        if summary is not None:
+            if not callable(summary):
+                raise TypeError(f"summary must be callable or None, got {type(summary).__name__}")
+            if inspect.iscoroutinefunction(summary):
+                raise TypeError(
+                    "summary must be synchronous; load async data in the host's "
+                    "on_load() and have summary read the result synchronously"
+                )
+        if not isinstance(key, str) or not key:
+            raise ValueError(f"key must be a non-empty str, got {key!r}")
+        if not isinstance(expanded, bool):
+            raise TypeError(f"expanded must be a bool, got {type(expanded).__name__}")
+        if not isinstance(trigger_first, bool):
+            raise TypeError(f"trigger_first must be a bool, got {type(trigger_first).__name__}")
+        for name, value in (("style", style), ("expanded_style", expanded_style)):
+            if not isinstance(value, discord.ButtonStyle):
+                raise TypeError(f"{name} must be a discord.ButtonStyle, got {value!r}")
+
+        self._label = label
+        self._reveal = reveal
+        self._summary = summary
+        self._expanded_label = expanded_label if expanded_label is not None else label
+        self._style = style
+        self._expanded_style = expanded_style
+        self._emoji = emoji
+        self._expanded_emoji = expanded_emoji if expanded_emoji is not None else emoji
+        self._expanded = expanded
+        self._trigger_first = trigger_first
+        self._key = key
+        self._view = None
+
+    # // ----( Override hook )---- // #
+
+    async def on_toggle(self, expanded: bool) -> None:
+        """Called with the new ``expanded`` value, after the flag flips and
+        before the re-render.
+
+        ``expanded`` is the post-flip state (``True`` once revealed, ``False``
+        once collapsed). Default is a no-op. Override to fetch async data when
+        expanded, log toggle events, or run validation on every open/close.
+        """
+        return None
+
+    # // ----( State )---- // #
+
+    @property
+    def expanded(self) -> bool:
+        """Whether the region is currently revealed."""
+        return self._expanded
+
+    def expand(self) -> None:
+        """Reveal the region on the next render."""
+        self._expanded = True
+
+    def collapse(self) -> None:
+        """Hide the region on the next render."""
+        self._expanded = False
+
+    def render(self, view) -> List[Any]:
+        """Stash the host view and return the collapsible's components.
+
+        Returns ``[trigger]`` while collapsed, or the trigger plus the
+        ``reveal()`` content while expanded (ordered by ``trigger_first``).
+        Splat the result into the host's tree::
+
+            for item in self.disclosure.render(self):
+                self.add_item(item)
+
+        ``view`` must be the host ``StatefulLayoutView``; the trigger calls
+        its ``build_ui`` / ``refresh`` on toggle. Returns the whole widget
+        (trigger plus revealed content), unlike ``PaginatedRegion.controls``,
+        which returns only its nav row while the host renders the content.
+        """
+        self._view = view
+        trigger = self._build_trigger()
+        if not self._expanded:
+            return [trigger]
+
+        revealed = self._reveal()
+        revealed = revealed if isinstance(revealed, list) else [revealed]
+        return [trigger, *revealed] if self._trigger_first else [*revealed, trigger]
+
+    def _build_trigger(self):
+        """Return the trigger component for the current state.
+
+        An ``action_section`` (Section + button accessory) when summary text
+        is available, else a bare ``ActionRow(button)``.
+        """
+        # The trigger button relabels/restyles between collapsed and expanded.
+        label = self._expanded_label if self._expanded else self._label
+        style = self._expanded_style if self._expanded else self._style
+        emoji = self._expanded_emoji if self._expanded else self._emoji
+        custom_id = f"{self._key}_trigger"
+
+        # With a summary, fuse the trigger into a Section beside its text via
+        # action_section. Fall back to the bare button row when no summary is
+        # set or the callable yields nothing (e.g. data not loaded yet) -- an
+        # empty Section has no text to render.
+        if self._summary is not None:
+            text = self._summary()
+            if text:
+                return action_section(
+                    text,
+                    label=label,
+                    callback=self._toggle,
+                    style=style,
+                    emoji=emoji,
+                    custom_id=custom_id,
+                )
+        return ActionRow(
+            StatefulButton(
+                label=label,
+                style=style,
+                emoji=emoji,
+                custom_id=custom_id,
+                callback=self._toggle,
+            )
+        )
+
+    async def _toggle(self, interaction: discord.Interaction) -> None:
+        self._expanded = not self._expanded
+        await self.on_toggle(self._expanded)
+        await _rerender_host(self._view)
 
 
 # // ========================================( Media )======================================== // #

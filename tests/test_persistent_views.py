@@ -117,6 +117,20 @@ class TestCustomIdValidation:
         # Should not raise
         view._validate_custom_ids()
 
+    async def test_link_button_accepted(self):
+        """Link buttons carry no custom_id and need none; they pass validation."""
+        import discord
+
+        class _View(PersistentView):
+            pass
+
+        view = _View(persistence_key="test:link")
+        view.add_item(StatefulButton(label="Go", custom_id="go", callback=AsyncMock()))
+        view.add_item(discord.ui.Button(label="Docs", url="https://example.com"))
+
+        # Must not raise despite the link button's custom_id being None.
+        view._validate_custom_ids()
+
 
 # // ========================================( Reducers )======================================== // #
 

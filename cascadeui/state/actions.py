@@ -143,16 +143,19 @@ class ActionCreators:
         return {"deleted": deleted, "cutoff": cutoff}
 
     @staticmethod
-    def registry_pruned(deleted: int, reason: str) -> ActionPayload:
+    def registry_pruned(
+        deleted: int, reason: str, keys: Optional[List[str]] = None
+    ) -> ActionPayload:
         """Create a REGISTRY_PRUNED action payload.
 
         Fires after the persistence manager deletes rows from the
-        persistent_views namespace. ``deleted`` is the row count removed;
-        ``reason`` is a short tag (e.g. ``"orphan_messages"``,
-        ``"missing_class"``, ``"manual"``) indicating what motivated the
-        prune.
+        persistent_views namespace. ``deleted`` is the row count removed,
+        ``keys`` is the list of ``persistence_key`` values actually pruned (so
+        a subscriber can reconcile its own records surgically), and ``reason``
+        is a short tag (``"explicit"`` for a targeted prune, ``"clear_all"``
+        for a full wipe) indicating what motivated the prune.
         """
-        return {"deleted": deleted, "reason": reason}
+        return {"deleted": deleted, "keys": keys or [], "reason": reason}
 
     @staticmethod
     def scoped_update(

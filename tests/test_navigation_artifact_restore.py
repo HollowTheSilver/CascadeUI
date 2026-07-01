@@ -86,6 +86,27 @@ class TestBackButtonSurvivesRebuild:
 
         assert back_row in list(view.children)
 
+    async def test_tab_layout_view_send(self):
+        """send() recomposes the tree (it builds the first tab's content),
+        so -- like _refresh_tabs -- it must restore the back button when a
+        pushed tab view uses send() as its rebuild target."""
+
+        async def build_a():
+            return TextDisplay("Tab A content")
+
+        view = TabLayoutView(
+            interaction=_make_interaction(),
+            tabs={"A": build_a},
+        )
+        _attach_message(view)
+        view._add_back_button()
+        back_row = view._auto_back_item
+        assert back_row in list(view.children)
+
+        await view.send()
+
+        assert back_row in list(view.children)
+
     async def test_wizard_layout_view(self):
         async def step_one():
             return TextDisplay("Step 1")

@@ -156,6 +156,24 @@ class PersistenceBackend(Protocol):
         primary-key columns used to detect conflicts."""
         ...
 
+    async def row_upsert_many(
+        self,
+        namespace: str,
+        rows: list[dict[str, Any]],
+        key_columns: list[str],
+    ) -> None:
+        """Upsert ``rows`` into ``namespace`` in one batch. ``key_columns``
+        names the primary-key columns used to detect conflicts. Each row is
+        copied on store and resolved with the same conflict semantics as
+        :meth:`row_upsert`.
+
+        SQL backends collapse the batch into a single round-trip (one
+        connection acquire + one transaction + ``executemany``). The
+        persistence middleware calls ``row_upsert`` per row when a backend
+        does not implement this method, so a backend may omit it. An empty
+        ``rows`` list is a no-op."""
+        ...
+
     async def row_select(
         self,
         namespace: str,

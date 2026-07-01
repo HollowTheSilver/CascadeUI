@@ -16,13 +16,20 @@ from discord.ui import (
     TextDisplay,
     Thumbnail,
 )
+from helpers import make_interaction
 
 from cascadeui import (
+    Choice,
+    Collapsible,
+    PaginatedRegion,
     StatefulButton,
+    StatefulLayoutView,
+    StatefulSelect,
     action_section,
     alert,
     button_row,
     card,
+    choice_row,
     confirm_section,
     cycle_button,
     divider,
@@ -144,6 +151,14 @@ class TestActionSection:
         result = action_section("text", label="Go", callback=self._noop, emoji="\U0001f504")
         assert result.accessory.emoji is not None
 
+    def test_disabled_default_false(self):
+        result = action_section("text", label="Go", callback=self._noop)
+        assert result.accessory.disabled is False
+
+    def test_disabled_true(self):
+        result = action_section("text", label="Go", callback=self._noop, disabled=True)
+        assert result.accessory.disabled is True
+
 
 # // ========================================( Toggle Section )======================================== // #
 
@@ -184,6 +199,14 @@ class TestToggleSection:
     def test_text_preserved(self):
         result = toggle_section("\u2705 **Moderation**", active=True, callback=self._noop)
         assert result.children[0].content == "\u2705 **Moderation**"
+
+    def test_disabled_default_false(self):
+        result = toggle_section("Module", active=True, callback=self._noop)
+        assert result.accessory.disabled is False
+
+    def test_disabled_true(self):
+        result = toggle_section("Module", active=True, callback=self._noop, disabled=True)
+        assert result.accessory.disabled is True
 
 
 # // ========================================( Image Section )======================================== // #
@@ -670,3 +693,1122 @@ class TestTabNav:
     def test_overflow_raises(self):
         with pytest.raises(ValueError, match="5-per-ActionRow"):
             tab_nav({str(i): _noop for i in range(6)})
+
+
+# // ========================================( Paginated Region )======================================== // #
+
+
+class _FakeHost:
+    """Minimal stand-in for the StatefulLayoutView a region captures.
+
+    Records build_ui / refresh / defer / respond / open_modal calls so the
+    region's callbacks can be exercised without the full view machinery.
+    """
+
+    def __init__(self, *, finished=False, async_build=False):
+        self.build_calls = 0
+        self.refresh_calls = 0
+        self._finished = finished
+        self._async_build = async_build
+        self.deferred = []
+        self.responded = []
+        self.opened_modal = None
+
+    def is_finished(self):
+        return self._finished
+
+    def build_ui(self):
+        self.build_calls += 1
+        if self._async_build:
+
+            async def _done():
+                return None
+
+            return _done()
+
+    async def refresh(self, **kwargs):
+        self.refresh_calls += 1
+
+    async def _safe_defer(self, interaction):
+        self.deferred.append(interaction)
+
+    async def respond(self, interaction, content, **kwargs):
+        self.responded.append(content)
+
+    async def open_modal(self, interaction, modal):
+        self.opened_modal = modal
+
+
+class _OnLoadHost:
+    """Host that builds in on_load (no build_ui) -- exercises reload() fallback.
+
+    The modern preload-based view shape: a view defines ``on_load`` rather
+    than ``build_ui``, so the region's ``_rerender`` must route through
+    ``reload`` (on_load + refresh) instead of the build_ui seam.
+    """
+
+    def __init__(self):
+        self.reload_calls = 0
+        self.refresh_calls = 0
+        self._finished = False
+
+    def is_finished(self):
+        return self._finished
+
+    async def reload(self):
+        self.reload_calls += 1
+
+    async def refresh(self, **kwargs):
+        self.refresh_calls += 1
+
+
+class _TabHost:
+    """Host that rebuilds via _refresh_tabs (the TabLayoutView seam).
+
+    A composite placed inside a tab must route its re-render through
+    ``_refresh_tabs`` -- the tab view has no build_ui and its bare reload()
+    would refresh a stale tree.
+    """
+
+    def __init__(self):
+        self.tab_refreshes = 0
+        self._finished = False
+
+    def is_finished(self):
+        return self._finished
+
+    async def _refresh_tabs(self):
+        self.tab_refreshes += 1
+
+    # A real TabLayoutView also inherits reload(); _refresh_tabs must win.
+    async def reload(self):
+        raise AssertionError("reload() should not be called for a tab host")
+
+    async def refresh(self, **kwargs):
+        raise AssertionError("bare refresh() should not be called for a tab host")
+
+
+def _ids(row):
+    return [b.custom_id for b in row.children]
+
+
+class TestPaginatedRegionConstruction:
+    """PaginatedRegion validates its construction arguments at __init__."""
+
+    def test_per_page_zero_raises(self):
+        with pytest.raises(ValueError, match="per_page must be a positive int"):
+            PaginatedRegion(per_page=0)
+
+    def test_per_page_negative_raises(self):
+        with pytest.raises(ValueError, match="per_page must be a positive int"):
+            PaginatedRegion(per_page=-1)
+
+    def test_per_page_bool_raises(self):
+        # bool is an int subclass; True must not slip through as per_page=1.
+        with pytest.raises(ValueError, match="per_page must be a positive int"):
+            PaginatedRegion(per_page=True)
+
+    def test_jump_threshold_zero_raises(self):
+        # jump_threshold is a class attribute (mirrors PaginatedLayoutView);
+        # a bad override fails at class-definition time, not construction.
+        with pytest.raises(ValueError, match="jump_threshold must be a positive int"):
+
+            class _R(PaginatedRegion):
+                jump_threshold = 0
+
+    def test_jump_threshold_bool_raises(self):
+        with pytest.raises(ValueError, match="jump_threshold must be a positive int"):
+
+            class _R(PaginatedRegion):
+                jump_threshold = True
+
+    def test_bad_button_style_raises(self):
+        # Mirrors _BasePaginatedMixin: a bad nav-button style fails at
+        # class-definition time, not when the button is built.
+        with pytest.raises(TypeError, match="must be a discord.ButtonStyle"):
+
+            class _R(PaginatedRegion):
+                prev_button_style = "green"
+
+    def test_bad_button_label_raises(self):
+        # A non-str label fails at class-definition time, not at render.
+        with pytest.raises(TypeError, match="must be a str or None"):
+
+            class _R(PaginatedRegion):
+                next_button_label = 42
+
+    def test_bad_button_emoji_raises(self):
+        with pytest.raises(TypeError, match="must be a str, discord.Emoji"):
+
+            class _R(PaginatedRegion):
+                next_button_emoji = 123
+
+    def test_empty_key_raises(self):
+        with pytest.raises(ValueError, match="key must be a non-empty str"):
+            PaginatedRegion(key="")
+
+    def test_defaults(self):
+        region = PaginatedRegion()
+        assert region.page == 0
+        assert region.items == []
+        assert region.page_count == 1
+
+
+class TestPaginatedRegionSlicing:
+    """The region owns the slice math: page_count, page_items, clamping."""
+
+    def test_page_count_ceils(self):
+        region = PaginatedRegion(per_page=3, items=list(range(10)))
+        assert region.page_count == 4  # ceil(10 / 3)
+
+    def test_page_count_minimum_one(self):
+        region = PaginatedRegion(per_page=5, items=[])
+        assert region.page_count == 1
+
+    def test_page_items_first_page(self):
+        region = PaginatedRegion(per_page=3, items=list(range(10)))
+        assert region.page_items == [0, 1, 2]
+
+    def test_page_items_tracks_page(self):
+        region = PaginatedRegion(per_page=3, items=list(range(10)))
+        region.set_page(1)
+        assert region.page_items == [3, 4, 5]
+
+    def test_set_page_clamps_high(self):
+        region = PaginatedRegion(per_page=3, items=list(range(10)))
+        region.set_page(99)
+        assert region.page == 3  # last page
+        assert region.page_items == [9]
+
+    def test_set_page_clamps_low(self):
+        region = PaginatedRegion(per_page=3, items=list(range(10)))
+        region.set_page(-5)
+        assert region.page == 0
+
+    def test_items_setter_reclamps(self):
+        region = PaginatedRegion(per_page=3, items=list(range(10)))
+        region.set_page(3)
+        # Data shrinks under the cursor -- the page must clamp back in range.
+        region.items = [1, 2]
+        assert region.page == 0
+
+    def test_carousel_per_page_one(self):
+        region = PaginatedRegion(per_page=1, items=["a", "b", "c"])
+        assert region.page_count == 3
+        assert region.page_items == ["a"]
+
+
+class TestPaginatedRegionControls:
+    """controls() captures the host and returns the nav row when warranted."""
+
+    def test_single_page_returns_empty(self):
+        region = PaginatedRegion(per_page=10, items=[1, 2, 3])
+        assert region.controls(_FakeHost()) == []
+
+    def test_becomes_single_page_after_shrink(self):
+        # A region that was multi-page drops its nav row once the data
+        # shrinks to one page -- controls() re-evaluates page_count per call.
+        region = PaginatedRegion(per_page=5, items=list(range(10)))
+        region.controls(_FakeHost())  # multi-page
+        region.items = [1, 2]
+        assert region.controls(_FakeHost()) == []
+
+    def test_multi_page_returns_one_row(self):
+        region = PaginatedRegion(per_page=2, items=list(range(6)))
+        rows = region.controls(_FakeHost())
+        assert len(rows) == 1
+        assert isinstance(rows[0], ActionRow)
+
+    def test_controls_captures_view(self):
+        region = PaginatedRegion(per_page=2, items=list(range(6)))
+        host = _FakeHost()
+        region.controls(host)
+        assert region._view is host
+
+    def test_below_threshold_three_buttons(self):
+        # 3 pages, threshold 5 -> prev / indicator / next only.
+        region = PaginatedRegion(per_page=2, items=list(range(6)))
+        rows = region.controls(_FakeHost())
+        assert _ids(rows[0]) == [
+            "region_page_prev",
+            "region_page_indicator",
+            "region_page_next",
+        ]
+
+    def test_at_threshold_five_buttons(self):
+        # 5 pages, threshold 5 -> first / prev / goto / next / last.
+        region = PaginatedRegion(per_page=2, items=list(range(10)))
+        rows = region.controls(_FakeHost())
+        assert _ids(rows[0]) == [
+            "region_page_first",
+            "region_page_prev",
+            "region_page_goto",
+            "region_page_next",
+            "region_page_last",
+        ]
+
+    def test_distinct_keys_avoid_collision(self):
+        left = PaginatedRegion(per_page=2, items=list(range(6)), key="left")
+        right = PaginatedRegion(per_page=2, items=list(range(6)), key="right")
+        lids = set(_ids(left.controls(_FakeHost())[0]))
+        rids = set(_ids(right.controls(_FakeHost())[0]))
+        assert lids.isdisjoint(rids)
+
+    def test_disabled_at_first_page(self):
+        region = PaginatedRegion(per_page=2, items=list(range(10)))
+        row = region.controls(_FakeHost())[0]
+        state = {b.custom_id: b.disabled for b in row.children}
+        assert state["region_page_first"] is True
+        assert state["region_page_prev"] is True
+        assert state["region_page_next"] is False
+        assert state["region_page_last"] is False
+
+    def test_disabled_at_last_page(self):
+        region = PaginatedRegion(per_page=2, items=list(range(10)))
+        region.set_page(4)
+        row = region.controls(_FakeHost())[0]
+        state = {b.custom_id: b.disabled for b in row.children}
+        assert state["region_page_first"] is False
+        assert state["region_page_prev"] is False
+        assert state["region_page_next"] is True
+        assert state["region_page_last"] is True
+
+
+class TestPaginatedRegionControlButtons:
+    """control_buttons() returns the nav buttons unwrapped for host composition."""
+
+    def test_single_page_returns_empty(self):
+        region = PaginatedRegion(per_page=10, items=[1, 2, 3])
+        assert region.control_buttons(_FakeHost()) == []
+
+    def test_returns_bare_button_list_not_row(self):
+        # Unlike controls(), control_buttons() returns the buttons directly.
+        region = PaginatedRegion(per_page=2, items=list(range(10)))
+        buttons = region.control_buttons(_FakeHost())
+        assert not isinstance(buttons, ActionRow)
+        assert all(not isinstance(b, ActionRow) for b in buttons)
+        assert [b.custom_id for b in buttons] == [
+            "region_page_first",
+            "region_page_prev",
+            "region_page_goto",
+            "region_page_next",
+            "region_page_last",
+        ]
+
+    def test_captures_view(self):
+        region = PaginatedRegion(per_page=2, items=list(range(6)))
+        host = _FakeHost()
+        region.control_buttons(host)
+        assert region._view is host
+
+    def test_compact_returns_three_buttons(self):
+        # compact drops first/last and forces the clickable go-to middle.
+        region = PaginatedRegion(per_page=1, items=list(range(20)))
+        buttons = region.control_buttons(_FakeHost(), compact=True)
+        assert [b.custom_id for b in buttons] == [
+            "region_page_prev",
+            "region_page_goto",
+            "region_page_next",
+        ]
+
+    def test_compact_goto_is_clickable_below_threshold(self):
+        # Even with few pages, compact's middle is the go-to button, not
+        # the non-interactive indicator -- the jump is compact's whole point.
+        region = PaginatedRegion(per_page=2, items=list(range(6)))  # 3 pages < threshold
+        buttons = region.control_buttons(_FakeHost(), compact=True)
+        goto = buttons[1]
+        assert goto.custom_id == "region_page_goto"
+        assert goto.disabled is False
+
+    def test_compact_disabled_states(self):
+        region = PaginatedRegion(per_page=1, items=list(range(20)))
+        first = {b.custom_id: b.disabled for b in region.control_buttons(_FakeHost(), compact=True)}
+        assert first["region_page_prev"] is True
+        assert first["region_page_next"] is False
+        region.set_page(19)
+        last = {b.custom_id: b.disabled for b in region.control_buttons(_FakeHost(), compact=True)}
+        assert last["region_page_prev"] is False
+        assert last["region_page_next"] is True
+
+    def test_full_set_matches_controls_row(self):
+        # control_buttons() and controls() build the same buttons; controls()
+        # just wraps them in an ActionRow.
+        region = PaginatedRegion(per_page=2, items=list(range(10)))
+        bare = region.control_buttons(_FakeHost())
+        wrapped = region.controls(_FakeHost())[0]
+        assert [b.custom_id for b in bare] == _ids(wrapped)
+
+    def test_controls_compact_three_button_row(self):
+        region = PaginatedRegion(per_page=1, items=list(range(20)))
+        rows = region.controls(_FakeHost(), compact=True)
+        assert len(rows) == 1
+        assert _ids(rows[0]) == ["region_page_prev", "region_page_goto", "region_page_next"]
+
+    def test_compact_fuses_with_back_exit_in_one_row(self):
+        # The carousel use case: three compact pager buttons plus Back and
+        # Exit pack into a single five-button ActionRow without overflowing.
+        view = StatefulLayoutView()
+        region = PaginatedRegion(per_page=1, items=list(range(20)), key="car")
+        row = ActionRow(
+            *region.control_buttons(view, compact=True),
+            view.make_back_button(),
+            view.make_exit_button(),
+        )
+        assert len(row.children) == 5
+
+    def test_full_set_overflows_when_fused(self):
+        # The full five-button set is meant for a row of its own; fusing it
+        # with other buttons overflows discord.py's five-unit ActionRow cap.
+        view = StatefulLayoutView()
+        region = PaginatedRegion(per_page=2, items=list(range(10)), key="big")
+        with pytest.raises(ValueError):
+            ActionRow(*region.control_buttons(view), view.make_back_button())
+
+
+class TestPaginatedRegionLabels:
+    """Indicator and goto labels follow PaginatedLayoutView's conventions."""
+
+    def test_indicator_label_default(self):
+        region = PaginatedRegion(per_page=2, items=list(range(6)))
+        assert region._resolve_indicator_label() == "Page 1/3"
+
+    def test_goto_label_default(self):
+        region = PaginatedRegion(per_page=2, items=list(range(6)))
+        assert region._resolve_goto_label() == "1/3"
+
+    def test_indicator_label_override(self):
+        # indicator_button_label is a class attribute (mirrors the view pattern).
+        class _Labeled(PaginatedRegion):
+            indicator_button_label = "Items"
+
+        region = _Labeled(per_page=2, items=list(range(6)))
+        assert region._resolve_indicator_label() == "Items"
+        assert region._resolve_goto_label() == "Items"
+
+
+class TestPaginatedRegionNavigation:
+    """Click callbacks mutate the index and rebuild + refresh the host."""
+
+    async def test_step_next_advances_and_rerenders(self):
+        region = PaginatedRegion(per_page=2, items=list(range(6)))
+        host = _FakeHost()
+        region.controls(host)
+        await region._make_step(1)(make_interaction())
+        assert region.page == 1
+        assert host.build_calls == 1
+        assert host.refresh_calls == 1
+
+    async def test_step_prev_clamps_at_zero(self):
+        region = PaginatedRegion(per_page=2, items=list(range(6)))
+        region.controls(_FakeHost())
+        await region._make_step(-1)(make_interaction())
+        assert region.page == 0
+
+    async def test_jump_last_tracks_live_count(self):
+        region = PaginatedRegion(per_page=2, items=list(range(6)))
+        region.controls(_FakeHost())
+        await region._make_jump(lambda: region.page_count - 1)(make_interaction())
+        assert region.page == 2
+
+    async def test_jump_first_returns_to_zero(self):
+        region = PaginatedRegion(per_page=2, items=list(range(6)))
+        region.set_page(2)
+        region.controls(_FakeHost())
+        await region._make_jump(lambda: 0)(make_interaction())
+        assert region.page == 0
+
+    async def test_on_page_changed_fires(self):
+        seen = []
+
+        class _Tracked(PaginatedRegion):
+            async def on_page_changed(self, page):
+                seen.append(page)
+
+        region = _Tracked(per_page=2, items=list(range(6)))
+        region.controls(_FakeHost())
+        await region._make_step(1)(make_interaction())
+        assert seen == [1]
+
+    async def test_rerender_skips_finished_view(self):
+        region = PaginatedRegion(per_page=2, items=list(range(6)))
+        host = _FakeHost(finished=True)
+        region.controls(host)
+        await region._make_step(1)(make_interaction())
+        # Index still advances, but no edit is shipped to a dead view.
+        assert region.page == 1
+        assert host.refresh_calls == 0
+
+    async def test_rerender_awaits_async_build_ui(self):
+        region = PaginatedRegion(per_page=2, items=list(range(6)))
+        host = _FakeHost(async_build=True)
+        region.controls(host)
+        await region._make_step(1)(make_interaction())
+        assert host.build_calls == 1
+        assert host.refresh_calls == 1
+
+    async def test_rerender_uses_reload_for_on_load_host(self):
+        # A host that builds in on_load (no build_ui) re-renders via reload().
+        region = PaginatedRegion(per_page=2, items=list(range(6)))
+        host = _OnLoadHost()
+        region.controls(host)
+        await region._make_step(1)(make_interaction())
+        assert region.page == 1
+        assert host.reload_calls == 1
+
+    async def test_rerender_uses_refresh_tabs_for_tab_host(self):
+        # Inside a TabLayoutView the region re-renders via _refresh_tabs.
+        region = PaginatedRegion(per_page=2, items=list(range(6)))
+        host = _TabHost()
+        region.controls(host)
+        await region._make_step(1)(make_interaction())
+        assert region.page == 1
+        assert host.tab_refreshes == 1
+
+
+class TestPaginatedRegionGoto:
+    """The goto button opens a modal that jumps to a typed page number."""
+
+    async def test_open_goto_sends_modal(self):
+        region = PaginatedRegion(per_page=2, items=list(range(10)))
+        host = _FakeHost()
+        region.controls(host)
+        await region._open_goto_modal(make_interaction())
+        assert host.opened_modal is not None
+
+    async def test_goto_submit_jumps(self):
+        region = PaginatedRegion(per_page=2, items=list(range(10)))
+        host = _FakeHost()
+        region.controls(host)
+        await region._open_goto_modal(make_interaction())
+        modal = host.opened_modal
+        modal.page_input._value = "3"
+        await modal.on_submit(make_interaction())
+        assert region.page == 2  # page 3 (1-based) -> index 2
+        assert host.refresh_calls == 1
+        assert len(host.deferred) == 1
+
+    async def test_goto_submit_invalid_responds(self):
+        region = PaginatedRegion(per_page=2, items=list(range(10)))
+        host = _FakeHost()
+        region.controls(host)
+        await region._open_goto_modal(make_interaction())
+        modal = host.opened_modal
+        modal.page_input._value = "abc"
+        await modal.on_submit(make_interaction())
+        assert region.page == 0  # unchanged
+        assert host.responded  # error message sent
+        assert host.refresh_calls == 0
+
+    async def test_goto_submit_clamps_overshoot(self):
+        region = PaginatedRegion(per_page=2, items=list(range(10)))  # 5 pages
+        host = _FakeHost()
+        region.controls(host)
+        await region._open_goto_modal(make_interaction())
+        modal = host.opened_modal
+        modal.page_input._value = "999"
+        await modal.on_submit(make_interaction())
+        assert region.page == 4  # clamped to last page
+        assert host.refresh_calls == 1
+        assert len(host.deferred) == 1
+
+    async def test_goto_submit_clamps_undershoot(self):
+        region = PaginatedRegion(per_page=2, items=list(range(10)))
+        host = _FakeHost()
+        region.controls(host)
+        await region._open_goto_modal(make_interaction())
+        modal = host.opened_modal
+        modal.page_input._value = "0"  # below the 1-based minimum
+        await modal.on_submit(make_interaction())
+        assert region.page == 0
+        assert host.refresh_calls == 1
+
+
+# // ========================================( Choice Row )======================================== // #
+
+
+async def _noop_select(interaction, value):
+    pass
+
+
+class TestChoiceRowConstruction:
+    """choice_row validates its inputs and rejects bad shapes."""
+
+    def test_empty_raises(self):
+        with pytest.raises(ValueError, match="must not be empty"):
+            choice_row({}, on_select=_noop_select)
+
+    def test_over_25_raises(self):
+        with pytest.raises(ValueError, match="25-option limit"):
+            choice_row({str(i): i for i in range(26)}, on_select=_noop_select)
+
+    def test_max_select_options_constant_exported(self):
+        from cascadeui import MAX_SELECT_OPTIONS
+
+        assert MAX_SELECT_OPTIONS == 25
+
+    def test_at_limit_is_accepted(self):
+        # Exactly MAX_SELECT_OPTIONS is the boundary and must be accepted.
+        from cascadeui import MAX_SELECT_OPTIONS
+
+        row = choice_row({str(i): i for i in range(MAX_SELECT_OPTIONS)}, on_select=_noop_select)
+        assert row is not None
+
+    def test_bad_threshold_raises(self):
+        with pytest.raises(ValueError, match="button_threshold"):
+            choice_row({"a": 1}, on_select=_noop_select, button_threshold=9)
+
+    def test_threshold_bool_raises(self):
+        with pytest.raises(ValueError, match="button_threshold"):
+            choice_row({"a": 1}, on_select=_noop_select, button_threshold=True)
+
+    def test_on_select_not_callable_raises(self):
+        with pytest.raises(TypeError, match="on_select must be callable"):
+            choice_row({"a": 1}, on_select=None)
+
+    def test_non_choice_option_raises(self):
+        with pytest.raises(TypeError, match="dict or a sequence of Choice"):
+            choice_row([("a", 1)], on_select=_noop_select)
+
+    def test_multi_selected_non_collection_raises(self):
+        with pytest.raises(TypeError, match="must be a collection"):
+            choice_row({"a": 1, "b": 2}, on_select=_noop_select, selected=1, multi=True)
+
+    def test_multi_selected_str_raises(self):
+        # A bare string is the likeliest mistake -- it is iterable, but a
+        # single value is not a collection of one-character choices.
+        with pytest.raises(TypeError, match="must be a collection"):
+            choice_row({"a": 1, "b": 2}, on_select=_noop_select, selected="a", multi=True)
+
+    def test_single_selected_collection_raises(self):
+        # The inverse mistake: a collection passed to single-select would hit
+        # an unhashable-set TypeError deep in the builder. Raise a directed
+        # error at the entry point instead, naming multi=True as the fix.
+        with pytest.raises(TypeError, match="must be a single value"):
+            choice_row({"a": 1, "b": 2}, on_select=_noop_select, selected=["a"], multi=False)
+
+
+class TestChoiceRowSingleButtons:
+    """Single-select small sets render as a segmented button row."""
+
+    def test_returns_action_row(self):
+        row = choice_row({"A": 1, "B": 2}, selected=1, on_select=_noop_select)
+        assert isinstance(row, ActionRow)
+        assert all(isinstance(b, StatefulButton) for b in row.children)
+
+    def test_active_is_highlighted_and_disabled(self):
+        row = choice_row({"A": 1, "B": 2, "C": 3}, selected=2, on_select=_noop_select)
+        a, b, c = list(row.children)
+        assert b.style == discord.ButtonStyle.primary and b.disabled is True
+        assert a.style == discord.ButtonStyle.secondary and a.disabled is False
+        assert c.style == discord.ButtonStyle.secondary and c.disabled is False
+
+    def test_none_selected_no_active(self):
+        row = choice_row({"A": 1, "B": 2}, on_select=_noop_select)
+        assert all(b.style == discord.ButtonStyle.secondary for b in row.children)
+        assert all(b.disabled is False for b in row.children)
+
+    def test_custom_styles(self):
+        row = choice_row(
+            {"A": 1, "B": 2},
+            selected=1,
+            on_select=_noop_select,
+            active_style=discord.ButtonStyle.success,
+            inactive_style=discord.ButtonStyle.danger,
+        )
+        a, b = list(row.children)
+        assert a.style == discord.ButtonStyle.success
+        assert b.style == discord.ButtonStyle.danger
+
+    def test_choice_input_with_emoji(self):
+        row = choice_row(
+            [Choice("Goals", 1, emoji="⚽"), Choice("Cards", 2)],
+            on_select=_noop_select,
+        )
+        assert row.children[0].emoji is not None
+
+    def test_custom_id_disambiguates(self):
+        left = choice_row({"A": 1}, on_select=_noop_select, custom_id="left")
+        right = choice_row({"A": 1}, on_select=_noop_select, custom_id="right")
+        lids = {b.custom_id for b in left.children}
+        rids = {b.custom_id for b in right.children}
+        assert lids.isdisjoint(rids)
+
+    async def test_click_passes_real_value(self):
+        seen = {}
+
+        async def on_sel(interaction, value):
+            seen["v"] = value
+
+        row = choice_row({"A": "alpha", "B": "beta"}, selected="alpha", on_select=on_sel)
+        await list(row.children)[1].original_callback(make_interaction())
+        assert seen["v"] == "beta"
+
+
+class TestChoiceRowDisabled:
+    """disabled=True greys out the whole control (buttons or dropdown)."""
+
+    def test_button_form_all_disabled(self):
+        row = choice_row(
+            {"A": 1, "B": 2, "C": 3}, selected=1, on_select=_noop_select, disabled=True
+        )
+        assert all(b.disabled is True for b in row.children)
+
+    def test_multi_button_form_all_disabled(self):
+        # Multi toggles are never self-disabled, but disabled=True overrides.
+        row = choice_row(
+            {"A": 1, "B": 2}, selected={1}, on_select=_noop_select, multi=True, disabled=True
+        )
+        assert all(b.disabled is True for b in row.children)
+
+    def test_dropdown_form_disabled(self):
+        opts = {chr(65 + i): i for i in range(8)}  # 8 options -> dropdown
+        row = choice_row(opts, on_select=_noop_select, disabled=True)
+        select = list(row.children)[0]
+        assert select.disabled is True
+
+    def test_default_not_disabled(self):
+        # Without disabled=, only the active single-select option is disabled.
+        row = choice_row({"A": 1, "B": 2}, selected=1, on_select=_noop_select)
+        a, b = list(row.children)
+        assert a.disabled is True and b.disabled is False
+
+
+class TestChoiceRowMultiButtons:
+    """Multi-select buttons are toggles, never disabled."""
+
+    def test_active_set_highlighted_none_disabled(self):
+        row = choice_row(
+            {"A": 1, "B": 2, "C": 3}, selected={1, 3}, on_select=_noop_select, multi=True
+        )
+        a, b, c = list(row.children)
+        assert a.style == discord.ButtonStyle.primary
+        assert b.style == discord.ButtonStyle.secondary
+        assert c.style == discord.ButtonStyle.primary
+        assert all(btn.disabled is False for btn in (a, b, c))
+
+    async def test_click_active_toggles_off(self):
+        seen = {}
+
+        async def on_sel(interaction, values):
+            seen["v"] = sorted(values)
+
+        row = choice_row({"A": 1, "B": 2, "C": 3}, selected={1, 3}, on_select=on_sel, multi=True)
+        await list(row.children)[0].original_callback(make_interaction())  # click A (active)
+        assert seen["v"] == [3]
+
+    async def test_click_inactive_toggles_on(self):
+        seen = {}
+
+        async def on_sel(interaction, values):
+            seen["v"] = sorted(values)
+
+        row = choice_row({"A": 1, "B": 2, "C": 3}, selected={1, 3}, on_select=on_sel, multi=True)
+        await list(row.children)[1].original_callback(make_interaction())  # click B (inactive)
+        assert seen["v"] == [1, 2, 3]
+
+
+class TestChoiceRowDropdown:
+    """Larger sets render as a dropdown that round-trips real values."""
+
+    def test_over_threshold_is_select(self):
+        row = choice_row({f"O{i}": i for i in range(10)}, selected=3, on_select=_noop_select)
+        child = list(row.children)[0]
+        assert isinstance(child, StatefulSelect)
+        assert len(child.options) == 10
+
+    def test_threshold_boundary(self):
+        five = choice_row({f"O{i}": i for i in range(5)}, on_select=_noop_select)
+        six = choice_row({f"O{i}": i for i in range(6)}, on_select=_noop_select)
+        assert all(isinstance(b, StatefulButton) for b in five.children)
+        assert isinstance(list(six.children)[0], StatefulSelect)
+
+    def test_threshold_zero_forces_select(self):
+        row = choice_row({"a": 1, "b": 2}, on_select=_noop_select, button_threshold=0)
+        assert isinstance(list(row.children)[0], StatefulSelect)
+
+    def test_selected_option_defaulted(self):
+        row = choice_row({f"O{i}": i for i in range(10)}, selected=3, on_select=_noop_select)
+        select = list(row.children)[0]
+        defaults = [o.value for o in select.options if o.default]
+        assert defaults == ["3"]  # the 4th option (index 3)
+
+    def test_option_values_are_string_indices(self):
+        row = choice_row({f"O{i}": i * 100 for i in range(8)}, on_select=_noop_select)
+        select = list(row.children)[0]
+        assert [o.value for o in select.options] == [str(i) for i in range(8)]
+
+    async def test_single_select_round_trips_value(self):
+        seen = {}
+
+        async def on_sel(interaction, value):
+            seen["v"] = value
+
+        # value 700 lives at index 7; the dropdown reports option value "7"
+        row = choice_row({f"O{i}": i * 100 for i in range(8)}, on_select=on_sel)
+        select = list(row.children)[0]
+        await select.original_callback(make_interaction(), ["7"])
+        assert seen["v"] == 700
+
+    async def test_single_select_empty_values_passes_none(self):
+        seen = {"v": "unset"}
+
+        async def on_sel(interaction, value):
+            seen["v"] = value
+
+        row = choice_row({f"O{i}": i for i in range(8)}, on_select=on_sel)
+        select = list(row.children)[0]
+        await select.original_callback(make_interaction(), [])
+        assert seen["v"] is None
+
+    def test_select_callback_is_two_param(self):
+        # The dropdown callback must accept (interaction, values) so
+        # StatefulSelect's create_stateful_callback passes component.values
+        # through. A regression to one param would silently drop the values.
+        import inspect
+
+        row = choice_row({f"O{i}": i for i in range(8)}, on_select=_noop_select)
+        select = list(row.children)[0]
+        params = [
+            p
+            for p in inspect.signature(select.original_callback).parameters.values()
+            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+        ]
+        assert len(params) >= 2
+
+    def test_dropdown_custom_id_disambiguates(self):
+        left = choice_row({f"O{i}": i for i in range(8)}, on_select=_noop_select, custom_id="left")
+        right = choice_row(
+            {f"O{i}": i for i in range(8)}, on_select=_noop_select, custom_id="right"
+        )
+        assert list(left.children)[0].custom_id != list(right.children)[0].custom_id
+
+    def test_descriptions_on_options(self):
+        row = choice_row(
+            [Choice(f"C{i}", i, description=f"desc {i}") for i in range(8)],
+            on_select=_noop_select,
+        )
+        select = list(row.children)[0]
+        assert select.options[0].description == "desc 0"
+
+
+class TestChoiceRowMultiDropdown:
+    """Multi-select dropdowns set max_values and round-trip a value list."""
+
+    def test_min_max_values(self):
+        row = choice_row(
+            {f"O{i}": i for i in range(8)}, selected={2, 5}, on_select=_noop_select, multi=True
+        )
+        select = list(row.children)[0]
+        assert select.min_values == 0
+        assert select.max_values == 8
+
+    def test_selected_set_defaulted(self):
+        row = choice_row(
+            {f"O{i}": i for i in range(8)}, selected={2, 5}, on_select=_noop_select, multi=True
+        )
+        select = list(row.children)[0]
+        defaults = sorted(o.value for o in select.options if o.default)
+        assert defaults == ["2", "5"]
+
+    async def test_round_trips_value_list(self):
+        seen = {}
+
+        async def on_sel(interaction, values):
+            seen["v"] = sorted(values)
+
+        row = choice_row({f"O{i}": i for i in range(8)}, on_select=on_sel, multi=True)
+        select = list(row.children)[0]
+        await select.original_callback(make_interaction(), ["2", "5"])
+        assert seen["v"] == [2, 5]
+
+
+# // ========================================( Collapsible )======================================== // #
+
+
+def _reveal_one():
+    return TextDisplay("revealed")
+
+
+def _reveal_many():
+    return [TextDisplay("a"), TextDisplay("b")]
+
+
+class TestCollapsibleConstruction:
+    """Collapsible validates its construction arguments."""
+
+    def test_empty_label_raises(self):
+        with pytest.raises(ValueError, match="label must be a non-empty str"):
+            Collapsible(label="", reveal=_reveal_one)
+
+    def test_reveal_not_callable_raises(self):
+        with pytest.raises(TypeError, match="reveal must be callable"):
+            Collapsible(label="Edit", reveal=None)
+
+    def test_empty_key_raises(self):
+        with pytest.raises(ValueError, match="key must be a non-empty str"):
+            Collapsible(label="Edit", reveal=_reveal_one, key="")
+
+    def test_non_bool_expanded_raises(self):
+        with pytest.raises(TypeError, match="expanded must be a bool"):
+            Collapsible(label="Edit", reveal=_reveal_one, expanded="yes")
+
+    def test_empty_expanded_label_raises(self):
+        with pytest.raises(ValueError, match="expanded_label must be a non-empty str"):
+            Collapsible(label="Edit", reveal=_reveal_one, expanded_label="")
+
+    def test_async_reveal_raises(self):
+        async def _async_reveal():
+            return TextDisplay("x")
+
+        with pytest.raises(TypeError, match="reveal must be synchronous"):
+            Collapsible(label="Edit", reveal=_async_reveal)
+
+    def test_bad_style_raises(self):
+        with pytest.raises(TypeError, match="style must be a discord.ButtonStyle"):
+            Collapsible(label="Edit", reveal=_reveal_one, style="primary")
+
+    def test_defaults(self):
+        c = Collapsible(label="Edit", reveal=_reveal_one)
+        assert c.expanded is False
+        # expanded_label defaults to label
+        assert c._expanded_label == "Edit"
+
+    def test_initial_expanded_state(self):
+        c = Collapsible(label="Edit", reveal=_reveal_one, expanded=True)
+        assert c.expanded is True
+
+
+class TestCollapsibleRender:
+    """render() returns the trigger collapsed, trigger + reveal expanded."""
+
+    def test_collapsed_one_trigger_row(self):
+        c = Collapsible(label="Edit", reveal=_reveal_one)
+        items = c.render(_FakeHost())
+        assert len(items) == 1
+        assert isinstance(items[0], ActionRow)
+        assert items[0].children[0].label == "Edit"
+
+    def test_trigger_custom_id_uses_key(self):
+        c = Collapsible(label="Edit", reveal=_reveal_one, key="leagues")
+        items = c.render(_FakeHost())
+        assert items[0].children[0].custom_id == "leagues_trigger"
+
+    def test_expanded_shows_reveal_and_trigger(self):
+        c = Collapsible(label="Edit", reveal=_reveal_one, expanded=True)
+        items = c.render(_FakeHost())
+        assert len(items) == 2  # trigger row + one revealed component
+        assert isinstance(items[0], ActionRow)  # trigger first (default)
+        assert isinstance(items[1], TextDisplay)
+
+    def test_expanded_relabels_trigger(self):
+        c = Collapsible(label="Edit", expanded_label="Done", reveal=_reveal_one, expanded=True)
+        items = c.render(_FakeHost())
+        assert items[0].children[0].label == "Done"
+
+    def test_expanded_restyles_trigger(self):
+        c = Collapsible(
+            label="Edit",
+            reveal=_reveal_one,
+            style=discord.ButtonStyle.primary,
+            expanded_style=discord.ButtonStyle.success,
+            expanded=True,
+        )
+        assert c.render(_FakeHost())[0].children[0].style == discord.ButtonStyle.success
+        # collapsed render uses the base style
+        c.collapse()
+        assert c.render(_FakeHost())[0].children[0].style == discord.ButtonStyle.primary
+
+    def test_expanded_reemojis_trigger(self):
+        c = Collapsible(
+            label="Edit",
+            reveal=_reveal_one,
+            emoji="\U0001f512",
+            expanded_emoji="\U0001f513",
+            expanded=True,
+        )
+        # PartialEmoji.name distinguishes the two glyphs
+        assert str(c.render(_FakeHost())[0].children[0].emoji) == "\U0001f513"
+
+    def test_reveal_list_flattened(self):
+        c = Collapsible(label="Edit", reveal=_reveal_many, expanded=True)
+        items = c.render(_FakeHost())
+        assert len(items) == 3  # trigger + two revealed components
+
+    def test_trigger_first_false_puts_trigger_last(self):
+        c = Collapsible(label="Edit", reveal=_reveal_one, expanded=True, trigger_first=False)
+        items = c.render(_FakeHost())
+        assert isinstance(items[-1], ActionRow)
+        assert items[-1].children[0].custom_id.endswith("_trigger")
+
+    def test_distinct_keys_avoid_collision(self):
+        left = Collapsible(label="x", reveal=_reveal_one, key="left").render(_FakeHost())
+        right = Collapsible(label="x", reveal=_reveal_one, key="right").render(_FakeHost())
+        assert left[0].children[0].custom_id != right[0].children[0].custom_id
+
+    def test_render_captures_view(self):
+        c = Collapsible(label="Edit", reveal=_reveal_one)
+        host = _FakeHost()
+        c.render(host)
+        assert c._view is host
+
+
+class TestCollapsibleSummary:
+    """A summary callable renders the trigger as an in-card action_section."""
+
+    def test_summary_renders_action_section(self):
+        c = Collapsible(label="Edit", reveal=_reveal_one, summary=lambda: "Flagged: Bob", key="rep")
+        trigger = c.render(_FakeHost())[0]
+        assert isinstance(trigger, Section)
+        assert trigger.children[0].content == "Flagged: Bob"
+        assert isinstance(trigger.accessory, StatefulButton)
+        assert trigger.accessory.label == "Edit"
+        assert trigger.accessory.custom_id == "rep_trigger"
+
+    def test_no_summary_stays_bare_button(self):
+        c = Collapsible(label="Edit", reveal=_reveal_one)
+        assert isinstance(c.render(_FakeHost())[0], ActionRow)
+
+    def test_empty_summary_falls_back_to_bare_button(self):
+        # A summary that yields nothing (e.g. data not loaded yet) degrades to
+        # the bare button rather than emitting an empty Section.
+        c = Collapsible(label="Edit", reveal=_reveal_one, summary=lambda: "")
+        assert isinstance(c.render(_FakeHost())[0], ActionRow)
+
+    def test_summary_section_relabels_on_expand(self):
+        c = Collapsible(
+            label="Edit",
+            expanded_label="Done",
+            reveal=_reveal_one,
+            summary=lambda: "text",
+            expanded=True,
+        )
+        trigger = c.render(_FakeHost())[0]
+        assert isinstance(trigger, Section)
+        assert trigger.accessory.label == "Done"
+
+    def test_summary_section_restyles_on_expand(self):
+        # Style parity with the bare-button path: the Section accessory carries
+        # the expanded style when open and the base style when collapsed.
+        c = Collapsible(
+            label="Edit",
+            reveal=_reveal_one,
+            summary=lambda: "text",
+            style=discord.ButtonStyle.primary,
+            expanded_style=discord.ButtonStyle.success,
+            expanded=True,
+        )
+        assert c.render(_FakeHost())[0].accessory.style == discord.ButtonStyle.success
+        c.collapse()
+        assert c.render(_FakeHost())[0].accessory.style == discord.ButtonStyle.primary
+
+    def test_summary_section_reemojis_on_expand(self):
+        c = Collapsible(
+            label="Edit",
+            reveal=_reveal_one,
+            summary=lambda: "text",
+            emoji="\U0001f512",
+            expanded_emoji="\U0001f513",
+            expanded=True,
+        )
+        assert str(c.render(_FakeHost())[0].accessory.emoji) == "\U0001f513"
+
+    def test_summary_trigger_first_false_puts_section_last(self):
+        c = Collapsible(
+            label="Edit",
+            reveal=_reveal_one,
+            summary=lambda: "text",
+            expanded=True,
+            trigger_first=False,
+        )
+        items = c.render(_FakeHost())
+        assert isinstance(items[-1], Section)
+        assert items[-1].accessory.custom_id.endswith("_trigger")
+
+    def test_none_summary_falls_back_to_bare_button(self):
+        # The fallback fires on None as well as empty string.
+        c = Collapsible(label="Edit", reveal=_reveal_one, summary=lambda: None)
+        assert isinstance(c.render(_FakeHost())[0], ActionRow)
+
+    def test_summary_trigger_fuses_into_card(self):
+        c = Collapsible(label="Edit", reveal=_reveal_one, summary=lambda: "summary", expanded=True)
+        result = card("### Title", *c.render(_FakeHost()))
+        assert isinstance(result, Container)
+
+    def test_summary_not_callable_raises(self):
+        with pytest.raises(TypeError, match="summary must be callable"):
+            Collapsible(label="Edit", reveal=_reveal_one, summary="text")
+
+    def test_async_summary_raises(self):
+        async def _async_summary():
+            return "x"
+
+        with pytest.raises(TypeError, match="summary must be synchronous"):
+            Collapsible(label="Edit", reveal=_reveal_one, summary=_async_summary)
+
+
+class TestCollapsibleToggle:
+    """The trigger toggles state and re-renders the host."""
+
+    def test_collapse_expand_methods(self):
+        c = Collapsible(label="Edit", reveal=_reveal_one)
+        c.expand()
+        assert c.expanded is True
+        c.collapse()
+        assert c.expanded is False
+
+    async def test_toggle_expands_and_rerenders(self):
+        c = Collapsible(label="Edit", reveal=_reveal_one)
+        host = _FakeHost()
+        c.render(host)
+        await c._toggle(make_interaction())
+        assert c.expanded is True
+        assert host.build_calls == 1
+        assert host.refresh_calls == 1
+
+    async def test_toggle_collapses_when_open(self):
+        c = Collapsible(label="Edit", reveal=_reveal_one, expanded=True)
+        host = _FakeHost()
+        c.render(host)
+        await c._toggle(make_interaction())
+        assert c.expanded is False
+
+    async def test_toggle_uses_reload_for_on_load_host(self):
+        c = Collapsible(label="Edit", reveal=_reveal_one)
+        host = _OnLoadHost()
+        c.render(host)
+        await c._toggle(make_interaction())
+        assert c.expanded is True
+        assert host.reload_calls == 1
+
+    async def test_toggle_uses_refresh_tabs_for_tab_host(self):
+        # Inside a TabLayoutView the composite re-renders via _refresh_tabs.
+        c = Collapsible(label="Edit", reveal=_reveal_one)
+        host = _TabHost()
+        c.render(host)
+        await c._toggle(make_interaction())
+        assert c.expanded is True
+        assert host.tab_refreshes == 1
+
+    async def test_toggle_skips_finished_view(self):
+        c = Collapsible(label="Edit", reveal=_reveal_one)
+        host = _FakeHost(finished=True)
+        c.render(host)
+        await c._toggle(make_interaction())
+        # State still flips, but no edit ships to a dead view (the finished
+        # guard, not a missing view: build_ui is not called either).
+        assert c.expanded is True
+        assert host.build_calls == 0
+        assert host.refresh_calls == 0
+
+    async def test_toggle_fires_on_toggle_hook(self):
+        seen = []
+
+        class _Tracked(Collapsible):
+            async def on_toggle(self, expanded):
+                seen.append(expanded)
+
+        c = _Tracked(label="Edit", reveal=_reveal_one)
+        c.render(_FakeHost())
+        await c._toggle(make_interaction())
+        await c._toggle(make_interaction())
+        assert seen == [True, False]

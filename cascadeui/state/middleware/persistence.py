@@ -92,13 +92,11 @@ _BOOKKEEPING_ACTIONS = frozenset(
 )
 
 
-# All scheduled flush tasks are tracked on ``PersistenceMiddleware._tasks``
-# rather than through ``TaskManager``. ``TaskManager._wrap_task`` double-
-# wraps the coroutine, which orphans the inner ``_run_flush`` coroutine
-# when the outer task is cancelled before its first step (Python never
-# enters a never-stepped coroutine frame on cancel, so no except block
-# can close the inner coro). Owning the tasks directly lets
-# ``asyncio.Task`` drive ``_run_flush`` itself so cancel unwinds cleanly.
+# Scheduled flush tasks live on ``PersistenceMiddleware._tasks`` via
+# ``_spawn`` (``asyncio.create_task`` + ``add_done_callback(discard)``),
+# not through ``TaskManager``. The flush lifecycle -- debounce windows,
+# retry backoff, cancel-on-teardown -- is coupled to this local task set,
+# so the middleware owns it directly.
 
 
 # // ========================================( Per-namespace state )======================================== // #
@@ -166,8 +164,39 @@ class PersistenceMiddleware:
         registry: Optional["RegistryPersistence"] = None,
         application: Optional["ApplicationPersistence"] = None,
         bot: Any = None,
-        migrators: Optional[Any] = None,
+        migrators: Optional[dict] = None,
+        restore_concurrency: int = 8,
     ) -> None:
+        # Validate the restore-concurrency knob at the construction site so
+        # a bad value fails here, not deep inside the reattach fan-out.
+        if (
+            not isinstance(restore_concurrency, int)
+            or isinstance(restore_concurrency, bool)
+            or restore_concurrency < 1
+        ):
+            raise ValueError(
+                "PersistenceMiddleware restore_concurrency= must be a positive int, "
+                f"got {restore_concurrency!r}."
+            )
+
+        # Validate the migrators bulk-registration map at the construction
+        # site. Expected: None, or a dict with optional "schema" and "kwargs"
+        # keys, each mapping a (name, from_version) tuple to an async migrator
+        # callable. Registered into the module migrator registries during
+        # initialize(), before apply_migrations and rehydrate consume them.
+        if migrators is not None:
+            if not isinstance(migrators, dict):
+                raise TypeError(
+                    "PersistenceMiddleware migrators= must be None or a dict with "
+                    f"optional 'schema' / 'kwargs' keys, got {type(migrators).__name__!r}."
+                )
+            unknown = set(migrators) - {"schema", "kwargs"}
+            if unknown:
+                raise ValueError(
+                    f"PersistenceMiddleware migrators= has unknown keys {sorted(unknown)}; "
+                    "expected 'schema' and/or 'kwargs'."
+                )
+
         # Fail fast on a wrong-type bot. The reattach pipeline calls
         # ``bot.add_listener`` / ``bot.get_channel``; passing a bare
         # string or a non-Client object would crash deep inside
@@ -209,6 +238,7 @@ class PersistenceMiddleware:
                 "application": application,
                 "bot": bot,
                 "migrators": migrators,
+                "restore_concurrency": restore_concurrency,
             }
             self._initialized = False
             # Namespace state is built after the manager resolves in
@@ -275,6 +305,10 @@ class PersistenceMiddleware:
         self._manager = manager
         self._store = store
         self._build_namespaces(manager)
+
+        # Register any caller-supplied migrators into the module registries
+        # before apply_migrations (schema) and rehydrate (kwargs) consume them.
+        self._register_migrators(cfg.get("migrators"))
 
         await manager.initialize_backends()
         await manager.apply_migrations()
@@ -388,7 +422,40 @@ class PersistenceMiddleware:
             registry=resolved_registry,
             application=resolved_application,
             bot=bot,
+            restore_concurrency=cfg.get("restore_concurrency", 8),
         )
+
+    @staticmethod
+    def _register_migrators(migrators: Optional[dict]) -> None:
+        """Register a caller-supplied migrator map into the module registries.
+
+        ``migrators`` is the validated dict from construction: optional
+        ``"schema"`` and ``"kwargs"`` keys, each mapping a
+        ``(name, from_version)`` tuple to an async migrator callable. Schema
+        entries land in ``_MIGRATORS`` (keyed by ``(table, from_version)``,
+        consumed by ``apply_migrations``); kwargs entries land in
+        ``_KWARGS_MIGRATORS`` (keyed by ``(view_class_qualname,
+        from_version)``, consumed during rehydrate).
+
+        Idempotent: a key already registered (via this path, the decorator,
+        or a prior construction) is skipped, so re-constructing the
+        middleware does not raise. New migrators still register.
+        """
+        if not migrators:
+            return
+        from ...persistence.migrations import (
+            get_kwargs_migrator,
+            get_schema_migrator,
+            register_kwargs_migrator,
+            register_migrator,
+        )
+
+        for (table, from_version), fn in (migrators.get("schema") or {}).items():
+            if get_schema_migrator(table, from_version) is None:
+                register_migrator(table, from_version)(fn)
+        for (qualname, from_version), fn in (migrators.get("kwargs") or {}).items():
+            if get_kwargs_migrator(qualname, from_version) is None:
+                register_kwargs_migrator(qualname, from_version)(fn)
 
     # // ========================================( Middleware entry )======================================== // #
 
@@ -589,8 +656,16 @@ class PersistenceMiddleware:
         table, key_columns, delete_column = self._namespace_tables(ns.name)
 
         try:
-            for row in rows:
-                await ns.backend.row_upsert(table, row, key_columns)
+            if rows:
+                # Prefer the batched path (one round-trip) when the backend
+                # implements it; fall back to per-row upsert so a custom
+                # backend without row_upsert_many keeps working.
+                upsert_many = getattr(ns.backend, "row_upsert_many", None)
+                if upsert_many is not None:
+                    await upsert_many(table, rows, key_columns)
+                else:
+                    for row in rows:
+                        await ns.backend.row_upsert(table, row, key_columns)
             for key in deletes:
                 await ns.backend.row_delete(table, {delete_column: key})
         except Exception as exc:
@@ -657,7 +732,11 @@ class PersistenceMiddleware:
         """
         persistence_key = payload.get("persistence_key")
         if view is None:
-            logger.warning(
+            # Benign race: the view exited between its
+            # PERSISTENT_VIEW_REGISTERED dispatch and this middleware
+            # observing it. Declining the write is the correct fallback,
+            # not an operator-actionable condition, so it logs at DEBUG.
+            logger.debug(
                 f"No live view found for persistence_key {persistence_key!r}; "
                 "skipping registry persist"
             )
@@ -681,7 +760,21 @@ class PersistenceMiddleware:
             # path cannot consume.
             init_kwargs_json = json.dumps(init_kwargs)
         except (TypeError, ValueError) as exc:
-            logger.error(f"init_kwargs for {persistence_key!r} not JSON-serializable: {exc}")
+            # Enumerate the non-serializable kwargs so the error names them.
+            # Runtime dependencies belong in on_bind, not the constructor.
+            bad = []
+            for key, value in init_kwargs.items():
+                try:
+                    json.dumps(value)
+                except (TypeError, ValueError):
+                    bad.append(f"{key}={type(value).__name__}")
+            offenders = ", ".join(bad) if bad else str(exc)
+            logger.error(
+                f"Persistent view {persistence_key!r} was not saved -- its constructor "
+                f"kwargs are not JSON-serializable ({offenders}). Runtime dependencies "
+                f"(database pools, the bot, service clients) cannot survive the persistence "
+                f"round-trip; pass them through on_bind(bot) instead."
+            )
             return None
 
         kwargs_version = int(getattr(view, "kwargs_schema_version", 1))

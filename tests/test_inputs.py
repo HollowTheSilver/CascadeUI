@@ -6,6 +6,7 @@ FileUpload) and are auto-collected by ``Modal`` at construction time.
 """
 
 import discord
+import pytest
 
 from cascadeui.components.inputs import (
     Checkbox,
@@ -40,6 +41,14 @@ class TestTextInputSlug:
         # Reachable both on the class and on an instance; no instance state required
         assert TextInput._slug("Foo") == "input_foo"
         assert TextInput(label="Bar")._slug("Foo") == "input_foo"
+
+    def test_slug_delegates_to_slugify(self):
+        # Punctuation collapses to a single underscore (the shared slugify
+        # rule) instead of surviving verbatim, keeping modal input ids safe.
+        from cascadeui import slugify
+
+        assert TextInput._slug("A/B Test!") == "input_a_b_test"
+        assert TextInput._slug("A/B Test!") == f"input_{slugify('A/B Test!')}"
 
 
 # // ========================================( TextInput.validators )======================================== // #
@@ -219,6 +228,40 @@ class TestSubmittedValuePropagation:
         assert b.value == "42"
         assert modal.values_by_input == {a: "Kael", b: "42"}
         assert captured == {"a": "Kael", "b": "42", "by_input_a": "Kael"}
+
+
+class TestModalPostSubmitDeferHardening:
+    """The trailing post-submit ack mirrors the view's ``_scheduled_task``
+    defer: a dead (10062) or already-acked interaction must not turn a
+    successful submission into an unhandled error routed to ``on_error``."""
+
+    async def test_post_submit_defer_swallows_dead_interaction(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        modal = Modal(title="T", inputs=[])
+
+        interaction = MagicMock()
+        interaction.user = MagicMock(id=1)
+        interaction.response = MagicMock()
+        interaction.response.is_done.return_value = False
+        interaction.response.defer = AsyncMock(side_effect=discord.NotFound(MagicMock(), ""))
+
+        await modal.on_submit(interaction)  # must not raise
+
+    async def test_post_submit_defer_swallows_already_acked_race(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        modal = Modal(title="T", inputs=[])
+
+        interaction = MagicMock()
+        interaction.user = MagicMock(id=1)
+        interaction.response = MagicMock()
+        interaction.response.is_done.return_value = False
+        interaction.response.defer = AsyncMock(
+            side_effect=discord.HTTPException(MagicMock(status=400), {"code": 40060})
+        )
+
+        await modal.on_submit(interaction)  # must not raise
 
 
 # // ========================================( Checkbox )======================================== // #
@@ -609,3 +652,59 @@ class TestModalMixedInputs:
         assert fu.values == ["attachment_obj"]
         assert modal.values_by_input[cg] == ["a", "b"]
         assert modal.values_by_input[fu] == ["attachment_obj"]
+
+
+# // ========================================( Modal validation error label )======================================== // #
+
+
+class TestModalValidationErrorLabel:
+    """A failed validator surfaces the field label, not the custom_id slug."""
+
+    async def test_error_message_uses_label_not_slug(self):
+        from cascadeui.validation import ValidationResult
+
+        def _always_fail(value, field, all_values):
+            return ValidationResult(False, "Enter a single emoji.")
+
+        field = TextInput(label="Emoji", validators=[_always_fail])
+        assert field.custom_id == "input_emoji"  # the derived slug
+        modal = Modal(title="T", inputs=[field])
+
+        sent = {}
+
+        class _Response:
+            def is_done(self):
+                return False
+
+            async def send_message(self, content, **kwargs):
+                sent["content"] = content
+
+        class _Interaction:
+            response = _Response()
+            user = type("U", (), {"id": 1})()
+
+        await modal.on_submit(_Interaction())
+
+        assert "**Emoji**" in sent["content"]
+        assert "input_emoji" not in sent["content"]
+
+
+class TestModalDuplicateInputs:
+    """Modal rejects two inputs that derive the same custom_id."""
+
+    def test_same_label_raises(self):
+        with pytest.raises(ValueError, match="Duplicate modal input custom_id"):
+            Modal(title="T", inputs=[TextInput(label="Name"), TextInput(label="Name")])
+
+    def test_error_names_the_slug(self):
+        with pytest.raises(ValueError, match="input_name"):
+            Modal(title="T", inputs=[TextInput(label="Name"), TextInput(label="Name")])
+
+    def test_cross_type_same_label_raises(self):
+        # All five wrappers share the input_{label} namespace.
+        with pytest.raises(ValueError, match="Duplicate modal input custom_id"):
+            Modal(title="T", inputs=[TextInput(label="Opt"), Checkbox(label="Opt")])
+
+    def test_distinct_labels_pass(self):
+        modal = Modal(title="T", inputs=[TextInput(label="Name"), TextInput(label="Email")])
+        assert len(modal.inputs) == 2

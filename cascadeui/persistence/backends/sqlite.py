@@ -237,6 +237,34 @@ class SQLiteBackend:
 
     # // ========================================( Relational surface )======================================== // #
 
+    def _build_upsert_sql(self, namespace: str, cols: list[str], key_columns: list[str]) -> str:
+        """Assemble an excluded-table upsert INSERT for ``cols``.
+
+        Every non-key column is overwritten on conflict; key columns are
+        excluded from the SET clause (they are the conflict target). When
+        every column is a key column the conflict is a DO NOTHING -- the row
+        already exists with identical values.
+        """
+        table = _quote_ident(namespace)
+        placeholders = ", ".join("?" for _ in cols)
+        col_list = ", ".join(_quote_ident(c) for c in cols)
+
+        update_cols = [c for c in cols if c not in key_columns]
+        if update_cols:
+            set_clause = ", ".join(
+                f"{_quote_ident(c)} = excluded.{_quote_ident(c)}" for c in update_cols
+            )
+            conflict_sql = (
+                f"ON CONFLICT ({', '.join(_quote_ident(k) for k in key_columns)}) "
+                f"DO UPDATE SET {set_clause}"
+            )
+        else:
+            conflict_sql = (
+                f"ON CONFLICT ({', '.join(_quote_ident(k) for k in key_columns)}) DO NOTHING"
+            )
+
+        return f"INSERT INTO {table} ({col_list}) VALUES ({placeholders}) {conflict_sql}"
+
     async def row_upsert(
         self,
         namespace: str,
@@ -248,36 +276,48 @@ class SQLiteBackend:
         if not key_columns:
             raise ValueError("row_upsert requires at least one key column")
 
-        table = _quote_ident(namespace)
         cols = list(row.keys())
-        placeholders = ", ".join("?" for _ in cols)
-        col_list = ", ".join(_quote_ident(c) for c in cols)
-
-        # Excluded-table upsert: every non-key column is overwritten on
-        # conflict, every key column is left alone (they already match
-        # by definition of being the conflict target).
-        update_cols = [c for c in cols if c not in key_columns]
-        if update_cols:
-            set_clause = ", ".join(
-                f"{_quote_ident(c)} = excluded.{_quote_ident(c)}" for c in update_cols
-            )
-            conflict_sql = (
-                f"ON CONFLICT ({', '.join(_quote_ident(k) for k in key_columns)}) "
-                f"DO UPDATE SET {set_clause}"
-            )
-        else:
-            # All columns are key columns -- conflict means the row
-            # already exists with identical values, no update needed.
-            conflict_sql = (
-                f"ON CONFLICT ({', '.join(_quote_ident(k) for k in key_columns)}) DO NOTHING"
-            )
-
-        sql = f"INSERT INTO {table} ({col_list}) VALUES ({placeholders}) {conflict_sql}"
+        sql = self._build_upsert_sql(namespace, cols, key_columns)
 
         db = self._db()
         async with self._write_lock:
             await db.execute(sql, tuple(row[c] for c in cols))
             await db.commit()
+
+    async def row_upsert_many(
+        self,
+        namespace: str,
+        rows: list[dict[str, Any]],
+        key_columns: list[str],
+    ) -> None:
+        if not rows:
+            return
+        if not key_columns:
+            raise ValueError("row_upsert_many requires at least one key column")
+
+        # Group by column signature so each executemany shares one SQL
+        # statement. Flush rows are homogeneous, so this is usually a single
+        # group; a mixed-shape batch produces one group per column set.
+        groups: dict[tuple, list[dict[str, Any]]] = {}
+        for row in rows:
+            if not row:
+                raise ValueError("row_upsert_many requires at least one column per row")
+            groups.setdefault(tuple(row.keys()), []).append(row)
+
+        db = self._db()
+        # One write lock and one commit for the whole batch -- the commit is
+        # a single fsync instead of one per row. The rollback on failure
+        # keeps the batch atomic: a raise in any group (or in any row inside
+        # one executemany) leaves the database unchanged.
+        async with self._write_lock:
+            try:
+                for cols, group in groups.items():
+                    sql = self._build_upsert_sql(namespace, list(cols), key_columns)
+                    await db.executemany(sql, [tuple(r[c] for c in cols) for r in group])
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
 
     async def row_select(
         self,

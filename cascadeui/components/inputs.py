@@ -1,13 +1,17 @@
 # // ========================================( Modules )======================================== // #
 
 
+import logging
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import discord
 from discord import CheckboxGroupOption, Interaction, RadioGroupOption, TextStyle
 
+from ..utils.strings import slugify
 from ..validation import validate_fields
 from .base import StatefulComponent
+
+logger = logging.getLogger(__name__)
 
 # // ========================================( Classes )======================================== // #
 
@@ -72,11 +76,12 @@ class TextInput(StatefulComponent):
     def _slug(cls, label: str) -> str:
         """Derive a stable ``custom_id`` slug from a field label.
 
-        Single source of truth for the slug rule. Used both during
-        :class:`TextInput` construction and by form patterns when
-        round-tripping ``"text"`` field values through a modal.
+        Single source of truth for the modal-input slug rule. Prefixes
+        ``input_`` and delegates to :func:`slugify`, so modal inputs share
+        the one safe lowercase-alphanumeric derivation the rest of the
+        library uses.
         """
-        return f"input_{label.lower().replace(' ', '_')}"
+        return f"input_{slugify(label)}"
 
     def create_discord_component(self):
         """Build a ``ui.Label`` wrapping the inner ``ui.TextInput``."""
@@ -418,6 +423,7 @@ class Modal(discord.ui.Modal, StatefulComponent):
             if isinstance(input_item, _WRAPPED_INPUT_TYPES):
                 label_wrapper = input_item.create_discord_component()
                 inner = label_wrapper.component
+                self._reject_duplicate_input(input_item.custom_id)
                 self.add_item(label_wrapper)
                 self.inputs[input_item.custom_id] = input_item
                 self._wrapped_pairs.append((input_item, inner))
@@ -428,9 +434,27 @@ class Modal(discord.ui.Modal, StatefulComponent):
                 # modal-compatible component the user constructed directly.
                 self.add_item(input_item)
                 inner = _unwrap_label(input_item)
+                self._reject_duplicate_input(inner.custom_id)
                 self.inputs[inner.custom_id] = input_item
 
         self.user_callback = callback
+
+    def _reject_duplicate_input(self, custom_id: str) -> None:
+        """Raise before a duplicate input custom_id silently overwrites.
+
+        Modal input ids derive from the label (``input_{label}``), so two
+        inputs with the same label collide on one key. Without this guard
+        the second silently overwrites the first in ``self.inputs`` and
+        its submitted value is lost at ``on_submit``.
+        """
+        if custom_id in self.inputs:
+            raise ValueError(
+                f"Duplicate modal input custom_id: {custom_id!r}. Modal input ids derive "
+                f"from the label ('input_{{label}}'), so two inputs with the same label "
+                f"collide on one key: one would silently overwrite the other and its "
+                f"submitted value would be lost.\n"
+                f"  Fix: Give the colliding inputs distinct labels."
+            )
 
     async def on_submit(self, interaction: Interaction):
         """Handle modal submission with optional validation."""
@@ -469,8 +493,11 @@ class Modal(discord.ui.Modal, StatefulComponent):
             if errors:
                 lines = []
                 for field_id, field_errors in errors.items():
+                    # Field label ("Emoji"), not the derived custom_id slug ("input_emoji").
+                    field = self.inputs.get(field_id)
+                    name = getattr(field, "label", field_id)
                     for err in field_errors:
-                        lines.append(f"**{field_id}**: {err.message}")
+                        lines.append(f"**{name}**: {err.message}")
                 await interaction.response.send_message("\n".join(lines), ephemeral=True)
                 return
 
@@ -492,7 +519,29 @@ class Modal(discord.ui.Modal, StatefulComponent):
         if self.user_callback:
             await self.user_callback(interaction, values)
             # Safety net: defer if the callback forgot to respond
-            if not interaction.response.is_done():
-                await interaction.response.defer()
+            await self._safe_post_submit_defer(interaction)
         else:
+            await self._safe_post_submit_defer(interaction)
+
+    async def _safe_post_submit_defer(self, interaction: Interaction) -> None:
+        """Acknowledge the modal submission if the callback left it unanswered.
+
+        Mirrors the post-callback defer in the view's ``_scheduled_task``:
+        the submission's state dispatch has already landed, so a dead or
+        already-acked interaction on the trailing ack must not turn a
+        successful submit into an unhandled error routed to ``on_error``.
+        """
+        if interaction.response.is_done():
+            return
+        try:
             await interaction.response.defer()
+        except discord.NotFound:
+            # 10062: the interaction token is already gone -- nothing to ack.
+            logger.debug("Modal post-submit defer hit a dead interaction (10062)")
+        except discord.HTTPException as e:
+            # 40060 (already acknowledged) is a benign cancellation race; any
+            # other status is a genuine ack failure the user saw as a toast.
+            if e.code == 40060:
+                logger.debug("Modal post-submit defer raced an existing ack (40060)")
+            else:
+                logger.warning(f"Modal post-submit defer failed: status={e.status} code={e.code}")

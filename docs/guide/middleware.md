@@ -80,7 +80,7 @@ from cascadeui.state.middleware import LoggingMiddleware
 await setup_middleware(LoggingMiddleware())
 ```
 
-Pass `level="DEBUG"` for verbose tracing or `level="WARNING"` to suppress routine traffic without removing the middleware. `setup_logging(actions=True)` (the default) auto-installs `LoggingMiddleware` for callers who already call `setup_logging` during startup, so a separate install step is not required.
+The `level` (default `INFO`) is the action stream's *emission* level, not a threshold: pass `level="DEBUG"` to keep routine action traffic out of INFO logs so it surfaces only when DEBUG is enabled. `setup_logging(actions=True)` (the default) auto-installs `LoggingMiddleware` at `INFO` for callers who already call `setup_logging` during startup; pass `setup_logging(actions="DEBUG")` to install it at a lower level instead, so a separate install step is not required.
 
 ### Persistence
 

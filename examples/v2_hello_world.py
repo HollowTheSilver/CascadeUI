@@ -48,11 +48,14 @@ class CounterView(StatefulLayoutView):
     owner_only = True
 
     # -- Instance control --
-    # One counter per user. If they open a second, the old one is
-    # replaced (edited to frozen state) and the new one takes over.
+    # One counter per user. If they open a second, the old message is
+    # deleted and the new one takes over.
     instance_limit = 1
     instance_scope = "user"
     instance_policy = "replace"
+    # The old message is deleted when replaced; "disable" would freeze it
+    # in place instead.
+    replace_policy = "delete"
 
     # -- Lifecycle --
     # ``"disable"`` freezes components on exit/timeout; ``"delete"`` would
