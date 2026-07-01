@@ -106,6 +106,18 @@ class InMemoryBackend:
                 return
         rows.append(dict(row))
 
+    async def row_upsert_many(
+        self,
+        namespace: str,
+        rows: list[dict[str, Any]],
+        key_columns: list[str],
+    ) -> None:
+        # No round-trip to batch for the in-memory store -- per-row upsert
+        # is O(1) amortized, and delegating keeps copy-on-store and conflict
+        # semantics identical to row_upsert.
+        for row in rows:
+            await self.row_upsert(namespace, row, key_columns)
+
     async def row_select(
         self,
         namespace: str,

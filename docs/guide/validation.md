@@ -7,7 +7,7 @@ CascadeUI provides a validation system for checking user input against rules bef
 Each validator is a factory function that returns a validation callable:
 
 ```python
-from cascadeui import min_length, max_length, regex, choices, min_value, max_value
+from cascadeui import min_length, max_length, regex, choices, min_value, max_value, emoji
 ```
 
 | Validator | What it checks | Example |
@@ -18,8 +18,52 @@ from cascadeui import min_length, max_length, regex, choices, min_value, max_val
 | `choices(allowed)` | Value is in the allowed list | `choices(["a", "b", "c"])` |
 | `min_value(n)` | Number is at least `n` | `min_value(13)` |
 | `max_value(n)` | Number is at most `n` | `max_value(120)` |
+| `emoji()` | A unicode emoji or custom `<:name:id>` token | `emoji()` |
 
 All validators accept an optional `msg` parameter to customize the error message.
+
+## Recipe: an emoji input
+
+Discord has no native emoji input, but the pieces to build one already ship: a `choice_row` of your emoji options plus a `Custom` option that opens a `Modal` gated by the `emoji()` validator. There is no separate "emoji picker" widget -- it is composition.
+
+```python
+from cascadeui import Choice, Modal, TextInput, choice_row, emoji
+
+# A row of emoji buttons for the options your UI uses, plus a "type your
+# own" escape (choice_row switches to a dropdown past five options):
+choice_row(
+    [Choice("Trophy", "🏆", emoji="🏆"),
+     Choice("Crown", "👑", emoji="👑"),
+     Choice("Fire", "🔥", emoji="🔥"),
+     Choice("Custom...", "__custom__", emoji="✏️")],
+    selected=self.icon,
+    on_select=self._pick_icon,
+)
+
+async def _pick_icon(self, interaction, value):
+    if value != "__custom__":
+        self.icon = value
+        self.build_ui()
+        await self.refresh()
+        return
+
+    field = TextInput(label="Emoji", placeholder="🏆", required=False,
+                      validators=[emoji()])
+
+    async def on_submitted(modal_interaction, values):
+        # emoji() rejected anything that is not an emoji before this runs.
+        if field.value:
+            self.icon = field.value
+            self.build_ui()
+            await self.refresh()
+
+    await self.open_modal(
+        interaction,
+        Modal(title="Custom emoji", inputs=[field], callback=on_submitted),
+    )
+```
+
+The curated emoji list is yours (it is your app's vocabulary); the library supplies the control (`choice_row` renders the options as buttons, or a dropdown past five), the modal, and the `emoji()` gate. `is_emoji()` is also exported from `cascadeui.utils` if you need the bare predicate.
 
 ## Field Definitions
 

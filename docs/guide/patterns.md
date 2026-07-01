@@ -102,12 +102,18 @@ Each category button pushes to its target view class with a default
 - **V1:** `lambda v: {"embed": v.build_embed()}` -- rebuilds the embed
 
 Override per category with the `"rebuild"` key when a sub-view needs
-different initialization:
+different synchronous initialization:
 
 ```python
 {"label": "Stats", "view": StatsView,
- "rebuild": lambda v: v.load_and_build()}
+ "rebuild": lambda v: v.build_ui()}
 ```
+
+When a sub-view loads its content from a database or other async source,
+define `on_load()` on the sub-view and omit the `"rebuild"` key entirely --
+the library calls `on_load()` before the push edit, so the sub-view
+re-fetches on every navigation. See
+[Navigating database-backed views](views.md#navigating-database-backed-views).
 
 ### Customization
 
@@ -523,6 +529,23 @@ async def on_finish(self, interaction):
 ## TabView / TabLayoutView
 
 Tabbed interface with button-based tab switching.
+
+!!! tip "Tabs vs navigation vs `tab_nav`"
+    Three tools cover "more than one view," and their use cases are distinct:
+
+    - **`TabLayoutView`** keeps a few sibling views in **one message** behind
+      a persistent tab bar. Reach for it when the user flips between sections
+      *frequently* and wants them all one click away (a settings panel, a
+      dashboard, a profile). Cost: one ActionRow is permanently spent on the
+      tab bar.
+    - **push/pop navigation** (`push()` / `pop()`) is for *hierarchical*
+      drill-down -- a hub to a detail to a sub-detail -- with back history.
+      Reach for it when each view is heavy or the flow is a tree, not a flat
+      set of peers.
+    - **`tab_nav()`** is the tab *look* without the pattern's lifecycle: a row
+      of tab-styled buttons the view switches in its own callback. Reach for
+      it for a lightweight switch or for inner sub-navigation *within* one
+      `TabLayoutView` tab (see `examples/v2_dashboard.py`).
 
 ### Tab Definitions
 
@@ -959,8 +982,9 @@ render as a `Section` regardless of cache state.
 `PersistentLeaderboardLayoutView` composes `_PersistentMixin` with
 `LeaderboardLayoutView` for admin-posted permanent panels. Defaults:
 `owner_only = False`, `exit_policy = "disable"`, `timeout = None`.
-Requires `persistence_key=`. `on_restore` calls `rebuild_pages()` to
-refresh from live data after a bot restart.
+Requires `persistence_key=`. `on_restore` calls `reload()` to re-fetch
+entries, recompose the tree, and edit the message after a bot restart, so
+the restored panel's controls route clicks immediately.
 
 ```python
 from cascadeui import PersistentLeaderboardLayoutView, get_store

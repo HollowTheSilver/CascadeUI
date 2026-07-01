@@ -161,18 +161,31 @@ def with_confirmation(
 
         async def _on_confirm(confirm_interaction: Interaction) -> None:
             try:
-                await confirm_interaction.response.edit_message(
-                    content=confirmed_message, embed=None, view=None
-                )
+                try:
+                    await confirm_interaction.response.edit_message(
+                        content=confirmed_message, embed=None, view=None
+                    )
+                except discord.HTTPException:
+                    # A failed prompt edit (deleted message, dead ack, transient
+                    # 5xx) must not cancel the confirmed action -- the contract is
+                    # "on confirm, run the callback". Swallow the cosmetic edit
+                    # failure and proceed; the callback acks the slot if it is
+                    # still open.
+                    pass
                 await original_callback(confirm_interaction)
             finally:
                 confirmation_view.stop()
 
         async def _on_cancel(cancel_interaction: Interaction) -> None:
             try:
-                await cancel_interaction.response.edit_message(
-                    content=cancelled_message, embed=None, view=None
-                )
+                try:
+                    await cancel_interaction.response.edit_message(
+                        content=cancelled_message, embed=None, view=None
+                    )
+                except discord.HTTPException:
+                    # Same containment as _on_confirm: a failed prompt edit must
+                    # not skip the on_cancel hook.
+                    pass
                 if on_cancel is not None:
                     await on_cancel(cancel_interaction)
             finally:

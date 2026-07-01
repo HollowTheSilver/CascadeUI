@@ -23,6 +23,278 @@ preserved below for historical reference but are not the supported baseline.
 
 ---
 
+## [3.4.0] - 2026-07-01
+
+### Added
+
+- **`PaginatedRegion` composable pager.** A stateful composite component that
+  pages one slice of a `StatefulLayoutView`'s tree while the host renders the
+  rest -- the V2 sibling of the V1 `PaginationControls`. Set `items`, render
+  `page_items`, and add `controls(self)` for the nav row inside the host's
+  `build_ui()` or `on_load()`. Each instance holds its own page index, so two
+  regions can share one view (give them distinct `key` values). Carries the
+  `PaginatedLayoutView` navigation surface -- first/last jump buttons and a
+  go-to-page modal past `jump_threshold` -- with the same class-attribute
+  customization and `on_page_changed` hook. Fills the gap between a one-shot
+  builder and a full paginated view. `control_buttons(self, compact=...)`
+  returns the nav buttons unwrapped so a node-tight host fuses them into a row
+  it owns alongside its own Back/Exit buttons; `compact=True` (also on
+  `controls`) yields a three-button prev/go-to/next set that packs with Back +
+  Exit inside one five-button row -- the shape a `per_page=1` carousel near the
+  40-component cap needs.
+- **`Collapsible` inline disclosure/expander.** A stateful composite where a
+  trigger button toggles an inline region of revealed content -- a `choice_row`,
+  a select, more buttons. The trigger relabels/restyles between collapsed and
+  expanded states; `render(view)` returns the trigger collapsed or the trigger
+  plus the revealed content expanded. Each instance holds its own state, so two
+  collapsibles in one view stay independent. The host supplies a `reveal`
+  callable and owns the collapse policy (`collapse()` after an action, or leave
+  it open); an `on_toggle` hook fires on every open/close. Absorbs the
+  hand-rolled "boolean flag + toggle callback + conditional render" disclosure
+  idiom. An optional `summary` callable fuses the trigger into a Section beside
+  a line of summary text (an `action_section`) instead of a bare button row --
+  the shape a card-based disclosure wants; it falls back to the bare button when
+  the callable yields nothing.
+- **`choice_row` "pick one/any" control + `Choice` type.** A builder for a
+  segmented choose-one control -- a row of buttons where the active option is
+  highlighted and (single-select) disabled, all sharing one `on_select` -- that
+  switches to a dropdown automatically when the option count outgrows a button
+  row (6-25 options) and raises past 25. `multi=True` makes it a multi-select
+  (toggle buttons, or a `max_values` dropdown). Accepts a `{label: value}` dict
+  or a sequence of `Choice` (which adds per-option emoji and dropdown
+  descriptions). The builder handles the string round-trip Discord forces on
+  select option values, so `on_select` always receives the real Python value.
+  `disabled=True` greys out the whole control (every button, or the dropdown)
+  for a read-only state such as a locked or closed choice. Replaces the
+  hand-rolled "style-if-active + disabled-if-current + per-option callback
+  factory" idiom.
+- **`action_section` / `toggle_section` accept `disabled=`.** Render a
+  card-embedded action button greyed out and non-interactive instead of
+  accepting the click and rejecting it inside the callback. Mirrors the raw
+  `StatefulButton` API; default `False` keeps existing callers unchanged.
+- **`MAX_SELECT_OPTIONS` constant** exported from the package root (Discord's
+  25-option select cap). `choice_row` references it instead of the bare integer.
+- **`on_load()` async preload hook + `reload()`.** Override `async def
+  on_load(self)` to fetch from a database or other async source and build the
+  view's tree against the result. The library calls it automatically before the
+  initial send and before every push/pop edit, so navigating to a child or back
+  to a parent re-reads its source (reload-on-render). `reload()` is the
+  out-of-band convenience (`on_load` then `refresh`) for re-fetching inside a
+  callback. Replaces the hand-rolled "sync `__init__` + async `load_and_build` +
+  `rebuild=lambda v: v.load_and_build()`" idiom with one hook.
+- **`on_pre_send(interaction)` hook** -- a pre-send veto gate on every view.
+  Override it to run a permission or data check before the send; returning
+  `False` aborts cleanly (no message, no state registered). It runs with the
+  interaction response slot still open, so an override can respond to the user
+  before the send without a forced `defer`. Demonstrated in the `v2_lobby` example.
+- **`on_bind(bot)` hook on persistent views.** Inject non-serializable runtime
+  dependencies -- a database pool, the bot, a service client -- that cannot ride
+  the constructor through the persistence round-trip. The library calls it
+  automatically during `send()` (when the bot is derivable from the context) and
+  during restore, before `on_restore`. A non-serializable constructor kwarg now
+  declines the registry write with a directed error naming the offending kwarg
+  and pointing to `on_bind`, instead of a near-silent failure that dropped the
+  view on the next restart. Demonstrated in the `v2_persistence` example.
+- **`on_message_gone()` view hook.** Fires when an edit observes the message was deleted
+  (a 404 from `refresh()`), so a consumer tracking the message in its own store can
+  reconcile that reference. The edit-path counterpart to the gateway-driven
+  `on_message_delete`.
+- **`make_back_button()` and `make_nav_row()` navigation helpers.**
+  `make_back_button()` returns an unattached Back button that pops the
+  navigation stack (mirrors `make_exit_button()`). `make_nav_row()` (V2)
+  returns one `ActionRow` combining Back and/or Exit, collapsing the common
+  pushed-sub-view footer into a single call. With `on_load()` defined, Back
+  reloads the restored parent automatically, so no rebuild callback is needed.
+  `back_label` / `back_style` / `back_emoji` (and the `exit_` equivalents)
+  customize each button, so a relabeled Back needs no manual composition.
+- **Leaderboard out-of-band refresh is now a public call.** `LeaderboardLayoutView`
+  builds its pages through `on_load()`, so the inherited `reload()` re-fetches
+  entries and re-renders the message in one public call -- previously an
+  out-of-band refresh needed `rebuild_pages()` plus reaching into the render
+  internals. A pushed leaderboard also reloads its data automatically on
+  navigation. Both short-circuits stay intact: an unchanged entry set skips the
+  avatar re-fetch, and an unchanged tree skips the message edit.
+- **`reload(force=True)` and `rebuild_pages(force=True)` on leaderboard views.** Force a
+  page rebuild even when the entry signature is unchanged: for a filter or a select's
+  highlighted option that changed without touching the row data. `reload(force=True)` is
+  the out-of-band path (re-fetch, re-render, re-store); `rebuild_pages(force=True)` is the
+  lower-level rebuild.
+- **`emoji()` validator + `is_emoji()` utility.** Discord has no native emoji
+  input, so `emoji()` (a sibling of `regex()` / `choices()`) gates a `Modal`
+  `TextInput` on whether the value is a unicode emoji or a custom `<:name:id>`
+  token; `is_emoji(text)` is the bare predicate, exported from
+  `cascadeui.utils`. An emoji "picker" is then composition -- a `choice_row`
+  of your emoji options plus a Custom option that opens a modal with the
+  validator (recipe in the validation guide) -- not a dedicated widget.
+- **Slow-`on_load` diagnostic.** When a view's `on_load()` preload overruns
+  `auto_defer_delay` (default 2.5s), the library logs a one-per-class warning
+  naming the view and the elapsed time. Exposes a render-path HTTP footgun
+  (serial fetches competing with the interaction ack) that otherwise only shows
+  up as a sluggish panel.
+- **Construction warns when an explicit `user_id` diverges from the
+  interaction user.** `user_id` is a framework-managed identity kwarg
+  (re-derived from the interaction on push/pop), so passing a custom value
+  silently diverges after navigation. Construction now logs a warning, once
+  per view class, naming the fix: use a non-reserved kwarg name for
+  application ids.
+- **`DevToolsCog.is_owner_tool` marker.** The dev-tools cog now carries a
+  readable `is_owner_tool = True` class attribute so a bot that routes
+  owner-only cogs differently (for example, to a control guild) can detect it
+  via `getattr(cog, "is_owner_tool", False)` instead of matching the class name.
+  Any owner-gated cog can carry the same marker.
+- **New example `v2_db_navigation.py`.** A repo-backed task list demonstrating
+  the database-navigation pattern: a stable repo handle passed as a kwarg, rows
+  loaded in `on_load()`, and reload-on-render through push/pop with `make_nav_row()`
+  and no `rebuild=` callbacks. The row list is paged with a `PaginatedRegion`
+  fed from `on_load()`.
+- **Composition cookbook** in the components guide. A positive "what nests in
+  what" reference for V2 layouts -- the nesting tree, what goes where, and
+  worked examples for placing selects and collapsible regions inside cards.
+
+### Changed
+
+- **Persistence flush batches all dirty rows into one backend round-trip.** The
+  middleware previously called `row_upsert` once per dirty row; it now calls the
+  new `PersistenceBackend.row_upsert_many`, so the SQL backends collapse a flush
+  into a single transaction (`executemany` + one commit) instead of N connection
+  acquires and N commits. A custom backend that does not implement
+  `row_upsert_many` keeps working -- the flush falls back to per-row
+  `row_upsert`.
+- **Persistent-view restore fetches concurrently at startup.** Reattaching
+  persistent views on `setup_hook` previously fetched each view's channel and
+  message one at a time, so a deployment with many panels paid an O(N) serial
+  Discord round-trip cost before the bot reached READY. The fetch phase now runs
+  concurrently under a bounded semaphore (`restore_concurrency` on
+  `PersistenceMiddleware(...)`, default 8); view registration stays serial and in
+  order. Many-panel bots reach READY substantially faster.
+- **`REGISTRY_PRUNED` carries the pruned `persistence_key`s, and `last_reattach_summary`
+  exposes them after startup.** The action payload gains a `keys` list alongside its
+  `deleted` count. Because the action dispatches only once and code running after
+  `setup_hook` completes (such as `on_ready` handlers) cannot subscribe in time to observe
+  it, the manager also stashes the reattach result on
+  `store.persistence_manager.last_reattach_summary` (`restored`/`skipped`/`failed`/`removed`/`unreachable`
+  key lists), so a consumer can reconcile its own records after startup regardless of
+  subscription timing.
+- **The V2 40-component message cap raises a directed error.** When a
+  `StatefulLayoutView` tree would exceed Discord's 40-component limit, `add_item`
+  re-raises discord.py's terse "maximum number of children exceeded" with the
+  running component count and a fix pointing at
+  `PaginatedRegion.control_buttons(view, compact=True)`. discord.py still owns
+  the enforcement; the library owns the message.
+- **Expected ephemeral-lifecycle conditions no longer log at WARNING.** An
+  ephemeral view that outlives its 15-minute interaction token logs its
+  unavoidable edit-on-timeout failure (and the T+810s refresh-button arming
+  failure) at DEBUG instead of WARNING -- the condition is expected and not
+  operator-actionable. Non-ephemeral edit failures still warn. A persistent-view
+  registry write that races the view's own exit also drops to DEBUG.
+- **`DevToolsCog` slash commands are hidden from non-admins.** The `/cascadeui`
+  group now sets `default_member_permissions` to none, so Discord no longer
+  shows it in a regular member's command picker -- the `is_owner()` check
+  already blocked execution; this removes the clutter for bots that sync the
+  cog globally. The prefix form (`!cascadeui ...`) is unaffected.
+- **DevTools inspector buttons are more responsive.** The Refresh, Clear History,
+  and performance-tab buttons in `/cascadeui inspect` now edit and acknowledge in
+  one round-trip instead of deferring first, removing a per-click pause. The
+  genuinely-slow buttons (Flush, Exit All, Clear Session) still acknowledge first.
+- **`v2_dashboard.py` enriched into a full V2 builder showcase** covering `choice_row`,
+  `Collapsible`, `tab_nav`, `cycle_button`, and `link_section` across three tabs, plus a
+  "tabs vs navigation vs `tab_nav`" decision note in the patterns guide.
+- **Modal input `custom_id`s now derive through the shared `slugify` rule**, so a punctuated
+  field label (`"A/B Test"`) yields a clean `input_a_b_test` id; letter-and-space labels are unchanged.
+
+### Fixed
+
+- **A failed interaction edit during navigation no longer bricks the view.** When a
+  Discord edit failed mid-`push()`/`pop()` (a missed ack, an expired token, a transient
+  5xx), the message kept showing the previous view while that view was already torn
+  down, so every later click was silently dropped. Navigation is now atomic: the source
+  view's teardown is deferred until the destination edit confirms, so a failed edit
+  rolls back to a live, re-clickable source instead of a dead message. The edit is
+  attempted across the interaction fast path, the deferred response, and the channel
+  endpoint before any rollback.
+- **Fast navigation no longer surfaces an occasional "This interaction failed".** When a
+  view's first render took roughly `auto_defer_delay` seconds, the auto-defer timer
+  could acknowledge the interaction in the same instant the fast-path edit ran, and
+  `edit_message` raised `InteractionResponded` -- a sibling of `HTTPException` the fast
+  path did not catch. Both the navigation and in-place-refresh fast paths now recognize
+  the race and fall through to the deferred edit.
+- **Tab views keep their Back button when used as a navigation rebuild target.**
+  A `TabLayoutView` that is pushed and rebuilt through `send()` could lose the auto
+  Back button on the rebuild; it is now restored afterward like the other navigation
+  patterns.
+- **`with_confirmation` no longer drops the confirmed action when the prompt edit
+  fails.** If editing the confirm/cancel prompt failed (a deleted message, a transient
+  error), the wrapped callback was skipped and the error propagated. The prompt edit is
+  now contained so the confirmed action (or `on_cancel`) still runs.
+- **Modal submissions no longer error when the trailing acknowledgement races.** A modal
+  whose callback left the interaction unanswered acked it afterward; a dead or
+  already-acked interaction made that defer raise into `Modal.on_error` even though the
+  submission had processed. The trailing ack now absorbs the dead-interaction and
+  already-acked cases, matching the view callback's post-callback defer.
+- **Persistent views no longer render with a cold cache on restart.** `on_restore` ran on
+  the `setup_hook` critical path, before the gateway cache was populated, so a render that
+  read `bot.get_user`/members/channels painted defaults (e.g. default avatars) that never
+  refreshed. `on_restore` now runs after `bot.wait_until_ready()` on a background task, so
+  its render resolves real values; interaction routing still registers immediately during
+  reattach.
+- **Persistent leaderboard panels route clicks immediately after a restart.**
+  `PersistentLeaderboardLayoutView` builds its ranking controls in `on_load`, so reattach
+  registered only the `"No pages."` placeholder tree and the real selects and nav buttons
+  dropped clicks until the next state change. `on_restore` now re-renders via `reload()`,
+  whose message edit re-stores the real components in discord.py's view store.
+- **Reattach no longer prunes a persistent view's row on a transient fetch failure.** A
+  `Forbidden` or `HTTPException` during the startup mass-fetch (a momentary permission change
+  or a 5xx) previously deleted the registry row alongside a real `NotFound`, so a
+  still-existing panel was orphaned and never reattached on a later restart. Only a definitive
+  `NotFound` now prunes; transient failures land in a new `unreachable` reattach-summary bucket
+  and leave the row on disk for the next restart.
+- **Persistent-view reattach logs one aggregate summary, not a line per view.** Startup
+  logged an INFO line per reattached view (a flood at hundreds of views) plus an aggregate
+  dumping every key list. Reattach now logs a single INFO summary with counts; the per-view
+  detail moved to DEBUG.
+- **`PersistenceMiddleware(migrators=...)` now registers the migrators.** The
+  `migrators=` keyword was accepted but silently ignored -- the value was stashed
+  and never wired into the migration registries. It now takes a dict with optional
+  `"schema"` and `"kwargs"` keys (each mapping `(name, from_version)` to an async
+  migrator) and registers them during `initialize()`, before schema migration and
+  rehydrate run. Registration is idempotent, so re-construction does not raise.
+- **`subscribed_actions` declared on a base class is now inherited.** The `__init__`
+  defaulting checked the leaf class's `__dict__` instead of the MRO, so a value factored
+  onto a base class was overwritten with an empty set and the view silently subscribed to
+  nothing. It now resolves through the MRO and copies into a fresh per-instance set.
+- **`TaskManager` no longer leaks a coroutine when a task is cancelled before it
+  starts.** A task cancelled in the same tick it was created left its coroutine
+  unawaited, emitting a "coroutine was never awaited" warning. Tasks now schedule their
+  coroutine directly and clean up through a done-callback, so a cancel-before-first-step
+  unwinds cleanly.
+- **`LoggingMiddleware` honors its configured `level` for emission.** The action stream
+  was hardcoded to `INFO`; it now emits at the configured level and no longer pins the
+  logger threshold, so `level="DEBUG"` (or `setup_logging(actions="DEBUG")`) keeps action
+  traffic out of INFO logs. `level="WARNING"` no longer suppresses the stream -- use
+  `actions=False` for that.
+- **`setup_logging` no longer prints literal ANSI escapes on a plain console.** The
+  console handler emitted color unconditionally, so a Windows console without virtual-terminal
+  processing showed `^[[31m` codes while the file handler stayed clean. `setup_logging` now
+  detects color support (delegating to discord.py's detector, honoring `NO_COLOR` / `FORCE_COLOR`)
+  and falls back to plain output; a new `color=True` / `color=False` argument forces it either way.
+- **`Modal` validation errors now name the field label, not its custom_id slug.**
+  A failed validator rendered the field's derived `custom_id` (e.g. `input_emoji`
+  for a field labelled "Emoji") in the user-facing error line. It now prefixes the
+  field's label instead.
+- **Duplicate component `custom_id`s are caught at build time with a directed error.**
+  Two components sharing a `custom_id` previously failed with an opaque Discord HTTP 400 at
+  render, and two modal inputs deriving the same id from their label (e.g. two fields both
+  labelled "Name") silently overwrote each other, dropping one field's submitted value. The
+  pre-send validator now walks the component tree (V1 and V2) and `Modal` checks its inputs,
+  each raising a `ValueError` that names the repeated id and the fix.
+- **Link and premium buttons no longer break a stateful view.** A link (`url`) or premium
+  (`sku_id`) button carries no `custom_id`, but the custom_id stabilizer treated it as an auto-id
+  button and assigned one, producing a Discord 400 (code 50035, "custom id and url cannot both be
+  specified") whenever such a button sat in a `build_ui()` tree. The stabilizer now skips both, and
+  a V1 `PersistentView` no longer rejects a link button for lacking a custom_id.
+
+---
+
 ## [3.3.4] - 2026-06-19
 
 ### Fixed

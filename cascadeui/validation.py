@@ -68,6 +68,25 @@ def choices(allowed: List[Any], msg: Optional[str] = None):
     return validator
 
 
+def emoji(msg: Optional[str] = None):
+    """Validate that a value is a single emoji or a custom Discord token.
+
+    Backed by :func:`cascadeui.utils.is_emoji`. Intended for a ``Modal``
+    ``TextInput`` collecting an arbitrary emoji -- Discord has no native emoji
+    input field. An empty value passes; ``required=True`` on the input rejects
+    blank, and a non-empty value that is not an emoji fails.
+    """
+    from .utils.strings import is_emoji
+
+    def validator(value, field, all_values):
+        text = str(value or "").strip()
+        if not text or is_emoji(text):
+            return ValidationResult(True)
+        return ValidationResult(False, msg or "Enter a single emoji or a custom server emoji.")
+
+    return validator
+
+
 def min_value(n: Union[int, float], msg: Optional[str] = None):
     """Validate that a numeric value is at least ``n``."""
 

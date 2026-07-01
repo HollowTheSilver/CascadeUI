@@ -41,3 +41,12 @@ Mirrors the union accepted by :class:`discord.ui.MediaGallery`,
   ``refresh(attachments=[...])`` for in-place swaps) so the bytes
   travel with the message.
 """
+
+
+MAX_SELECT_OPTIONS = 25
+"""Discord's hard cap on the number of options in a single select menu.
+
+A :class:`discord.ui.Select` (and CascadeUI's ``StatefulSelect`` / ``Dropdown``)
+rejects more than this at the API boundary. The V2 ``choice_row`` builder
+enforces it, raising ``ValueError`` past the cap.
+"""

@@ -380,3 +380,48 @@ class TestTabOverflowParity:
             rows_by_index[button.row] = rows_by_index.get(button.row, 0) + 1
         widths = [rows_by_index[i] for i in sorted(rows_by_index)]
         assert widths == [5, 1]
+
+
+# // ========================================( Composites inside tabs )======================================== // #
+
+
+class TestCompositesInsideTabs:
+    """V2 stateful composites re-render correctly when placed inside a tab.
+
+    A ``TabLayoutView`` rebuilds its active tab through ``_refresh_tabs``,
+    not ``build_ui``/``on_load``. The shared ``_rerender_host`` probe must
+    recognize that seam so a ``Collapsible`` (or ``PaginatedRegion``) click
+    inside a tab rebuilds the tab instead of refreshing a stale tree.
+    """
+
+    async def test_collapsible_toggle_rebuilds_tab(self):
+        from cascadeui import Collapsible, card
+
+        class DemoTabs(TabLayoutView):
+            owner_only = False
+
+            def __init__(self, **kwargs):
+                self.box = Collapsible(
+                    label="More",
+                    expanded_label="Less",
+                    reveal=lambda: TextDisplay("REVEALED"),
+                )
+                super().__init__(tabs={"T": self.build_t}, **kwargs)
+
+            async def build_t(self):
+                return [card("## Tab", *self.box.render(self))]
+
+        view = DemoTabs(interaction=_make_interaction())
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+        await view._refresh_tabs()  # initial build, collapsed
+
+        def has_revealed():
+            return any(
+                isinstance(c, TextDisplay) and "REVEALED" in (c.content or "")
+                for c in view.walk_children()
+            )
+
+        assert has_revealed() is False
+        await view.box._toggle(_make_interaction())  # internal composite toggle
+        assert has_revealed() is True  # the tab was rebuilt via _refresh_tabs

@@ -16,7 +16,17 @@ persistence_key=None,        # Stable identity for persistent data
 theme=None,            # Per-view Theme override
 ```
 
-Pass either `context` or `interaction` -- both extract the user, guild, and interaction for `send()`. Use `context` from prefix/hybrid commands, `interaction` from app commands or component callbacks.
+Pass either `context` or `interaction` -- both extract the user, guild, and interaction for `send()`. Use `context` from prefix/hybrid commands, `interaction` from app commands or component callbacks. A bare `discord.TextChannel` has no `.author`, so passing one as `context` derives no `user_id` and no `session_id`; the view is ownerless. See [View identity](../guide/persistence.md#view-identity-user_id-and-session_id-follow-the-construction-context) for the full model.
+
+!!! warning "Reserved constructor parameters"
+    Eight constructor kwargs are framework-managed: `context`, `interaction`,
+    `message`, `state_store`, `session_id`, `user_id`, `guild_id`, and `parent`.
+    They are stripped from the captured init kwargs and re-derived on push/pop
+    reconstruction. The reconstructed view receives the framework-derived value
+    for these names, not whatever was passed at construction, so application data
+    stored under a reserved name (e.g. `user_id=target_player_id`) diverges
+    silently on the first push or pop. Use a distinct, non-reserved kwarg name
+    for application IDs.
 
 ## Shared Methods
 
@@ -26,12 +36,13 @@ These methods are available on all view classes (V1 and V2):
 
 Sends the view as a message. V1 accepts `content`, `embed`, `embeds`, `file`, `files`, `ephemeral`. V2 accepts `file`, `files`, `ephemeral` (V2 sends the view as its own content, so no content/embed params). The `file` / `files` pair mirrors discord.py's `Messageable.send` signature and pairs with the V2 media builders (`gallery`, `image_section`, `file_attachment`) for `attachment://` references. See [Local file attachments](../guide/components.md#local-file-attachments).
 
-**Return value:** the sent `discord.Message` on success, or `None` when the view was blocked before reaching Discord. Two conditions produce `None`:
+**Return value:** the sent `discord.Message` on success, or `None` when the view was blocked before reaching Discord. Three conditions produce `None`:
 
-1. **Instance limit rejection** -- `instance_policy = "reject"` and the user has hit `instance_limit`. The `on_instance_limit` hook fires and handles the response automatically.
-2. **Participant registration failure** -- `auto_register_participants = True` and a user in `allowed_users` already occupies an instance of this view type. Rollback removes all side effects (registry, state tree, participants).
+1. **`on_pre_send` veto** -- the override returned `False`. No message ships, no state registers, and the interaction's response slot stays open for the override to respond to the user.
+2. **Instance limit rejection** -- `instance_policy = "reject"` and the user has hit `instance_limit`. The `on_instance_limit` hook fires and handles the response automatically.
+3. **Participant registration failure** -- `auto_register_participants = True` and a user in `allowed_users` already occupies an instance of this view type. Rollback removes all side effects (registry, state tree, participants).
 
-In both cases, the view is fully cleaned up -- no message was sent, no state remains. See [send() and Rollback](../guide/views.md#send-and-rollback) for usage patterns.
+In each case, the view is fully cleaned up -- no message was sent, no state remains. See [send() and Rollback](../guide/views.md#send-and-rollback) for usage patterns.
 
 #### `dispatch(action_type, payload=None)`
 
@@ -77,6 +88,10 @@ Registers a child view for automatic cleanup. When the parent exits or times out
 #### `on_message_delete()` *(async, override)*
 
 Called when the view's Discord message is deleted externally (admin delete, bulk purge, channel delete). Default calls `exit(delete_message=False)`. Override for custom behavior (logging, re-sending). If overriding without calling `exit()`, the view remains as a ghost in the state store.
+
+#### `on_message_gone()` *(async, override)*
+
+Called when `refresh()` issues an edit that returns `discord.NotFound` (the message was deleted out from under the view). The library nulls `self._message` and fires this hook so a consumer tracking the message in its own store can reconcile that reference; key the reconcile on the view's stable identity (`persistence_key`), since `self._message` is already nulled. Default is a no-op. Unlike `on_message_delete()`, this hook does not exit the view (the gateway event owns teardown), which keeps it safe to fire from the reactive refresh path. The edit-path counterpart to the gateway-driven `on_message_delete()`; both can fire for one deletion, so make the reconcile idempotent. It may run while the view's update lock is held, so an override may do I/O but should not dispatch a state change back into this view.
 
 #### `on_replaced()` *(async, override)*
 
@@ -173,6 +188,10 @@ view.set_class_attribute("participant_limit", player_count)
 
 Returns a pre-configured `StatefulButton` without adding it to the view. Use in V2 views that need to place exit buttons inside specific `ActionRow` or `Container` subtrees rather than at the top level. `add_exit_button()` continues to work for top-level placement.
 
+#### `make_back_button(label="Back", style=ButtonStyle.secondary, emoji="◀", custom_id=None, row=None)`
+
+Returns an unattached `StatefulButton` whose callback pops the navigation stack. The matched pair to `make_exit_button()` -- pack it into a caller-owned `ActionRow` or `Container` subtree. For the top-level auto-injected case, set `auto_back_button = True` instead.
+
 #### `add_exit_button(label="Exit", style=ButtonStyle.secondary, row=None, emoji="❌", delete_message=False, custom_id=None)`
 
 Adds an exit button that calls `self.exit()`. In V2 views, the button is wrapped in an `ActionRow`. Set `delete_message=True` to delete the message instead of disabling components. Pass `custom_id` for persistent views.
@@ -184,6 +203,37 @@ Cleans up the view: cancels tasks, unsubscribes, disables components. When `dele
 #### `get_theme()`
 
 Returns the view's theme (per-view override or global default).
+
+#### `await on_pre_send(interaction)` *(override)*
+
+Pre-send veto gate. Default returns `True`. The library calls it first in the send pipeline -- before `on_load()`, placement validation, instance enforcement, and the Discord call -- so a `False` return aborts the send before any of that work. An abort is clean: no message ships and no state registers, so a vetoed send leaves zero side effects. The interaction's response slot is still open, so an override can `respond()` to explain the veto; on a proceed, the slot stays available for the actual send (no forced `defer` onto the followup path). `interaction` is the triggering interaction, or `None` for a channel/context send.
+
+```python
+async def on_pre_send(self, interaction):
+    if not await self.repo.user_has_access(self.user_id):
+        await self.respond(interaction, "You don't have access.", ephemeral=True)
+        return False
+    return True
+```
+
+#### `await on_load()` *(override)*
+
+Async preload hook. Default is a no-op. The library calls it automatically before the initial send (inside `send()`) and before every push/pop edit, so navigating to a child or back to a parent re-fetches its source. Override to load from a database or other async source and build the view's component tree against the result. A data-loading view fetches its own source through `on_load()` on navigation, so its push and pop calls carry no `rebuild=` argument. See [Navigating database-backed views](../guide/views.md#navigating-database-backed-views).
+
+```python
+async def on_load(self):
+    self.rows = await self.repo.list_tasks()
+    self.build_ui()
+```
+
+#### `await reload()`
+
+Runs `on_load()` followed by `refresh()`. The out-of-band counterpart to the automatic `on_load()` calls -- use it inside a callback that mutated the view's data source and needs an immediate re-fetch and re-render.
+
+```python
+async def on_refresh(self, interaction):
+    await self.reload()
+```
 
 #### `await seed_initial_state(state)` *(override)*
 
@@ -243,7 +293,7 @@ Called before every component callback. Returns `True` to allow, `False` to bloc
 - `persistence_key` (str | None): Stable data identity key
 - `message` (Message | None): The sent message, if any
 - `state_store` (StateStore): The singleton store
-- `session_id` (str | None): Session identity for this view. Auto-derived at `__init__` as `<module.QualName>:user_<id>:<8hex>` unless `session_continuity = True` is set on the class (which drops the `:<8hex>` suffix) or an explicit `session_id=` kwarg is passed.
+- `session_id` (str | None): Session identity for this view. `None` when no `user_id` could be derived (channel-posted views have no `.author`, so they carry no session). When `user_id` is present, auto-derived as `<module.QualName>:user_<id>:<8hex>` unless `session_continuity = True` is set on the class (which drops the `:<8hex>` suffix) or an explicit `session_id=` kwarg is passed.
 - `scoped_state` (dict): The scoped state for this view's user/guild (empty dict if no state_scope)
 - `shared_data` (dict): The current session's `shared_data` dict (empty dict if no session or no data)
 
@@ -274,6 +324,7 @@ Called before every component callback. Returns `True` to allow, `False` to bloc
 - `exit_policy` (str): What bare `exit()` calls do when no `delete_message` argument is supplied. `"disable"` (default) freezes the components in place; `"delete"` removes the message. Always overridden by an explicit `delete_message=` argument or by an `exit()` method override. Independent of `replace_policy`.
 - `auto_defer` (bool): Enable the auto-defer safety net (default: `True`).
 - `auto_defer_delay` (float): Seconds before auto-deferring (default: `2.5`).
+- `refresh_cooldown_ms` (int | None): Proactive minimum gap between successive Discord edits, in milliseconds. Refreshes arriving inside an active window are coalesced into one deferred re-render that fires at the window boundary. `None` (default) disables the proactive cooldown; the reactive 429 backoff is always active regardless. Validated as a positive int (`0` is rejected).
 - `serialize_interactions` (bool): Serialize rapid button clicks with an `asyncio.Lock` (default: `True`). Set to `False` for views that handle parallel callbacks.
 - `edit_timeout` (float | None): Maximum seconds any single Discord edit may stall before it is cancelled. Bounds the edits the library issues after the initial send -- state-driven refresh, exit/teardown, and navigation edits. discord.py issues edits with no total HTTP timeout, so without this a stalled connection would pin the view until the socket drops. Default `60.0` (clears realistic attachment uploads while capping a true hang). Set to `None` to disable the bound (unbounded, matching discord.py's own default). The acting-view fast path keeps its own tighter bound, which protects the 3-second ack deadline rather than guarding against a hang.
 - `session_continuity` (bool): Governs `session_id` auto-derivation polarity. Default `False` gives every invocation a per-instance UUID suffix, so repeat opens of the same view class are independent sessions with their own nav stack, undo timeline, and `shared_data`. Set to `True` on views that want repeat-open state coalescing (undo history surviving close-and-reopen, `shared_data` continuity across gestures); the opt-in collapses derivation back to the class-coalesced shape. Push/pop chains stay on one session regardless because `_navigate_to` forwards `session_id` explicitly.
@@ -298,9 +349,35 @@ V2 views ARE the message content -- `send()` takes no `content` or `embed` param
 
 #### V2-Specific Methods
 
+##### `make_nav_row(*, back=True, exit=True, back_label="Back", exit_label="Exit", back_style=secondary, back_emoji="◀", exit_style=secondary, exit_emoji="❌", delete_message=False, back_custom_id=None, exit_custom_id=None)`
+
+Returns one `ActionRow` containing a Back button and/or an Exit button -- the V2 navigation footer helper. Raises `ValueError` if both `back` and `exit` are `False`. Back pops the navigation stack; Exit calls `self.exit()` (`delete_message` controls whether the message is deleted or frozen). When the popped view defines `on_load()`, that hook runs on the restored view before the edit ships, re-fetching its source on render. The `back_*` / `exit_*` label, style, and emoji kwargs forward to `make_back_button` / `make_exit_button`, so a relabeled Back (`make_nav_row(back_label="Leagues", back_emoji="🏠")`) needs no manual composition.
+
+```python
+def build_ui(self):
+    self.clear_items()
+    self.add_item(card("## Inventory", ...))
+    self.add_item(self.make_nav_row())
+```
+
 ##### `clear_row(row)`
 
 No-op on V2 views. V2 uses a tree structure rather than rows.
+
+---
+
+### `DisplayLayoutView`
+
+```python
+DisplayLayoutView(context=None, *, container)
+```
+
+A parameterized concrete variant of `StatefulLayoutView` that renders a supplied `container` without requiring a subclass. It has no state machine and no hook surface: a shorthand for one-shot ephemeral V2 sends where a full subclass would be overkill.
+
+```python
+view = DisplayLayoutView(context=ctx, container=card("Done!"))
+await view.send(ephemeral=True)
+```
 
 ---
 
@@ -424,6 +501,12 @@ PaginatedLayoutView(context=None, pages=[list_of_components, ...], **kwargs)
 
 Each page is a list of V2 components. Navigation buttons (Previous, Next, First, Last, Go-to-page) work identically to V1's `PaginatedView`.
 
+#### Class Attributes
+
+##### `nav_inside_container` *(bool, default `False`)*
+
+When `True` and multiple pages exist, wraps the page content and the navigation row together in a single `Container`. Default `False` keeps them as separate top-level children. Single-page views render no navigation row, so the flag has no visible effect there. When the page formatter returns a single `Container`, the wrap builds a fresh Container (copying its accent color and spoiler) rather than nesting one inside another, which Discord rejects.
+
 #### Class Methods
 
 ##### `await PaginatedLayoutView.from_data(items, per_page, formatter, **kwargs)`
@@ -497,9 +580,11 @@ await view.send()
 | `on_leaderboard_empty()` | Returns the V2 component list shown when `entries` is empty. |
 | `on_state_changed(state)` *(async, override)* | Calls `rebuild_pages()` then the paginated refresh; live-data subclasses subscribe to data actions and override `get_entries()`. |
 
+**Out-of-band refresh.** `reload()` re-fetches entries, recomposes the tree, and edits the message (the public path for a manual refresh button or `on_restore`); `rebuild_pages()` rebuilds only the page list. Both accept `force=True` to bypass the entry-signature short-circuit when something outside the row data changed the render: a filter, or a select's highlighted option folded into `build_summary`.
+
 #### Persistent Variant
 
-`PersistentLeaderboardLayoutView` composes `_PersistentMixin` with `LeaderboardLayoutView` for admin-posted permanent panels. Defaults: `owner_only = False`, `exit_policy = "disable"`, `timeout = None`. Requires `persistence_key=` at construction. `on_restore` calls `rebuild_pages()` to refresh from live data after a bot restart.
+`PersistentLeaderboardLayoutView` composes `_PersistentMixin` with `LeaderboardLayoutView` for admin-posted permanent panels. Defaults: `owner_only = False`, `exit_policy = "disable"`, `timeout = None`. Requires `persistence_key=` at construction. `on_restore` calls `reload()` after a bot restart to re-fetch entries, recompose the tree, and edit the message, which re-stores the panel's components so clicks route immediately.
 
 See [`docs/guide/patterns.md`](../guide/patterns.md#leaderboardlayoutview-persistentleaderboardlayoutview) for cardinality model, customization tiers, and section-mode rendering details.
 
@@ -648,9 +733,13 @@ Same requirements and behavior as `PersistentView` -- `persistence_key` required
 
 #### Methods
 
+##### `on_bind(bot)` *(override)*
+
+Inject non-serializable runtime dependencies (a database pool, the bot, a service client) from `bot`. The library calls it during `send()` when the bot is derivable from the construction context, and during restore before `on_restore`. Shared by every persistent view through `_PersistentMixin`. See [Runtime dependencies via `on_bind`](../guide/persistence.md#runtime-dependencies-via-on_bind).
+
 ##### `on_restore(bot)` *(override)*
 
-Called after the view is restored on bot restart.
+Called after the view is restored on bot restart, once `bot.wait_until_ready()` resolves so the gateway cache (`get_user`, members, channels) is warm. A render here resolves real values instead of cold defaults. Interaction routing registers earlier, during reattach, so the view is clickable before this render runs.
 
 ---
 
@@ -699,7 +788,7 @@ PersistentView(
 
 ##### `on_restore(bot)` *(override)*
 
-Called after the view is restored on bot restart.
+Called after the view is restored on bot restart, once `bot.wait_until_ready()` resolves so the gateway cache (`get_user`, members, channels) is warm. A render here resolves real values instead of cold defaults. Interaction routing registers earlier, during reattach, so the view is clickable before this render runs.
 
 ---
 
@@ -777,7 +866,7 @@ Pages can be `Embed` objects, strings, or dicts with `"embed"` and/or `"content"
 
 ---
 
-## `PersistenceMiddleware(manager=None, *, backend=None, registry=None, application=None, bot=None, migrators=None)`
+## `PersistenceMiddleware(manager=None, *, backend=None, registry=None, application=None, bot=None, migrators=None, restore_concurrency=8)`
 
 Write-through middleware that owns the full persistence pipeline. Install via `setup_middleware` once in `setup_hook`, after loading cogs.
 
@@ -785,6 +874,8 @@ Write-through middleware that owns the full persistence pipeline. Install via `s
 - With `bot`: also re-attaches PersistentView and PersistentLayoutView instances, and installs the message-deletion cleanup listener
 - `backend`: a `PersistenceBackend` instance (e.g. `SQLiteBackend`, `InMemoryBackend`) used as the shorthand for any namespace not configured explicitly
 - `registry`, `application`: per-namespace configs (`RegistryPersistence`, `ApplicationPersistence`) that override the shorthand. Scoped state rides under the application namespace -- opt a scoped slot in via `persistent_slots = ("scoped",)` on the view class.
+- `migrators`: optional dict with `"schema"` and/or `"kwargs"` keys, each mapping a `(name, from_version)` tuple to an async migrator callable. When omitted, no migrators are registered through this kwarg; the `@register_migrator` / `@register_kwargs_migrator` decorators are the canonical registration path, and this dict is the programmatic bulk alternative.
+- `restore_concurrency`: positive int bounding how many persistent-view channel and message fetches run concurrently during startup reattach (default `8`).
 
 ```python
 from cascadeui import setup_middleware
@@ -796,7 +887,7 @@ await setup_middleware(
 )
 ```
 
-The reattach summary (`{"restored": [...], "skipped": [...], "failed": [...], "removed": [...]}`) is available via `await store.persistence_manager.reattach_persistent_views()`.
+The reattach summary (`{"restored": [...], "skipped": [...], "failed": [...], "removed": [...], "unreachable": [...]}`) is available via `await store.persistence_manager.reattach_persistent_views()`.
 
 See [docs/api/persistence.md](persistence.md) for the full API reference.
 

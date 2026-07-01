@@ -3,12 +3,16 @@
 
 from .v1 import ConfirmationButtons, PaginationControls, ProgressBar, ToggleGroup
 from .v2 import (
+    Choice,
+    Collapsible,
     EmojiGrid,
+    PaginatedRegion,
     action_section,
     alert,
     button_grid,
     button_row,
     card,
+    choice_row,
     confirm_section,
     cycle_button,
     divider,
@@ -46,6 +50,9 @@ __all__ = [
     "button_row",
     "cycle_button",
     "toggle_button",
+    # V2 choices
+    "Choice",
+    "choice_row",
     # V2 content
     "key_value",
     "alert",
@@ -56,6 +63,10 @@ __all__ = [
     "gap",
     # V2 navigation
     "tab_nav",
+    # V2 pagination
+    "PaginatedRegion",
+    # V2 collapsible
+    "Collapsible",
     # V2 media
     "gallery",
     "file_attachment",

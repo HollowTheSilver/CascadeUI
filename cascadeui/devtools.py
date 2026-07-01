@@ -7,6 +7,7 @@ import logging
 from datetime import datetime, timezone
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 from discord.ext.commands import Context
 from discord.ui import ActionRow, TextDisplay
@@ -256,7 +257,12 @@ class InspectorView(TabLayoutView):
         return ActionRow(self.make_exit_button(label="Close", emoji="\u274c"))
 
     async def _refresh(self, interaction):
-        await self._safe_defer(interaction)
+        # No pre-defer: _refresh_tabs() -> refresh() rides the acting-view
+        # fast path (edit + ack in one call), and the post-callback defer
+        # acks if the digest short-circuits. Pre-deferring would consume the
+        # response slot and force the slow two-call path. Only the genuinely
+        # slow inspector callbacks (flush, exit-all, session-clear) keep an
+        # ack-first _safe_defer, because their work can exceed the 3s window.
         await self._refresh_tabs()
 
     def _truncate(self, items, max_len=200):
@@ -414,7 +420,7 @@ class InspectorView(TabLayoutView):
 
     async def _clear_history(self, interaction):
         """Clear the action history buffer."""
-        await self._safe_defer(interaction)
+        # No pre-defer (light callback; see _refresh).
         self.state_store.history.clear()
         logger.info("Inspector: cleared action history")
         await self._refresh_tabs()
@@ -800,13 +806,13 @@ class InspectorView(TabLayoutView):
             store.disable_perf()
         else:
             store.enable_perf()
-        await self._safe_defer(interaction)
+        # No pre-defer (light callback; see _refresh).
         await self._refresh_tabs()
 
     async def _perf_clear(self, interaction):
         """Drop every recorded sample (dispatch + refresh)."""
+        # No pre-defer (light callback; see _refresh).
         self.state_store.clear_perf()
-        await self._safe_defer(interaction)
         await self._refresh_tabs()
 
     async def _perf_export(self, interaction):
@@ -1271,7 +1277,12 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
 
     Provides the visual state inspector and administrative commands
     under a single ``/cascadeui`` command group. All subcommands are
-    owner-only and respond ephemerally.
+    owner-only and respond ephemerally. The slash commands set
+    ``default_member_permissions`` to none, so Discord hides them from
+    non-admins in the command picker; ``is_owner()`` still gates execution
+    and the prefix form (``!cascadeui ...``) stays available. The
+    ``is_owner_tool = True`` class attribute lets a bot detect that the cog
+    is owner-gated without matching the class name.
 
     Usage:
         from cascadeui import DevToolsCog
@@ -1297,10 +1308,22 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
         /cascadeui subscribers    List active state subscribers
     """
 
+    # Marks this cog's commands as owner-gated. A consumer that routes owner-only
+    # tooling differently (e.g. to a control guild so it never reaches a member's
+    # slash picker) reads getattr(cog, "is_owner_tool", False) instead of matching
+    # the class name. Any owner-gated cog -- library or consumer -- can carry the
+    # same marker, so the check generalizes.
+    is_owner_tool = True
+
     def __init__(self, bot):
         self.bot = bot
 
+    # default_permissions() with no perms (= Permissions.none) hides the
+    # /cascadeui slash commands from non-admins in the picker -- Discord has no
+    # owner-only visibility. is_owner() still gates execution; the prefix form
+    # (!cascadeui ...) is unaffected.
     @commands.hybrid_group(name="cascadeui", description="CascadeUI developer tools.")
+    @app_commands.default_permissions()
     @commands.is_owner()
     async def cascadeui_group(self, ctx: Context) -> None:
         """CascadeUI developer tools. Run a subcommand for details."""

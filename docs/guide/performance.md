@@ -345,6 +345,78 @@ Each step produces a number the Performance tab can compare against.
 
 ---
 
+## Timing and Concurrency Knobs
+
+Selectors, `batch()`, and `@computed` reduce how much *work* a dispatch
+does. A separate family of class attributes governs interaction
+*timing* and edit *concurrency* -- the dials that matter when a view
+does unavoidable async work per interaction (a database read, an
+attachment upload, a heavy render). They live on every `StatefulView`
+and `StatefulLayoutView`:
+
+| Attribute | Default | What it governs | Raise or change it when |
+|-----------|---------|-----------------|-------------------------|
+| `auto_defer` | `True` | The ack safety net. A background timer acknowledges the interaction if the callback has not responded in time. | Keep it on. Turning it off removes the only thing standing between a slow callback and Discord's 3-second ack wall. |
+| `auto_defer_delay` | `2.5` | How long the safety net waits before acking (seconds). | A view's callback can run long; lowering it acks sooner. The default leaves headroom under the 3s wall. |
+| `serialize_interactions` | `True` | Serializes callbacks behind a lock so rapid clicks cannot fire racing `message.edit()` calls. | Keep it on for views that edit one shared message. It serializes the edits, not the data loads. |
+| `refresh_cooldown_ms` | `None` | A proactive throttle: edits inside the window are coalesced into one deferred re-render. | A view re-renders rapidly and you want fewer REST round-trips. The reactive 429 backoff is always on regardless. |
+| `edit_timeout` | `60.0` | The ceiling on every edit the library issues after the initial send. A stalled edit is cancelled at this bound. | Uploads or large payloads need longer than 60s per edit. Set `None` to await with no ceiling. |
+| `timeout` | `180` (discord.py default) | The discord.py view timeout, in seconds. Values over 900s engage the ephemeral refresh handoff automatically. | Long-lived panels. A persistent view sets `timeout = None`. |
+
+One more knob lives on the persistence layer rather than the view:
+`PersistenceMiddleware(restore_concurrency=8)` bounds how many
+persistent views reattach concurrently on startup. Raise it when a bot
+restores many panels and the serial fetch cost dominates `setup_hook`.
+
+`auto_defer` is the one to understand. The safety-net timer runs
+independently of the serialization lock, so it acks the interaction at
+`auto_defer_delay` seconds **regardless of what the callback is doing**.
+A slow callback therefore produces a slow response, not a failed one --
+the ack is still delivered. The 3-second wall only becomes a risk when
+the safety net is weakened (`auto_defer = False`, or `auto_defer_delay`
+raised toward 3s) *and* the render is slow.
+
+---
+
+## Keep HTTP Off the Render Path
+
+`build_ui()` runs synchronously on the render path -- the lead-up to
+the interaction's response -- and `on_load()`, though async, is awaited
+before the first paint. Any HTTP a view issues in either still competes
+with that interaction's own acknowledgement and adds directly to how
+long the view takes to appear.
+
+The sharp edge is a per-item fan-out. Resolving an avatar per row with
+`bot.fetch_user(...)`, syncing a role per entry, or looking a record up
+per cell reads as parallel work but is not: calls that share a Discord
+rate-limit bucket (and `fetch_user` calls all share one -- the user id
+is not a bucket-routing parameter) run **serially**, so `asyncio.gather`
+over them does not overlap the round-trips. A leaderboard that fetches
+twenty avatars on open pays twenty sequential round-trips before the
+first paint.
+
+Resolve it off the hot path instead:
+
+- **Read from cache.** `bot.get_user(id)` is a synchronous cache lookup
+  with no HTTP; pair it with a default fallback when the cache misses.
+  The same applies to `guild.get_member`, `guild.get_role`, and the
+  other `get_*` accessors.
+- **Do bulk I/O once, in a preload.** If a view genuinely needs remote
+  data, fetch it a single time in `on_load()` and render from the
+  result, rather than issuing one request per rendered element.
+
+The principle generalizes: a view should render from data it already
+holds. When it must reach out, it reaches out once, not once per row.
+
+CascadeUI flags this automatically. When `on_load()` overruns
+`auto_defer_delay` (the interaction-timing budget, default 2.5s), the
+library logs a warning naming the view and the elapsed time, once per view
+class so a consistently slow preload surfaces without flooding the log. A
+`ProfileView.on_load() took 4.2s` line names the exact view to move off the
+hot path.
+
+---
+
 ## See Also
 
 - [DevTools](devtools.md) for the Inspector's other tabs.

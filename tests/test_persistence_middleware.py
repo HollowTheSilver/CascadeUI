@@ -592,6 +592,83 @@ class TestMiddlewareRetryBackoff:
 # // ========================================( Observability hooks )======================================== // #
 
 
+class TestMiddlewareBatchedFlush:
+    """_flush prefers row_upsert_many, falling back to per-row row_upsert."""
+
+    def _dirty(self, ns, names):
+        for n in names:
+            ns.dirty_rows[n] = {
+                "slot_name": n,
+                "payload": "{}",
+                "schema_version": 1,
+                "updated_at": 1,
+                "expires_at": None,
+            }
+
+    async def test_flush_prefers_row_upsert_many(self):
+        middleware, mgr, backend = await _make_middleware()
+        ns = middleware._ns_application
+
+        calls = {"many": 0, "rows": 0}
+        original = backend.row_upsert_many
+
+        async def spy(table, rows, key_columns):
+            calls["many"] += 1
+            calls["rows"] = len(rows)
+            await original(table, rows, key_columns)
+
+        backend.row_upsert_many = spy  # type: ignore[method-assign]
+        self._dirty(ns, ("a", "b"))
+        await middleware._flush(ns)
+
+        assert calls["many"] == 1  # one batched call, not two per-row calls
+        assert calls["rows"] == 2
+
+    async def test_flush_falls_back_to_per_row_upsert(self):
+        middleware, mgr, backend = await _make_middleware()
+        ns = middleware._ns_application
+
+        # Shadow the batch method with None so getattr finds no callable --
+        # mimics a custom backend that never implemented row_upsert_many.
+        backend.row_upsert_many = None  # type: ignore[assignment]
+
+        calls = {"single": 0}
+        original = backend.row_upsert
+
+        async def spy(table, row, key_columns):
+            calls["single"] += 1
+            await original(table, row, key_columns)
+
+        backend.row_upsert = spy  # type: ignore[method-assign]
+        self._dirty(ns, ("a", "b"))
+        await middleware._flush(ns)
+
+        assert calls["single"] == 2  # one row_upsert per dirty row
+
+    async def test_batched_failure_re_enqueues_whole_batch(self):
+        # Raise from row_upsert_many itself (not via InMemoryBackend's
+        # delegation to row_upsert) so the batched failure path has direct
+        # coverage of the retry re-enqueue.
+        middleware, mgr, backend = await _make_middleware()
+        ns = middleware._ns_application
+
+        async def failing(table, rows, key_columns):
+            raise RuntimeError("disk full")
+
+        backend.row_upsert_many = failing  # type: ignore[method-assign]
+        self._dirty(ns, ("a", "b"))
+        await middleware._flush(ns)
+
+        # The whole batch re-enqueues and the retry counter advances.
+        assert ns.retry_count == 1
+        assert set(ns.dirty_rows) == {"a", "b"}
+
+        # Clear the buffer and close so the scheduled backoff task drains.
+        ns.dirty_rows.clear()
+        ns.deleted_keys.clear()
+        await middleware.close()
+
+
 class TestMiddlewareObservabilityHooks:
     """on_flush and on_error fire with the documented argument shapes."""
 

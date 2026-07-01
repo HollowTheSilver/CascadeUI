@@ -3,6 +3,7 @@
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import discord
 import pytest
 from helpers import make_interaction
 
@@ -418,3 +419,44 @@ class TestWithConfirmation:
             with pytest.raises(RuntimeError, match="cancel handler failed"):
                 await cancel_btn.callback(make_interaction())
             mock_stop.assert_called_once()
+
+    async def test_confirm_runs_action_even_when_prompt_edit_fails(self):
+        """A failed prompt edit (deleted message, dead ack, transient 5xx) must
+        not skip the confirmed action -- the contract is 'on confirm, run the
+        callback'. The cosmetic edit failure is contained; the action still runs."""
+        original = AsyncMock()
+        component = _make_button(callback=original)
+        with_confirmation(component)
+        interaction = make_interaction()
+
+        await component.callback(interaction)
+        inner_view = interaction.response.send_message.call_args[1]["view"]
+        confirm_btn = next(c for c in inner_view.children if c.label == "Yes")
+
+        confirm_interaction = make_interaction()
+        confirm_interaction.response.edit_message = AsyncMock(
+            side_effect=discord.NotFound(MagicMock(), "")
+        )
+
+        await confirm_btn.callback(confirm_interaction)  # must not raise
+        original.assert_awaited_once()
+
+    async def test_cancel_runs_hook_even_when_prompt_edit_fails(self):
+        """Symmetric to the confirm path: a failed prompt edit must not skip the
+        on_cancel hook."""
+        on_cancel = AsyncMock()
+        component = _make_button()
+        with_confirmation(component, on_cancel=on_cancel)
+        interaction = make_interaction()
+
+        await component.callback(interaction)
+        inner_view = interaction.response.send_message.call_args[1]["view"]
+        cancel_btn = next(c for c in inner_view.children if c.label == "No")
+
+        cancel_interaction = make_interaction()
+        cancel_interaction.response.edit_message = AsyncMock(
+            side_effect=discord.HTTPException(MagicMock(status=500), "boom")
+        )
+
+        await cancel_btn.callback(cancel_interaction)  # must not raise
+        on_cancel.assert_awaited_once()

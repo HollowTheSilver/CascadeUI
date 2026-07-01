@@ -608,7 +608,8 @@ for row in rows:
 ### Components
 - Stateful buttons, selects, and modals with state integration
 - Select callbacks can opt into a `values` second parameter
-- V2 builders: `card()`, `stats_card()`, `action_section()`, `toggle_section()`, `image_section()`, `link_section()`, `confirm_section()`, `button_row()`, `cycle_button()`, `toggle_button()`, `tab_nav()`, `key_value()`, `alert()`, `progress_bar()`, `divider()`, `gap()`, `gallery()`, `file_attachment()`
+- V2 builders: `card()`, `stats_card()`, `action_section()`, `toggle_section()`, `image_section()`, `link_section()`, `confirm_section()`, `button_row()`, `cycle_button()`, `toggle_button()`, `tab_nav()`, `choice_row()`, `key_value()`, `alert()`, `progress_bar()`, `divider()`, `gap()`, `gallery()`, `file_attachment()`
+- V2 stateful composites: `PaginatedRegion` (per-section pager), `Collapsible` (inline disclosure)
 - Grid helpers: `emoji_grid()` and `button_grid()`
 - Typed modal fields (`text`, `integer`, `float`, `date`) with per-field validation
 - Declarative `FormSchema` and `WizardSchema` base classes

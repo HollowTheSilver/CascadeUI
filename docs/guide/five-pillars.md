@@ -182,8 +182,10 @@ continuous across navigation. `replace()` does not transfer (clean break).
 share?*
 
 Governs which views belong to a shared coordination unit. A session is created
-automatically when a root view calls `send()` and dies when its last member
-exits.
+automatically when a root view calls `send()` -- provided a `user_id` was derived
+from the construction context. Views constructed with a bare channel (no interaction,
+no command context) carry no `user_id` and therefore no session; `SESSION_CREATED`
+is skipped and `session_id` is `None`. A session dies when its last member exits.
 
 | Concept | Purpose |
 |---------|---------|

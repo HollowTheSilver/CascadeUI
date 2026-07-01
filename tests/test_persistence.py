@@ -11,9 +11,13 @@ Backend-level coverage lives in :mod:`test_backends`; middleware
 fan-out coverage lives in :mod:`test_persistence_middleware`.
 """
 
+import asyncio
 import json
+import logging
+from unittest.mock import MagicMock
 
 import pytest
+from helpers import make_interaction
 
 from cascadeui import setup_middleware
 from cascadeui.exceptions import PersistenceConfigError, PersistenceInitError
@@ -311,6 +315,85 @@ class TestManagerApplyMigrations:
 # // ========================================( Manager rehydrate )======================================== // #
 
 
+class TestPruneRegistryKeys:
+    """prune_registry reports the persistence_keys it actually removed."""
+
+    def test_action_creator_includes_keys(self):
+        from cascadeui.state.actions import ActionCreators
+
+        payload = ActionCreators.registry_pruned(2, "explicit", keys=["a", "b"])
+        assert payload == {"deleted": 2, "keys": ["a", "b"], "reason": "explicit"}
+        # Backward-compatible default when no keys are supplied.
+        assert ActionCreators.registry_pruned(0, "clear_all")["keys"] == []
+
+    async def test_registry_pruned_carries_pruned_keys(self):
+        be = InMemoryBackend()
+        await be.initialize()
+        for key in ("panel:a", "panel:b"):
+            await be.row_upsert(
+                TABLE_PERSISTENT_VIEWS,
+                {
+                    "persistence_key": key,
+                    "view_class": "MyPanel",
+                    "custom_id": None,
+                    "message_id": 1,
+                    "channel_id": 2,
+                    "guild_id": None,
+                    "user_id": None,
+                    "session_id": None,
+                    "init_kwargs": "{}",
+                    "kwargs_schema_version": 1,
+                    "schema_version": 1,
+                    "created_at": 1,
+                    "updated_at": 1,
+                },
+                ["persistence_key"],
+            )
+        store = get_store()
+        mgr = PersistenceManager(store=store, registry=RegistryPersistence(backend=be))
+
+        captured = []
+
+        async def _on_pruned(action, state):
+            captured.append(action["payload"])
+
+        store.on("registry_pruned", _on_pruned)
+        try:
+            # One present key + one absent key: only the present one is reported.
+            deleted = await mgr.prune_registry(persistence_keys=["panel:a", "panel:gone"])
+        finally:
+            store.off("registry_pruned", _on_pruned)
+
+        assert deleted == 1
+        assert len(captured) == 1
+        assert captured[0]["keys"] == ["panel:a"]
+        assert captured[0]["deleted"] == 1
+        assert captured[0]["reason"] == "explicit"
+
+    async def test_all_absent_keys_report_empty(self):
+        # Pruning only keys that are not on disk reports zero deleted and an
+        # empty keys list, not a false positive.
+        be = InMemoryBackend()
+        await be.initialize()
+        store = get_store()
+        mgr = PersistenceManager(store=store, registry=RegistryPersistence(backend=be))
+
+        captured = []
+
+        async def _on_pruned(action, state):
+            captured.append(action["payload"])
+
+        store.on("registry_pruned", _on_pruned)
+        try:
+            deleted = await mgr.prune_registry(persistence_keys=["panel:gone"])
+        finally:
+            store.off("registry_pruned", _on_pruned)
+
+        assert deleted == 0
+        assert captured[0]["keys"] == []
+        assert captured[0]["deleted"] == 0
+
+
 class TestManagerRehydrate:
     """rehydrate restores each configured namespace into store state."""
 
@@ -537,13 +620,101 @@ class TestManagerReattachNoBot:
 
     async def test_returns_empty_summary(self):
         mgr = PersistenceManager(store=get_store())
+        assert mgr.last_reattach_summary is None  # not run yet
         summary = await mgr.reattach_persistent_views()
         assert summary == {
             "restored": [],
             "skipped": [],
             "failed": [],
             "removed": [],
+            "unreachable": [],
         }
+        # The summary is published on the manager so a consumer can read the
+        # pruned keys (summary["removed"]) after setup_middleware returns, since
+        # REGISTRY_PRUNED fires too early for a hook. It is the same object the
+        # method returned.
+        assert mgr.last_reattach_summary is summary
+
+
+class TestReattachUnreachable:
+    """Transient fetch failures land in `unreachable` (row left on disk, not
+    pruned); only a definitive `NotFound` goes to `removed`."""
+
+    def _mgr_with_bot(self, bot):
+        mgr = PersistenceManager(store=get_store())
+        mgr._bot = bot
+        return mgr
+
+    async def test_forbidden_channel_is_unreachable(self):
+        from unittest.mock import AsyncMock
+
+        import discord
+
+        bot = MagicMock()
+        bot.get_channel.return_value = None
+        bot.fetch_channel = AsyncMock(side_effect=discord.Forbidden(MagicMock(status=403), "nope"))
+        mgr = self._mgr_with_bot(bot)
+
+        removed, unreachable = [], []
+        row = {"persistence_key": "panel:x", "channel_id": 1, "message_id": 2}
+        result = await mgr._fetch_restore_message(row, removed, unreachable)
+
+        assert result is None
+        assert removed == []  # transient: row stays on disk for the next restart
+        assert unreachable == ["panel:x"]
+
+    async def test_http_exception_channel_is_unreachable(self):
+        from unittest.mock import AsyncMock
+
+        import discord
+
+        bot = MagicMock()
+        bot.get_channel.return_value = None
+        bot.fetch_channel = AsyncMock(
+            side_effect=discord.HTTPException(MagicMock(status=503), "5xx")
+        )
+        mgr = self._mgr_with_bot(bot)
+
+        removed, unreachable = [], []
+        row = {"persistence_key": "panel:y", "channel_id": 1, "message_id": 2}
+        result = await mgr._fetch_restore_message(row, removed, unreachable)
+
+        assert result is None
+        assert removed == []
+        assert unreachable == ["panel:y"]
+
+    async def test_non_messageable_channel_is_unreachable(self):
+        import discord
+
+        bot = MagicMock()
+        bot.get_channel.return_value = MagicMock(spec=discord.CategoryChannel)
+        mgr = self._mgr_with_bot(bot)
+
+        removed, unreachable = [], []
+        row = {"persistence_key": "panel:w", "channel_id": 1, "message_id": 2}
+        result = await mgr._fetch_restore_message(row, removed, unreachable)
+
+        assert result is None
+        assert removed == []  # was pruned before the fix; now left on disk
+        assert unreachable == ["panel:w"]
+
+    async def test_notfound_channel_is_removed(self):
+        from unittest.mock import AsyncMock
+
+        import discord
+
+        bot = MagicMock()
+        bot.get_channel.return_value = None
+        bot.fetch_channel = AsyncMock(side_effect=discord.NotFound(MagicMock(status=404), "gone"))
+        mgr = self._mgr_with_bot(bot)
+
+        removed, unreachable = [], []
+        row = {"persistence_key": "panel:z", "channel_id": 1, "message_id": 2}
+        result = await mgr._fetch_restore_message(row, removed, unreachable)
+
+        assert result is None
+        assert removed == ["panel:z"]  # definitive 404: pruned
+        assert unreachable == []
 
 
 class TestManagerReattachInitKwargsDuplicate:
@@ -623,6 +794,7 @@ class TestManagerReattachInitKwargsDuplicate:
             init_kwargs=json.loads(init_kwargs_with_dup),
             message=_Msg(),
             class_name=_DupPanel.__qualname__,
+            restored_views=[],
         )
 
         assert outcome == "restored"
@@ -699,6 +871,7 @@ class TestManagerReattachInitKwargsDuplicate:
             init_kwargs=json.loads(init_kwargs_with_theme),
             message=_Msg(),
             class_name=_ThemedPanel.__qualname__,
+            restored_views=[],
         )
 
         # Drop both: stringified theme would never be a real Theme, and
@@ -711,14 +884,249 @@ class TestManagerReattachInitKwargsDuplicate:
         assert view.theme is None
 
 
+# // ========================================( Reattach on_bind )======================================== // #
+
+
+class TestReattachOnBind:
+    """``on_bind(bot)`` runs during reattach (setup_hook); ``on_restore`` runs
+    after, in the deferred post-ready render, with on_bind's deps available."""
+
+    def _stub_seams(self, cls):
+        async def _fake_register(self):
+            pass
+
+        async def _fake_update(self, message):
+            pass
+
+        cls._register_state = _fake_register
+        cls._update_message_state = _fake_update
+        cls._validate_custom_ids = lambda self: None
+
+    async def _row(self, key, cls):
+        be = InMemoryBackend()
+        await be.initialize()
+        await be.row_upsert(
+            TABLE_PERSISTENT_VIEWS,
+            {
+                "persistence_key": key,
+                "view_class": cls.__qualname__,
+                "custom_id": None,
+                "message_id": 1,
+                "channel_id": 2,
+                "guild_id": None,
+                "user_id": None,
+                "session_id": None,
+                "init_kwargs": json.dumps({"persistence_key": key}),
+                "kwargs_schema_version": 1,
+                "schema_version": 1,
+                "created_at": 1,
+                "updated_at": 1,
+            },
+            ["persistence_key"],
+        )
+        mgr = PersistenceManager(store=get_store(), registry=RegistryPersistence(backend=be))
+        await mgr.rehydrate()
+        return mgr
+
+    async def test_on_bind_runs_before_on_restore_with_deps(self):
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        order = []
+
+        class _BindPanel(PersistentLayoutView):
+            def on_bind(self, bot):
+                order.append("bind")
+                self.db = bot.db
+
+            async def on_restore(self, bot):
+                order.append("restore")
+                # The dependency on_bind injected is available here.
+                assert self.db == "POOL"
+
+        self._stub_seams(_BindPanel)
+        mgr = await self._row("panel:bind", _BindPanel)
+
+        class _Msg:
+            id = 1
+
+        class _FakeBot:
+            db = "POOL"
+
+            def add_view(self, view, message_id):
+                pass
+
+            async def wait_until_ready(self):
+                pass
+
+        mgr._bot = _FakeBot()
+        restored_views = []
+        outcome = await mgr._reattach_one(
+            row=mgr._registry_rows[0],
+            view_cls=_BindPanel,
+            init_kwargs={"persistence_key": "panel:bind"},
+            message=_Msg(),
+            class_name=_BindPanel.__qualname__,
+            restored_views=restored_views,
+        )
+        # on_bind runs during reattach; on_restore is deferred to after-ready.
+        assert outcome == "restored"
+        assert order == ["bind"]
+        assert len(restored_views) == 1
+
+        # Drive the deferred post-ready render: on_restore now runs, with the
+        # dependency on_bind injected still available.
+        await mgr._run_post_ready_restore(restored_views)
+        assert order == ["bind", "restore"]
+
+    async def test_async_on_bind_is_awaited(self):
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        class _AsyncBindPanel(PersistentLayoutView):
+            async def on_bind(self, bot):
+                self.db = bot.db
+
+        self._stub_seams(_AsyncBindPanel)
+        mgr = await self._row("panel:abind", _AsyncBindPanel)
+
+        class _Msg:
+            id = 1
+
+        captured = {}
+
+        class _FakeBot:
+            db = "POOL"
+
+            def add_view(self, view, message_id):
+                captured["view"] = view
+
+        mgr._bot = _FakeBot()
+        outcome = await mgr._reattach_one(
+            row=mgr._registry_rows[0],
+            view_cls=_AsyncBindPanel,
+            init_kwargs={"persistence_key": "panel:abind"},
+            message=_Msg(),
+            class_name=_AsyncBindPanel.__qualname__,
+            restored_views=[],
+        )
+        assert outcome == "restored"
+        assert captured["view"].db == "POOL"
+
+
+class TestSendTimeBind:
+    """``_bind_from_context`` (the send-time seam) forwards ``on_bind`` when
+    the construction context resolves a bot, and ``send()`` invokes it."""
+
+    async def test_send_invokes_bind_from_context(self):
+        # Covers the send() -> _bind_from_context wiring, so removing the call
+        # from send() fails here rather than silently skipping dep injection.
+        from unittest.mock import AsyncMock
+
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        class _Panel(PersistentLayoutView):
+            async def on_bind(self, bot):
+                pass
+
+        inter = make_interaction()
+        inter.client = type("B", (), {})()
+        view = _Panel(interaction=inter, persistence_key="send:wire")
+        view._bind_from_context = AsyncMock()
+        # Instance-stub the pipeline below the mixin so the Discord send is
+        # skipped without patching the base class for every other subclass.
+        view._send_pipeline = AsyncMock(return_value=None)
+        await view.send()
+        view._bind_from_context.assert_awaited_once()
+
+    async def test_calls_on_bind_when_bot_derivable(self):
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        bound = {}
+
+        class _Panel(PersistentLayoutView):
+            def on_bind(self, bot):
+                bound["bot"] = bot
+                self.db = bot.db
+
+        class _FakeBot:
+            db = "POOL"
+
+        inter = make_interaction()
+        inter.client = _FakeBot()
+        view = _Panel(interaction=inter, persistence_key="send:bind")
+        await view._bind_from_context()
+        assert bound["bot"] is inter.client
+        assert view.db == "POOL"
+
+    async def test_noop_when_bot_not_derivable(self):
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        called = {"n": 0}
+
+        class _Panel(PersistentLayoutView):
+            def on_bind(self, bot):
+                called["n"] += 1
+
+        inter = make_interaction()
+        inter.client = None  # channel-context-like: no resolvable bot
+        view = _Panel(interaction=inter, persistence_key="send:nobot")
+        await view._bind_from_context()
+        assert called["n"] == 0
+
+    async def test_async_on_bind_awaited(self):
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        class _Panel(PersistentLayoutView):
+            async def on_bind(self, bot):
+                self.db = bot.db
+
+        class _FakeBot:
+            db = "POOL"
+
+        inter = make_interaction()
+        inter.client = _FakeBot()
+        view = _Panel(interaction=inter, persistence_key="send:async")
+        await view._bind_from_context()
+        assert view.db == "POOL"
+
+
+class TestNonSerializableKwargError:
+    """A non-JSON constructor kwarg declines the row with a directed error."""
+
+    async def test_declines_row_and_points_to_on_bind(self, caplog):
+        from cascadeui.state.middleware.persistence import PersistenceMiddleware
+
+        class _Pool:  # a stand-in for a non-serializable runtime dependency
+            pass
+
+        class _FakeView:
+            _init_kwargs = {"persistence_key": "panel:x", "db": _Pool()}
+            kwargs_schema_version = 1
+            session_id = None
+
+        mw = PersistenceMiddleware(backend=InMemoryBackend())
+        payload = {
+            "persistence_key": "panel:x",
+            "class_name": "X",
+            "message_id": 1,
+            "channel_id": 2,
+        }
+        with caplog.at_level(logging.ERROR):
+            row = mw._build_registry_row(payload, _FakeView())
+
+        assert row is None  # the row is declined, not silently corrupted
+        assert "on_bind" in caplog.text  # the error names the fix
+        assert "db=_Pool" in caplog.text  # and the offending kwarg
+
+
 # // ========================================( Reattach batching )======================================== // #
 
 
 class TestReattachBatching:
-    """``_reattach_one`` wraps the registration dispatches and ``on_restore``
-    in a single ``store.batch()`` so each restored view produces one
-    BATCH_COMPLETE notification instead of three (or more) standalone
-    cycles. With N persistent views the savings scale linearly.
+    """``_reattach_one`` wraps the registration dispatches in a single
+    ``store.batch()`` so each restored view produces one BATCH_COMPLETE
+    notification instead of three standalone cycles. With N persistent views
+    the savings scale linearly. (``on_restore`` is deferred to the post-ready
+    render and batched separately there.)
     """
 
     async def test_three_dispatches_collapse_to_one_notification(self):
@@ -793,6 +1201,7 @@ class TestReattachBatching:
                 init_kwargs={"persistence_key": "panel:batch"},
                 message=_Msg(),
                 class_name=_SilentPanel.__qualname__,
+                restored_views=[],
             )
 
             await store._flush_notifications()
@@ -804,6 +1213,417 @@ class TestReattachBatching:
             assert notification_actions == ["BATCH_COMPLETE"]
         finally:
             store._unsubscribe("test_catch_all")
+
+
+class TestPostReadyRestore:
+    """on_restore is deferred to a post-ready task so its gateway-cache reads
+    (avatars, members, channels) land warm, off the setup_hook critical path
+    where the cache is still cold."""
+
+    def _view(self, vid, on_restore, finished=False):
+        view = MagicMock()
+        view.id = vid
+        view.is_finished.return_value = finished
+        view.on_restore = on_restore
+        return view
+
+    async def test_on_restore_waits_for_ready(self):
+        events = []
+        ready = asyncio.Event()
+
+        class _FakeBot:
+            async def wait_until_ready(self):
+                await ready.wait()
+                events.append("ready")
+
+        async def _on_restore(bot):
+            events.append("restore")
+
+        mgr = PersistenceManager(store=get_store(), bot=_FakeBot())
+        task = asyncio.create_task(
+            mgr._run_post_ready_restore([self._view("v-ready", _on_restore)])
+        )
+        await asyncio.sleep(0)  # let the task reach wait_until_ready
+        assert events == []  # on_restore has not run -- still waiting on ready
+
+        ready.set()
+        await task
+        assert events == ["ready", "restore"]  # ready first, THEN the render
+
+    async def test_finished_view_is_skipped(self):
+        called = []
+
+        class _FakeBot:
+            async def wait_until_ready(self):
+                pass
+
+        async def _on_restore(bot):
+            called.append("ran")
+
+        mgr = PersistenceManager(store=get_store(), bot=_FakeBot())
+        await mgr._run_post_ready_restore([self._view("v-finished", _on_restore, finished=True)])
+        assert called == []
+
+    async def test_one_failure_does_not_abort_the_rest(self):
+        ran = []
+
+        class _FakeBot:
+            async def wait_until_ready(self):
+                pass
+
+        async def _boom(bot):
+            raise ValueError("boom")
+
+        async def _ok(bot):
+            ran.append("ok")
+
+        mgr = PersistenceManager(store=get_store(), bot=_FakeBot())
+        await mgr._run_post_ready_restore([self._view("v-boom", _boom), self._view("v-ok", _ok)])
+        assert ran == ["ok"]  # the failure did not abort the surviving view
+
+    def test_done_callback_discards_its_own_task(self):
+        # The done-callback discards its OWN task from the set and leaves the
+        # sweeper field alone.
+        mgr = PersistenceManager(store=get_store())
+        mgr._ttl_sweeper_task = "sweeper-sentinel"
+        done = MagicMock()
+        done.cancelled.return_value = False
+        done.exception.return_value = None
+        mgr._post_ready_restore_tasks.add(done)
+
+        mgr._on_post_ready_restore_done(done)
+
+        assert done not in mgr._post_ready_restore_tasks
+        assert mgr._ttl_sweeper_task == "sweeper-sentinel"  # untouched
+
+    def test_multiple_post_ready_tasks_coexist(self):
+        # Option-1 contract: the set tracks each reattach's render task, so a
+        # second reattach never drops a batch the way the old single-slot
+        # guard did. Each task settles independently via its done-callback.
+        mgr = PersistenceManager(store=get_store())
+        t1, t2 = MagicMock(), MagicMock()
+        mgr._post_ready_restore_tasks.update({t1, t2})
+
+        t1.cancelled.return_value = False
+        t1.exception.return_value = None
+        mgr._on_post_ready_restore_done(t1)
+
+        assert mgr._post_ready_restore_tasks == {t2}  # only the settled one left
+
+    def test_sweeper_done_callback_clears_its_own_field(self):
+        mgr = PersistenceManager(store=get_store())
+        mgr._ttl_sweeper_task = "sentinel"
+        sentinel_task = MagicMock()
+        mgr._post_ready_restore_tasks.add(sentinel_task)
+
+        done = MagicMock()
+        done.cancelled.return_value = False
+        done.exception.return_value = None
+        mgr._on_sweeper_done(done)
+
+        assert mgr._ttl_sweeper_task is None
+        assert sentinel_task in mgr._post_ready_restore_tasks  # untouched
+
+
+class TestReattachConcurrency:
+    """reattach_persistent_views prepares (resolve class, migrate kwargs,
+    fetch the Discord message) concurrently under a bounded semaphore, then
+    registers each view serially. The split preserves correctness and bounds
+    the fetch fan-out to restore_concurrency.
+    """
+
+    async def _seed_rows(self, be, view_cls, n):
+        for i in range(n):
+            key = f"panel:{i}"
+            await be.row_upsert(
+                TABLE_PERSISTENT_VIEWS,
+                {
+                    "persistence_key": key,
+                    # _persistent_view_classes is keyed by _class_session_key()
+                    # (module + qualname), which is what reattach looks up.
+                    "view_class": view_cls._class_session_key(),
+                    "custom_id": None,
+                    "message_id": i + 1,
+                    "channel_id": 100 + i,
+                    "guild_id": None,
+                    "user_id": None,
+                    "session_id": None,
+                    "init_kwargs": json.dumps({"persistence_key": key}),
+                    "kwargs_schema_version": 1,
+                    "schema_version": 1,
+                    "created_at": 1,
+                    "updated_at": 1,
+                },
+                ["persistence_key"],
+            )
+
+    class _Msg:
+        def __init__(self, mid):
+            self.id = mid
+
+    async def test_all_rows_restore_in_row_order(self):
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        class _P(PersistentLayoutView):
+            pass
+
+        be = InMemoryBackend()
+        await be.initialize()
+        await self._seed_rows(be, _P, 4)
+
+        mgr = PersistenceManager(
+            store=get_store(), registry=RegistryPersistence(backend=be), bot=object()
+        )
+        await mgr.rehydrate()
+
+        reattach_order = []
+
+        async def _fake_fetch(row, removed_keys, unreachable_keys):
+            return (None, self._Msg(row["message_id"]))
+
+        async def _fake_reattach(row, view_cls, init_kwargs, message, class_name, restored_views):
+            reattach_order.append(row["persistence_key"])
+            return "restored"
+
+        mgr._fetch_restore_message = _fake_fetch
+        mgr._reattach_one = _fake_reattach
+
+        summary = await mgr.reattach_persistent_views()
+
+        assert sorted(summary["restored"]) == ["panel:0", "panel:1", "panel:2", "panel:3"]
+        # gather preserves input order, so phase 2 registers in row order.
+        assert reattach_order == ["panel:0", "panel:1", "panel:2", "panel:3"]
+
+    async def test_fetch_phase_bounded_by_restore_concurrency(self):
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        class _P(PersistentLayoutView):
+            pass
+
+        be = InMemoryBackend()
+        await be.initialize()
+        await self._seed_rows(be, _P, 5)
+
+        mgr = PersistenceManager(
+            store=get_store(),
+            registry=RegistryPersistence(backend=be),
+            bot=object(),
+            restore_concurrency=2,
+        )
+        await mgr.rehydrate()
+
+        tracker = {"live": 0, "max": 0}
+
+        async def _fake_fetch(row, removed_keys, unreachable_keys):
+            tracker["live"] += 1
+            tracker["max"] = max(tracker["max"], tracker["live"])
+            await asyncio.sleep(0.02)
+            tracker["live"] -= 1
+            return (None, self._Msg(row["message_id"]))
+
+        async def _fake_reattach(row, view_cls, init_kwargs, message, class_name, restored_views):
+            return "restored"
+
+        mgr._fetch_restore_message = _fake_fetch
+        mgr._reattach_one = _fake_reattach
+
+        await mgr.reattach_persistent_views()
+
+        # 5 rows, cap 2 -> never more than 2 fetches in flight at once.
+        assert tracker["max"] == 2
+
+    async def test_registration_phase_is_serial(self):
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        class _P(PersistentLayoutView):
+            pass
+
+        be = InMemoryBackend()
+        await be.initialize()
+        await self._seed_rows(be, _P, 4)
+
+        mgr = PersistenceManager(
+            store=get_store(),
+            registry=RegistryPersistence(backend=be),
+            bot=object(),
+            restore_concurrency=4,
+        )
+        await mgr.rehydrate()
+
+        tracker = {"live": 0, "max": 0}
+
+        async def _fake_fetch(row, removed_keys, unreachable_keys):
+            return (None, self._Msg(row["message_id"]))
+
+        async def _fake_reattach(row, view_cls, init_kwargs, message, class_name, restored_views):
+            tracker["live"] += 1
+            tracker["max"] = max(tracker["max"], tracker["live"])
+            await asyncio.sleep(0.01)
+            tracker["live"] -= 1
+            return "restored"
+
+        mgr._fetch_restore_message = _fake_fetch
+        mgr._reattach_one = _fake_reattach
+
+        await mgr.reattach_persistent_views()
+
+        # Registration mutates shared registries -- it must stay serial even
+        # when the fetch phase runs many rows concurrently.
+        assert tracker["max"] == 1
+
+    async def test_malformed_row_does_not_abort_others(self):
+        # A row missing a required key must land in summary["failed"] and not
+        # escape the gather -- otherwise one bad row aborts every other row's
+        # reattach (a wider blast radius than the old serial loop).
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        class _P(PersistentLayoutView):
+            pass
+
+        be = InMemoryBackend()
+        await be.initialize()
+        await self._seed_rows(be, _P, 2)
+
+        mgr = PersistenceManager(
+            store=get_store(), registry=RegistryPersistence(backend=be), bot=object()
+        )
+        await mgr.rehydrate()
+        # Inject a malformed row that has no "view_class" key.
+        mgr._registry_rows.append({"persistence_key": "panel:bad"})
+
+        async def _fake_fetch(row, removed_keys, unreachable_keys):
+            return (None, self._Msg(row["message_id"]))
+
+        async def _fake_reattach(row, view_cls, init_kwargs, message, class_name, restored_views):
+            return "restored"
+
+        mgr._fetch_restore_message = _fake_fetch
+        mgr._reattach_one = _fake_reattach
+
+        # Must not raise despite the malformed row.
+        summary = await mgr.reattach_persistent_views()
+
+        assert sorted(summary["restored"]) == ["panel:0", "panel:1"]
+        assert summary["failed"] == ["panel:bad"]
+
+    async def test_unknown_class_skips_and_warns(self, caplog):
+        be = InMemoryBackend()
+        await be.initialize()
+        await be.row_upsert(
+            TABLE_PERSISTENT_VIEWS,
+            {
+                "persistence_key": "panel:unknown",
+                "view_class": "nonexistent.module.GhostPanel",
+                "custom_id": None,
+                "message_id": 1,
+                "channel_id": 2,
+                "guild_id": None,
+                "user_id": None,
+                "session_id": None,
+                "init_kwargs": json.dumps({"persistence_key": "panel:unknown"}),
+                "kwargs_schema_version": 1,
+                "schema_version": 1,
+                "created_at": 1,
+                "updated_at": 1,
+            },
+            ["persistence_key"],
+        )
+
+        mgr = PersistenceManager(
+            store=get_store(), registry=RegistryPersistence(backend=be), bot=object()
+        )
+        await mgr.rehydrate()
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui.persistence.manager"):
+            summary = await mgr.reattach_persistent_views()
+
+        assert summary["skipped"] == ["panel:unknown"]
+        assert any("not found" in r.getMessage() for r in caplog.records)
+
+
+class TestRestoreConcurrencyValidation:
+    """PersistenceMiddleware validates restore_concurrency at construction."""
+
+    def test_zero_raises(self):
+        with pytest.raises(ValueError, match="positive int"):
+            PersistenceMiddleware(restore_concurrency=0)
+
+    def test_negative_raises(self):
+        with pytest.raises(ValueError, match="positive int"):
+            PersistenceMiddleware(restore_concurrency=-1)
+
+    def test_bool_raises(self):
+        with pytest.raises(ValueError, match="positive int"):
+            PersistenceMiddleware(restore_concurrency=True)
+
+    def test_string_raises(self):
+        with pytest.raises(ValueError, match="positive int"):
+            PersistenceMiddleware(restore_concurrency="8")
+
+    def test_valid_value_passes(self):
+        mw = PersistenceMiddleware(backend=InMemoryBackend(), restore_concurrency=4)
+        assert mw is not None
+
+
+class TestMigratorsWiring:
+    """PersistenceMiddleware(migrators=...) registers migrators into the
+    module registries; initialize() wires them in before apply_migrations
+    (schema) and rehydrate (kwargs) consume them.
+    """
+
+    async def test_kwargs_migrator_wired_through_initialize(self):
+        from cascadeui.persistence.migrations import get_kwargs_migrator
+
+        async def _mig(kwargs):
+            return kwargs
+
+        key = ("test.module.PanelKwargs", 1)
+        try:
+            await setup_middleware(
+                PersistenceMiddleware(backend=InMemoryBackend(), migrators={"kwargs": {key: _mig}})
+            )
+            assert get_kwargs_migrator(*key) is _mig
+        finally:
+            _KWARGS_MIGRATORS.pop(key, None)
+
+    def test_register_migrators_schema(self):
+        from cascadeui.persistence.migrations import get_schema_migrator
+
+        async def _mig(backend):
+            pass
+
+        key = ("test_table_schema", 1)
+        try:
+            PersistenceMiddleware._register_migrators({"schema": {key: _mig}})
+            assert get_schema_migrator(*key) is _mig
+        finally:
+            _MIGRATORS.pop(key, None)
+
+    def test_register_migrators_idempotent(self):
+        from cascadeui.persistence.migrations import get_kwargs_migrator
+
+        async def _mig(kwargs):
+            return kwargs
+
+        key = ("test.module.PanelIdem", 1)
+        try:
+            PersistenceMiddleware._register_migrators({"kwargs": {key: _mig}})
+            # Re-registering the same key is a no-op, not a ValueError.
+            PersistenceMiddleware._register_migrators({"kwargs": {key: _mig}})
+            assert get_kwargs_migrator(*key) is _mig
+        finally:
+            _KWARGS_MIGRATORS.pop(key, None)
+
+    def test_none_is_noop(self):
+        PersistenceMiddleware._register_migrators(None)  # no error, no registration
+
+    def test_non_dict_raises_typeerror(self):
+        with pytest.raises(TypeError, match="must be None or a dict"):
+            PersistenceMiddleware(migrators=[1, 2, 3])
+
+    def test_unknown_key_raises_valueerror(self):
+        with pytest.raises(ValueError, match="unknown keys"):
+            PersistenceMiddleware(migrators={"bogus": {}})
 
 
 # // ========================================( PersistenceMiddleware setup )======================================== // #
@@ -869,6 +1689,7 @@ class TestPersistenceMiddlewareSetup:
             "skipped": [],
             "failed": [],
             "removed": [],
+            "unreachable": [],
         }
 
     async def test_explicit_none_opts_out_namespace(self):

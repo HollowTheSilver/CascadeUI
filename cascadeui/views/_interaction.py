@@ -212,6 +212,13 @@ class _InteractionMixin:
         cannot land in time is useless anyway -- the auto-defer timer,
         running outside the lock, is the backstop -- so the stall is
         cancelled and swallowed rather than propagated.
+
+        A failed ack is never propagated. ``NotFound`` (10062) means the
+        interaction token is already gone -- expired, or a duplicate ack
+        landed server-side -- so there is nothing left to acknowledge.
+        The navigation-edit paths route their deferred ack through here;
+        ``NotFound`` and any other HTTP ack failure are logged at debug and
+        absorbed so a missed ack never reaches the callback's error path.
         """
         if not interaction.response.is_done():
             try:
@@ -222,6 +229,16 @@ class _InteractionMixin:
                 logger.debug(
                     f"Ack defer stalled past {self.auto_defer_delay}s in "
                     f"{type(self).__name__}; auto-defer timer backstops the ack."
+                )
+            except discord.NotFound:
+                logger.debug(
+                    f"Ack defer hit a dead interaction (10062) in "
+                    f"{type(self).__name__}; nothing left to acknowledge."
+                )
+            except discord.HTTPException as e:
+                logger.debug(
+                    f"Ack defer failed in {type(self).__name__}: "
+                    f"status={getattr(e, 'status', '?')} code={getattr(e, 'code', '?')}"
                 )
 
     # // ==================( Ephemeral Refresh )================== // #
@@ -254,8 +271,17 @@ class _InteractionMixin:
         Discord's interaction token lives for exactly 15 minutes (900s). The
         timer fires ``refresh_warning_seconds`` early so the swap edit still
         succeeds inside the token window.
+
+        The wait is computed against ``_ephemeral_arm_deadline`` (stamped once
+        at send), so a re-schedule after a failed-navigation rollback sleeps
+        only the time remaining until the original deadline -- not a fresh
+        window that would overshoot the 900s token cliff.
         """
-        delay = max(1, 900 - self.refresh_warning_seconds)
+        deadline = self._ephemeral_arm_deadline
+        if deadline is not None:
+            delay = max(1, deadline - time.monotonic())
+        else:
+            delay = max(1, 900 - self.refresh_warning_seconds)
         try:
             await asyncio.sleep(delay)
         except asyncio.CancelledError:
@@ -299,9 +325,12 @@ class _InteractionMixin:
                 except Exception as retry_err:
                     logger.warning(f"Refresh button retry failed: {retry_err}")
             else:
-                logger.warning(f"Could not arm ephemeral refresh button: {e}")
+                # By the T+810s arming point the webhook token is at or near
+                # the 900s cliff, so an arming-edit failure is the expected
+                # terminal state of an ephemeral view, not an error. DEBUG.
+                logger.debug(f"Could not arm ephemeral refresh button: {e}")
         except Exception as e:
-            logger.warning(f"Could not arm ephemeral refresh button: {e}")
+            logger.debug(f"Could not arm ephemeral refresh button: {e}")
 
     async def _reopen_ephemeral(self, interaction: Interaction) -> None:
         """Spawn a fresh ephemeral view via a new interaction token.

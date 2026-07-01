@@ -113,7 +113,10 @@ def _coerce_jsonb_for_write(table: str, row: dict[str, Any]) -> dict[str, Any]:
     """
     cols = JSONB_COLUMNS.get(table, frozenset())
     if not cols:
-        return row
+        # Copy even when no coercion is needed so the backend never holds
+        # a reference to the caller's dict (copy-on-store, matching the
+        # JSONB branch below).
+        return dict(row)
     out: dict[str, Any] = {}
     for k, v in row.items():
         if k in cols and isinstance(v, dict):
@@ -398,20 +401,11 @@ class PostgresBackend:
 
     # // ========================================( Relational surface )======================================== // #
 
-    async def row_upsert(
-        self,
-        namespace: str,
-        row: dict[str, Any],
-        key_columns: list[str],
-    ) -> None:
-        if not row:
-            raise ValueError("row_upsert requires at least one column")
-        if not key_columns:
-            raise ValueError("row_upsert requires at least one key column")
-
-        coerced = _coerce_jsonb_for_write(namespace, row)
+    def _build_upsert_sql(self, namespace: str, cols: list[str], key_columns: list[str]) -> str:
+        """Assemble an excluded-table upsert INSERT for ``cols`` with ``$n``
+        placeholders. Non-key columns are overwritten on conflict; an
+        all-key-column row resolves to DO NOTHING."""
         table = _quote_ident(namespace)
-        cols = list(coerced.keys())
         placeholders = ", ".join(f"${i + 1}" for i in range(len(cols)))
         col_list = ", ".join(_quote_ident(c) for c in cols)
 
@@ -429,7 +423,22 @@ class PostgresBackend:
                 f"ON CONFLICT ({', '.join(_quote_ident(k) for k in key_columns)}) DO NOTHING"
             )
 
-        sql = f"INSERT INTO {table} ({col_list}) VALUES ({placeholders}) {conflict_sql}"
+        return f"INSERT INTO {table} ({col_list}) VALUES ({placeholders}) {conflict_sql}"
+
+    async def row_upsert(
+        self,
+        namespace: str,
+        row: dict[str, Any],
+        key_columns: list[str],
+    ) -> None:
+        if not row:
+            raise ValueError("row_upsert requires at least one column")
+        if not key_columns:
+            raise ValueError("row_upsert requires at least one key column")
+
+        coerced = _coerce_jsonb_for_write(namespace, row)
+        cols = list(coerced.keys())
+        sql = self._build_upsert_sql(namespace, cols, key_columns)
 
         pool = self._pool_or_raise()
         async with pool.acquire() as conn:
@@ -441,6 +450,45 @@ class PostgresBackend:
                 await self._notify_invalidation(
                     conn, namespace, str(coerced.get(key_columns[0], ""))
                 )
+
+    async def row_upsert_many(
+        self,
+        namespace: str,
+        rows: list[dict[str, Any]],
+        key_columns: list[str],
+    ) -> None:
+        if not rows:
+            return
+        if not key_columns:
+            raise ValueError("row_upsert_many requires at least one key column")
+
+        # Coerce up front and group by column signature so each executemany
+        # shares one statement. Flush rows are homogeneous, so this is
+        # usually a single group; a mixed-shape batch produces one group per
+        # column set.
+        coerced_rows: list[dict[str, Any]] = []
+        groups: dict[tuple, list[dict[str, Any]]] = {}
+        for row in rows:
+            if not row:
+                raise ValueError("row_upsert_many requires at least one column per row")
+            coerced = _coerce_jsonb_for_write(namespace, row)
+            coerced_rows.append(coerced)
+            groups.setdefault(tuple(coerced.keys()), []).append(coerced)
+
+        pool = self._pool_or_raise()
+        # One connection acquire + one transaction for the whole batch
+        # instead of one per row. The NOTIFYs ride the same connection and
+        # deliver on commit. The listener contract is keyed per (namespace,
+        # key), so each row still emits its own invalidation.
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                for cols, group in groups.items():
+                    sql = self._build_upsert_sql(namespace, list(cols), key_columns)
+                    await conn.executemany(sql, [tuple(r[c] for c in cols) for r in group])
+                for coerced in coerced_rows:
+                    await self._notify_invalidation(
+                        conn, namespace, str(coerced.get(key_columns[0], ""))
+                    )
 
     async def row_select(
         self,

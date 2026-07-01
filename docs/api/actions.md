@@ -297,6 +297,29 @@ registry.
 
 `PersistenceMiddleware` flushes the registry namespace to disk immediately on this action.
 
+### `REGISTRY_PRUNED`
+
+Dispatched by `PersistenceManager.prune_registry()` after deleting rows from the
+`persistent_views` registry (reattach pruning a message deleted while the bot was
+offline, or an explicit clear). Dispatch-only: no reducer, no state change.
+
+During startup reattach, `REGISTRY_PRUNED` fires synchronously inside `setup_middleware`.
+Under the canonical setup order (cogs loaded before `setup_middleware`), a subscription wired
+in a cog's `setup(bot)` is already registered and does observe the action. Code subscribing
+only in `on_ready` or later misses it (dispatches once, no replay). For that case read
+`store.persistence_manager.last_reattach_summary["removed"]` after startup instead; see the
+[Persistence guide](../guide/persistence.md).
+
+**Payload:**
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `deleted` | `int` | Number of rows removed |
+| `keys` | `list[str]` | The `persistence_key`s actually pruned; a key passed in but absent on disk is not listed |
+| `reason` | `str` | `"explicit"` for a targeted prune, `"clear_all"` for a full wipe |
+
+**State change:** None. The `keys` list lets a subscriber clear exactly the affected external records without sweeping its whole domain against the registry.
+
 ---
 
 ## Inspector
@@ -401,7 +424,7 @@ Three middleware components interact with these actions:
   `SESSION_UPDATED` is **not** skipped - `update_session()` changes are
   captured and restored by undo/redo.
 
-- **`LoggingMiddleware`** logs every dispatched action. Default level is `INFO`; pass `level="DEBUG"` for full action tracing or `level="WARNING"` to suppress routine traffic.
+- **`LoggingMiddleware`** logs every dispatched action. The configured `level` (default `INFO`) is the action stream's *emission* level, not a threshold: pass `level="DEBUG"` to keep the routine action traffic out of INFO logs so it surfaces only when DEBUG is enabled. The middleware does not pin the logger threshold; visibility follows the `cascadeui.actions` logger and its handlers.
 
 ## Action Filters and Undo
 

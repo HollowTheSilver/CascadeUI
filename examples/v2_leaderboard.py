@@ -17,8 +17,8 @@ Demonstrates:
     - Section-mode split hooks: ``format_primary`` + ``format_secondary``
       for the two-line entry body, plus async ``get_avatar_url`` for
       the thumbnail accessory
-    - Visual parity across rows: real members resolve an avatar via
-      ``bot.fetch_user``; synthetic rows carry a ``synthetic`` flag
+    - Visual parity across rows: real members resolve an avatar from the
+      bot's user cache (``bot.get_user``); synthetic rows carry a ``synthetic`` flag
       and route to a Discord default avatar URL so every Section
       renders with a thumbnail accessory. Synthetic user IDs are
       fake-but-valid-shape snowflakes so the client renders
@@ -66,7 +66,14 @@ from discord.ext import commands
 from discord.ext.commands import Context
 from discord.ui import TextDisplay
 
-from cascadeui import LeaderboardLayoutView, card, divider, key_value, progress_bar
+from cascadeui import (
+    LeaderboardLayoutView,
+    action_section,
+    card,
+    divider,
+    key_value,
+    progress_bar,
+)
 
 # // ========================================( Config )======================================== // #
 
@@ -114,9 +121,9 @@ def _synthetic_entry(index: int) -> tuple:
     tries to resolve and fails, rendering ``<@ID>`` as an "@Unknown
     User" mention pill. That preserves the blue mention-pill look of
     real guild members without requiring the Members intent. The
-    ``synthetic`` flag tells ``get_avatar_url`` to skip the
-    ``fetch_user`` round-trip -- 25 failed lookups per rebuild would
-    otherwise burn rate-limit budget for nothing.
+    ``synthetic`` flag tells ``get_avatar_url`` to route straight to a
+    default avatar -- a fake snowflake is never in the user cache, so the
+    lookup would miss anyway.
     """
     synthetic_id = _FAKE_SNOWFLAKE_BASE + index
     stats = _mock_stats_for(synthetic_id)
@@ -177,6 +184,11 @@ class ServerLeaderboard(LeaderboardLayoutView):
         # and passing the bot at construction makes the dependency explicit.
         self._mode = mode
         self._bot = bot
+        # ``_detailed`` toggles the win-rate bar in every row. The button in
+        # ``build_summary`` flips it and calls ``reload(force=True)``: the entry
+        # data is unchanged, so the entry-signature short-circuit would skip the
+        # rebuild without the force flag.
+        self._detailed = True
         super().__init__(*args, **kwargs)
 
     def format_primary(self, rank: int, user_id: int, stats: dict) -> str:
@@ -194,34 +206,32 @@ class ServerLeaderboard(LeaderboardLayoutView):
         """
         games = stats["games"]
         wins = stats["wins"]
-        bar = progress_bar(wins, games or 1, width=6, show_percent=True).content
-        return f"`{stats['mmr']}` MMR \u2022 " f"{wins}W / {games}G \u2022 " f"{bar}"
+        line = f"`{stats['mmr']}` MMR \u2022 {wins}W / {games}G"
+        if self._detailed:
+            bar = progress_bar(wins, games or 1, width=6, show_percent=True).content
+            line = f"{line} \u2022 {bar}"
+        return line
 
     async def get_avatar_url(self, user_id: int, stats: dict):
         """Resolve a thumbnail URL for the Section accessory.
 
-        Real members route through ``bot.fetch_user`` so the avatar
-        reflects their current Discord profile. Synthetic rows and
-        ``fetch_user`` failures both route to a Discord default avatar
-        URL so every Section still renders with an accessory --
-        otherwise the library's TextDisplay-collapse fallback would
-        kick in and produce an uneven display where only some rows
-        have thumbnails.
-
-        The try/except swallows any ``HTTPException`` from ``fetch_user``
-        (rate limit, user not found) and degrades to the same default.
+        Real members resolve from the bot's user cache (``bot.get_user``):
+        a synchronous lookup with no HTTP, so avatar resolution adds no
+        latency to the render path. Per-entry ``fetch_user`` calls would share
+        one rate-limit bucket and run serially -- 25 round-trips before the
+        first paint, which ``asyncio.gather`` does not change -- so the cache
+        is the right source here. Cache misses and synthetic rows both route to a Discord
+        default avatar URL so every Section still renders with an accessory --
+        otherwise the library's TextDisplay-collapse fallback would kick in
+        and produce an uneven display where only some rows have thumbnails.
         """
-        # Synthetic rows carry a ``synthetic`` flag so this hook can
-        # skip the ``fetch_user`` round-trip entirely -- the fake
-        # snowflake would fail resolution anyway, and 25 failed lookups
-        # per page rebuild would burn rate-limit budget for nothing.
-        # The default avatar slot (0-5) is picked via ``user_id % 6``
-        # so the same demo entry always draws the same face.
+        # Synthetic rows carry a ``synthetic`` flag, and a real member may not
+        # be in cache; both fall back to a default avatar slot (0-5) picked via
+        # ``user_id % 6`` so the same entry always draws the same face.
         if stats.get("synthetic") or self._bot is None:
             return _DEFAULT_AVATAR_URL.format(n=user_id % 6)
-        try:
-            user = await self._bot.fetch_user(user_id)
-        except Exception:
+        user = self._bot.get_user(user_id)
+        if user is None:
             return _DEFAULT_AVATAR_URL.format(n=user_id % 6)
         # A 128px CDN variant renders noticeably faster client-side than the
         # default 1024px asset -- Section thumbnails are small on-screen, so
@@ -257,7 +267,20 @@ class ServerLeaderboard(LeaderboardLayoutView):
             TextDisplay("## Overview"),
             divider(),
             key_value(summary),
+            action_section(
+                f"Win-rate bars: {'on' if self._detailed else 'off'}",
+                label="Toggle bars",
+                callback=self._toggle_detail,
+                custom_id="lb_toggle_detail",
+            ),
         )
+
+    async def _toggle_detail(self, interaction):
+        # The ranking entries do not change, only how each row renders, so the
+        # entry-signature short-circuit in rebuild_pages would skip the rebuild.
+        # reload(force=True) rebuilds the pages anyway and ships the new render.
+        self._detailed = not self._detailed
+        await self.reload(force=True)
 
 
 # // ========================================( Cog )======================================== // #

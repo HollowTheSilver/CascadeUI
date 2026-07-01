@@ -45,6 +45,27 @@ class TestNoLimitByDefault:
         assert len(store._active_views) == 5
 
 
+class TestOnPreSendGateV1:
+    """on_pre_send gates the V1 StatefulView send path identically. The hook
+    lives on the shared _StatefulMixin and the gate runs in the shared
+    _send_pipeline, so V1 inherits it alongside the sibling instance gate.
+    """
+
+    async def test_veto_aborts_v1_send(self):
+        store = get_store()
+
+        class _GatedV1(StatefulView):
+            async def on_pre_send(self, interaction):
+                return False
+
+        view = _GatedV1(interaction=_make_interaction())
+        message = await view.send()
+
+        assert message is None
+        assert view.is_finished()
+        assert view.id not in store._active_views
+
+
 # // ========================================( Replace Policy )======================================== // #
 
 

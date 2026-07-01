@@ -44,6 +44,17 @@ Numeric value must be at least `n`. Non-numeric values fail with a type error me
 
 Numeric value must be at most `n`. Non-numeric values fail with a type error message.
 
+### `emoji(msg=None)`
+
+Value must be a single emoji (a unicode emoji or a custom Discord token `<:name:id>`). Empty values pass -- use `required=True` on the input, or `min_length`, to forbid blank. Backed by the `is_emoji()` heuristic in `cascadeui.utils`. Pair it with a `Modal` `TextInput` to accept an arbitrary emoji, since Discord has no native emoji input field:
+
+```python
+from cascadeui import Modal, TextInput, emoji
+
+field = TextInput(label="Emoji", placeholder="🏆", required=False, validators=[emoji()])
+Modal(title="Choose an emoji", inputs=[field], callback=on_submit)
+```
+
 ---
 
 ## Runner Functions

@@ -323,6 +323,41 @@ class TestAutoDeferErrorHandling:
 
         assert elapsed < 2.0  # bounded by auto_defer_delay, not the 60s stall
 
+    async def test_safe_defer_swallows_dead_interaction(self):
+        """A dead interaction (10062) on the ack must not propagate. The token
+        is already gone, so there is nothing to acknowledge -- the navigation
+        deferred-edit path routes its ack through here, and a raised NotFound
+        would surface a recoverable ack miss as an unhandled callback error.
+        """
+        import discord
+
+        view = StatefulView(interaction=_make_interaction())
+        view.auto_defer_delay = 1.0
+        view.owner_only = False
+
+        interaction = _make_interaction(is_done=False)
+        interaction.response.defer = AsyncMock(side_effect=discord.NotFound(MagicMock(), ""))
+
+        await view._safe_defer(interaction)  # must not raise
+
+    async def test_safe_defer_swallows_other_http_ack_failure(self):
+        """Any non-NotFound HTTP ack failure (e.g. 40060 already-acked) is also
+        absorbed: a defer that cannot land is useless, and the auto-defer timer
+        outside the lock is the backstop.
+        """
+        import discord
+
+        view = StatefulView(interaction=_make_interaction())
+        view.auto_defer_delay = 1.0
+        view.owner_only = False
+
+        interaction = _make_interaction(is_done=False)
+        interaction.response.defer = AsyncMock(
+            side_effect=discord.HTTPException(MagicMock(status=400), {"code": 40060})
+        )
+
+        await view._safe_defer(interaction)  # must not raise
+
     async def test_callback_error_still_triggers_on_error(self):
         """When the callback raises, on_error is called even with auto-defer active."""
         view = StatefulView(interaction=_make_interaction())

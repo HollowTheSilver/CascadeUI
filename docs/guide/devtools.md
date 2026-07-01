@@ -85,6 +85,18 @@ This registers the `/cascadeui` hybrid command group. All subcommands
 are owner-only -- the `is_owner()` check on the group propagates to
 every subcommand automatically.
 
+The group also sets `default_member_permissions` to none, so Discord hides
+the `/cascadeui` slash commands from non-admin members in the command picker.
+Discord has no owner-only visibility, so this restricts the picker to admins;
+`is_owner()` still blocks execution, and the prefix form (`!cascadeui ...`)
+stays available to the owner in a guild where they are not an admin.
+
+`DevToolsCog` carries `is_owner_tool = True`. A bot that routes owner-only
+cogs differently -- syncing them to a control guild so they never reach a
+member's slash picker, for example -- reads `getattr(cog, "is_owner_tool",
+False)` to detect the cog instead of matching its class name. Your own
+owner-gated cogs can carry the same marker so one check covers them all.
+
 ---
 
 ## `/cascadeui` Commands

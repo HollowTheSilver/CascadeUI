@@ -748,3 +748,77 @@ class TestOnReopenFailure:
         assert captured[0][0] == "factory_error"
         # The default send_message should NOT have been called
         refresh_interaction.response.send_message.assert_not_called()
+
+
+class TestEphemeralRearmOnNavRollback:
+    """A failed-navigation rollback re-arms the source's ephemeral refresh
+    handoff -- cancelled in _navigate_to ahead of the deferred teardown -- so a
+    recovered long-lived ephemeral source still swaps in its refresh button
+    before the 900s token cliff. The re-schedule uses the original deadline, so
+    it sleeps the remaining time rather than a fresh window.
+    """
+
+    @staticmethod
+    def _capture_tasks(view):
+        scheduled: list = []
+
+        def _spy(coro):
+            scheduled.append(coro)
+            coro.close()  # discard without "never awaited" warning
+
+        return scheduled, patch.object(view, "create_task", side_effect=_spy)
+
+    async def test_rollback_reschedules_ephemeral_handoff(self):
+        import time as _time
+
+        class _Source(StatefulLayoutView):
+            auto_refresh_ephemeral = True
+
+        source = _Source(interaction=_make_interaction(user_id=1, guild_id=100))
+        await source.send()
+        # Engaged handoff: deadline stamped at send, button not yet armed.
+        source._ephemeral = True
+        source._ephemeral_arm_deadline = _time.monotonic() + 500
+        source._refresh_armed = False
+
+        new_view = _Source(interaction=_make_interaction(user_id=1, guild_id=100))
+        scheduled, spy = self._capture_tasks(source)
+        with spy:
+            await source._rollback_navigation(new_view)
+
+        assert len(scheduled) == 1  # the ephemeral handoff was re-scheduled
+
+    async def test_rollback_skips_reschedule_without_handoff(self):
+        # A source that never engaged the handoff (no deadline stamped) gets no
+        # re-schedule on rollback.
+        class _Source(StatefulLayoutView):
+            pass
+
+        source = _Source(interaction=_make_interaction(user_id=1, guild_id=100))
+        await source.send()
+        new_view = _Source(interaction=_make_interaction(user_id=1, guild_id=100))
+
+        scheduled, spy = self._capture_tasks(source)
+        with spy:
+            await source._rollback_navigation(new_view)
+
+        assert scheduled == []
+
+    async def test_rollback_skips_reschedule_when_already_armed(self):
+        import time as _time
+
+        class _Source(StatefulLayoutView):
+            auto_refresh_ephemeral = True
+
+        source = _Source(interaction=_make_interaction(user_id=1, guild_id=100))
+        await source.send()
+        source._ephemeral = True
+        source._ephemeral_arm_deadline = _time.monotonic() + 500
+        source._refresh_armed = True  # already armed -> nothing to re-arm
+
+        new_view = _Source(interaction=_make_interaction(user_id=1, guild_id=100))
+        scheduled, spy = self._capture_tasks(source)
+        with spy:
+            await source._rollback_navigation(new_view)
+
+        assert scheduled == []

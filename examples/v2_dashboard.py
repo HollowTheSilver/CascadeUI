@@ -11,8 +11,13 @@ impossible with V1 embeds:
     - ``on_tab_switched`` hook for analytics on every tab change
     - Separators for visual hierarchy between content blocks
     - State-driven module toggles with live visual feedback
+    - The V2 builder set on the Controls tab: ``tab_nav`` inner navigation,
+      ``button_row``, ``toggle_button``, ``cycle_button``, and a
+      ``choice_row`` dropdown placed inside a card
+    - A ``Collapsible`` revealing a ``confirm_section`` for a reveal-on-click
+      reset, re-rendering through the tab's own rebuild path when toggled
+    - ``link_section`` for text paired with a link button (About tab)
     - Session limiting (one dashboard per user per guild)
-    - V2 convenience helpers for concise component assembly
     - ``@computed`` aggregate (``dashboard_total_visits``) read from the store
 
 A V1 view shows one embed (one color) with buttons separated below.
@@ -37,20 +42,51 @@ from discord.ext.commands import Context
 from discord.ui import ActionRow, TextDisplay
 
 from cascadeui import (
+    Collapsible,
     TabLayoutView,
     access_slot,
     action_section,
+    button_row,
     card,
     cascade_reducer,
+    choice_row,
     computed,
+    confirm_section,
+    cycle_button,
     divider,
     gap,
     key_value,
+    link_section,
     read_slot,
+    tab_nav,
+    toggle_button,
     toggle_section,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Default module enablement, restored by the Controls > Reset action.
+_MODULE_DEFAULTS = {
+    "Moderation": True,
+    "Logging": True,
+    "Welcome Messages": False,
+    "Auto-Role": False,
+    "Leveling": True,
+}
+
+# Controls-tab option sets. The theme presets map a label to the accent
+# color the Appearance card previews when that preset is picked.
+_REFRESH_INTERVALS = ["15s", "30s", "60s"]
+_NOTIF_TYPES = ["Mentions", "DMs", "Replies", "Reactions"]
+_THEME_PRESETS = {
+    "Default": discord.Color.blurple(),
+    "Midnight": discord.Color.dark_blue(),
+    "Ocean": discord.Color.teal(),
+    "Forest": discord.Color.green(),
+    "Sunset": discord.Color.orange(),
+    "Rose": discord.Color.magenta(),
+}
 
 
 # // ========================================( Reducer + @computed )======================================== // #
@@ -90,11 +126,14 @@ def dashboard_total_visits(visits):
 class DashboardView(TabLayoutView):
     """Multi-tab dashboard showcasing V2 layout features.
 
-    Three tabs demonstrate different V2 component patterns:
+    Four tabs demonstrate different V2 component patterns:
 
         Overview  -- Multiple themed containers with section accessories
-        Modules   -- State-driven toggles with live visual feedback
-        About     -- Rich text layout with separators and containers
+        Modules   -- State-driven toggles + a Collapsible reset confirm
+        Controls  -- The interactive builder set: tab_nav inner navigation,
+                     button_row, toggle_button, cycle_button, and a
+                     choice_row dropdown inside a card
+        About     -- Rich text layout with separators, containers, and links
     """
 
     # // ----( Policy surface )---- // #
@@ -105,37 +144,49 @@ class DashboardView(TabLayoutView):
     replace_policy = "delete"
     exit_policy = "delete"
     auto_defer = True
-    # ``state_scope = None`` because module toggles and tab-visit counters
-    # live on the instance, not the Redux tree. The dashboard is a layout
-    # showcase rather than a state-management tutorial -- see ``v2_settings``
-    # for the scoped-state pattern.
+    # ``state_scope = None`` because module toggles live on the instance; tab
+    # visits travel through application state via the custom reducer above and
+    # are read in build_overview.
     state_scope = None
     # Non-ephemeral panel; the flag has no effect here.
     auto_refresh_ephemeral = False
 
     # // ----( Tab styling )---- // #
-    # Success green marks the active tab so the dashboard reads like an
-    # admin panel; inactive tabs stay on the muted secondary style.
+    # Active tab uses success green, inactive tabs use secondary.
     active_tab_style = discord.ButtonStyle.success
     inactive_tab_style = discord.ButtonStyle.secondary
 
     def __init__(self, *args, **kwargs):
-        # Module toggle states live on the instance, not in the Redux
-        # tree, because this example is a layout showcase rather than a
-        # state-management tutorial. Visit counts, by contrast, live in
-        # the store so the ``@computed`` aggregate above has a stable
-        # read path -- see ``dashboard_total_visits``.
-        self._modules = {
-            "Moderation": True,
-            "Logging": True,
-            "Welcome Messages": False,
-            "Auto-Role": False,
-            "Leveling": True,
-        }
+        # Module toggles and Controls-tab preferences are instance state, not
+        # Redux. Visit counts live in the store so the ``@computed`` aggregate
+        # above has a stable read path (``dashboard_total_visits``).
+        self._modules = dict(_MODULE_DEFAULTS)
+
+        # Controls-tab state: which inner sub-view ``tab_nav`` shows, plus
+        # the preferences the builders drive.
+        self._controls_view = "Preferences"
+        self._notifications = True
+        self._notif_types = {"Mentions", "DMs"}
+        self._refresh_interval = "30s"
+        self._theme_preset = "Default"
+
+        # The Modules reset confirm hides behind a ``Collapsible`` (see
+        # ``build_modules``); the trigger reveals a ``confirm_section`` inline.
+        self._reset_zone = Collapsible(
+            label="Danger zone",
+            expanded_label="Hide",
+            style=discord.ButtonStyle.danger,
+            reveal=self._reset_reveal,
+            # ``summary`` flips the trigger into an in-card action_section: the
+            # button sits beside this one-line summary instead of standing alone.
+            summary=lambda: "Reset all modules to defaults?",
+            key="reset",
+        )
 
         tabs = {
             "\U0001f4ca Overview": self.build_overview,
             "\U0001f9e9 Modules": self.build_modules,
+            "\u2699\ufe0f Controls": self.build_controls,
             "\u2139\ufe0f About": self.build_about,
         }
         super().__init__(*args, tabs=tabs, **kwargs)
@@ -152,20 +203,19 @@ class DashboardView(TabLayoutView):
         routes through the reducer above and feeds the ``@computed``
         total that the Overview surfaces.
         """
-        name = self._tab_names[index]
+        name = self.active_tab
         await self.dispatch("DASHBOARD_TAB_VISITED", {"tab_name": name})
 
     # // ==================( Helpers )================== // #
 
     def _exit_row(self):
-        """Build an exit button ActionRow for the bottom of each tab.
+        """One ActionRow holding just a Close (Exit) button for each tab.
 
-        ``make_exit_button`` returns an unattached ``StatefulButton`` whose
-        callback honors ``exit_policy`` and any ``delete_message`` override,
-        so tab builders can pack it into their own ``ActionRow`` without
-        hand-rolling a close handler.
+        ``make_nav_row(back=False)`` yields the standard Back+Exit footer
+        with Back dropped -- an exit-only row -- so there is no ActionRow to
+        hand-roll.
         """
-        return ActionRow(self.make_exit_button(label="Close"))
+        return self.make_nav_row(back=False, exit_label="Close")
 
     @property
     def _guild(self):
@@ -257,6 +307,8 @@ class DashboardView(TabLayoutView):
 
         Demonstrates:
             - toggle_section() for enable/disable rows
+            - Collapsible wrapping confirm_section() for a reveal-on-click
+              danger action
             - Dynamic component tree rebuilt on each toggle
         """
         enabled = sum(1 for v in self._modules.values() if v)
@@ -272,7 +324,14 @@ class DashboardView(TabLayoutView):
                 )
             )
 
-        return [card(*items, color=discord.Color.purple()), self._exit_row()]
+        # The reset action stays collapsed until the user opens it, so the
+        # confirm/cancel row only spends component budget when needed.
+        reset = card(
+            "## Maintenance",
+            *self._reset_zone.render(self),
+            color=discord.Color.dark_red(),
+        )
+        return [card(*items, color=discord.Color.purple()), gap(), reset, self._exit_row()]
 
     def _make_toggle(self, module_name):
         """Create a toggle callback for a specific module."""
@@ -283,6 +342,151 @@ class DashboardView(TabLayoutView):
 
         return callback
 
+    def _reset_reveal(self):
+        """Build the confirm prompt the reset Collapsible reveals when open."""
+        return confirm_section(
+            "Reset every module to its default state?",
+            on_confirm=self._on_reset_modules,
+            on_cancel=self._on_cancel_reset,
+            confirm_label="Reset",
+            cancel_label="Keep",
+        )
+
+    async def _on_reset_modules(self, interaction):
+        self._modules = dict(_MODULE_DEFAULTS)
+        self._reset_zone.collapse()
+        await self._refresh_tabs()
+
+    async def _on_cancel_reset(self, interaction):
+        self._reset_zone.collapse()
+        await self._refresh_tabs()
+
+    # // ==================( Controls Tab )================== // #
+
+    async def build_controls(self):
+        """Interactive controls demonstrating the builder set.
+
+        Demonstrates:
+            - tab_nav() for lightweight inner sub-navigation (Preferences /
+              Appearance) without a second TabLayoutView
+            - button_row(), toggle_button(), cycle_button(), and a
+              choice_row(multi=True) toggle group on Preferences
+            - choice_row() as a single-select dropdown inside a card on Appearance
+        """
+        # tab_nav is the lighter alternative to TabLayoutView: tab-styled
+        # buttons the view switches in its own callback, with no async tab
+        # builders or on_tab_switched lifecycle. Here it splits one tab into
+        # two sub-views.
+        nav = tab_nav(
+            {"Preferences": self._show_prefs, "Appearance": self._show_appearance},
+            active=self._controls_view,
+        )
+        body = (
+            self._controls_prefs()
+            if self._controls_view == "Preferences"
+            else self._controls_appearance()
+        )
+        return [nav, *body, self._exit_row()]
+
+    def _controls_prefs(self):
+        return [
+            card(
+                "## Preferences",
+                key_value(
+                    {
+                        "Notifications": "On" if self._notifications else "Off",
+                        "Refresh interval": self._refresh_interval,
+                    }
+                ),
+                # A standalone toggle and a value-cycler share one ActionRow.
+                # Both are rebuilt each render, so start= re-seeds the cycler
+                # from the stored value rather than resetting to the first.
+                ActionRow(
+                    toggle_button(
+                        active=self._notifications,
+                        on_toggle=self._on_notifications,
+                        labels=("Notifications On", "Notifications Off"),
+                    ),
+                    cycle_button(
+                        values=_REFRESH_INTERVALS,
+                        start=_REFRESH_INTERVALS.index(self._refresh_interval),
+                        on_change=self._on_interval,
+                        emoji="\U0001f504",
+                    ),
+                ),
+                # button_row turns a {label: callback} map into one ActionRow.
+                button_row(
+                    {"Save": self._on_save, "Reset": self._on_reset_prefs},
+                    style=discord.ButtonStyle.primary,
+                ),
+                # choice_row(multi=True) renders one toggle button per type
+                # (4 <= the 5-button threshold). on_select receives the full
+                # selected list, which _on_notif_types stores as a set.
+                TextDisplay("Notify me about:"),
+                choice_row(
+                    {t: t for t in _NOTIF_TYPES},
+                    selected=self._notif_types,
+                    on_select=self._on_notif_types,
+                    multi=True,
+                    custom_id="notif_types",
+                ),
+                color=discord.Color.blurple(),
+            )
+        ]
+
+    def _controls_appearance(self):
+        # Six theme presets render choice_row as a dropdown -- placed inside
+        # the card, not stranded below it. Picking one recolors this card.
+        # custom_id keeps this control distinct from any other choice_row.
+        return [
+            card(
+                "## Appearance",
+                TextDisplay("Theme preset:"),
+                choice_row(
+                    {name: name for name in _THEME_PRESETS},
+                    selected=self._theme_preset,
+                    on_select=self._on_theme,
+                    custom_id="theme",
+                ),
+                color=_THEME_PRESETS[self._theme_preset],
+            )
+        ]
+
+    async def _show_prefs(self, interaction):
+        self._controls_view = "Preferences"
+        await self._refresh_tabs()
+
+    async def _show_appearance(self, interaction):
+        self._controls_view = "Appearance"
+        await self._refresh_tabs()
+
+    async def _on_notifications(self, interaction, active):
+        self._notifications = active
+        await self._refresh_tabs()
+
+    async def _on_notif_types(self, interaction, values):
+        # multi=True hands on_select the full selected list, not one value.
+        self._notif_types = set(values)
+        await self._refresh_tabs()
+
+    async def _on_interval(self, interaction, value):
+        self._refresh_interval = value
+        await self._refresh_tabs()
+
+    async def _on_theme(self, interaction, value):
+        self._theme_preset = value
+        await self._refresh_tabs()
+
+    async def _on_save(self, interaction):
+        await self.respond(interaction, "Preferences saved.", ephemeral=True)
+
+    async def _on_reset_prefs(self, interaction):
+        self._notifications = True
+        self._notif_types = {"Mentions", "DMs"}
+        self._refresh_interval = "30s"
+        self._theme_preset = "Default"
+        await self._refresh_tabs()
+
     # // ==================( About Tab )================== // #
 
     async def build_about(self):
@@ -290,6 +494,7 @@ class DashboardView(TabLayoutView):
 
         Demonstrates:
             - card() with long-form markdown content
+            - link_section() for text paired with a link button
             - gap() for invisible gaps between containers
             - Subheading text via Discord's -# markdown
         """
@@ -317,7 +522,25 @@ class DashboardView(TabLayoutView):
             color=discord.Color.dark_grey(),
         )
 
-        return [info, gap(), tech, self._exit_row()]
+        # link_section pairs text with a link button (no callback -- the
+        # platform handles navigation). Link buttons are Section
+        # accessories, so they cost no ActionRow budget.
+        links = card(
+            "## Resources",
+            link_section(
+                "Browse the full guide and API reference.",
+                label="Docs",
+                url="https://hollowthesilver.github.io/CascadeUI/",
+            ),
+            link_section(
+                "Read Discord's V2 component reference.",
+                label="Components",
+                url="https://discord.com/developers/docs/components/reference",
+            ),
+            color=discord.Color.blurple(),
+        )
+
+        return [info, gap(), tech, gap(), links, self._exit_row()]
 
 
 # // ========================================( Cog )======================================== // #
@@ -336,7 +559,7 @@ class V2DashboardExample(commands.Cog, name="v2_dashboard_example"):
     async def v2dashboard(self, context: Context) -> None:
         """Open a multi-tab V2 dashboard.
 
-        Three tabs demonstrate layout patterns that are impossible in V1:
+        Four tabs demonstrate layout patterns that are impossible in V1:
         multiple colored containers, sections with inline action buttons,
         and state-driven toggles -- all in one message.
         """

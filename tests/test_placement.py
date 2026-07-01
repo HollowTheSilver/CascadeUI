@@ -20,7 +20,9 @@ from discord.ui import (
     TextDisplay,
     Thumbnail,
     UserSelect,
+    View,
 )
+from helpers import make_interaction
 
 from cascadeui import (
     StatefulButton,
@@ -41,7 +43,7 @@ from cascadeui import (
     tab_nav,
     toggle_section,
 )
-from cascadeui.views._placement import validate_placement
+from cascadeui.views._placement import validate_placement, validate_unique_custom_ids
 
 
 async def _noop(interaction):
@@ -532,3 +534,100 @@ class TestValidatePlacementAttribute:
             validate_placement = False
 
         assert _OK.validate_placement is False
+
+
+# // ========================================( custom_id Uniqueness )======================================== // #
+
+
+class TestUniqueCustomIds:
+    """validate_unique_custom_ids rejects duplicate custom_ids in one tree."""
+
+    def test_duplicate_buttons_raise(self):
+        row = ActionRow()
+        row.add_item(Button(label="a", custom_id="dup"))
+        row.add_item(Button(label="b", custom_id="dup"))
+        with pytest.raises(ValueError, match="Duplicate component custom_id"):
+            validate_unique_custom_ids(_view_with(row))
+
+    def test_error_names_the_repeated_id(self):
+        row = ActionRow()
+        row.add_item(Button(label="a", custom_id="choice"))
+        row.add_item(Button(label="b", custom_id="choice"))
+        with pytest.raises(ValueError, match="'choice'"):
+            validate_unique_custom_ids(_view_with(row))
+
+    def test_distinct_buttons_pass(self):
+        row = ActionRow()
+        row.add_item(Button(label="a", custom_id="x"))
+        row.add_item(Button(label="b", custom_id="y"))
+        validate_unique_custom_ids(_view_with(row))
+
+    def test_duplicate_selects_across_rows_raise(self):
+        row1 = ActionRow()
+        row1.add_item(UserSelect(custom_id="s"))
+        row2 = ActionRow()
+        row2.add_item(UserSelect(custom_id="s"))
+        with pytest.raises(ValueError, match="Duplicate component custom_id"):
+            validate_unique_custom_ids(_view_with(row1, row2))
+
+    def test_non_interactive_items_ignored(self):
+        # Display items get an injected custom_id once attached, so the
+        # detector discriminates by type: two of them never collide.
+        validate_unique_custom_ids(_view_with(TextDisplay("a"), TextDisplay("b")))
+
+    def test_v1_flat_view_duplicate_raises(self):
+        # V1 View is a flat tree (no ActionRow nesting); walk_children still
+        # yields the buttons, so one check covers both versions.
+        v = View()
+        v.add_item(Button(label="a", custom_id="dup"))
+        v.add_item(Button(label="b", custom_id="dup"))
+        with pytest.raises(ValueError, match="Duplicate component custom_id"):
+            validate_unique_custom_ids(v)
+
+    def test_dynamic_item_duplicate_raises(self):
+        # DynamicItem wraps a Button but is not a Button subclass; the
+        # detector includes it so two DynamicPersistentButton-style items
+        # sharing an inner custom_id are caught, not just native buttons.
+        from discord.ui import DynamicItem
+
+        class _Dyn(DynamicItem[Button], template=r"dyn:(?P<x>\d+)"):
+            def __init__(self, x: int):
+                super().__init__(Button(custom_id=f"dyn:{x}", label=f"L{x}"))
+
+        row1 = ActionRow()
+        row1.add_item(_Dyn(1))
+        row2 = ActionRow()
+        row2.add_item(_Dyn(1))
+        with pytest.raises(ValueError, match="Duplicate component custom_id"):
+            validate_unique_custom_ids(_view_with(row1, row2))
+
+
+# // ========================================( custom_id Wiring )======================================== // #
+
+
+class TestCheckPlacementUniqueIdsWiring:
+    """_check_placement runs the uniqueness detector ungated, including V1."""
+
+    async def test_v1_duplicate_blocked_by_check_placement(self):
+        from cascadeui import StatefulView
+
+        view = StatefulView(interaction=make_interaction())
+        view.add_item(StatefulButton(label="a", custom_id="dup"))
+        view.add_item(StatefulButton(label="b", custom_id="dup"))
+        with pytest.raises(ValueError, match="Duplicate component custom_id"):
+            view._check_placement()
+
+    async def test_send_pipeline_raise_rolls_back_subscriber(self):
+        # A dup-id raise at Stage 0b must undo the __init__ subscriber, so a
+        # rejected send leaves no leaked subscription (the rollback contract).
+        from cascadeui import StatefulView
+        from cascadeui.state.singleton import get_store
+
+        store = get_store()
+        view = StatefulView(interaction=make_interaction())
+        view.add_item(StatefulButton(label="a", custom_id="dup"))
+        view.add_item(StatefulButton(label="b", custom_id="dup"))
+        assert view.id in store.subscribers
+        with pytest.raises(ValueError, match="Duplicate component custom_id"):
+            await view.send()
+        assert view.id not in store.subscribers

@@ -370,6 +370,7 @@ the matching `<:name:id>` form when a plain string is required.
 | `StatefulSelect` option dicts | `"emoji"` key |
 | `action_section`, `toggle_section`, `link_section`, `button_row`, `cycle_button`, `toggle_button` | `emoji=` kwarg |
 | `confirm_section` | `confirm_emoji=` / `cancel_emoji=` |
+| `choice_row` | per option via `Choice(emoji=...)`; the `{label: value}` dict form has no emoji slot |
 | `MenuView` / `MenuLayoutView` category dicts | `"emoji"` key |
 | `RoleCategory(icon=...)` | rendered as a markdown prefix in the category header |
 | `RolesLayoutView` / `PersistentRolesLayoutView` | `format_button_emoji` classmethod returns `EmojiInput` |
@@ -450,9 +451,10 @@ identically to guild emojis.
 Convenience functions for building V2 component trees. All return standard
 discord.py components.
 
-### `card(*children, color=None)`
+### `card(*children, color=None, spoiler=False)`
 
-Creates a `Container`. Strings are auto-wrapped in `TextDisplay`:
+Creates a `Container`. Strings are auto-wrapped in `TextDisplay`. Pass
+`spoiler=True` to hide the whole container behind a spoiler overlay:
 
 ```python
 from cascadeui import card, divider
@@ -480,7 +482,8 @@ self.add_item(key_value({"Status": "Online", "Users": "42"}))
 
 ### `action_section(text, *, label, callback, ...)`
 
-A `Section` with text and a button accessory:
+A `Section` with text and a button accessory. Pass `disabled=True` to render
+the button greyed out and non-interactive:
 
 ```python
 from cascadeui import action_section
@@ -491,9 +494,11 @@ self.add_item(action_section(
 ))
 ```
 
-### `toggle_section(text, *, active, callback)`
+### `toggle_section(text, *, active, callback, labels=("Enabled", "Disabled"), emoji=None)`
 
-A `Section` with a green/red toggle button:
+A `Section` with a green/red toggle button. `labels` sets the (active, inactive)
+button text -- pass `("On", "Off")` to relabel -- and `emoji` adds a button emoji.
+Pass `disabled=True` to render the button greyed out and non-interactive:
 
 ```python
 from cascadeui import toggle_section
@@ -504,11 +509,13 @@ self.add_item(toggle_section(
 ))
 ```
 
-### `image_section(text, *, url)`
+### `image_section(text, *, url, description=None, spoiler=False)`
 
 A `Section` with a `Thumbnail` image. `url` accepts a remote URL string,
 the `attachment://name.ext` form, or a `discord.File` instance whose
-`.uri` is read internally. See [Local file attachments](#local-file-attachments).
+`.uri` is read internally. `description` sets the thumbnail's alt text (up to
+256 chars); `spoiler=True` hides it behind a spoiler. See
+[Local file attachments](#local-file-attachments).
 
 ### `link_section(text, *, label, url, emoji=None)`
 
@@ -651,6 +658,52 @@ self.add_item(button_row(
 Raises `ValueError` if the mapping is empty or exceeds Discord's
 5-buttons-per-row limit. For per-button customization, build the `ActionRow`
 by hand.
+
+### `choice_row(options, *, on_select, selected=None, multi=False, ...)`
+
+A "pick one" (or "pick any") control. Where `button_row` gives N buttons
+each with its own callback and no notion of a current selection,
+`choice_row` gives N options that share one `on_select` and tracks which is
+active: the active option renders highlighted, and in single-select it is
+also disabled so re-picking it is a no-op. Pass a `{label: value}` dict for
+the common case, or a list of `Choice` when an option needs an emoji or a
+dropdown description:
+
+```python
+from cascadeui import choice_row
+
+# inside your StatefulLayoutView.build_ui():
+self.add_item(choice_row(
+    {"Easy": Difficulty.EASY, "Normal": Difficulty.NORMAL, "Hard": Difficulty.HARD},
+    selected=self.difficulty,
+    on_select=self._set_difficulty,   # async (interaction, value) -> None
+))
+```
+
+When the option count outgrows a button row (more than `button_threshold`,
+default 5), `choice_row` renders a dropdown instead -- up to Discord's
+25-option select limit (exported as `MAX_SELECT_OPTIONS`), past which it
+raises. Discord requires select option values to be strings; the builder maps
+to and from that form, so `on_select` always receives the real Python value,
+never a stringified index.
+
+Set `multi=True` to let several options be active at once. `selected`
+becomes a set, the buttons become toggles (no disabled state, since an
+active option must be clickable to turn it off), and `on_select` receives
+the full list of selected values. Two `choice_row` controls in one view need
+distinct `custom_id=` values so their components do not collide.
+
+!!! warning "The host owns the selection -- rebuild after `on_select`"
+    `choice_row` is stateless: it reads `selected` at build time and renders
+    the active option(s) from it. Your `on_select` callback must store the new
+    value and rebuild the row -- `build_ui()` then `refresh()`, or a state
+    dispatch that triggers `on_state_changed`. Without a rebuild, the control
+    snaps back to the build-time selection on the next click.
+
+!!! tip
+    Reach for a raw `StatefulSelect` when you need custom `min_values` /
+    `max_values`, or a select type other than text (role, user, channel).
+    `choice_row` covers the common "pick from a fixed set of values" shape.
 
 ### `cycle_button(*, values, on_change, ...)`
 
@@ -856,6 +909,86 @@ unresolved.
 
 ---
 
+## Composing V2 layouts
+
+A V2 view is a tree, and most layout questions reduce to one thing: what
+nests inside what. The allowed shape is small enough to hold in your head,
+and only two nestings are ever illegal.
+
+### The nesting tree
+
+```text
+LayoutView (the view)
+  - Container  (a card)         the main grouping block
+      - TextDisplay             markdown text
+      - Section                 text + one accessory (button or thumbnail)
+      - ActionRow               buttons OR one select
+      - MediaGallery            1-10 images
+      - File                    a downloadable file
+      - Separator               a divider or gap
+  - ActionRow                   (also valid at the top level)
+  - Section                     (also valid at the top level)
+  - MediaGallery / File / TextDisplay / Separator
+```
+
+The two surprising illegal nestings are: a `Container` cannot hold another
+`Container`, and a `Section` cannot hold another `Section`. The rest follow
+type logic -- a bare `Button` or `Select` needs an `ActionRow`, and a
+`Thumbnail` belongs only as a `Section` accessory.
+
+### What goes where
+
+- **Top level (the view):** Containers (cards), ActionRows, Sections,
+  MediaGalleries, Files, TextDisplays, Separators. A bare `Button`,
+  `Select`, or `Thumbnail` is *not* valid at the top level -- it must live
+  inside an `ActionRow` (buttons/selects) or a `Section` (thumbnail).
+- **Inside a card (`Container`):** everything the top level accepts except
+  another card. Text, sections, action rows (which may wrap a select),
+  galleries, and dividers all nest inside a card.
+- **Inside an `ActionRow`:** up to 5 buttons, *or* exactly one select --
+  not both.
+- **Inside a `Section`:** one to three `TextDisplay` children plus one
+  accessory (a button or a thumbnail).
+
+### Selects and choice_rows belong inside cards
+
+A card accepts ActionRows, and a `choice_row` *is* an ActionRow (buttons, or
+a single select), so a dropdown belongs *inside* the card it relates to, not
+stranded as a separate row below it. A raw `StatefulSelect` drops in the same
+way once wrapped in an `ActionRow` -- `choice_row` does that wrapping for you:
+
+```python
+self.add_item(card(
+    "## Filters",
+    key_value(self._summary()),
+    choice_row(LEAGUES, selected=self.league, on_select=self._pick),  # inside the card
+))
+```
+
+### Reveal a region inside a card
+
+Because `Collapsible.render()` and `PaginatedRegion.controls()` return raw
+components rather than a pre-wrapped card, you choose where they land. Splat
+them into a `card()` and the revealed region expands *inside* the card:
+
+```python
+def build_ui(self):
+    self.clear_items()
+    self.add_item(card(
+        "## Filters",
+        key_value(self._summary()),
+        *self.league_picker.render(self),   # trigger + reveal, inside the card
+    ))
+```
+
+The single caveat is the Container-in-Container rule: a `reveal` callable
+must not return a `card` when you splat it into a card. choice_rows,
+sections, and text are all fine -- each is either an ActionRow or a
+Container-legal child.
+
+The rules below spell out every constraint and how CascadeUI's pre-flight
+validator enforces them.
+
 ## V2 Placement Rules
 
 Discord's V2 component system has strict rules about which component types
@@ -894,6 +1027,7 @@ when you call `send()`.
 | `Section` must hold 1-3 children (empty) | accepts (empty) | rejects |
 | `ActionRow` must hold at least 1 child (empty) | accepts | rejects |
 | `MediaGallery` must hold 1-10 items | accepts | rejects |
+| Two components share a `custom_id` | accepts | rejects (code 50035) |
 
 ### Builders are guardrails
 
@@ -905,6 +1039,8 @@ above. Each builder hardcodes a Discord-API-valid shape:
 - `action_section()` / `toggle_section()` / `link_section()` always produce
   `Section(TextDisplay, accessory=Button-variant)`.
 - `button_row()` always produces `ActionRow(Button, Button, ...)` capped at 5.
+- `choice_row()` always produces one `ActionRow` (buttons or a `StatefulSelect`),
+  capped at 5 buttons / 25 options.
 - `gallery()` / `file_attachment()` always produce a properly-wrapped media component.
 
 A user who composes views entirely from builders cannot construct a tree
@@ -941,6 +1077,29 @@ bypass validation entirely -- nothing changed, the previous send
 already validated the tree. The cost on every other refresh is one
 linear walk over the component tree, microseconds for typical views.
 
+### Duplicate custom_ids
+
+Discord also rejects a message whose component tree contains two
+components with the same `custom_id` (HTTP 400, code 50035). This is a
+uniqueness rule, not a placement one, so it runs for **every** view (V1
+`StatefulView` as well as V2) and is not governed by `validate_placement`.
+The same three seams walk the tree and raise a directed `ValueError`
+naming the repeated id:
+
+```
+ValueError: Duplicate component custom_id: 'choice' appears more than once in ConfigView.
+  Discord rejects this message with HTTP 400 (code 50035: component custom id cannot be duplicated).
+  Fix: Give each component a distinct custom_id. A builder used more than once
+       (choice_row, PaginatedRegion, Collapsible) needs a distinct custom_id=/key= per call.
+```
+
+Auto-generated ids never collide here: CascadeUI position-anchors them
+before send. Only caller-supplied ids repeat, most often a builder called
+twice with its default (`choice_row`, `PaginatedRegion`, `Collapsible`).
+`Modal` applies the same rule to its inputs at construction: two inputs
+whose labels derive the same `custom_id` raise immediately rather than
+silently overwriting each other at submit.
+
 ### Opting out
 
 Set `validate_placement = False` on the view class for a documented escape
@@ -954,7 +1113,9 @@ class MyDashboard(StatefulLayoutView):
 
 The recommended use case is narrow: the validator's matrix lags a Discord
 or discord.py update. Any other reason to opt out signals an actual
-placement bug -- prefer fixing the tree.
+placement bug. Prefer fixing the tree. `validate_placement = False`
+disables only the placement matrix; the duplicate-`custom_id` check is a
+separate, always-on guard and still runs.
 
 ---
 
@@ -962,7 +1123,7 @@ placement bug -- prefer fixing the tree.
 
 Two helpers for building grid-based UIs:
 
-### `emoji_grid(rows, cols, *, fill, row_labels, col_labels, corner, cell_sep)`
+### `emoji_grid(rows, cols, *, fill="⬛", row_labels=None, col_labels=None, corner=None, cell_sep=" ")`
 
 Returns an `EmojiGrid` -- a live `TextDisplay` subclass that rewrites its
 content on every mutation:
@@ -1067,6 +1228,94 @@ Shows a confirmation prompt before executing the callback.
 ### `with_cooldown(button, *, seconds, scope="user")`
 
 Per-user (default), per-guild, or global cooldown.
+
+---
+
+## V2 Composite Components
+
+A composite component holds state across interactions and lives *inside* a view, sitting between the two simpler shapes: a builder returns a one-shot tree and forgets it, a view owns the whole message.
+
+### `PaginatedRegion`
+
+Pages one slice of a `StatefulLayoutView`'s tree while the host renders everything else. Reach for `PaginatedLayoutView` when the page list *is* the message; reach for `PaginatedRegion` when one section of a multi-section view needs its own page index while the surrounding layout -- a header, other cards, a second list -- stays put.
+
+!!! note "Why `PaginatedLayoutView` takes a `formatter` but `PaginatedRegion` does not"
+    A `PaginatedLayoutView` owns the whole message, so it needs a `formatter` to render each page -- there is no other render hook to call. A `PaginatedRegion` lives inside a host view whose `build_ui()` or `on_load()` already renders everything, so it only slices the item list and the host renders the slice alongside the rest of the layout.
+
+```python
+from cascadeui import StatefulLayoutView, PaginatedRegion, action_section, card
+
+class TaskListView(StatefulLayoutView):
+    def __init__(self, tasks, **kwargs):
+        super().__init__(**kwargs)
+        self.tasks = tasks
+        self.pager = PaginatedRegion(per_page=6)
+
+    def build_ui(self):
+        self.clear_items()
+        self.pager.items = self.tasks
+        rows = [action_section(t.title, label="Open", callback=self._open(t))
+                for t in self.pager.page_items]
+        self.add_item(card("## Tasks", *rows, *self.pager.controls(self)))
+```
+
+`controls(self)` captures the host and returns the nav row (empty on a single page). A page click re-runs the host's render path and re-slices. Each region keeps its own page index, so two regions can share a view if you give them distinct `key` values. Customization mirrors `PaginatedLayoutView` -- subclass and override the `{first,prev,indicator,next,last}_button_{label,emoji,style}` class attributes, `jump_threshold`, or the `on_page_changed` hook. See the API reference for the full surface.
+
+### `Collapsible`
+
+A trigger button that toggles an inline region of revealed content -- the disclosure/expander pattern. Use it when a button should reveal more controls (a `choice_row`, a select, a form) in place and hide them again, instead of pushing a new view or sending a follow-up. Pass a `reveal` callable that returns the content; `Collapsible` owns the toggle state and drives the host's render path on each click.
+
+```python
+from cascadeui import Collapsible, choice_row
+
+class FilterView(StatefulLayoutView):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.league_picker = Collapsible(
+            label="Edit Leagues",
+            expanded_label="Done",
+            reveal=lambda: choice_row(
+                LEAGUES, selected=self.league, on_select=self._pick_league
+            ),
+        )
+
+    def build_ui(self):
+        self.clear_items()
+        self.add_item(card("## Filters", key_value(self._summary())))
+        for item in self.league_picker.render(self):
+            self.add_item(item)
+
+    async def _pick_league(self, interaction, value):
+        self.league = value
+        self.league_picker.collapse()   # collapse after the pick
+        self.build_ui()
+        await self.refresh()
+```
+
+`render(self)` returns the trigger alone while collapsed, or the trigger plus the `reveal()` content while expanded (order via `trigger_first`). The collapse policy is the caller's -- `collapse()` after a revealed action finishes, or leave it open for multi-step use. The trigger relabels and restyles between states via `expanded_label` / `expanded_style` / `expanded_emoji`, and two collapsibles in one view need distinct `key` values.
+
+`expand()` / `collapse()` set the state programmatically and `expanded` reads it; the `on_toggle(expanded)` hook fires after every open or close for async prefetch or logging.
+
+### In-card disclosure with `summary`
+
+By default the trigger is a button on its own row. When the disclosure belongs *inside* a card -- the Edit button sitting beside a line of summary text rather than in a row of its own -- pass a `summary` callable (zero-argument, synchronous, read on every render like `reveal`). The trigger then renders as an `action_section`: a Section carrying the summary text with the trigger button as its accessory, so the whole disclosure splats into one `card(...)`.
+
+```python
+self.representation = Collapsible(
+    label="Edit",
+    expanded_label="Done",
+    emoji="✏️",
+    summary=lambda: f"Flagged beside your name: **{self.represented_name}**.",
+    reveal=lambda: ActionRow(self._represented_select()),
+    key="representation",
+)
+
+def build_ui(self):
+    self.clear_items()
+    self.add_item(card("### 🏳️ Representation", *self.representation.render(self)))
+```
+
+When `summary` returns an empty value (data not loaded yet), the trigger falls back to the bare button rather than rendering an empty Section.
 
 ---
 

@@ -30,6 +30,9 @@ Features demonstrated:
     - DynamicPersistentButton   (under the hood; used by the roles
                                  pattern for click routing without
                                  per-button instance tracking)
+    - on_bind                   (inject non-serializable runtime deps --
+                                 the bot, a database pool, a service
+                                 client -- into a restored persistent view)
     - PersistenceMiddleware     (installed via setup_middleware in
                                  setup_hook)
     - persistent_slots          (declarative slot opt-in on the
@@ -184,9 +187,38 @@ class RoleSelectorPanel(PersistentRolesLayoutView):
     # freeze in place rather than deleting the panel message.
     exit_policy = "disable"
 
+    async def on_bind(self, bot):
+        """Inject runtime dependencies that cannot ride the persistence round-trip.
+
+        The library calls ``on_bind`` at two seams it drives itself: once
+        before the first ``send()``, and again on every restart before
+        ``on_restore``. A panel posted days ago has no live ``bot``,
+        database pool, or service client as a constructor kwarg after a
+        restart -- those objects do not serialize. ``on_bind`` hands them
+        back. Stash them on ``self`` here and every method (``build_ui``,
+        button callbacks, ``on_load``, ``on_restore``) can reach them. The
+        bot stands in for a database pool or service client in a real app.
+        """
+        self.bot = bot
+
     async def on_restore(self, bot):
-        """Called after the panel is re-attached on bot restart."""
-        logger.info(f"Role selector panel restored (persistence_key={self.persistence_key})")
+        """Called after the panel is re-attached on bot restart.
+
+        Runs after the gateway is ready, so the ``self.bot`` injected by
+        ``on_bind`` resolves the guild from a warm cache. Roles can be
+        deleted while the bot is offline, so a real panel would reconcile
+        its configured role IDs against the live guild here.
+        """
+        # ``self.bot`` (injected by on_bind) and the ``bot`` parameter are the
+        # same object here. Reading self.bot mirrors how a button callback or
+        # build_ui -- which never receive ``bot`` -- reach the dependency:
+        # inject once in on_bind, read self.bot anywhere on the view.
+        guild = self.bot.get_guild(self.guild_id) if self.guild_id else None
+        guild_label = guild.name if guild else self.guild_id
+        logger.info(
+            f"Role selector panel restored for guild {guild_label} "
+            f"(persistence_key={self.persistence_key})"
+        )
 
 
 # // ========================================( Reducers )======================================== // #

@@ -160,7 +160,7 @@ Roles) in V1 and V2 where applicable, see [View Patterns](patterns.md).
 Every view follows the same lifecycle:
 
 1. **Init** -- view created, components added, subscribed to state store
-2. **Send** -- message sent, state registered (`VIEW_CREATED`, `SESSION_CREATED`)
+2. **Send** -- `on_pre_send` runs first as a veto gate (return `False` to abort with no side effects), then `on_load`, placement validation, instance enforcement, state registration (`VIEW_CREATED`, `SESSION_CREATED`), and the Discord send
 3. **Interact** -- user clicks buttons/selects, callbacks fire
 4. **Exit/Timeout** -- components disabled, state cleaned up (`VIEW_DESTROYED`)
 
@@ -175,16 +175,16 @@ super().__init__(*args, timeout=None, **kwargs)  # Never timeout
 ```
 
 !!! note "Ephemeral timeout derivation"
-    `send(ephemeral=True)` adjusts `timeout` based on `auto_refresh_ephemeral`:
+    `send(ephemeral=True)` derives `auto_refresh_ephemeral` from the declared
+    `timeout`. The `timeout` value itself is never rewritten.
 
-    - When `auto_refresh_ephemeral = True` (or left at the `None` default that
-      auto-engages on long timeouts), a timeout below `86400s` (24 hours) is
-      bumped up to `86400s`. The refresh handoff re-opens the view on a fresh
-      interaction token before the webhook's 900-second cliff, so the state
-      store lifetime must extend past it.
-    - When `auto_refresh_ephemeral = False`, a missing or larger timeout is
-      clamped down to `900s` to match the interaction token's 15-minute
-      cliff, so the view does not linger after its webhook token expires.
+    - Left at the `None` default, the refresh handoff engages when
+      `timeout is None or timeout > 900`: the view intends to outlive the
+      15-minute webhook window, so the handoff re-opens it on a fresh
+      interaction token before the 900-second cliff. An in-window ephemeral
+      (`timeout <= 900`) declines the handoff.
+    - An explicit `auto_refresh_ephemeral = True` or `False` overrides the
+      derivation entirely.
 
     The derivation is centralized in `_send_pipeline` -- every view that
     routes through `send()` (patterns included) inherits the policy.
@@ -259,15 +259,18 @@ class CustomView(StatefulLayoutView):
 message reference capture in one call.
 
 **Return value:** the sent `discord.Message` on success, or `None` when the
-view was blocked. Two conditions produce `None`:
+view was blocked. Three conditions produce `None`:
 
-1. **Instance limit rejection** -- `instance_policy = "reject"` and the user has
+1. **`on_pre_send` veto** -- the override returned `False`. No message ships,
+   no state registers. The response slot stays open for the override to explain
+   the rejection.
+2. **Instance limit rejection** -- `instance_policy = "reject"` and the user has
    hit `instance_limit`. The `on_instance_limit` hook fires automatically.
-2. **Participant registration failure** -- `auto_register_participants = True`
+3. **Participant registration failure** -- `auto_register_participants = True`
    and a user in `allowed_users` already occupies an instance.
 
-In both cases, the library handles cleanup completely -- no message, no state
-tree entry, no registry slot.
+In all three cases, the library handles cleanup completely -- no message, no
+state tree entry, no registry slot.
 
 ```python
 view = ExpensiveView(context=ctx)
@@ -341,16 +344,27 @@ Push views onto a stack and pop them to go back:
 The Discord message edit fires on every push and pop. `rebuild=` is an
 optional pre-edit hook for views that need post-construction setup:
 
-1. The interaction is auto-deferred
+1. The destination tree is built before the interaction is acked
 2. The optional `rebuild` callback runs against the new view
 3. The message is edited with the new view (plus any kwargs the
    callback returned)
+
+Navigation edits and acks in one round-trip through
+`interaction.response.edit_message` when the response slot is still open,
+falling back to defer plus `edit_original_response` when the slot is
+already consumed (an auto-defer timer fired, or the caller pre-deferred).
 
 V2 `rebuild` typically calls `build_ui()` to populate views that
 construct empty. V1 `rebuild` returns a dict of edit kwargs
 (e.g., `{"embed": v.build_embed()}`). Sync or async both work. Views
 built by async classmethods like `PaginatedLayoutView.from_data` come
 fully populated -- omit `rebuild` entirely.
+
+`rebuild=` handles sync post-construction tree or embed setup. Views
+whose content comes from a database or other async source define
+[`on_load()`](#navigating-database-backed-views); the library calls it
+automatically before every push/pop edit, so those views fetch their own
+source on navigation.
 
 ### How It Works
 
@@ -390,6 +404,66 @@ instance is already built.
     or [classic paginator gist](https://gist.github.com/Soheab/f226fc06a3468af01ea3168c95b30af8),
     see the [migration map in the patterns guide](patterns.md#coming-from-a-paginator-gist)
     for the full mapping of gist concepts to CascadeUI's grammar.
+
+### Navigating database-backed views
+
+Views that load their content from a database define `on_load()` instead
+of passing `rebuild=` on every push and pop. The library calls `on_load()`
+automatically before the initial send and before every push/pop edit, so
+navigating to a child or back to a parent re-fetches its source on render:
+
+```python
+class TaskListView(StatefulLayoutView):
+    subscribed_actions = set()
+
+    def __init__(self, *args, db, **kwargs):
+        # db is a non-reserved kwarg, so push/pop reconstruction
+        # preserves it faithfully.
+        self.db = db
+        super().__init__(*args, **kwargs)
+        self.rows = []
+        self.build_ui()
+
+    async def on_load(self):
+        # Runs before the initial send and before every push/pop edit.
+        self.rows = await self.db.list_tasks(self.user_id)
+        self.build_ui()
+
+    def build_ui(self):
+        self.clear_items()
+        lines = "\n".join(f"- {r['title']}" for r in self.rows) or "_No tasks yet._"
+        self.add_item(card("## Tasks", lines))
+        self.add_item(self.make_nav_row())
+
+    async def on_refresh(self, interaction):
+        # In-view Refresh button: re-fetch and re-render in place.
+        await self.reload()
+```
+
+A parent pushes to it directly; `on_load()` runs on the destination view
+before the edit ships:
+
+```python
+async def open_tasks(self, interaction):
+    await self.push(TaskListView, interaction, db=self.db)
+```
+
+`make_nav_row()` builds the Back plus Exit footer (V2 only). Popping back
+to the parent re-runs its `on_load()` and re-fetches its rows before the
+edit ships, so the Back button drives the reload on its own. `reload()` is
+the out-of-band counterpart for an in-view Refresh button: it runs
+`on_load()` then `refresh()`.
+
+!!! warning "Database handles go in a non-reserved kwarg"
+    Store the database handle under a kwarg the framework does not manage
+    (`db=` above). The
+    [reserved constructor parameters](../api/views.md#shared-constructor-parameters)
+    -- `context`, `interaction`, `message`, `state_store`, `session_id`,
+    `user_id`, `guild_id`, `parent` -- are re-derived on push/pop, so a repo
+    smuggled through one of them diverges after navigation.
+
+See [`examples/v2_db_navigation.py`](https://github.com/HollowTheSilver/CascadeUI/tree/main/examples/v2_db_navigation.py)
+for a runnable cog.
 
 ### Auto Back Button
 

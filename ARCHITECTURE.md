@@ -292,6 +292,42 @@ import, not forty clicks into a game when a user triggers the limit.
 Validating at subclass-definition time produces clear errors at the
 right call site with zero runtime cost.
 
+### 11. Navigation atomicity via defer-teardown
+
+**Decision:** `push()` and `pop()` defer the source view's teardown until
+the destination edit confirms. The source is unsubscribed but not
+destroyed until the edit succeeds; a failed edit rolls back to the live
+source instead of a torn-down one.
+
+**Alternatives considered:** Tear the source down before the edit (the
+original order); best-effort teardown with logging on edit failure.
+
+**Reason:** Tearing the source down first meant a failed edit (a missed
+ack, an expired token, a transient 5xx) left the message showing a view
+whose handlers were already gone, so every later click was silently
+dropped. Deferring teardown past the fallible edit makes navigation
+all-or-nothing: on success the source is committed-destroyed, on failure
+it is re-subscribed and stays clickable on the message it still owns.
+`replace()` keeps inline teardown because it is a one-way transition with
+no source to recover to.
+
+### 12. Duplicate custom_id detection over auto-uniqueness
+
+**Decision:** Two components in one view, or two inputs in one modal, that
+share a `custom_id` raise a directed error at build time. The library
+never rewrites the id to make it unique.
+
+**Alternatives considered:** Auto-uniquify by appending a per-instance
+suffix; leave it to Discord's HTTP 400 at send.
+
+**Reason:** Persistent view reattachment matches the exact `custom_id`
+Discord stored on the original message, so a suffix minted fresh on
+restart dead-ends the button. Raising instead surfaces the collision
+at the call site rather than as a render-time 400 (or, for modal inputs, a
+silent value overwrite). The ids the stabilizer assigns are already
+collision-free by tree-position anchoring, so only caller-supplied ids
+reach this check, where a collision is always a genuine mistake.
+
 ---
 
 ## When CascadeUI Fits

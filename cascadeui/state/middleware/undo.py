@@ -182,7 +182,14 @@ class UndoMiddleware:
                 "shared_data": pre_shared if pre_shared is not None else {},
             }
             limit = self._get_undo_limit(source_id)
-            self._push_undo(result, source_id, snapshot, limit)
+            new_views = self._views_with_undo_pushed(result, source_id, snapshot, limit)
+            if new_views is not None:
+                # ``result`` is this dispatch's freshly-reduced state (the
+                # store has already bound it to ``self.state`` in run_reducer),
+                # so writing the rebuilt ``views`` mapping onto it is the
+                # idiomatic middleware transform -- the nested view/undo_stack
+                # dicts are fresh (built by the helper), not shared structures.
+                result["views"] = new_views
 
         return result
 
@@ -251,21 +258,37 @@ class UndoMiddleware:
                 "shared_data": shared_data_cache[cache_key],
             }
             limit = self._get_undo_limit(source_id)
-            self._push_undo(live_state, source_id, snapshot, limit)
+            new_views = self._views_with_undo_pushed(live_state, source_id, snapshot, limit)
+            if new_views is not None:
+                # Batch-commit bookkeeping runs after the batch's reducers
+                # have committed and before BATCH_COMPLETE notifies, so there
+                # is no middleware return to thread. Rebind the store's state
+                # reference (the same reference-swap the dispatch path uses),
+                # never an in-place key write on the live dict. ``live_state``
+                # is rebound too so the next source_id reads this push.
+                live_state = {**live_state, "views": new_views}
+                self._store.state = live_state
 
-    def _push_undo(self, state: StateData, view_id: str, snapshot: dict, limit: int):
-        """Push a snapshot onto the view's undo stack in the given state dict.
+    def _views_with_undo_pushed(
+        self, state: StateData, view_id: str, snapshot: dict, limit: int
+    ) -> Optional[dict]:
+        """Return a fresh ``views`` mapping with ``snapshot`` pushed onto
+        ``view_id``'s undo stack, or ``None`` when the view is absent.
 
-        Reducers may share the view dict and its undo_stack list with prior
-        state versions (shallow-spread reducers only clone along the mutation
-        path).  This helper therefore constructs fresh undo_stack / view /
-        views dicts and rewires the top-level ``state`` reference -- never
-        mutates the input nested structures in place.
+        Pure: constructs fresh undo_stack / view / views dicts and returns
+        the new ``views`` mapping without touching ``state`` or any nested
+        structure. Reducers shallow-spread, so the input view dict and its
+        undo_stack list may be shared with prior state versions; rebuilding
+        avoids corrupting them. The caller decides how to apply the result:
+        the dispatch path writes it onto its own freshly-reduced state
+        (``result["views"] = ...``), the batch-commit path rebinds the live
+        store reference (``store.state = {**state, "views": ...}``) rather
+        than mutating the committed dict in place.
         """
         views = state.get("views", {})
         view = views.get(view_id)
         if view is None:
-            return
+            return None
 
         undo_stack = view.get("undo_stack", [])
         new_undo_stack = [*undo_stack, snapshot]
@@ -274,8 +297,8 @@ class UndoMiddleware:
 
         # Clear redo stack on new action (standard undo/redo behavior)
         new_view = {**view, "undo_stack": new_undo_stack, "redo_stack": []}
-        state["views"] = {**views, view_id: new_view}
 
         logger.debug(
             f"Undo snapshot pushed for view {view_id} " f"(stack depth: {len(new_undo_stack)})"
         )
+        return {**views, view_id: new_view}

@@ -2,8 +2,10 @@
 
 
 import asyncio
-import weakref
-from typing import Any, Coroutine, Dict, Optional, Set
+import logging
+from typing import Coroutine, Dict, Optional, Set
+
+logger = logging.getLogger("cascadeui.tasks")
 
 # // ========================================( Classes )======================================== // #
 
@@ -16,35 +18,32 @@ class TaskManager:
 
     def create_task(self, owner_id: str, coro: Coroutine) -> asyncio.Task:
         """Create and track a background task under the given owner ID."""
-        task = asyncio.create_task(self._wrap_task(coro, owner_id))
-
-        if owner_id not in self._tasks:
-            self._tasks[owner_id] = set()
-
-        self._tasks[owner_id].add(task)
+        task = asyncio.create_task(coro)
+        self._tasks.setdefault(owner_id, set()).add(task)
+        task.add_done_callback(lambda t: self._on_task_done(owner_id, t))
         return task
 
-    async def _wrap_task(self, coro: Coroutine, owner_id: str) -> Any:
-        """Wrap a coroutine to remove the task from tracking when complete."""
-        try:
-            return await coro
-        except asyncio.CancelledError:
-            # Re-raise cancellation so it's properly handled
-            raise
-        except Exception as e:
-            import logging
+    def _on_task_done(self, owner_id: str, task: asyncio.Task) -> None:
+        """Drop a finished task from tracking and surface any error.
 
-            logging.getLogger("cascadeui.tasks").error(f"Task error for owner {owner_id}: {e}")
-            raise
-        finally:
-            # Remove task from tracking
-            if owner_id in self._tasks:
-                task = asyncio.current_task()
-                if task in self._tasks[owner_id]:
-                    self._tasks[owner_id].remove(task)
-                # Clean up empty sets
-                if not self._tasks[owner_id]:
-                    del self._tasks[owner_id]
+        Runs as a done-callback on the task itself, so cleanup lands one
+        event-loop tick after the task finishes. Scheduling the coroutine
+        directly (no wrapper) means a cancel-before-first-step closes the
+        coroutine through the task rather than orphaning it with a "coroutine
+        was never awaited" warning. ``task.exception()`` retrieves the error so
+        asyncio does not separately log it as never-retrieved; cancellation is
+        not an error and is skipped.
+        """
+        owned = self._tasks.get(owner_id)
+        if owned is not None:
+            owned.discard(task)
+            if not owned:
+                self._tasks.pop(owner_id, None)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(f"Task error for owner {owner_id}: {exc}")
 
     def cancel_tasks(self, owner_id: str) -> int:
         """Cancel all tasks for the given owner ID."""
@@ -71,7 +70,7 @@ class TaskManager:
 
         Snapshots the current set so tasks spawned by awaited callbacks do
         not extend the wait indefinitely. Exceptions inside tasks are already
-        logged by ``_wrap_task``; this helper swallows them so a single
+        logged by ``_on_task_done``; this helper swallows them so a single
         failing subscriber does not abort the flush.
         """
         tasks = list(self._tasks.get(owner_id, ()))

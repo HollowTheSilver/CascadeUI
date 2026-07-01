@@ -2,9 +2,11 @@
 
 import pytest
 
+from cascadeui.utils import is_emoji
 from cascadeui.validation import (
     ValidationResult,
     choices,
+    emoji,
     max_length,
     max_value,
     min_length,
@@ -163,3 +165,73 @@ class TestValidateFields:
         values = {"plain": "anything"}
         errors = await validate_fields(values, field_defs)
         assert errors == {}
+
+
+# // ========================================( Emoji )======================================== // #
+
+
+class TestIsEmoji:
+    """The is_emoji heuristic accepts emoji and custom tokens, rejects text."""
+
+    def test_unicode_emoji(self):
+        assert is_emoji("\U0001f3c6") is True  # trophy
+
+    def test_symbol_range_emoji(self):
+        assert is_emoji("⭐") is True  # star
+        assert is_emoji("⚡") is True  # lightning
+
+    def test_flag_sequence(self):
+        assert is_emoji("\U0001f1fa\U0001f1f8") is True  # US flag
+
+    def test_zwj_sequence(self):
+        assert is_emoji("\U0001f468‍\U0001f469‍\U0001f467") is True  # family
+
+    def test_custom_token(self):
+        assert is_emoji("<:custom:123456789>") is True
+        assert is_emoji("<a:spin:987654321>") is True
+
+    def test_shortcode_rejected(self):
+        assert is_emoji(":trophy:") is False
+
+    def test_plain_text_rejected(self):
+        assert is_emoji("hello") is False
+        assert is_emoji("cafe") is False
+
+    def test_non_ascii_text_rejected(self):
+        # Non-ASCII but carries ASCII letters -- not an emoji.
+        assert is_emoji("café") is False
+
+    def test_empty_and_whitespace_rejected(self):
+        assert is_emoji("") is False
+        assert is_emoji("   ") is False
+        assert is_emoji(None) is False
+
+    def test_digits_rejected(self):
+        assert is_emoji("123") is False
+
+    def test_malformed_token_rejected(self):
+        assert is_emoji("<:bad>") is False
+
+
+class TestEmojiValidator:
+    """The emoji() validator factory gates a field on is_emoji."""
+
+    def test_emoji_passes(self):
+        assert emoji()("\U0001f3c6", {}, {}).valid is True
+
+    def test_custom_token_passes(self):
+        assert emoji()("<:custom:123>", {}, {}).valid is True
+
+    def test_non_emoji_fails(self):
+        result = emoji()("not an emoji", {}, {})
+        assert result.valid is False
+        assert result.message
+
+    def test_empty_passes(self):
+        # Empty is allowed; required=/min_length forbid blank, not this validator.
+        assert emoji()("", {}, {}).valid is True
+        assert emoji()(None, {}, {}).valid is True
+
+    def test_custom_message(self):
+        result = emoji(msg="Pick an emoji!")("nope", {}, {})
+        assert result.message == "Pick an emoji!"

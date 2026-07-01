@@ -4,7 +4,7 @@ Persistence in CascadeUI spans two isolated namespaces (registry, application), 
 
 ---
 
-## `PersistenceMiddleware(manager=None, *, backend=None, registry=None, application=None, bot=None, migrators=None)`
+## `PersistenceMiddleware(manager=None, *, backend=None, registry=None, application=None, bot=None, migrators=None, restore_concurrency=8)`
 
 Write-through middleware that owns the persistence pipeline. Construct once in `setup_hook`, after every cog that defines a `PersistentView` subclass has loaded, and pass it through `setup_middleware` to install it into the dispatch chain.
 
@@ -30,7 +30,8 @@ await setup_middleware(
 - `backend` -- shorthand: fills any namespace not configured via `registry=`/`application=`.
 - `registry`, `application` -- per-namespace overrides. Each accepts the matching config class from `cascadeui.persistence`. Explicit config wins over shorthand; passing the config with `backend=None` opts the namespace out entirely.
 - `bot` -- when supplied, enables the reattach pipeline for `PersistentView` subclasses and installs the message-deletion cleanup listener. When omitted, only state data is restored.
-- `migrators` -- optional iterable of schema migrators. Defaults to the library's built-in registry.
+- `migrators` -- optional dict with `"schema"` and/or `"kwargs"` keys, each mapping a `(name, from_version)` tuple to an async migrator callable. When omitted, no migrators are registered through this kwarg; the `@register_migrator` / `@register_kwargs_migrator` decorators are the canonical registration path, and this dict is the programmatic bulk alternative.
+- `restore_concurrency` -- positive int bounding how many persistent-view channel and message fetches run concurrently during startup reattach (default `8`).
 
 ### `async initialize(store)`
 
@@ -91,6 +92,9 @@ class MyBackend:
     async def row_upsert(
         self, namespace: str, row: dict[str, Any], key_columns: list[str]
     ) -> None: ...
+    async def row_upsert_many(
+        self, namespace: str, rows: list[dict[str, Any]], key_columns: list[str]
+    ) -> None: ...
     async def row_select(
         self, namespace: str, where: dict[str, Any] | None = None
     ) -> list[dict[str, Any]]: ...
@@ -110,6 +114,8 @@ Three correctness guarantees beyond the method signatures:
 2. **NULL-safe TTL prune** -- `row_delete_where_lt` must not sweep rows whose column value is missing or `None`.
 3. **Scan-snapshot safety** -- `kv_scan` must not raise `RuntimeError` when the caller writes to the same namespace mid-iteration.
 
+`row_upsert_many` batches the writes a flush would otherwise issue one at a time -- the SQL backends collapse it into a single transaction (`executemany` plus one commit). It shares `row_upsert`'s copy-on-store and conflict semantics. The persistence middleware falls back to per-row `row_upsert` when a backend does not implement it, so a custom backend may omit it.
+
 `InMemoryBackend` is the reference implementation.
 
 ---
@@ -119,9 +125,10 @@ Three correctness guarantees beyond the method signatures:
 Flag enum advertising which method sets a backend implements. Any combination via bitwise OR.
 
 - `Capability.KV` -- `kv_read`, `kv_write`, `kv_delete`, `kv_scan`
-- `Capability.RELATIONAL` -- `row_upsert`, `row_select`, `row_delete`, `row_delete_where_lt`
+- `Capability.RELATIONAL` -- `row_upsert`, `row_upsert_many`, `row_select`, `row_delete`, `row_delete_where_lt`
 - `Capability.SCHEMA_META` -- `get_schema_version`, `set_schema_version`
 - `Capability.TTL_INDEX` -- declares the backend has an indexed TTL column. Required when any `SlotPolicy` declares `ttl_days`.
+- `Capability.RAW_SQL` -- `execute`, `fetch`, `fetch_one`, `executemany`, and the `transaction()` context manager. Declared by the SQL backends; `InMemoryBackend` omits it.
 
 `PersistenceMiddleware.initialize` raises `PersistenceConfigError` at config time when a declared capability's method is missing.
 
@@ -131,7 +138,7 @@ Flag enum advertising which method sets a backend implements. Any combination vi
 
 ### `InMemoryBackend`
 
-Always available. All three capabilities. Process-local; state is lost on restart. Useful for tests and single-run bots.
+Always available. Declares `KV | RELATIONAL | TTL_INDEX | SCHEMA_META` (every capability except `RAW_SQL`, which an in-memory store has no engine for). Process-local; state is lost on restart. Useful for tests and single-run bots.
 
 ```python
 from cascadeui.persistence import InMemoryBackend
@@ -141,7 +148,7 @@ backend = InMemoryBackend()
 
 ### `SQLiteBackend(path, *, busy_timeout_ms=5000, synchronous="NORMAL")`
 
-Requires `pip install pycascadeui[sqlite]`. All three capabilities. Uses WAL mode and prepared statements.
+Requires `pip install pycascadeui[sqlite]`. Declares all five capabilities (including `RAW_SQL`). Uses WAL mode and prepared statements.
 
 ```python
 from cascadeui.persistence import SQLiteBackend
@@ -150,6 +157,18 @@ backend = SQLiteBackend("cascadeui.db")
 ```
 
 Importable from `cascadeui.persistence` only when `aiosqlite` is installed; the import is optional and silent otherwise.
+
+### `PostgresBackend(dsn, *, pool_kwargs=None)`
+
+Requires `pip install pycascadeui[postgres]`. Declares all five capabilities (including `RAW_SQL`). Backed by an `asyncpg` connection pool with JSONB storage, and adds `LISTEN`/`NOTIFY` for cross-process scoped-state invalidation: the right choice for a multi-process deployment.
+
+```python
+from cascadeui.persistence import PostgresBackend
+
+backend = PostgresBackend("postgresql://user:pass@host/db?sslmode=verify-full")
+```
+
+Importable from `cascadeui.persistence` only when `asyncpg` is installed; the import is optional and silent otherwise. `dsn` takes the standard libpq URL; `pool_kwargs` forwards extra arguments to the `asyncpg` pool.
 
 ---
 

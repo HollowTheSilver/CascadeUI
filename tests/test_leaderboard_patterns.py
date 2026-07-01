@@ -1,5 +1,7 @@
 """Tests for LeaderboardLayoutView and PersistentLeaderboardLayoutView."""
 
+from unittest.mock import AsyncMock, MagicMock
+
 import discord
 import pytest
 from discord.ui import Container, LayoutView, Section, TextDisplay, Thumbnail
@@ -346,9 +348,9 @@ class TestLeaderboardPagination:
 
     async def test_multi_page_nav_row_attached_once(self):
         """The navigation ActionRow appears in the view tree exactly once
-        after the send-time tree layout runs.
+        after the preload tree layout runs.
 
-        ``LeaderboardLayoutView.send`` calls ``_compose_pagination_tree``
+        ``LeaderboardLayoutView.on_load`` calls ``_compose_pagination_tree``
         to lay out the page content + nav row in a single shot. An
         earlier shape called ``_add_page_content`` and then
         ``add_item(self._nav_row)`` separately, which double-attached
@@ -362,14 +364,8 @@ class TestLeaderboardPagination:
         entries = [(i, {"wins": 100 - i, "games": 100}) for i in range(10)]
         view = PagedBoard(interaction=_make_interaction(), entries=entries)
 
-        # Mirror the body of send() up to (but not including) super().send()
-        # so the assertion checks the same tree layout the user sees.
-        view.pages = await view._build_leaderboard_pages()
-        view.clear_items()
-        view._build_nav_buttons()
-        view._compose_pagination_tree()
-        for extra in view._extra_items:
-            view.add_item(extra)
+        # on_load is the preload seam that lays out the tree the user sees.
+        await view.on_load()
 
         nav_row = view._nav_row
         assert nav_row is not None
@@ -485,6 +481,117 @@ class TestLeaderboardPagination:
         assert view._next_btn.disabled is True
 
 
+class TestLeaderboardReload:
+    """on_load re-fetches + recomposes the tree; the inherited reload()
+    (on_load + refresh) is the public out-of-band refresh, replacing the
+    reach into _build_nav_buttons / _update_page / _entries_signature.
+    """
+
+    async def test_on_load_builds_pages_and_tree(self):
+        # on_load is the preload seam: after it runs, pages are built and
+        # the tree is composed -- no send() needed to be render-ready.
+        view = LeaderboardLayoutView(interaction=_make_interaction(), entries=SAMPLE_ENTRIES)
+        assert view.pages == []  # __init__ hands the base an empty list
+
+        await view.on_load()
+
+        assert len(view.pages) >= 1
+        assert len(list(view.children)) >= 1  # tree composed
+
+    async def test_reload_refetches_and_rerenders(self):
+        # A live board whose get_entries() changes out-of-band: reload()
+        # picks up the new data (signature changes) and edits the message.
+        class LiveBoard(LeaderboardLayoutView):
+            def __init__(self, *args, **kwargs):
+                self._live = list(SAMPLE_ENTRIES)
+                super().__init__(*args, **kwargs)
+
+            def get_entries(self):
+                return self._live
+
+        view = LiveBoard(interaction=_make_interaction())
+        await view.on_load()
+        sig_before = view._entries_signature
+
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+
+        view._live = view._live + [(999, {"wins": 1, "games": 1})]
+        await view.reload()
+
+        assert view._entries_signature != sig_before  # re-fetched new data
+        view._message.edit.assert_awaited()  # re-rendered the message
+
+    async def test_reload_unchanged_signature_short_circuits_rebuild(self):
+        # rebuild_pages short-circuits on an unchanged entry signature, so a
+        # reload() with no data change does not re-run the page build.
+        view = LeaderboardLayoutView(interaction=_make_interaction(), entries=SAMPLE_ENTRIES)
+        await view.on_load()
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+
+        build_calls = {"n": 0}
+        original_build = view._build_leaderboard_pages
+
+        async def _counting_build():
+            build_calls["n"] += 1
+            return await original_build()
+
+        view._build_leaderboard_pages = _counting_build
+
+        await view.reload()
+
+        # No signature change -> rebuild_pages short-circuits -> no rebuild.
+        assert build_calls["n"] == 0
+
+    async def test_force_rebuilds_despite_unchanged_signature(self):
+        # force=True defeats the entry-signature short-circuit, so a filter or
+        # a select-highlight change that does not touch the entry data still
+        # rebuilds the pages (the public alternative to clearing the private
+        # _entries_signature).
+        view = LeaderboardLayoutView(interaction=_make_interaction(), entries=SAMPLE_ENTRIES)
+        await view.on_load()  # establishes the signature + initial pages
+
+        build_calls = {"n": 0}
+        original_build = view._build_leaderboard_pages
+
+        async def _counting_build():
+            build_calls["n"] += 1
+            return await original_build()
+
+        view._build_leaderboard_pages = _counting_build
+
+        await view.rebuild_pages()  # unchanged signature -> short-circuits
+        assert build_calls["n"] == 0
+        await view.rebuild_pages(force=True)  # forced -> rebuilds anyway
+        assert build_calls["n"] == 1
+
+    async def test_reload_force_rebuilds_despite_unchanged_signature(self):
+        # reload(force=True) clears the entry signature so on_load's
+        # rebuild_pages rebuilds even when the data is unchanged -- the public
+        # path the persistent out-of-band refresh actually calls (vs poking
+        # the private _entries_signature).
+        view = LeaderboardLayoutView(interaction=_make_interaction(), entries=SAMPLE_ENTRIES)
+        await view.on_load()
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+        view._check_placement = lambda: None
+
+        build_calls = {"n": 0}
+        original_build = view._build_leaderboard_pages
+
+        async def _counting_build():
+            build_calls["n"] += 1
+            return await original_build()
+
+        view._build_leaderboard_pages = _counting_build
+
+        await view.reload()  # unchanged signature -> short-circuits
+        assert build_calls["n"] == 0
+        await view.reload(force=True)  # forced -> rebuilds
+        assert build_calls["n"] == 1
+
+
 # // ========================================( PersistentLeaderboardLayoutView )======================================== // #
 
 
@@ -508,6 +615,25 @@ class TestPersistentLeaderboardLayoutView:
 
     def test_default_owner_only_is_false(self):
         assert PersistentLeaderboardLayoutView.owner_only is False
+
+    async def test_on_restore_renders_to_restore_components(self):
+        # on_restore must reload() so reattach's placeholder tree is replaced
+        # by a real render whose edit re-stores the components. rebuild_pages()
+        # alone (the pre-fix behavior) ships no edit, so a restored panel would
+        # drop clicks until the next state change.
+        view = PersistentLeaderboardLayoutView(
+            interaction=_make_interaction(),
+            entries=SAMPLE_ENTRIES,
+            persistence_key="board:restore-test",
+        )
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+        view._check_placement = lambda: None
+        view._last_tree_digest = None  # reattach state: no digest baseline yet
+
+        await view.on_restore(MagicMock())
+
+        view._message.edit.assert_awaited()  # the re-store edit shipped
 
     def test_default_exit_policy_is_disable(self):
         assert PersistentLeaderboardLayoutView.exit_policy == "disable"

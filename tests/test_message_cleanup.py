@@ -1,7 +1,8 @@
 """Tests for automatic view cleanup on message deletion."""
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
+import discord
 import pytest
 
 from cascadeui.state.store import StateStore
@@ -30,9 +31,6 @@ def _make_view(store, *, message_id=12345, user_id=100, guild_id=200):
     """Create a minimal StatefulView with a mock message attached."""
 
     class _TestView(StatefulView):
-        pass
-
-    with patch.object(StatefulView, "__init_subclass__", lambda **kw: None):
         pass
 
     view = _TestView(user_id=user_id, guild_id=guild_id, state_store=store)
@@ -196,3 +194,46 @@ class TestOnMessageDeleteHook:
 
         assert log == ["custom"]
         view.exit.assert_awaited_once()
+
+
+# // ========================================( on_message_gone )======================================== // #
+
+
+class TestOnMessageGoneHook:
+    """refresh() observing a 404 nulls _message and fires on_message_gone."""
+
+    async def test_default_is_noop(self):
+        store = StateStore()
+        view = _make_view(store)
+        # Default returns None: no exit, no raise.
+        assert await view.on_message_gone() is None
+
+    async def test_refresh_404_nulls_message_and_fires_hook(self):
+        store = StateStore()
+        view = _make_view(store)
+        view._last_tree_digest = None  # skip the render-hash short-circuit
+        view._check_placement = lambda: None
+        view._message.edit = AsyncMock(
+            side_effect=discord.NotFound(MagicMock(status=404), "Not Found")
+        )
+        view.on_message_gone = AsyncMock()
+
+        await view.refresh()
+
+        view.on_message_gone.assert_awaited_once()
+        assert view._message is None
+
+    async def test_refresh_404_swallows_hook_error(self):
+        store = StateStore()
+        view = _make_view(store)
+        view._last_tree_digest = None
+        view._check_placement = lambda: None
+        view._message.edit = AsyncMock(
+            side_effect=discord.NotFound(MagicMock(status=404), "Not Found")
+        )
+        view.on_message_gone = AsyncMock(side_effect=RuntimeError("boom"))
+
+        # A raising hook must not break refresh()'s non-raising contract.
+        await view.refresh()
+
+        assert view._message is None
