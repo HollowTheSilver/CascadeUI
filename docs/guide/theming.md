@@ -100,9 +100,16 @@ theme = self.get_theme()  # Per-view > global default > bare fallback
 
 ## Automatic Theme Propagation
 
-Inside `build_ui()`, the view's theme is set on a context variable
-automatically. Builder functions like `card()` and `stats_card()` read this
-context as a fallback when no explicit `color=` is passed:
+The view's theme reaches builder functions two ways, and together they
+apply it no matter where a component tree is built.
+
+**At build time (ambient context).** Every library render seam runs
+inside a theme context holding `view.get_theme()`: `build_ui()`,
+`on_load()`, wizard step builders, tab builders, paginated page
+formatters, and the leaderboard's page build. Builder functions like
+`card()` and `stats_card()` read the context as a fallback when no
+explicit `color=` is passed, and `divider()` / `gap()` read the theme's
+`separator_spacing` style (`"small"` / `"large"`) the same way:
 
 ```python
 class ThemedView(StatefulLayoutView):
@@ -115,15 +122,42 @@ class ThemedView(StatefulLayoutView):
         self.add_item(card("## Section Two", "More content"))
 ```
 
-Explicit `color=` always wins:
+**At render time (resolution backstop).** A `card()` built without an
+explicit color stays theme-managed: whenever a view ships its tree
+(initial send, refresh, navigation edit), managed cards re-resolve
+against the view's current theme. A card built outside any view context
+(a module-level helper, a pre-built page list) still renders themed
+once a view sends it, and a runtime theme change restyles managed cards
+on the next refresh.
+
+Explicit `color=` always wins and is never touched by either mechanism:
 
 ```python
 # This card is green regardless of the view's theme
 self.add_item(card("## Override", color=discord.Color.green()))
 ```
 
-Outside a view context (e.g. top-level code), `card()` produces containers
-with no accent color.
+### Dynamic Themes
+
+`get_theme()` resolves the view's theme: the `theme=` kwarg or class
+attribute, falling back to the global default. Override it to drive the
+theme from state -- every card follows the override on each rebuild,
+including the render-time backstop:
+
+```python
+from cascadeui import get_theme as lookup_theme
+
+class SettingsView(StatefulLayoutView):
+    state_scope = "user"
+
+    def get_theme(self):
+        name = self.scoped_state.get("theme", "default")
+        return lookup_theme(name) or super().get_theme()
+```
+
+`examples/v2_settings.py` runs this idiom end to end: picking a theme on
+the appearance page restyles the hub's summary card, category card, and
+footer note on the same state change, with no per-card color plumbing.
 
 ### Reading the Theme Context
 

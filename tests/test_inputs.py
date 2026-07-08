@@ -306,12 +306,30 @@ class TestCheckboxGroup:
     """CheckboxGroup input derives custom_id from label and stores multi-values."""
 
     def test_custom_id_from_label(self):
-        cg = CheckboxGroup(label="Toppings", options=[])
+        cg = CheckboxGroup(label="Toppings", options=[{"label": "Cheese", "value": "cheese"}])
         assert cg.custom_id == "input_toppings"
 
     def test_values_default_none(self):
-        cg = CheckboxGroup(label="X", options=[])
+        cg = CheckboxGroup(label="X", options=[{"label": "A", "value": "a"}])
         assert cg.values is None
+
+    def test_empty_options_rejected_at_construction(self):
+        """Discord accepts 1-10 checkbox options; the bound is enforced at
+        construction so the mistake surfaces where the options are built,
+        not as an HTTP 400 when the modal opens.
+        """
+        with pytest.raises(ValueError, match="accepts 1-10"):
+            CheckboxGroup(label="Empty", options=[])
+
+    def test_eleven_options_rejected_at_construction(self):
+        options = [{"label": f"O{i}", "value": str(i)} for i in range(11)]
+        with pytest.raises(ValueError, match="accepts 1-10"):
+            CheckboxGroup(label="Overfull", options=options)
+
+    def test_ten_options_accepted(self):
+        options = [{"label": f"O{i}", "value": str(i)} for i in range(10)]
+        cg = CheckboxGroup(label="Full", options=options)
+        assert len(cg.options) == 10
 
     def test_dict_options_converted(self):
         cg = CheckboxGroup(
@@ -373,12 +391,30 @@ class TestRadioGroup:
     """RadioGroup input derives custom_id from label and stores single value."""
 
     def test_custom_id_from_label(self):
-        rg = RadioGroup(label="Difficulty", options=[])
+        rg = RadioGroup(
+            label="Difficulty",
+            options=[{"label": "Easy", "value": "e"}, {"label": "Hard", "value": "h"}],
+        )
         assert rg.custom_id == "input_difficulty"
 
     def test_value_default_none(self):
-        rg = RadioGroup(label="X", options=[])
+        rg = RadioGroup(
+            label="X",
+            options=[{"label": "A", "value": "a"}, {"label": "B", "value": "b"}],
+        )
         assert rg.value is None
+
+    def test_single_option_rejected_at_construction(self):
+        """Discord requires 2-10 radio options; the bound is enforced at
+        construction so the mistake surfaces where the options are built.
+        """
+        with pytest.raises(ValueError, match="requires 2-10"):
+            RadioGroup(label="Lonely", options=[{"label": "A", "value": "a"}])
+
+    def test_eleven_options_rejected_at_construction(self):
+        options = [{"label": f"O{i}", "value": str(i)} for i in range(11)]
+        with pytest.raises(ValueError, match="requires 2-10"):
+            RadioGroup(label="Overfull", options=options)
 
     def test_dict_options_converted(self):
         rg = RadioGroup(
@@ -410,7 +446,10 @@ class TestRadioGroup:
         v = regex(r"^easy$", "must be easy")
         rg = RadioGroup(
             label="Mode",
-            options=[discord.RadioGroupOption(label="Easy", value="easy")],
+            options=[
+                discord.RadioGroupOption(label="Easy", value="easy"),
+                discord.RadioGroupOption(label="Hard", value="hard"),
+            ],
             validators=[v],
         )
         modal = Modal(title="T", inputs=[rg])
@@ -479,7 +518,10 @@ class TestLabelDescription:
         rg = RadioGroup(
             label="Mode",
             description="Choose one",
-            options=[discord.RadioGroupOption(label="A", value="a")],
+            options=[
+                discord.RadioGroupOption(label="A", value="a"),
+                discord.RadioGroupOption(label="B", value="b"),
+            ],
         )
         comp = rg.create_discord_component()
         assert comp.description == "Choose one"
@@ -539,7 +581,10 @@ class TestModalMixedInputs:
             ),
             RadioGroup(
                 label="Size",
-                options=[discord.RadioGroupOption(label="S", value="s")],
+                options=[
+                    discord.RadioGroupOption(label="S", value="s"),
+                    discord.RadioGroupOption(label="L", value="l"),
+                ],
             ),
             FileUpload(label="File"),
         ]
@@ -560,7 +605,10 @@ class TestModalMixedInputs:
             TextInput(label="Name", validators=[v1]),
             RadioGroup(
                 label="Mode",
-                options=[discord.RadioGroupOption(label="A", value="a")],
+                options=[
+                    discord.RadioGroupOption(label="A", value="a"),
+                    discord.RadioGroupOption(label="B", value="b"),
+                ],
                 validators=[v2],
             ),
             Checkbox(label="Ok"),  # no validators
@@ -576,7 +624,10 @@ class TestModalMixedInputs:
         cb = Checkbox(label="Agree")
         rg = RadioGroup(
             label="Pick",
-            options=[discord.RadioGroupOption(label="A", value="a")],
+            options=[
+                discord.RadioGroupOption(label="A", value="a"),
+                discord.RadioGroupOption(label="B", value="b"),
+            ],
         )
         modal = Modal(title="T", inputs=[cb, rg])
 
@@ -708,3 +759,16 @@ class TestModalDuplicateInputs:
     def test_distinct_labels_pass(self):
         modal = Modal(title="T", inputs=[TextInput(label="Name"), TextInput(label="Email")])
         assert len(modal.inputs) == 2
+
+
+class TestOpenModalEmptyGuard:
+    """open_modal rejects a zero-component modal before send (Discord 400)."""
+
+    async def test_empty_modal_raises(self):
+        from helpers import make_interaction
+
+        from cascadeui import StatefulLayoutView
+
+        view = StatefulLayoutView(interaction=make_interaction())
+        with pytest.raises(ValueError, match="no components"):
+            await view.open_modal(make_interaction(), Modal(title="Empty", inputs=[]))

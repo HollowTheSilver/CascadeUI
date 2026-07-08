@@ -5,16 +5,50 @@ import asyncio
 from typing import ClassVar, Dict, List, Optional, Tuple, Union
 
 import discord
-from discord.ui import Container, Section, TextDisplay, Thumbnail
+from discord.ui import Container, Item, Section, TextDisplay, Thumbnail
 
-from ...components.patterns.v2 import card, divider, gap, key_value
+from ...components.patterns.v2 import card, divider, gallery, gap, key_value
+from ...components.types import MediaInput
 from ..base import _StatefulMixin
 from ..persistent import _PersistentMixin
 from .paginated import PaginatedLayoutView, _BasePaginatedMixin
 
-# Sentinel distinguishing "user passed subtitle=None" (explicit skip)
-# from "user omitted the kwarg" (fall back to class default).
+# Sentinel distinguishing an explicitly passed ``None`` (suppress that
+# masthead piece) from an omitted kwarg (fall back to the class default).
+# Shared by the ``title`` / ``subtitle`` / ``banner`` constructor kwargs.
 _UNSET: object = object()
+
+
+def _as_frame_items(value) -> list:
+    """Normalize a frame-hook return into a component list.
+
+    The frame hooks accept ``None`` (no frame), a single V2 component,
+    or a list of components; page assembly always splices lists. Bare
+    strings wrap in ``TextDisplay``, matching ``card()``'s forgiveness.
+    """
+    if value is None:
+        return []
+    items = value if isinstance(value, list) else [value]
+    return [TextDisplay(item) if isinstance(item, str) else item for item in items]
+
+
+def _coerce_banner(value):
+    """Coerce a ``banner`` value to the media reference ``gallery`` accepts.
+
+    ``None``, URL strings, and ``discord.File`` pass through. Objects
+    carrying a string ``url`` attribute (``discord.Asset``, so
+    ``guild.icon`` and ``member.display_avatar`` work directly) coerce
+    to that URL. Anything else raises ``TypeError`` at the call site.
+    """
+    if value is None or isinstance(value, (str, discord.File)):
+        return value
+    url = getattr(value, "url", None)
+    if isinstance(url, str):
+        return url
+    raise TypeError(
+        f"banner must be a URL string, discord.File, or an object with a "
+        f"string .url attribute (e.g. discord.Asset); got {type(value).__name__}"
+    )
 
 
 # // ========================================( Shared Mixin )======================================== // #
@@ -39,7 +73,17 @@ class _BaseLeaderboardMixin:
     leaderboard_per_page: Optional[int] = 5
 
     # Rankings card H2 title. Default when no ``title=`` kwarg is passed.
-    title: str = "Leaderboard"
+    # Falsy (``None`` or empty string) renders no text heading, so a
+    # banner-only or heading-free masthead needs no override.
+    title: Optional[str] = "Leaderboard"
+
+    # Full-width banner image rendered at the top of the rankings card,
+    # above the ``title`` heading when both are set. Accepts a URL
+    # string, a ``discord.File``, or any object with a string ``.url``
+    # (``discord.Asset``, so ``guild.icon`` works directly). ``None``
+    # renders no banner. Class attribute OR ``banner=`` constructor
+    # kwarg; the ``build_title`` hook overrides both.
+    banner: Optional[MediaInput] = None
 
     # H3 subtitle rendered above the ranking rows. The library emits
     # ``f"### {subtitle}"`` verbatim when truthy; set to ``None`` (or
@@ -103,6 +147,21 @@ class _BaseLeaderboardMixin:
     )
 
     @classmethod
+    def _validate_attribute_value(cls, name: str, value) -> None:
+        """Extend the base dispatch with the ``banner`` media check.
+
+        Routing through this seam keeps definition-time validation and
+        ``set_class_attribute`` in agreement: both reject an
+        unrecognizable ``banner`` with the coercion helper's directed
+        ``TypeError`` at the point of the mistake.
+        """
+        if name == "banner":
+            if value is not None:
+                _coerce_banner(value)
+            return
+        super()._validate_attribute_value(name, value)
+
+    @classmethod
     def _validate_class_attributes(cls) -> None:
         """Extend base validation with the entry_layout / per_page coupling.
 
@@ -123,6 +182,8 @@ class _BaseLeaderboardMixin:
                 f"leaderboard_per_page <= 5 (Discord component budget); "
                 f"got leaderboard_per_page={per_page}."
             )
+        if "banner" in own:
+            cls._validate_attribute_value("banner", own["banner"])
 
     def get_entries(self) -> List[Tuple[int, dict]]:
         """Return the sorted leaderboard entries as ``(user_id, stats)`` pairs.
@@ -249,7 +310,10 @@ class _BaseLeaderboardMixin:
           ``card(...)`` to build one; the returned card owns its own
           title and layout, so the rankings card stays focused on the
           ranked rows alone. Pair with ``subtitle = None``
-          to drop the rankings H3 for a clean two-card look.
+          to drop the rankings H3 for a clean two-card look. A
+          two-card page cannot take the ``nav_inside_container``
+          wrap (Discord forbids Container nesting); it keeps the
+          sibling layout with the nav row as a separate row.
         - ``None``: no summary at any placement.
 
         Override to add game-specific aggregates (forfeits, draws,
@@ -257,6 +321,89 @@ class _BaseLeaderboardMixin:
         Default returns one row: ``Players`` count.
         """
         return {"Players": str(len(entries))}
+
+    def build_title(self, page: int) -> Union[Item, List[Item], None]:
+        """Render optional components replacing the card's masthead.
+
+        The masthead is the rankings card's identity strip: the
+        ``banner`` image and the ``## title`` heading. Called once per
+        page with the zero-based page index. Return a single V2
+        component or a list to render as the masthead for that page;
+        return an empty list to render no masthead on that page; return
+        ``None`` (default) to compose the masthead from the declarative
+        pair instead -- the ``banner`` image when set, then the
+        ``title`` heading when truthy. ``show_title_divider`` draws
+        below whichever masthead renders and is skipped when the
+        masthead is empty.
+
+        The returned components render inside the rankings card, so
+        they must be Container-legal children (``gallery(...)``,
+        ``TextDisplay``, ``Section``; a nested ``card(...)`` is rejected
+        by the placement validator). Pages rebuild only when the entry
+        signature changes, so a masthead that depends on data outside
+        the entries needs ``reload(force=True)`` -- the same contract as
+        the other frame hooks.
+        """
+        return None
+
+    def _build_masthead(self, page: int) -> list:
+        """Compose the rankings card's masthead components for one page.
+
+        The ``build_title`` hook wins whenever it returns non-``None``:
+        component(s) render as the masthead, and an explicit empty list
+        renders no masthead for that page. Only ``None`` falls through
+        to the declarative pair, in order: the ``banner`` image, then
+        the ``## title`` heading. Both unset composes an empty masthead.
+        """
+        hook_value = self.build_title(page)
+        if hook_value is not None:
+            return _as_frame_items(hook_value)
+        items: list = []
+        media = _coerce_banner(self.banner)
+        if media:
+            items.append(gallery(media))
+        if self.title:
+            items.append(TextDisplay(f"## {self.title}"))
+        return items
+
+    def build_header(self, page: int) -> Union[Item, List[Item], None]:
+        """Render optional frame components above the page's content.
+
+        Called once per page on every page rebuild. ``page`` is the
+        zero-based page index; return ``None`` for all indexes except
+        ``0`` to frame only the first page. The returned component(s)
+        are placed first in the page's top-level components -- above
+        the standalone summary card when ``build_summary`` returns a
+        ``Container``. Return a single V2 component, a list of
+        components, or ``None`` (default) for no header.
+
+        A ``gallery(...)`` banner is the typical header: a wide image
+        anchored above the rankings card. Pages rebuild only when the
+        entry signature changes, so a header that depends on data
+        outside the entries needs ``reload(force=True)`` -- the same
+        contract as ``build_summary``. Frame components also opt the
+        page out of the ``nav_inside_container`` wrap: the rankings card
+        is a Container and Discord forbids Container nesting, so framed
+        pages keep the sibling layout with the nav row as a separate
+        row.
+        """
+        return None
+
+    def build_footer(self, page: int) -> Union[Item, List[Item], None]:
+        """Render optional frame components below the page's content.
+
+        The counterpart of :meth:`build_header`: called once per page
+        with the zero-based page index, and the returned component(s)
+        are placed last in the page's top-level components -- below the
+        rankings card and above the navigation row. Return a single V2
+        component, a list of components, or ``None`` (default) for no
+        footer.
+
+        Suits identity or attribution content: a caption
+        ``TextDisplay``, a link row, or a closing image. The rebuild
+        and layout caveats on :meth:`build_header` apply identically.
+        """
+        return None
 
     def _resolve_per_page(self) -> int:
         if self.leaderboard_per_page is not None:
@@ -301,7 +448,18 @@ class _BaseLeaderboardMixin:
         ``get_avatar_url`` once per entry to resolve optional thumbnails.
         Lines mode never awaits but shares this coroutine so the two
         render branches sit behind one coherent builder.
+
+        The whole build runs inside the view's theme context so the
+        rankings card and every user hook invoked here (``build_summary``,
+        ``build_title``, ``build_header``, ``build_footer``) inherit the
+        view's accent colour, whichever caller triggered the rebuild.
         """
+        from ...theming.context import theme_context
+
+        with theme_context(self.get_theme()):
+            return await self._build_leaderboard_pages_inner()
+
+    async def _build_leaderboard_pages_inner(self) -> list:
         entries = self.get_entries()
 
         if not entries:
@@ -349,8 +507,8 @@ class _BaseLeaderboardMixin:
             end = start + per_page
             page_entries = top[start:end]
 
-            items: list = [TextDisplay(f"## {self.title}")]
-            if self.show_title_divider:
+            items: list = self._build_masthead(page_idx)
+            if items and self.show_title_divider:
                 items.append(divider())
 
             # Inline page-1 summary only when build_summary returned a
@@ -401,7 +559,9 @@ class _BaseLeaderboardMixin:
             page_components: list = [card(*items, color=self.card_color)]
             if summary_card is not None:
                 page_components.insert(0, summary_card)
-            pages.append(page_components)
+            header = _as_frame_items(self.build_header(page_idx))
+            footer = _as_frame_items(self.build_footer(page_idx))
+            pages.append([*header, *page_components, *footer])
 
         return pages
 
@@ -428,14 +588,37 @@ class LeaderboardLayoutView(_BaseLeaderboardMixin, PaginatedLayoutView):
             ``Container`` renders as a standalone card above the
             rankings on every page, ``None`` or empty dict suppresses
             the summary entirely.
+        ``build_title(page)``
+            Optional components replacing the rankings card's masthead
+            (the ``banner`` image + ``## title`` heading). ``None``
+            (default) composes the masthead from the declarative
+            ``banner`` / ``title`` pair.
+        ``build_header(page)`` / ``build_footer(page)``
+            Optional page-frame components: header items render above
+            the summary card, footer items below the rankings card and
+            above the navigation row. Return a component, a list, or
+            ``None`` (default, no frame). ``page`` is the zero-based
+            page index, so a frame can target only the first page.
         ``get_entries()``
             Data source. Default returns constructor ``entries=``.
 
-    Heading text:
+    Card masthead:
+        ``banner``
+            Full-width image at the top of the rankings card, above the
+            title heading when both are set. URL string, ``discord.File``,
+            or anything with a string ``.url`` (``guild.icon`` works
+            directly). Default ``None`` (no banner). Class attribute OR
+            ``banner=`` constructor kwarg.
         ``title``
-            H2 title on the rankings card (default ``"Leaderboard"``).
-            Class attribute OR ``title=`` constructor kwarg; the kwarg
-            wins when passed.
+            H2 heading on the rankings card (default ``"Leaderboard"``).
+            Class attribute OR ``title=`` constructor kwarg. Pass
+            ``title=None`` (or an empty string) to render no text
+            heading: with ``banner`` set, the banner alone is the
+            masthead; with neither, the card starts at its content and
+            the title divider is skipped. Mutating ``banner`` or
+            ``title`` on a live view needs ``reload(force=True)``:
+            the entry-signature short-circuit skips rebuilds when the
+            ranked data is unchanged.
         ``subtitle``
             H3 subtitle above the ranking rows (default ``"Rankings"``).
             Class attribute OR ``subtitle=`` constructor kwarg. Set to
@@ -467,20 +650,29 @@ class LeaderboardLayoutView(_BaseLeaderboardMixin, PaginatedLayoutView):
     exit_policy = "delete"
     state_scope = None
 
-    def __init__(self, *args, entries=None, title=None, subtitle=_UNSET, **kwargs):
-        if title is not None:
+    def __init__(self, *args, entries=None, title=_UNSET, subtitle=_UNSET, banner=_UNSET, **kwargs):
+        # ``title`` / ``subtitle`` / ``banner`` share the sentinel shape:
+        # passing ``None`` explicitly suppresses that masthead piece,
+        # while omitting the kwarg falls back to the class default.
+        if title is not _UNSET:
             self.title = title
-        # Subtitle uses a sentinel so the user can pass ``subtitle=None``
-        # to explicitly skip the H3 heading at construction time.
-        # ``subtitle=_UNSET`` (no kwarg) falls back to the class default.
         if subtitle is not _UNSET:
             self.subtitle = subtitle
+        if banner is not _UNSET:
+            self.banner = _coerce_banner(banner)
         self._entries = entries or []
         # Pages build lives in ``on_load()`` so the async ``get_avatar_url``
         # hook can resolve thumbnails before the first render. ``__init__``
         # hands the paginated base an empty list until then.
         kwargs["pages"] = []
         super().__init__(*args, **kwargs)
+        # The kwargs snapshot for push/pop and persistence captures the raw
+        # ``banner=`` value before the coercion above ran. Write the
+        # resolved value back so a ``discord.Asset`` banner round-trips as
+        # its JSON-safe URL string, the only shape the registry row's JSON
+        # serialization and restart reattachment can carry.
+        if "banner" in self._init_kwargs:
+            self._init_kwargs["banner"] = self.banner
 
     async def on_load(self) -> None:
         """Fetch entries and rebuild the page tree before display.

@@ -115,6 +115,10 @@ Key points:
   default `on_state_changed()` calls `build_ui()` followed by
   `refresh()` whenever the selector's value changes -- no manual
   callback wiring needed.
+- **`build_ui()` must run once in `__init__`** for the first render:
+  `send()` ships whatever components the view holds, and a plain
+  subclass starts empty. Every render after that is driven by
+  `on_state_changed()`.
 
 ---
 

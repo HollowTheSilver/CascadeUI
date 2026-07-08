@@ -136,6 +136,10 @@ class CounterView(StatefulLayoutView):
     subscribed_actions = {"SCOPED_UPDATE"}
     state_scope = "user"
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.build_ui()  # First render: send() needs components to ship
+
     def build_ui(self):
         self.clear_items()
         count = self.scoped_state.get("count", 0)
@@ -379,7 +383,7 @@ class ConfigHub(MenuLayoutView):
         ]
         super().__init__(*args, categories=categories, **kwargs)
 
-    def _build_header(self):
+    def build_header(self):
         return [card("## Server Config", key_value(self._summary()))]
 ```
 
@@ -607,6 +611,7 @@ for row in rows:
 
 ### Components
 - Stateful buttons, selects, and modals with state integration
+- Modal inputs beyond text: `Checkbox`, `CheckboxGroup`, `RadioGroup`, `FileUpload`, sharing one validator + custom_id contract with `TextInput`
 - Select callbacks can opt into a `values` second parameter
 - V2 builders: `card()`, `stats_card()`, `action_section()`, `toggle_section()`, `image_section()`, `link_section()`, `confirm_section()`, `button_row()`, `cycle_button()`, `toggle_button()`, `tab_nav()`, `choice_row()`, `key_value()`, `alert()`, `progress_bar()`, `divider()`, `gap()`, `gallery()`, `file_attachment()`
 - V2 stateful composites: `PaginatedRegion` (per-section pager), `Collapsible` (inline disclosure)

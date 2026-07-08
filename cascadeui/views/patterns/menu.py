@@ -1,6 +1,7 @@
 # // ========================================( Modules )======================================== // #
 
 
+import warnings
 from typing import Any, Callable, ClassVar, Dict, List, Optional
 
 import discord
@@ -206,7 +207,7 @@ class MenuLayoutView(_BaseMenuMixin, StatefulLayoutView):
 
     Customization:
         Override ``menu_style`` to set the default button style for all
-        category items. Override ``_build_header()`` / ``_build_footer()``
+        category items. Override ``build_header()`` / ``build_footer()``
         to add components above or below the category list. Set
         ``auto_exit_button = True`` to auto-add an exit button in an
         ActionRow at the bottom.
@@ -220,6 +221,20 @@ class MenuLayoutView(_BaseMenuMixin, StatefulLayoutView):
 
     _default_rebuild = staticmethod(lambda v: v.build_ui())
 
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        # Definition-time deprecation signal for the underscore hook pair.
+        # The overrides still render (the public hooks delegate), so this
+        # warns without breaking.
+        for old, new in (("_build_header", "build_header"), ("_build_footer", "build_footer")):
+            if old in cls.__dict__:
+                warnings.warn(
+                    f"{cls.__name__}.{old}() is deprecated; override {new}() "
+                    f"instead. The existing override still renders.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+
     def __init__(
         self,
         *args,
@@ -231,21 +246,41 @@ class MenuLayoutView(_BaseMenuMixin, StatefulLayoutView):
         self._categories: List[Dict[str, Any]] = categories or []
         self.build_ui()
 
-    def _build_header(self):
+    def build_header(self):
         """Return V2 components for the area above category items.
 
         Override to add a title card, summary, or status display.
         Returns a list of V2 components or a single component.
-        Default returns an empty list.
+        Default delegates to the deprecated ``_build_header`` so
+        existing overrides of the old name keep rendering; with
+        neither overridden, the result is an empty list (no header).
         """
-        return []
+        return self._build_header()
 
-    def _build_footer(self):
+    def build_footer(self):
         """Return V2 components for the area below category items.
 
         Override to add notes, status text, or extra action buttons.
         Returns a list of V2 components or a single component.
-        Default returns an empty list.
+        Default delegates to the deprecated ``_build_footer`` so
+        existing overrides of the old name keep rendering; with
+        neither overridden, the result is an empty list (no footer).
+        """
+        return self._build_footer()
+
+    def _build_header(self):
+        """Deprecated alias of :meth:`build_header`.
+
+        Overrides of this name still render because the public hook's
+        default delegates here. New code overrides ``build_header``.
+        """
+        return []
+
+    def _build_footer(self):
+        """Deprecated alias of :meth:`build_footer`.
+
+        Overrides of this name still render because the public hook's
+        default delegates here. New code overrides ``build_footer``.
         """
         return []
 
@@ -266,20 +301,18 @@ class MenuLayoutView(_BaseMenuMixin, StatefulLayoutView):
     def _build_category_card(self, items):
         """Wrap the category action_section items in a V2 card.
 
-        Override to customize the card's accent color or structure.
-        The default pulls ``accent_colour`` from ``self.get_theme()``.
+        Override to customize the card's accent color or structure. The
+        default builds a theme-managed ``card()``: the ambient theme
+        context supplies the accent, and the render-time resolution
+        keeps it aligned with the view's live theme.
         """
-        accent = None
-        theme = self.get_theme()
-        if theme:
-            accent = theme.get_style("accent_colour")
-        return card(*items, color=accent)
+        return card(*items)
 
     def build_ui(self):
         """Rebuild the full component tree from header, categories, footer."""
         self.clear_items()
 
-        header = self._build_header()
+        header = self.build_header()
         if header:
             items = header if isinstance(header, list) else [header]
             for item in items:
@@ -291,7 +324,7 @@ class MenuLayoutView(_BaseMenuMixin, StatefulLayoutView):
         if category_items:
             self.add_item(self._build_category_card(category_items))
 
-        footer = self._build_footer()
+        footer = self.build_footer()
         if footer:
             items = footer if isinstance(footer, list) else [footer]
             for item in items:

@@ -12,7 +12,9 @@ from typing import Any, ClassVar, Dict, Optional, Set
 
 import discord
 from discord import Interaction
-from discord.ui import Item, TextDisplay
+from discord.ui import Container
+from discord.ui import File as UIFile
+from discord.ui import Item, MediaGallery, TextDisplay, Thumbnail
 
 from ..components.base import StatefulButton
 from ..components.types import EmojiInput
@@ -613,31 +615,41 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
 
                 @functools.wraps(original_build)
                 async def _themed_build_ui(self, *args, **kw):
-                    from ..theming.context import _current_theme, set_current_theme
+                    from ..theming.context import theme_context
 
-                    token = set_current_theme(self.get_theme())
-                    try:
+                    with theme_context(self.get_theme()):
                         result = await original_build(self, *args, **kw)
                         self._stabilize_custom_ids()
                         return result
-                    finally:
-                        _current_theme.reset(token)
 
             else:
 
                 @functools.wraps(original_build)
                 def _themed_build_ui(self, *args, **kw):
-                    from ..theming.context import _current_theme, set_current_theme
+                    from ..theming.context import theme_context
 
-                    token = set_current_theme(self.get_theme())
-                    try:
+                    with theme_context(self.get_theme()):
                         result = original_build(self, *args, **kw)
                         self._stabilize_custom_ids()
                         return result
-                    finally:
-                        _current_theme.reset(token)
 
             cls.build_ui = _themed_build_ui
+
+        # on_load is the modern preload seam and builds component trees
+        # the same way build_ui does, so it gets the same ambient theme.
+        # Custom_id stabilization is not repeated here -- refresh() and
+        # the send pipeline already stabilize at their own seams.
+        if "on_load" in cls.__dict__:
+            original_load = cls.on_load
+
+            @functools.wraps(original_load)
+            async def _themed_on_load(self, *args, **kw):
+                from ..theming.context import theme_context
+
+                with theme_context(self.get_theme()):
+                    return await original_load(self, *args, **kw)
+
+            cls.on_load = _themed_on_load
 
     @classmethod
     def _class_session_key(cls) -> str:
@@ -1024,6 +1036,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         # Runs before any state mutation, but the __init__ subscriber and
         # undo entry already exist, so a rejection rolls them back before
         # re-raising, keeping the send() rollback contract intact even here.
+        self._apply_theme_defaults()
         try:
             self._check_placement()
         except ValueError:
@@ -1519,8 +1532,10 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
 
         The digest captures only the fields Discord compares server-side
         when an edit is applied: ``custom_id``, ``label``, ``style``,
-        ``disabled``, ``url``, ``placeholder``, emoji string form, and
-        (for ``TextDisplay``/``Container`` items) the visible text.
+        ``disabled``, ``url``, ``placeholder``, emoji string form,
+        (for ``TextDisplay``/``Container`` items) the visible text, and
+        (for ``MediaGallery``/``Thumbnail``/``File`` items) the media
+        URL plus its description/spoiler flags.
         Anything else -- internal python ids, callback identity, ephemeral
         view back-references -- is deliberately excluded. Two views that
         would render identical bytes on the wire must produce the same
@@ -1546,6 +1561,24 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             # ``isinstance`` is the only reliable discriminator here.
             if isinstance(item, TextDisplay):
                 parts.append(("t", item.content))
+            # Container accents are wire-visible: a theme change that only
+            # recolors marked cards must produce a new digest so the
+            # re-render ships.
+            elif isinstance(item, Container):
+                accent = item.accent_color
+                parts.append(("c", accent.value if accent else None, item.spoiler))
+            # Media-carrying items: the URL is the wire-visible state. A
+            # rebuild that swaps only a banner or avatar URL must change
+            # the digest, or refresh() short-circuits and the stale image
+            # stays on screen.
+            elif isinstance(item, MediaGallery):
+                parts.append(
+                    ("g", tuple((g.media.url, g.description, g.spoiler) for g in item.items))
+                )
+            elif isinstance(item, Thumbnail):
+                parts.append(("th", item.media.url, item.description, item.spoiler))
+            elif isinstance(item, UIFile):
+                parts.append(("f", item.media.url, item.spoiler))
             # Buttons and selects: record the wire-visible attributes.
             elif hasattr(item, "custom_id"):
                 # A select's rendered selection lives in opt.default, which
@@ -1573,10 +1606,9 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                         option_state,
                     )
                 )
-            # Other layout items (Separator, MediaGallery, Thumbnail) do
-            # not currently carry mutable state the user can observe
-            # changing between rebuilds. If they gain one later, extend
-            # here with a dedicated branch.
+            # Separator carries no user-visible mutable state. If a
+            # future layout item gains one, extend here with a
+            # dedicated branch.
         return hash(tuple(parts))
 
     def _freeze_components(self):
@@ -1904,6 +1936,11 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             # re-running against already-stable ids produces the same ids.
             self._stabilize_custom_ids()
 
+            # Theme-managed accents resolve against the live view theme
+            # before the digest, so a runtime theme change alters the
+            # digest and ships as a re-render instead of being skipped.
+            self._apply_theme_defaults()
+
             # Render-hash short-circuit. Only valid when the caller is not
             # supplying fresh embed/content kwargs -- those affect bytes
             # outside the component tree, so the digest cannot certify
@@ -2132,6 +2169,28 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         bound the acting-view fast path in ``refresh()`` uses.
         """
         return await asyncio.wait_for(coro, timeout=max(0.5, self.auto_defer_delay - 1.0))
+
+    def _apply_theme_defaults(self) -> None:
+        """Resolve theme-managed accents against the view's live theme.
+
+        ``card()`` / ``stats_card()`` mark the Containers they build
+        without an explicit ``color=``; this resolver stamps the view
+        theme's ``accent_colour`` onto every marked top-level Container.
+        Runs at the same seams as ``_check_placement`` (initial send,
+        refresh, navigation edit), so a marked card renders themed no
+        matter where its tree was built (page pre-builds, ``on_load``,
+        formatters, module-level helpers), and a runtime theme change
+        re-resolves on the next refresh. Explicit colors are never
+        marked, so they always win. V1 views hold no Containers and
+        fall through untouched.
+        """
+        theme = self.get_theme()
+        if theme is None:
+            return
+        accent = theme.get_style("accent_colour")
+        for child in self.children:
+            if isinstance(child, Container) and getattr(child, "_cascadeui_theme_accent", False):
+                child.accent_color = accent
 
     def _check_placement(self) -> None:
         """Validate the component tree before shipping it to Discord.

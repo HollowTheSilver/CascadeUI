@@ -275,3 +275,114 @@ class TestBuilderThemeFallback:
         view = MyView(user_id=1)
         view.build_ui()
         assert captured["container"].accent_colour == discord.Color.red()
+
+
+class TestThemeResolutionSeams:
+    """theme_context() provider seams + the late-resolution backstop."""
+
+    def test_theme_context_sets_and_resets(self):
+        from cascadeui.theming.context import theme_context
+
+        red = Theme("red", {"accent_colour": discord.Color.red()})
+        assert get_current_theme() is None
+        with theme_context(red):
+            assert get_current_theme() is red
+        assert get_current_theme() is None
+
+    def test_theme_context_resets_on_exception(self):
+        from cascadeui.theming.context import theme_context
+
+        red = Theme("red")
+        with pytest.raises(RuntimeError):
+            with theme_context(red):
+                raise RuntimeError("boom")
+        assert get_current_theme() is None
+
+    async def test_on_load_runs_inside_theme_context(self):
+        """on_load builds get the ambient theme, matching build_ui."""
+        from cascadeui.components.patterns.v2 import card
+
+        red = Theme("red", {"accent_colour": discord.Color.red()})
+        captured = {}
+
+        class PreloadView(StatefulLayoutView):
+            theme = red
+
+            async def on_load(self):
+                captured["container"] = card("test")
+
+        view = PreloadView(user_id=1)
+        await view.on_load()
+        assert captured["container"].accent_colour == discord.Color.red()
+
+    def test_backstop_resolves_marked_container_built_anywhere(self):
+        """A card() built with no context and no color renders themed once
+        the view's resolution seam runs -- the tree's build site no longer
+        matters.
+        """
+        from cascadeui.components.patterns.v2 import card
+
+        orphan = card("built at module level")
+        assert orphan.accent_colour is None
+
+        red = Theme("red", {"accent_colour": discord.Color.red()})
+
+        class Host(StatefulLayoutView):
+            theme = red
+
+        view = Host(user_id=1)
+        view.add_item(orphan)
+        view._apply_theme_defaults()
+        assert orphan.accent_color == discord.Color.red()
+
+    def test_backstop_never_touches_explicit_color(self):
+        from cascadeui.components.patterns.v2 import card
+
+        pinned = card("explicit", color=discord.Color.green())
+
+        red = Theme("red", {"accent_colour": discord.Color.red()})
+
+        class Host(StatefulLayoutView):
+            theme = red
+
+        view = Host(user_id=1)
+        view.add_item(pinned)
+        view._apply_theme_defaults()
+        assert pinned.accent_color == discord.Color.green()
+
+    def test_backstop_follows_runtime_theme_switch(self):
+        """Marked containers re-resolve against the live theme, so a theme
+        change lands on the next resolution pass instead of staying baked.
+        """
+        from cascadeui.components.patterns.v2 import card
+
+        red = Theme("red", {"accent_colour": discord.Color.red()})
+        blue = Theme("blue", {"accent_colour": discord.Color.blue()})
+
+        class Host(StatefulLayoutView):
+            theme = red
+
+        view = Host(user_id=1)
+        managed = card("managed")
+        view.add_item(managed)
+        view._apply_theme_defaults()
+        assert managed.accent_color == discord.Color.red()
+
+        view.theme = blue
+        view._apply_theme_defaults()
+        assert managed.accent_color == discord.Color.blue()
+
+    def test_divider_and_gap_follow_theme_spacing(self):
+        from discord import SeparatorSpacing
+
+        from cascadeui.components.patterns.v2 import divider, gap
+        from cascadeui.theming.context import theme_context
+
+        roomy = Theme("roomy", {"separator_spacing": "large"})
+        with theme_context(roomy):
+            assert divider().spacing == SeparatorSpacing.large
+            assert gap().spacing == SeparatorSpacing.large
+            # Explicit values win over the theme.
+            assert divider(large=False).spacing == SeparatorSpacing.small
+        # Outside a theme context the default stays small.
+        assert divider().spacing == SeparatorSpacing.small

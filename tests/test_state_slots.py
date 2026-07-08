@@ -3,6 +3,7 @@
 from unittest.mock import MagicMock
 
 import pytest
+from helpers import RenderableLayoutView
 from helpers import make_interaction as _make_interaction
 
 from cascadeui import access_slot, read_slot, slot_property
@@ -74,7 +75,7 @@ class TestSlotProperty:
     async def test_reads_value_from_seeded_slot(self):
         interaction = _make_interaction(user_id=100)
 
-        class GameView(StatefulLayoutView):
+        class GameView(RenderableLayoutView):
             phase = slot_property(
                 "phase", slot="bs_test", key=lambda self: self.user_id, default="setup"
             )
@@ -92,7 +93,7 @@ class TestSlotProperty:
         # rather than raising KeyError.
         interaction = _make_interaction(user_id=200)
 
-        class UnseedeView(StatefulLayoutView):
+        class UnseedeView(RenderableLayoutView):
             phase = slot_property(
                 "phase", slot="never_created", key=lambda self: self.user_id, default="idle"
             )
@@ -108,7 +109,7 @@ class TestSlotProperty:
         store = get_store()
         access_slot(store.state, "shared_slot", 999, default_factory=lambda: {"phase": "x"})
 
-        class OtherUserView(StatefulLayoutView):
+        class OtherUserView(RenderableLayoutView):
             phase = slot_property(
                 "phase",
                 slot="shared_slot",
@@ -125,7 +126,7 @@ class TestSlotProperty:
         # Key exists but the named field isn't in it yet.
         interaction = _make_interaction(user_id=400)
 
-        class PartialSeedView(StatefulLayoutView):
+        class PartialSeedView(RenderableLayoutView):
             score = slot_property("score", slot="ps", key=lambda self: self.user_id, default=0)
 
             async def seed_initial_state(self, state):
@@ -142,7 +143,7 @@ class TestSlotProperty:
         interaction = _make_interaction(user_id=500)
         store = get_store()
 
-        class LiveView(StatefulLayoutView):
+        class LiveView(RenderableLayoutView):
             score = slot_property("score", slot="live", key=lambda self: self.user_id, default=0)
 
             async def seed_initial_state(self, state):

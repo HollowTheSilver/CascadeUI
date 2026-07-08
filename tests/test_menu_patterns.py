@@ -315,34 +315,84 @@ class TestMenuLayoutViewStyles:
 
 
 class TestMenuLayoutViewHooks:
-    """V2 MenuLayoutView hook overrides fire on category selection."""
+    """V2 MenuLayoutView build_header/build_footer hooks and the deprecation
+    shim for the underscore-prefixed pair."""
 
     def test_build_header_default_empty(self):
         view = MenuLayoutView(interaction=_make_interaction(), categories=[])
-        assert view._build_header() == []
+        assert view.build_header() == []
 
     def test_build_footer_default_empty(self):
         view = MenuLayoutView(interaction=_make_interaction(), categories=[])
-        assert view._build_footer() == []
+        assert view.build_footer() == []
 
     def test_build_header_override(self):
         class HeaderMenu(MenuLayoutView):
-            def _build_header(self):
+            def build_header(self):
                 return [TextDisplay("Header")]
 
         view = HeaderMenu(interaction=_make_interaction(), categories=[])
-        header = view._build_header()
+        header = view.build_header()
         assert len(header) == 1
         assert isinstance(header[0], TextDisplay)
 
     def test_build_footer_override(self):
         class FooterMenu(MenuLayoutView):
-            def _build_footer(self):
+            def build_footer(self):
                 return TextDisplay("Footer note")
 
         view = FooterMenu(interaction=_make_interaction(), categories=[])
-        footer = view._build_footer()
+        footer = view.build_footer()
         assert isinstance(footer, TextDisplay)
+
+    def test_legacy_underscore_override_still_renders(self):
+        """The deprecated ``_build_header`` / ``_build_footer`` names warn at
+        class definition and keep rendering through the public hooks'
+        delegation, so pre-rename subclasses survive the migration intact.
+        """
+        with pytest.warns(DeprecationWarning, match="_build_header"):
+
+            class LegacyMenu(MenuLayoutView):
+                auto_exit_button = False
+
+                def _build_header(self):
+                    return [TextDisplay("LEGACY HEADER")]
+
+        view = LegacyMenu(
+            interaction=_make_interaction(),
+            categories=[{"label": "A", "view": _DummySubLayoutView}],
+        )
+        assert isinstance(view.children[0], TextDisplay)
+        assert view.children[0].content == "LEGACY HEADER"
+
+    def test_legacy_underscore_footer_warns_and_renders(self):
+        with pytest.warns(DeprecationWarning, match="_build_footer"):
+
+            class LegacyFooterMenu(MenuLayoutView):
+                auto_exit_button = False
+
+                def _build_footer(self):
+                    return TextDisplay("LEGACY FOOTER")
+
+        view = LegacyFooterMenu(
+            interaction=_make_interaction(),
+            categories=[{"label": "A", "view": _DummySubLayoutView}],
+        )
+        assert view.children[-1].content == "LEGACY FOOTER"
+
+    def test_public_names_define_without_warning(self):
+        """Overriding the public hooks must not trip the deprecation check."""
+        import warnings as _warnings
+
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("error", DeprecationWarning)
+
+            class CleanMenu(MenuLayoutView):
+                def build_header(self):
+                    return [TextDisplay("Clean")]
+
+                def build_footer(self):
+                    return [TextDisplay("Clean")]
 
     async def test_on_category_selected_fires(self):
         hook_calls = []
@@ -393,7 +443,7 @@ class TestMenuLayoutViewBuildUi:
         class OrderedMenu(MenuLayoutView):
             auto_exit_button = False
 
-            def _build_header(self):
+            def build_header(self):
                 return [TextDisplay("HEADER")]
 
         view = OrderedMenu(
@@ -408,7 +458,7 @@ class TestMenuLayoutViewBuildUi:
         class OrderedMenu(MenuLayoutView):
             auto_exit_button = False
 
-            def _build_footer(self):
+            def build_footer(self):
                 return [TextDisplay("FOOTER")]
 
         view = OrderedMenu(

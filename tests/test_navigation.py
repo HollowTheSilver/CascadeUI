@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import discord
 import pytest
+from helpers import RenderableLayoutView
 from helpers import make_interaction as _make_interaction
 
 from cascadeui.state.actions import ActionCreators
@@ -682,7 +683,7 @@ class TestNavigationFastPath:
 
     async def test_clear_on_empty_back_handles_ack_race_v2(self):
         """Same race on the V2 freeze path (edits view=self, not view=None)."""
-        view = StatefulLayoutView(interaction=_make_interaction(user_id=1, guild_id=100))
+        view = RenderableLayoutView(interaction=_make_interaction(user_id=1, guild_id=100))
         await view.send()
 
         nav = _make_interaction(user_id=1, guild_id=100, is_done=False)
@@ -1110,9 +1111,9 @@ class TestNavigationInstanceForm:
         # The literal composition the instance form exists for: a real
         # from_data() result pushed onto a parent, covering the from_data ->
         # push registration path end to end (not just push(instance) alone).
-        from cascadeui import PaginatedLayoutView, StatefulLayoutView
+        from cascadeui import PaginatedLayoutView
 
-        class _Root(StatefulLayoutView):
+        class _Root(RenderableLayoutView):
             def build_ui(self):
                 pass
 

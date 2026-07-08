@@ -74,12 +74,18 @@ Returns the current default `Theme` instance, or `None` if no default is set.
 
 ### `get_current_theme()`
 
-Returns the `Theme` active in the current execution context. Inside a view's
-`build_ui()` method, returns the view's theme. Outside a view context, returns
-`None`.
+Returns the `Theme` active in the current execution context. Inside any view
+render seam (`build_ui()`, `on_load()`, wizard step builders, tab builders,
+paginated page formatters, the leaderboard page build), returns the view's
+theme. Outside a view context, returns `None`.
 
-Builder functions like `card()` and `stats_card()` call this internally as a
-fallback when no explicit `color=` is passed.
+Builder functions call this internally: `card()` and `stats_card()` as the
+accent fallback when no explicit `color=` is passed, `divider()` and `gap()`
+for the theme's `separator_spacing` style. Cards built with no explicit color
+also stay theme-managed after construction: the view re-resolves their accent
+against its current theme at every render seam (send, refresh, navigation
+edit), so a card built outside any context still renders themed and a runtime
+theme change lands on the next refresh.
 
 ---
 

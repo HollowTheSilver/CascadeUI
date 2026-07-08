@@ -85,6 +85,7 @@ from cascadeui import (
     emoji_grid,
     gap,
     get_store,
+    image_section,
     key_value,
     read_slot,
     stats_card,
@@ -112,28 +113,31 @@ COL_LABELS = [str(i) for i in range(1, 11)]
 # Regional indicator emoji for axis labels (A-J)
 ROW_EMOJI = [chr(0x1F1E6 + i) for i in range(BOARD_SIZE)]
 # Keycap emoji for column labels (1-10)
-COL_EMOJI = [f"{i}\ufe0f\u20e3" if i < 10 else "\U0001f51f" for i in range(1, BOARD_SIZE + 1)]
+COL_EMOJI = [
+    f"{i}\N{VARIATION SELECTOR-16}\N{COMBINING ENCLOSING KEYCAP}" if i < 10 else "\N{KEYCAP TEN}"
+    for i in range(1, BOARD_SIZE + 1)
+]
 
 # Per-ship colored squares for visual distinction on the private board
 SHIP_COLORS = {
-    "Carrier": "\U0001f7e5",  # 🟥 Red
-    "Battleship": "\U0001f7e7",  # 🟧 Orange
-    "Cruiser": "\U0001f7e8",  # 🟨 Yellow
-    "Submarine": "\U0001f7e9",  # 🟩 Green
-    "Destroyer": "\U0001f7ea",  # 🟪 Purple
+    "Carrier": "\N{LARGE RED SQUARE}",  # 🟥 Red
+    "Battleship": "\N{LARGE ORANGE SQUARE}",  # 🟧 Orange
+    "Cruiser": "\N{LARGE YELLOW SQUARE}",  # 🟨 Yellow
+    "Submarine": "\N{LARGE GREEN SQUARE}",  # 🟩 Green
+    "Destroyer": "\N{LARGE PURPLE SQUARE}",  # 🟪 Purple
 }
 
 # Emoji for the attack board (shots fired at opponent)
-WATER = "\u2b1b"  # ⬛ Black square -- empty grid cell
-MISS = "\U0001f7e6"  # 🟦 Blue square -- miss (ocean splash)
-HIT = "\U0001f525"  # 🔥 Fire -- hit (ship not yet sunk)
-SUNK = "\U0001f480"  # 💀 Skull -- sunk ship cell
+WATER = "\N{BLACK LARGE SQUARE}"  # ⬛ Black square -- empty grid cell
+MISS = "\N{LARGE BLUE SQUARE}"  # 🟦 Blue square -- miss (ocean splash)
+HIT = "\N{FIRE}"  # 🔥 Fire -- hit (ship not yet sunk)
+SUNK = "\N{SKULL}"  # 💀 Skull -- sunk ship cell
 
 # Emoji for the private board (your ships + incoming damage)
-SHIP_HIT = "\U0001f525"  # 🔥 Fire -- your ship was hit
-SHIP_SUNK = "\U0001f480"  # 💀 Skull -- your ship was sunk
-WATER_MISS = "\U0001f7e6"  # 🟦 Blue square -- opponent missed here
-WATER_EMPTY = "\u2b1b"  # ⬛ Black square -- empty water
+SHIP_HIT = "\N{FIRE}"  # 🔥 Fire -- your ship was hit
+SHIP_SUNK = "\N{SKULL}"  # 💀 Skull -- your ship was sunk
+WATER_MISS = "\N{LARGE BLUE SQUARE}"  # 🟦 Blue square -- opponent missed here
+WATER_EMPTY = "\N{BLACK LARGE SQUARE}"  # ⬛ Black square -- empty water
 
 # Colors
 COLOR_P1_TURN = discord.Color.blurple()
@@ -189,7 +193,7 @@ def _make_defense_grid(ships: dict[str, list[int]]) -> EmojiGrid:
         BOARD_SIZE, BOARD_SIZE, fill=WATER_EMPTY, row_labels=ROW_EMOJI, col_labels=COL_EMOJI
     )
     for name, cells in ships.items():
-        grid[cells] = SHIP_COLORS.get(name, "\u2b1c")
+        grid[cells] = SHIP_COLORS.get(name, "\N{WHITE LARGE SQUARE}")
     return grid
 
 
@@ -201,7 +205,7 @@ def _ship_status_line(ships: dict[str, list[int]], sunk_ships: set[str], emoji: 
             color = SHIP_COLORS.get(name, "")
             label = f"~~{name}~~" if name in sunk_ships else f"**{name}**"
             parts.append(f"{color} {label}" if emoji else label)
-    return " \u2022 ".join(parts)
+    return " \N{BULLET} ".join(parts)
 
 
 # // ========================================( Reducers )======================================== // #
@@ -342,26 +346,36 @@ class BattleshipChallengeView(StatefulLayoutView):
         self.clear_items()
         self.add_item(
             card(
-                "## \u2693 Battleship Challenge",
-                TextDisplay(
-                    f"<@{self.challenger_id}> challenges <@{self.opponent.id}> "
-                    f"to a **{BOARD_SIZE}\u00d7{BOARD_SIZE}** game of Battleship!"
+                image_section(
+                    f"## \N{ANCHOR} Battleship Challenge\n"
+                    f"-# <@{self.challenger_id}> challenges <@{self.opponent.id}>",
+                    url=self.opponent.display_avatar.with_size(128).url,
+                ),
+                divider(),
+                key_value(
+                    {
+                        "Grid": f"{BOARD_SIZE} \N{MULTIPLICATION SIGN} {BOARD_SIZE}",
+                        "Fleet": f"{len(SHIPS)} ships \N{MIDDLE DOT} "
+                        f"{sum(size for _, size in SHIPS)} cells",
+                    }
                 ),
                 divider(),
                 ActionRow(
                     StatefulButton(
                         label="Accept",
                         style=discord.ButtonStyle.success,
-                        emoji="\u2714",
+                        emoji="\N{HEAVY CHECK MARK}",
                         callback=self._accept,
                     ),
                     StatefulButton(
                         label="Decline",
                         style=discord.ButtonStyle.danger,
-                        emoji="\u2716",
+                        emoji="\N{HEAVY MULTIPLICATION X}",
                         callback=self._decline,
                     ),
                 ),
+                f"-# Only <@{self.opponent.id}> can respond \N{MIDDLE DOT} "
+                f"expires in {int(self.timeout)} seconds",
                 color=discord.Color.blurple(),
             )
         )
@@ -411,7 +425,7 @@ class BattleshipChallengeView(StatefulLayoutView):
         self.clear_items()
         self.add_item(
             card(
-                "## \u2693 Battleship Challenge",
+                "## \N{ANCHOR} Battleship Challenge",
                 TextDisplay(
                     f"<@{self.opponent.id}> declined the challenge from "
                     f"<@{self.challenger_id}>."
@@ -428,7 +442,7 @@ class BattleshipChallengeView(StatefulLayoutView):
         self.clear_items()
         self.add_item(
             card(
-                "## \u2693 Battleship Challenge",
+                "## \N{ANCHOR} Battleship Challenge",
                 TextDisplay(
                     f"Challenge from <@{self.challenger_id}> to " f"<@{self.opponent.id}> expired."
                 ),
@@ -532,9 +546,9 @@ class BattleshipView(StatefulLayoutView):
         self._defense_1.clear()
         self._defense_2.clear()
         for name, cells in self.ships_1.items():
-            self._defense_1[cells] = SHIP_COLORS.get(name, "\u2b1c")
+            self._defense_1[cells] = SHIP_COLORS.get(name, "\N{WHITE LARGE SQUARE}")
         for name, cells in self.ships_2.items():
-            self._defense_2[cells] = SHIP_COLORS.get(name, "\u2b1c")
+            self._defense_2[cells] = SHIP_COLORS.get(name, "\N{WHITE LARGE SQUARE}")
 
     def __init__(self, *args, opponent_id: int, **kwargs):
         super().__init__(*args, **kwargs)
@@ -635,12 +649,20 @@ class BattleshipView(StatefulLayoutView):
         fleet view sees the re-roll button right next to the board it
         affects.
         """
-        p1_mark = "\u2705" if self.player_1 in self._ready else "\u23f3"
-        p2_mark = "\u2705" if self.player_2 in self._ready else "\u23f3"
+        p1_mark = (
+            "\N{WHITE HEAVY CHECK MARK}"
+            if self.player_1 in self._ready
+            else "\N{HOURGLASS WITH FLOWING SAND}"
+        )
+        p2_mark = (
+            "\N{WHITE HEAVY CHECK MARK}"
+            if self.player_2 in self._ready
+            else "\N{HOURGLASS WITH FLOWING SAND}"
+        )
 
         self.add_item(
             card(
-                "## \u2693 Fleet Setup",
+                "## \N{ANCHOR} Fleet Setup",
                 TextDisplay(
                     "Open your fleet to preview or re-generate your board.\n"
                     f"Hit **Ready** to lock in, or auto-starts in **{SETUP_TIMEOUT}s**."
@@ -657,19 +679,19 @@ class BattleshipView(StatefulLayoutView):
                 StatefulButton(
                     label="View Fleet",
                     style=discord.ButtonStyle.primary,
-                    emoji="\U0001f6a2",
+                    emoji="\N{SHIP}",
                     callback=self._show_my_ships,
                 ),
                 StatefulButton(
                     label="Ready",
                     style=discord.ButtonStyle.success,
-                    emoji="\u2714",
+                    emoji="\N{HEAVY CHECK MARK}",
                     callback=self._ready_up,
                 ),
                 StatefulButton(
                     label="Cancel",
                     style=discord.ButtonStyle.danger,
-                    emoji="\u274c",
+                    emoji="\N{CROSS MARK}",
                     callback=self._cancel_setup,
                 ),
             )
@@ -691,7 +713,7 @@ class BattleshipView(StatefulLayoutView):
 
         self.add_item(
             card(
-                TextDisplay("## \u2693 Battleship"),
+                TextDisplay("## \N{ANCHOR} Battleship"),
                 divider(),
                 gap(),
                 TextDisplay(f"**Turn:** <@{current_id}>"),
@@ -761,13 +783,13 @@ class BattleshipView(StatefulLayoutView):
                 StatefulButton(
                     label="Fire!",
                     style=discord.ButtonStyle.danger,
-                    emoji="\U0001f4a5",
+                    emoji="\N{COLLISION SYMBOL}",
                     callback=self._fire,
                 ),
                 StatefulButton(
                     label="My Ships",
                     style=discord.ButtonStyle.secondary,
-                    emoji="\U0001f6a2",
+                    emoji="\N{SHIP}",
                     callback=self._show_my_ships,
                 ),
                 StatefulButton(
@@ -785,7 +807,7 @@ class BattleshipView(StatefulLayoutView):
 
         self.add_item(
             card(
-                TextDisplay("## \u2693 Battleship"),
+                TextDisplay("## \N{ANCHOR} Battleship"),
                 divider(),
                 attack,
                 divider(),
@@ -815,19 +837,19 @@ class BattleshipView(StatefulLayoutView):
                 StatefulButton(
                     label=rematch_label,
                     style=discord.ButtonStyle.primary,
-                    emoji="\U0001f504",
+                    emoji="\N{ANTICLOCKWISE DOWNWARDS AND UPWARDS OPEN CIRCLE ARROWS}",
                     callback=self._rematch,
                 ),
                 StatefulButton(
                     label="My Ships",
                     style=discord.ButtonStyle.secondary,
-                    emoji="\U0001f6a2",
+                    emoji="\N{SHIP}",
                     callback=self._show_my_ships,
                 ),
                 StatefulButton(
                     label="Close",
                     style=discord.ButtonStyle.secondary,
-                    emoji="\u274c",
+                    emoji="\N{CROSS MARK}",
                     callback=self._close,
                 ),
             )
@@ -925,7 +947,9 @@ class BattleshipView(StatefulLayoutView):
                 sunk_set.add(hit_ship)
                 attack[ship_cells] = SUNK
                 defense[ship_cells] = SHIP_SUNK
-                self._last_result = f"\U0001f4a5 Sunk <@{victim_id}>'s **{hit_ship.lower()}**!"
+                self._last_result = (
+                    f"\N{COLLISION SYMBOL} Sunk <@{victim_id}>'s **{hit_ship.lower()}**!"
+                )
 
                 # Check win condition
                 if len(sunk_set) == len(opponent_ships):
@@ -935,11 +959,11 @@ class BattleshipView(StatefulLayoutView):
                     await self.refresh()
                     return
             else:
-                self._last_result = f"\U0001f525 Hit <@{victim_id}>'s ship at **{coord}**!"
+                self._last_result = f"\N{FIRE} Hit <@{victim_id}>'s ship at **{coord}**!"
         else:
             attack[target] = MISS
             defense[target] = WATER_MISS
-            self._last_result = f"\u26aa Missed <@{victim_id}> at **{coord}**."
+            self._last_result = f"\N{MEDIUM WHITE CIRCLE} Missed <@{victim_id}> at **{coord}**."
 
         # Switch turn
         self.turn = 2 if self.turn == 1 else 1
@@ -1291,12 +1315,12 @@ class MyShipsView(StatefulLayoutView):
         fleet = _ship_status_line(ships=ships, sunk_ships=sunk)
 
         in_setup = self.parent_view.phase == "setup"
-        title = "## \U0001f6a2 My Fleet (Setup)" if in_setup else "## \U0001f6a2 My Fleet"
+        title = "## \N{SHIP} My Fleet (Setup)" if in_setup else "## \N{SHIP} My Fleet"
         prompt = (
             "Generate a new board layout, or close and hit **Ready**."
             if in_setup
-            else f"{SHIP_HIT} Hit \u2022 {SHIP_SUNK} Sunk \u2022 "
-            f"{WATER_MISS} Miss \u2022 {WATER_EMPTY} Empty"
+            else f"{SHIP_HIT} Hit \N{BULLET} {SHIP_SUNK} Sunk \N{BULLET} "
+            f"{WATER_MISS} Miss \N{BULLET} {WATER_EMPTY} Empty"
         )
 
         self.add_item(
@@ -1317,7 +1341,7 @@ class MyShipsView(StatefulLayoutView):
                 StatefulButton(
                     label="Regenerate",
                     style=discord.ButtonStyle.primary,
-                    emoji="\U0001f3b2",
+                    emoji="\N{GAME DIE}",
                     callback=self._reroll,
                 )
             )
@@ -1325,7 +1349,7 @@ class MyShipsView(StatefulLayoutView):
             StatefulButton(
                 label="Close",
                 style=discord.ButtonStyle.secondary,
-                emoji="\u274c",
+                emoji="\N{CROSS MARK}",
                 callback=self._close,
             )
         )
@@ -1351,7 +1375,7 @@ class MyShipsView(StatefulLayoutView):
         defense = self._own_defense_grid()
         defense.clear()
         for name, cells in new_ships.items():
-            defense[cells] = SHIP_COLORS.get(name, "\u2b1c")
+            defense[cells] = SHIP_COLORS.get(name, "\N{WHITE LARGE SQUARE}")
 
         self.parent_view._ready.discard(self.user_id)
 
@@ -1502,7 +1526,7 @@ class BattleshipExample(commands.Cog, name="v2_battleship_example"):
                 games = stats.get("games", 0)
                 forfeits = stats.get("forfeits", 0)
                 win_rate = (wins / games * 100) if games else 0.0
-                return f"{wins}W / {games}G \u2022 {win_rate:.0f}% \u2022 {forfeits}F"
+                return f"{wins}W / {games}G \N{BULLET} {win_rate:.0f}% \N{BULLET} {forfeits}F"
 
             def build_summary(self, entries):
                 # Each game contributes to two player rows

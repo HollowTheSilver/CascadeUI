@@ -213,8 +213,8 @@ Modal(
 )
 ```
 
-- `inputs` accepts any combination of CascadeUI input wrappers (`TextInput`, `Checkbox`, `CheckboxGroup`, `RadioGroup`, `FileUpload`) or raw `discord.ui.TextInput` instances.
-- Validators are read from each input's `validators` list and collected internally. On failure, an ephemeral error message is sent and the callback is skipped.
+- `inputs` accepts any combination of CascadeUI input wrappers (`TextInput`, `Checkbox`, `CheckboxGroup`, `RadioGroup`, `FileUpload`) or raw `discord.ui.TextInput` instances. Discord caps a modal at 5 top-level inputs; labels must be distinct because each input's `custom_id` derives from its label (duplicates raise at construction).
+- Validators are read from each input's `validators` list and collected internally. On failure, an ephemeral error message is sent and the callback is skipped. Each validator receives whatever its input submits: `str` for text, `bool` for a checkbox, `list[str]` for a checkbox group, `list[discord.Attachment]` for an upload.
 - `view_id` -- links the modal to a view's state. A `MODAL_SUBMITTED` action is dispatched before the callback runs.
 - If no `callback` is provided, the interaction is deferred automatically.
 
@@ -247,15 +247,17 @@ Wraps `discord.ui.CheckboxGroup` with stable `custom_id` and dict shorthand for 
 CheckboxGroup(
     label=str,               # Required
     options=[{"label": str, "value": str, "default": bool}, ...],
-    min_values=0,
-    max_values=None,         # Defaults to len(options)
+    required=True,
+    min_values=None,         # Discord defaults to 0 when omitted
+    max_values=None,         # Discord defaults to 1 when omitted
     validators=None,
     description=None,        # Optional: ui.Label.description
 )
 ```
 
 Options accept dict shorthand or native `discord.CheckboxGroupOption` instances.
-After submit: `.values` -> `list[str]`.
+Discord accepts 1-10 options; an out-of-range count raises a directed
+`ValueError` at construction. After submit: `.values` -> `list[str]`.
 
 ---
 
@@ -267,12 +269,15 @@ Wraps `discord.ui.RadioGroup` with stable `custom_id` and dict shorthand for opt
 RadioGroup(
     label=str,               # Required
     options=[{"label": str, "value": str, "default": bool}, ...],
+    required=True,
     validators=None,
     description=None,        # Optional: ui.Label.description
 )
 ```
 
-After submit: `.value` -> `str`.
+Same dict shorthand as `CheckboxGroup`. Discord requires 2-10 options; an
+out-of-range count raises a directed `ValueError` at construction. After
+submit: `.value` -> `str`.
 
 ---
 
@@ -283,7 +288,9 @@ Wraps `discord.ui.FileUpload` with stable `custom_id`.
 ```python
 FileUpload(
     label=str,               # Required
-    max_values=10,
+    required=True,
+    min_values=None,         # Discord defaults to 0 when omitted
+    max_values=None,         # Discord defaults to 1 when omitted
     validators=None,
     description=None,        # Optional: ui.Label.description
 )

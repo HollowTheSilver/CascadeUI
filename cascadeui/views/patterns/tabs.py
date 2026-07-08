@@ -421,7 +421,12 @@ class TabLayoutView(_BaseTabMixin, StatefulLayoutView):
 
         tab_name = self._tab_names[self._active_tab]
         builder = self._tabs[tab_name]
-        content = await builder()
+        # Tab builders run inside the view's theme context so card()
+        # calls in user builders inherit the view's accent colour.
+        from ...theming.context import theme_context
+
+        with theme_context(self.get_theme()):
+            content = await builder()
 
         if isinstance(content, list):
             for item in content:
@@ -448,7 +453,10 @@ class TabLayoutView(_BaseTabMixin, StatefulLayoutView):
         """
         if self._tab_names:
             builder = self._tabs[self._tab_names[self._active_tab]]
-            content = await builder()
+            from ...theming.context import theme_context
+
+            with theme_context(self.get_theme()):
+                content = await builder()
 
             self.clear_items()
             for row in self._tab_rows:

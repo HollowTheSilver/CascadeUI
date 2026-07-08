@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 import pytest
+from helpers import RenderableLayoutView
 from helpers import make_interaction as _make_interaction
 
 from cascadeui import InstanceLimitError
@@ -771,7 +772,7 @@ class TestEphemeralRearmOnNavRollback:
     async def test_rollback_reschedules_ephemeral_handoff(self):
         import time as _time
 
-        class _Source(StatefulLayoutView):
+        class _Source(RenderableLayoutView):
             auto_refresh_ephemeral = True
 
         source = _Source(interaction=_make_interaction(user_id=1, guild_id=100))
@@ -791,7 +792,7 @@ class TestEphemeralRearmOnNavRollback:
     async def test_rollback_skips_reschedule_without_handoff(self):
         # A source that never engaged the handoff (no deadline stamped) gets no
         # re-schedule on rollback.
-        class _Source(StatefulLayoutView):
+        class _Source(RenderableLayoutView):
             pass
 
         source = _Source(interaction=_make_interaction(user_id=1, guild_id=100))
@@ -807,7 +808,7 @@ class TestEphemeralRearmOnNavRollback:
     async def test_rollback_skips_reschedule_when_already_armed(self):
         import time as _time
 
-        class _Source(StatefulLayoutView):
+        class _Source(RenderableLayoutView):
             auto_refresh_ephemeral = True
 
         source = _Source(interaction=_make_interaction(user_id=1, guild_id=100))

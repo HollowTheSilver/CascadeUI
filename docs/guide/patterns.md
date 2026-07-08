@@ -57,7 +57,7 @@ parameter:
             ]
             super().__init__(*args, categories=categories, **kwargs)
 
-        def _build_header(self):
+        def build_header(self):
             return [card("## Settings", key_value(self._get_summary()))]
     ```
 
@@ -133,14 +133,16 @@ async def on_category_selected(self, category, index, interaction):
     await self.dispatch("MENU_NAVIGATE", {"target": category["label"]})
 ```
 
-**`_build_header()` / `_build_footer()`** (V2 only) -- return V2
-components for areas above and below the category list:
+**`build_header()` / `build_footer()`** (V2 only) -- return V2
+components for areas above and below the category list. The former
+underscore-prefixed names remain as deprecated aliases; existing
+overrides keep rendering.
 
 ```python
-def _build_header(self):
+def build_header(self):
     return [card("## Dashboard", key_value(self.summary_data))]
 
-def _build_footer(self):
+def build_footer(self):
     return [TextDisplay("-# Session limited: one panel per user.")]
 ```
 
@@ -160,7 +162,7 @@ summary card.
 - **V1 (`MenuView`):** Category buttons with `build_embed()` for the
   hub card. `_build_extra_items()` adds controls alongside buttons.
 - **V2 (`MenuLayoutView`):** `action_section()` items with inline
-  descriptions. `_build_header()` and `_build_footer()` add content
+  descriptions. `build_header()` and `build_footer()` add content
   above and below.
 
 ---
@@ -787,6 +789,12 @@ top-level children of the view -- the original layout. Items added via
 mode. Single-page views render no nav row, so the flag has no effect
 when only one page is displayed.
 
+A page that mixes a `Container` with other top-level items (a rankings
+card plus a leaderboard `build_header` banner, or a standalone summary
+card) cannot be wrapped, since Discord forbids Container nesting. Those
+pages keep the sibling layout with the nav row as a separate row; pages
+that can wrap still do.
+
 ### Binding per-instance state to a formatter
 
 The `formatter=` callable receives one chunk and returns the page's V2
@@ -919,7 +927,10 @@ change (multi-line, different separator).
 | `format_primary(rank, user_id, stats)` | Section render mode only -- first line of the two-line section body. Default delegates to `format_rank` + `format_name`. |
 | `format_secondary(rank, user_id, stats)` | Section render mode only -- second line of the section body. Default delegates to `format_stats`. |
 | `get_avatar_url(user_id, stats)` | Async hook returning an avatar URL for the section's `Thumbnail` accessory. Default returns `None`, which triggers the stacked `TextDisplay` fallback. |
-| `build_summary(entries)` | Dict rendered as a `key_value` block above the rankings. Return `{}` to suppress. |
+| `build_summary(entries)` | Summary content; the return shape picks placement. A `dict[str, str]` renders as a `key_value` block inline on page 1; a `Container` ships as a standalone card above the rankings on every page; `None` or `{}` suppresses the summary. |
+| `build_title(page)` | Optional components replacing the rankings card's masthead (the `banner` image + `## title` heading) inside the Container. `None` (default) composes the masthead from the declarative `banner` / `title` pair. Same return shapes and `page` semantics as `build_header`. |
+| `build_header(page)` | Optional page-frame components placed first on the page, above the standalone summary card -- a `gallery()` banner is the typical use. Return a component, a list, or `None` (default). `page` is the zero-based page index, so a frame can target only the first page. |
+| `build_footer(page)` | The counterpart of `build_header`: components placed last on the page, below the rankings card and above the navigation row -- a caption, link row, or closing image. Same return shapes and `page` semantics. |
 | `on_leaderboard_empty()` | Returns the V2 component list shown when `entries` is empty. Default wraps `leaderboard_empty_message` in a single card. |
 | `on_state_changed(state)` | Runs `rebuild_pages()` before the paginated refresh -- lets live-data subclasses re-fetch on every subscribed action. The rebuild short-circuits when the entries signature (user ids + stats) is unchanged, so identical re-fetches cost one comparison instead of a full page rebuild. |
 
@@ -939,7 +950,8 @@ class MmrBoard(LeaderboardLayoutView):
 
 - `leaderboard_top_n` (default `10`) -- how many entries to consider from the data source.
 - `leaderboard_per_page` (default `5`) -- entries per page. Set to `None` to collapse the display into a single page equal to `top_n` (no navigation controls). At the default, a `top_n` of 10 produces two pages with prev/next controls, and a `top_n` of 25 surfaces the full first/last + go-to-page surface.
-- `title` (default `"Leaderboard"`) -- H2 on the rankings card. Constructor `title=` kwarg overrides.
+- `title` (default `"Leaderboard"`) -- H2 heading on the rankings card. Constructor `title=` kwarg overrides; `title=None` (or an empty string) renders no text heading, so a banner-only masthead needs no hook override. With neither `title` nor `banner` set, the title divider is skipped too.
+- `banner` (default `None`) -- full-width image at the top of the rankings card, above the title heading when both are set. Accepts a URL string, a `discord.File`, or anything with a string `.url` (`guild.icon` works directly). Constructor `banner=` kwarg overrides the class attribute; the `build_title` hook overrides both.
 - `subtitle` (default `"Rankings"`) -- H3 above the ranked rows. Set to `None` or empty string (or pass `subtitle=None` at construction) to skip the H3 entirely, which pairs naturally with a `build_summary` override that returns a standalone Container.
 - `leaderboard_empty_message` -- static text when no entries exist.
 - `entry_layout` (default `"lines"`) -- controls row rendering. `"lines"` stacks entries as `TextDisplay` rows inside a single card; `"sections"` renders each entry as a `Section` with a `Thumbnail` accessory and a two-line body (`format_primary` + `format_secondary`). Section mode caps `leaderboard_per_page` at `5` -- setting a larger value with `entry_layout = "sections"` raises at class-definition time via `_validate_class_attributes`.

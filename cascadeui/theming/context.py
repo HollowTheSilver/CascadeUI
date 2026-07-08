@@ -1,6 +1,7 @@
 # // ========================================( Modules )======================================== // #
 
 
+import contextlib
 import contextvars
 from typing import TYPE_CHECKING, Optional
 
@@ -35,3 +36,21 @@ def set_current_theme(theme: Optional["Theme"]) -> contextvars.Token:
     previous value via ``_current_theme.reset(token)``.
     """
     return _current_theme.set(theme)
+
+
+@contextlib.contextmanager
+def theme_context(theme: Optional["Theme"]):
+    """Establish ``theme`` as the ambient theme for the enclosed block.
+
+    The single seam every library render path uses to make builder
+    fallbacks (``card()``, ``stats_card()``, ``divider()``) resolve the
+    view's theme: the ``build_ui`` / ``on_load`` wrappers and the
+    pattern-internal rebuild seams all enter this context before
+    invoking builder code. Restores the previous ambient theme on exit,
+    exception or not.
+    """
+    token = _current_theme.set(theme)
+    try:
+        yield theme
+    finally:
+        _current_theme.reset(token)

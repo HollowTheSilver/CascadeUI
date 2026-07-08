@@ -134,8 +134,11 @@ class V2SettingsHubView(MenuLayoutView):
 
     Features demonstrated:
         - ``MenuLayoutView`` (category hub with auto-wired push)
-        - ``_build_header()`` override (live settings summary card)
-        - ``_build_footer()`` override (``with_confirmation`` on Reset All)
+        - Dynamic per-user theme via a ``get_theme()`` override: every
+          card, the menu's category card, and the footer note follow the
+          state-selected theme with no per-card color plumbing
+        - ``build_header()`` override (live settings summary card)
+        - ``build_footer()`` override (``with_confirmation`` on Reset All)
         - instance_limit=1 with user_guild scope
         - State selector (only re-renders when this user's settings change)
         - Batched dispatch (multiple state updates in one notification)
@@ -157,7 +160,7 @@ class V2SettingsHubView(MenuLayoutView):
     # sub-page dispatching SETTINGS_UPDATED rebuilds the hub in place,
     # regardless of which scope the sub-page wrote to.
     subscribed_actions = {"SETTINGS_UPDATED"}
-    # Exit button is placed manually in _build_footer alongside Reset All.
+    # Exit button is placed manually in build_footer alongside Reset All.
     auto_exit_button = False
 
     def __init__(self, *args, **kwargs):
@@ -195,26 +198,27 @@ class V2SettingsHubView(MenuLayoutView):
 
     # // ----( Menu hooks )---- // #
 
-    def _resolve_accent(self):
-        """Resolve the accent color from the user-selected theme."""
+    def get_theme(self):
+        """Resolve the per-user theme from scoped state.
+
+        Overriding ``get_theme()`` is the dynamic-theme idiom: the
+        library reads it at every render seam (the ``build_ui`` theme
+        context, the menu's category card, the theme-managed accent
+        resolution), so a theme switch in state restyles every card on
+        the next rebuild with no per-card color plumbing.
+        """
         user_s = _read_settings(self.user_scoped_state())
-        theme = get_theme(user_s["theme"]) or get_theme("default")
-        return theme.get_style("primary_color") or discord.Color.blurple()
+        return get_theme(user_s["theme"]) or super().get_theme()
 
-    def _build_category_card(self, items):
-        """Match the category card accent to the user-selected theme."""
-        return card(*items, color=self._resolve_accent())
-
-    def _build_header(self):
+    def build_header(self):
         """Summary card showing current values from all sub-pages.
 
-        ``_build_header()`` is called inside ``build_ui()``, which runs
+        ``build_header()`` is called inside ``build_ui()``, which runs
         both at init and on every ``on_state_changed()`` cycle. The
         summary card therefore reflects live state without extra wiring.
         """
         user_s = _read_settings(self.user_scoped_state())
         guild_s = _read_guild_settings(self.user_guild_scoped_state())
-        accent = self._resolve_accent()
 
         return [
             card(
@@ -238,20 +242,20 @@ class V2SettingsHubView(MenuLayoutView):
                         ),
                     }
                 ),
-                color=accent,
             ),
         ]
 
-    def _build_footer(self):
+    def build_footer(self):
         """Footer with session note and Reset All + Exit buttons.
 
         ``with_confirmation`` wraps the Reset All button in an ephemeral
         confirmation prompt. The wrapped callback is only invoked after
         the user confirms.
 
-        The session-limit note is wrapped in a ``card()`` with the same
-        theme accent as the header and categories so it reads as a final
-        panel of the view rather than floating unstyled below the cards.
+        The session-limit note is wrapped in a ``card()`` so it reads as
+        a final panel of the view rather than floating unstyled below the
+        cards; its accent follows the user-selected theme automatically,
+        the same as the header and categories.
         """
         reset_button = StatefulButton(
             label="Reset All",
@@ -262,7 +266,6 @@ class V2SettingsHubView(MenuLayoutView):
         return [
             card(
                 TextDisplay("-# Session limited: only one settings panel per user per guild."),
-                color=self._resolve_accent(),
             ),
             ActionRow(
                 with_confirmation(
@@ -318,7 +321,8 @@ class V2AppearanceView(StatefulLayoutView):
     Features demonstrated:
         - Push/pop navigation (back button returns to hub)
         - Live theme switching via scoped state dispatch
-        - Per-view accent color (card color changes on theme switch)
+        - Dynamic theme via a ``get_theme()`` override (the card's accent
+          follows the selection instantly, with no explicit ``color=``)
         - ``default=True`` on ``SelectOption`` for V2 persistent selection
     """
 
@@ -338,6 +342,11 @@ class V2AppearanceView(StatefulLayoutView):
         super().__init__(*args, **kwargs)
         self.build_ui()
 
+    def get_theme(self):
+        """Per-user theme from scoped state -- same idiom as the hub."""
+        s = _read_settings(self.scoped_state)
+        return get_theme(s["theme"]) or super().get_theme()
+
     def state_selector(self, state):
         """Only re-render when the theme value changes."""
         return (
@@ -350,8 +359,6 @@ class V2AppearanceView(StatefulLayoutView):
         self.clear_items()
 
         s = _read_settings(self.scoped_state)
-        theme = get_theme(s["theme"]) or get_theme("default")
-        accent = theme.get_style("primary_color") or discord.Color.blurple()
 
         self.add_item(
             card(
@@ -361,7 +368,6 @@ class V2AppearanceView(StatefulLayoutView):
                     "Select a theme below. The card's accent color\n"
                     "updates instantly via the shared state subscription."
                 ),
-                color=accent,
             )
         )
 

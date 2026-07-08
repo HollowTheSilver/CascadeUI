@@ -4,7 +4,15 @@ from unittest.mock import AsyncMock, MagicMock
 
 import discord
 import pytest
-from discord.ui import Container, LayoutView, Section, TextDisplay, Thumbnail
+from discord.ui import (
+    Container,
+    LayoutView,
+    MediaGallery,
+    Section,
+    Separator,
+    TextDisplay,
+    Thumbnail,
+)
 from helpers import make_interaction as _make_interaction
 
 from cascadeui.views.layout import StatefulLayoutView
@@ -322,6 +330,286 @@ class TestLeaderboardOverrideHooks:
 
         assert "<@42>" in _page_text(view)
         assert "<@1>" not in _page_text(view)
+
+
+class TestPageFrameHooks:
+    """build_header / build_footer page-frame placement."""
+
+    def test_default_hooks_return_none(self):
+        interaction = _make_interaction()
+        view = LeaderboardLayoutView(interaction=interaction)
+        assert view.build_header(0) is None
+        assert view.build_footer(0) is None
+
+    async def test_defaults_add_no_frame(self):
+        """None defaults leave the page shape unchanged: rankings card only."""
+        view = await _make_view(entries=SAMPLE_ENTRIES)
+        page_0 = view.pages[0]
+        assert len(page_0) == 1
+        assert isinstance(page_0[0], Container)
+
+    async def test_header_renders_first_on_page(self):
+        class Banner(LeaderboardLayoutView):
+            def build_header(self, page):
+                return MediaGallery(discord.MediaGalleryItem("https://example.com/banner.png"))
+
+        view = await _make_view(cls=Banner, entries=SAMPLE_ENTRIES)
+        page_0 = view.pages[0]
+        assert isinstance(page_0[0], MediaGallery)
+        assert isinstance(page_0[1], Container)
+
+    async def test_footer_renders_last_on_page(self):
+        class Footed(LeaderboardLayoutView):
+            def build_footer(self, page):
+                return TextDisplay("-# Updated hourly")
+
+        view = await _make_view(cls=Footed, entries=SAMPLE_ENTRIES)
+        page_0 = view.pages[0]
+        assert isinstance(page_0[0], Container)
+        assert page_0[-1].content == "-# Updated hourly"
+
+    async def test_header_precedes_container_summary(self):
+        """Full frame order: header, summary card, rankings card, footer."""
+        from cascadeui.components.patterns.v2 import card
+
+        class Framed(LeaderboardLayoutView):
+            def build_summary(self, entries):
+                return card(TextDisplay("## Overview"))
+
+            def build_header(self, page):
+                return MediaGallery(discord.MediaGalleryItem("https://example.com/banner.png"))
+
+            def build_footer(self, page):
+                return TextDisplay("-# footer")
+
+        view = await _make_view(cls=Framed, entries=SAMPLE_ENTRIES)
+        assert [type(c).__name__ for c in view.pages[0]] == [
+            "MediaGallery",
+            "Container",
+            "Container",
+            "TextDisplay",
+        ]
+
+    async def test_list_return_is_spliced(self):
+        class MultiFrame(LeaderboardLayoutView):
+            def build_footer(self, page):
+                return [TextDisplay("line one"), TextDisplay("line two")]
+
+        view = await _make_view(cls=MultiFrame, entries=SAMPLE_ENTRIES)
+        page_0 = view.pages[0]
+        assert page_0[-2].content == "line one"
+        assert page_0[-1].content == "line two"
+
+    async def test_page_index_targets_first_page_only(self):
+        class FirstPageBanner(LeaderboardLayoutView):
+            leaderboard_per_page = 2
+
+            def build_header(self, page):
+                if page != 0:
+                    return None
+                return MediaGallery(discord.MediaGalleryItem("https://example.com/banner.png"))
+
+        many_entries = [(i, {"wins": 10 - i, "games": 10}) for i in range(6)]
+        view = await _make_view(cls=FirstPageBanner, entries=many_entries)
+        assert isinstance(view.pages[0][0], MediaGallery)
+        for page in view.pages[1:]:
+            assert not any(isinstance(c, MediaGallery) for c in page)
+
+    async def test_unconditional_frame_on_every_page(self):
+        """The hook receives each page's zero-based index during the build."""
+
+        class EveryPage(LeaderboardLayoutView):
+            leaderboard_per_page = 2
+
+            def build_footer(self, page):
+                return TextDisplay(f"-# page {page}")
+
+        many_entries = [(i, {"wins": 10 - i, "games": 10}) for i in range(6)]
+        view = await _make_view(cls=EveryPage, entries=many_entries)
+        assert len(view.pages) == 3
+        for idx, page in enumerate(view.pages):
+            assert page[-1].content == f"-# page {idx}"
+
+    async def test_framed_page_with_nav_inside_container_stays_send_legal(self):
+        """The rankings card is a Container, so a framed page cannot take
+        the ``nav_inside_container`` wrap; it must fall back to the sibling
+        layout instead of composing a nested-Container tree the placement
+        validator rejects.
+        """
+        from cascadeui.components.patterns.v2 import card, gallery
+        from cascadeui.views._placement import validate_placement
+
+        class FramedWrapped(LeaderboardLayoutView):
+            nav_inside_container = True
+            leaderboard_per_page = 2
+
+            def build_summary(self, entries):
+                return card(TextDisplay("## Overview"))
+
+            def build_header(self, page):
+                if page != 0:
+                    return None
+                return gallery("https://example.com/banner.png")
+
+            def build_footer(self, page):
+                return TextDisplay("-# footer")
+
+        many_entries = [(i, {"wins": 10 - i, "games": 10}) for i in range(6)]
+        view = await _make_view(cls=FramedWrapped, entries=many_entries)
+        await view.on_load()
+        validate_placement(view)
+        # Sibling fallback: the nav row is a top-level child, not nested.
+        assert view._nav_row in list(view.children)
+
+
+class TestCardMasthead:
+    """banner / title / build_title masthead composition."""
+
+    BANNER_URL = "https://example.com/banner.png"
+
+    def _rankings_card(self, view, page_idx=0):
+        containers = [c for c in view.pages[page_idx] if isinstance(c, Container)]
+        return containers[-1]
+
+    def _has_h2(self, view, page_idx=0):
+        # startswith("## ") misses the H3 subtitle ("###..."), so this
+        # detects only a rendered H2 title line.
+        return any(
+            t.content.startswith("## ")
+            for t in self._rankings_card(view, page_idx).walk_children()
+            if isinstance(t, TextDisplay)
+        )
+
+    async def test_banner_renders_above_title(self):
+        view = await _make_view(entries=SAMPLE_ENTRIES, banner=self.BANNER_URL)
+        children = list(self._rankings_card(view).children)
+        assert isinstance(children[0], MediaGallery)
+        assert isinstance(children[1], TextDisplay)
+        assert children[1].content == "## Leaderboard"
+
+    async def test_banner_only_when_title_none(self):
+        view = await _make_view(entries=SAMPLE_ENTRIES, banner=self.BANNER_URL, title=None)
+        children = list(self._rankings_card(view).children)
+        assert isinstance(children[0], MediaGallery)
+        assert not self._has_h2(view)
+
+    async def test_title_none_without_banner_skips_masthead_and_divider(self):
+        view = await _make_view(entries=SAMPLE_ENTRIES, title=None)
+        children = list(self._rankings_card(view).children)
+        assert not isinstance(children[0], (MediaGallery, Separator))
+        assert not self._has_h2(view)
+
+    async def test_empty_string_title_class_level_suppresses_heading(self):
+        class Bare(LeaderboardLayoutView):
+            title = ""
+
+        view = await _make_view(cls=Bare, entries=SAMPLE_ENTRIES)
+        assert not self._has_h2(view)
+
+    async def test_divider_renders_under_banner_only_masthead(self):
+        view = await _make_view(entries=SAMPLE_ENTRIES, banner=self.BANNER_URL, title=None)
+        children = list(self._rankings_card(view).children)
+        assert isinstance(children[0], MediaGallery)
+        assert isinstance(children[1], Separator)
+
+    async def test_build_title_replaces_declarative_masthead(self):
+        class CustomMasthead(LeaderboardLayoutView):
+            def build_title(self, page):
+                return TextDisplay("# Season Finale")
+
+        view = await _make_view(cls=CustomMasthead, entries=SAMPLE_ENTRIES, banner=self.BANNER_URL)
+        children = list(self._rankings_card(view).children)
+        assert children[0].content == "# Season Finale"
+        # The hook wins outright: no banner gallery, no ## text title.
+        assert not any(isinstance(c, MediaGallery) for c in children)
+        assert "## Leaderboard" not in _page_text(view)
+
+    async def test_build_title_none_falls_back_per_page(self):
+        class FirstPageOnly(LeaderboardLayoutView):
+            leaderboard_per_page = 2
+
+            def build_title(self, page):
+                if page != 0:
+                    return None
+                return TextDisplay("# Grand Opening")
+
+        many_entries = [(i, {"wins": 10 - i, "games": 10}) for i in range(6)]
+        view = await _make_view(cls=FirstPageOnly, entries=many_entries)
+        assert "# Grand Opening" in _page_text(view, page_idx=0)
+        assert _page_text(view, page_idx=1).startswith("## Leaderboard")
+
+    async def test_banner_asset_like_object_coerces_to_url(self):
+        asset = MagicMock()
+        asset.url = self.BANNER_URL
+        view = await _make_view(entries=SAMPLE_ENTRIES, banner=asset)
+        children = list(self._rankings_card(view).children)
+        assert isinstance(children[0], MediaGallery)
+        assert children[0].items[0].media.url == self.BANNER_URL
+
+    def test_banner_invalid_kwarg_raises_at_construction(self):
+        with pytest.raises(TypeError, match="banner must be"):
+            LeaderboardLayoutView(
+                interaction=_make_interaction(), entries=SAMPLE_ENTRIES, banner=123
+            )
+
+    def test_banner_invalid_class_value_raises_at_definition(self):
+        with pytest.raises(TypeError, match="banner must be"):
+
+            class BadBanner(LeaderboardLayoutView):
+                banner = 123
+
+    def test_set_class_attribute_banner_validates(self):
+        """Per-instance banner overrides run the same validator as class
+        definition, so misuse fails at the call site instead of deep
+        inside a later async rebuild.
+        """
+        view = LeaderboardLayoutView(interaction=_make_interaction(), entries=SAMPLE_ENTRIES)
+        with pytest.raises(TypeError, match="banner must be"):
+            view.set_class_attribute("banner", 123)
+        view.set_class_attribute("banner", self.BANNER_URL)
+        assert view.banner == self.BANNER_URL
+
+    def test_init_kwargs_store_coerced_banner(self):
+        """The kwargs snapshot must hold the coerced URL string, not the
+        raw Asset object -- a live Asset in the registry row declines the
+        whole persistence write and the panel never reattaches.
+        """
+        asset = MagicMock()
+        asset.url = self.BANNER_URL
+        view = LeaderboardLayoutView(
+            interaction=_make_interaction(), entries=SAMPLE_ENTRIES, banner=asset
+        )
+        assert view._init_kwargs["banner"] == self.BANNER_URL
+
+    async def test_build_title_empty_list_renders_no_masthead(self):
+        """An explicit empty list means "no masthead on this page" and is
+        distinct from ``None`` (which falls back to the declarative pair).
+        """
+
+        class BareFirstPage(LeaderboardLayoutView):
+            leaderboard_per_page = 2
+
+            def build_title(self, page):
+                return [] if page == 0 else None
+
+        many_entries = [(i, {"wins": 10 - i, "games": 10}) for i in range(6)]
+        view = await _make_view(cls=BareFirstPage, entries=many_entries, banner=self.BANNER_URL)
+        page_0_children = list(self._rankings_card(view, 0).children)
+        assert not isinstance(page_0_children[0], (MediaGallery, Separator))
+        assert not self._has_h2(view, 0)
+        # Page 1 falls back to the declarative banner + title pair.
+        assert isinstance(list(self._rankings_card(view, 1).children)[0], MediaGallery)
+        assert self._has_h2(view, 1)
+
+    async def test_frame_hook_bare_string_wraps_in_textdisplay(self):
+        class StringFooter(LeaderboardLayoutView):
+            def build_footer(self, page):
+                return "-# plain string caption"
+
+        view = await _make_view(cls=StringFooter, entries=SAMPLE_ENTRIES)
+        footer = view.pages[0][-1]
+        assert isinstance(footer, TextDisplay)
+        assert footer.content == "-# plain string caption"
 
 
 # // ========================================( Pagination )======================================== // #
@@ -1083,6 +1371,40 @@ class TestCardColor:
         for page in view.pages:
             container = [c for c in page if isinstance(c, Container)][-1]
             assert container.accent_colour == red
+
+
+class TestThemeAccentSeam:
+    """The page build inherits the view's theme, whichever caller runs it."""
+
+    async def test_rankings_card_inherits_view_theme_accent(self):
+        """A themed board renders a themed rankings card with no
+        ``card_color`` override -- the page build establishes the theme
+        context itself, so ``rebuild_pages`` callers (``on_state_changed``,
+        ``reload``) are covered the same as ``on_load``.
+        """
+        from cascadeui.theming.core import Theme
+
+        gold = Theme("gold", {"accent_colour": discord.Color.gold()})
+
+        class ThemedBoard(LeaderboardLayoutView):
+            theme = gold
+
+        view = await _make_view(cls=ThemedBoard, entries=SAMPLE_ENTRIES)
+        rankings = [c for c in view.pages[0] if isinstance(c, Container)][-1]
+        assert rankings.accent_colour == discord.Color.gold()
+
+    async def test_explicit_card_color_still_wins(self):
+        from cascadeui.theming.core import Theme
+
+        gold = Theme("gold", {"accent_colour": discord.Color.gold()})
+
+        class PinnedBoard(LeaderboardLayoutView):
+            theme = gold
+            card_color = discord.Color.dark_red()
+
+        view = await _make_view(cls=PinnedBoard, entries=SAMPLE_ENTRIES)
+        rankings = [c for c in view.pages[0] if isinstance(c, Container)][-1]
+        assert rankings.accent_colour == discord.Color.dark_red()
 
 
 class TestShowTitleDivider:

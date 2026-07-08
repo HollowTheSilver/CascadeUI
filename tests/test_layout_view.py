@@ -7,7 +7,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import discord
 import pytest
-from discord.ui import ActionRow, Container, LayoutView, TextDisplay
+from discord.ui import ActionRow, Container
+from discord.ui import File as UIFile
+from discord.ui import LayoutView, MediaGallery, Section, TextDisplay, Thumbnail
+from helpers import RenderableLayoutView
 from helpers import make_interaction as _make_interaction
 
 from cascadeui.components.base import StatefulButton, StatefulSelect
@@ -305,7 +308,7 @@ class TestStatefulLayoutViewSend:
 
     async def test_send_via_interaction(self):
         interaction = _make_interaction()
-        view = StatefulLayoutView(interaction=interaction)
+        view = RenderableLayoutView(interaction=interaction)
 
         message = await view.send()
 
@@ -315,7 +318,7 @@ class TestStatefulLayoutViewSend:
 
     async def test_send_registers_view(self):
         interaction = _make_interaction()
-        view = StatefulLayoutView(interaction=interaction)
+        view = RenderableLayoutView(interaction=interaction)
         store = get_store()
 
         await view.send()
@@ -325,7 +328,7 @@ class TestStatefulLayoutViewSend:
     async def test_send_no_content_embed_params(self):
         """V2 send() has no content/embed/embeds params."""
         interaction = _make_interaction()
-        view = StatefulLayoutView(interaction=interaction)
+        view = RenderableLayoutView(interaction=interaction)
 
         # Only ephemeral is accepted
         message = await view.send(ephemeral=False)
@@ -334,7 +337,7 @@ class TestStatefulLayoutViewSend:
     async def test_send_rollback_on_failure(self):
         interaction = _make_interaction()
         interaction.response.send_message = AsyncMock(side_effect=Exception("fail"))
-        view = StatefulLayoutView(interaction=interaction)
+        view = RenderableLayoutView(interaction=interaction)
         store = get_store()
 
         with pytest.raises(Exception, match="fail"):
@@ -343,7 +346,7 @@ class TestStatefulLayoutViewSend:
         assert view.id not in store._active_views
 
     async def test_send_requires_context_or_interaction(self):
-        view = StatefulLayoutView()
+        view = RenderableLayoutView()
 
         with pytest.raises(RuntimeError, match="requires either"):
             await view.send()
@@ -351,7 +354,7 @@ class TestStatefulLayoutViewSend:
     async def test_send_forwards_files_to_discord(self):
         """``files=`` reaches the underlying send call alongside ``view=``."""
         interaction = _make_interaction()
-        view = StatefulLayoutView(interaction=interaction)
+        view = RenderableLayoutView(interaction=interaction)
         photo = MagicMock(spec=discord.File)
 
         await view.send(files=[photo])
@@ -363,7 +366,7 @@ class TestStatefulLayoutViewSend:
     async def test_send_forwards_single_file_to_discord(self):
         """``file=`` (singular) reaches the underlying send call."""
         interaction = _make_interaction()
-        view = StatefulLayoutView(interaction=interaction)
+        view = RenderableLayoutView(interaction=interaction)
         photo = MagicMock(spec=discord.File)
 
         await view.send(file=photo)
@@ -374,7 +377,7 @@ class TestStatefulLayoutViewSend:
     async def test_send_omits_files_when_unset(self):
         """Send-kwargs carry no ``file``/``files`` keys unless callers supplied them."""
         interaction = _make_interaction()
-        view = StatefulLayoutView(interaction=interaction)
+        view = RenderableLayoutView(interaction=interaction)
 
         await view.send()
 
@@ -386,7 +389,7 @@ class TestStatefulLayoutViewSend:
         """Caller-supplied file handles get closed when the send raises before HTTP."""
         interaction = _make_interaction()
         interaction.response.send_message = AsyncMock(side_effect=Exception("fail"))
-        view = StatefulLayoutView(interaction=interaction)
+        view = RenderableLayoutView(interaction=interaction)
         photo1 = MagicMock(spec=discord.File)
         photo2 = MagicMock(spec=discord.File)
 
@@ -400,7 +403,7 @@ class TestStatefulLayoutViewSend:
         """``file=`` (singular) also gets closed on rollback."""
         interaction = _make_interaction()
         interaction.response.send_message = AsyncMock(side_effect=Exception("fail"))
-        view = StatefulLayoutView(interaction=interaction)
+        view = RenderableLayoutView(interaction=interaction)
         photo = MagicMock(spec=discord.File)
 
         with pytest.raises(Exception, match="fail"):
@@ -415,7 +418,7 @@ class TestSeedInitialState:
     async def test_default_hook_is_no_op(self):
         # The default hook does nothing -- existing views ship unchanged.
         interaction = _make_interaction()
-        view = StatefulLayoutView(interaction=interaction)
+        view = RenderableLayoutView(interaction=interaction)
 
         message = await view.send()
         assert message is not None
@@ -424,7 +427,7 @@ class TestSeedInitialState:
         interaction = _make_interaction()
         captured = {}
 
-        class SeedingView(StatefulLayoutView):
+        class SeedingView(RenderableLayoutView):
             async def seed_initial_state(self, state):
                 captured["state"] = state
 
@@ -442,7 +445,7 @@ class TestSeedInitialState:
         store = get_store()
         observed = {}
 
-        class SeedingView(StatefulLayoutView):
+        class SeedingView(RenderableLayoutView):
             async def seed_initial_state(self, state):
                 observed["registered"] = self.id in store._active_views
 
@@ -468,7 +471,7 @@ class TestSeedInitialState:
 
         store._register_reducer("SEED_TEST_ACTION", _seed_reducer)
 
-        class SeedingView(StatefulLayoutView):
+        class SeedingView(RenderableLayoutView):
             async def seed_initial_state(self, state):
                 await self.dispatch("SEED_TEST_ACTION", {"value": "seeded"})
 
@@ -486,7 +489,7 @@ class TestSeedInitialState:
         # subclass author sees the bug immediately.
         interaction = _make_interaction()
 
-        class BrokenSeedView(StatefulLayoutView):
+        class BrokenSeedView(RenderableLayoutView):
             async def seed_initial_state(self, state):
                 raise RuntimeError("seed broke")
 
@@ -507,7 +510,7 @@ class TestOnLoadHook:
     async def test_default_hook_is_no_op(self):
         # Views without async preload ship unchanged -- the default does nothing.
         interaction = _make_interaction()
-        view = StatefulLayoutView(interaction=interaction)
+        view = RenderableLayoutView(interaction=interaction)
 
         message = await view.send()
         assert message is not None
@@ -516,7 +519,7 @@ class TestOnLoadHook:
         interaction = _make_interaction()
         observed = {}
 
-        class LoadingView(StatefulLayoutView):
+        class LoadingView(RenderableLayoutView):
             async def on_load(self):
                 observed["loaded"] = True
 
@@ -539,7 +542,7 @@ class TestOnLoadHook:
 
         interaction.response.send_message = AsyncMock(side_effect=_tracking_send)
 
-        class LoadingView(StatefulLayoutView):
+        class LoadingView(RenderableLayoutView):
             async def on_load(self):
                 order.append("on_load")
 
@@ -585,7 +588,7 @@ class TestOnLoadHook:
         interaction = _make_interaction()
         order = []
 
-        class LoadingView(StatefulLayoutView):
+        class LoadingView(RenderableLayoutView):
             async def on_load(self):
                 order.append("on_load")
 
@@ -684,7 +687,7 @@ class TestOnPreSendHook:
     async def test_default_hook_allows_send(self):
         # The default returns True, so a view without an override sends normally.
         interaction = _make_interaction()
-        view = StatefulLayoutView(interaction=interaction)
+        view = RenderableLayoutView(interaction=interaction)
 
         message = await view.send()
         assert message is not None
@@ -740,7 +743,7 @@ class TestOnPreSendHook:
         interaction = _make_interaction()
         seen = {}
 
-        class GatedView(StatefulLayoutView):
+        class GatedView(RenderableLayoutView):
             async def on_pre_send(self, interaction):
                 seen["interaction"] = interaction
                 return True
@@ -793,7 +796,7 @@ class TestOnTimeoutLogLevel:
 
     async def test_ephemeral_edit_failure_logs_debug(self, caplog):
         interaction = _make_interaction()
-        view = StatefulLayoutView(interaction=interaction)
+        view = RenderableLayoutView(interaction=interaction)
         await view.send()
         view._ephemeral = True
         view._message = MagicMock()
@@ -816,7 +819,7 @@ class TestOnTimeoutLogLevel:
 
     async def test_non_ephemeral_edit_failure_logs_warning(self, caplog):
         interaction = _make_interaction()
-        view = StatefulLayoutView(interaction=interaction)
+        view = RenderableLayoutView(interaction=interaction)
         await view.send()
         view._ephemeral = False
         view._message = MagicMock()
@@ -1336,6 +1339,92 @@ class TestRenderHashShortCircuit:
         before = view._compute_tree_digest()
 
         select.set_selected("b")
+        view.build_ui()
+        after = view._compute_tree_digest()
+        assert before != after
+
+    def test_digest_captures_container_accent(self):
+        """A theme switch that only recolors a card must change the digest,
+        or refresh() would skip the themed re-render.
+        """
+        accent = [discord.Color.red()]
+
+        def build(view):
+            view.clear_items()
+            view.add_item(Container(TextDisplay("body"), accent_color=accent[0]))
+
+        view = self._make_view_with_build(build)
+        view.build_ui()
+        before = view._compute_tree_digest()
+
+        accent[0] = discord.Color.blue()
+        view.build_ui()
+        after = view._compute_tree_digest()
+        assert before != after
+
+    def test_digest_captures_gallery_media_url(self):
+        """A rebuild that swaps only a gallery item's URL must change the
+        digest, or refresh() short-circuits and the stale image stays on
+        screen -- a regenerated banner would silently never re-render.
+        """
+        url = ["https://example.com/banner_v1.png"]
+
+        def build(view):
+            view.clear_items()
+            view.add_item(MediaGallery(discord.MediaGalleryItem(url[0])))
+
+        view = self._make_view_with_build(build)
+        view.build_ui()
+        before = view._compute_tree_digest()
+
+        url[0] = "https://example.com/banner_v2.png"
+        view.build_ui()
+        after = view._compute_tree_digest()
+        assert before != after
+
+    def test_digest_stable_for_identical_gallery(self):
+        def build(view):
+            view.clear_items()
+            view.add_item(MediaGallery(discord.MediaGalleryItem("https://example.com/banner.png")))
+
+        view = self._make_view_with_build(build)
+        view.build_ui()
+        d1 = view._compute_tree_digest()
+        view.build_ui()
+        d2 = view._compute_tree_digest()
+        assert d1 == d2
+
+    def test_digest_captures_thumbnail_media_url(self):
+        """Thumbnails are Section accessories; walk_children() yields them,
+        and an avatar-URL-only change must produce a new digest.
+        """
+        url = ["https://example.com/avatar_v1.png"]
+
+        def build(view):
+            view.clear_items()
+            view.add_item(Container(Section(TextDisplay("row"), accessory=Thumbnail(media=url[0]))))
+
+        view = self._make_view_with_build(build)
+        view.build_ui()
+        before = view._compute_tree_digest()
+
+        url[0] = "https://example.com/avatar_v2.png"
+        view.build_ui()
+        after = view._compute_tree_digest()
+        assert before != after
+
+    def test_digest_captures_file_media_url(self):
+        url = ["attachment://report_v1.txt"]
+
+        def build(view):
+            view.clear_items()
+            view.add_item(UIFile(url[0]))
+
+        view = self._make_view_with_build(build)
+        view.build_ui()
+        before = view._compute_tree_digest()
+
+        url[0] = "attachment://report_v2.txt"
         view.build_ui()
         after = view._compute_tree_digest()
         assert before != after

@@ -314,9 +314,7 @@ class TestLibraryInternalBatching:
         BATCH_COMPLETE. VIEW_UPDATED fires separately after the Discord
         send because it is outside the state-registration batch.
         """
-        from helpers import make_interaction
-
-        from cascadeui.views.layout import StatefulLayoutView
+        from helpers import RenderableLayoutView, make_interaction
 
         store = get_store()
         received = []
@@ -327,7 +325,7 @@ class TestLibraryInternalBatching:
         store.subscribe("send-batch-sub", handler, action_filter=None)
 
         interaction = make_interaction()
-        view = StatefulLayoutView(interaction=interaction)
+        view = RenderableLayoutView(interaction=interaction)
         await view.send()
         await store._flush_notifications()
 
@@ -344,14 +342,12 @@ class TestLibraryInternalBatching:
         once the destination edit confirms -- the deferral that lets a failed
         edit roll back to a live source.
         """
-        from helpers import make_interaction
+        from helpers import RenderableLayoutView, make_interaction
 
-        from cascadeui.views.layout import StatefulLayoutView
-
-        class Source(StatefulLayoutView):
+        class Source(RenderableLayoutView):
             pass
 
-        class Target(StatefulLayoutView):
+        class Target(RenderableLayoutView):
             pass
 
         store = get_store()

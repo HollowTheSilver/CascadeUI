@@ -203,6 +203,9 @@ All five share the same contract:
   directly; CascadeUI unwraps them internally during submit
   collection.
 
+See [Validation](validation.md) for the built-in validator catalog --
+`validators=` works the same way on all five wrapper types.
+
 ### TextInput
 
 Wraps `discord.ui.TextInput`:
@@ -291,6 +294,12 @@ difficulty = RadioGroup(
 Same dict shorthand as `CheckboxGroup`. After submit: `difficulty.value` →
 `str`.
 
+!!! note "Option counts are checked at construction"
+    `CheckboxGroup` accepts 1-10 options; `RadioGroup` requires 2-10.
+    Both bounds are Discord platform limits, enforced by CascadeUI with a
+    directed `ValueError` at construction -- the mistake surfaces where the
+    options are built, not as an HTTP 400 when the modal opens.
+
 ### FileUpload
 
 Wraps `discord.ui.FileUpload`:
@@ -331,6 +340,65 @@ has already consumed the response slot. See
 [Opening Modals from Callbacks](views.md#opening-modals-from-callbacks).
 
 After submit, each input's `.value` / `.values` is populated. `modal.values_by_input` provides a dict keyed by input instance.
+
+### Structured forms and edit-in-place
+
+The wrapped inputs compose freely: one modal can carry a paragraph
+field, a pick-one radio, a multi-select checkbox group, and a boolean
+flag as a single form. Two composition rules apply -- Discord caps a
+modal at 5 top-level inputs, and labels must be distinct because each
+input's `custom_id` derives from its label (duplicates raise at
+construction).
+
+```python
+import discord
+from cascadeui import Checkbox, CheckboxGroup, Modal, RadioGroup, TextInput
+
+REGIONS = ["NA", "EU", "APAC"]
+ROLES = ["Tank", "DPS", "Support"]
+
+def build_profile_modal(self) -> Modal:
+    bio = TextInput(
+        label="Bio",
+        style=discord.TextStyle.paragraph,
+        default=self.bio or None,
+    )
+    region = RadioGroup(
+        label="Region",
+        options=[{"label": r, "value": r, "default": r == self.region} for r in REGIONS],
+    )
+    roles = CheckboxGroup(
+        label="Roles",
+        max_values=2,
+        options=[{"label": r, "value": r, "default": r in self.roles} for r in ROLES],
+    )
+    dms_ok = Checkbox(label="Allow DMs", default=self.dms_ok)
+
+    async def on_submitted(interaction, values):
+        self.bio = (bio.value or "").strip()
+        self.region = region.value or ""
+        self.roles = list(roles.values or [])
+        self.dms_ok = bool(dms_ok.value)
+        self.build_ui()
+        await self.refresh()
+
+    return Modal(
+        title="Edit Profile",
+        inputs=[bio, region, roles, dms_ok],
+        callback=on_submitted,
+    )
+```
+
+Building each option's `default` from current state is what makes the
+modal edit-in-place: re-opening it shows the form as already saved, so
+a submit that changes one field round-trips the rest unchanged.
+Factoring the construction into a builder method (as above) keeps the
+open callback to one line and lets tests exercise the real modal.
+
+`examples/v2_wizard.py` runs this shape live: its name modal pairs a
+`TextInput` with an optional `FileUpload` portrait (the upload replaces
+the character's preview image), and its background modal combines all
+four structured types in one form.
 
 Validators from all inputs are auto-collected. If any fail, the modal
 responds with error messages and blocks submission.

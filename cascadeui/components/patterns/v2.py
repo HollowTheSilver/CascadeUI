@@ -108,18 +108,25 @@ def card(
             color=discord.Color.green(),
         )
     """
-    if color is None:
+    theme_managed = color is None
+    if theme_managed:
         from ...theming.context import get_current_theme
 
         theme = get_current_theme()
         if theme:
             color = theme.get_style("accent_colour")
     items = [TextDisplay(c) if isinstance(c, str) else c for c in children]
-    return Container(
+    container = Container(
         *items,
         accent_colour=color,
         spoiler=spoiler,
     )
+    # No explicit color means the accent stays theme-managed: the view's
+    # render seams re-resolve it against the live theme, so the card is
+    # themed no matter where it was built and follows runtime theme
+    # changes. An explicit color is never marked and never touched.
+    container._cascadeui_theme_accent = theme_managed
+    return container
 
 
 # // ========================================( Sections )======================================== // #
@@ -951,7 +958,8 @@ def stats_card(
             footer="Updated just now",
         )
     """
-    if color is None:
+    theme_managed = color is None
+    if theme_managed:
         from ...theming.context import get_current_theme
 
         theme = get_current_theme()
@@ -965,7 +973,10 @@ def stats_card(
     ]
     if footer:
         children.append(TextDisplay(f"-# {footer}"))
-    return Container(*children, accent_colour=color)
+    container = Container(*children, accent_colour=color)
+    # Same theme-managed contract as ``card()``: see the note there.
+    container._cascadeui_theme_accent = theme_managed
+    return container
 
 
 def progress_bar(
@@ -1021,24 +1032,42 @@ def progress_bar(
 # // ========================================( Separators )======================================== // #
 
 
-def divider(large: bool = False) -> Separator:
+def _resolve_separator_large(large: Optional[bool]) -> bool:
+    """Resolve a separator's spacing against the active theme.
+
+    ``None`` (the default) reads the ambient theme's ``separator_spacing``
+    style (``"small"`` / ``"large"``, defaulting to small outside a theme
+    context); an explicit ``True`` / ``False`` always wins.
+    """
+    if large is not None:
+        return large
+    from ...theming.context import get_current_theme
+
+    theme = get_current_theme()
+    return bool(theme) and theme.get_style("separator_spacing") == "large"
+
+
+def divider(large: Optional[bool] = None) -> Separator:
     """A visible separator line between content blocks.
 
     Args:
-        large: Use large spacing around the divider. Defaults to
-            small spacing.
+        large: Use large spacing around the divider. ``None`` (default)
+            follows the active theme's ``separator_spacing`` style;
+            outside a theme context it falls back to small spacing.
     """
-    size = SeparatorSpacing.large if large else SeparatorSpacing.small
+    size = SeparatorSpacing.large if _resolve_separator_large(large) else SeparatorSpacing.small
     return Separator(visible=True, spacing=size)
 
 
-def gap(large: bool = False) -> Separator:
+def gap(large: Optional[bool] = None) -> Separator:
     """Invisible spacing between content blocks (no visible line).
 
     Args:
-        large: Use large spacing. Defaults to small spacing.
+        large: Use large spacing. ``None`` (default) follows the active
+            theme's ``separator_spacing`` style; outside a theme context
+            it falls back to small spacing.
     """
-    size = SeparatorSpacing.large if large else SeparatorSpacing.small
+    size = SeparatorSpacing.large if _resolve_separator_large(large) else SeparatorSpacing.small
     return Separator(visible=False, spacing=size)
 
 

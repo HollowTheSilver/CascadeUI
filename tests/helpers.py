@@ -3,6 +3,26 @@
 from unittest.mock import AsyncMock, MagicMock
 
 import discord
+from discord.ui import TextDisplay
+
+from cascadeui import StatefulLayoutView
+
+
+class RenderableLayoutView(StatefulLayoutView):
+    """Minimal non-empty V2 view for tests that exercise state, slot, or
+    lifecycle logic without a real component tree.
+
+    Adds one ``TextDisplay`` at construction so the tree is a valid
+    components-v2 message. ``validate_placement`` requires at least one
+    top-level component; a bare ``StatefulLayoutView`` subclass with no
+    ``build_ui`` sends an empty tree that Discord rejects with HTTP 400, so
+    state-focused fixtures inherit from this base instead of subclassing
+    ``StatefulLayoutView`` directly.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.add_item(TextDisplay("test content"))
 
 
 def make_interaction(user_id=100, guild_id=200, is_done=False, message=None):

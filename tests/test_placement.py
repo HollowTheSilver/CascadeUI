@@ -65,6 +65,13 @@ class TestTopLevelRejections:
     """LayoutView top-level children must be Container / Section / TextDisplay /
     MediaGallery / File / Separator / ActionRow."""
 
+    def test_empty_top_level_view_rejected(self):
+        # A components-v2 message needs >= 1 top-level component; the empty
+        # tree is the one shape the per-child walk cannot reach.
+        v = _view_with()
+        with pytest.raises(ValueError, match="no top-level components"):
+            validate_placement(v)
+
     def test_standalone_button_at_top_level_rejected(self):
         v = _view_with(Button(custom_id="b", label="L"))
         with pytest.raises(ValueError, match="Button cannot be a child of LayoutView"):

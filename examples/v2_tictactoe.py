@@ -5,7 +5,9 @@ V2 TicTacToe -- CascadeUI Multi-User Game
 A two-player TicTacToe game demonstrating multi-user interaction
 patterns with V2 components:
 
-    - Challenge acceptance flow (opponent must accept before the game starts)
+    - Challenge acceptance flow (opponent must accept before the game
+      starts), rendered as an avatar-headed card with the game config
+      in ``key_value`` and the response rules as a subtext caption
     - ``allowed_users`` + ``register_participant`` for session-aware
       multi-user views
     - ``unauthorized_message`` for custom rejection text when a
@@ -61,6 +63,7 @@ from cascadeui import (
     divider,
     gap,
     get_store,
+    image_section,
     key_value,
     stats_card,
 )
@@ -71,9 +74,9 @@ logger = logging.getLogger(__name__)
 # // ========================================( Constants )======================================== // #
 
 
-EMPTY = "\u2800"  # Braille blank -- renders as a wide empty space on buttons
-X_MARK = "\u2716"
-O_MARK = "\u25ef"
+EMPTY = "\N{BRAILLE PATTERN BLANK}"  # renders as a wide empty space on buttons
+X_MARK = "\N{HEAVY MULTIPLICATION X}"
+O_MARK = "\N{LARGE CIRCLE}"
 
 # Colors for game states
 COLOR_X_TURN = discord.Color.blurple()
@@ -178,28 +181,40 @@ class TicTacToeChallengeView(StatefulLayoutView):
 
     def build_ui(self):
         self.clear_items()
-        desc = f"a **{self.size}x{self.size}** game of TicTacToe"
-        if self.win_length != self.size:
-            desc += f" (**{self.win_length}** in a row)"
         self.add_item(
             card(
-                "## TicTacToe Challenge",
-                TextDisplay(f"<@{self.challenger_id}> challenges <@{self.opponent.id}> to {desc}!"),
+                # Opponent avatar resolves from the Member object with no
+                # fetch; display_avatar always falls back to a default.
+                image_section(
+                    f"## \N{CROSSED SWORDS}\N{VARIATION SELECTOR-16} TicTacToe Challenge\n"
+                    f"-# <@{self.challenger_id}> challenges <@{self.opponent.id}>",
+                    url=self.opponent.display_avatar.with_size(128).url,
+                ),
+                divider(),
+                key_value(
+                    {
+                        "Board": f"{self.size} x {self.size}",
+                        "Win length": f"{self.win_length} in a row",
+                    }
+                ),
                 divider(),
                 ActionRow(
                     StatefulButton(
                         label="Accept",
                         style=discord.ButtonStyle.success,
-                        emoji="\u2714",
+                        emoji="\N{HEAVY CHECK MARK}",
                         callback=self._accept,
                     ),
                     StatefulButton(
                         label="Decline",
                         style=discord.ButtonStyle.danger,
-                        emoji="\u2716",
+                        emoji="\N{HEAVY MULTIPLICATION X}",
                         callback=self._decline,
                     ),
                 ),
+                # Surfaces allowed_users and the prompt timeout in the UI.
+                f"-# Only <@{self.opponent.id}> can respond \N{MIDDLE DOT} "
+                f"expires in {int(self.timeout)} seconds",
                 color=discord.Color.blurple(),
             )
         )
@@ -360,9 +375,13 @@ class TicTacToeView(StatefulLayoutView):
             card_items.append(TextDisplay(f"{mark} <@{current_id}>'s turn"))
             card_items.append(gap())
 
-        # Player legend
+        # The legend doubles as the rules line: on custom boards the win
+        # condition is otherwise invisible once the challenge card is gone.
         card_items.append(
-            TextDisplay(f"{X_MARK} <@{self.player_x}> vs {O_MARK} <@{self.player_o}>")
+            TextDisplay(
+                f"-# {X_MARK} <@{self.player_x}> vs {O_MARK} <@{self.player_o}> "
+                f"\N{MIDDLE DOT} first to {self.win_length} in a row"
+            )
         )
         card_items.append(divider())
 
@@ -398,13 +417,13 @@ class TicTacToeView(StatefulLayoutView):
                     StatefulButton(
                         label=rematch_label,
                         style=discord.ButtonStyle.primary,
-                        emoji="\U0001f504",
+                        emoji="\N{ANTICLOCKWISE DOWNWARDS AND UPWARDS OPEN CIRCLE ARROWS}",
                         callback=self._rematch,
                     ),
                     StatefulButton(
                         label="Close",
                         style=discord.ButtonStyle.secondary,
-                        emoji="\u274c",
+                        emoji="\N{CROSS MARK}",
                         callback=self._close,
                     ),
                 )
@@ -764,7 +783,7 @@ class TicTacToeExample(commands.Cog, name="v2_tictactoe_example"):
                 games = stats.get("games", 0)
                 draws = stats.get("draws", 0)
                 win_rate = (wins / games * 100) if games else 0.0
-                return f"{wins}W / {games}G \u2022 {win_rate:.0f}% \u2022 {draws}D"
+                return f"{wins}W / {games}G \N{BULLET} {win_rate:.0f}% \N{BULLET} {draws}D"
 
             def build_summary(self, entries):
                 # Each game contributes to two player rows

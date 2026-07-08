@@ -253,7 +253,7 @@ class RegistrationFormView(FormLayoutView):
     async def on_submit(self, interaction, values):
         """Render a confirmation embed and close the form."""
         embed = discord.Embed(
-            title="\u2705 Registration Complete",
+            title="\N{WHITE HEAVY CHECK MARK} Registration Complete",
             color=discord.Color.green(),
         )
         embed.add_field(name="Username", value=values["username"], inline=True)
