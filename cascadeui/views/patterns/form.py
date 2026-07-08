@@ -922,10 +922,9 @@ class FormLayoutView(_BaseFormMixin, StatefulLayoutView):
         ``alert()`` and ``card()`` inherit the view's accent colour
         without explicit ``color=`` arguments.
         """
-        from ...theming.context import _current_theme, set_current_theme
+        from ...theming.context import theme_context
 
-        token = set_current_theme(self.get_theme())
-        try:
+        with theme_context(self.get_theme()):
             self.clear_items()
             title_line = f"**{self.title}**"
 
@@ -951,8 +950,6 @@ class FormLayoutView(_BaseFormMixin, StatefulLayoutView):
             self._create_form_controls()
             # Restore the navigation back button if push() added one.
             self._restore_navigation_artifacts()
-        finally:
-            _current_theme.reset(token)
 
     async def _update_form_display(self):
         """Update the form display with current values."""

@@ -5,21 +5,21 @@
 
 from unittest.mock import AsyncMock, MagicMock
 
+from helpers import RenderableLayoutView
 from helpers import make_interaction as _make_interaction
 
-from cascadeui.views.layout import StatefulLayoutView
 from cascadeui.views.view import StatefulView
 
 # // ========================================( Fixtures )======================================== // #
 
 
-class _HubView(StatefulLayoutView):
+class _HubView(RenderableLayoutView):
     """Root view for push/pop tests."""
 
     pass
 
 
-class _SubView(StatefulLayoutView):
+class _SubView(RenderableLayoutView):
     """Target view for push tests."""
 
     pass

@@ -186,6 +186,13 @@ class CheckboxGroup(StatefulComponent):
         self.label = label
         self.description = description
         self.options = self._process_options(options, CheckboxGroupOption)
+        # Discord rejects an out-of-range option count with HTTP 400 when
+        # the modal opens; raising here surfaces the mistake at its source.
+        if not 1 <= len(self.options) <= 10:
+            raise ValueError(
+                f"CheckboxGroup {label!r} has {len(self.options)} options; Discord "
+                f"accepts 1-10. Trim the list or split the choices across inputs."
+            )
         self.required = required
         self.min_values = min_values
         self.max_values = max_values
@@ -259,6 +266,14 @@ class RadioGroup(StatefulComponent):
         self.label = label
         self.description = description
         self.options = CheckboxGroup._process_options(options, RadioGroupOption)
+        # Discord rejects an out-of-range option count with HTTP 400 when
+        # the modal opens; raising here surfaces the mistake at its source.
+        if not 2 <= len(self.options) <= 10:
+            raise ValueError(
+                f"RadioGroup {label!r} has {len(self.options)} options; Discord "
+                f"requires 2-10. Use a Checkbox for a single yes/no choice, or "
+                f"trim the list."
+            )
         self.required = required
         self.validators: List[Callable] = list(validators) if validators else []
         self.custom_id = TextInput._slug(label)

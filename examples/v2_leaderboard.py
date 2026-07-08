@@ -34,6 +34,12 @@ Demonstrates:
       page. This example returns a ``Container`` so the aggregate
       header stays visible while the user flips through all five
       pages of rankings.
+    - ``build_header`` / ``build_footer`` page-frame hooks: a guild-icon
+      banner rendered above the summary card on page 1 only (gated on
+      the hook's zero-based ``page`` argument), and a subtext caption
+      rendered below the rankings card on every page. Header components
+      land first in the page, footer components land between the
+      rankings card and the navigation row.
     - Symmetric ``title=`` + ``subtitle=`` constructor kwargs: both are
       three-tier (class default -> subclass override -> explicit arg).
       This example passes both at init -- ``title`` to splice in the
@@ -71,6 +77,7 @@ from cascadeui import (
     action_section,
     card,
     divider,
+    gallery,
     key_value,
     progress_bar,
 )
@@ -177,13 +184,16 @@ class ServerLeaderboard(LeaderboardLayoutView):
     entry_layout = "sections"
     exit_policy = "delete"
 
-    def __init__(self, *args, mode: str = "", bot=None, **kwargs):
+    def __init__(self, *args, mode: str = "", bot=None, banner_url=None, **kwargs):
         # ``bot`` is captured here (not pulled from ``context`` later) so
         # ``get_avatar_url`` can reach it without touching the interaction.
         # Section-mode leaderboards typically need a user-fetch entry point,
         # and passing the bot at construction makes the dependency explicit.
         self._mode = mode
         self._bot = bot
+        # Guild icon URL for the page-1 banner; ``None`` when the guild has
+        # no icon, which ``build_header`` degrades to no banner.
+        self._banner_url = banner_url
         # ``_detailed`` toggles the win-rate bar in every row. The button in
         # ``build_summary`` flips it and calls ``reload(force=True)``: the entry
         # data is unchanged, so the entry-signature short-circuit would skip the
@@ -206,10 +216,10 @@ class ServerLeaderboard(LeaderboardLayoutView):
         """
         games = stats["games"]
         wins = stats["wins"]
-        line = f"`{stats['mmr']}` MMR \u2022 {wins}W / {games}G"
+        line = f"`{stats['mmr']}` MMR \N{BULLET} {wins}W / {games}G"
         if self._detailed:
             bar = progress_bar(wins, games or 1, width=6, show_percent=True).content
-            line = f"{line} \u2022 {bar}"
+            line = f"{line} \N{BULLET} {bar}"
         return line
 
     async def get_avatar_url(self, user_id: int, stats: dict):
@@ -275,6 +285,32 @@ class ServerLeaderboard(LeaderboardLayoutView):
             ),
         )
 
+    # Page 1 already sits at 39 of Discord's 40 recursive components
+    # (banner + summary card + five entry sections + footer + nav row).
+    # Extending either frame hook means trimming elsewhere first -- the
+    # summary toggle button or the title divider are the cheapest cuts.
+    def build_header(self, page: int):
+        """Render the guild-icon banner above the summary card on page 1.
+
+        ``page`` is the zero-based page index, so returning ``None`` for
+        every other index keeps the banner off pages 2-5 and gives the
+        rankings the full height back after the first page turn. ``None``
+        also covers guilds with no icon: the hook degrades to no banner
+        instead of a broken image.
+        """
+        if page != 0 or not self._banner_url:
+            return None
+        return gallery(self._banner_url)
+
+    def build_footer(self, page: int):
+        """Render a subtext caption below the rankings card on every page.
+
+        Footer components land between the rankings card and the
+        navigation row. The ``-#`` markdown prefix renders as Discord
+        subtext, the right weight for attribution or freshness lines.
+        """
+        return TextDisplay(f"-# {self._mode or 'Demo'} \N{MIDDLE DOT} MMR is simulated")
+
     async def _toggle_detail(self, interaction):
         # The ranking entries do not change, only how each row renders, so the
         # entry-signature short-circuit in rebuild_pages would skip the rebuild.
@@ -320,6 +356,7 @@ class LeaderboardCog(commands.Cog, name="v2_leaderboard_example"):
             subtitle=None,
             mode=mode,
             bot=context.bot,
+            banner_url=context.guild.icon.url if context.guild.icon else None,
         )
         await view.send(ephemeral=True)
 

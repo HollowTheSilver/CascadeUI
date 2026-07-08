@@ -111,10 +111,12 @@ class StatefulLayoutView(_StatefulMixin, LayoutView):
                 f"40-component limit for a single message{at}, counted "
                 f"recursively across every Container, Section, ActionRow, "
                 f"button, and text node.\n"
-                f"  Fix: trim the tree -- a node-tight pager fits prev / go-to "
-                f"/ next + Back + Exit in one ActionRow via "
-                f"PaginatedRegion.control_buttons(view, compact=True), or split "
-                f"the content across multiple messages."
+                f"  Fix: trim the tree -- drop or merge content nodes (fold "
+                f"adjacent TextDisplays, remove a divider or Section "
+                f"accessory), compact the pager to prev / go-to / next + Back "
+                f"+ Exit in one ActionRow via "
+                f"PaginatedRegion.control_buttons(view, compact=True), or "
+                f"split the content across multiple messages."
             ) from exc
 
     def _install_refresh_button(self, button: StatefulButton) -> None:

@@ -123,7 +123,7 @@ ROLE_CATEGORIES = [
         # ``discord.ui.Button(emoji=...)`` parameter. Custom emoji
         # only render where the bot can see them (shared guild, or an
         # application-owned emoji created via the discord.py API).
-        icon="🎮",
+        icon="\N{VIDEO GAME}",
         roles={
             "Minecraft": 123456789012345005,
             "Valorant": 123456789012345006,
@@ -334,13 +334,13 @@ class PersonalVisitsView(StatefulLayoutView):
                 StatefulButton(
                     label="Record Visit",
                     style=discord.ButtonStyle.primary,
-                    emoji="\U0001f4cd",  # round pushpin
+                    emoji="\N{ROUND PUSHPIN}",  # round pushpin
                     callback=self._record,
                 ),
                 StatefulButton(
                     label="Reset",
                     style=discord.ButtonStyle.danger,
-                    emoji="♻️",  # recycle
+                    emoji="\N{BLACK UNIVERSAL RECYCLING SYMBOL}\N{VARIATION SELECTOR-16}",  # recycle
                     callback=self._reset,
                 ),
                 self.make_exit_button(),

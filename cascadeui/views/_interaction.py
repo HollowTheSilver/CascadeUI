@@ -189,7 +189,23 @@ class _InteractionMixin:
         fallback_message:
             Ephemeral text sent when the response slot is already consumed.
             Defaults to ``"Could not open the dialog. Please try again."``.
+
+        Raises
+        ------
+        ValueError:
+            The modal has no components. Discord rejects a zero-component
+            modal with HTTP 400; this converts it into a directed build-time
+            error. Checked here, not in ``Modal.__init__``, because a
+            ``Modal(inputs=[])`` followed by ``add_item()`` is a valid build
+            path and the tree is only complete at open time.
         """
+        if not modal.children:
+            raise ValueError(
+                f"Modal {modal.title!r} has no components. A modal needs at "
+                f"least one input; Discord rejects an empty one with HTTP 400.\n"
+                f"  Fix: pass at least one TextInput to Modal(inputs=[...]), or "
+                f"add one via modal.add_item() before open_modal()."
+            )
         if not interaction.response.is_done():
             await interaction.response.send_modal(modal)
             return True

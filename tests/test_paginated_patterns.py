@@ -455,6 +455,82 @@ class TestPaginatedLayoutNavInsideContainer:
             len(list(page_b.children)) == 1
         ), f"page_b mutated across renders: {list(page_b.children)}"
 
+    def test_mixed_page_falls_back_to_sibling_layout(self):
+        """A page mixing a Container with other top-level items cannot be
+        wrapped -- Discord forbids Container nesting, and adopting the
+        Container's children would merge deliberately separate cards.
+        The flag degrades to the sibling layout for that page instead of
+        composing a tree the placement validator rejects.
+        """
+        from cascadeui.views._placement import validate_placement
+
+        class _Wrapped(PaginatedLayoutView):
+            nav_inside_container = True
+
+        card_a = Container(TextDisplay("A"))
+        view = _Wrapped(
+            interaction=_make_interaction(),
+            pages=[
+                [card_a, TextDisplay("caption")],
+                [Container(TextDisplay("B")), TextDisplay("caption")],
+            ],
+        )
+        children = list(view.children)
+        # Sibling layout: page items and the nav row are all top-level.
+        assert card_a in children
+        assert view._nav_row in children
+        # No Container nesting anywhere -- the composed tree is send-legal.
+        validate_placement(view)
+
+    def test_wrapped_page_follows_runtime_theme_switch(self):
+        """The fresh nav wrapper inherits the source card's theme marker,
+        so the render-time accent resolution reaches wrapped pages the
+        same as sibling-layout pages -- a live theme switch restyles the
+        wrapped card instead of freezing it at build-time color.
+        """
+        import discord
+
+        from cascadeui.components.patterns.v2 import card
+        from cascadeui.theming.core import Theme
+
+        red = Theme("red", {"accent_colour": discord.Color.red()})
+        blue = Theme("blue", {"accent_colour": discord.Color.blue()})
+
+        class _Wrapped(PaginatedLayoutView):
+            nav_inside_container = True
+            theme = red
+
+        view = _Wrapped(
+            interaction=_make_interaction(),
+            pages=[[card("A")], [card("B")]],
+        )
+        view._apply_theme_defaults()
+        wrapper = list(view.children)[0]
+        assert wrapper.accent_color == discord.Color.red()
+
+        view.theme = blue
+        view._apply_theme_defaults()
+        assert wrapper.accent_color == discord.Color.blue()
+
+    def test_multi_item_page_without_container_still_wraps(self):
+        """Container-free multi-item pages keep the wrapped layout."""
+
+        class _Wrapped(PaginatedLayoutView):
+            nav_inside_container = True
+
+        view = _Wrapped(
+            interaction=_make_interaction(),
+            pages=[
+                [TextDisplay("A"), TextDisplay("A2")],
+                [TextDisplay("B")],
+            ],
+        )
+        children = list(view.children)
+        assert view._nav_row not in children
+        wrappers = [c for c in children if isinstance(c, Container)]
+        assert len(wrappers) == 1
+        assert view._nav_row in list(wrappers[0].walk_children())
+
 
 # // ========================================( V2 Send Kwargs Propagation )======================================== // #
 

@@ -12,6 +12,9 @@ pip install pycascadeui
 
 # With the SQLite persistence backend
 pip install pycascadeui[sqlite]
+
+# With the PostgreSQL persistence backend
+pip install pycascadeui[postgres]
 ```
 
 ### From Source
@@ -30,7 +33,7 @@ If you want to run tests or contribute:
 pip install -e ".[dev]"
 ```
 
-This installs additional dependencies: `pytest`, `pytest-asyncio`, `black`, and `isort`.
+This installs additional dependencies: `pytest`, `pytest-asyncio`, `black`, `isort`, and `testcontainers[postgres]` (for the real-database backend tests).
 
 ## Verify Installation
 

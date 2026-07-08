@@ -505,7 +505,7 @@ Each page is a list of V2 components. Navigation buttons (Previous, Next, First,
 
 ##### `nav_inside_container` *(bool, default `False`)*
 
-When `True` and multiple pages exist, wraps the page content and the navigation row together in a single `Container`. Default `False` keeps them as separate top-level children. Single-page views render no navigation row, so the flag has no visible effect there. When the page formatter returns a single `Container`, the wrap builds a fresh Container (copying its accent color and spoiler) rather than nesting one inside another, which Discord rejects.
+When `True` and multiple pages exist, wraps the page content and the navigation row together in a single `Container`. Default `False` keeps them as separate top-level children. Single-page views render no navigation row, so the flag has no visible effect there. When the page formatter returns a single `Container`, the wrap builds a fresh Container (copying its accent color and spoiler) rather than nesting one inside another, which Discord rejects. A page that mixes a `Container` with other top-level items cannot be wrapped at all; it falls back to the sibling layout with the navigation row as a separate row.
 
 #### Class Methods
 
@@ -555,7 +555,8 @@ await view.send()
 |---|---|---|
 | `leaderboard_top_n` | `10` | Total entries to consider from the data source. |
 | `leaderboard_per_page` | `5` | Entries per page. `None` collapses into a single page equal to `top_n`. |
-| `title` | `"Leaderboard"` | H2 on the rankings card. Constructor `title=` kwarg overrides. |
+| `title` | `"Leaderboard"` | H2 heading on the rankings card. Constructor `title=` kwarg overrides; `None` or `""` renders no text heading (with no `banner` either, the title divider is skipped too). |
+| `banner` | `None` | Full-width image at the top of the rankings card, above the title heading when both are set. URL string, `discord.File`, or anything with a string `.url` (`guild.icon` works directly). Constructor `banner=` kwarg overrides. |
 | `subtitle` | `"Rankings"` | H3 above the ranked rows. Set to `None` or `""` to skip. |
 | `leaderboard_empty_message` | `"No entries recorded yet."` | Static text when no entries exist. |
 | `entry_layout` | `"lines"` | `"lines"` packs entries into a single TextDisplay; `"sections"` renders each entry as a `Section` with optional avatar Thumbnail. Section mode caps `leaderboard_per_page` at 5. |
@@ -577,6 +578,9 @@ await view.send()
 | `format_primary` / `format_secondary` | Section-mode two-line body. |
 | `get_avatar_url(user_id, stats)` *(async)* | Section-mode `Thumbnail` URL. |
 | `build_summary(entries)` | Returns `dict[str, str]` (rendered inline page 1), a `Container` (standalone card on every page), or `None` (no summary). |
+| `build_title(page)` | Optional components replacing the rankings card's masthead (the `banner` image + `## title` heading) inside the Container. `None` (default) composes the masthead from the declarative `banner` / `title` pair. Same return shapes and `page` semantics as `build_header`. |
+| `build_header(page)` | Optional page-frame components placed first on the page, above the standalone summary card. Returns a component, a list, or `None` (default). `page` is the zero-based page index. |
+| `build_footer(page)` | Optional page-frame components placed last on the page, below the rankings card and above the navigation row. Same return shapes and `page` semantics as `build_header`. |
 | `on_leaderboard_empty()` | Returns the V2 component list shown when `entries` is empty. |
 | `on_state_changed(state)` *(async, override)* | Calls `rebuild_pages()` then the paginated refresh; live-data subclasses subscribe to data actions and override `get_entries()`. |
 
@@ -617,13 +621,13 @@ Each category generates an `action_section()` item that pushes to the specified 
 
 #### Override Hooks
 
-##### `_build_header()` *(override)*
+##### `build_header()` *(override)*
 
-Returns V2 components (list or single) for the area above category items. Default returns `[]`.
+Returns V2 components (list or single) for the area above category items. Default returns `[]`. The former `_build_header()` remains as a deprecated alias; existing overrides keep rendering.
 
-##### `_build_footer()` *(override)*
+##### `build_footer()` *(override)*
 
-Returns V2 components (list or single) for the area below category items. Default returns `[]`.
+Returns V2 components (list or single) for the area below category items. Default returns `[]`. The former `_build_footer()` remains as a deprecated alias; existing overrides keep rendering.
 
 ##### `_build_category_item(category, index)` *(override)*
 

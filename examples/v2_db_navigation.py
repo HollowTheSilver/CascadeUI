@@ -156,7 +156,7 @@ class TaskListView(StatefulLayoutView):
             self.tasks_pager.items = tasks
             sections = [
                 action_section(
-                    f"{'✅' if task['done'] else '⬜'} **{task['title']}**",
+                    f"{'\N{WHITE HEAVY CHECK MARK}' if task['done'] else '\N{WHITE LARGE SQUARE}'} **{task['title']}**",
                     label="Open",
                     callback=self._make_open(task_id),
                 )
@@ -173,7 +173,7 @@ class TaskListView(StatefulLayoutView):
                 StatefulButton(
                     label="New Task",
                     style=discord.ButtonStyle.success,
-                    emoji="➕",
+                    emoji="\N{HEAVY PLUS SIGN}",
                     callback=self._new_task,
                 ),
                 self.make_exit_button(),
@@ -252,7 +252,9 @@ class TaskDetailView(StatefulLayoutView):
             self.add_item(self.make_nav_row())
             return
 
-        status = "✅ Done" if task["done"] else "⬜ Not done"
+        status = (
+            "\N{WHITE HEAVY CHECK MARK} Done" if task["done"] else "\N{WHITE LARGE SQUARE} Not done"
+        )
         self.add_item(card(f"## {task['title']}", key_value({"Status": status})))
         self.add_item(
             ActionRow(

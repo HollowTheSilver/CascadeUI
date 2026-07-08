@@ -997,9 +997,9 @@ class TestRejectionCleanup:
 
     async def test_v2_auto_register_rollback_cleans_state_tree(self):
         """V2 layout.py rollback must dispatch VIEW_DESTROYED (mirrors base.py fix)."""
-        from cascadeui.views.layout import StatefulLayoutView
+        from helpers import RenderableLayoutView
 
-        class _V2Game(StatefulLayoutView):
+        class _V2Game(RenderableLayoutView):
             auto_register_participants = True
             participant_limit = 2
             instance_scope = "user_guild"

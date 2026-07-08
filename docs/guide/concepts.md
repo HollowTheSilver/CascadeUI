@@ -285,7 +285,7 @@ Modal collects all input values on submit and fires a single
 | `Checkbox` | `discord.ui.Checkbox` | `bool` |
 | `CheckboxGroup` | `discord.ui.CheckboxGroup` | `list[str]` |
 | `RadioGroup` | `discord.ui.RadioGroup` | `str` |
-| `FileUpload` | `discord.ui.FileUpload` | `list` |
+| `FileUpload` | `discord.ui.FileUpload` | `list[discord.Attachment]` |
 
 All five share the same contract: `custom_id` derived from label,
 optional `validators` list, and automatic value write-back on submit.

@@ -73,7 +73,7 @@ Quick poll demonstrating `@computed` for global memoized values that multiple vi
 
 ### v2_wizard.py
 
-D&D character creator using `WizardLayoutView`. Five steps (Name & Race, Class & Subclass, Ability Scores, Background, Confirmation) with per-step validation, cross-step state (class list filters by race, subclass list filters by class, ability points draw from a shared pool), and the `on_finish` method hook. Demonstrates navigation button customization (`back_button_label`, `finish_button_label`, `finish_button_emoji`), inline selects for structured choices (alignment, languages with race-based defaults), a toggle button in a `card()` for a boolean flag (heroic destiny), and a modal for free-form backstory text.
+D&D character creator using `WizardLayoutView`. Six steps (Identity, Class, Abilities, Background, a conditional Destiny step, Review) with per-step validation, cross-step state (class list filters by race, subclass by class, ability points draw from a shared pool), a live character-sheet preview card on every step, and the `on_finish` method hook. Demonstrates navigation button customization, `choice_row` segmented choices with race-based language defaults, a `toggle_section` boolean flag (heroic destiny), and the structured modal inputs: the name modal pairs a `TextInput` with an optional `FileUpload` portrait that replaces the preview image, and the background modal combines paragraph text with `RadioGroup`, `CheckboxGroup`, and `Checkbox` in one edit-in-place form.
 
 **Command:** `/v2wizard`
 

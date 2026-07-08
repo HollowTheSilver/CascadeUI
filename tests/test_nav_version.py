@@ -3,9 +3,9 @@
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from helpers import RenderableLayoutView
 from helpers import make_interaction as _make_interaction
 
-from cascadeui.views.layout import StatefulLayoutView
 from cascadeui.views.view import StatefulView
 
 
@@ -15,7 +15,7 @@ class _V1View(StatefulView):
     pass
 
 
-class _V2View(StatefulLayoutView):
+class _V2View(RenderableLayoutView):
     """A minimal V2 view for nav tests."""
 
     pass

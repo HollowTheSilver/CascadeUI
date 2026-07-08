@@ -184,10 +184,10 @@ class DashboardView(TabLayoutView):
         )
 
         tabs = {
-            "\U0001f4ca Overview": self.build_overview,
-            "\U0001f9e9 Modules": self.build_modules,
-            "\u2699\ufe0f Controls": self.build_controls,
-            "\u2139\ufe0f About": self.build_about,
+            "\N{BAR CHART} Overview": self.build_overview,
+            "\N{JIGSAW PUZZLE PIECE} Modules": self.build_modules,
+            "\N{GEAR}\N{VARIATION SELECTOR-16} Controls": self.build_controls,
+            "\N{INFORMATION SOURCE}\N{VARIATION SELECTOR-16} About": self.build_about,
         }
         super().__init__(*args, tabs=tabs, **kwargs)
 
@@ -258,7 +258,7 @@ class DashboardView(TabLayoutView):
                 f"**Members:** {members}",
                 label="Refresh",
                 callback=self._refresh_overview,
-                emoji="\U0001f504",
+                emoji="\N{ANTICLOCKWISE DOWNWARDS AND UPWARDS OPEN CIRCLE ARROWS}",
             ),
             divider(),
             key_value(
@@ -298,7 +298,7 @@ class DashboardView(TabLayoutView):
 
     async def _go_to_modules(self, interaction):
         """Switch to the Modules tab from the Overview quick action."""
-        await self.switch_tab("\U0001f9e9 Modules")
+        await self.switch_tab("\N{JIGSAW PUZZLE PIECE} Modules")
 
     # // ==================( Modules Tab )================== // #
 
@@ -315,7 +315,7 @@ class DashboardView(TabLayoutView):
         items: list = [TextDisplay(f"## Bot Modules\n{enabled} of {len(self._modules)} enabled")]
 
         for name, active in self._modules.items():
-            emoji = "\u2705" if active else "\u274c"
+            emoji = "\N{WHITE HEAVY CHECK MARK}" if active else "\N{CROSS MARK}"
             items.append(
                 toggle_section(
                     f"{emoji} **{name}**",
@@ -411,7 +411,7 @@ class DashboardView(TabLayoutView):
                         values=_REFRESH_INTERVALS,
                         start=_REFRESH_INTERVALS.index(self._refresh_interval),
                         on_change=self._on_interval,
-                        emoji="\U0001f504",
+                        emoji="\N{ANTICLOCKWISE DOWNWARDS AND UPWARDS OPEN CIRCLE ARROWS}",
                     ),
                 ),
                 # button_row turns a {label: callback} map into one ActionRow.
@@ -517,7 +517,7 @@ class DashboardView(TabLayoutView):
             TextDisplay(
                 "**CascadeUI** - Stateful Discord UI framework\n"
                 "**discord.py 2.7+** - V2 component support\n\n"
-                "-# TabLayoutView \u2022 Section \u2022 Container \u2022 StatefulButton"
+                "-# TabLayoutView \N{BULLET} Section \N{BULLET} Container \N{BULLET} StatefulButton"
             ),
             color=discord.Color.dark_grey(),
         )

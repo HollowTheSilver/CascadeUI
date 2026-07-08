@@ -2,6 +2,7 @@
 
 
 import inspect
+import logging
 from collections import OrderedDict
 from typing import Callable, ClassVar, List, Optional
 
@@ -14,6 +15,8 @@ from ...components.types import EmojiInput
 from ..base import _StatefulMixin
 from ..layout import StatefulLayoutView
 from ..view import StatefulView
+
+logger = logging.getLogger(__name__)
 
 # // ========================================( Shared Mixin )======================================== // #
 
@@ -667,7 +670,10 @@ class PaginatedLayoutView(_BasePaginatedMixin, StatefulLayoutView):
             as one cohesive card. When ``False`` (default), page content
             and the nav row are separate top-level children of the view --
             the original layout. ``_build_extra_items`` items remain
-            outside the wrapping Container in either mode.
+            outside the wrapping Container in either mode. A page that
+            mixes a Container with other top-level items cannot be
+            wrapped (Discord forbids Container nesting); such pages keep
+            the sibling layout with the nav row as a separate row.
     """
 
     nav_inside_container: ClassVar[bool] = False
@@ -759,6 +765,8 @@ class PaginatedLayoutView(_BasePaginatedMixin, StatefulLayoutView):
         content + nav row are wrapped in one ``Container`` and that
         Container is the only child added here. Pages of one (no nav row)
         and the empty-pages placeholder are unaffected -- nothing to wrap.
+        Mixed pages that a Container cannot legally hold fall back to the
+        sibling layout; see :meth:`_build_nav_wrapper`.
 
         Extras from ``_build_extra_items`` stay outside the wrapping
         Container; the caller adds them after this method returns.
@@ -770,41 +778,74 @@ class PaginatedLayoutView(_BasePaginatedMixin, StatefulLayoutView):
             self._page_content_items.append(placeholder)
             return
 
-        items = self._resolve_page(self.pages[self.current_page])
+        # Callable page formatters run inside the view's theme context
+        # so card() calls in user formatters inherit the view's accent.
+        from ...theming.context import theme_context
+
+        with theme_context(self.get_theme()):
+            items = self._resolve_page(self.pages[self.current_page])
         show_nav = len(self.pages) > 1
 
         if self.nav_inside_container and show_nav:
-            # Discord rejects Container-in-Container (type 17 inside type 17)
-            # with HTTP 400 "Invalid Form Body". When the formatter already
-            # returned a single Container -- common when callers reach for
-            # ``card(...)`` to set a per-page accent color -- build a fresh
-            # wrapper that copies the source Container's metadata (accent,
-            # spoiler) and adopts its children alongside the nav row.
-            #
-            # The source Container in ``self.pages`` is never mutated. Page
-            # turns rebuild the wrapper from scratch each render, so the
-            # nav row never accumulates across visits to the same source
-            # page (which would duplicate its button custom_ids and trip
-            # Discord's "Component custom id cannot be duplicated" reject).
-            if len(items) == 1 and isinstance(items[0], Container):
-                source = items[0]
-                wrapper = Container(
-                    *list(source.children),
-                    self._nav_row,
-                    accent_color=source.accent_color,
-                    spoiler=source.spoiler,
-                )
-            else:
-                wrapper = Container(*items, self._nav_row)
-            self.add_item(wrapper)
-            self._page_content_items.append(wrapper)
-            return
+            wrapper = self._build_nav_wrapper(items)
+            if wrapper is not None:
+                self.add_item(wrapper)
+                self._page_content_items.append(wrapper)
+                return
+            # Mixed page: the wrap is impossible, so the sibling layout
+            # below renders the page unchanged with the nav row as a
+            # separate top-level row.
 
         for item in items:
             self.add_item(item)
             self._page_content_items.append(item)
         if show_nav:
             self.add_item(self._nav_row)
+
+    def _build_nav_wrapper(self, items) -> Optional[Container]:
+        """Build the ``nav_inside_container`` wrapper, or decline with ``None``.
+
+        Two page shapes wrap cleanly. A single-``Container`` page gets a
+        fresh wrapper that copies the source Container's metadata (accent,
+        spoiler) and adopts its children alongside the nav row: Discord
+        rejects Container-in-Container (type 17 inside type 17) with HTTP
+        400 "Invalid Form Body", and the source Container in ``self.pages``
+        is never mutated -- page turns rebuild the wrapper from scratch each
+        render, so the nav row never accumulates across visits to the same
+        source page (which would duplicate its button custom_ids and trip
+        Discord's "Component custom id cannot be duplicated" reject). A page
+        with no Containers at all wraps directly.
+
+        A mixed page (a Container alongside other top-level items, e.g. a
+        rankings card plus ``build_header``/``build_footer`` frames or a
+        standalone summary card) cannot be wrapped: nesting the Container
+        is forbidden, and adopting its children would merge deliberately
+        separate cards into one. Returns ``None`` so the caller falls back
+        to the sibling layout with the page content intact.
+        """
+        if len(items) == 1 and isinstance(items[0], Container):
+            source = items[0]
+            wrapper = Container(
+                *list(source.children),
+                self._nav_row,
+                accent_color=source.accent_color,
+                spoiler=source.spoiler,
+            )
+            # A theme-managed source keeps its marker on the wrapper, so
+            # the render-time accent resolution reaches wrapped pages the
+            # same as sibling-layout pages.
+            if getattr(source, "_cascadeui_theme_accent", False):
+                wrapper._cascadeui_theme_accent = True
+            return wrapper
+        if not any(isinstance(item, Container) for item in items):
+            return Container(*items, self._nav_row)
+        if not getattr(self, "_nav_wrap_declined", False):
+            self._nav_wrap_declined = True
+            logger.debug(
+                f"nav_inside_container declined for {type(self).__name__}: the page mixes "
+                f"a Container with other top-level items; rendering the sibling layout."
+            )
+        return None
 
     def _add_page_content(self):
         """Append current page's V2 components and track them for later removal.

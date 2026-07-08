@@ -93,6 +93,20 @@ def validate_placement(view) -> None:
             violations in the same tree are not reported -- fix the
             first one and re-validate.
     """
+    # A components-v2 message must carry at least one top-level component.
+    # An empty tree is the one size-violation the per-child walk below
+    # cannot reach, since the loop no-ops on empty children.
+    if not view.children:
+        raise ValueError(
+            f"Invalid V2 placement: {type(view).__name__} has no top-level "
+            f"components (a components-v2 message requires at least 1).\n"
+            f"  Path: {type(view).__name__}\n"
+            f"  Discord rejects this composition with HTTP 400.\n"
+            f"  Fix: build_ui() must add at least one top-level component "
+            f"(e.g. a card()). Render a placeholder card when the view would "
+            f"otherwise be empty."
+        )
+
     root_path: List[str] = [type(view).__name__]
     for index, child in enumerate(view.children):
         child_path = root_path + [f"{type(child).__name__}[{index}]"]

@@ -23,7 +23,10 @@ pattern with V2 components:
     - ``protect_attached = False`` -- a lobby is a staging area, not
       a committed game. When the host opens a new lobby, the old one is
       replaced and ``on_replaced`` pings each waiting participant
-    - ``card()`` + ``key_value()`` for the structured lobby display
+    - Single status-colored lobby card: an ``image_section`` host header
+      (avatar thumbnail, no fetches), ``key_value`` + ``progress_bar``
+      fill state, a roster whose open slots render as ``-#`` subtext
+      lines, and the control row as a card child
     - Custom reducer tracking lobby completions in application state
 
 Commands:
@@ -52,7 +55,9 @@ from cascadeui import (
     card,
     cascade_reducer,
     divider,
+    image_section,
     key_value,
+    progress_bar,
 )
 
 logger = logging.getLogger(__name__)
@@ -72,7 +77,7 @@ COLOR_CLOSED = discord.Color.dark_grey()
 
 
 def _lobby_stats_default():
-    return {"opened": 0, "started": 0, "disbanded": 0}
+    return {"started": 0, "disbanded": 0}
 
 
 @cascade_reducer("LOBBY_STARTED")
@@ -132,90 +137,140 @@ class LobbyView(StatefulLayoutView):
     # ``state_scope = None`` because lobby stats live under custom reducers
     # written to the global state tree, not under any built-in scope key.
     state_scope = None
+    # The lobby rebuilds from instance state in its own callbacks; the
+    # LOBBY_STARTED / LOBBY_DISBANDED dispatches are stat side effects
+    # this view never observes.
+    subscribed_actions = set()
     auto_defer = True
 
-    def __init__(self, *args, max_players: int = DEFAULT_MAX_PLAYERS, **kwargs):
+    def __init__(
+        self,
+        *args,
+        max_players: int = DEFAULT_MAX_PLAYERS,
+        host_avatar_url: str = None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
-        # Per-invocation policy override -- runs the same validator
-        # pipeline as __init_subclass__, so a slash-command argument
-        # outside the valid range fails immediately at view construction.
+        # Per-invocation policy override: runs the same validator
+        # pipeline as __init_subclass__, so a zero, negative, or non-int
+        # value fails at view construction. The 2-8 business range is the
+        # command's Range converter, not the library's.
         self.set_class_attribute("participant_limit", max_players)
+        # Host avatar for the header thumbnail; the cog resolves it from
+        # the invoking author, so no fetch or cache lookup happens here.
+        self._host_avatar_url = host_avatar_url
         self._started = False
         self.build_ui()
 
     # // ==================( UI )================== // #
 
     def build_ui(self) -> None:
+        """Render the lobby as one status-colored card, or the started recap.
+
+        Both states branch on ``_started`` here, so every caller renders
+        the right panel through the same ``build_ui()`` + ``refresh()``
+        pair.
+        """
         self.clear_items()
 
         host_mention = f"<@{self.user_id}>"
+
+        if self._started:
+            players = " ".join([host_mention] + [f"<@{uid}>" for uid in sorted(self.participants)])
+            # alert() prefixes its level emoji to the first line, and
+            # Discord only renders ## as a heading at line-start, so the
+            # recap leads with a bold line rather than a ## heading.
+            self.add_item(
+                alert(
+                    f"**\N{VIDEO GAME} Game Started!**\n"
+                    f"**Players:** {players}\n"
+                    f"-# Lobby closed \N{MIDDLE DOT} good luck!",
+                    level="success",
+                )
+            )
+            return
+
         slots_filled = len(self.participants) + 1  # +1 for host
         capacity = self.participant_limit
 
-        if self._started:
-            status = "Started"
-            color = COLOR_CLOSED
-        elif slots_filled >= capacity:
-            status = "Full"
+        if slots_filled >= capacity:
+            status = "\N{LARGE YELLOW CIRCLE} Full"
             color = COLOR_FULL
         else:
-            status = "Open"
+            status = "\N{LARGE GREEN CIRCLE} Open"
             color = COLOR_OPEN
 
-        # roster_lines is always non-empty -- the host is line 1.
-        roster_lines = [f"1. {host_mention} *(host)*"]
+        # The host avatar rides an image_section thumbnail; with no URL the
+        # header degrades to the same text as a plain card child.
+        header_text = (
+            f"## \N{GAME DIE} Game Lobby\n"
+            f"-# Hosted by {host_mention} \N{MIDDLE DOT} anyone can join"
+        )
+        header = (
+            image_section(header_text, url=self._host_avatar_url)
+            if self._host_avatar_url
+            else header_text
+        )
+
+        # Filled slots are numbered mention lines; open slots render as
+        # subtext so the remaining capacity is visible at a glance. The
+        # heading shares the roster TextDisplay instead of adding its own,
+        # keeping the card under Discord's 10-per-Container cap with room
+        # to grow.
+        roster_lines = [f"### Players", f"1. {host_mention} *(host)*"]
         for idx, uid in enumerate(sorted(self.participants), start=2):
             roster_lines.append(f"{idx}. <@{uid}>")
+        for slot in range(slots_filled + 1, capacity + 1):
+            roster_lines.append(f"-# {slot}. open")
         roster_text = "\n".join(roster_lines)
 
         self.add_item(
             card(
-                "## Game Lobby",
+                header,
+                divider(),
                 key_value(
                     {
-                        "Host": host_mention,
                         "Status": status,
                         "Slots": f"{slots_filled} / {capacity}",
                     }
                 ),
+                progress_bar(slots_filled, capacity, width=8, show_percent=False),
                 divider(),
-                "### Players",
                 roster_text,
-                color=color,
-            )
-        )
-
-        if not self._started:
-            self.add_item(
+                divider(),
                 ActionRow(
                     StatefulButton(
                         label="Join",
                         style=discord.ButtonStyle.success,
-                        emoji="\u2795",  # heavy plus
+                        emoji="\N{HEAVY PLUS SIGN}",
                         callback=self._join,
                     ),
                     StatefulButton(
                         label="Leave",
                         style=discord.ButtonStyle.secondary,
-                        emoji="\u2796",  # heavy minus
+                        emoji="\N{HEAVY MINUS SIGN}",
                         callback=self._leave,
                     ),
                     StatefulButton(
                         label="Start Game",
                         style=discord.ButtonStyle.primary,
-                        emoji="\u25b6",  # play
+                        emoji="\N{BLACK RIGHT-POINTING TRIANGLE}\N{VARIATION SELECTOR-16}",
                         callback=self._start,
                         owner_only=True,
                     ),
                     StatefulButton(
                         label="Disband",
                         style=discord.ButtonStyle.danger,
-                        emoji="\u274c",
+                        emoji="\N{CROSS MARK}",
                         callback=self._disband,
                         owner_only=True,
                     ),
-                )
+                ),
+                f"-# Anyone can join or leave \N{MIDDLE DOT} "
+                f"only the host can start or disband",
+                color=color,
             )
+        )
 
     # // ==================( Hooks )================== // #
 
@@ -301,13 +356,8 @@ class LobbyView(StatefulLayoutView):
         self._started = True
         await self.dispatch("LOBBY_STARTED", {"players": len(self.participants) + 1})
 
-        self.clear_items()
-        self.add_item(
-            alert(
-                f"## Game Started\n{len(self.participants) + 1} players are in.",
-                level="success",
-            )
-        )
+        # build_ui renders the started recap once the flag is set.
+        self.build_ui()
         await self.refresh()
 
     async def _disband(self, interaction: discord.Interaction):
@@ -341,6 +391,9 @@ class LobbyExample(commands.Cog, name="v2_lobby_example"):
             user_id=context.author.id,
             guild_id=context.guild.id if context.guild else None,
             max_players=max_players,
+            # display_avatar always resolves (falls back to the default
+            # avatar), and the 128px variant keeps the thumbnail light.
+            host_avatar_url=context.author.display_avatar.with_size(128).url,
         )
         await view.send()  # send() returns None if on_pre_send vetoes (returns False); the hook already responded
 

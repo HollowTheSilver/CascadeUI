@@ -57,10 +57,10 @@ logger = logging.getLogger(__name__)
 
 # Poll choices with their display emoji
 CHOICES = {
-    "python": "\U0001f40d",
-    "rust": "\U0001f980",
-    "go": "\U0001f439",
-    "typescript": "\U0001f4d8",
+    "python": "\N{SNAKE}",
+    "rust": "\N{CRAB}",
+    "go": "\N{HAMSTER FACE}",
+    "typescript": "\N{BLUE BOOK}",
 }
 
 
@@ -201,7 +201,7 @@ class PollView(StatefulLayoutView):
 
         # Header card -- theme accent applied automatically via
         # the contextvars-based theme context set by build_ui wrapping
-        self.add_item(card("## \U0001f4ca Quick Poll", "Vote for your favorite language!"))
+        self.add_item(card("## \N{BAR CHART} Quick Poll", "Vote for your favorite language!"))
         self.add_item(gap())
 
         # Results card using stats_card -- also theme-aware.
@@ -210,7 +210,7 @@ class PollView(StatefulLayoutView):
         result_stats = {}
         for lang, emoji in CHOICES.items():
             count = totals.get(lang, 0)
-            bar = "\u2588" * count + "\u2591" * max(0, 5 - count)
+            bar = "\N{FULL BLOCK}" * count + "\N{LIGHT SHADE}" * max(0, 5 - count)
             label = f"{emoji} {lang.capitalize()}"
             result_stats[label] = f"`{bar}` {count}"
 

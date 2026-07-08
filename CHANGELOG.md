@@ -23,6 +23,105 @@ preserved below for historical reference but are not the supported baseline.
 
 ---
 
+## [3.4.1] - 2026-07-08
+
+### Added
+
+- **Leaderboard page-frame hooks.** `build_header(page)` and
+  `build_footer(page)` on the leaderboard pattern place optional components
+  above the summary card and below the rankings card (above the navigation
+  row): the seam for a banner image or an attribution footer. Both default to
+  `None`, accept a single component or a list, and receive the zero-based page
+  index so a frame can target only the first page. `v2_leaderboard`
+  demonstrates both.
+- **Menu header/footer hooks are now public.** `MenuLayoutView.build_header()`
+  and `build_footer()` replace the underscore-prefixed pair, matching the
+  leaderboard's page-frame hook naming.
+- **Structured modal forms guide.** The components guide teaches the modal
+  input types and the edit-in-place defaults pattern, with `v2_wizard` as the
+  live reference.
+- **Option-count validation on modal groups.** `CheckboxGroup` enforces
+  Discord's 1-10 option bound and `RadioGroup` its 2-10 bound with a directed
+  `ValueError` at construction, replacing a silent acceptance that failed as
+  an HTTP 400 when the modal opened.
+- **Leaderboard card masthead.** A `banner` attribute (class attribute or
+  `banner=` kwarg; URL string, `discord.File`, or anything with a string
+  `.url` such as `guild.icon`) renders a full-width image at the top of the
+  rankings card, above the title heading when both are set. `title=None` (or
+  an empty string) now renders no text heading instead of a stray `## `, so
+  banner-only and heading-free cards are declarative -- with an empty
+  masthead the title divider is skipped. A `build_title(page)` hook replaces
+  the whole masthead for dynamic composition, same shape as
+  `build_header` / `build_footer`.
+
+### Changed
+
+- **`v2_wizard` example redesigned.** Every step now renders a live
+  character-sheet preview (with a name-seeded portrait) and folds its controls
+  into cards via `choice_row` and `action_section` instead of stacked bare
+  selects. Also resolves a bug in the prior version where the Background step
+  could not be advanced. The name and background modals now demonstrate the
+  structured modal inputs: a `FileUpload` portrait that replaces the preview
+  image, plus `RadioGroup`, `CheckboxGroup`, and `Checkbox` in one form.
+- **`v2_lobby` example redesigned.** The lobby renders as one status-colored
+  card: a host-avatar header, slot-fill progress bar, a roster that shows its
+  open slots, and the control row inside the card.
+- **Game-example challenge prompts enriched.** The `v2_tictactoe` and
+  `v2_battleship` challenge cards gain an opponent-avatar header, the game
+  config as a `key_value` block, and a caption naming who can respond and
+  when the prompt expires. The tictactoe board legend now also shows the win
+  condition, which was invisible during play on custom-size boards.
+- The 40-component-limit error now also suggests trimming content nodes, not
+  only compacting the pager row, since page content is the more common cause.
+- **`v2_settings` example teaches the dynamic-theme idiom.** The hub and
+  appearance page override `get_theme()` to read the user's selected theme
+  from scoped state, replacing per-card color plumbing -- every card follows
+  a theme switch automatically.
+
+### Deprecated
+
+- **`MenuLayoutView._build_header()` / `_build_footer()`.** Superseded by the
+  public `build_header()` / `build_footer()`. Existing overrides keep
+  rendering (the public hooks delegate to them) and a `DeprecationWarning`
+  fires at class definition; migrate by dropping the underscore.
+
+### Fixed
+
+- **Empty V2 views now fail with a directed error.** `validate_placement`
+  rejects a `LayoutView` with no top-level components at send, refresh, and
+  navigation, replacing Discord's terse HTTP 400 for an empty components-v2
+  message with a build-time `ValueError` that names the fix.
+- **Empty modals now fail with a directed error.** `open_modal` rejects a modal
+  with no components before it is sent, replacing a Discord HTTP 400.
+- **Media-only rebuilds now re-render.** The render digest hashes media URLs
+  (`MediaGallery` items, `Thumbnail`, `File`), so a rebuild that changes only
+  an image (a regenerated banner, a new avatar) ships the edit instead of
+  being skipped as an unchanged tree.
+- **`nav_inside_container` no longer rejects mixed pages.** A page combining a
+  `Container` with other top-level items (a rankings card plus a standalone
+  summary card or frame components) previously raised a nested-Container
+  placement error. Such pages now fall back to the sibling layout with the
+  navigation row as a separate row; pages that can wrap still do.
+- **README Hello World example runs as copied.** It was missing the initial
+  `build_ui()` call in `__init__`, so a verbatim copy failed on first send.
+  The quickstart now also states the first-render rule explicitly.
+- **Stale modal-input limitation removed.** The known-limitations page claimed
+  structured modal inputs (`Checkbox`, `CheckboxGroup`, `RadioGroup`) fail
+  with a Discord 400, contradicting the component docs that teach them. The
+  full serialize-and-submit loop verifies against discord.py 2.7.0 and 2.7.1,
+  so the section is gone.
+- **Theme accents apply everywhere, not only inside `build_ui()`.** Pattern
+  render paths (leaderboard page builds, wizard steps, tab builders, paginated
+  formatters, `on_load`) now run inside the view's theme context, and cards
+  built without an explicit color re-resolve against the view's live theme at
+  every render seam -- a card renders themed no matter where it was built, and
+  a runtime theme switch restyles managed cards on the next refresh. The
+  theme's `separator_spacing` style, documented but previously unread, now
+  drives `divider()` / `gap()` spacing the same way. Explicit colors and
+  spacing always win.
+
+---
+
 ## [3.4.0] - 2026-07-01
 
 ### Added

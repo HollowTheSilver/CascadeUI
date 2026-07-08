@@ -2,26 +2,31 @@
 V2 Wizard -- D&D Character Creator
 ==================================
 
-A five-step character creator that demonstrates ``WizardLayoutView``
-handling the full range of wizard features in a single flow:
+A multi-step character creator that demonstrates ``WizardLayoutView``
+handling the full range of wizard features in a single, richly composed
+flow:
 
-    - Text input via a modal opened from a step button
-    - Inline selects and toggles for structured input (alignment,
-      languages, heroic destiny) alongside a modal for free-form text
-    - Cascading selects where later options depend on earlier choices
-    - Point-pool allocation with live remaining-count feedback
+    - A live character-sheet preview card, shown on every step, that fills
+      in as choices are made (with a name-seeded portrait via ``image_section``)
+    - Controls folded into titled cards (``action_section`` / ``choice_row`` /
+      ``toggle_section``) rather than bare rows floating beneath a text card
+    - ``choice_row`` segmented controls that highlight the active option and
+      auto-fold to a dropdown once the option set outgrows a button row
+    - Cascading choices where later options depend on earlier ones
+    - Structured modal inputs across all five wrapper types: the name
+      modal pairs a ``TextInput`` with an optional ``FileUpload`` portrait
+      (the upload replaces the generated preview image), and the
+      background modal combines a paragraph ``TextInput`` with a
+      ``RadioGroup``, a ``CheckboxGroup``, and a ``Checkbox`` in one form
+    - Point-pool allocation with a live ``progress_bar``
     - Per-step validators that block progression with fail-loud errors
-    - A final review card assembled from every prior step's state
     - Navigation-button customization via the
       ``back/next/finish_button_{label,emoji,style}`` triples
     - ``on_finish`` as a method hook that posts the finished sheet
 
-The character progression mirrors a simplified D&D 5e flow: pick a race,
-then a race-gated class, then a class-gated subclass, then allocate a
-pool of ability points, then fill in background details (backstory,
-alignment, languages, and an optional heroic-destiny flag). Every step
-reads from and writes to instance state, and the review step composes
-the full sheet from all accumulated values.
+Emoji use Python's ``\\N{NAME}`` named escapes throughout: they read
+clearly in source, grep cleanly, and avoid the raw-glyph pitfalls that
+bite copy-paste and search-and-replace.
 
 Commands:
     /v2wizard   Start the character creator
@@ -34,6 +39,7 @@ Usage:
 
 
 import logging
+from urllib.parse import quote
 
 import discord
 from discord.ext import commands
@@ -41,16 +47,23 @@ from discord.ext.commands import Context
 from discord.ui import ActionRow, TextDisplay
 
 from cascadeui import (
+    Checkbox,
+    CheckboxGroup,
     DisplayLayoutView,
+    FileUpload,
     Modal,
-    StatefulButton,
+    RadioGroup,
     StatefulSelect,
     TextInput,
     WizardLayoutView,
     WizardStep,
+    action_section,
     card,
+    choice_row,
     divider,
+    image_section,
     key_value,
+    progress_bar,
     toggle_section,
 )
 
@@ -95,7 +108,7 @@ ALIGNMENTS = [
 ]
 
 # Common is always known; racial languages are pre-selected as defaults
-# in the background step's language select based on the chosen race.
+# in the background step based on the chosen race.
 LANGUAGES = ["Common", "Elvish", "Dwarvish", "Halfling", "Draconic", "Infernal", "Celestial"]
 RACIAL_LANGUAGES = {
     "Human": [],
@@ -103,6 +116,12 @@ RACIAL_LANGUAGES = {
     "Dwarf": ["Dwarvish"],
     "Halfling": ["Halfling"],
 }
+
+# Origin and tool proficiencies are collected inside the background modal
+# via RadioGroup and CheckboxGroup, so the step card stays compact while
+# the modal carries the structured detail.
+ORIGINS = ["Noble", "Commoner", "Outlander"]
+TOOLS = ["Smith's tools", "Thieves' tools", "Herbalism kit", "Cartographer's tools"]
 
 ABILITIES = ["STR", "DEX", "CON", "INT", "WIS", "CHA"]
 ABILITY_NAMES = {
@@ -125,14 +144,15 @@ MAX_SCORE = 15
 
 
 class CharacterCreatorView(WizardLayoutView):
-    """Five-step D&D character creator built on ``WizardLayoutView``.
+    """Multi-step D&D character creator built on ``WizardLayoutView``.
 
     Step order:
-        1. Identity       -- Name (modal) and race
-        2. Class          -- Race-gated class and class-gated subclass
-        3. Attributes     -- Point-pool allocation across six stats
-        4. Background     -- Inline selects + toggle + backstory modal
-        5. Review         -- Full character sheet summary
+        1. Identity     -- Name (modal) and race
+        2. Class        -- Race-gated class and class-gated subclass
+        3. Attributes   -- Point-pool allocation across six stats
+        4. Background   -- Alignment, languages, destiny, and a backstory modal
+        5. Destiny      -- Conditional flavor step (Heroic Destiny only)
+        6. Review       -- Full character sheet summary
     """
 
     # // ----( Policy surface )---- // #
@@ -152,10 +172,8 @@ class CharacterCreatorView(WizardLayoutView):
     )
 
     # // ----( Progress header )---- // #
-    # Setting ``show_progress_bar = True`` tells ``WizardLayoutView`` to
-    # render a progress bar above every step. The header uses the
-    # ``step_indicator_label`` text plus a proportional progress bar --
-    # override ``_build_progress_header`` to customize the header card.
+    # ``show_progress_bar = True`` tells ``WizardLayoutView`` to render a
+    # proportional progress bar above every step.
     show_progress_bar = True
 
     # // ----( Navigation-button customization )---- // #
@@ -163,24 +181,28 @@ class CharacterCreatorView(WizardLayoutView):
     # class attributes. The back, next, and finish triples together form
     # the full customization surface.
     back_button_label = "Previous"
-    back_button_emoji = "\u2b05\ufe0f"  # ⬅️
+    back_button_emoji = "\N{LEFTWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}"
     back_button_style = discord.ButtonStyle.secondary
     next_button_label = "Continue"
-    next_button_emoji = "\u27a1\ufe0f"  # ➡️
+    next_button_emoji = "\N{BLACK RIGHTWARDS ARROW}\N{VARIATION SELECTOR-16}"
     next_button_style = discord.ButtonStyle.primary
     finish_button_label = "Create Character"
-    finish_button_emoji = "\U0001f3b2"  # 🎲
+    finish_button_emoji = "\N{GAME DIE}"
     finish_button_style = discord.ButtonStyle.success
 
     def __init__(self, *args, **kwargs):
         # Character sheet state. Every step reads from and writes to
-        # these attributes; the review step composes them into a card.
+        # these attributes; the preview and review compose them into cards.
         self._name: str = ""
+        self._portrait: str = ""  # Uploaded portrait URL; falls back to DiceBear
         self._race: str = ""
         self._class: str = ""
         self._subclass: str = ""
         self._scores: dict[str, int] = {a: STARTING_SCORE for a in ABILITIES}
         self._backstory: str = ""
+        self._origin: str = ""
+        self._tools: list[str] = []
+        self._haunted: bool = False
         self._alignment: str = ""
         self._languages: list[str] = []
         self._heroic_destiny: bool = False
@@ -189,12 +211,9 @@ class CharacterCreatorView(WizardLayoutView):
         # bound-method references (``self.build_identity``, not
         # ``self.build_identity()``) -- the wizard calls them each time a
         # step renders, reading whatever the instance attributes above hold
-        # at that moment. ``WizardStep`` validates ``name`` non-empty and
-        # ``builder``/``validator``/``condition`` callability at
-        # construction, so an accidental trailing ``()`` raises
-        # ``ValueError`` at class-load time rather than on the first click.
-        # Review has no validator because the finish button runs on the
-        # last step's accumulated state.
+        # at that moment. An accidental trailing ``()`` raises ``ValueError``
+        # at class-load time rather than on the first click. Review has no
+        # validator because the finish button runs on the last step.
         steps = [
             WizardStep(
                 name="Identity",
@@ -216,13 +235,10 @@ class CharacterCreatorView(WizardLayoutView):
                 builder=self.build_background,
                 validator=self.validate_background,
             ),
-            # The Destiny step is conditional: it only renders when the
-            # Heroic Destiny toggle on the Background step is set.
-            # ``condition`` receives the live view so reading
-            # ``v._heroic_destiny`` reflects whatever the Background step
-            # wrote last. Conditions are re-evaluated on every
-            # navigation, so toggling the destiny flag back off hides the
-            # step immediately and the step indicator re-flows.
+            # The Destiny step is conditional: it renders only when the
+            # Heroic Destiny toggle on the Background step is set. Conditions
+            # are re-evaluated on every navigation, so toggling the flag off
+            # hides the step immediately and the step indicator re-flows.
             WizardStep(
                 name="Destiny",
                 builder=self.build_destiny,
@@ -231,8 +247,8 @@ class CharacterCreatorView(WizardLayoutView):
             WizardStep(name="Review", builder=self.build_review),
         ]
         # Per-step analytics counters -- ``on_validation_failed`` records
-        # validator rejections so post-hoc analysis can see which step
-        # the user is repeatedly bouncing off.
+        # validator rejections so post-hoc analysis can see which step the
+        # user is repeatedly bouncing off.
         self._validation_failures: dict[int, int] = {}
         super().__init__(*args, steps=steps, **kwargs)
 
@@ -242,8 +258,8 @@ class CharacterCreatorView(WizardLayoutView):
         """Fires after each step becomes active (initial send, next, back).
 
         Fire-and-forget -- exceptions raised here are logged but do not
-        block navigation. Common uses: analytics, prefetch, per-step
-        side effects that do not belong in the builder itself.
+        block navigation. Common uses: analytics, prefetch, per-step side
+        effects that do not belong in the builder itself.
         """
         logger.info(
             "Wizard step entered: user=%s step=%s/%s",
@@ -255,13 +271,14 @@ class CharacterCreatorView(WizardLayoutView):
     async def on_validation_failed(self, step_index: int, error: str, interaction):
         """Fires when the current step's validator returns ``(False, error)``.
 
-        The third ``interaction`` argument is the raw Discord interaction
-        that tripped the validator -- forward it to ``self.respond(...)``
-        when the override needs to surface a custom error to the user.
-        Useful for counting retry loops, surfacing stuck users to a
-        moderator channel, or gating retries behind a cooldown.
+        The counter here is additive analytics. The ``super()`` call is what
+        preserves the built-in behavior: the base hook sends ``error`` to the
+        user as an ephemeral response. An override that skips it silently hides
+        why the wizard will not advance, so always call up unless you replace
+        the feedback yourself with ``self.respond(interaction, ...)``.
         """
         self._validation_failures[step_index] = self._validation_failures.get(step_index, 0) + 1
+        await super().on_validation_failed(step_index, error, interaction)
 
     # // ========================================( Derived helpers )======================================== // #
 
@@ -279,51 +296,106 @@ class CharacterCreatorView(WizardLayoutView):
     def _available_subclasses(self) -> list[str]:
         return SUBCLASSES_BY_CLASS.get(self._class, [])
 
+    # // ========================================( Live character sheet )======================================== // #
+
+    def _portrait_url(self) -> str:
+        """A deterministic character portrait seeded by the name.
+
+        Uses DiceBear's ``adventurer`` style, so the portrait is stable for
+        a given name and changes the moment the name does. A ``Section``
+        accessory cannot be null, so a race/class fallback seed keeps the
+        thumbnail present before a name is entered.
+        """
+        seed = self._name or f"{self._race or 'hero'}-{self._class or 'adventurer'}"
+        return f"https://api.dicebear.com/9.x/adventurer/png?seed={quote(seed)}&size=256"
+
+    def _build_sheet_preview(self):
+        """The live character sheet, shown on top of every step.
+
+        This panel is what makes the wizard read like an app rather than a
+        form: every choice appears here immediately, so the character takes
+        shape as the user moves through the steps. Only fields that have
+        been filled render, so the card grows as the flow progresses.
+        """
+        name = self._name or "Unnamed Hero"
+        lineage = f"{self._race} {self._class}".strip()
+        subclass = f" \N{MIDDLE DOT} {self._subclass}" if self._subclass else ""
+        summary = f"*{lineage}{subclass}*" if self._race else "*Pick a race to begin your legend.*"
+
+        fields: dict[str, str] = {}
+        if self._race:
+            fields["Race"] = self._race
+        if self._class:
+            fields["Class"] = f"{self._class} ({self._subclass})" if self._subclass else self._class
+        if self._points_remaining != POINT_POOL:
+            fields["Attributes"] = " \N{MIDDLE DOT} ".join(
+                f"{a} {self._scores[a]}" for a in ABILITIES
+            )
+        if self._alignment:
+            fields["Alignment"] = self._alignment
+        if self._origin or self._haunted:
+            quirk = "haunted past" if self._haunted else ""
+            fields["Origin"] = " \N{MIDDLE DOT} ".join(p for p in (self._origin, quirk) if p)
+        if self._tools:
+            fields["Tools"] = ", ".join(self._tools)
+        if self._languages:
+            fields["Languages"] = ", ".join(self._languages)
+        if self._heroic_destiny:
+            fields["Destiny"] = "Marked for greatness"
+
+        # An uploaded portrait (from the name modal's FileUpload) replaces
+        # the generated one the moment it lands.
+        portrait = self._portrait or self._portrait_url()
+        children: list = [image_section(f"### \N{SCROLL} {name}\n{summary}", url=portrait)]
+        if fields:
+            children.append(divider())
+            children.append(key_value(fields))
+        return card(*children, color=discord.Color.dark_teal())
+
     # // ========================================( Step 1 - Identity )======================================== // #
 
     async def build_identity(self):
-        """Name button + race select.
+        """Name (modal, folded into a card) + race as a segmented choice_row.
 
-        The name is captured through a modal so a paragraph of free text
-        does not have to be squeezed into a select option. The race
-        select rebuilds on each change so the chosen option is visible
-        in the card heading below.
+        The name opens a modal so a paragraph of free text does not have to
+        squeeze into a select option; the button that opens it is folded into
+        the card via ``action_section`` rather than left floating. Race is a
+        ``choice_row`` so all four options show at once as segmented buttons.
         """
-        name_display = f"**{self._name}**" if self._name else "_not set_"
-        race_display = f"**{self._race}**" if self._race else "_not set_"
+        name_summary = f"**Name:** {self._name}" if self._name else "**Name:** _not set_"
 
-        body = card(
-            "## \U0001f3ad Identity",
+        controls = card(
+            "## \N{PERFORMING ARTS} Identity",
             TextDisplay(
-                "Every adventurer starts with a name and a lineage. Pick "
-                "both here - the available classes on the next step depend "
-                "on the race chosen."
+                "Every adventurer starts with a name and a lineage. The "
+                "classes available on the next step depend on the race chosen."
             ),
             divider(),
-            key_value({"Name": name_display, "Race": race_display}),
+            action_section(
+                name_summary,
+                label="Edit Name" if self._name else "Enter Name",
+                callback=self._open_name_modal,
+                style=discord.ButtonStyle.primary,
+                emoji="\N{WRITING HAND}\N{VARIATION SELECTOR-16}",
+            ),
+            choice_row(
+                {race: race for race in RACES},
+                on_select=self._on_race_selected,
+                selected=self._race or None,
+                custom_id="wiz_race",
+            ),
             color=discord.Color.blurple(),
         )
+        return [self._build_sheet_preview(), controls]
 
-        name_btn = StatefulButton(
-            label="Enter Name",
-            style=discord.ButtonStyle.primary,
-            emoji="\u270d\ufe0f",
-            callback=self._open_name_modal,
-        )
+    def _build_name_modal(self) -> Modal:
+        """Compose the identity modal: name text plus an optional portrait.
 
-        race_select = StatefulSelect(
-            placeholder="Choose a race...",
-            options=[
-                discord.SelectOption(label=race, value=race, default=(race == self._race))
-                for race in RACES
-            ],
-            callback=self._on_race_selected,
-        )
-
-        return [body, ActionRow(name_btn), ActionRow(race_select)]
-
-    async def _open_name_modal(self, interaction):
-        """Open a modal that writes the submitted text back to ``self._name``."""
+        ``FileUpload`` demonstrates a structured modal input beyond text:
+        the submitted attachment's URL replaces the generated portrait in
+        the live sheet preview. Attachment URLs are CDN links tied to the
+        upload, so the swap holds for the life of the session.
+        """
         name_input = TextInput(
             label="Character Name",
             placeholder="e.g. Kael Ironbeard",
@@ -332,27 +404,36 @@ class CharacterCreatorView(WizardLayoutView):
             min_length=1,
             max_length=40,
         )
+        portrait_input = FileUpload(
+            label="Portrait",
+            description="Optional: upload an image to replace the generated portrait.",
+            required=False,
+            max_values=1,
+        )
 
         async def on_submitted(modal_interaction, values):
-            # The ``name_input`` reference is captured by this closure at
-            # modal construction time; ``name_input.value`` holds the
-            # submitted text after Discord delivers the modal payload.
+            # The wrapper instances are captured by this closure at modal
+            # construction time; ``.value`` / ``.values`` hold the submitted
+            # payload after Discord delivers it.
             self._name = (name_input.value or "").strip()
+            if portrait_input.values:
+                self._portrait = portrait_input.values[0].url
             await self._refresh_wizard()
 
-        modal = Modal(
+        return Modal(
             title="Name your character",
-            inputs=[name_input],
+            inputs=[name_input, portrait_input],
             callback=on_submitted,
         )
-        await self.open_modal(interaction, modal)
 
-    async def _on_race_selected(self, interaction, values):
-        new_race = values[0]
-        if new_race != self._race:
+    async def _open_name_modal(self, interaction):
+        await self.open_modal(interaction, self._build_name_modal())
+
+    async def _on_race_selected(self, interaction, value):
+        if value != self._race:
             # Changing race invalidates any previous class and subclass
             # because the class pool is gated by race.
-            self._race = new_race
+            self._race = value
             self._class = ""
             self._subclass = ""
         await self._refresh_wizard()
@@ -367,62 +448,48 @@ class CharacterCreatorView(WizardLayoutView):
     # // ========================================( Step 2 - Class )======================================== // #
 
     async def build_class(self):
-        """Class + subclass selects, gated by the prior step's race.
+        """Class + subclass as segmented choice_rows, gated by the race.
 
-        The subclass select renders as a disabled placeholder until a
-        class has been picked, so the dependency chain is obvious.
+        The subclass row appears only once a class is chosen, so the
+        dependency chain is obvious.
         """
-        class_display = f"**{self._class}**" if self._class else "_not set_"
-        subclass_display = f"**{self._subclass}**" if self._subclass else "_not set_"
-
-        body = card(
-            f"## \u2694\ufe0f Class - {self._race}",
+        children: list = [
+            "## \N{CROSSED SWORDS}\N{VARIATION SELECTOR-16} Class",
             TextDisplay(
-                f"A {self._race} can train as any of the classes below. "
-                "Subclass options appear once a class is chosen."
+                f"A **{self._race}** can train as any of the classes below. "
+                "A subclass appears once a class is chosen."
             ),
             divider(),
-            key_value({"Class": class_display, "Subclass": subclass_display}),
-            color=discord.Color.dark_red(),
-        )
-
-        class_options = [
-            discord.SelectOption(label=c, value=c, default=(c == self._class))
-            for c in self._available_classes()
+            choice_row(
+                {c: c for c in self._available_classes()},
+                on_select=self._on_class_selected,
+                selected=self._class or None,
+                custom_id="wiz_class",
+            ),
         ]
-        class_select = StatefulSelect(
-            placeholder="Choose a class...",
-            options=class_options,
-            callback=self._on_class_selected,
-        )
-
-        rows: list = [body, ActionRow(class_select)]
-
         if self._class:
-            subclass_options = [
-                discord.SelectOption(label=s, value=s, default=(s == self._subclass))
-                for s in self._available_subclasses()
-            ]
-            subclass_select = StatefulSelect(
-                placeholder="Choose a subclass...",
-                options=subclass_options,
-                callback=self._on_subclass_selected,
+            children.append(TextDisplay("**Subclass**"))
+            children.append(
+                choice_row(
+                    {s: s for s in self._available_subclasses()},
+                    on_select=self._on_subclass_selected,
+                    selected=self._subclass or None,
+                    custom_id="wiz_subclass",
+                )
             )
-            rows.append(ActionRow(subclass_select))
+        controls = card(*children, color=discord.Color.dark_red())
+        return [self._build_sheet_preview(), controls]
 
-        return rows
-
-    async def _on_class_selected(self, interaction, values):
-        new_class = values[0]
-        if new_class != self._class:
+    async def _on_class_selected(self, interaction, value):
+        if value != self._class:
             # Subclass pool is gated by class, so changing class clears
             # any stale subclass choice.
-            self._class = new_class
+            self._class = value
             self._subclass = ""
         await self._refresh_wizard()
 
-    async def _on_subclass_selected(self, interaction, values):
-        self._subclass = values[0]
+    async def _on_subclass_selected(self, interaction, value):
+        self._subclass = value
         await self._refresh_wizard()
 
     async def validate_class(self):
@@ -437,65 +504,57 @@ class CharacterCreatorView(WizardLayoutView):
     async def build_abilities(self):
         """Point-pool allocation across six attributes.
 
-        Every attribute starts at 8 and a pool of 6 points is available.
-        The select increments the chosen ability by 1; the reset button
-        zeroes the allocation so the user can start over.
+        The pool is shown as a live ``progress_bar``; the increment select
+        keeps its dynamic labels (too long for buttons), and Reset is folded
+        into the card via ``action_section``.
         """
-        lines = [f"{ABILITY_NAMES[a]}: **{self._scores[a]}**" for a in ABILITIES]
-        pool_line = f"**Points remaining:** {self._points_remaining} / {POINT_POOL}"
+        lines = "  \N{MIDDLE DOT}  ".join(f"{a} **{self._scores[a]}**" for a in ABILITIES)
 
-        body = card(
-            "## \U0001f4ca Attributes",
-            TextDisplay(
-                f"Every attribute starts at {STARTING_SCORE}. Spend all "
-                f"{POINT_POOL} points by increasing the attributes of "
-                "your choice. Values cap at "
-                f"{MAX_SCORE}, and the Continue button stays locked "
-                "until the pool is empty."
-            ),
-            divider(),
-            TextDisplay("\n".join(lines)),
-            divider(),
-            TextDisplay(pool_line),
-            color=discord.Color.gold(),
-        )
-
-        # Only abilities that are below the cap and that the pool can
-        # still afford are offered as increment targets. When the filter
-        # produces an empty list, ``StatefulSelect`` substitutes a
-        # disabled placeholder automatically, so no fallback branch is
-        # needed here -- the placeholder text alone communicates state.
+        # Only abilities below the cap that the pool can still afford are
+        # offered. An empty list yields a disabled placeholder automatically.
         eligible = [
             a for a in ABILITIES if self._scores[a] < MAX_SCORE and self._points_remaining > 0
         ]
         if eligible:
             placeholder = "Spend a point on..."
         elif self._points_remaining == 0:
-            placeholder = "Pool empty -- press Continue or Reset"
+            placeholder = "Pool empty - press Continue"
         else:
-            placeholder = "Every score is at the cap -- press Reset"
+            placeholder = "Every score is at the cap - press Reset"
 
         increment_select = StatefulSelect(
             placeholder=placeholder,
             options=[
                 discord.SelectOption(
-                    label=f"+1 {ABILITY_NAMES[a]} (now {self._scores[a]} → {self._scores[a] + 1})",
+                    label=f"+1 {ABILITY_NAMES[a]} (now {self._scores[a]} \N{RIGHTWARDS ARROW} {self._scores[a] + 1})",
                     value=a,
                 )
                 for a in eligible
             ],
             callback=self._on_point_spent,
         )
-        select_row = ActionRow(increment_select)
 
-        reset_btn = StatefulButton(
-            label="Reset",
-            style=discord.ButtonStyle.secondary,
-            emoji="\u21a9\ufe0f",
-            callback=self._reset_scores,
+        controls = card(
+            "## \N{BAR CHART} Attributes",
+            TextDisplay(
+                f"Every attribute starts at {STARTING_SCORE}. Spend all {POINT_POOL} "
+                f"points; scores cap at {MAX_SCORE}. Continue unlocks when the pool is empty."
+            ),
+            divider(),
+            TextDisplay(lines),
+            progress_bar(self._points_spent, POINT_POOL, width=12, show_percent=False),
+            TextDisplay(f"-# {self._points_remaining} of {POINT_POOL} points remaining"),
+            ActionRow(increment_select),
+            action_section(
+                "Start the allocation over.",
+                label="Reset",
+                callback=self._reset_scores,
+                style=discord.ButtonStyle.secondary,
+                emoji="\N{LEFTWARDS ARROW WITH HOOK}\N{VARIATION SELECTOR-16}",
+            ),
+            color=discord.Color.gold(),
         )
-
-        return [body, select_row, ActionRow(reset_btn)]
+        return [self._build_sheet_preview(), controls]
 
     async def _on_point_spent(self, interaction, values):
         ability = values[0]
@@ -512,93 +571,84 @@ class CharacterCreatorView(WizardLayoutView):
         if self._points_remaining != 0:
             return (
                 False,
-                f"Allocate every point before continuing " f"({self._points_remaining} remaining).",
+                f"Allocate every point before continuing ({self._points_remaining} remaining).",
             )
         return True, ""
 
     # // ========================================( Step 4 - Background )======================================== // #
 
     async def build_background(self):
-        """Backstory, alignment, languages, and heroic destiny.
+        """Alignment, languages, destiny, and a background modal, one card.
 
-        Structured choices (alignment, languages, destiny) are inline
-        components on the step page. Free-form text (backstory) opens a
-        modal -- modals are the right tool for paragraph-length input,
-        while selects and toggles work better inline where the user can
-        see every option at a glance.
+        Alignment and languages are ``choice_row``s (both outgrow a button
+        row, so they fold to dropdowns); Heroic Destiny is a
+        ``toggle_section``. The backstory button opens the structured
+        background modal -- paragraph text, origin radio, tool checkboxes,
+        and a quirk flag in a single form (see ``_build_background_modal``).
         """
-        # Backstory preview
-        if self._backstory:
-            preview = self._backstory
-            if len(preview) > 300:
-                preview = preview[:297] + "..."
-            backstory_display = f"> {preview}"
-        else:
-            backstory_display = "_Not written yet._"
+        # Common (always known) plus any racial languages are known by
+        # default. Seed them on first entry so the pre-selected options count
+        # as chosen; without this the validator sees an empty list even
+        # though the select shows them ticked.
+        if not self._languages:
+            self._languages = sorted({"Common"} | set(RACIAL_LANGUAGES.get(self._race, [])))
 
-        body = card(
-            "## \U0001f4dc Background",
+        if self._backstory:
+            preview = self._backstory[:200] + ("..." if len(self._backstory) > 200 else "")
+            backstory_summary = f"**Backstory:** {preview}"
+        else:
+            backstory_summary = "**Backstory:** _not written yet_"
+
+        controls = card(
+            "## \N{SCROLL} Background",
             TextDisplay(
-                "Every adventurer carries a history. Choose an alignment, "
-                "select the languages this character knows, and write a "
-                "backstory to bring them to life."
+                "Choose an alignment, the languages this character knows, and "
+                "write a backstory to bring them to life."
             ),
             divider(),
-            key_value({"Backstory": backstory_display}),
+            action_section(
+                backstory_summary,
+                label="Edit Background" if self._backstory else "Write Background",
+                callback=self._open_backstory_modal,
+                style=discord.ButtonStyle.primary,
+                emoji="\N{MEMO}",
+            ),
+            TextDisplay("**Alignment**"),
+            choice_row(
+                {a: a for a in ALIGNMENTS},
+                on_select=self._on_alignment_selected,
+                selected=self._alignment or None,
+                custom_id="wiz_alignment",
+                placeholder="Choose an alignment...",
+            ),
+            TextDisplay("**Languages**"),
+            choice_row(
+                {lang: lang for lang in LANGUAGES},
+                on_select=self._on_languages_selected,
+                selected=set(self._languages),
+                multi=True,
+                custom_id="wiz_languages",
+                placeholder="Select languages known...",
+            ),
+            toggle_section(
+                "**Heroic Destiny** - fate has marked this character for greatness",
+                active=self._heroic_destiny,
+                callback=self._on_destiny_toggled,
+            ),
             color=discord.Color.dark_purple(),
         )
+        return [self._build_sheet_preview(), controls]
 
-        backstory_btn = StatefulButton(
-            label="Edit Backstory" if self._backstory else "Write Backstory",
-            style=discord.ButtonStyle.primary,
-            emoji="\U0001f4dd",
-            callback=self._open_backstory_modal,
-        )
+    def _build_background_modal(self) -> Modal:
+        """Compose the background modal: one form, four input types.
 
-        alignment_select = StatefulSelect(
-            placeholder="Choose an alignment...",
-            options=[
-                discord.SelectOption(label=a, value=a, default=(a == self._alignment))
-                for a in ALIGNMENTS
-            ],
-            callback=self._on_alignment_selected,
-        )
-
-        # Pre-select Common (always known) and any racial languages
-        # based on the race chosen in step 1. Previously selected
-        # languages are preserved across step rebuilds.
-        racial_defaults = {"Common"} | set(RACIAL_LANGUAGES.get(self._race, []))
-        selected = set(self._languages) if self._languages else racial_defaults
-        language_select = StatefulSelect(
-            placeholder="Select languages known...",
-            options=[
-                discord.SelectOption(label=lang, value=lang, default=(lang in selected))
-                for lang in LANGUAGES
-            ],
-            min_values=1,
-            max_values=len(LANGUAGES),
-            callback=self._on_languages_selected,
-        )
-
-        # ``toggle_section`` auto-selects the Enabled/Disabled label and
-        # green/red style from ``active=``, so the destiny row collapses
-        # to one call instead of a hand-rolled label/style branch + card.
-        destiny_row = toggle_section(
-            "**Heroic Destiny** -- fate has marked this character for greatness",
-            active=self._heroic_destiny,
-            callback=self._on_destiny_toggled,
-        )
-
-        return [
-            body,
-            ActionRow(backstory_btn),
-            ActionRow(alignment_select),
-            ActionRow(language_select),
-            destiny_row,
-        ]
-
-    async def _open_backstory_modal(self, interaction):
-        """Open a modal for the backstory paragraph."""
+        A paragraph ``TextInput``, a ``RadioGroup`` (pick-one origin), a
+        ``CheckboxGroup`` (up to two tool proficiencies), and a ``Checkbox``
+        flag share a single modal, so the step card stays compact while
+        the form carries the structured detail. Current selections
+        pre-fill via each option's ``default`` so re-opening the modal
+        shows the character as already built.
+        """
         backstory_input = TextInput(
             label="Backstory",
             placeholder="Where did your character come from? What drives them?",
@@ -608,24 +658,46 @@ class CharacterCreatorView(WizardLayoutView):
             max_length=1500,
             style=discord.TextStyle.paragraph,
         )
+        origin_input = RadioGroup(
+            label="Origin",
+            required=False,
+            options=[{"label": o, "value": o, "default": o == self._origin} for o in ORIGINS],
+        )
+        tools_input = CheckboxGroup(
+            label="Tool Proficiencies",
+            description="Pick up to two.",
+            required=False,
+            max_values=2,
+            options=[{"label": t, "value": t, "default": t in self._tools} for t in TOOLS],
+        )
+        haunted_input = Checkbox(
+            label="Haunted Past",
+            description="Something from long ago still follows this character.",
+            default=self._haunted,
+        )
 
         async def on_submitted(modal_interaction, values):
             self._backstory = (backstory_input.value or "").strip()
+            self._origin = origin_input.value or ""
+            self._tools = list(tools_input.values or [])
+            self._haunted = bool(haunted_input.value)
             await self._refresh_wizard()
 
-        modal = Modal(
-            title="Character Backstory",
-            inputs=[backstory_input],
+        return Modal(
+            title="Character Background",
+            inputs=[backstory_input, origin_input, tools_input, haunted_input],
             callback=on_submitted,
         )
-        await self.open_modal(interaction, modal)
 
-    async def _on_alignment_selected(self, interaction, values):
-        self._alignment = values[0]
+    async def _open_backstory_modal(self, interaction):
+        await self.open_modal(interaction, self._build_background_modal())
+
+    async def _on_alignment_selected(self, interaction, value):
+        self._alignment = value
         await self._refresh_wizard()
 
     async def _on_languages_selected(self, interaction, values):
-        self._languages = list(values)
+        self._languages = sorted(values)
         await self._refresh_wizard()
 
     async def _on_destiny_toggled(self, interaction):
@@ -646,14 +718,14 @@ class CharacterCreatorView(WizardLayoutView):
     async def build_destiny(self):
         """Flavor card rendered only when Heroic Destiny is enabled.
 
-        Reached via the conditional ``condition=lambda v: v._heroic_destiny``
-        on the step definition. No validator -- a user who flips Heroic
-        Destiny off on an earlier back-nav simply stops seeing this step
-        on re-entry; no stale required-field gate blocks them.
+        Reached via ``condition=lambda v: v._heroic_destiny`` on the step
+        definition. No validator -- a user who flips Heroic Destiny off on an
+        earlier back-nav simply stops seeing this step on re-entry.
         """
         return [
+            self._build_sheet_preview(),
             card(
-                "## \u2728 Heroic Destiny",
+                "## \N{SPARKLES} Heroic Destiny",
                 TextDisplay(
                     f"A prophecy has marked **{self._name}** for greatness. "
                     "When the campaign begins, the DM will consult the "
@@ -667,28 +739,18 @@ class CharacterCreatorView(WizardLayoutView):
     # // ========================================( Step 6 - Review )======================================== // #
 
     async def build_review(self):
-        """Full character sheet composed from every prior step's state."""
-        stats_line = " · ".join(f"{a} {self._scores[a]}" for a in ABILITIES)
-        languages_line = ", ".join(self._languages) if self._languages else "None"
+        """Final review: the live sheet plus the full backstory and a prompt.
 
-        backstory_preview = self._backstory
-        if len(backstory_preview) > 400:
-            backstory_preview = backstory_preview[:397] + "..."
+        The preview already shows the assembled stats, so review adds the
+        full backstory (which the preview truncates) and the finish prompt.
+        """
+        backstory = self._backstory
+        if len(backstory) > 600:
+            backstory = backstory[:597] + "..."
 
-        sheet = card(
-            f"## \U0001f4dc {self._name}",
-            TextDisplay(f"*{self._race} {self._class} - {self._subclass}*"),
-            divider(),
-            key_value(
-                {
-                    "Attributes": stats_line,
-                    "Alignment": self._alignment,
-                    "Languages": languages_line,
-                    "Heroic Destiny": "Yes" if self._heroic_destiny else "No",
-                }
-            ),
-            divider(),
-            TextDisplay(f"**Backstory**\n> {backstory_preview}"),
+        detail = card(
+            "## \N{WHITE HEAVY CHECK MARK} Review",
+            TextDisplay(f"**Backstory**\n> {backstory}"),
             divider(),
             TextDisplay(
                 "-# Press **Create Character** to finalize the sheet, or "
@@ -696,32 +758,25 @@ class CharacterCreatorView(WizardLayoutView):
             ),
             color=discord.Color.green(),
         )
-        return [sheet]
+        return [self._build_sheet_preview(), detail]
 
     # // ========================================( Finish )======================================== // #
 
     async def on_finish(self, interaction):
         """Post the finalized character sheet as an ephemeral card followup.
 
-        ``WizardLayoutView.on_finish`` is the method hook that fires when
-        the user clicks the finish button on the last step. Overriding
-        it replaces the default exit-only behavior with a custom flow that
-        echoes the completed sheet back to the user.
+        ``WizardLayoutView.on_finish`` fires when the user clicks the finish
+        button on the last step. Overriding it replaces the default exit-only
+        behavior with a custom flow that echoes the completed sheet back.
 
-        The trailing ``await self.exit()`` respects
-        ``exit_policy = "delete"``, so the wizard message is removed after
-        the followup is sent. Setting
-        ``exit_policy = "disable"`` would freeze the final review card
-        in place instead of deleting it.
+        The trailing ``await self.exit()`` respects ``exit_policy = "delete"``,
+        so the wizard message is removed after the followup is sent.
         """
-        stats_line = " · ".join(f"{a} {self._scores[a]}" for a in ABILITIES)
+        stats_line = " \N{MIDDLE DOT} ".join(f"{a} {self._scores[a]}" for a in ABILITIES)
         destiny_tag = " *(Hero of Destiny)*" if self._heroic_destiny else ""
 
-        # Build a confirmation view with a single card summarizing the
-        # finished character. DisplayLayoutView renders a pre-built
-        # container without requiring a full subclass.
         body = card(
-            f"## \U0001f3b2 {self._name}{destiny_tag}",
+            f"## \N{GAME DIE} {self._name}{destiny_tag}",
             TextDisplay(f"*{self._race} {self._class} - {self._subclass}*"),
             divider(),
             key_value(
@@ -729,6 +784,8 @@ class CharacterCreatorView(WizardLayoutView):
                     "Attributes": stats_line,
                     "Alignment": self._alignment,
                     "Languages": ", ".join(self._languages),
+                    **({"Origin": self._origin} if self._origin else {}),
+                    **({"Tools": ", ".join(self._tools)} if self._tools else {}),
                 }
             ),
             divider(),
@@ -750,15 +807,15 @@ class V2WizardExample(commands.Cog, name="v2_wizard_example"):
 
     @commands.hybrid_command(
         name="v2wizard",
-        description="Start a five-step D&D character creator.",
+        description="Start a multi-step D&D character creator.",
     )
     async def v2wizard(self, context: Context) -> None:
         """Open the character creator wizard.
 
-        Five steps lead from identity through class, abilities, and
-        background to a final review card. Each step validates its own
-        inputs before the wizard allows progression, and the finish
-        button posts the completed sheet back to the invoking user.
+        The steps lead from identity through class, abilities, and background
+        to a final review card. A live character-sheet preview fills in as
+        the flow progresses, and the finish button posts the completed sheet
+        back to the invoking user.
         """
         view = CharacterCreatorView(context=context)
         await view.send()

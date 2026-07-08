@@ -427,7 +427,10 @@ class _NavigationMixin:
         # Pre-flight check on the new view's assembled tree. Catches the
         # same class of HTTP 400 the validator catches in send/refresh:
         # invalid placements introduced by a rebuild callback that
-        # populates the tree post-init.
+        # populates the tree post-init. Theme-managed accents resolve
+        # first so the destination renders themed regardless of where
+        # its tree was built.
+        new_view._apply_theme_defaults()
         new_view._check_placement()
 
         # Push/pop reuse the parent's Discord message, carried onto

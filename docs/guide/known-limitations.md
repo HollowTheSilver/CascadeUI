@@ -87,17 +87,6 @@ and manual responses are safe to combine.
 These are limitations in discord.py's implementation, not the Discord API
 itself. Future discord.py releases may resolve them.
 
-### V2 Modal Input Components Not Supported in Modals
-
-Opening a modal containing `Checkbox`, `CheckboxGroup`, or `RadioGroup`
-produces a `400 Bad Request` (error 50035). Discord's modal endpoint does
-accept these component types with proper wrapping, but discord.py's `Modal`
-serialization sends them as bare top-level components without the required
-ActionRow wrapping and does not set the `components_v2` flag. Place structured
-choices as inline components on the view itself (using `StatefulSelect` or
-`toggle_section()`) and reserve modals for `TextInput` fields only. The
-`v2_wizard.py` example demonstrates this hybrid pattern on step 4.
-
 ### Ephemeral Messages Cannot Be Fetched
 
 Ephemeral messages have no permanent message ID accessible to the bot. This
@@ -335,6 +324,8 @@ sent.
 | Buttons per ActionRow | 5 |
 | Select menus per ActionRow | 1 (consumes the entire row) |
 | Options per Select menu | 25 |
+| Options per `CheckboxGroup` | 10 |
+| Options per `RadioGroup` | 2-10 |
 | Total components per V2 LayoutView | 40 |
 | Components per ActionRow (V2) | 5 |
 | `custom_id` length | 100 characters |
@@ -372,7 +363,7 @@ sent.
 | Interaction token lifetime | 15 minutes |
 | Ephemeral messages | Not editable/deletable after token expiry |
 | Modals per interaction | 1 (must be the initial response) |
-| TextInputs per Modal | 5 |
+| Inputs per Modal | 5 |
 
 ### Message Limits
 

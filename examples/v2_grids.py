@@ -141,7 +141,7 @@ class V2GridsExample(commands.Cog, name="v2_grids_example"):
         context: Context,
         rows: int,
         cols: int,
-        fill: str = "\u2b1b",
+        fill: str = "\N{BLACK LARGE SQUARE}",
         row_labels: AxisPreset = "none",
         col_labels: AxisPreset = "none",
     ) -> None:
@@ -162,25 +162,25 @@ class V2GridsExample(commands.Cog, name="v2_grids_example"):
         except (ValueError, TypeError) as exc:
             # The library validates at construction -- surface the error
             # message verbatim so the recording can showcase the guardrails.
-            await context.send(f"\u26a0\ufe0f `{exc}`", ephemeral=True)
+            await context.send(f"\N{WARNING SIGN}\N{VARIATION SELECTOR-16} `{exc}`", ephemeral=True)
             return
 
         # Demo overlays: a star in the top-left and a 2x2 accent block
         # anchored near the center. Both are safe for any grid >= 3x3.
-        grid[(0, 0)] = "\u2b50"
+        grid[(0, 0)] = "\N{WHITE MEDIUM STAR}"
         if rows >= 3 and cols >= 3:
             mid_r, mid_c = rows // 2, cols // 2
             grid.fill_rect(
                 (max(0, mid_r - 1), max(0, mid_c - 1)),
                 (min(rows - 1, mid_r), min(cols - 1, mid_c)),
-                "\U0001f7e6",
+                "\N{LARGE BLUE SQUARE}",
             )
 
         showcase = card(
             f"## EmojiGrid `{rows}x{cols}`",
             TextDisplay(
-                f"-# fill=`{fill}` \u2022 row_labels=`{row_labels}` "
-                f"\u2022 col_labels=`{col_labels}`"
+                f"-# fill=`{fill}` \N{BULLET} row_labels=`{row_labels}` "
+                f"\N{BULLET} col_labels=`{col_labels}`"
             ),
             divider(),
             grid,
@@ -219,7 +219,7 @@ class V2GridsExample(commands.Cog, name="v2_grids_example"):
             elif label_style == "numeric":
                 label = str(row * cols + col)
             else:
-                label = "\u00b7"
+                label = "\N{MIDDLE DOT}"
             # Non-interactive indicators use discord.ui.Button directly.
             # StatefulButton is for interactive buttons with callbacks.
             return discord.ui.Button(
@@ -231,12 +231,12 @@ class V2GridsExample(commands.Cog, name="v2_grids_example"):
         try:
             action_rows = button_grid(rows, cols, cell_factory)
         except (ValueError, TypeError) as exc:
-            await context.send(f"\u26a0\ufe0f `{exc}`", ephemeral=True)
+            await context.send(f"\N{WARNING SIGN}\N{VARIATION SELECTOR-16} `{exc}`", ephemeral=True)
             return
 
         header = card(
             f"## button_grid `{rows}x{cols}`",
-            TextDisplay(f"-# label_style=`{label_style}` \u2022 buttons are display-only"),
+            TextDisplay(f"-# label_style=`{label_style}` \N{BULLET} buttons are display-only"),
             color=discord.Color.green(),
         )
         await _send_showcase(context, [header, gap(), *action_rows])
@@ -266,41 +266,43 @@ class V2GridsExample(commands.Cog, name="v2_grids_example"):
         button grid alone contributes 30 components.
         """
         # 1. Blank square: nothing overlaid, shows the raw fill primitive.
-        blank = emoji_grid(4, 4, fill="\u2b1c")
+        blank = emoji_grid(4, 4, fill="\N{WHITE LARGE SQUARE}")
 
         # 2. Wide rectangle with column headers only. fill_rect shows a
         # wide stripe that reads clearly in a non-square aspect ratio.
-        wide = emoji_grid(3, 8, fill="\u2b1b", col_labels="numeric")
-        wide.fill_rect((1, 0), (1, 7), "\U0001f7e6")
+        wide = emoji_grid(3, 8, fill="\N{BLACK LARGE SQUARE}", col_labels="numeric")
+        wide.fill_rect((1, 0), (1, 7), "\N{LARGE BLUE SQUARE}")
 
         # 3. Custom 0-indexed column labels -- demonstrates that axis
         # presets are optional; any Sequence[str] of the right length
         # works. Starts at 0 instead of the "numeric" preset's 1, using
         # the keycap-zero glyph that the preset deliberately omits.
-        zero_indexed = [f"{d}\ufe0f\u20e3" for d in "0123456789"]
-        custom_axis = emoji_grid(3, 10, fill="\u2b1b", col_labels=zero_indexed)
-        custom_axis.fill_rect((1, 0), (1, 9), "\U0001f7e6")
+        zero_indexed = [
+            f"{d}\N{VARIATION SELECTOR-16}\N{COMBINING ENCLOSING KEYCAP}" for d in "0123456789"
+        ]
+        custom_axis = emoji_grid(3, 10, fill="\N{BLACK LARGE SQUARE}", col_labels=zero_indexed)
+        custom_axis.fill_rect((1, 0), (1, 9), "\N{LARGE BLUE SQUARE}")
 
         # 4. Tall rectangle with row labels only -- the mirror of #2,
         # exercising the "row labels without column headers" state.
-        tall = emoji_grid(6, 3, fill="\u2b1c", row_labels="alpha")
-        tall.fill_rect((0, 1), (5, 1), "\U0001f7e9")
+        tall = emoji_grid(6, 3, fill="\N{WHITE LARGE SQUARE}", row_labels="alpha")
+        tall.fill_rect((0, 1), (5, 1), "\N{LARGE GREEN SQUARE}")
 
         # 5. Fully labeled square with an explicit corner cell -- the
         # four-state axis matrix in its most decorated form.
         full = emoji_grid(
             4,
             4,
-            fill="\u2b1b",
+            fill="\N{BLACK LARGE SQUARE}",
             row_labels="alpha",
             col_labels="numeric",
-            corner="\U0001f3f4",
+            corner="\N{WAVING BLACK FLAG}",
         )
         for i in range(4):
-            full[(i, i)] = "\u2b50"
+            full[(i, i)] = "\N{WHITE MEDIUM STAR}"
 
         # 6. Bulk iterable assignment -- one statement paints a heart.
-        pattern = emoji_grid(5, 5, fill="\u2b1c")
+        pattern = emoji_grid(5, 5, fill="\N{WHITE LARGE SQUARE}")
         heart_cells = [
             (0, 1),
             (0, 3),
@@ -319,7 +321,7 @@ class V2GridsExample(commands.Cog, name="v2_grids_example"):
             (3, 3),
             (4, 2),
         ]
-        pattern[heart_cells] = "\u2764\ufe0f"
+        pattern[heart_cells] = "\N{HEAVY BLACK HEART}\N{VARIATION SELECTOR-16}"
 
         # 7. 2x5 inert button strip -- rectangular button_grid form.
         def strip_factory(row: int, col: int) -> discord.ui.Button:
@@ -345,28 +347,34 @@ class V2GridsExample(commands.Cog, name="v2_grids_example"):
             "## Grid Gallery",
             TextDisplay("-# Eight variations rendered from a single command."),
             divider(),
-            TextDisplay("**1. Blank 4\u00d74**  `emoji_grid(4, 4, fill=...)`"),
+            TextDisplay("**1. Blank 4\N{MULTIPLICATION SIGN}4**  `emoji_grid(4, 4, fill=...)`"),
             blank,
             divider(),
-            TextDisplay("**2. Wide 3\u00d78**  `col_labels='numeric'` + fill_rect stripe"),
+            TextDisplay(
+                "**2. Wide 3\N{MULTIPLICATION SIGN}8**  `col_labels='numeric'` + fill_rect stripe"
+            ),
             wide,
             divider(),
             TextDisplay(
-                "**3. Custom axis 3\u00d710**  0-indexed `col_labels=[0\ufe0f\u20e3..9\ufe0f\u20e3]` "
+                "**3. Custom axis 3\N{MULTIPLICATION SIGN}10**  0-indexed `col_labels=[0\N{VARIATION SELECTOR-16}\N{COMBINING ENCLOSING KEYCAP}..9\N{VARIATION SELECTOR-16}\N{COMBINING ENCLOSING KEYCAP}]` "
                 "(any `Sequence[str]` works)"
             ),
             custom_axis,
             divider(),
-            TextDisplay("**4. Tall 6\u00d73**  `row_labels='alpha'` + fill_rect column"),
+            TextDisplay(
+                "**4. Tall 6\N{MULTIPLICATION SIGN}3**  `row_labels='alpha'` + fill_rect column"
+            ),
             tall,
             divider(),
             TextDisplay(
-                "**5. Labeled 4\u00d74**  `row_labels='alpha'`, "
+                "**5. Labeled 4\N{MULTIPLICATION SIGN}4**  `row_labels='alpha'`, "
                 "`col_labels='numeric'`, custom corner, diagonal accent"
             ),
             full,
             divider(),
-            TextDisplay("**6. Bulk assign 5\u00d75**  iterable-of-keys paints in one statement"),
+            TextDisplay(
+                "**6. Bulk assign 5\N{MULTIPLICATION SIGN}5**  iterable-of-keys paints in one statement"
+            ),
             pattern,
             color=discord.Color.gold(),
         )
@@ -377,13 +385,13 @@ class V2GridsExample(commands.Cog, name="v2_grids_example"):
         await _send_showcase(context, [emoji_gallery])
 
         strip_header = card(
-            "## 7. button_grid 2\u00d75  (rectangular strip, primary style)",
+            "## 7. button_grid 2\N{MULTIPLICATION SIGN}5  (rectangular strip, primary style)",
             color=discord.Color.blurple(),
         )
         await _send_showcase(context, [strip_header, gap(), *strip_rows])
 
         coord_header = card(
-            "## 8. button_grid 5\u00d75  (coord labels, max density)",
+            "## 8. button_grid 5\N{MULTIPLICATION SIGN}5  (coord labels, max density)",
             color=discord.Color.green(),
         )
         await _send_showcase(context, [coord_header, gap(), *coord_rows])

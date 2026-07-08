@@ -202,6 +202,20 @@ await self.open_modal(interaction, modal)
 
 Inside a CascadeUI view, use `self.open_modal()` instead of raw `send_modal()`.
 
+The same `validators=` attachment works on every wrapped input type, not
+just `TextInput`. Each validator receives whatever its input submits:
+
+| Input | Value passed to validators |
+|-------|------------------------------|
+| `TextInput` | `str` |
+| `Checkbox` | `bool` |
+| `CheckboxGroup` | `list[str]` |
+| `RadioGroup` | `str` |
+| `FileUpload` | `list[discord.Attachment]` |
+
+See [Components -- Modal Inputs](components.md#modal-inputs) for the
+construction reference and a composed multi-type example.
+
 If any validator fails, the user sees an ephemeral message listing the errors and the callback is not called. If all validators pass, the callback runs normally.
 
 You can also call `validate_fields()` manually in a custom `on_submit` if you need more control over error presentation.
