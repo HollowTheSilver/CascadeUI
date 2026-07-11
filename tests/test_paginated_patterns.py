@@ -101,6 +101,27 @@ class TestOnPageChangedHook:
         assert calls == [1]
         assert view.current_page == 1
 
+    async def test_raising_hook_does_not_abort_page_turn(self):
+        """A raising on_page_changed override is swallowed so the page turn
+        and its refresh still complete -- cursor and display stay in sync."""
+
+        class RaisingPaginated(PaginatedLayoutView):
+            async def on_page_changed(self, page):
+                raise RuntimeError("boom")
+
+        view = RaisingPaginated(
+            interaction=_make_interaction(),
+            pages=[[Container(TextDisplay("A"))], [Container(TextDisplay("B"))]],
+        )
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+
+        callback = view._make_step_callback(1)
+        await callback(_make_interaction())  # must not raise
+
+        assert view.current_page == 1
+        assert view._message.edit.called
+
 
 # // ========================================( V2 nav identity + extra_items preservation )======================================== // #
 
@@ -176,6 +197,109 @@ class TestPaginatedLayoutButtonIdentity:
         await view._update_page()
 
         assert view._indicator_btn.label == "Page 3/3"
+
+
+# // ========================================( Nav state sync on reload )======================================== // #
+
+
+class TestNavStateSyncOnReload:
+    """Nav disabled/label state must reflect current_page whenever the row is
+    rebuilt off the page-turn path (a reload, an on_load), not revert to
+    page-one defaults over later-page content. Regression for the bug where
+    _build_nav_buttons hardcoded page-one states and only _update_page
+    recomputed them.
+    """
+
+    def _view(self):
+        return PaginatedLayoutView(
+            interaction=_make_interaction(),
+            pages=[
+                [Container(TextDisplay("A"))],
+                [Container(TextDisplay("B"))],
+                [Container(TextDisplay("C"))],
+            ],
+        )
+
+    def test_builder_rebuild_on_middle_page_enables_prev(self):
+        view = self._view()
+        view.current_page = 1
+        view._build_nav_buttons()  # the reload / on_load rebuild path
+        assert view._prev_btn.disabled is False
+        assert view._next_btn.disabled is False
+
+    def test_builder_rebuild_on_last_page_disables_next(self):
+        view = self._view()
+        view.current_page = 2
+        view._build_nav_buttons()
+        assert view._prev_btn.disabled is False
+        assert view._next_btn.disabled is True
+
+    def test_builder_rebuild_on_first_page_disables_prev(self):
+        view = self._view()
+        view._build_nav_buttons()  # current_page == 0
+        assert view._prev_btn.disabled is True
+        assert view._next_btn.disabled is False
+
+    def test_builder_rebuild_syncs_indicator_label(self):
+        view = self._view()
+        view.current_page = 1
+        view._build_nav_buttons()
+        assert view._indicator_btn.label == "Page 2/3"
+
+    async def test_page_count_growth_rebuilds_jump_button_set(self):
+        """A page-count change crossing jump_threshold rebuilds the button SET
+        (first/last/goto appear), not just their disabled state."""
+        view = PaginatedLayoutView(
+            interaction=_make_interaction(),
+            pages=[[Container(TextDisplay(str(i)))] for i in range(2)],
+        )
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+        assert view._show_jump is False
+        assert view._first_btn is None
+
+        # Grow past jump_threshold (default 5); the update path must rebuild.
+        view.pages = [[Container(TextDisplay(str(i)))] for i in range(6)]
+        await view._update_page()
+
+        assert view._show_jump is True
+        assert view._first_btn is not None
+        assert view._last_btn is not None
+
+
+# // ========================================( nav_divider )======================================== // #
+
+
+class TestNavDivider:
+    """nav_divider inserts a divider before the in-card nav row."""
+
+    def test_divider_present_when_enabled(self):
+        from discord.ui import Separator
+
+        class Divided(PaginatedLayoutView):
+            nav_inside_container = True
+            nav_divider = True
+
+        view = Divided(
+            interaction=_make_interaction(),
+            pages=[[Container(TextDisplay("A"))], [Container(TextDisplay("B"))]],
+        )
+        wrapper = list(view.children)[0]
+        assert isinstance(wrapper, Container)
+        assert any(isinstance(c, Separator) for c in wrapper.children)
+
+    def test_no_divider_by_default(self):
+        from discord.ui import Separator
+
+        class Plain(PaginatedLayoutView):
+            nav_inside_container = True
+
+        view = Plain(
+            interaction=_make_interaction(),
+            pages=[[Container(TextDisplay("A"))], [Container(TextDisplay("B"))]],
+        )
+        wrapper = list(view.children)[0]
+        assert not any(isinstance(c, Separator) for c in wrapper.children)
 
 
 # // ========================================( Single-page nav suppression )======================================== // #

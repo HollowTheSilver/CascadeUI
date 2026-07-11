@@ -9,8 +9,8 @@ the manager for explicit prunes, slot-policy registration, and
 shutdown.
 
 When any registered :class:`SlotPolicy` carries ``ttl_days``, the
-manager starts a daily background TTL sweeper at
-:meth:`install_middleware` time. The sweeper calls
+manager starts a daily background TTL sweeper during
+:meth:`PersistenceMiddleware.initialize`. The sweeper calls
 ``row_delete_where_lt(TABLE_APPLICATION_SLOTS, "expires_at", now)``
 once per 24 hours, so rows with ``expires_at=NULL`` (no TTL) are
 never touched by contract. ``expires_at`` is an absolute wall-clock
@@ -19,7 +19,8 @@ bot restarts. :meth:`rehydrate` issues one prune pass before reading
 so rows that expired while the bot was offline are dropped rather
 than loaded into memory.
 
-Lifecycle phases:
+Lifecycle phases, driven by :meth:`PersistenceMiddleware.initialize`
+when the middleware is installed via :func:`setup_middleware`:
 
 1. :meth:`initialize_backends` -- dedup by backend identity, call
    :meth:`~PersistenceBackend.initialize` once per unique instance.
@@ -30,8 +31,6 @@ Lifecycle phases:
    in-memory store. Returns only when the store is fully restored.
 4. :meth:`reattach_persistent_views` -- (requires ``bot``) walks the
    registry, re-fetches messages, reconstructs view instances.
-5. :meth:`install_middleware` -- installs the write-through middleware
-   on the store. The manager tracks which namespaces are write-enabled.
 
 Runtime surface: :meth:`prune_application`, :meth:`prune_registry`,
 :meth:`register_slot_policy`, :meth:`close`. Each prune dispatches its
@@ -50,6 +49,7 @@ import time
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from ..exceptions import PersistenceInitError, PersistenceRehydrateError
+from ..state.actions import ActionCreators
 from .config import (
     NAMESPACE_APPLICATION,
     NAMESPACE_REGISTRY,
@@ -73,11 +73,12 @@ logger = logging.getLogger(__name__)
 
 # Kwargs captured by ``__init_subclass__`` that are also surfaced as
 # their own registry-row column (``persistence_key``) or are not safely
-# round-trippable through JSON (``theme`` -- a live ``Theme`` object).
+# round-trippable through JSON (``theme`` is a live ``Theme`` object;
+# ``bot`` is a live client injected via ``on_bind`` on restore).
 # The middleware strips them at write so the registry stays clean, and
 # ``_reattach_one`` strips them at read so the row column wins on
 # reconstruction without a duplicate-keyword crash.
-_NON_PERSISTABLE_KWARGS: frozenset[str] = frozenset({"persistence_key", "theme"})
+_NON_PERSISTABLE_KWARGS: frozenset[str] = frozenset({"persistence_key", "theme", "bot"})
 
 
 # // ========================================( Manager )======================================== // #
@@ -120,6 +121,10 @@ class PersistenceManager:
         self._rehydrated: bool = False
         self._closed: bool = False
         self._registry_rows: list[dict[str, Any]] = []
+        # Keys restored across reattach passes. reattach() re-drives the
+        # reattach and skips these so an already-live panel is never re-fetched
+        # or double-registered on a second pass.
+        self._restored_keys: set[str] = set()
         # Summary from the most recent reattach_persistent_views() (restored /
         # skipped / failed / removed key lists). Stashed so a consumer can read
         # which persistence_keys were pruned for gone messages after
@@ -132,8 +137,8 @@ class PersistenceManager:
         # and extended at runtime by register_slot_policy.
         self._slot_policies: dict[str, SlotPolicy] = dict(self.application.slots)
 
-        # TTL sweeper task. Started by install_middleware() only when at
-        # least one slot declares ttl_days > 0. Cancelled by close().
+        # TTL sweeper task. Started during PersistenceMiddleware.initialize()
+        # only when at least one slot declares ttl_days > 0. Cancelled by close().
         self._ttl_sweeper_task: Optional[asyncio.Task] = None
         # Post-ready on_restore render tasks. Each reattach call schedules its
         # own and tracks it here (mirrors PersistenceMiddleware._tasks), so a
@@ -145,8 +150,9 @@ class PersistenceManager:
         # users register via register_hook().
         self._hooks: dict[str, list[Callable[..., Any]]] = {}
 
-        # Middleware handle populated by install_middleware(). Stays
-        # None when every namespace is opted out (no backend).
+        # Middleware handle. Left None under the canonical setup_middleware
+        # install, which owns the middleware's own flush/close lifecycle; the
+        # flush_all() / close() guards below skip when it is None.
         self._middleware: Any = None
 
     # // ========================================( Introspection )======================================== // #
@@ -174,12 +180,11 @@ class PersistenceManager:
         on re-registration so accidental overwrites surface immediately.
 
         When the new policy declares ``ttl_days`` and the daily sweeper
-        is not yet running, bootstrap it. Without this, a slot policy
-        registered after :meth:`install_middleware` would be invisible
-        to the sweeper -- it inspects ``_slot_policies`` once at install
-        time and never re-checks. Idempotent: ``_start_ttl_sweeper`` is
-        a no-op when the task is already alive or when the application
-        backend is opted out.
+        is not yet running, bootstrap it here: the sweeper inspects
+        ``_slot_policies`` once at start time and never re-checks, so a
+        policy registered after it starts is invisible to it without this
+        bootstrap. Idempotent: ``_start_ttl_sweeper`` is a no-op when the
+        task is already alive or when the application backend is opted out.
         """
         if not isinstance(name, str):
             raise TypeError(f"slot name must be str, got {type(name).__name__}")
@@ -388,7 +393,12 @@ class PersistenceManager:
         if self._bot is None:
             return summary
 
-        rows = self._registry_rows
+        # Skip keys already restored on a prior pass so reattach() only
+        # processes rows that are new (a class imported after the initial
+        # reattach) or still pending (skipped / unreachable / failed).
+        rows = [
+            r for r in self._registry_rows if r.get("persistence_key") not in self._restored_keys
+        ]
         if not rows:
             return summary
 
@@ -488,6 +498,9 @@ class PersistenceManager:
             task.add_done_callback(self._on_post_ready_restore_done)
             self._post_ready_restore_tasks.add(task)
 
+        # Remember what this pass restored so a later reattach() skips it.
+        self._restored_keys.update(summary["restored"])
+
         # One aggregate summary (counts, not the full key lists) so a bot with
         # hundreds of persistent views does not flood startup; per-view detail
         # is at DEBUG.
@@ -497,6 +510,25 @@ class PersistenceManager:
             f"{len(summary['removed'])} removed, {len(summary['unreachable'])} unreachable"
         )
         return summary
+
+    async def reattach(self) -> dict[str, list[str]]:
+        """Re-drive persistent-view reattach after the initial pass.
+
+        The initial reattach (during :meth:`PersistenceMiddleware.initialize`)
+        can only attach view classes already imported at that point; a class
+        whose module loads later (a cog loaded after ``setup_middleware``) lands
+        in ``summary["skipped"]`` and its posted message stays dead until the
+        next restart. Call this once the classes are imported, e.g. at the end
+        of ``setup_hook`` after every cog loads, to attach those panels
+        without a restart, so import order stops mattering.
+
+        Idempotent: keys restored on a prior pass are skipped, so an
+        already-live panel is never re-fetched or double-registered.
+        Transiently ``unreachable`` / ``failed`` rows are retried. Returns the
+        same summary shape as :meth:`reattach_persistent_views`, covering only
+        the rows this pass processed.
+        """
+        return await self.reattach_persistent_views()
 
     async def _migrate_init_kwargs(
         self,
@@ -741,36 +773,6 @@ class PersistenceManager:
                     self._store._unregister_view(view.id)
             return "failed"
 
-    # // ========================================( Middleware install )======================================== // #
-
-    def install_middleware(self) -> None:
-        """Install per-namespace write-through middleware on the store.
-
-        Constructs one :class:`PersistenceMiddleware` instance and
-        registers it with the store's middleware chain. The middleware
-        is stashed on ``self._middleware`` so :meth:`close` can flush +
-        close it cleanly during shutdown.
-
-        Skipped when every namespace is opted out (all three backends
-        are ``None``): without a backend, the middleware would do
-        nothing but still incur per-dispatch overhead.
-        """
-        # Late import: persistence imports state, state imports
-        # persistence in type-checking only. A top-level import would
-        # fire the circular path at load time.
-        from ..state.middleware.persistence import PersistenceMiddleware
-
-        if not any(cfg.backend is not None for cfg in (self.registry, self.application)):
-            return
-
-        middleware = PersistenceMiddleware(self)
-        self._middleware: PersistenceMiddleware = middleware
-        self._store._add_middleware(middleware)
-
-        # Start the daily TTL sweeper when any persistent slot declares
-        # ttl_days. Nothing to sweep otherwise -- skip the task.
-        self._start_ttl_sweeper()
-
     def register_hook(self, name: str, callback: Callable[..., Any]) -> None:
         """Register an observability hook.
 
@@ -874,15 +876,16 @@ class PersistenceManager:
                 if backend is None:
                     return
                 try:
+                    cutoff = int(time.time())
                     deleted = await backend.row_delete_where_lt(
                         TABLE_APPLICATION_SLOTS,
                         "expires_at",
-                        int(time.time()),
+                        cutoff,
                     )
                     if deleted:
                         await self._store.dispatch(
                             "APPLICATION_SLOTS_PRUNED",
-                            {"deleted": deleted, "reason": "ttl_sweep"},
+                            ActionCreators.application_slots_pruned(deleted, cutoff=cutoff),
                         )
                 except Exception as exc:
                     logger.error(f"TTL sweeper error: {exc}", exc_info=True)
@@ -911,6 +914,7 @@ class PersistenceManager:
 
         if slot is not None:
             deleted = await backend.row_delete(TABLE_APPLICATION_SLOTS, {"slot_name": slot})
+            cutoff = None
         elif older_than_days is not None:
             cutoff = int(time.time()) - (older_than_days * 86400)
             deleted = await backend.row_delete_where_lt(
@@ -921,7 +925,7 @@ class PersistenceManager:
 
         await self._store.dispatch(
             "APPLICATION_SLOTS_PRUNED",
-            {"deleted": deleted, "cutoff": older_than_days},
+            ActionCreators.application_slots_pruned(deleted, cutoff=cutoff),
         )
         return deleted
 

@@ -387,6 +387,53 @@ class TestCheckboxGroup:
 # // ========================================( RadioGroup )======================================== // #
 
 
+class TestConstructionBoundValidation:
+    """Documented numeric bounds raise a directed ValueError at construction,
+    instead of a Discord HTTP 400 when the modal opens."""
+
+    def test_textinput_min_length_out_of_range(self):
+        with pytest.raises(ValueError, match="min_length=5000"):
+            TextInput(label="X", min_length=5000)
+
+    def test_textinput_max_length_out_of_range(self):
+        with pytest.raises(ValueError, match="max_length=5000"):
+            TextInput(label="X", max_length=5000)
+
+    def test_textinput_valid_bounds_ok(self):
+        ti = TextInput(label="X", min_length=0, max_length=100)
+        assert ti.min_length == 0 and ti.max_length == 100
+
+    def test_textinput_none_bounds_ok(self):
+        ti = TextInput(label="X")
+        assert ti.min_length is None and ti.max_length is None
+
+    def test_checkboxgroup_max_values_out_of_range(self):
+        with pytest.raises(ValueError, match="max_values=11"):
+            CheckboxGroup(label="X", options=[{"label": "A", "value": "a"}], max_values=11)
+
+    def test_fileupload_max_values_out_of_range(self):
+        with pytest.raises(ValueError, match="max_values=11"):
+            FileUpload(label="X", max_values=11)
+
+    def test_fileupload_valid_bounds_ok(self):
+        fu = FileUpload(label="X", min_values=0, max_values=5)
+        assert fu.max_values == 5
+
+    def test_statefulselect_option_cap_raises(self):
+        from cascadeui.components.base import StatefulSelect
+
+        options = [discord.SelectOption(label=f"o{i}", value=str(i)) for i in range(26)]
+        with pytest.raises(ValueError, match="at most 25"):
+            StatefulSelect(options=options)
+
+    def test_statefulselect_at_cap_ok(self):
+        from cascadeui.components.base import StatefulSelect
+
+        options = [discord.SelectOption(label=f"o{i}", value=str(i)) for i in range(25)]
+        sel = StatefulSelect(options=options)
+        assert len(sel.options) == 25
+
+
 class TestRadioGroup:
     """RadioGroup input derives custom_id from label and stores single value."""
 

@@ -23,7 +23,6 @@ from ..state.actions import ActionCreators
 from ..state.singleton import get_store
 from ..state.store import _CURRENT_INTERACTION
 from ..utils.coercion import coerce_snowflake_id, coerce_snowflake_id_set
-from ..utils.errors import safe_execute, with_error_boundary
 from ..utils.tasks import get_task_manager
 from ._interaction import _InteractionMixin
 from ._navigation import _NavigationMixin
@@ -797,6 +796,15 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         # produce one scheduled task, not N.
         self._refresh_not_before: float = 0.0
         self._deferred_refresh_task: Optional[asyncio.Task] = None
+        # Set when reload() is called inside a cooldown window so the single
+        # deferred task re-fetches (via reload) at the boundary instead of a
+        # plain on_state_changed re-render: coalescing a burst of out-of-band
+        # reloads into one on_load fetch.
+        self._reload_pending: bool = False
+        # Keyword args of the reload() that got coalesced, replayed by the
+        # deferred boundary task so a forwarded reload keyword (e.g. force)
+        # survives the defer.
+        self._pending_reload_kwargs: dict = {}
 
         # Derive user_id, guild_id, and session_id from context/interaction
         if self.interaction is None and self.context is not None:
@@ -1030,21 +1038,6 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         # preload -- before the tree is validated and shipped.
         await self._run_on_load()
 
-        # -- Stage 0b: pre-flight tree validation --
-        # Catches two Discord-400 conditions before send: duplicate
-        # custom_ids (V1 and V2) and, for V2, invalid component placements.
-        # Runs before any state mutation, but the __init__ subscriber and
-        # undo entry already exist, so a rejection rolls them back before
-        # re-raising, keeping the send() rollback contract intact even here.
-        self._apply_theme_defaults()
-        try:
-            self._check_placement()
-        except ValueError:
-            self.stop()
-            self.state_store._unsubscribe(self.id)
-            self.state_store._undo_enabled_views.pop(self.id, None)
-            raise
-
         # -- Stage 1: instance enforcement --
         try:
             await self._enforce_instance_limit()
@@ -1113,6 +1106,15 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
 
         class_name = type(self).__name__
         try:
+            # Pre-flight validation runs HERE, on the final tree -- after
+            # seed_initial_state has built it -- so the check sees exactly what
+            # ships to Discord. Catches duplicate custom_ids (V1/V2) and invalid
+            # V2 placements before the HTTP send. A rejection rolls back the full
+            # registration via the teardown below, since state registration has
+            # already happened by this stage.
+            self._apply_theme_defaults()
+            self._check_placement()
+
             if self.context and hasattr(self.context, "send"):
                 if ephemeral:
                     send_kwargs["ephemeral"] = ephemeral
@@ -1251,9 +1253,23 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         response shown to the user.
         """
         try:
-            await interaction.response.send_message(self.unauthorized_message, ephemeral=True)
+            await self.respond(interaction, self.unauthorized_message, ephemeral=True)
         except discord.HTTPException as e:
             logger.debug(f"Could not send unauthorized response in {self.__class__.__name__}: {e}")
+
+    async def _call_hook_safe(self, hook, *args) -> None:
+        """Run a fire-and-forget user hook, logging any exception.
+
+        An override that raises must never block the surrounding navigation,
+        rebuild, or lifecycle flow. Shared by every pattern that fires a
+        post-event hook (``on_page_changed``, ``on_tab_switched``,
+        ``on_step_entered`` / ``on_step_exited``, ``on_field_changed``,
+        ``on_replaced``).
+        """
+        try:
+            await hook(*args)
+        except Exception as exc:
+            logger.warning(f"{hook.__name__} raised in {type(self).__name__}: {exc}")
 
     async def on_instance_limit(self, error: "InstanceLimitError") -> None:
         """Called when ``send()`` is blocked by the session limit.
@@ -1627,9 +1643,18 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         # Exit tracked child views first
         await self._cleanup_attached_children()
 
-        self._freeze_components()
+        # Tear down tasks and both registries BEFORE the cosmetic freeze edit,
+        # mirroring exit(). _destroy_view frees the instance-limit slot up front
+        # so a concurrent send() does not count this timed-out view during the
+        # up-to-edit_timeout edit below, and removes the state entry before the
+        # active entry so a failed dispatch cannot strand a ghost.
+        self.task_manager.cancel_tasks(self.id)
+        self.state_store._unsubscribe(self.id)
+        self.state_store._undo_enabled_views.pop(self.id, None)
+        await self.state_store._destroy_view(self.id, source_id=self.id)
 
         if self._message:
+            self._freeze_components()
             try:
                 await self._bounded(self._message.edit(view=self))
             except discord.NotFound:
@@ -1637,7 +1662,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             except asyncio.TimeoutError:
                 logger.warning(
                     f"Timed out disabling components on timeout for "
-                    f"{type(self).__name__}; continuing teardown."
+                    f"{type(self).__name__}; view torn down regardless."
                 )
             except Exception as e:
                 # An ephemeral view that outlived its 15-minute interaction
@@ -1655,16 +1680,6 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     )
                 else:
                     logger.warning(f"Could not disable components on timeout: {e}.")
-
-        # Cancel tasks and clean up state, mirroring exit(). _destroy_view folds
-        # in the active-registry removal so it commits only after the
-        # VIEW_DESTROYED state removal lands, keeping the two registries
-        # consistent when the dispatch fails.
-        self.task_manager.cancel_tasks(self.id)
-        self.state_store._unsubscribe(self.id)
-        self.state_store._undo_enabled_views.pop(self.id, None)
-
-        await self.state_store._destroy_view(self.id, source_id=self.id)
 
     async def on_message_delete(self) -> None:
         """Called when the view's message is deleted externally.
@@ -1874,7 +1889,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             kwargs = result if isinstance(result, dict) else {}
             await self.refresh(**kwargs)
 
-    async def reload(self) -> None:
+    async def reload(self, **kwargs) -> None:
         """Re-run :meth:`on_load`, then edit the message to show the result.
 
         The out-of-band counterpart to the automatic ``on_load`` calls on
@@ -1883,7 +1898,25 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         immediately (a create/edit/archive action, a manual refresh
         button). Equivalent to ``await self.on_load()`` followed by
         ``await self.refresh()``.
+
+        Respects the refresh throttle at the reload layer: a reload landing
+        inside an active cooldown (``refresh_cooldown_ms`` or a 429 backoff)
+        defers the whole reload (``on_load``'s fetch included) and a burst
+        collapses to one fetch + edit at the window boundary. The deferred
+        boundary task replays the coalesced call's keyword arguments, so a
+        subclass that adds a reload keyword (e.g. ``force``) must forward it to
+        ``super().reload(**kwargs)`` for the replay to carry it. A keyword
+        consumed before ``super().reload()`` whose effect is not already in
+        pre-gate view state is otherwise dropped when the reload defers.
         """
+        now = time.monotonic()
+        wait = self._refresh_not_before - now
+        if wait > 0:
+            self._reload_pending = True
+            self._pending_reload_kwargs = kwargs
+            if self._deferred_refresh_task is None or self._deferred_refresh_task.done():
+                self._deferred_refresh_task = self.create_task(self._deferred_refresh(wait))
+            return
         await self._run_on_load()
         await self.refresh()
 
@@ -2224,19 +2257,26 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             self._refresh_not_before = time.monotonic() + (self.refresh_cooldown_ms / 1000)
 
     async def _deferred_refresh(self, wait: float) -> None:
-        """Sleep until the cooldown boundary, then re-enter on_state_changed.
+        """Sleep until the cooldown boundary, then re-render.
 
-        Re-entering :meth:`on_state_changed` (not calling :meth:`refresh`
-        directly) means ``build_ui()`` re-runs against the latest store
-        state -- so the deferred edit ships whatever the view should look
-        like *at the moment it fires*, not whatever it looked like at the
-        point the cooldown kicked in.
+        Re-enters :meth:`reload` when a reload was coalesced into this window
+        (so the deferred render re-fetches via ``on_load``), otherwise
+        :meth:`on_state_changed` (so ``build_ui()`` re-runs against the latest
+        store state). Either way the deferred edit ships what the view should
+        look like *at the moment it fires*, not what it looked like when the
+        cooldown kicked in.
         """
         try:
             await asyncio.sleep(wait)
             if self.is_finished() or not self._message:
                 return
-            await self.on_state_changed(self.state_store.state)
+            if self._reload_pending:
+                self._reload_pending = False
+                kwargs = self._pending_reload_kwargs
+                self._pending_reload_kwargs = {}
+                await self.reload(**kwargs)
+            else:
+                await self.on_state_changed(self.state_store.state)
         finally:
             self._deferred_refresh_task = None
 
@@ -2606,10 +2646,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         # while the view is fully intact (message, participants, channel).
         # Errors are logged but never block the new view's send().
         for old_view in to_replace:
-            try:
-                await old_view.on_replaced()
-            except Exception as e:
-                logger.warning(f"on_replaced raised in {old_view.__class__.__name__}: {e}")
+            await old_view._call_hook_safe(old_view.on_replaced)
 
         # Exit oldest owned views to make room. Each view's replace_policy
         # decides what happens to its message: "delete" (default) removes

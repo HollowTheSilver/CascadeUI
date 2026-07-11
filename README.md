@@ -429,10 +429,10 @@ await view.send()
 
 ### Leaderboards
 
-> Paginated ranked displays with cross-page numbering, optional summary stats, and a persistent variant for admin-posted panels that refresh on live data without a bot restart.
+> Paginated ranked displays with cross-page numbering, optional page-frame hooks (`build_header` / `build_footer`) for aggregate stats, and a persistent variant for admin-posted panels that refresh on live data without a bot restart.
 
 ```python
-from cascadeui import LeaderboardLayoutView, PersistentLeaderboardLayoutView, get_store
+from cascadeui import LeaderboardLayoutView, PersistentLeaderboardLayoutView, get_store, stats_card
 
 class BattleshipLeaderboard(LeaderboardLayoutView):
     leaderboard_top_n = 25
@@ -444,10 +444,15 @@ class BattleshipLeaderboard(LeaderboardLayoutView):
         games = stats.get("games", 0)
         return f"**{wins}W** / {games - wins}L"
 
-    def build_summary(self, entries):
-        # Each game contributes to two player rows, so halve for unique games.
-        unique_games = sum(s.get("games", 0) for _, s in entries) // 2
-        return {"Players": str(len(entries)), "Games Played": str(unique_games)}
+    def build_header(self, page):
+        # Aggregate stats read from the loaded top-N, rendered above the
+        # rankings on every page. Each game contributes to two player rows,
+        # so halve for unique games.
+        unique_games = sum(s.get("games", 0) for _, s in self.ranked_entries) // 2
+        return stats_card(
+            "Overview",
+            {"Players": str(len(self.ranked_entries)), "Games Played": str(unique_games)},
+        )
 
 
 # One-shot usage: fetch live entries and pass them in.

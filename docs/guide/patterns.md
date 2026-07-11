@@ -790,10 +790,27 @@ mode. Single-page views render no nav row, so the flag has no effect
 when only one page is displayed.
 
 A page that mixes a `Container` with other top-level items (a rankings
-card plus a leaderboard `build_header` banner, or a standalone summary
-card) cannot be wrapped, since Discord forbids Container nesting. Those
-pages keep the sibling layout with the nav row as a separate row; pages
-that can wrap still do.
+card plus a `build_header` card above, or a `Container` footer below)
+cannot be wrapped, since Discord forbids Container nesting. Those pages
+keep the sibling layout with the nav row as a separate row; pages that
+can wrap still do.
+
+Set `nav_divider = True` (default `False`) to render a divider between the
+page content and the in-card nav row, giving the pager a visual separator.
+It has no effect in the sibling layout.
+
+```python
+class CardPaginator(PaginatedLayoutView):
+    nav_inside_container = True
+    nav_divider = True
+```
+
+On a `LeaderboardLayoutView`, `build_footer` placement follows its return type.
+A raw component folds *inside* the rankings
+card (below the entries), so a caption stays attached to the ranking rows; a
+`Container` (`card(...)`) renders as its own card below the rankings. With
+`nav_inside_container = True` the pager joins an in-card footer inside the same
+card unit.
 
 ### Binding per-instance state to a formatter
 
@@ -876,8 +893,9 @@ learning material for the underlying discord.py V1 and V2 primitives.
 
 V2-only paginated ranked display pattern. Accepts a list of
 `(user_id, stats_dict)` tuples and renders one card-based page per
-`leaderboard_per_page` chunk, with a summary header on page 1 and
-cross-page rank numbering. Builds on top of `PaginatedLayoutView`, so
+`leaderboard_per_page` chunk, with optional `build_header` /
+`build_footer` frame content on whichever pages the override chooses,
+plus cross-page rank numbering. Builds on top of `PaginatedLayoutView`, so
 every paginated feature (first/last buttons, go-to modal, jump
 threshold) is available.
 
@@ -926,11 +944,11 @@ change (multi-line, different separator).
 | `format_entry(rank, user_id, stats)` | Composes the four hooks above into one line. Override directly only when the row layout itself needs to change. |
 | `format_primary(rank, user_id, stats)` | Section render mode only -- first line of the two-line section body. Default delegates to `format_rank` + `format_name`. |
 | `format_secondary(rank, user_id, stats)` | Section render mode only -- second line of the section body. Default delegates to `format_stats`. |
-| `get_avatar_url(user_id, stats)` | Async hook returning an avatar URL for the section's `Thumbnail` accessory. Default returns `None`, which triggers the stacked `TextDisplay` fallback. |
-| `build_summary(entries)` | Summary content; the return shape picks placement. A `dict[str, str]` renders as a `key_value` block inline on page 1; a `Container` ships as a standalone card above the rankings on every page; `None` or `{}` suppresses the summary. |
+| `get_avatar_url(user_id, stats)` | Async hook returning an avatar URL for the section's `Thumbnail` accessory. The default resolves from the bot's user cache when a `bot=` kwarg is passed (member avatar on a hit, Discord default avatar on a miss); without a bot it returns `None`, triggering the stacked `TextDisplay` fallback. |
 | `build_title(page)` | Optional components replacing the rankings card's masthead (the `banner` image + `## title` heading) inside the Container. `None` (default) composes the masthead from the declarative `banner` / `title` pair. Same return shapes and `page` semantics as `build_header`. |
-| `build_header(page)` | Optional page-frame components placed first on the page, above the standalone summary card -- a `gallery()` banner is the typical use. Return a component, a list, or `None` (default). `page` is the zero-based page index, so a frame can target only the first page. |
-| `build_footer(page)` | The counterpart of `build_header`: components placed last on the page, below the rankings card and above the navigation row -- a caption, link row, or closing image. Same return shapes and `page` semantics. |
+| `build_header(page)` | Content above the rankings card. The value is prepended as-is: a `Container` renders as its own card (an Overview `stats_card`, a banner), anything else floats as a bare top-level item (no return-type branching, unlike `build_footer`). Read `ranked_entries` for aggregate stats. Return a component, a list, or `None` (default). `page` is the zero-based page index, so a frame can target only some pages. |
+| `build_footer(page)` | Optional footer components, placed by return type: a raw component (caption, link row, image) folds inside the rankings card; a `Container` (`card(...)`) renders as its own card below it. Same return shapes and `page` semantics as `build_header`. |
+| `ranked_entries` *(property)* | The loaded top-N `(user_id, stats)` slice; read it in `build_header` / `build_footer` / `build_title` to compute aggregate stats without re-fetching. |
 | `on_leaderboard_empty()` | Returns the V2 component list shown when `entries` is empty. Default wraps `leaderboard_empty_message` in a single card. |
 | `on_state_changed(state)` | Runs `rebuild_pages()` before the paginated refresh -- lets live-data subclasses re-fetch on every subscribed action. The rebuild short-circuits when the entries signature (user ids + stats) is unchanged, so identical re-fetches cost one comparison instead of a full page rebuild. |
 
@@ -952,42 +970,42 @@ class MmrBoard(LeaderboardLayoutView):
 - `leaderboard_per_page` (default `5`) -- entries per page. Set to `None` to collapse the display into a single page equal to `top_n` (no navigation controls). At the default, a `top_n` of 10 produces two pages with prev/next controls, and a `top_n` of 25 surfaces the full first/last + go-to-page surface.
 - `title` (default `"Leaderboard"`) -- H2 heading on the rankings card. Constructor `title=` kwarg overrides; `title=None` (or an empty string) renders no text heading, so a banner-only masthead needs no hook override. With neither `title` nor `banner` set, the title divider is skipped too.
 - `banner` (default `None`) -- full-width image at the top of the rankings card, above the title heading when both are set. Accepts a URL string, a `discord.File`, or anything with a string `.url` (`guild.icon` works directly). Constructor `banner=` kwarg overrides the class attribute; the `build_title` hook overrides both.
-- `subtitle` (default `"Rankings"`) -- H3 above the ranked rows. Set to `None` or empty string (or pass `subtitle=None` at construction) to skip the H3 entirely, which pairs naturally with a `build_summary` override that returns a standalone Container.
+- `subtitle` (default `"Rankings"`) -- H3 above the ranked rows. Set to `None` or empty string (or pass `subtitle=None` at construction) to skip the H3 entirely, which pairs naturally with an Overview `build_header` card that already carries its own heading.
 - `leaderboard_empty_message` -- static text when no entries exist.
 - `entry_layout` (default `"lines"`) -- controls row rendering. `"lines"` stacks entries as `TextDisplay` rows inside a single card; `"sections"` renders each entry as a `Section` with a `Thumbnail` accessory and a two-line body (`format_primary` + `format_secondary`). Section mode caps `leaderboard_per_page` at `5` -- setting a larger value with `entry_layout = "sections"` raises at class-definition time via `_validate_class_attributes`.
 - `podium_emojis` (default gold/silver/bronze medals) -- dict keyed by rank number. `format_rank` reads this for ranks 1-3; ranks beyond fall back to `f"**{rank}.**"`. Override the dict on a subclass to change the podium glyphs (or extend it past rank 3) without overriding `format_rank` itself.
 - `entry_separator` (default `" -- "`) -- string rendered between the name and stat columns inside `format_entry` (`"lines"` mode). Override on a subclass for visual variety (`" | "`, `" • "`, etc.) without rewriting `format_entry`.
-- `card_color` (default `None`) -- optional accent color for the rankings card. `None` falls through to the active theme's accent. Set to a `discord.Color` on a subclass to give the rankings card its own accent (useful when `build_summary` returns a Container with its own color and a deliberate two-color layout is wanted).
+- `card_color` (default `None`) -- optional accent color for the rankings card. `None` falls through to the active theme's accent. Set to a `discord.Color` on a subclass to give the rankings card its own accent (useful when a `build_header` Overview card carries its own color and a deliberate two-color layout is wanted).
 - `show_title_divider` (default `True`) -- whether to render a horizontal divider below the title and above the rest of the card content. Set to `False` for a more compact card.
 
 ### Section render mode {#section-render-mode}
 
 When `entry_layout = "sections"`, each leaderboard row becomes a
 Discord `Section` with the user's avatar as the accessory and two lines
-of text. Override the three split hooks to control each piece:
+of text. Pass `bot=` and the built-in `get_avatar_url` resolves each
+avatar from the user cache. Override only `format_secondary` for a
+custom second line:
 
 ```python
 class AvatarBoard(LeaderboardLayoutView):
     entry_layout = "sections"
     leaderboard_per_page = 5
 
-    def format_primary(self, rank, user_id, stats):
-        return f"{self.format_rank(rank)} {self.format_name(user_id, stats)}"
-
     def format_secondary(self, rank, user_id, stats):
         return f"{stats['wins']}W / {stats['games']}G"
 
-    async def get_avatar_url(self, user_id, stats):
-        user = self.context.bot.get_user(user_id)
-        return user.display_avatar.url if user else None
+# Pass the bot so the default get_avatar_url can resolve avatars.
+view = AvatarBoard(context=ctx, entries=entries, bot=bot)
 ```
 
-`get_avatar_url` is async so subclasses can fetch from Discord if the
-user is not cached. When the hook returns `None`, the library falls
-back to a stacked `TextDisplay` with the two lines joined by a newline
--- the row's content stays intact without requiring a subclass to
-override the accessory. Override `get_avatar_url` when every row must
-render as a `Section` regardless of cache state.
+The default `get_avatar_url` resolves a member's avatar from the bot's
+user cache on a hit and a Discord default avatar on a miss, so every
+`Section` renders a thumbnail. Without a `bot=`, it returns `None` and
+the row falls back to a stacked `TextDisplay` with the two lines joined
+by a newline -- the content stays intact without a subclass touching the
+accessory. `format_primary` (the first line: rank + name) uses the
+library default; override it or `get_avatar_url` only when a different
+shape is needed.
 
 ### Persistent variant
 
@@ -1015,6 +1033,15 @@ class ServerStatsBoard(PersistentLeaderboardLayoutView):
             reverse=True,
         )
 ```
+
+Section-mode avatar resolution works the same as on the base class, but
+the bot arrives through `on_bind` rather than a `bot=` kwarg: the library
+injects it automatically on the initial send (from the interaction) and
+on every restart, so the default `get_avatar_url` resolves avatars in
+both cases. A panel posted from a bare channel context (no interaction)
+has no bot on its first render and falls back to the two-line
+`TextDisplay`; call `await view.on_bind(bot)` before `send()` if that
+first render must show avatars.
 
 Pair with `persistent_slots = ("...",)` on the subclass (or
 `SlotPolicy(persistent=True)` at setup) to persist the underlying

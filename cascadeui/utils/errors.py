@@ -99,39 +99,6 @@ def with_retry(config: Optional[RetryConfig] = None):
     return decorator
 
 
-class ErrorBoundary:
-    """Context manager for error boundaries."""
-
-    def __init__(self, name: str, log_level: str = "ERROR"):
-        self.name = name
-        # Convert string log level to integer
-        self.log_level = self._get_log_level(log_level)
-
-    @staticmethod
-    def _get_log_level(level_name: str) -> int:
-        """Convert string log level to integer constant."""
-        import logging
-
-        level_map = {
-            "DEBUG": logging.DEBUG,
-            "INFO": logging.INFO,
-            "WARNING": logging.WARNING,
-            "ERROR": logging.ERROR,
-            "CRITICAL": logging.CRITICAL,
-        }
-        return level_map.get(level_name.upper(), logging.ERROR)
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if exc_val is not None:
-            logger.log(self.log_level, f"Error in {self.name}: {exc_val}", exc_info=True)
-            # Return False to propagate the exception
-            return False
-        return True
-
-
 async def safe_execute(coro: Coroutine, fallback: Any = None, log_error: bool = True) -> Any:
     """
     Safely execute a coroutine and return fallback value on error.

@@ -70,6 +70,42 @@ class TestTabStyleApplication:
         assert view._tab_buttons[0].style is discord.ButtonStyle.secondary
         assert view._tab_buttons[1].style is discord.ButtonStyle.primary
 
+    async def test_builder_derives_active_from_cursor(self):
+        """The builder styles the active tab from _active_tab, not position 0,
+        so a rebuild off a non-zero tab highlights the right button.
+        """
+        view = TabLayoutView(
+            interaction=_make_interaction(),
+            tabs={"A": _builder, "B": _builder, "C": _builder},
+        )
+        view._active_tab = 2
+        view._tab_buttons = []
+        view.clear_items()
+        view._build_tab_buttons()
+
+        assert view._tab_buttons[2].style is discord.ButtonStyle.primary
+        assert view._tab_buttons[0].style is discord.ButtonStyle.secondary
+
+
+class TestTabButtonDerivationV1:
+    """V1 TabView's builder styles the active tab from _active_tab, mirroring
+    the V2 fix. The two builders are independent implementations, so the V1
+    path needs its own coverage.
+    """
+
+    def test_v1_builder_derives_active_from_cursor(self):
+        view = TabView(
+            interaction=_make_interaction(),
+            tabs={"A": _builder, "B": _builder, "C": _builder},
+        )
+        view._active_tab = 2
+        view._tab_buttons = []
+        view.clear_items()
+        view._build_tab_buttons()
+
+        assert view._tab_buttons[2].style is view.active_tab_style
+        assert view._tab_buttons[0].style is view.inactive_tab_style
+
 
 # // ========================================( on_tab_switched hook )======================================== // #
 
@@ -85,6 +121,27 @@ class TestOnTabSwitchedHook:
         )
         result = await view.on_tab_switched(0)
         assert result is None
+
+    async def test_raising_hook_does_not_abort_switch(self):
+        """A raising on_tab_switched override is swallowed so the tab switch
+        and its refresh still complete."""
+
+        class RaisingTabs(TabLayoutView):
+            async def on_tab_switched(self, index):
+                raise RuntimeError("boom")
+
+        view = RaisingTabs(
+            interaction=_make_interaction(),
+            tabs={"A": _builder, "B": _builder},
+        )
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+
+        callback = view._make_switch_callback(1)
+        await callback(_make_interaction())  # must not raise
+
+        assert view._active_tab == 1
+        assert view._message.edit.called
 
     async def test_hook_fires_on_switch_tab(self):
         calls = []

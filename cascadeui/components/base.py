@@ -11,6 +11,7 @@ from discord.ui import Item
 from ..state.actions import ActionCreators
 from ..state.store import _CURRENT_INTERACTION
 from ..utils.coercion import coerce_snowflake_match
+from .types import MAX_SELECT_OPTIONS
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +178,14 @@ class StatefulSelect(discord.ui.Select, StatefulComponent):
         if options is not None and len(options) == 0:
             kwargs["options"] = [_EMPTY_SELECT_OPTION]
             kwargs["disabled"] = True
+        elif options is not None and len(options) > MAX_SELECT_OPTIONS:
+            # Discord 400s a select with more than 25 options at send. Raise
+            # here so the mistake surfaces at construction, matching the cap
+            # choice_row already enforces for the same limit.
+            raise ValueError(
+                f"StatefulSelect has {len(options)} options; Discord accepts at most "
+                f"{MAX_SELECT_OPTIONS}. Trim the list or split the choices across selects."
+            )
 
         super().__init__(*args, **kwargs)
 

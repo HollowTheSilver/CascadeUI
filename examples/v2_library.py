@@ -20,6 +20,10 @@ What this example demonstrates:
         paginator renders as one cohesive card. Default ``False`` keeps
         the original sibling layout.
 
+    - nav_divider = True
+        Adds a separator between the page content and the in-card nav
+        row so the pager does not butt against the last list row.
+
     - auto_back_button = True
         CascadeUI generates a Back button on the pushed view. The
         button calls ``self.pop()`` automatically and the underlying
@@ -145,12 +149,16 @@ class CategoryListView(PaginatedLayoutView):
     hub's category-button callback. ``auto_back_button`` adds the Back
     button; clicking it pops the nav stack and restores the hub view to
     the same Discord message. ``nav_inside_container`` wraps page
-    content + nav row in a single Container.
+    content + nav row in a single Container, and ``nav_divider`` adds a
+    separator between the two inside that card.
     """
 
     owner_only = True
     auto_back_button = True
     nav_inside_container = True
+    # Draws a separator between the page content and the in-card pager so the
+    # control strip does not butt against the last list row.
+    nav_divider = True
     exit_policy = "disable"
     state_scope = None
     # No Redux reactivity -- pagination state is pattern-internal.

@@ -588,6 +588,98 @@ class TestMiddlewareRetryBackoff:
         assert ns.retry_count == 0
         await middleware.close()
 
+    async def test_retry_reenqueue_preserves_write_over_pending_delete(self):
+        """A write that lands during a failed delete-flush must not be
+        resurrected as a delete on the retry re-enqueue.
+
+        Regression: the re-enqueue re-added every snapshotted delete
+        unconditionally, so a re-register racing a failed unregister flush left
+        the key in BOTH buffers and the next flush upsert-then-deleted it --
+        dropping the newer write (a re-registered persistent view failing to
+        reattach after restart).
+        """
+        middleware, mgr, backend = await _make_middleware()
+        ns = middleware._ns_application
+        key = "pref"
+        row = {
+            "slot_name": key,
+            "payload": "{}",
+            "schema_version": 1,
+            "updated_at": 1,
+            "expires_at": None,
+        }
+
+        # Snapshot state: a delete (unregister) is pending, no dirty row yet.
+        ns.deleted_keys.add(key)
+        # Sit at MAX-1 so this failure hits the cap and returns without leaving
+        # a scheduled backoff task past the assertions.
+        ns.retry_count = PersistenceMiddleware.MAX_RETRIES - 1
+
+        async def failing_delete(table, where):
+            # A concurrent write of the same key arrives during the delete's
+            # await: routing sets the dirty row and discards it from deletes.
+            ns.dirty_rows[key] = row
+            ns.deleted_keys.discard(key)
+            raise RuntimeError("backend down mid-delete")
+
+        backend.row_delete = failing_delete  # type: ignore[method-assign]
+
+        await middleware._flush(ns)
+
+        # The newer write survives and is NOT also queued for deletion.
+        assert key in ns.dirty_rows
+        assert key not in ns.deleted_keys
+
+        ns.dirty_rows.clear()
+        ns.deleted_keys.clear()
+        await middleware.close()
+
+    async def test_retry_reenqueue_preserves_delete_over_pending_write(self):
+        """Mirror of the write-over-delete case: a delete (unregister) that
+        lands during a failed write-flush must not be resurrected as a write on
+        the retry re-enqueue.
+
+        The re-enqueue guard is symmetric; the sibling test above fails a delete
+        flush and covers the delete-side branch, so this one fails a write flush
+        to reach the write-side branch (``if key not in ns.deleted_keys``) that
+        the empty ``rows`` snapshot in the sibling never executes.
+        """
+        middleware, mgr, backend = await _make_middleware()
+        ns = middleware._ns_application
+        key = "pref"
+        row = {
+            "slot_name": key,
+            "payload": "{}",
+            "schema_version": 1,
+            "updated_at": 1,
+            "expires_at": None,
+        }
+
+        # Snapshot state: a write (register) is pending, no delete yet.
+        ns.dirty_rows[key] = row
+        # Sit at MAX-1 so this failure hits the cap and returns without leaving
+        # a scheduled backoff task past the assertions.
+        ns.retry_count = PersistenceMiddleware.MAX_RETRIES - 1
+
+        async def failing_upsert_many(table, rows, key_columns):
+            # A concurrent unregister of the same key arrives during the write's
+            # await: routing sets the delete and discards the dirty row.
+            ns.deleted_keys.add(key)
+            ns.dirty_rows.pop(key, None)
+            raise RuntimeError("backend down mid-write")
+
+        backend.row_upsert_many = failing_upsert_many  # type: ignore[method-assign]
+
+        await middleware._flush(ns)
+
+        # The newer delete survives and the stale write is NOT resurrected.
+        assert key in ns.deleted_keys
+        assert key not in ns.dirty_rows
+
+        ns.dirty_rows.clear()
+        ns.deleted_keys.clear()
+        await middleware.close()
+
 
 # // ========================================( Observability hooks )======================================== // #
 

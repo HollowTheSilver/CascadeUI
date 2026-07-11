@@ -406,18 +406,6 @@ class _BaseFormMixin:
         surface warnings before the user submits.
         """
 
-    async def _call_hook_safe(self, hook, *args) -> None:
-        """Run a fire-and-forget hook, logging any exception.
-
-        Matches the wrapping pattern at ``base.py:_enforce_instance_limit``
-        for ``on_replaced`` -- override errors must never block the
-        surrounding form rebuild or interaction-response flow.
-        """
-        try:
-            await hook(*args)
-        except Exception as exc:
-            logger.warning(f"{hook.__name__} raised in {type(self).__name__}: {exc}")
-
     async def _open_text_modal(self, interaction: Interaction) -> None:
         """Open the grouped modal for every modal-rendered field on the form."""
         modal_fields = _collect_modal_fields(self.fields)

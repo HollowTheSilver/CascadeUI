@@ -13,6 +13,21 @@ from .base import StatefulComponent
 
 logger = logging.getLogger(__name__)
 
+
+# // ========================================( Helpers )======================================== // #
+
+
+def _validate_range(owner: str, name: str, value: Optional[int], lo: int, hi: int) -> None:
+    """Reject an out-of-range numeric bound at construction time.
+
+    Discord accepts these bounds only within ``[lo, hi]`` and 400s the modal
+    open otherwise; raising here surfaces the mistake where the value is set.
+    ``None`` (Discord's server default) is always allowed.
+    """
+    if value is not None and not lo <= value <= hi:
+        raise ValueError(f"{owner} {name}={value} is out of range; Discord accepts {lo}-{hi}.")
+
+
 # // ========================================( Classes )======================================== // #
 
 
@@ -63,6 +78,8 @@ class TextInput(StatefulComponent):
         self.required = required
         self.min_length = min_length
         self.max_length = max_length
+        _validate_range(f"TextInput {label!r}", "min_length", min_length, 0, 4000)
+        _validate_range(f"TextInput {label!r}", "max_length", max_length, 1, 4000)
         self.style = style
         self.validators: List[Callable] = list(validators) if validators else []
         self.custom_id = self._slug(label)
@@ -196,6 +213,8 @@ class CheckboxGroup(StatefulComponent):
         self.required = required
         self.min_values = min_values
         self.max_values = max_values
+        _validate_range(f"CheckboxGroup {label!r}", "min_values", min_values, 0, 10)
+        _validate_range(f"CheckboxGroup {label!r}", "max_values", max_values, 1, 10)
         self.validators: List[Callable] = list(validators) if validators else []
         self.custom_id = TextInput._slug(label)
         self.values: Optional[List[str]] = None
@@ -334,6 +353,8 @@ class FileUpload(StatefulComponent):
         self.required = required
         self.min_values = min_values
         self.max_values = max_values
+        _validate_range(f"FileUpload {label!r}", "min_values", min_values, 0, 10)
+        _validate_range(f"FileUpload {label!r}", "max_values", max_values, 1, 10)
         self.validators: List[Callable] = list(validators) if validators else []
         self.custom_id = TextInput._slug(label)
         self.values: Optional[List] = None

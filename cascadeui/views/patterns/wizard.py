@@ -194,18 +194,6 @@ class _BaseWizardMixin:
 
     # // ----( Navigation callbacks )---- // #
 
-    async def _call_hook_safe(self, hook, *args) -> None:
-        """Run a fire-and-forget hook, logging any exception.
-
-        Matches the wrapping pattern at ``base.py:_enforce_instance_limit``
-        for ``on_replaced`` -- override errors must never block the
-        surrounding navigation / lifecycle flow.
-        """
-        try:
-            await hook(*args)
-        except Exception as exc:
-            logger.warning(f"{hook.__name__} raised in {type(self).__name__}: {exc}")
-
     async def _go_back(self, interaction: Interaction):
         prev = self._prev_visible_index(self._current_step)
         if prev is not None:
@@ -314,7 +302,7 @@ class WizardView(_BaseWizardMixin, StatefulView):
             style=self.back_button_style,
             custom_id="wizard_back",
             row=4,
-            disabled=True,
+            disabled=self._prev_visible_index(self._current_step) is None,
             callback=self._go_back,
         )
         self.add_item(self._back_btn)
@@ -435,7 +423,7 @@ class WizardLayoutView(_BaseWizardMixin, StatefulLayoutView):
             emoji=self.back_button_emoji,
             style=self.back_button_style,
             custom_id="wizard_back",
-            disabled=True,
+            disabled=self._prev_visible_index(self._current_step) is None,
             callback=self._go_back,
         )
 
