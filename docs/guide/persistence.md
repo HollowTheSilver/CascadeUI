@@ -175,6 +175,31 @@ first reattach). Reconcile only from `removed` (a definitive 404); a key in
 `REGISTRY_PRUNED` action carries the same `removed` data for a consumer that
 subscribes before `setup_middleware`.
 
+### Re-driving reattach after a runtime cog load
+
+With the canonical `setup_hook` order above (cogs first, then `setup_middleware`),
+the reattach pass inside `setup_middleware` imports every `PersistentView`
+subclass before it runs, so all of them attach. That order needs no `reattach()`
+call.
+
+`reattach()` is the escape hatch for a persistent-view cog loaded *after*
+`setup_middleware` has already run: a hot-reloaded extension, or a cog loaded
+lazily at runtime. Its class was not imported during the initial pass, so its
+posted messages land in the `skipped` bucket and stay dead until the next
+restart. Call `reattach()` once after the runtime load to attach them:
+
+```python
+async def reload_feature(self):
+    # A persistent-view cog loaded well after setup_hook finished.
+    await self.load_extension("cogs.new_dashboard")
+    await get_store().persistence_manager.reattach()
+```
+
+`reattach()` is idempotent: panels already attached on a prior pass are
+skipped (no re-fetch, no double registration), and transiently `unreachable` /
+`failed` rows are retried. It returns the same five-bucket summary as
+`reattach_persistent_views()`, covering only the rows it processed.
+
 ## Backends
 
 ### Built-in backends
@@ -1035,7 +1060,7 @@ inferring it from row counts.
 ### Automatic TTL sweeping
 
 When any slot declares `ttl_days`, the manager starts a daily background
-sweeper at `install_middleware()` time. It calls `row_delete_where_lt` on
+sweeper during initialization. It calls `row_delete_where_lt` on
 `application_slots.expires_at` once every 24 hours and drops rows whose
 absolute wall-clock expiration has passed. No cadence configuration is
 exposed -- TTLs are expressed in days, sub-day precision is meaningless,

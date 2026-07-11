@@ -359,7 +359,7 @@ and `StatefulLayoutView`:
 | `auto_defer` | `True` | The ack safety net. A background timer acknowledges the interaction if the callback has not responded in time. | Keep it on. Turning it off removes the only thing standing between a slow callback and Discord's 3-second ack wall. |
 | `auto_defer_delay` | `2.5` | How long the safety net waits before acking (seconds). | A view's callback can run long; lowering it acks sooner. The default leaves headroom under the 3s wall. |
 | `serialize_interactions` | `True` | Serializes callbacks behind a lock so rapid clicks cannot fire racing `message.edit()` calls. | Keep it on for views that edit one shared message. It serializes the edits, not the data loads. |
-| `refresh_cooldown_ms` | `None` | A proactive throttle: edits inside the window are coalesced into one deferred re-render. | A view re-renders rapidly and you want fewer REST round-trips. The reactive 429 backoff is always on regardless. |
+| `refresh_cooldown_ms` | `None` | A proactive throttle: edits inside the window are coalesced into one deferred re-render, and a `reload()` in the window defers its `on_load()` fetch too, not just the edit. | A view re-renders rapidly and you want fewer REST round-trips. The reactive 429 backoff is always on regardless. |
 | `edit_timeout` | `60.0` | The ceiling on every edit the library issues after the initial send. A stalled edit is cancelled at this bound. | Uploads or large payloads need longer than 60s per edit. Set `None` to await with no ceiling. |
 | `timeout` | `180` (discord.py default) | The discord.py view timeout, in seconds. Values over 900s engage the ephemeral refresh handoff automatically. | Long-lived panels. A persistent view sets `timeout = None`. |
 

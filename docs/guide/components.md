@@ -294,11 +294,14 @@ difficulty = RadioGroup(
 Same dict shorthand as `CheckboxGroup`. After submit: `difficulty.value` →
 `str`.
 
-!!! note "Option counts are checked at construction"
-    `CheckboxGroup` accepts 1-10 options; `RadioGroup` requires 2-10.
-    Both bounds are Discord platform limits, enforced by CascadeUI with a
-    directed `ValueError` at construction -- the mistake surfaces where the
-    options are built, not as an HTTP 400 when the modal opens.
+!!! note "Counts and bounds are checked at construction"
+    `CheckboxGroup` accepts 1-10 options; `RadioGroup` requires 2-10. The same
+    directed `ValueError` guards every documented numeric bound at construction:
+    `TextInput` `min_length` / `max_length` (0-4000 / 1-4000), the `min_values` /
+    `max_values` on `CheckboxGroup` and `FileUpload` (0-10 / 1-10), and the
+    25-option cap on `StatefulSelect` / `Dropdown`. Each mistake surfaces where
+    the component is built, not as an HTTP 400 when the modal opens or the
+    message ships.
 
 ### FileUpload
 

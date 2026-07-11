@@ -717,6 +717,40 @@ class TestReattachUnreachable:
         assert unreachable == []
 
 
+class TestReattachIdempotent:
+    """reattach() re-drives the reattach, skipping keys already restored on a
+    prior pass (B1(c)) so a class imported after the initial reattach attaches
+    without re-touching already-live panels."""
+
+    async def test_reattach_skips_already_restored_keys(self):
+        mgr = PersistenceManager(store=get_store())
+        mgr._bot = MagicMock()
+        mgr._registry_rows = [
+            {
+                "persistence_key": "panel:a",
+                "view_class": "Unregistered",
+                "channel_id": 1,
+                "message_id": 2,
+            },
+            {
+                "persistence_key": "panel:b",
+                "view_class": "Unregistered",
+                "channel_id": 3,
+                "message_id": 4,
+            },
+        ]
+        # panel:a was restored on the initial pass.
+        mgr._restored_keys = {"panel:a"}
+
+        summary = await mgr.reattach()
+
+        # panel:a was filtered out before processing -- it appears in no bucket.
+        all_keys = [k for bucket in summary.values() for k in bucket]
+        assert "panel:a" not in all_keys
+        # panel:b is processed (its class isn't registered, so it lands in skipped).
+        assert "panel:b" in summary["skipped"]
+
+
 class TestManagerReattachInitKwargsDuplicate:
     """Reattach strips persistence_key from init_kwargs before splatting.
 

@@ -1,6 +1,7 @@
 # // ========================================( Modules )======================================== // #
 
 
+import logging
 import time
 from typing import Any, Callable, Dict, Optional
 
@@ -9,10 +10,38 @@ from discord import ButtonStyle, Interaction
 
 from .types import EmojiInput
 
+logger = logging.getLogger(__name__)
+
 # // ========================================( Constants )======================================== // #
 
 
 _VALID_COOLDOWN_SCOPES = frozenset({"user", "guild", "user_guild", "global"})
+
+
+# // ========================================( Helpers )======================================== // #
+
+
+class _ConfirmationView(discord.ui.View):
+    """Inner view for ``with_confirmation``.
+
+    Disables its buttons on timeout so a late click reflects expiry instead of
+    erroring with "This interaction failed". ``message`` is captured after the
+    prompt is sent so the disabled state can be edited onto it.
+    """
+
+    def __init__(self, timeout: float):
+        super().__init__(timeout=timeout)
+        self.message: Optional[discord.Message] = None
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            if hasattr(item, "disabled"):
+                item.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException as e:
+                logger.debug(f"with_confirmation prompt timeout edit failed: {e}")
 
 
 # // ========================================( Functions )======================================== // #
@@ -71,8 +100,10 @@ def with_loading_state(
         if isinstance(view, _StatefulMixin) and view._message is not None:
             try:
                 await view.refresh()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(
+                    f"with_loading_state pre-edit refresh failed on {type(view).__name__}: {e}"
+                )
         elif not interaction.response.is_done():
             try:
                 await interaction.response.edit_message(view=view)
@@ -105,8 +136,10 @@ def with_loading_state(
                     await view.refresh()
                 elif interaction.message:
                     await interaction.message.edit(view=view)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(
+                    f"with_loading_state restore edit failed on {type(view).__name__}: {e}"
+                )
 
     component.callback = loading_callback
     return component
@@ -157,7 +190,7 @@ def with_confirmation(
     original_callback = component.callback
 
     async def confirmation_callback(interaction: Interaction) -> None:
-        confirmation_view = discord.ui.View(timeout=timeout)
+        confirmation_view = _ConfirmationView(timeout=timeout)
 
         async def _on_confirm(confirm_interaction: Interaction) -> None:
             try:
@@ -208,6 +241,7 @@ def with_confirmation(
         from ..views.base import _StatefulMixin
 
         view = component.view
+        prompt_message = None
         if isinstance(view, _StatefulMixin):
             await view.respond(interaction, embed=embed, view=confirmation_view, ephemeral=True)
         elif not interaction.response.is_done():
@@ -215,7 +249,21 @@ def with_confirmation(
                 embed=embed, view=confirmation_view, ephemeral=True
             )
         else:
-            await interaction.followup.send(embed=embed, view=confirmation_view, ephemeral=True)
+            prompt_message = await interaction.followup.send(
+                embed=embed, view=confirmation_view, ephemeral=True
+            )
+
+        # Capture the prompt so on_timeout can disable its buttons. The
+        # followup path returns the message directly; the response-slot path
+        # resolves it via original_response(). Best-effort -- if the slot was
+        # pre-consumed on the respond() path, on_timeout still disables the
+        # buttons in memory.
+        if prompt_message is None:
+            try:
+                prompt_message = await interaction.original_response()
+            except discord.HTTPException as e:
+                logger.debug(f"with_confirmation could not capture prompt message: {e}")
+        confirmation_view.message = prompt_message
 
     component.callback = confirmation_callback
     return component

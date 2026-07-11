@@ -76,6 +76,7 @@ class _BasePaginatedMixin:
     _BOOL_ATTRS: ClassVar[tuple] = (
         *_StatefulMixin._BOOL_ATTRS,
         "nav_inside_container",
+        "nav_divider",
     )
 
     # // ----( Override hook )---- // #
@@ -105,13 +106,43 @@ class _BasePaginatedMixin:
             return self.indicator_button_label
         return f"{current}/{total}"
 
+    # // ----( Nav state )---- // #
+
+    def _sync_nav_state(self) -> None:
+        """Derive every nav button's disabled state and the indicator label
+        from ``current_page`` / ``len(pages)``.
+
+        The single source of truth for nav state, shared by the builders
+        (``_build_navigation_buttons`` / ``_build_nav_buttons``) and the
+        page-turn handlers (``_update_page``). Every render path that rebuilds
+        the row runs the same computation, so a rebuild triggered off the
+        page-turn path (a reload, an ``on_load``) can no longer leave the
+        buttons at page-one defaults while the content shows a later page.
+        Buttons are already constructed by the time any caller runs this, so
+        the only guards are the ``_first_btn`` / ``_last_btn`` None-checks for
+        views below the jump threshold.
+        """
+        total = len(self.pages)
+        at_first = self.current_page == 0
+        at_last = self.current_page >= total - 1
+        self._prev_btn.disabled = at_first
+        self._next_btn.disabled = at_last
+        if self._first_btn is not None:
+            self._first_btn.disabled = at_first
+        if self._last_btn is not None:
+            self._last_btn.disabled = at_last
+        if self._show_jump:
+            self._indicator_btn.label = self._resolve_goto_label()
+        else:
+            self._indicator_btn.label = self._resolve_indicator_label()
+
     # // ----( Callback factories )---- // #
 
     def _make_step_callback(self, delta: int):
         async def callback(interaction: Interaction):
             new_page = max(0, min(len(self.pages) - 1, self.current_page + delta))
             self.current_page = new_page
-            await self.on_page_changed(new_page)
+            await self._call_hook_safe(self.on_page_changed, new_page)
             await self._update_page()
 
         return callback
@@ -127,7 +158,7 @@ class _BasePaginatedMixin:
                 target = target_resolver
             target = max(0, min(len(self.pages) - 1, target))
             self.current_page = target
-            await self.on_page_changed(target)
+            await self._call_hook_safe(self.on_page_changed, target)
             await self._update_page()
 
         return callback
@@ -570,6 +601,12 @@ class PaginatedView(_BasePaginatedMixin, StatefulView):
             )
             self._nav_buttons.append(self._last_btn)
 
+        # Derive the disabled/label state from current_page so a re-invoke
+        # of this builder after the page has moved reflects the real page,
+        # not page one.
+        self._sync_nav_state()
+        self._nav_built_for_count = len(self.pages)
+
     def _extract_page(self, page) -> dict:
         """Extract embed/content kwargs from a page entry.
 
@@ -628,22 +665,17 @@ class PaginatedView(_BasePaginatedMixin, StatefulView):
         await self._ensure_page_loaded(self.current_page)
 
         page_kwargs = self._extract_page(self.pages[self.current_page])
-        total = len(self.pages)
-        at_first = self.current_page == 0
-        at_last = self.current_page >= total - 1
-
-        self._prev_btn.disabled = at_first
-        self._next_btn.disabled = at_last
-        if self._first_btn is not None:
-            self._first_btn.disabled = at_first
-        if self._last_btn is not None:
-            self._last_btn.disabled = at_last
-
-        if self._show_jump:
-            self._indicator_btn.label = self._resolve_goto_label()
+        if len(self.pages) != getattr(self, "_nav_built_for_count", None):
+            # Page count crossed jump_threshold: rebuild + re-attach the button
+            # set (first/last/goto may appear or disappear). V1 mutates the tree
+            # in place, so remove the old buttons before rebuilding.
+            for btn in self._nav_buttons:
+                self.remove_item(btn)
+            self._build_navigation_buttons()
+            for btn in self._nav_buttons:
+                self.add_item(btn)
         else:
-            self._indicator_btn.label = self._resolve_indicator_label()
-
+            self._sync_nav_state()
         await self.refresh(**page_kwargs)
 
 
@@ -664,7 +696,7 @@ class PaginatedLayoutView(_BasePaginatedMixin, StatefulLayoutView):
 
     Customization + override hook mirror ``PaginatedView``.
 
-    V2-only attribute:
+    V2-only attributes:
         nav_inside_container: When ``True``, page content and the nav row
             are wrapped in a single ``Container`` so the paginator renders
             as one cohesive card. When ``False`` (default), page content
@@ -674,9 +706,14 @@ class PaginatedLayoutView(_BasePaginatedMixin, StatefulLayoutView):
             mixes a Container with other top-level items cannot be
             wrapped (Discord forbids Container nesting); such pages keep
             the sibling layout with the nav row as a separate row.
+        nav_divider: When ``True`` (and ``nav_inside_container`` is on), a
+            divider renders between the card content and the in-card nav
+            row, giving the control strip a visual separator. Default
+            ``False`` keeps the flush look. No effect in sibling layout.
     """
 
     nav_inside_container: ClassVar[bool] = False
+    nav_divider: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -823,10 +860,21 @@ class PaginatedLayoutView(_BasePaginatedMixin, StatefulLayoutView):
         separate cards into one. Returns ``None`` so the caller falls back
         to the sibling layout with the page content intact.
         """
+        # nav_divider (opt-in) inserts a divider between the card content and
+        # the in-card nav row. A fresh node each call keeps the divider
+        # single-owned across renders of the same source page, honoring the
+        # rebuild-from-scratch contract.
+        nav_prefix: list = []
+        if self.nav_divider:
+            from ...components.patterns.v2 import divider
+
+            nav_prefix = [divider()]
+
         if len(items) == 1 and isinstance(items[0], Container):
             source = items[0]
             wrapper = Container(
                 *list(source.children),
+                *nav_prefix,
                 self._nav_row,
                 accent_color=source.accent_color,
                 spoiler=source.spoiler,
@@ -838,7 +886,7 @@ class PaginatedLayoutView(_BasePaginatedMixin, StatefulLayoutView):
                 wrapper._cascadeui_theme_accent = True
             return wrapper
         if not any(isinstance(item, Container) for item in items):
-            return Container(*items, self._nav_row)
+            return Container(*items, *nav_prefix, self._nav_row)
         if not getattr(self, "_nav_wrap_declined", False):
             self._nav_wrap_declined = True
             logger.debug(
@@ -846,20 +894,6 @@ class PaginatedLayoutView(_BasePaginatedMixin, StatefulLayoutView):
                 f"a Container with other top-level items; rendering the sibling layout."
             )
         return None
-
-    def _add_page_content(self):
-        """Append current page's V2 components and track them for later removal.
-
-        Retained as a thin wrapper around ``_compose_pagination_tree`` for
-        any subclass that overrode this method before
-        ``nav_inside_container`` landed. The composition path now flows
-        through ``_compose_pagination_tree``; subclasses that need to
-        customize the page-content render shape should override that
-        method instead.
-        """
-        # Collapsed call: the helper handles every shape including the
-        # empty-pages placeholder and the wrapped/unwrapped split.
-        self._compose_pagination_tree()
 
     def _build_nav_buttons(self):
         """Build nav buttons into a fresh ``self._nav_row`` ActionRow.
@@ -945,9 +979,16 @@ class PaginatedLayoutView(_BasePaginatedMixin, StatefulLayoutView):
 
         # Buttons are built unconditionally so identity survives a
         # rebuild_pages() that grows total from 1 to 2+. Callers attach
-        # the row to the tree when pagination is meaningful;
-        # _update_page re-checks each refresh.
+        # the row to the tree when pagination is meaningful.
         self._nav_row = ActionRow(*buttons)
+
+        # Sync disabled/label state here (not just in _update_page) so a
+        # rebuild off the page-turn path (LeaderboardLayoutView.on_load,
+        # any reload) reflects the current page instead of page one.
+        self._sync_nav_state()
+        # Record the count this button SET was built for so _update_page can
+        # detect a jump_threshold crossing and rebuild (not just re-sync).
+        self._nav_built_for_count = len(self.pages)
 
     async def send(self, *args, **kwargs):
         """Preload page 0 in cursor mode, then rebuild and ship.
@@ -961,11 +1002,28 @@ class PaginatedLayoutView(_BasePaginatedMixin, StatefulLayoutView):
         """
         if self._is_cursor_mode and self.pages and self.pages[0] is None:
             await self._ensure_page_loaded(0)
-            self.clear_items()
-            self._compose_pagination_tree()
-            for extra in self._extra_items:
-                self.add_item(extra)
+            self._recompose_page_tree()
         return await super().send(*args, **kwargs)
+
+    def _recompose_page_tree(self, *, rebuild_nav: bool = False) -> None:
+        """Clear the tree and re-add page content, extras, and the back button.
+
+        The single recompose sequence shared by ``send`` (cursor preload),
+        ``_update_page`` (page turn), and ``LeaderboardLayoutView.on_load``
+        (reload). ``rebuild_nav=True`` re-runs ``_build_nav_buttons`` first,
+        for callers whose page count may have changed since construction
+        (the leaderboard, whose entries are fetched async in ``on_load``).
+        ``_restore_navigation_artifacts`` re-adds the auto back button when
+        ``push()`` injected one; it is a no-op at plain-send time, so routing
+        ``send`` through here adds no behavior.
+        """
+        self.clear_items()
+        if rebuild_nav:
+            self._build_nav_buttons()
+        self._compose_pagination_tree()
+        for extra in self._extra_items:
+            self.add_item(extra)
+        self._restore_navigation_artifacts()
 
     async def _update_page(self):
         """Mutate nav in place, rebuild page content, preserve extra items.
@@ -981,34 +1039,13 @@ class PaginatedLayoutView(_BasePaginatedMixin, StatefulLayoutView):
         # No-op for eager mode and for cached cursor pages.
         await self._ensure_page_loaded(self.current_page)
 
-        total = len(self.pages)
-        at_first = self.current_page == 0
-        at_last = self.current_page >= total - 1
-
-        self._prev_btn.disabled = at_first
-        self._next_btn.disabled = at_last
-        if self._first_btn is not None:
-            self._first_btn.disabled = at_first
-        if self._last_btn is not None:
-            self._last_btn.disabled = at_last
-
-        if self._show_jump:
-            self._indicator_btn.label = self._resolve_goto_label()
+        if len(self.pages) != getattr(self, "_nav_built_for_count", None):
+            # The page count crossed jump_threshold since the nav row was built
+            # (a refresh_data / refresh_pages / rebuild_pages call). Rebuild the
+            # button SET: _sync_nav_state only mutates existing buttons, it
+            # cannot add or remove the first/last/goto buttons _show_jump gates.
+            self._recompose_page_tree(rebuild_nav=True)
         else:
-            self._indicator_btn.label = self._resolve_indicator_label()
-
-        # Clear and re-compose. The helper handles the nav-row inclusion
-        # based on len(self.pages) and ``nav_inside_container``;
-        # rebuild_pages() can shrink past the multi-page boundary so the
-        # check is per-refresh inside the helper.
-        self.clear_items()
-        self._compose_pagination_tree()
-        for extra in self._extra_items:
-            self.add_item(extra)
-
-        # Restore the navigation back button if push() added one. Without
-        # this, ``clear_items()`` strips the back button on every page turn
-        # and the user is stranded in the pushed view with no way back.
-        self._restore_navigation_artifacts()
-
+            self._sync_nav_state()
+            self._recompose_page_tree()
         await self.refresh()

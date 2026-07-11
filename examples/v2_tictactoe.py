@@ -19,6 +19,9 @@ patterns with V2 components:
     - ``protect_attached = True`` prevents the challenger from
       silently abandoning an active game with another player
     - ``exit_policy = "delete"`` on the disposable challenge prompt
+    - ``exit_policy = "disable"`` on the finished game board, freezing it
+      in place on Close so the completed card stays as a record (matching
+      Battleship's phase-aware ``exit()`` override)
     - Dynamic board size (3x3 to 5x5 via the size parameter)
     - Configurable win length (e.g. 3-in-a-row on a 5x5 board)
     - Turn enforcement inside move callbacks (not interaction_check)
@@ -65,6 +68,7 @@ from cascadeui import (
     get_store,
     image_section,
     key_value,
+    progress_bar,
     stats_card,
 )
 
@@ -316,10 +320,12 @@ class TicTacToeView(StatefulLayoutView):
     # allowed_users and participant_limit" in docs/guide/views.md.
     participant_limit = 2
     auto_register_participants = True
-    # Bare exit() (close button, timeout) deletes the message; the
-    # board state is reproducible from any rematch, so there's nothing
-    # worth freezing on the public card after the game ends.
-    exit_policy = "delete"
+    # Close freezes the finished board in place as a record, matching the
+    # default timeout freeze and Battleship's game-over Close. Exit here is
+    # always post-game (no setup phase to abandon), so a declarative policy
+    # fits where Battleship needs a phase-aware exit() override. Stale games
+    # are still removed by replace_policy when a new one evicts them.
+    exit_policy = "disable"
 
     def __init__(self, *args, opponent_id: int, size: int = 3, win_length: int = 3, **kwargs):
         super().__init__(*args, **kwargs)
@@ -600,7 +606,9 @@ class TicTacToeView(StatefulLayoutView):
         await self.refresh()
 
     async def _close(self, interaction: discord.Interaction):
-        """Close the game (deletion handled by exit_policy = "delete")."""
+        """Close the finished game. ``exit_policy = "disable"`` freezes the
+        final board in place rather than deleting it, so the completed card
+        stays as a record (matching Battleship)."""
         await self.exit()
 
 
@@ -776,29 +784,46 @@ class TicTacToeExample(commands.Cog, name="v2_tictactoe_example"):
             return
 
         class _TicTacToeLeaderboard(LeaderboardLayoutView):
+            # Section mode renders each entry as a two-line card with an avatar
+            # thumbnail: top 10 across two pages of 5.
             leaderboard_top_n = 10
+            leaderboard_per_page = 5
+            entry_layout = "sections"
 
-            def format_stats(self, user_id, stats):
+            def format_secondary(self, rank, user_id, stats):
                 wins = stats.get("wins", 0)
                 games = stats.get("games", 0)
                 draws = stats.get("draws", 0)
-                win_rate = (wins / games * 100) if games else 0.0
-                return f"{wins}W / {games}G \N{BULLET} {win_rate:.0f}% \N{BULLET} {draws}D"
+                bar = progress_bar(wins, games or 1, width=6, show_percent=True).content
+                return f"{wins}W / {games}G \N{BULLET} {draws}D \N{BULLET} {bar}"
 
-            def build_summary(self, entries):
-                # Each game contributes to two player rows
+            def build_header(self, page):
+                # Overview stats card above the rankings on every page,
+                # read from self.ranked_entries (the loaded top-N slice).
+                entries = self.ranked_entries
+                # Each game contributes to two player rows.
                 unique_games = sum(e[1].get("games", 0) for e in entries) // 2
                 total_draws = sum(e[1].get("draws", 0) for e in entries) // 2
-                return {
-                    "Games played": str(unique_games),
-                    "Draws": str(total_draws),
-                    "Players": str(len(entries)),
-                }
+                return stats_card(
+                    "Overview",
+                    {
+                        "Games played": str(unique_games),
+                        "Draws": str(total_draws),
+                        "Players": str(len(entries)),
+                    },
+                )
+
+            def build_footer(self, page):
+                # A raw component folds inside the rankings card, below the rows.
+                return TextDisplay("-# Sorted by wins")
 
         view = _TicTacToeLeaderboard(
             context=context,
             entries=entries,
             title=f"TicTacToe Leaderboard -- {context.guild.name}",
+            # The base view stores bot= for the default get_avatar_url, which
+            # resolves each entry's avatar from the user cache (no hook needed).
+            bot=self.bot,
         )
         await view.send(ephemeral=True)
 

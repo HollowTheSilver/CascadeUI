@@ -136,6 +136,51 @@ class TestOnFinishMethodHook:
 # // ========================================( V2 button-mutation parity )======================================== // #
 
 
+class TestWizardBackButtonDerivation:
+    """The back button's disabled state derives from _current_step in the
+    builder, so a rebuild off a non-first step leaves Back enabled instead of
+    reverting to the first-step default.
+    """
+
+    async def test_back_derives_disabled_from_current_step(self):
+        async def _b():
+            return discord.ui.TextDisplay("step")
+
+        view = WizardLayoutView(
+            interaction=_make_interaction(),
+            steps=[
+                {"name": "A", "builder": _b},
+                {"name": "B", "builder": _b},
+                {"name": "C", "builder": _b},
+            ],
+        )
+        assert view._back_btn.disabled is True  # step 0: nowhere to go back
+
+        view._current_step = 1
+        view._build_nav_buttons()
+        assert view._back_btn.disabled is False
+
+    def test_v1_back_derives_disabled_from_current_step(self):
+        """V1 WizardView's builder derives the back button's disabled state from
+        _current_step, mirroring the V2 fix on its own independent builder.
+        """
+        builder = lambda v: None
+        view = WizardView(
+            interaction=_make_interaction(),
+            steps=[
+                {"name": "A", "builder": builder},
+                {"name": "B", "builder": builder},
+                {"name": "C", "builder": builder},
+            ],
+        )
+        assert view._back_btn.disabled is True  # step 0: nowhere to go back
+
+        view._current_step = 1
+        view.clear_items()
+        view._build_nav_buttons()
+        assert view._back_btn.disabled is False
+
+
 class TestWizardLayoutViewButtonIdentity:
     """V2 variant must mutate nav buttons in place, not rebuild them."""
 

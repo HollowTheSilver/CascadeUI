@@ -232,7 +232,7 @@ class _BaseTabMixin:
     def _make_switch_callback(self, index: int):
         async def callback(interaction: Interaction):
             self._active_tab = index
-            await self.on_tab_switched(index)
+            await self._call_hook_safe(self.on_tab_switched, index)
             await self._refresh_tabs()
 
         return callback
@@ -252,7 +252,7 @@ class _BaseTabMixin:
         except ValueError:
             raise ValueError(f"Tab '{name}' not found. Available: {self._tab_names}")
         self._active_tab = index
-        await self.on_tab_switched(index)
+        await self._call_hook_safe(self.on_tab_switched, index)
         await self._refresh_tabs()
 
 
@@ -308,7 +308,7 @@ class TabView(_BaseTabMixin, StatefulView):
         tab counts that spill past the five-per-row ActionRow cap.
         """
         for i, name in enumerate(self._tab_names):
-            style = self.active_tab_style if i == 0 else self.inactive_tab_style
+            style = self.active_tab_style if i == self._active_tab else self.inactive_tab_style
             button = StatefulButton(
                 label=name,
                 style=style,
@@ -388,7 +388,7 @@ class TabLayoutView(_BaseTabMixin, StatefulLayoutView):
         interactive rows of up to five buttons.
         """
         for i, name in enumerate(self._tab_names):
-            style = self.active_tab_style if i == 0 else self.inactive_tab_style
+            style = self.active_tab_style if i == self._active_tab else self.inactive_tab_style
             button = StatefulButton(
                 label=name,
                 style=style,

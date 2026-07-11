@@ -85,9 +85,9 @@ A `PersistentLayoutView`-based role selector panel that survives bot restarts. C
 
 ### v2_tictactoe.py
 
-Two-player TicTacToe demonstrating multi-user interaction patterns. Features a challenge acceptance flow (opponent must accept before the game starts), dynamic board size (3x3 to 5x5), configurable win length (e.g. 3-in-a-row on a 5x5 board), Discord mentions, mutual rematch agreement (both players must confirm), forfeit tracking, and participant-aware session limiting via `register_participant()`. Uses `allowed_users` for restricting interaction to the two players and a custom reducer for tracking game statistics.
+Two-player TicTacToe demonstrating multi-user interaction patterns. Features a challenge acceptance flow (opponent must accept before the game starts), dynamic board size (3x3 to 5x5), configurable win length (e.g. 3-in-a-row on a 5x5 board), Discord mentions, mutual rematch agreement (both players must confirm), forfeit tracking, and participant-aware session limiting via `register_participant()`. Uses `allowed_users` to restrict interaction to the two players; per-player lifetime stats are written to scoped state via `SCOPED_UPDATE` and grouped into a server ranking by a `@computed` selector (no custom reducer). The finished board freezes on Close (`exit_policy = "disable"`), matching Battleship. `/tictactoe leaderboard` renders the ranking on a Section-mode `LeaderboardLayoutView` with avatar thumbnails and an Overview stats card.
 
-**Command:** `/tictactoe @user [size] [win]`
+**Commands:** `/tictactoe play @user [size] [win]`, `/tictactoe stats [user]`, `/tictactoe leaderboard`
 
 ### v2_lobby.py
 
@@ -103,13 +103,13 @@ Display-only showcase for the grid helpers (`emoji_grid()` and `button_grid()`).
 
 ### v2_battleship.py
 
-Two-player 10x10 Battleship with a standard fleet, text-rendered emoji grids, a fleet setup phase with re-roll consensus, ephemeral private fleet panels via `attach_child()`, turn-based select targeting, and automatic cleanup via `_cleanup_attached_children()` on game end. Demonstrates `attach_child()`, `register_participant()`, dispatch-then-cleanup ordering, the ephemeral interaction-bound constraint, and live cross-view reactivity (Re-Roll dispatches update both the ephemeral and the public ready card via the standard subscriber pipeline).
+Two-player 10x10 Battleship with a standard fleet, text-rendered emoji grids, a fleet setup phase with re-roll consensus, ephemeral private fleet panels via `attach_child()`, turn-based select targeting, and automatic cleanup via `_cleanup_attached_children()` on game end. Demonstrates `attach_child()`, `register_participant()`, dispatch-then-cleanup ordering, the ephemeral interaction-bound constraint, and live cross-view reactivity (Re-Roll dispatches update both the ephemeral and the public ready card via the standard subscriber pipeline). A phase-aware `exit()` override deletes an abandoned setup but freezes the finished board as a record. `/battleship leaderboard` renders server rankings on a Section-mode `LeaderboardLayoutView` with avatar thumbnails and an Overview stats card.
 
-**Command:** `/battleship @user`
+**Commands:** `/battleship play @user`, `/battleship stats [user]`, `/battleship leaderboard`
 
 ### v2_leaderboard.py
 
-Server leaderboard built on `LeaderboardLayoutView`. Overrides `format_entry` for MMR display with medal emojis and `build_summary` for aggregate stats. `leaderboard_top_n=25` with `leaderboard_per_page=5` produces five-page navigation. The cog inspects `bot.intents.members` and the guild cache: real members fill the top of the board when available, and synthetic Demo Player rows pad any remaining slots so the display always renders exactly 25 entries regardless of guild size or intent configuration. Stats are derived deterministically from member ID via `random.Random(member_id)`, so repeat invocations return a stable ranking without a persistence layer. Contrast with `v2_battleship.py`, which feeds the same view class from live computed state -- the tuple shape fed into the pattern is identical, the data source differs.
+Server leaderboard built on `LeaderboardLayoutView` in Section render mode: overrides `format_secondary` for two-line rows with inline win-rate bars, passes `bot=` so the library's default `get_avatar_url` resolves avatar thumbnails, and overrides `build_header` for an Overview stats card (with the guild icon on its heading, computed from `ranked_entries`). `leaderboard_top_n=25` with `leaderboard_per_page=5` produces five-page navigation. The cog inspects `bot.intents.members` and the guild cache: real members fill the top of the board when available, and synthetic Demo Player rows pad any remaining slots so the display always renders exactly 25 entries regardless of guild size or intent configuration. Stats are derived deterministically from member ID via `random.Random(member_id)`, so repeat invocations return a stable ranking without a persistence layer. Contrast with `v2_battleship.py`, which feeds the same view class from live computed state -- the tuple shape fed into the pattern is identical, the data source differs.
 
 **Command:** `/leaderboard`
 

@@ -497,6 +497,24 @@ class TestSeedInitialState:
         with pytest.raises(RuntimeError, match="seed broke"):
             await view.send()
 
+    async def test_seed_can_build_the_component_tree(self):
+        # A view whose tree is built ONLY in seed_initial_state must still
+        # pass placement validation and send. Placement runs on the final
+        # tree at the Discord-send stage, after seed has populated it -- not
+        # before registration, where the tree is still empty and the check
+        # would reject it as "no top-level components".
+        interaction = _make_interaction()
+
+        class SeedBuildsUIView(StatefulLayoutView):
+            async def seed_initial_state(self, state):
+                self.add_item(Container(TextDisplay("built in seed")))
+
+        view = SeedBuildsUIView(interaction=interaction)
+        message = await view.send()
+
+        assert message is not None
+        assert any(isinstance(child, Container) for child in view.children)
+
 
 class TestOnLoadHook:
     """The on_load hook runs an async preload before the view is displayed.
@@ -602,6 +620,87 @@ class TestOnLoadHook:
         await view.reload()
 
         assert order == ["on_load", "refresh"]
+
+
+class TestReloadThrottleCoalescing:
+    """reload() respects the refresh throttle at the reload layer, so a burst of
+    out-of-band reloads inside a cooldown collapses to one on_load fetch (B2)."""
+
+    async def test_reload_without_cooldown_fetches_immediately(self):
+        interaction = _make_interaction()
+        loads = []
+
+        class LoadingView(RenderableLayoutView):
+            async def on_load(self):
+                loads.append(1)
+
+            async def refresh(self, **kwargs):
+                pass
+
+        view = LoadingView(interaction=interaction)
+        await view.reload()
+        assert loads == [1]
+
+    async def test_reload_during_cooldown_defers_the_fetch(self):
+        import time
+
+        interaction = _make_interaction()
+        loads = []
+
+        class LoadingView(RenderableLayoutView):
+            async def on_load(self):
+                loads.append(1)
+
+            async def refresh(self, **kwargs):
+                pass
+
+        view = LoadingView(interaction=interaction)
+        # Simulate an active cooldown window.
+        view._refresh_not_before = time.monotonic() + 30
+
+        await view.reload()
+        # The fetch was deferred, not run.
+        assert loads == []
+        assert view._reload_pending is True
+        assert view._deferred_refresh_task is not None
+
+        # A second reload in the window neither fetches nor spawns a 2nd task.
+        first_task = view._deferred_refresh_task
+        await view.reload()
+        assert loads == []
+        assert view._deferred_refresh_task is first_task
+
+        # Let the event loop pick up the task so its coroutine enters the sleep
+        # before cancellation -- avoids a "never awaited" warning.
+        await asyncio.sleep(0)
+        view._deferred_refresh_task.cancel()
+        try:
+            await view._deferred_refresh_task
+        except asyncio.CancelledError:
+            pass
+
+    async def test_deferred_reload_replays_captured_kwargs(self):
+        """A coalesced reload's keyword args are replayed at the boundary, so a
+        forwarded keyword (e.g. force) survives the defer."""
+        interaction = _make_interaction()
+        replayed = []
+
+        class KwargView(RenderableLayoutView):
+            async def reload(self, **kwargs):
+                replayed.append(kwargs)  # capture the replay; don't re-defer
+
+            async def on_load(self):
+                pass
+
+        view = KwargView(interaction=interaction)
+        view._message = MagicMock()
+        view._reload_pending = True
+        view._pending_reload_kwargs = {"force": True}
+
+        await view._deferred_refresh(0)
+
+        assert replayed == [{"force": True}]
+        assert view._pending_reload_kwargs == {}
 
 
 class TestOnLoadDurationWarning:

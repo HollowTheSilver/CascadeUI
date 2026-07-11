@@ -148,8 +148,8 @@ class ApplicationPersistence:
     policy use :class:`SlotPolicy` defaults (in-memory, no TTL).
 
     When any slot declares ``ttl_days``, :class:`PersistenceManager`
-    starts a daily background sweeper at ``install_middleware()`` time
-    that deletes rows whose ``expires_at`` has passed. No cadence
+    starts a daily background sweeper during initialization that deletes
+    rows whose ``expires_at`` has passed. No cadence
     configuration is exposed: TTLs are expressed in days, sub-day
     granularity is meaningless, and asking the user to also schedule a
     prune task is friction the library can absorb. Explicit prune

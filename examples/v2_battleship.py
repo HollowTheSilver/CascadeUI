@@ -87,6 +87,7 @@ from cascadeui import (
     get_store,
     image_section,
     key_value,
+    progress_bar,
     read_slot,
     stats_card,
 )
@@ -1519,29 +1520,46 @@ class BattleshipExample(commands.Cog, name="v2_battleship_example"):
             return
 
         class _BattleshipLeaderboard(LeaderboardLayoutView):
+            # Section mode renders each entry as a two-line card with an avatar
+            # thumbnail: top 10 across two pages of 5.
             leaderboard_top_n = 10
+            leaderboard_per_page = 5
+            entry_layout = "sections"
 
-            def format_stats(self, user_id, stats):
+            def format_secondary(self, rank, user_id, stats):
                 wins = stats.get("wins", 0)
                 games = stats.get("games", 0)
                 forfeits = stats.get("forfeits", 0)
-                win_rate = (wins / games * 100) if games else 0.0
-                return f"{wins}W / {games}G \N{BULLET} {win_rate:.0f}% \N{BULLET} {forfeits}F"
+                bar = progress_bar(wins, games or 1, width=6, show_percent=True).content
+                return f"{wins}W / {games}G \N{BULLET} {forfeits}F \N{BULLET} {bar}"
 
-            def build_summary(self, entries):
-                # Each game contributes to two player rows
+            def build_header(self, page):
+                # Overview stats card above the rankings on every page,
+                # read from self.ranked_entries (the loaded top-N slice).
+                entries = self.ranked_entries
+                # Each game contributes to two player rows.
                 unique_games = sum(e[1].get("games", 0) for e in entries) // 2
                 total_forfeits = sum(e[1].get("forfeits", 0) for e in entries)
-                return {
-                    "Games played": str(unique_games),
-                    "Forfeits": str(total_forfeits),
-                    "Players": str(len(entries)),
-                }
+                return stats_card(
+                    "Overview",
+                    {
+                        "Games played": str(unique_games),
+                        "Forfeits": str(total_forfeits),
+                        "Players": str(len(entries)),
+                    },
+                )
+
+            def build_footer(self, page):
+                # A raw component folds inside the rankings card, below the rows.
+                return TextDisplay("-# Sorted by wins")
 
         view = _BattleshipLeaderboard(
             context=context,
             entries=entries,
             title=f"Battleship Leaderboard -- {context.guild.name}",
+            # The base view stores bot= for the default get_avatar_url, which
+            # resolves each entry's avatar from the user cache (no hook needed).
+            bot=self.bot,
         )
         await view.send(ephemeral=True)
 

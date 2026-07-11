@@ -320,6 +320,22 @@ only in `on_ready` or later misses it (dispatches once, no replay). For that cas
 
 **State change:** None. The `keys` list lets a subscriber clear exactly the affected external records without sweeping its whole domain against the registry.
 
+### `APPLICATION_SLOTS_PRUNED`
+
+Dispatched by `PersistenceManager.prune_application()` and the daily TTL sweeper
+after deleting expired rows from the `application` namespace. Dispatch-only: no
+reducer, no state change. Subscribe or use `store.on("application_slots_pruned", ...)`
+to observe prunes.
+
+**Payload:**
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `deleted` | `int` | Number of application-slot rows removed |
+| `cutoff` | `Optional[int]` | The `expires_at` threshold used (epoch seconds) for a TTL sweep, or `None` for a manual prune |
+
+**State change:** None.
+
 ---
 
 ## Inspector

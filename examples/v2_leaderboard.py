@@ -14,41 +14,40 @@ Demonstrates:
     - ``LeaderboardLayoutView`` for paginated ranked displays
     - ``entry_layout = "sections"`` for rich per-entry rendering with
       avatar thumbnails
-    - Section-mode split hooks: ``format_primary`` + ``format_secondary``
-      for the two-line entry body, plus async ``get_avatar_url`` for
-      the thumbnail accessory
+    - Section-mode entry body via ``format_secondary`` (the second line:
+      MMR, W/G, win-rate bar). ``format_primary`` (rank + name) and avatar
+      resolution both use the library defaults -- passing ``bot=`` lets the
+      default ``get_avatar_url`` resolve thumbnails from the user cache
     - Visual parity across rows: real members resolve an avatar from the
-      bot's user cache (``bot.get_user``); synthetic rows carry a ``synthetic`` flag
-      and route to a Discord default avatar URL so every Section
-      renders with a thumbnail accessory. Synthetic user IDs are
-      fake-but-valid-shape snowflakes so the client renders
-      ``<@ID>`` as an "@Unknown User" mention pill -- same blue
-      highlight as a real member mention, no Members intent required.
+      user cache; synthetic demo rows miss it and render a Discord default
+      avatar, so every Section keeps its thumbnail. Synthetic user IDs are
+      fake-but-valid-shape snowflakes so the client renders ``<@ID>`` as an
+      "@Unknown User" mention pill: same blue highlight as a real member
+      mention, no Members intent required.
       The library's TextDisplay-collapse fallback remains the
-      last-resort path (Section requires a non-``None`` accessory)
-      -- this example bypasses it by always returning a URL.
-    - ``build_summary`` union-return hook: returning a ``dict[str, str]``
-      renders the aggregate stats inline on page 1 (library default);
-      returning a ``Container`` (via ``card(...)``) promotes the summary
-      to a standalone card rendered above the rankings card on every
-      page. This example returns a ``Container`` so the aggregate
-      header stays visible while the user flips through all five
-      pages of rankings.
-    - ``build_header`` / ``build_footer`` page-frame hooks: a guild-icon
-      banner rendered above the summary card on page 1 only (gated on
-      the hook's zero-based ``page`` argument), and a subtext caption
-      rendered below the rankings card on every page. Header components
-      land first in the page, footer components land between the
-      rankings card and the navigation row.
+      last-resort path (Section requires a non-``None`` accessory).
+      This example bypasses it by always returning a URL.
+    - ``build_header`` builds the Overview stats card above the rankings on
+      every page, so the aggregate stats stay visible while the user flips
+      through. Stats are composed content, not a separate hook: the override reads
+      ``self.ranked_entries`` (the loaded top-N) and returns a ``card()``
+      that renders as its own card above the rankings. The guild icon rides
+      as the card's heading accessory via ``image_section``.
+    - ``build_footer`` renders a ``-#`` caption folded inside the rankings
+      card on every page, so the caption reads as the card's footer rather
+      than floating below it.
     - Symmetric ``title=`` + ``subtitle=`` constructor kwargs: both are
       three-tier (class default -> subclass override -> explicit arg).
       This example passes both at init -- ``title`` to splice in the
       guild name, and ``subtitle=None`` to suppress the H3 since the
-      standalone Overview card returned from ``build_summary`` already
-      acts as the top-level heading slot.
+      Overview card from ``build_header`` already carries its own heading.
     - ``leaderboard_top_n`` + ``leaderboard_per_page`` for multi-page nav
     - The ``(user_id, stats_dict)`` tuple contract the pattern consumes
     - ``progress_bar`` used inline for a live win-rate cell
+    - ``reload(force=True)``: a "Toggle bars" button flips a render-only
+      display flag and reloads; ``force`` bypasses the entry-signature
+      short-circuit so an unchanged-entries re-render still rebuilds the
+      pages
     - Graceful degradation when privileged intents are unavailable
 
 Contrast with ``v2_battleship.py``: that example reads live stats from
@@ -77,7 +76,7 @@ from cascadeui import (
     action_section,
     card,
     divider,
-    gallery,
+    image_section,
     key_value,
     progress_bar,
 )
@@ -93,11 +92,6 @@ _TARGET_SIZE = 25  # Exactly 5 pages of 5 entries
 # ``<@ID>`` as an "@Unknown User" pill. That's what gives the demo rows
 # the blue mention-pill look without requiring real guild members.
 _FAKE_SNOWFLAKE_BASE = 100_000_000_000_000_000
-
-# Discord's six default avatar PNGs. Returning one of these for a synthetic
-# entry restores visual parity with real-member rows: every Section renders
-# with an accessory instead of the TextDisplay-collapse fallback.
-_DEFAULT_AVATAR_URL = "https://cdn.discordapp.com/embed/avatars/{n}.png"
 
 
 # // ========================================( Data )======================================== // #
@@ -127,15 +121,12 @@ def _synthetic_entry(index: int) -> tuple:
     The id is a plausible 10^17-range snowflake the Discord client
     tries to resolve and fails, rendering ``<@ID>`` as an "@Unknown
     User" mention pill. That preserves the blue mention-pill look of
-    real guild members without requiring the Members intent. The
-    ``synthetic`` flag tells ``get_avatar_url`` to route straight to a
-    default avatar -- a fake snowflake is never in the user cache, so the
-    lookup would miss anyway.
+    real guild members without requiring the Members intent. A fake
+    snowflake is never in the user cache, so the library's default
+    ``get_avatar_url`` falls back to a Discord default avatar for it.
     """
     synthetic_id = _FAKE_SNOWFLAKE_BASE + index
-    stats = _mock_stats_for(synthetic_id)
-    stats["synthetic"] = True
-    return (synthetic_id, stats)
+    return (synthetic_id, _mock_stats_for(synthetic_id))
 
 
 def _build_entries(real_members) -> tuple:
@@ -173,37 +164,35 @@ class ServerLeaderboard(LeaderboardLayoutView):
     of guild size or intent configuration.
 
     Runs in Section render mode: each entry is a two-line
-    ``Section`` with an avatar thumbnail accessory. Real members
-    resolve their Discord avatar; synthetic rows skip the resolve
-    and route to a Discord default avatar so every Section renders
-    with a thumbnail.
+    ``Section`` with an avatar thumbnail accessory. Passing ``bot=``
+    lets the library's default ``get_avatar_url`` resolve real members
+    from the user cache; synthetic rows miss the cache and fall back to
+    a Discord default avatar, so every Section renders with a thumbnail.
     """
 
     leaderboard_top_n = _TARGET_SIZE
     leaderboard_per_page = 5
+    # Jump buttons (first / last / go-to-page) appear at >= jump_threshold
+    # pages. Raised to 6 so this 5-page board shows only prev / next, freeing
+    # two nav slots for the in-card build_footer (each page nears the 40-node cap).
+    jump_threshold = 6
     entry_layout = "sections"
     exit_policy = "delete"
 
-    def __init__(self, *args, mode: str = "", bot=None, banner_url=None, **kwargs):
-        # ``bot`` is captured here (not pulled from ``context`` later) so
-        # ``get_avatar_url`` can reach it without touching the interaction.
-        # Section-mode leaderboards typically need a user-fetch entry point,
-        # and passing the bot at construction makes the dependency explicit.
+    def __init__(self, *args, mode: str = "", icon_url=None, **kwargs):
+        # ``bot=`` flows through to the base view, which stores it for the
+        # default ``get_avatar_url``. This example passes no avatar hook of its
+        # own -- the library resolves thumbnails from the bot's user cache.
         self._mode = mode
-        self._bot = bot
-        # Guild icon URL for the page-1 banner; ``None`` when the guild has
-        # no icon, which ``build_header`` degrades to no banner.
-        self._banner_url = banner_url
-        # ``_detailed`` toggles the win-rate bar in every row. The button in
-        # ``build_summary`` flips it and calls ``reload(force=True)``: the entry
-        # data is unchanged, so the entry-signature short-circuit would skip the
-        # rebuild without the force flag.
+        # Guild icon URL for the Overview card heading; ``None`` when the guild
+        # has no icon, which ``build_header`` degrades to a plain heading.
+        self._icon_url = icon_url
+        # ``_detailed`` toggles the win-rate bar in every row. The button on
+        # the Overview card (built in ``build_header``) flips it and calls
+        # ``reload(force=True)``: the entry data is unchanged, so the
+        # entry-signature short-circuit would skip the rebuild without the flag.
         self._detailed = True
         super().__init__(*args, **kwargs)
-
-    def format_primary(self, rank: int, user_id: int, stats: dict) -> str:
-        """Top line of the section: rank + name."""
-        return f"{self.format_rank(rank)} {self.format_name(user_id, stats)}"
 
     def format_secondary(self, rank: int, user_id: int, stats: dict) -> str:
         """Bottom line of the section: MMR, W/G, and a live win-rate bar.
@@ -222,61 +211,42 @@ class ServerLeaderboard(LeaderboardLayoutView):
             line = f"{line} \N{BULLET} {bar}"
         return line
 
-    async def get_avatar_url(self, user_id: int, stats: dict):
-        """Resolve a thumbnail URL for the Section accessory.
+    # Every page carries two cards (the Overview stats card + the rankings card
+    # with its in-card footer) plus the nav row, under Discord's 40-component
+    # cap. jump_threshold = 6 drops the first / last / go-to buttons on this
+    # 5-page board to keep headroom.
+    def build_header(self, page: int):
+        """Build the Overview stats card above the rankings, on every page.
 
-        Real members resolve from the bot's user cache (``bot.get_user``):
-        a synchronous lookup with no HTTP, so avatar resolution adds no
-        latency to the render path. Per-entry ``fetch_user`` calls would share
-        one rate-limit bucket and run serially -- 25 round-trips before the
-        first paint, which ``asyncio.gather`` does not change -- so the cache
-        is the right source here. Cache misses and synthetic rows both route to a Discord
-        default avatar URL so every Section still renders with an accessory --
-        otherwise the library's TextDisplay-collapse fallback would kick in
-        and produce an uneven display where only some rows have thumbnails.
+        Stats are content you compose, not a separate hook: this reads
+        ``self.ranked_entries`` (the loaded top-N slice) and returns a
+        ``card()``. A ``Container`` return renders as its own card above the
+        rankings on every page, so the aggregate stats stay visible while the
+        user flips through the rankings. The guild icon rides as the card's
+        heading accessory via ``image_section`` when the guild has one, and
+        degrades to a plain ``## Overview`` heading otherwise. (``page`` is
+        available to gate a frame to page 1 only; this example keeps the
+        Overview visible throughout.)
         """
-        # Synthetic rows carry a ``synthetic`` flag, and a real member may not
-        # be in cache; both fall back to a default avatar slot (0-5) picked via
-        # ``user_id % 6`` so the same entry always draws the same face.
-        if stats.get("synthetic") or self._bot is None:
-            return _DEFAULT_AVATAR_URL.format(n=user_id % 6)
-        user = self._bot.get_user(user_id)
-        if user is None:
-            return _DEFAULT_AVATAR_URL.format(n=user_id % 6)
-        # A 128px CDN variant renders noticeably faster client-side than the
-        # default 1024px asset -- Section thumbnails are small on-screen, so
-        # the larger original is wasted bytes through the Discord client's
-        # image pipeline.
-        return user.display_avatar.with_size(128).url
-
-    def build_summary(self, entries):
-        """Return a standalone Container so the summary persists across pages.
-
-        The ``build_summary`` hook is union-return: a ``dict[str, str]``
-        renders inline on page 1 only, a ``Container`` renders as a
-        standalone top-level card on every page, and ``None`` (or an
-        empty dict) skips the summary entirely. This override returns
-        a ``Container`` so the Mode row and aggregate stats stay
-        visible while the user flips through all five pages of rankings.
-
-        The ``Mode`` row identifies the data source (real, demo, or a
-        mix). Remaining rows aggregate the full 25-entry slice.
-        """
+        entries = self.ranked_entries
         total_games = sum(e[1]["games"] for e in entries)
-        total_wins = sum(e[1]["wins"] for e in entries)
         avg_mmr = (sum(e[1]["mmr"] for e in entries) // len(entries)) if entries else 0
-        summary = {
+        stats = {
             "Ranked players": str(len(entries)),
             "Games played": str(total_games),
-            "Total wins": str(total_wins),
             "Average MMR": str(avg_mmr),
         }
         if self._mode:
-            summary["Mode"] = self._mode
+            stats["Mode"] = self._mode
+        heading = (
+            image_section("## Overview", url=self._icon_url)
+            if self._icon_url
+            else TextDisplay("## Overview")
+        )
         return card(
-            TextDisplay("## Overview"),
+            heading,
             divider(),
-            key_value(summary),
+            key_value(stats),
             action_section(
                 f"Win-rate bars: {'on' if self._detailed else 'off'}",
                 label="Toggle bars",
@@ -285,31 +255,15 @@ class ServerLeaderboard(LeaderboardLayoutView):
             ),
         )
 
-    # Page 1 already sits at 39 of Discord's 40 recursive components
-    # (banner + summary card + five entry sections + footer + nav row).
-    # Extending either frame hook means trimming elsewhere first -- the
-    # summary toggle button or the title divider are the cheapest cuts.
-    def build_header(self, page: int):
-        """Render the guild-icon banner above the summary card on page 1.
-
-        ``page`` is the zero-based page index, so returning ``None`` for
-        every other index keeps the banner off pages 2-5 and gives the
-        rankings the full height back after the first page turn. ``None``
-        also covers guilds with no icon: the hook degrades to no banner
-        instead of a broken image.
-        """
-        if page != 0 or not self._banner_url:
-            return None
-        return gallery(self._banner_url)
-
     def build_footer(self, page: int):
-        """Render a subtext caption below the rankings card on every page.
+        """Render an in-card caption below the entries on every page.
 
-        Footer components land between the rankings card and the
-        navigation row. The ``-#`` markdown prefix renders as Discord
-        subtext, the right weight for attribution or freshness lines.
+        build_footer content rides inside the rankings card, so a short ``-#``
+        subtext line reads as the card's footer. It states the sort basis, which
+        the Mode row does not cover, so it adds information rather than repeating
+        the Overview stats.
         """
-        return TextDisplay(f"-# {self._mode or 'Demo'} \N{MIDDLE DOT} MMR is simulated")
+        return TextDisplay("-# Rankings sorted by MMR")
 
     async def _toggle_detail(self, interaction):
         # The ranking entries do not change, only how each row renders, so the
@@ -356,7 +310,7 @@ class LeaderboardCog(commands.Cog, name="v2_leaderboard_example"):
             subtitle=None,
             mode=mode,
             bot=context.bot,
-            banner_url=context.guild.icon.url if context.guild.icon else None,
+            icon_url=context.guild.icon.url if context.guild.icon else None,
         )
         await view.send(ephemeral=True)
 

@@ -228,7 +228,7 @@ async def on_load(self):
 
 #### `await reload()`
 
-Runs `on_load()` followed by `refresh()`. The out-of-band counterpart to the automatic `on_load()` calls -- use it inside a callback that mutated the view's data source and needs an immediate re-fetch and re-render.
+Runs `on_load()` followed by `refresh()`. The out-of-band counterpart to the automatic `on_load()` calls: use it inside a callback that mutated the view's data source and needs an immediate re-fetch and re-render. Under an active `refresh_cooldown_ms` window (or a 429 backoff), the whole reload, including the `on_load()` fetch, is deferred to the window boundary and coalesced with any other pending reload.
 
 ```python
 async def on_refresh(self, interaction):
@@ -245,7 +245,7 @@ async def seed_initial_state(self, state):
         await self.dispatch("LEADERBOARD_SEED", {"entries": []})
 ```
 
-The hook receives the live store state dict. Dispatches issued from inside join the surrounding batch, so seed work collapses into the view's `VIEW_CREATED` notification cycle. Default is a no-op.
+The hook receives the live store state dict. Dispatches issued from inside join the surrounding batch, so seed work collapses into the view's `VIEW_CREATED` notification cycle. Default is a no-op. A subclass may also build its component tree here when the initial render depends on seeded state: pre-flight placement validation runs on the tree the hook produces, not the empty pre-seed tree.
 
 #### `on_state_changed(state)` *(override)*
 
@@ -507,6 +507,10 @@ Each page is a list of V2 components. Navigation buttons (Previous, Next, First,
 
 When `True` and multiple pages exist, wraps the page content and the navigation row together in a single `Container`. Default `False` keeps them as separate top-level children. Single-page views render no navigation row, so the flag has no visible effect there. When the page formatter returns a single `Container`, the wrap builds a fresh Container (copying its accent color and spoiler) rather than nesting one inside another, which Discord rejects. A page that mixes a `Container` with other top-level items cannot be wrapped at all; it falls back to the sibling layout with the navigation row as a separate row.
 
+##### `nav_divider` *(bool, default `False`)*
+
+When `True` and `nav_inside_container` is also `True`, renders a divider between the page content and the in-card navigation row. No effect in the sibling layout (`nav_inside_container = False`).
+
 #### Class Methods
 
 ##### `await PaginatedLayoutView.from_data(items, per_page, formatter, **kwargs)`
@@ -535,7 +539,7 @@ All five navigation buttons (first, previous, indicator, next, last) support lab
 
 ### `LeaderboardLayoutView` / `PersistentLeaderboardLayoutView`
 
-V2-only paginated ranked-display pattern. Subclass of `PaginatedLayoutView`. Renders a sorted list of `(user_id, stats_dict)` entries across one or more pages. Each page is a card with ranked entry lines; the summary header appears on page 1 only by default.
+V2-only paginated ranked-display pattern. Subclass of `PaginatedLayoutView`. Renders a sorted list of `(user_id, stats_dict)` entries across one or more pages. Each page is a card with ranked entry lines; the optional `build_header` / `build_footer` hooks add content above and below the card (an Overview stats card, an identity caption), on whichever pages the override chooses.
 
 ```python
 class ServerLeaderboard(LeaderboardLayoutView):
@@ -565,6 +569,8 @@ await view.send()
 | `card_color` | `None` | Optional `discord.Color` for the rankings card accent. `None` falls through to the active theme. |
 | `show_title_divider` | `True` | Toggle the divider rendered below the title. |
 
+**Constructor.** Besides `entries=` / `title=` / `subtitle=` / `banner=`, `LeaderboardLayoutView` accepts an optional `bot=` kwarg. Passing it lets the default `get_avatar_url` resolve avatars from the bot's user cache in Section mode. The persistent variant receives the bot through `on_bind` instead (it is stripped from the persistence round-trip).
+
 #### Override Hooks
 
 | Hook | Purpose |
@@ -576,15 +582,15 @@ await view.send()
 | `format_accessory(user_id, stats)` | Optional right-side accessory. Default `None`. |
 | `format_entry(rank, user_id, stats)` | Composes the four column hooks. Override only when row layout itself needs to change. |
 | `format_primary` / `format_secondary` | Section-mode two-line body. |
-| `get_avatar_url(user_id, stats)` *(async)* | Section-mode `Thumbnail` URL. |
-| `build_summary(entries)` | Returns `dict[str, str]` (rendered inline page 1), a `Container` (standalone card on every page), or `None` (no summary). |
+| `get_avatar_url(user_id, stats)` *(async)* | Section-mode `Thumbnail` URL. The default resolves from the bot's user cache when a `bot=` kwarg is passed (member avatar on a cache hit, a Discord default avatar on a miss), and returns `None` without a bot so the entry falls back to the two-line `TextDisplay`. Override to resolve from another source. |
 | `build_title(page)` | Optional components replacing the rankings card's masthead (the `banner` image + `## title` heading) inside the Container. `None` (default) composes the masthead from the declarative `banner` / `title` pair. Same return shapes and `page` semantics as `build_header`. |
-| `build_header(page)` | Optional page-frame components placed first on the page, above the standalone summary card. Returns a component, a list, or `None` (default). `page` is the zero-based page index. |
-| `build_footer(page)` | Optional page-frame components placed last on the page, below the rankings card and above the navigation row. Same return shapes and `page` semantics as `build_header`. |
+| `build_header(page)` | Content above the rankings card. The value is prepended as-is: a `Container` renders as its own card (an Overview `stats_card`, a banner), anything else floats as a bare top-level item (no return-type branching, unlike `build_footer`). Read `ranked_entries` for aggregate stats. Returns a component, a list, or `None` (default). `page` is the zero-based page index. |
+| `build_footer(page)` | Content below the rankings, placed by return type: a raw component folds inside the rankings card below the entries, a `Container` renders as its own standalone card below it. Same return shapes and `page` semantics as `build_header`. |
 | `on_leaderboard_empty()` | Returns the V2 component list shown when `entries` is empty. |
+| `ranked_entries` *(property)* | The loaded top-N `(user_id, stats)` slice for the current render; read it in `build_header` / `build_footer` / `build_title` to compute aggregate stats without re-fetching. |
 | `on_state_changed(state)` *(async, override)* | Calls `rebuild_pages()` then the paginated refresh; live-data subclasses subscribe to data actions and override `get_entries()`. |
 
-**Out-of-band refresh.** `reload()` re-fetches entries, recomposes the tree, and edits the message (the public path for a manual refresh button or `on_restore`); `rebuild_pages()` rebuilds only the page list. Both accept `force=True` to bypass the entry-signature short-circuit when something outside the row data changed the render: a filter, or a select's highlighted option folded into `build_summary`.
+**Out-of-band refresh.** `reload()` re-fetches entries, recomposes the tree, and edits the message (the public path for a manual refresh button or `on_restore`); `rebuild_pages()` rebuilds only the page list. Both accept `force=True` to bypass the entry-signature short-circuit when something outside the row data changed the render: a filter, or a select's highlighted option read by `build_header`.
 
 #### Persistent Variant
 

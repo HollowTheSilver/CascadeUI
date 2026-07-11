@@ -200,7 +200,7 @@ class TestLeaderboardLayoutViewRendering:
 
 
 class TestLeaderboardOverrideHooks:
-    """Custom format_entry and build_summary overrides."""
+    """Custom format_entry, build_header stats, and data-source overrides."""
 
     async def test_custom_format_entry(self):
         class CustomFormat(LeaderboardLayoutView):
@@ -210,80 +210,31 @@ class TestLeaderboardOverrideHooks:
         view = await _make_view(cls=CustomFormat, entries=SAMPLE_ENTRIES)
         assert "#1 user=111" in _page_text(view)
 
-    async def test_custom_build_summary(self):
-        class CustomSummary(LeaderboardLayoutView):
-            def build_summary(self, entries):
-                total = sum(e[1].get("games", 0) for e in entries)
-                return {"Total games": str(total)}
+    async def test_build_header_renders_stats_from_ranked_entries(self):
+        """build_header reads self.ranked_entries to build an Overview card."""
+        from cascadeui.components.patterns.v2 import stats_card
 
-        view = await _make_view(cls=CustomSummary, entries=SAMPLE_ENTRIES)
-        assert "35" in _page_text(view)
+        class StatsBoard(LeaderboardLayoutView):
+            def build_header(self, page):
+                if page != 0:
+                    return None
+                total = sum(e[1].get("games", 0) for e in self.ranked_entries)
+                return stats_card("Overview", {"Total games": str(total)})
 
-    async def test_empty_summary_suppresses_section(self):
-        class NoSummary(LeaderboardLayoutView):
-            def build_summary(self, entries):
-                return {}
+        view = await _make_view(cls=StatsBoard, entries=SAMPLE_ENTRIES)
+        assert "35" in _page_text(view, page_idx=0)
 
-        view = await _make_view(cls=NoSummary, entries=SAMPLE_ENTRIES)
-        assert "Players" not in _page_text(view)
-
-    async def test_build_summary_dict_renders_inline_page_1(self):
-        """Default return shape: dict wraps in key_value inline on page 1."""
+    async def test_ranked_entries_exposes_loaded_slice(self):
+        """self.ranked_entries is the loaded top-N slice, readable by hooks."""
         view = await _make_view(entries=SAMPLE_ENTRIES)
-        # Page 1 contains the inline key_value summary
-        assert "Players" in _page_text(view, page_idx=0)
+        assert view.ranked_entries == SAMPLE_ENTRIES[: view.leaderboard_top_n]
 
-    async def test_build_summary_returning_container_renders_two_cards(self):
-        """Container return ships as a second top-level component every page."""
-        from cascadeui.components.patterns.v2 import card
-
-        class TwoCardBoard(LeaderboardLayoutView):
-            leaderboard_per_page = 2
-
-            def build_summary(self, entries):
-                return card(TextDisplay("## Overview"), TextDisplay("3 players"))
-
-        many_entries = [(i, {"wins": 10 - i, "games": 10}) for i in range(6)]
-        view = await _make_view(cls=TwoCardBoard, entries=many_entries)
-        # Two top-level Containers per page (summary card + rankings card)
-        for page in view.pages:
-            containers = [c for c in page if isinstance(c, Container)]
-            assert len(containers) == 2
-
-    async def test_build_summary_returning_container_suppresses_inline_summary(self):
-        """Container return skips the inline key_value path entirely."""
-        from cascadeui.components.patterns.v2 import card
-
-        class StandaloneSummary(LeaderboardLayoutView):
-            def build_summary(self, entries):
-                return card(TextDisplay("## Standalone"))
-
-        view = await _make_view(cls=StandaloneSummary, entries=SAMPLE_ENTRIES)
-        # Check the rankings card (second container) has no inline stats
+    async def test_no_summary_by_default(self):
+        """A bare leaderboard renders just the rankings card, no stats section."""
+        view = await _make_view(entries=SAMPLE_ENTRIES)
         page_0 = view.pages[0]
         containers = [c for c in page_0 if isinstance(c, Container)]
-        assert len(containers) == 2
-        # First container is the user's summary card, second is rankings
-        rankings_card = containers[1]
-        rankings_text = " ".join(
-            getattr(t, "content", "")
-            for t in rankings_card.walk_children()
-            if isinstance(t, TextDisplay)
-        )
-        assert "Players" not in rankings_text
-
-    async def test_build_summary_returning_none_has_no_summary(self):
-        """None return: no summary at any placement."""
-
-        class NoSummary(LeaderboardLayoutView):
-            def build_summary(self, entries):
-                return None
-
-        view = await _make_view(cls=NoSummary, entries=SAMPLE_ENTRIES)
-        page_0 = view.pages[0]
-        containers = [c for c in page_0 if isinstance(c, Container)]
-        # Only the rankings card, no standalone summary card
-        assert len(containers) == 1
+        assert len(containers) == 1  # only the rankings card, no summary
 
     async def test_custom_get_entries(self):
         class LiveBoard(LeaderboardLayoutView):
@@ -332,6 +283,66 @@ class TestLeaderboardOverrideHooks:
         assert "<@1>" not in _page_text(view)
 
 
+class TestDefaultAvatarResolution:
+    """The default get_avatar_url resolves avatars when a bot is provided."""
+
+    def _bot_with_user(self, avatar_url="https://cdn.example/avatar.png"):
+        user = MagicMock()
+        user.display_avatar.with_size.return_value.url = avatar_url
+        bot = MagicMock(spec=discord.Client)
+        bot.get_user.return_value = user
+        return bot
+
+    async def test_no_bot_returns_none(self):
+        # No bot -> decline resolution; the entry falls back to the
+        # TextDisplay-collapse path (unchanged pre-bot behavior).
+        view = LeaderboardLayoutView(interaction=_make_interaction())
+        assert await view.get_avatar_url(111, {}) is None
+
+    async def test_bot_cache_hit_returns_member_avatar(self):
+        bot = self._bot_with_user()
+        view = LeaderboardLayoutView(interaction=_make_interaction(), bot=bot)
+        assert await view.get_avatar_url(111, {}) == "https://cdn.example/avatar.png"
+        bot.get_user.assert_called_once_with(111)
+
+    async def test_bot_cache_miss_returns_default_avatar(self):
+        bot = MagicMock(spec=discord.Client)
+        bot.get_user.return_value = None
+        view = LeaderboardLayoutView(interaction=_make_interaction(), bot=bot)
+        # user_id 111 -> (111 >> 22) % 6 == 0
+        assert (
+            await view.get_avatar_url(111, {}) == "https://cdn.discordapp.com/embed/avatars/0.png"
+        )
+
+    async def test_bot_kwarg_stored_on_view(self):
+        bot = MagicMock(spec=discord.Client)
+        view = LeaderboardLayoutView(interaction=_make_interaction(), bot=bot)
+        assert view._bot is bot
+
+    def test_non_client_bot_rejected_at_construction(self):
+        # A wrong-type bot fails here, not as an AttributeError deep inside
+        # the section-mode avatar gather.
+        with pytest.raises(TypeError, match="discord.Client"):
+            LeaderboardLayoutView(interaction=_make_interaction(), bot="not-a-bot")
+
+    def test_bot_is_stripped_from_persistence_round_trip(self):
+        from cascadeui.persistence.manager import _NON_PERSISTABLE_KWARGS
+
+        assert "bot" in _NON_PERSISTABLE_KWARGS
+
+    async def test_persistent_on_bind_sets_bot(self):
+        # The persistent variant cannot carry bot through the round-trip,
+        # so on_bind injects it at send and restore for get_avatar_url.
+        bot = self._bot_with_user()
+        view = PersistentLeaderboardLayoutView(
+            interaction=_make_interaction(), persistence_key="test-avatar-bind"
+        )
+        assert view._bot is None
+        await view.on_bind(bot)
+        assert view._bot is bot
+        assert await view.get_avatar_url(111, {}) == "https://cdn.example/avatar.png"
+
+
 class TestPageFrameHooks:
     """build_header / build_footer page-frame placement."""
 
@@ -358,37 +369,38 @@ class TestPageFrameHooks:
         assert isinstance(page_0[0], MediaGallery)
         assert isinstance(page_0[1], Container)
 
-    async def test_footer_renders_last_on_page(self):
+    async def test_footer_renders_last_inside_rankings_card(self):
         class Footed(LeaderboardLayoutView):
             def build_footer(self, page):
                 return TextDisplay("-# Updated hourly")
 
         view = await _make_view(cls=Footed, entries=SAMPLE_ENTRIES)
         page_0 = view.pages[0]
-        assert isinstance(page_0[0], Container)
-        assert page_0[-1].content == "-# Updated hourly"
+        rankings_card = page_0[-1]
+        assert isinstance(rankings_card, Container)
+        # Footer rides as the last child inside the rankings card.
+        assert rankings_card.children[-1].content == "-# Updated hourly"
 
-    async def test_header_precedes_container_summary(self):
-        """Full frame order: header, summary card, rankings card, footer."""
+    async def test_header_content_precedes_rankings_card(self):
+        """build_header content (banner + Overview card) renders above the
+        rankings card, in list order."""
         from cascadeui.components.patterns.v2 import card
 
         class Framed(LeaderboardLayoutView):
-            def build_summary(self, entries):
-                return card(TextDisplay("## Overview"))
-
             def build_header(self, page):
-                return MediaGallery(discord.MediaGalleryItem("https://example.com/banner.png"))
+                return [
+                    MediaGallery(discord.MediaGalleryItem("https://example.com/banner.png")),
+                    card(TextDisplay("## Overview")),
+                ]
 
             def build_footer(self, page):
                 return TextDisplay("-# footer")
 
         view = await _make_view(cls=Framed, entries=SAMPLE_ENTRIES)
-        assert [type(c).__name__ for c in view.pages[0]] == [
-            "MediaGallery",
-            "Container",
-            "Container",
-            "TextDisplay",
-        ]
+        page_0 = view.pages[0]
+        assert [type(c).__name__ for c in page_0] == ["MediaGallery", "Container", "Container"]
+        # Footer is the last child of the rankings card, not a top-level sibling.
+        assert page_0[-1].children[-1].content == "-# footer"
 
     async def test_list_return_is_spliced(self):
         class MultiFrame(LeaderboardLayoutView):
@@ -396,9 +408,9 @@ class TestPageFrameHooks:
                 return [TextDisplay("line one"), TextDisplay("line two")]
 
         view = await _make_view(cls=MultiFrame, entries=SAMPLE_ENTRIES)
-        page_0 = view.pages[0]
-        assert page_0[-2].content == "line one"
-        assert page_0[-1].content == "line two"
+        rankings_card = view.pages[0][-1]
+        assert rankings_card.children[-2].content == "line one"
+        assert rankings_card.children[-1].content == "line two"
 
     async def test_page_index_targets_first_page_only(self):
         class FirstPageBanner(LeaderboardLayoutView):
@@ -428,7 +440,7 @@ class TestPageFrameHooks:
         view = await _make_view(cls=EveryPage, entries=many_entries)
         assert len(view.pages) == 3
         for idx, page in enumerate(view.pages):
-            assert page[-1].content == f"-# page {idx}"
+            assert page[-1].children[-1].content == f"-# page {idx}"
 
     async def test_framed_page_with_nav_inside_container_stays_send_legal(self):
         """The rankings card is a Container, so a framed page cannot take
@@ -443,13 +455,13 @@ class TestPageFrameHooks:
             nav_inside_container = True
             leaderboard_per_page = 2
 
-            def build_summary(self, entries):
-                return card(TextDisplay("## Overview"))
-
             def build_header(self, page):
                 if page != 0:
                     return None
-                return gallery("https://example.com/banner.png")
+                return [
+                    gallery("https://example.com/banner.png"),
+                    card(TextDisplay("## Overview")),
+                ]
 
             def build_footer(self, page):
                 return TextDisplay("-# footer")
@@ -607,7 +619,7 @@ class TestCardMasthead:
                 return "-# plain string caption"
 
         view = await _make_view(cls=StringFooter, entries=SAMPLE_ENTRIES)
-        footer = view.pages[0][-1]
+        footer = view.pages[0][-1].children[-1]
         assert isinstance(footer, TextDisplay)
         assert footer.content == "-# plain string caption"
 
@@ -694,18 +706,6 @@ class TestLeaderboardPagination:
         assert "**4.**" in page2
         assert "**5.**" in page2
         assert "**6.**" in page2
-
-    async def test_summary_only_on_first_page(self):
-        """Summary key_value appears on page 1 only."""
-
-        class PagedBoard(LeaderboardLayoutView):
-            leaderboard_top_n = 6
-            leaderboard_per_page = 3
-
-        entries = [(i, {"wins": 100 - i, "games": 100}) for i in range(6)]
-        view = await _make_view(cls=PagedBoard, entries=entries)
-        assert "Players" in _page_text(view, 0)
-        assert "Players" not in _page_text(view, 1)
 
     async def test_title_on_every_page(self):
         """Title heading appears on all pages."""
@@ -1371,6 +1371,74 @@ class TestCardColor:
         for page in view.pages:
             container = [c for c in page if isinstance(c, Container)][-1]
             assert container.accent_colour == red
+
+
+class TestFooterInsideCard:
+    """build_footer content folds INTO the rankings card as trailing children,
+    always, so the footer stays attached to the entries it annotates instead
+    of floating between the card and the nav row. Decoupled from
+    nav_inside_container: the fold happens in both layouts.
+    """
+
+    def _footer_in_card(self, page0, needle):
+        # True when a TextDisplay carrying `needle` rides inside a Container,
+        # false when it sits as a top-level sibling.
+        sibling = any(
+            isinstance(c, TextDisplay) and needle in getattr(c, "content", "") for c in page0
+        )
+        in_card = any(
+            isinstance(c, Container)
+            and any(
+                isinstance(ch, TextDisplay) and needle in getattr(ch, "content", "")
+                for ch in c.walk_children()
+            )
+            for c in page0
+        )
+        return in_card and not sibling
+
+    async def test_footer_folds_into_card_under_nav_inside_container(self):
+        class FooterBoard(LeaderboardLayoutView):
+            nav_inside_container = True
+
+            def build_footer(self, page):
+                return TextDisplay("-# data source: live")
+
+        view = await _make_view(cls=FooterBoard, entries=SAMPLE_ENTRIES)
+        assert self._footer_in_card(view.pages[0], "data source")
+
+    async def test_footer_folds_into_card_in_default_layout(self):
+        """The fold applies in the default layout too, not just under nav_inside_container."""
+
+        class FooterBoard(LeaderboardLayoutView):
+            def build_footer(self, page):
+                return TextDisplay("-# data source: live")
+
+        view = await _make_view(cls=FooterBoard, entries=SAMPLE_ENTRIES)
+        assert self._footer_in_card(view.pages[0], "data source")
+
+    async def test_container_footer_renders_as_standalone_card(self):
+        """A Container return renders as its own card below the rankings, not
+        folded inside."""
+        from cascadeui.components.patterns.v2 import card
+
+        class CardFooter(LeaderboardLayoutView):
+            def build_footer(self, page):
+                return card(TextDisplay("-# standalone footer"))
+
+        view = await _make_view(cls=CardFooter, entries=SAMPLE_ENTRIES)
+        page0 = view.pages[0]
+        footer_card, rankings_card = page0[-1], page0[-2]
+        # The Container footer is its own top-level card below the rankings...
+        assert isinstance(footer_card, Container)
+        assert any(
+            isinstance(ch, TextDisplay) and "standalone footer" in getattr(ch, "content", "")
+            for ch in footer_card.walk_children()
+        )
+        # ...not nested inside the rankings card.
+        assert not any(
+            isinstance(ch, TextDisplay) and "standalone footer" in getattr(ch, "content", "")
+            for ch in rankings_card.walk_children()
+        )
 
 
 class TestThemeAccentSeam:

@@ -328,10 +328,7 @@ class PersistenceMiddleware:
         store.persistence_manager = manager
 
         # Start the daily TTL sweeper when any persistent slot declares
-        # ttl_days. Nothing to sweep otherwise -- skip the task. The
-        # legacy install_middleware path calls this itself; the direct
-        # path routes it here so the state is reachable from either
-        # entry.
+        # ttl_days. Nothing to sweep otherwise -- skip the task.
         manager._start_ttl_sweeper()
 
         if bot is not None:
@@ -676,14 +673,22 @@ class PersistenceMiddleware:
             )
             await self._fire_hook("on_error", ns.name, exc)
 
-            # Re-enqueue so the next scheduled flush retries. setdefault
-            # preserves any newer row that arrived between snapshot and
-            # exception (unlikely under the write lock, but cheap to
-            # guard).
+            # Re-enqueue so the next scheduled flush retries, restoring the
+            # single-buffer-per-key invariant the routing helpers maintain (a
+            # key lives in dirty_rows OR deleted_keys, never both). A
+            # re-register/unregister that arrived during the failed flush may
+            # have claimed a key for the opposite buffer, so each side skips a
+            # key the other side now owns: the re-enqueued snapshot never
+            # resurrects a key in the buffer it left, and the newer write
+            # survives the next flush. That guard is what keeps a re-registered
+            # persistent view reattaching after restart.
             for row in rows:
                 key = row[key_columns[0]]
-                ns.dirty_rows.setdefault(key, row)
-            ns.deleted_keys.update(deletes)
+                if key not in ns.deleted_keys:
+                    ns.dirty_rows.setdefault(key, row)
+            for key in deletes:
+                if key not in ns.dirty_rows:
+                    ns.deleted_keys.add(key)
 
             if ns.retry_count >= self.MAX_RETRIES:
                 logger.critical(

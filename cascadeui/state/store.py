@@ -523,9 +523,6 @@ class StateStore:
                 await view.push(OtherView)           # transitively batched
                 await view.update_session(x=1)       # transitively batched
                 await store.dispatch("MY_ACTION")    # batched
-
-        The returned context also exposes ``batch.dispatch(...)`` as a
-        back-compat shim equivalent to ``store.dispatch(...)``.
         """
         return BatchContext(self, source_id=source_id)
 

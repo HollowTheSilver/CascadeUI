@@ -23,6 +23,112 @@ preserved below for historical reference but are not the supported baseline.
 
 ---
 
+## [3.5.0] - 2026-07-11
+
+### Breaking
+
+- **`PersistenceManager.install_middleware()` removed.** The legacy
+  manager-driven middleware install path is gone. Wire persistence through
+  `setup_middleware(PersistenceMiddleware(...))` (the canonical path since
+  v3.3.0). No consumer used the manager-driven topology in practice, but it was
+  public API, so its removal is a breaking change.
+- **`LeaderboardLayoutView.build_summary` removed.** Aggregate stats are now
+  composed content rather than a dedicated hook: read the new `ranked_entries`
+  property inside `build_header` and return a `stats_card(...)` (or any `card`).
+  This collapses the overlapping "content above the rankings" hooks into one and
+  drops the `dict`-vs-`Container` return-type ambiguity. Migration: a
+  `build_summary(entries)` returning a stats dict or card becomes
+  `build_header(page)` reading `self.ranked_entries` and returning a
+  `stats_card`, gated on `page == 0` for a page-1-only Overview.
+
+### Added
+
+- **`PersistenceManager.reattach()`.** Re-drive persistent-view reattach after
+  the initial pass, so a view class imported *after* `setup_middleware` (a cog
+  loaded later) attaches without a restart: import order stops mattering.
+  Idempotent: already-restored panels are skipped (no re-fetch, no double
+  registration); transiently unreachable rows are retried. Call it once every
+  cog has loaded.
+- **Construction-time bound validation for selects and modal inputs.**
+  `StatefulSelect` / `Dropdown` reject more than 25 options, and `CheckboxGroup`
+  / `FileUpload` / `TextInput` reject out-of-range `min`/`max` bounds, with a
+  directed `ValueError` at construction instead of a Discord HTTP 400 when the
+  component ships or the modal opens.
+- **`nav_divider` for in-card paginators.** With `nav_inside_container` on,
+  `nav_divider = True` renders a divider between the page content and the
+  in-card navigation row. Defaults to `False` (the flush look).
+- **Built-in avatar resolution for Section-mode leaderboards.**
+  `LeaderboardLayoutView` accepts a `bot=` kwarg and ships a default
+  `get_avatar_url` that resolves each entry's avatar from the bot's user cache
+  (a Discord default avatar on a cache miss), so section-mode boards no longer
+  need a hand-rolled avatar hook. Without a `bot`, the default returns `None`
+  and the two-line `TextDisplay` fallback is unchanged. The persistent variant
+  receives the bot through `on_bind`.
+
+### Changed
+
+- **`reload()` respects the refresh throttle.** A `reload()` inside an active
+  `refresh_cooldown_ms` window (or a 429 backoff) now defers the whole reload,
+  `on_load`'s fetch included, and a burst collapses to one fetch + edit at the
+  window boundary with fresh data. Previously only the edit was throttled, so an
+  out-of-band-driven panel ran a full `on_load` fetch per trigger. A coalesced
+  reload replays its keyword arguments at the boundary, so a subclass reload
+  keyword (e.g. `force`) survives the defer when forwarded to
+  `super().reload(**kwargs)`.
+- **`LeaderboardLayoutView.build_footer` placement is now return-type-driven.**
+  A raw component (a caption, link row, or image) folds inside the rankings card
+  below the entries and stays attached to them, while a `Container` (`card(...)`)
+  renders as its own standalone card below the rankings. Previously the default
+  sibling layout floated a raw footer as an orphaned line between the card and
+  the nav row.
+
+### Removed
+
+- Dead internals: the unused `_add_page_content` shim on `PaginatedLayoutView`
+  and the unused `ErrorBoundary` utility class. Internal-only, no public surface.
+
+### Fixed
+
+- **Persistence flush no longer drops a re-registered view on a retry.** A
+  re-register racing a failed unregister flush could leave the key queued for
+  both write and delete. The next flush then deleted it, so a re-registered
+  persistent view failed to reattach after restart. The retry re-enqueue now
+  preserves the single-buffer-per-key routing invariant.
+- **`APPLICATION_SLOTS_PRUNED` payload is consistent.** The TTL sweep and manual
+  prune dispatched disagreeing keys (`reason` vs `cutoff`); both now emit a
+  consistent `{deleted, cutoff}` shape via `ActionCreators`.
+- **Paginated nav buttons no longer go stale on an out-of-band reload.** A view
+  reloaded while parked past the first page redrew its Prev/Next/First/Last
+  buttons in page-one states over later-page content; button state now derives
+  from the current page in every render path.
+- **Paginated jump buttons rebuild on a data refresh that crosses
+  `jump_threshold`.** `refresh_data` / `refresh_pages` changing the page count
+  across the threshold now add or remove the first/last/go-to buttons, not just
+  re-sync their disabled state (V1 and V2).
+- **In-card paginators and leaderboard footers coexist.** With
+  `nav_inside_container` on, a `build_footer` frame renders inside the card
+  above the pager instead of forcing the nav row out.
+- **A raising `on_page_changed` / `on_tab_switched` override no longer desyncs
+  the view.** These post-navigation hooks are now fire-and-forget (logged,
+  swallowed) like their wizard/form siblings, so the page turn / tab switch and
+  its refresh always complete.
+- **Placement validation runs after `seed_initial_state`.** A view that builds
+  its component tree inside `seed_initial_state` (rather than `__init__` /
+  `build_ui`) no longer fails to send with a "no top-level components" error:
+  the pre-flight placement check now validates the tree the hook produced, not
+  the empty pre-seed tree.
+- **`on_timeout` frees the instance-limit slot before its cosmetic edit,**
+  mirroring `exit()`: a stalled timeout edit no longer holds the slot for up
+  to `edit_timeout`.
+- **`on_unauthorized` routes through `respond()`,** covering the
+  already-acknowledged interaction case its sibling response hooks already
+  handled.
+- **`with_confirmation`'s prompt disables its buttons on timeout** instead of
+  leaving live-looking buttons that error on a late click; `with_loading_state`
+  logs its swallowed edit failures at debug.
+
+---
+
 ## [3.4.1] - 2026-07-08
 
 ### Added

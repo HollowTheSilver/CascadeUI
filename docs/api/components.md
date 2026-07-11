@@ -49,6 +49,7 @@ Every click dispatches a `COMPONENT_INTERACTION` action. Skips dispatch when the
 
 ## `StatefulSelect`
 
+
 Extends `discord.ui.Select` with state integration.
 
 ```python
@@ -62,6 +63,8 @@ StatefulSelect(
     row=None,
 )
 ```
+
+More than 25 options raises a `ValueError` at construction (`MAX_SELECT_OPTIONS`), turning a Discord HTTP 400 into a construction-time error. `Dropdown` inherits the same cap.
 
 ### `set_selected(value)`
 
@@ -191,6 +194,8 @@ TextInput(
 )
 ```
 
+`min_length` accepts 0-4000 and `max_length` accepts 1-4000; an out-of-range bound raises a directed `ValueError` at construction.
+
 The `custom_id` is auto-generated as `"input_{label}"` (lowercased, spaces replaced with underscores). Use `TextInput._slug(label)` to reproduce the same transformation externally.
 
 `description=` populates `ui.Label.description` for an optional secondary helper line beneath the title. Available on every wrapped input type (Checkbox, CheckboxGroup, RadioGroup, FileUpload all accept the same kwarg).
@@ -257,7 +262,9 @@ CheckboxGroup(
 
 Options accept dict shorthand or native `discord.CheckboxGroupOption` instances.
 Discord accepts 1-10 options; an out-of-range count raises a directed
-`ValueError` at construction. After submit: `.values` -> `list[str]`.
+`ValueError` at construction. `min_values` accepts 0-10 and `max_values` accepts
+1-10, likewise raising at construction when out of range. After submit:
+`.values` -> `list[str]`.
 
 ---
 
@@ -296,7 +303,7 @@ FileUpload(
 )
 ```
 
-After submit: `.values` -> `list[discord.Attachment]`.
+`min_values` accepts 0-10 and `max_values` accepts 1-10; an out-of-range bound raises a directed `ValueError` at construction. After submit: `.values` -> `list[discord.Attachment]`.
 
 !!! warning "Ephemeral attachment URLs"
     `discord.Attachment` URLs expire. Read attachment data in the modal

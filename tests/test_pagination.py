@@ -447,6 +447,35 @@ class TestUpdatePage:
         goto_btn = _get_item(view, "paginated_goto")
         assert goto_btn.label == "5/10"
 
+    async def test_refresh_data_growth_rebuilds_jump_button_set(self):
+        """A refresh_data that grows the page count across jump_threshold
+        rebuilds the button SET (first/last/goto appear), not just their
+        disabled state. Mirrors the V2 fix on the structurally distinct V1
+        remove/rebuild/add path, driven through the public refresh_data entry.
+        """
+
+        def formatter(chunk):
+            return discord.Embed(title=str(chunk))
+
+        # Start below jump_threshold (default 5): 2 pages, no jump buttons.
+        view = await PaginatedView.from_data(
+            list(range(2)), per_page=1, formatter=formatter, interaction=_make_interaction()
+        )
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+        assert view._show_jump is False
+        assert view._first_btn is None
+
+        # Grow past jump_threshold through the public entry point.
+        await view.refresh_data(list(range(6)))
+
+        assert view._show_jump is True
+        assert view._first_btn is not None
+        assert view._last_btn is not None
+        # The rebuilt buttons are re-attached to the tree, not just constructed.
+        assert _get_item(view, "paginated_first") is not None
+        assert _get_item(view, "paginated_last") is not None
+
     async def test_update_page_updates_indicator_label(self):
         """_update_page refreshes the indicator label for small page sets."""
         pages = _make_embeds(3)
