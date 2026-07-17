@@ -47,7 +47,7 @@ Invoked automatically by `setup_middleware`. Direct invocation is supported for 
 
 ### `RegistryPersistence(backend=...)`
 
-Governs the `PersistentView` registry namespace. Rows hold one entry per `persistence_key`; registry rows have no TTL and live until the view unregisters or the user prunes them explicitly. Pass `backend=None` to opt the registry out of persistence (persistent views still work in memory, but do not survive a restart).
+Governs the `PersistentView` registry namespace. Rows hold one entry per `persistence_key`; registry rows have no TTL and live until the view unregisters or you prune them explicitly. Pass `backend=None` to opt the registry out of persistence (persistent views still work in memory, but do not survive a restart).
 
 ### `ApplicationPersistence(backend=..., slots={})`
 

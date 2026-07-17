@@ -163,6 +163,7 @@ class TicTacToeChallengeView(StatefulLayoutView):
     instance_limit = 1
     instance_scope = "user_guild"
     instance_policy = "replace"
+    replace_policy = "delete"  # the evicted prompt's message goes with it
     exit_policy = "delete"  # disposable prompt -- never freeze
 
     def __init__(
@@ -288,15 +289,17 @@ class TicTacToeView(StatefulLayoutView):
     unauthorized_message = "You're not part of this game."
     instance_limit = 1
     instance_scope = "user_guild"
-    instance_policy = "replace"  # protect_attached = True is the library default. The challenger
-    # cannot silently abandon an active game -- they must exit the current
-    # board before starting a new one. Without this, Player B's game would
-    # vanish with no warning when Player A re-challenges someone else.
+    instance_policy = "replace"
+    replace_policy = "delete"
+    # The challenger cannot silently abandon an active game: they must exit
+    # the current board before starting a new one. Without this, Player B's
+    # game would vanish with no warning when Player A re-challenges someone
+    # else.
     protect_attached = True
-    replace_policy = "delete"  # ``state_scope = None`` because the live game board is ephemeral
-    # view-local state -- nothing about an in-progress game belongs to
-    # one player's profile. Lifetime stats are dispatched separately to
-    # ``user_guild`` scope at game end via ``_record_player_stats``.
+    # The live game board is ephemeral view-local state: nothing about an
+    # in-progress game belongs to one player's profile. Lifetime stats are
+    # dispatched separately to ``user_guild`` scope at game end via
+    # ``_record_player_stats``.
     state_scope = None
     # Lifetime stats land under a dedicated ``tictactoe_stats`` slot via
     # ``dispatch_scoped`` (see ``_record_player_stats``). Naming the slot

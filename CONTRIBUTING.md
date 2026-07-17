@@ -104,8 +104,16 @@ Fork the repo, branch from `dev`, and open your PR against `dev`.
 ```bash
 git clone https://github.com/HollowTheSilver/CascadeUI.git
 cd CascadeUI
-pip install -e ".[dev]"
+pip install -e ".[dev,sqlite,postgres]"
 ```
+
+Install the backend extras even if you are not touching persistence. The
+parametrized backend suite builds its cases from whichever backends are
+importable, so a `.[dev]`-only install drops the SQLite ones at collection
+rather than skipping them: they leave no line behind, and the run still
+reports green. The PostgreSQL cases also need a running Docker daemon,
+since they spin up a real server through `testcontainers`; without one
+they skip visibly, which is fine.
 
 ### Development Bot Scaffold
 

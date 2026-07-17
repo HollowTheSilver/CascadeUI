@@ -323,6 +323,20 @@ class _InteractionMixin:
         try:
             self.clear_items()
             self._install_refresh_button(self._build_refresh_button())
+            # The cooldown paces background re-renders; an armed view has no
+            # more of those, and this edit answers to a hard deadline: the
+            # webhook token expires 90 seconds from here. Clearing the window
+            # keeps the handoff from queueing behind the pacing a long
+            # ``refresh_cooldown_ms`` imposes.
+            #
+            # Discord's rate-limit window is NOT cleared. A 429 here is the
+            # one case the freeze in _handle_state_notification cannot repair:
+            # the flag above is already set, so no notification will get
+            # another edit through. It survives because _handle_rate_limit
+            # queues the discarded edit to ship at the backoff boundary, and
+            # the deferred render honors the armed flag by shipping the tree
+            # as-is instead of rebuilding over the button.
+            self._cooldown_not_before = 0.0
             await self.refresh()
         except discord.NotFound:
             pass

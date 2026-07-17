@@ -17,7 +17,7 @@ from helpers import make_interaction as _make_interaction
 
 from cascadeui.components.base import StatefulButton, StatefulSelect
 from cascadeui.components.inputs import Modal as CascadeModal
-from cascadeui.validation import min_length
+from cascadeui.validation import min_length, regex
 from cascadeui.views.patterns.form import (
     MAX_TEXT_FIELDS,
     FormLayoutView,
@@ -102,6 +102,33 @@ class TestTextFieldCeiling:
         interaction = _make_interaction()
         with pytest.raises(ValueError, match=str(MAX_TEXT_FIELDS)):
             FormView(interaction=interaction, fields=self._make_text_fields(7))
+
+    def test_v1_non_modal_fields_past_the_row_budget_raise(self):
+        # Four selects plus two booleans need six action rows; a V1 form has
+        # five. The overflow field used to vanish silently; it now raises.
+        opts = [{"label": "A", "value": "a"}]
+        fields = [
+            {"id": f"s{i}", "type": "select", "label": f"S{i}", "options": opts} for i in range(4)
+        ] + [
+            {"id": "b1", "type": "boolean", "label": "B1"},
+            {"id": "b2", "type": "boolean", "label": "B2"},
+        ]
+        with pytest.raises(ValueError, match="does not fit"):
+            FormView(interaction=_make_interaction(), fields=fields)
+
+    @pytest.mark.parametrize("form_cls", [FormView, FormLayoutView], ids=lambda c: c.__name__)
+    def test_duplicate_modal_labels_rejected_at_construction(self, form_cls):
+        # Modal input ids derive from the label, so two fields labelled the
+        # same collided at modal-open (the Edit button's first click). The
+        # clash now raises at construction, naming both fields.
+        with pytest.raises(ValueError, match="collide"):
+            form_cls(
+                interaction=_make_interaction(),
+                fields=[
+                    {"id": "home", "type": "text", "label": "Address"},
+                    {"id": "work", "type": "text", "label": "Address"},
+                ],
+            )
 
 
 # // ========================================( FormView text button rendering )======================================== // #
@@ -243,10 +270,9 @@ class TestBuildTextModal:
         text_inputs = _modal_text_inputs(modal)
         assert text_inputs[0].default == "existing_user"
 
-    def test_modal_falls_back_to_field_default_when_value_absent(self):
-        """When ``form.values`` has no entry for a field, the modal seeds
-        the input from ``field["default"]``. Exercises the fallback branch
-        in ``_build_form_modal`` (``form.values.get(field_id, field["default"])``).
+    def test_modal_input_shows_the_field_default(self):
+        """A field ``default`` is seeded into ``form.values`` at construction,
+        and the modal renders it as the input's default.
         """
         view = FormView(
             interaction=_make_interaction(),
@@ -259,7 +285,7 @@ class TestBuildTextModal:
                 }
             ],
         )
-        assert "u" not in view.values  # precondition: nothing written yet
+        assert view.values["u"] == "seeded_user"  # seeded at construction
         modal = _build_form_modal(view, "Edit")
         text_inputs = _modal_text_inputs(modal)
         assert text_inputs[0].default == "seeded_user"
@@ -329,7 +355,7 @@ class TestBuildTextModal:
         validation failure" bug. Previously, validators lived on the Modal
         layer -- failure caused an early return before the callback fired,
         so form.values was never updated and the next modal open reset all
-        inputs. The inline-error flow (Commit 3) surfaces the rejection
+        inputs. The inline-error flow surfaces the rejection
         on ``_field_errors`` instead of an ephemeral message.
         """
         view = FormView(
@@ -360,6 +386,137 @@ class TestBuildTextModal:
         assert "u" in view._field_errors
         assert any("10" in msg or "length" in msg.lower() for msg in view._field_errors["u"])
         interaction.response.send_message.assert_not_called()
+
+    @pytest.mark.parametrize("form_cls", [FormView, FormLayoutView], ids=lambda c: c.__name__)
+    async def test_clearing_an_optional_select_does_not_crash(self, form_cls):
+        """An optional select (min_values=0) delivers an empty list when
+        cleared, and the callback indexed it, so clearing a choice raised
+        IndexError and the user saw 'This interaction failed'."""
+        view = form_cls(
+            interaction=_make_interaction(),
+            fields=[
+                {
+                    "id": "color",
+                    "type": "select",
+                    "label": "Color",
+                    "required": False,
+                    "options": [{"label": "Red", "value": "red"}],
+                }
+            ],
+        )
+        view._update_form_display = AsyncMock()
+        select = next(c for c in view.walk_children() if isinstance(c, StatefulSelect))
+
+        select._values = ["red"]
+        await select.callback(_make_interaction())
+        select._values = []  # the deselect-all gesture Discord allows
+        await select.callback(_make_interaction())
+
+        assert view.values["color"] is None
+
+    async def test_parse_and_validator_errors_surface_together(self):
+        """One submit reveals every mistake, across parse and validator errors.
+
+        A parse error on one field used to short-circuit the whole submit, so
+        validator errors on other fields stayed hidden until the parse error
+        was fixed and the form resubmitted. The user met their mistakes one
+        round at a time.
+        """
+        view = FormView(
+            interaction=_make_interaction(),
+            fields=[
+                {"id": "age", "type": "integer", "label": "Age", "min_value": 18},
+                {
+                    "id": "email",
+                    "type": "text",
+                    "label": "Email",
+                    "validators": [regex(r"^[^@]+@[^@]+\.[^@]+$", "Must be a valid email")],
+                },
+                {
+                    "id": "password",
+                    "type": "text",
+                    "label": "Password",
+                    "validators": [min_length(8, "At least 8 characters")],
+                },
+            ],
+        )
+        modal = _build_form_modal(view, "Register")
+        view._update_form_display = AsyncMock()
+
+        typed = {"Age": "5", "Email": "nope", "Password": "x"}  # all three wrong
+        for wrapped in modal.inputs.values():
+            wrapped.value = typed[wrapped.label]
+
+        await modal.user_callback(_make_interaction(), {})
+
+        # The integer range error and both validator errors are all present.
+        assert set(view._field_errors) == {"age", "email", "password"}
+
+    async def test_validators_skip_a_field_that_failed_to_parse(self):
+        """A field that failed to parse holds its raw string, so its own
+        validators must not run against it and mask the parse error."""
+        view = FormView(
+            interaction=_make_interaction(),
+            fields=[
+                {
+                    "id": "age",
+                    "type": "integer",
+                    "label": "Age",
+                    "min_value": 18,
+                    "validators": [min_length(2)],  # would see the raw string if it ran
+                },
+            ],
+        )
+        modal = _build_form_modal(view, "Register")
+        view._update_form_display = AsyncMock()
+
+        next(iter(modal.inputs.values())).value = "notanumber"
+        await modal.user_callback(_make_interaction(), {})
+
+        # Exactly one error, and it is the parse error. If the min_length(2)
+        # validator had run against the raw string, a second error would join
+        # it, or worse the raw string would slip past validation.
+        assert len(view._field_errors["age"]) == 1
+        assert "whole number" in view._field_errors["age"][0]
+
+    async def test_modal_submit_preserves_a_non_modal_field_error(self):
+        """A modal edit clears only the modal fields' errors. A select or
+        boolean error is on a field the modal never touched, so it stays on
+        screen instead of being wiped when a text field is fixed."""
+        view = FormView(
+            interaction=_make_interaction(),
+            fields=[
+                {
+                    "id": "country",
+                    "type": "select",
+                    "label": "Country",
+                    "options": [{"label": "US", "value": "us"}],
+                },
+                {"id": "age", "type": "integer", "label": "Age", "min_value": 18},
+                {
+                    "id": "email",
+                    "type": "text",
+                    "label": "Email",
+                    "validators": [regex(r"^[^@]+@[^@]+\.[^@]+$", "Must be a valid email")],
+                },
+            ],
+        )
+        view._update_form_display = AsyncMock()
+        # A prior submit left an error on the non-modal select and on a text field.
+        view._field_errors = {
+            "country": ["Pick a valid country"],
+            "email": ["Must be a valid email"],
+        }
+
+        modal = _build_form_modal(view, "Register")
+        typed = {"Age": "5", "Email": "valid@example.com"}  # age still bad, email now valid
+        for wrapped in modal.inputs.values():
+            wrapped.value = typed[wrapped.label]
+        await modal.user_callback(_make_interaction(), {})
+
+        assert "country" in view._field_errors  # non-modal error preserved
+        assert "email" not in view._field_errors  # fixed via the modal
+        assert "age" in view._field_errors  # still out of range
 
 
 # // ========================================( _open_text_modal wiring )======================================== // #
@@ -552,12 +709,13 @@ class TestOnFieldChangedHook:
 
 
 class TestInlineValidationErrors:
-    """Commit 3: validator failure surfaces on the form, not an ephemeral.
+    """Validator failure surfaces on the form, not an ephemeral.
 
-    The V1 and V2 submit callbacks both route rejection through
-    ``_set_validation_errors`` + ``_update_form_display`` so the user
-    sees the error inline on the form body. Clearing happens on any
-    field-change gesture so the UI stays in sync with the latest input.
+    The V1 and V2 submit callbacks both set ``_field_errors`` /
+    ``_form_error`` from ``_validate_form`` and re-render, so the user sees
+    the error inline on the form body. Required and validator errors surface
+    together. Clearing happens on any field-change gesture so the UI stays in
+    sync with the latest input.
     """
 
     async def _find_submit_callback(self, view):
@@ -587,6 +745,82 @@ class TestInlineValidationErrors:
         # No ephemeral fallback; error state lives on the form.
         interaction.response.send_message.assert_not_called()
         view._update_form_display.assert_awaited()
+
+    async def test_missing_required_and_bad_value_surface_together(self):
+        """A blank required field and a validator failure elsewhere both show
+        on one submit. The required-check used to return early, hiding the
+        validator error until the missing field was filled and resubmitted.
+        """
+        from cascadeui.validation import regex
+
+        view = FormView(
+            interaction=_make_interaction(),
+            fields=[
+                {"id": "age", "type": "integer", "label": "Age", "required": True},
+                {
+                    "id": "email",
+                    "type": "text",
+                    "label": "Email",
+                    "required": True,
+                    "validators": [regex(r"^[^@]+@[^@]+\.[^@]+$", "Must be a valid email")],
+                },
+            ],
+        )
+        view._update_form_display = AsyncMock()
+        view.values = {"email": "notanemail"}  # age missing, email bad
+        submit_cb = await self._find_submit_callback(view)
+
+        await submit_cb(_make_interaction())
+
+        # The required summary names the missing field...
+        assert "Age" in view._form_error
+        # ...and the validator error on the other field is present too.
+        assert "email" in view._field_errors
+
+    async def test_drafted_field_shows_specific_parse_error_not_missing(self):
+        """A field the user entered that failed to parse surfaces its specific
+        parse message on submit, matching the modal path. A typed integer's
+        range lives in the parse layer, not a validators list, so before the
+        draft was consulted the Submit path reported the field only as a
+        generic missing-required summary, inconsistent with the modal.
+        """
+        from cascadeui.validation import regex
+
+        view = FormView(
+            interaction=_make_interaction(),
+            fields=[
+                {
+                    "id": "age",
+                    "type": "integer",
+                    "label": "Age",
+                    "required": True,
+                    "min_value": 13,
+                },
+                {
+                    "id": "email",
+                    "type": "text",
+                    "label": "Email",
+                    "required": True,
+                    "validators": [regex(r"^[^@]+@[^@]+\.[^@]+$", "Must be a valid email")],
+                },
+            ],
+        )
+        view._update_form_display = AsyncMock()
+        # Age entered out of range: the modal drafts the raw string because
+        # _parse_field_value rejects it to None. Email holds a bad value.
+        view.values = {"email": "notanemail"}
+        view._raw_drafts = {"age": "5"}
+        submit_cb = await self._find_submit_callback(view)
+
+        await submit_cb(_make_interaction())
+
+        # Age surfaces as a field error with its specific range message, not
+        # as the generic required-field summary.
+        assert "age" in view._field_errors
+        assert any("at least 13" in msg for msg in view._field_errors["age"])
+        assert view._form_error is None
+        # The other field's error still surfaces in the same submit.
+        assert "email" in view._field_errors
 
     async def test_v1_submit_validator_failure_populates_field_errors(self):
         view = FormView(
@@ -657,6 +891,40 @@ class TestInlineValidationErrors:
         assert view._field_errors == {}
         assert view._form_error is None
 
+    async def test_field_change_preserves_unrelated_field_errors(self):
+        """Changing one field clears only its own error. Selecting a country
+        used to wipe the still-accurate age and email messages; now an
+        unrelated field's error stays on screen until that field changes or
+        the next submit re-checks it."""
+        view = FormLayoutView(
+            interaction=_make_interaction(),
+            fields=[
+                {
+                    "id": "country",
+                    "type": "select",
+                    "label": "Country",
+                    "options": [{"label": "US", "value": "us"}],
+                },
+                {"id": "age", "type": "integer", "label": "Age"},
+                {"id": "email", "type": "text", "label": "Email"},
+            ],
+        )
+        view._field_errors = {
+            "age": ["Must be at least 13."],
+            "email": ["Must be a valid email address"],
+        }
+        view._update_form_display = AsyncMock()
+
+        select = next(
+            c for c in view.walk_children() if getattr(c, "custom_id", None) == "form_country"
+        )
+        select._values = ["us"]
+        await select.callback(_make_interaction())
+
+        assert "age" in view._field_errors  # unrelated errors survive the country change
+        assert "email" in view._field_errors
+        assert "country" not in view._field_errors
+
     async def test_boolean_change_clears_field_errors(self):
         view = FormView(
             interaction=_make_interaction(),
@@ -708,7 +976,7 @@ class TestInlineValidationErrors:
 
 
 class TestFieldGroups:
-    """Commit 3: ``group`` field key collects consecutive runs, no merging.
+    """The ``group`` field key collects consecutive runs, no merging.
 
     ``_iter_field_groups`` yields ``(group_name_or_None, [fields])``
     in declaration order. Reordering fields reorders groups; interleaved
@@ -819,6 +1087,14 @@ class TestParseFieldValue:
         assert parsed == "hello"
         assert err is None
 
+    @pytest.mark.parametrize("raw", ["nan", "inf", "-inf"])
+    def test_float_rejects_non_finite(self, raw):
+        # float() accepts these, and a NaN slips past min/max bounds and
+        # serializes to invalid JSON, so the parse rejects them outright.
+        parsed, err = _parse_field_value({"id": "x", "type": "float"}, raw)
+        assert parsed is None
+        assert err is not None
+
     def test_none_input_returns_none(self):
         parsed, err = _parse_field_value({"id": "x", "type": "integer"}, None)
         assert parsed is None
@@ -918,9 +1194,10 @@ class TestModalParseErrors:
         assert "age" in view._field_errors
         assert any("whole number" in e for e in view._field_errors["age"])
 
-    async def test_parse_error_preserves_raw_string(self):
-        """On parse failure, the raw string is written to form.values so the
-        next modal open shows what the user typed rather than clearing input."""
+    async def test_parse_error_drafts_the_raw_string(self):
+        """On parse failure the raw text is held in ``_raw_drafts`` so the next
+        modal open prefills what the user typed, while ``values`` keeps only
+        parsed values rather than a string in a typed field."""
         view = FormView(
             interaction=_make_interaction(),
             fields=[{"id": "age", "type": "integer", "label": "Age"}],
@@ -928,12 +1205,16 @@ class TestModalParseErrors:
         view._update_form_display = AsyncMock()
 
         modal = _build_form_modal(view, "Edit")
-        wrapped = next(iter(modal.inputs.values()))
-        wrapped.value = "abc"
+        next(iter(modal.inputs.values())).value = "abc"
 
         await modal.user_callback(_make_interaction(), {})
 
-        assert view.values["age"] == "abc"
+        # The raw text is not laundered into values.
+        assert "age" not in view.values
+        assert view._raw_drafts["age"] == "abc"
+        # The next modal open still shows what the user typed.
+        modal2 = _build_form_modal(view, "Edit")
+        assert next(iter(modal2.inputs.values())).default == "abc"
 
     async def test_parse_error_skips_field_validators(self):
         """Parse errors must not trigger field validators, which would raise
@@ -1069,19 +1350,28 @@ class TestTypedModalAggregation:
 # // ========================================( Submit short-circuits on stale errors )======================================== // #
 
 
-class TestSubmitShortCircuit:
-    """Submit while _field_errors is populated refreshes display instead of validating."""
+class TestSubmitAlwaysRevalidates:
+    """Submit always re-validates, so every current error surfaces at once.
 
-    async def test_v1_submit_skips_validate_when_field_errors_set(self):
+    An earlier short-circuit skipped validation whenever an error was
+    already on screen, which could hide a non-modal error (a missing
+    required select) until the visible one was fixed. Submit now recomputes
+    the full error set every time; unparsed input lives in _raw_drafts, so
+    validators never run against a raw string.
+    """
+
+    async def test_v1_submit_revalidates_when_field_errors_already_set(self):
         view = FormView(
             interaction=_make_interaction(),
             fields=[{"id": "age", "type": "integer", "required": True}],
         )
         view._update_form_display = AsyncMock()
         view._field_errors = {"age": ["Must be a whole number, got 'x'."]}
-        view.values["age"] = "x"  # raw string from parse failure
+        view._raw_drafts["age"] = "x"  # unparsed input lives in _raw_drafts, not values
 
-        validate_spy = AsyncMock()
+        validate_spy = AsyncMock(
+            return_value=(False, {"age": ["Must be a whole number, got 'x'."]}, None)
+        )
         view._validate_form = validate_spy
 
         submit_btn = next(
@@ -1091,19 +1381,18 @@ class TestSubmitShortCircuit:
         )
 
         await submit_btn.callback(_make_interaction())
-        validate_spy.assert_not_called()
+        validate_spy.assert_called_once()  # re-validated instead of short-circuiting
         view._update_form_display.assert_called_once()
 
-    async def test_v1_submit_runs_when_errors_cleared(self):
+    async def test_v1_submit_runs_when_no_errors_set(self):
         view = FormView(
             interaction=_make_interaction(),
             fields=[{"id": "name", "type": "text", "required": True}],
         )
         view._update_form_display = AsyncMock()
         view.values["name"] = "Alice"
-        # No errors set -> validate_form runs normally
 
-        validate_spy = AsyncMock(return_value=(True, ""))
+        validate_spy = AsyncMock(return_value=(True, {}, None))
         view._validate_form = validate_spy
         view.on_submit = AsyncMock()
         view.exit = AsyncMock()
@@ -1320,6 +1609,53 @@ class TestMultiSelect:
         )
         assert view._format_field_value(view.fields[0], []) == "Not set"
 
+    def test_secret_field_masks_its_value(self):
+        """A secret field renders masked in the display, at a fixed length so
+        the value and its length are both hidden; a blank one is still 'Not
+        set'."""
+        view = FormView(
+            interaction=_make_interaction(),
+            fields=[{"id": "pw", "type": "text", "label": "Password", "secret": True}],
+        )
+        short = view._format_field_value(view.fields[0], "ab")
+        long = view._format_field_value(view.fields[0], "a-much-longer-password")
+        assert "ab" not in short and "password" not in long
+        assert short == long  # fixed length: value length not revealed
+        assert view._format_field_value(view.fields[0], None) == "Not set"
+
+    def test_display_shows_raw_draft_for_parse_failed_field(self):
+        """A field the user entered that failed to parse shows the typed text
+        in the display, not "Not set", matching how a text field renders its
+        value. The draft lives in _raw_drafts, not self.values, so the display
+        reads the draft first; a field with neither still reads "Not set"."""
+        view = FormView(
+            interaction=_make_interaction(),
+            fields=[
+                {"id": "age", "type": "integer", "label": "Age", "min_value": 13},
+                {"id": "email", "type": "text", "label": "Email"},
+                {"id": "bio", "type": "text", "label": "Bio"},
+            ],
+        )
+        view.values["email"] = "notanemail"  # text parses, lands in values
+        view._raw_drafts["age"] = "5"  # out-of-range int, parsed to None, drafted
+
+        age_line = view._format_field_lines(next(f for f in view.fields if f["id"] == "age"))[0]
+        email_line = view._format_field_lines(next(f for f in view.fields if f["id"] == "email"))[0]
+        bio_line = view._format_field_lines(next(f for f in view.fields if f["id"] == "bio"))[0]
+
+        assert "5" in age_line and "Not set" not in age_line
+        assert "notanemail" in email_line
+        assert "Not set" in bio_line  # genuinely empty, no value and no draft
+
+    def test_formfield_carries_secret_flag(self):
+        from cascadeui import FormField
+
+        view = FormView(
+            interaction=_make_interaction(),
+            fields=[FormField(id="pw", label="Password", type="text", secret=True)],
+        )
+        assert view.fields[0]["secret"] is True
+
     def test_required_multi_select_empty_list_blocks_submit(self):
         view = FormView(
             interaction=_make_interaction(),
@@ -1411,6 +1747,36 @@ class TestFormFieldPatternIntegration:
         )
         assert view.fields[0]["id"] == "email"
 
+    async def test_declared_default_seeds_values(self):
+        """A field ``default`` used to reach only the modal prefill, so a
+        required field with a default still displayed 'Not set' and blocked
+        submission. Defaults now seed ``values`` at construction."""
+        view = FormView(
+            interaction=_make_interaction(),
+            fields=[
+                {"id": "age", "type": "integer", "label": "Age", "default": 18, "required": True},
+                {"id": "bio", "type": "text", "label": "Bio"},  # no default
+            ],
+        )
+        assert view.values["age"] == 18
+        assert "bio" not in view.values  # absent, not seeded to None
+        result = await view._validate_form()
+        valid = result[0] if isinstance(result, tuple) else result
+        assert valid  # the required field is satisfied by its default
+
+    def test_dict_without_type_gets_a_text_control(self):
+        """A raw dict with no ``type`` used to render no control at all, so a
+        required field left the form permanently unsubmittable. It now fills
+        to text, matching the FormField default."""
+        view = FormView(
+            interaction=_make_interaction(),
+            fields=[{"id": "bio", "label": "Bio", "required": True}],
+        )
+        assert view.fields[0]["type"] == "text"
+        # An edit control now exists for the field, not just the submit button.
+        custom_ids = [c.custom_id for c in view.walk_children() if getattr(c, "custom_id", None)]
+        assert any("edit" in cid.lower() for cid in custom_ids)
+
     def test_mixed_dict_and_formfield(self):
         from cascadeui import FormField
 
@@ -1479,3 +1845,40 @@ class TestFormSchema:
         """
         view = FormLayoutView(interaction=_make_interaction())
         assert view.fields == []
+
+
+class TestFormViewInitialRender:
+    """V1 form content reaches the first message, not just the pop edit."""
+
+    async def test_send_ships_the_form_embed(self):
+        """The form embed is the V1 render; the controls alone are not.
+
+        _build_form_embed is private, so before send() supplied it a V1 form
+        had no public way to put its first frame on the message.
+        """
+        interaction = _make_interaction()
+        view = FormView(
+            interaction=interaction,
+            title="Signup",
+            fields=[{"id": "name", "label": "Name", "type": "text"}],
+        )
+
+        await view.send()
+
+        embed = interaction.response.send_message.call_args.kwargs.get("embed")
+        assert embed is not None
+        assert "Signup" in (embed.title or "")
+
+    async def test_explicit_embed_wins(self):
+        """A caller-supplied embed is not replaced by the form's own."""
+        interaction = _make_interaction()
+        view = FormView(
+            interaction=interaction,
+            title="Signup",
+            fields=[{"id": "name", "label": "Name", "type": "text"}],
+        )
+
+        await view.send(embed=discord.Embed(title="Caller"))
+
+        embed = interaction.response.send_message.call_args.kwargs.get("embed")
+        assert embed.title == "Caller"

@@ -2,6 +2,7 @@
 
 
 import logging
+import math
 from typing import Any, ClassVar, Dict, List, Optional
 
 import discord
@@ -54,6 +55,27 @@ def _validate_modal_field_count(cls_name: str, fields: List[Dict[str, Any]]) -> 
             f"{cls_name} defines {count} modal fields (text/integer/float/date), "
             f"but Discord modals allow at most {MAX_TEXT_FIELDS} text inputs per modal."
         )
+
+
+def _validate_modal_field_labels(cls_name: str, fields: List[Dict[str, Any]]) -> None:
+    """Raise ``ValueError`` if two modal fields derive the same input id.
+
+    A modal input's ``custom_id`` comes from its label, so two modal fields
+    whose labels slugify to the same value collide when the modal is built.
+    Catching it at construction names both fields, rather than raising on the
+    Edit button's first click.
+    """
+    seen: Dict[str, Any] = {}
+    for field in _collect_modal_fields(fields):
+        label = field.get("label", field.get("id"))
+        slug = CascadeTextInput._slug(str(label))
+        if slug in seen:
+            raise ValueError(
+                f"{cls_name} has two modal fields whose labels collide: "
+                f"{seen[slug]!r} and {field.get('id')!r} both derive input id "
+                f"{slug!r}. Give them distinct labels."
+            )
+        seen[slug] = field.get("id")
 
 
 def _resolve_modal_edit_label(override: Optional[str], modal_fields: List[Dict[str, Any]]) -> str:
@@ -116,6 +138,10 @@ def _parse_field_value(field: Dict[str, Any], raw: Optional[str]):
             parsed = float(raw)
         except ValueError:
             return None, f"Must be a number, got {raw!r}."
+        # float() accepts "nan"/"inf", which slip past min/max (nan compares
+        # False to everything) and serialize to invalid JSON.
+        if not math.isfinite(parsed):
+            return None, f"Must be a finite number, got {raw!r}."
         min_v = field.get("min_value")
         max_v = field.get("max_value")
         if min_v is not None and parsed < min_v:
@@ -151,9 +177,10 @@ def _build_form_modal(form, title: str) -> CascadeModal:
     already skips ``MODAL_SUBMITTED``, so form-edit hops do not pollute
     the undo stack.
 
-    Validators declared on individual fields run in the submit callback
-    after parsing succeeds -- they never fire against unparsed raw
-    strings.
+    Validators declared on individual fields run in this callback against
+    the fields that parsed, and their errors merge with the parse errors, so
+    one submit surfaces every mistake. A field that failed to parse shows its
+    parse error and is skipped by its validators here.
     """
     modal_fields = _collect_modal_fields(form.fields)
     field_by_id: Dict[Any, Dict[str, Any]] = {f.get("id"): f for f in modal_fields}
@@ -164,7 +191,11 @@ def _build_form_modal(form, title: str) -> CascadeModal:
     for field in modal_fields:
         field_id = field.get("id")
         field_label = field.get("label", field_id)
-        current_value = form.values.get(field_id, field.get("default"))
+        # A pending raw draft (last input failed to parse) wins, so the user
+        # sees what they typed; otherwise the parsed value or the default.
+        current_value = form._raw_drafts.get(
+            field_id, form.values.get(field_id, field.get("default"))
+        )
         placeholder = field.get("placeholder")
         if placeholder is None:
             ftype = field.get("type", "text")
@@ -197,40 +228,61 @@ def _build_form_modal(form, title: str) -> CascadeModal:
             raw = text_input.value
             parsed, parse_error = _parse_field_value(field, raw)
             if parse_error is not None:
-                # Preserve the raw string so the next modal open shows
-                # what the user typed -- the error surfaces via
-                # _field_errors instead.
-                form.values[field_id] = raw
+                # Hold the raw text in _raw_drafts, not values: the next modal
+                # open prefills what the user typed, but values keeps the last
+                # valid value rather than a string in a typed field.
+                form._raw_drafts[field_id] = raw
                 parse_errors[field_id] = [parse_error]
                 continue
+            form._raw_drafts.pop(field_id, None)
             form.values[field_id] = parsed
             if old_value != parsed:
                 changes.append((field_id, old_value, parsed))
 
-        if changes:
-            form._clear_errors()
+        # This modal edit recomputes every modal field's error below, so clear
+        # the modal fields' prior errors and the form-level summary while
+        # leaving a non-modal select or boolean error in place: the modal did
+        # not touch those fields, so their messages are still accurate.
+        for fid in field_by_id:
+            form._field_errors.pop(fid, None)
+        form._form_error = None
 
         for field_id, old_value, new_value in changes:
             await form._call_hook_safe(form.on_field_changed, field_id, old_value, new_value)
 
-        if parse_errors:
-            # Parse errors take precedence over validator errors -- running
-            # validators against raw strings would TypeError.
-            form._field_errors = dict(parse_errors)
-            form._form_error = None
-            await form._update_form_display()
-            return
+        # Parse errors and validator errors surface together, so one submit
+        # reveals every mistake. Validators run only against fields that
+        # parsed: a field that failed to parse holds its raw string, and its
+        # parse error is the message it shows, so a typed validator has
+        # nothing to check there.
+        field_errors: Dict[Any, List[str]] = dict(parse_errors)
 
-        # Run field validators that were originally declared on the fields.
-        if field_validators:
+        to_validate = {
+            fid: validators
+            for fid, validators in field_validators.items()
+            if fid not in parse_errors
+        }
+        if to_validate:
             from ...validation import validate_fields
 
-            field_defs = [{"id": fid, "validators": fv} for fid, fv in field_validators.items()]
+            field_defs = [
+                {
+                    "id": fid,
+                    "validators": fv,
+                    "required": field_by_id[fid].get("required", False),
+                }
+                for fid, fv in to_validate.items()
+            ]
             errors = await validate_fields(form.values, field_defs)
-            if errors:
-                form._set_validation_errors(errors)
-                await form._update_form_display()
-                return
+            for fid, errs in errors.items():
+                field_errors.setdefault(fid, []).extend(e.message for e in errs)
+
+        if field_errors:
+            # Merge, not replace: a non-modal field's error cleared above stays
+            # gone, but any that was left standing is preserved.
+            form._field_errors.update(field_errors)
+            await form._update_form_display()
+            return
 
         await form._update_form_display()
 
@@ -278,7 +330,16 @@ class _BaseFormMixin:
 
         self.title = title
         self.fields = _normalize_fields(fields, schema, type(self).__name__)
-        self.values = {}
+        # Seed declared defaults so a field with a ``default`` starts filled:
+        # the display shows it, the required-check counts it, and select
+        # defaults render. Without this, ``default`` reached only the modal
+        # prefill and an otherwise-satisfied required field still blocked.
+        self.values = {f["id"]: f["default"] for f in self.fields if f.get("default") is not None}
+
+        # Raw text a modal field failed to parse, held apart from ``values``
+        # so ``values`` only ever carries parsed values. The next modal open
+        # prefills from here; ``values`` keeps the field's last valid value.
+        self._raw_drafts: Dict[str, str] = {}
 
         # Inline validation error state. ``_field_errors`` maps field id
         # to list[str]; ``_form_error`` holds a form-level message used
@@ -288,8 +349,46 @@ class _BaseFormMixin:
         self._form_error: Optional[str] = None
 
         _validate_modal_field_count(type(self).__name__, self.fields)
+        _validate_modal_field_labels(type(self).__name__, self.fields)
 
         self._build_form()
+
+    # // ----( Navigation state )---- // #
+
+    def get_nav_state(self) -> dict:
+        """Carry entered-but-unsubmitted values across a ``pop``.
+
+        ``values`` is assigned in ``__init__`` and is not a constructor
+        kwarg, so a reconstruction hands back an empty form: fill three
+        fields, open a picker or a help screen, press Back, and the typing
+        is gone with nothing to say it ever happened.
+
+        The values and any pending raw drafts (input the user typed that
+        has not parsed yet) both travel, so a field carried across a pop
+        renders the same either way. Validation errors do not: they are
+        the output of a submit that has not run against this data yet, and
+        re-showing them beside values the user may have come back to fix
+        would be stale. The next submit recomputes them.
+        """
+        return {"values": dict(self.values), "raw_drafts": dict(self._raw_drafts)}
+
+    def restore_nav_state(self, state: dict) -> None:
+        """Restore entered values and pending drafts for fields the form
+        still declares.
+
+        Fields are filtered against the current declaration because a
+        reconstruction can build a different set than it had at push time
+        (a schema change, a conditional field). A value with no field to
+        render it would sit in ``values`` and reach the submit payload
+        without ever being shown.
+        """
+        known = {field.get("id") for field in self.fields}
+        values = state.get("values")
+        if values:
+            self.values.update({k: v for k, v in values.items() if k in known})
+        drafts = state.get("raw_drafts")
+        if drafts:
+            self._raw_drafts.update({k: v for k, v in drafts.items() if k in known})
 
     # // ----( Group + error helpers )---- // #
 
@@ -323,6 +422,11 @@ class _BaseFormMixin:
 
     def _format_field_value(self, field: Dict[str, Any], value: Any) -> str:
         """Render a single field's value as display text."""
+        # A secret field masks its value in the display (password, token).
+        # Fixed-width dots so the length is not revealed either; a blank
+        # field still shows "Not set" via the paths below.
+        if field.get("secret") and value is not None:
+            return "\N{BULLET}" * 8
         ftype = field.get("type")
         if ftype == "boolean":
             if value is True:
@@ -342,7 +446,13 @@ class _BaseFormMixin:
         """Return one or two display lines for a field -- value plus inline error."""
         fid = field.get("id")
         flabel = field.get("label", fid)
-        fvalue = self._format_field_value(field, self.values.get(fid))
+        # A parse-failed field holds what the user typed in _raw_drafts rather
+        # than self.values, so read the draft first: a typed field with an
+        # unparseable value shows the entered text like a text field does,
+        # instead of reading as "Not set".
+        raw = self._raw_drafts.get(fid)
+        value = raw if raw is not None else self.values.get(fid)
+        fvalue = self._format_field_value(field, value)
         required = _REQUIRED_MARKER if field.get("required", False) else ""
         lines = [f"{flabel}{required}: {fvalue}"]
         if fid in self._field_errors:
@@ -350,17 +460,20 @@ class _BaseFormMixin:
             lines.append(f"\u26a0\ufe0f {errs}")
         return lines
 
-    def _set_validation_errors(self, errors: Any) -> None:
-        """Populate ``_field_errors`` / ``_form_error`` from ``_validate_form()``."""
-        if isinstance(errors, dict):
-            self._field_errors = {fid: [e.message for e in errs] for fid, errs in errors.items()}
-            self._form_error = None
-        else:
-            self._field_errors = {}
-            self._form_error = errors
-
     def _clear_errors(self) -> None:
         self._field_errors = {}
+        self._form_error = None
+
+    def _clear_field_error(self, fid) -> None:
+        """Clear only the error state a change to ``fid`` invalidates.
+
+        Another field's validator result still holds because its value did
+        not change, so its message stays on screen instead of vanishing
+        when the user edits an unrelated field. The form-level required
+        summary can go stale when a change fills a missing field, so it
+        clears and recomputes on the next submit.
+        """
+        self._field_errors.pop(fid, None)
         self._form_error = None
 
     def _build_form(self):
@@ -417,9 +530,9 @@ class _BaseFormMixin:
         """Return True when ``self.values[field_id]`` is missing or empty.
 
         Empty means ``None``, absent key, or (for ``multi_select``) an
-        empty sequence. Parse errors leave raw strings in ``self.values``
-        which still count as "present" for required-field purposes --
-        the parse error is what blocks submission in that case.
+        empty sequence. A value that failed to parse is held in
+        ``_raw_drafts``, not ``self.values``, so it reads as empty here and
+        a required field with unparsed input surfaces as required.
         """
         field_id = field.get("id")
         if field_id not in self.values:
@@ -432,24 +545,70 @@ class _BaseFormMixin:
         return False
 
     async def _validate_form(self):
-        """Validate form data using both required-field checks and field validators."""
-        missing_fields = []
+        """Validate the form, surfacing required and validator errors together.
+
+        Returns ``(valid, field_errors, form_error)``. ``field_errors`` maps
+        a field id to its validator messages; ``form_error`` is the
+        form-level "complete all required fields" summary, or ``None``. A
+        blank required field and a bad value elsewhere both appear at once,
+        so fixing one does not hide the other until the next submit.
+
+        A field the user entered that failed to parse holds its raw string
+        in ``_raw_drafts``. Such a field is invalid, not missing, so its
+        specific parse error (a typed field's ``min_value`` / ``max_value``
+        range, a bad integer) is re-derived here rather than degrading to
+        the generic required-field summary. This keeps the Submit path in
+        step with the modal path, which reports the same specific message.
+        """
+        # Re-derive the specific parse error for every drafted field so the
+        # Submit path matches what the modal showed for the same bad input.
+        draft_errors: Dict[str, List[str]] = {}
         for field in self.fields:
-            if field.get("required", False) and self._is_field_empty(field):
-                missing_fields.append(field.get("label", field.get("id")))
+            fid = field.get("id")
+            raw = self._raw_drafts.get(fid)
+            if raw is not None:
+                _, err = _parse_field_value(field, raw)
+                if err:
+                    draft_errors.setdefault(fid, []).append(err)
 
-        if missing_fields:
-            return False, f"Please complete all required fields: {', '.join(missing_fields)}"
+        missing_ids = {
+            field.get("id")
+            for field in self.fields
+            if field.get("required", False)
+            and self._is_field_empty(field)
+            and field.get("id") not in draft_errors
+        }
+        missing_labels = [
+            field.get("label", field.get("id"))
+            for field in self.fields
+            if field.get("id") in missing_ids
+        ]
 
-        has_validators = any(field.get("validators") for field in self.fields)
-        if has_validators:
+        field_errors: Dict[str, List[str]] = {fid: list(errs) for fid, errs in draft_errors.items()}
+
+        # Validators run only on fields that parsed and are not already
+        # flagged missing: a missing field's error is the required-field
+        # summary alone, and a drafted field's is its parse message.
+        to_check = [
+            field
+            for field in self.fields
+            if field.get("id") not in missing_ids
+            and field.get("id") not in self._raw_drafts
+            and field.get("validators")
+        ]
+        if to_check:
             from ...validation import validate_fields
 
-            errors = await validate_fields(self.values, self.fields)
-            if errors:
-                return False, errors
+            errors = await validate_fields(self.values, to_check)
+            for fid, errs in errors.items():
+                field_errors.setdefault(fid, []).extend(e.message for e in errs)
 
-        return True, ""
+        form_error = None
+        if missing_labels:
+            form_error = f"Please complete all required fields: {', '.join(missing_labels)}"
+
+        valid = not missing_labels and not field_errors
+        return valid, field_errors, form_error
 
     async def on_state_changed(self, state):
         """Update form display when state changes."""
@@ -462,7 +621,7 @@ class _BaseFormMixin:
 class FormView(_BaseFormMixin, StatefulView):
     """A view for collecting form data from users.
 
-    Supports field types: ``"select"``, ``"boolean"``, ``"text"``.
+    Supports field types: ``"text"``, ``"integer"``, ``"float"``, ``"date"``, ``"boolean"``, ``"select"``, and ``"multi_select"``.
 
     Text fields cannot render inline (Discord restricts ``TextInput`` to
     modals), so a grouped "Edit Text Fields" button opens a single
@@ -482,7 +641,16 @@ class FormView(_BaseFormMixin, StatefulView):
 
         for field in self.fields:
             if current_row > 4:
-                break  # Discord max 5 rows (0-4)
+                # Discord allows five action rows (0-4), and each select or
+                # boolean field takes one. Past the budget the field used to
+                # vanish with no error, leaving a required field unfillable;
+                # name the overflow instead.
+                raise ValueError(
+                    f"{type(self).__name__} field {field.get('id')!r} does not "
+                    f"fit: a V1 form has five component rows, and its select and "
+                    f"boolean fields have filled them. Use fewer non-text fields, "
+                    f"or a V2 FormLayoutView, which holds more."
+                )
 
             field_type = field.get("type", "string")
             field_id = field.get("id")
@@ -514,10 +682,13 @@ class FormView(_BaseFormMixin, StatefulView):
                 def make_select_callback(fid, sel):
                     async def callback(interaction):
                         old_value = self.values.get(fid)
-                        new_value = sel.values[0]
+                        # An optional select (min_values=0) delivers an empty
+                        # list when the user clears it; None is the "not set"
+                        # value the display and required-check already expect.
+                        new_value = sel.values[0] if sel.values else None
                         self.values[fid] = new_value
                         if old_value != new_value:
-                            self._clear_errors()
+                            self._clear_field_error(fid)
                             await self._call_hook_safe(
                                 self.on_field_changed, fid, old_value, new_value
                             )
@@ -564,7 +735,7 @@ class FormView(_BaseFormMixin, StatefulView):
                         new_value = list(sel.values)
                         self.values[fid] = new_value
                         if list(old_value or []) != new_value:
-                            self._clear_errors()
+                            self._clear_field_error(fid)
                             await self._call_hook_safe(
                                 self.on_field_changed, fid, old_value, new_value
                             )
@@ -597,7 +768,7 @@ class FormView(_BaseFormMixin, StatefulView):
                         old_value = self.values.get(fid)
                         self.values[fid] = value
                         if old_value != value:
-                            self._clear_errors()
+                            self._clear_field_error(fid)
                             await self._call_hook_safe(self.on_field_changed, fid, old_value, value)
                         await self._update_form_display()
 
@@ -636,15 +807,12 @@ class FormView(_BaseFormMixin, StatefulView):
         )
 
         async def submit_callback(interaction):
-            # Parse errors from the modal leave raw strings in self.values;
-            # submitting would fire validators against unparsed strings.
-            # Keep the user on the existing error view until they reopen
-            # the modal and fix the input.
-            if self._field_errors or self._form_error:
-                await self._update_form_display()
-                return
-
-            valid, errors = await self._validate_form()
+            # Always re-validate on submit: _validate_form derives every
+            # field's current error (drafts included), so a submit surfaces
+            # all outstanding problems at once rather than re-showing a stale
+            # subset. Unparsed input lives in _raw_drafts, never self.values,
+            # so validators never run against a raw string.
+            valid, field_errors, form_error = await self._validate_form()
 
             if valid:
                 await self.on_submit(interaction, self.values)
@@ -654,20 +822,24 @@ class FormView(_BaseFormMixin, StatefulView):
                 if not self.is_finished():
                     await self.exit()
             else:
-                self._set_validation_errors(errors)
+                self._field_errors = field_errors
+                self._form_error = form_error
                 await self._update_form_display()
 
         submit_button.callback = submit_callback
         self.add_item(submit_button)
 
-    async def _update_form_display(self):
-        """Update the form display with current values.
+    def _build_form_embed(self) -> discord.Embed:
+        """Render the current values as the form's embed.
 
-        Renders fields grouped by consecutive ``"group"`` runs when any
-        field declares a group, falling back to a flat field list when
-        none do. Inline field errors surface as an italic warning line
-        under the offending field value; the form-level error becomes
-        the embed's red-tinted description.
+        Fields group by consecutive ``"group"`` runs when any field declares
+        a group, falling back to a flat field list when none do. Inline field
+        errors surface as an italic warning line under the offending field
+        value; the form-level error becomes the embed's red-tinted
+        description.
+
+        Kept separate from shipping it: a navigation edit needs the embed
+        without the refresh, and a field change needs both.
         """
         has_form_error = self._form_error is not None
         colour = discord.Color.red() if has_form_error or self._field_errors else None
@@ -703,7 +875,51 @@ class FormView(_BaseFormMixin, StatefulView):
                     inline=False,
                 )
 
-        await self.refresh(embed=embed)
+        return embed
+
+    async def _update_form_display(self):
+        """Rebuild the form embed and ship it."""
+        await self.refresh(**await self._nav_edit_kwargs())
+
+    async def send(
+        self,
+        content: Optional[str] = None,
+        *,
+        embed: Optional[discord.Embed] = None,
+        embeds: Optional[List[discord.Embed]] = None,
+        file: Optional[discord.File] = None,
+        files: Optional[List[discord.File]] = None,
+        ephemeral: bool = False,
+    ):
+        """Send the view, using the form's own embed when none is given.
+
+        V1 form content lives in the embed, so the first message would
+        otherwise ship the field controls over an empty body. This is the
+        same render ``_nav_edit_kwargs`` supplies on a ``pop``. An explicit
+        ``embed`` or ``content`` wins.
+        """
+        if embed is None and content is None:
+            embed = (await self._nav_edit_kwargs()).get("embed")
+        return await super().send(
+            content=content,
+            embed=embed,
+            embeds=embeds,
+            file=file,
+            files=files,
+            ephemeral=ephemeral,
+        )
+
+    nav_rebuild = staticmethod(lambda v: v._nav_edit_kwargs())
+
+    async def _nav_edit_kwargs(self) -> dict:
+        """The embed a navigation edit needs to show the current values.
+
+        ``pop()`` passes no rebuild of its own, so without this the edit
+        would restore the controls and leave whatever the child view put on
+        the message. V1 form content lives in the embed, so the embed is the
+        render.
+        """
+        return {"embed": self._build_form_embed()}
 
 
 # // ========================================( V2: FormLayoutView )======================================== // #
@@ -715,7 +931,7 @@ class FormLayoutView(_BaseFormMixin, StatefulLayoutView):
     The V2 equivalent of ``FormView``. Uses ``TextDisplay`` inside a
     ``Container`` instead of embeds for field display.
 
-    Supports field types: ``"select"``, ``"boolean"``, ``"text"``. Text
+    Supports field types: ``"text"``, ``"integer"``, ``"float"``, ``"date"``, ``"boolean"``, ``"select"``, and ``"multi_select"``. Text
     fields render via a grouped "Edit Text Fields" button that opens a
     single :class:`cascadeui.Modal`; the 5-input modal cap is enforced
     at construction time.
@@ -760,10 +976,13 @@ class FormLayoutView(_BaseFormMixin, StatefulLayoutView):
                 def make_select_callback(fid, sel):
                     async def callback(interaction):
                         old_value = self.values.get(fid)
-                        new_value = sel.values[0]
+                        # An optional select (min_values=0) delivers an empty
+                        # list when the user clears it; None is the "not set"
+                        # value the display and required-check already expect.
+                        new_value = sel.values[0] if sel.values else None
                         self.values[fid] = new_value
                         if old_value != new_value:
-                            self._clear_errors()
+                            self._clear_field_error(fid)
                             await self._call_hook_safe(
                                 self.on_field_changed, fid, old_value, new_value
                             )
@@ -808,7 +1027,7 @@ class FormLayoutView(_BaseFormMixin, StatefulLayoutView):
                         new_value = list(sel.values)
                         self.values[fid] = new_value
                         if list(old_value or []) != new_value:
-                            self._clear_errors()
+                            self._clear_field_error(fid)
                             await self._call_hook_safe(
                                 self.on_field_changed, fid, old_value, new_value
                             )
@@ -837,7 +1056,7 @@ class FormLayoutView(_BaseFormMixin, StatefulLayoutView):
                         old_value = self.values.get(fid)
                         self.values[fid] = value
                         if old_value != value:
-                            self._clear_errors()
+                            self._clear_field_error(fid)
                             await self._call_hook_safe(self.on_field_changed, fid, old_value, value)
                         await self._update_form_display()
 
@@ -869,15 +1088,12 @@ class FormLayoutView(_BaseFormMixin, StatefulLayoutView):
         )
 
         async def submit_callback(interaction):
-            # Parse errors from the modal leave raw strings in self.values;
-            # submitting would fire validators against unparsed strings.
-            # Keep the user on the existing error view until they reopen
-            # the modal and fix the input.
-            if self._field_errors or self._form_error:
-                await self._update_form_display()
-                return
-
-            valid, errors = await self._validate_form()
+            # Always re-validate on submit: _validate_form derives every
+            # field's current error (drafts included), so a submit surfaces
+            # all outstanding problems at once rather than re-showing a stale
+            # subset. Unparsed input lives in _raw_drafts, never self.values,
+            # so validators never run against a raw string.
+            valid, field_errors, form_error = await self._validate_form()
 
             if valid:
                 await self.on_submit(interaction, self.values)
@@ -888,7 +1104,8 @@ class FormLayoutView(_BaseFormMixin, StatefulLayoutView):
                 if not self.is_finished():
                     await self.exit()
             else:
-                self._set_validation_errors(errors)
+                self._field_errors = field_errors
+                self._form_error = form_error
                 await self._update_form_display()
 
         submit_button.callback = submit_callback
@@ -938,6 +1155,17 @@ class FormLayoutView(_BaseFormMixin, StatefulLayoutView):
             self._create_form_controls()
             # Restore the navigation back button if push() added one.
             self._restore_navigation_artifacts()
+
+    def restore_nav_state(self, state: dict) -> None:
+        """Restore entered values and rebuild the tree to show them.
+
+        The base restores the values; a V2 view is its components, so the
+        tree has to be recomposed or the message would render the empty
+        fields ``__init__`` built while the restored values sat unseen in
+        ``values`` and reached the next submit anyway.
+        """
+        super().restore_nav_state(state)
+        self._rebuild_display()
 
     async def _update_form_display(self):
         """Update the form display with current values."""

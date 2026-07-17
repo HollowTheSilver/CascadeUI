@@ -7,8 +7,8 @@ import inspect
 import logging
 import time
 import uuid
-from datetime import datetime
-from typing import Any, ClassVar, Dict, Optional, Set
+from datetime import datetime, timezone
+from typing import Any, Callable, ClassVar, Dict, Optional, Set
 
 import discord
 from discord import Interaction
@@ -22,7 +22,7 @@ from ..exceptions import InstanceLimitError
 from ..state.actions import ActionCreators
 from ..state.singleton import get_store
 from ..state.store import _CURRENT_INTERACTION
-from ..utils.coercion import coerce_snowflake_id, coerce_snowflake_id_set
+from ..utils.coercion import coerce_snowflake_id, coerce_snowflake_id_set, is_snowflake
 from ..utils.tasks import get_task_manager
 from ._interaction import _InteractionMixin
 from ._navigation import _NavigationMixin
@@ -36,11 +36,9 @@ logger = logging.getLogger(__name__)
 # Maps class name -> class for navigation stack resolution
 _view_class_registry: Dict[str, type] = {}
 
-# Class names already warned about an explicit user_id kwarg that diverged
-# from the interaction user. Dedupes the construction-time warning to once
-# per class so push/pop reconstruction (which re-injects user_id) and repeat
-# opens do not spam the log.
-_user_id_divergence_warned: set = set()
+# Class names already warned about an author locked out of their own view.
+# Dedupes to once per class so repeat opens do not spam the log.
+_user_id_lock_out_warned: set = set()
 
 # Tracks view classes whose on_load() has overrun the interaction-timing budget.
 # Deduped per class so a consistently-slow preload warns once, not on every
@@ -62,6 +60,24 @@ _NON_RECONSTRUCTIBLE_KWARGS = frozenset(
         "parent",
     }
 )
+
+# Backoff for a rate-limit that arrives with no ``Retry-After`` to read.
+#
+# Reaching this constant means the bot is OFFLINE, not slow. discord.py
+# absorbs and retries every ordinary rate-limit itself (it sleeps the
+# response's own retry_after and re-sends), and raises a 429 only when the
+# reply carries no ``Via`` header -- its own test for a request Cloudflare
+# blocked at the edge, before Discord ever saw it. That is an IP-level ban
+# against the whole bot, typically hour-scale: no message edits, no command
+# responses, and not even an interaction ack, since acks are HTTP too.
+#
+# So this is not a UI pacing value and there is no interactive latency to
+# trade against -- every view is already dead when it is read. It governs
+# one thing: how hard a banned bot keeps knocking. 429s count toward the
+# same invalid-response budget that triggers the ban, so retrying every
+# second can hold the door shut. Minutes-scale is the point; the only cost
+# is staying quiet a little past a ban that lifted early.
+_CLOUDFLARE_BAN_BACKOFF = 60.0
 
 
 def _register_view_class(cls):
@@ -202,9 +218,8 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
     # re-enters ``on_state_changed`` once the window expires, so the edit
     # reflects the latest store state rather than whatever was current at
     # the deferred call's site. ``None`` (default) disables the proactive
-    # cooldown. Independent of the always-on reactive 429 backoff path,
-    # which writes to the same ``_refresh_not_before`` timestamp when
-    # Discord returns an escalated rate-limit.
+    # cooldown. Independent of the always-on reactive 429 backoff, which
+    # arms its own window and is never waived.
     refresh_cooldown_ms: Optional[int] = None
 
     # Subclass config: edit timeout ceiling
@@ -575,12 +590,19 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             for slot_name in slots:
                 _PERSISTENT_SLOTS.add(slot_name)
 
-        # Wrap __init__ on subclasses that define their own, so kwargs are
-        # auto-captured for push/pop reconstruction.  Only the outermost
-        # (most-derived) wrapper captures; intermediate classes skip via
-        # the _pending_init_kwargs guard.
-        if "__init__" in cls.__dict__:
-            original_init = cls.__init__
+        # Wrap __init__ so kwargs are auto-captured for push/pop
+        # reconstruction. The test is whether this class already inherits a
+        # wrapper, not whether it declares __init__ itself: a pattern can
+        # take its __init__ from a plain mixin that never triggers
+        # __init_subclass__ (the _Base*Mixin classes do not subclass
+        # _StatefulMixin), and keying off cls.__dict__ skipped those
+        # entirely -- they captured nothing, so pop rebuilt them with none
+        # of their constructor arguments and a popped form came back with
+        # no fields. Only the outermost wrapper captures; inner ones skip
+        # via the _pending_init_kwargs guard.
+        resolved_init = cls.__init__
+        if not getattr(resolved_init, "_cascadeui_captures_kwargs", False):
+            original_init = resolved_init
 
             @functools.wraps(original_init)
             def _capturing_init(self, *args, **kw):
@@ -599,6 +621,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     }
                 original_init(self, *args, **kw)
 
+            _capturing_init._cascadeui_captures_kwargs = True
             cls.__init__ = _capturing_init
 
         # Wrap build_ui to set the theme context automatically and
@@ -787,14 +810,20 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         self._update_lock = asyncio.Lock()
         self._update_pending = False
 
-        # Refresh throttling state. ``_refresh_not_before`` is a monotonic
-        # timestamp marking the earliest moment the next edit may ship;
-        # written by the proactive cooldown path (after a successful edit
-        # when ``refresh_cooldown_ms`` is set) and by the reactive 429 path
-        # (when Discord returns a rate-limit). ``_deferred_refresh_task``
-        # holds the single pending retry, so N refreshes inside the window
-        # produce one scheduled task, not N.
-        self._refresh_not_before: float = 0.0
+        # Refresh throttling state: two monotonic timestamps, each marking
+        # the earliest moment the next edit may ship, kept apart because
+        # they answer to different authorities. ``_cooldown_not_before`` is
+        # the library's own opt-in pacing (written after a successful edit
+        # when ``refresh_cooldown_ms`` is set) and is waived for edits made
+        # in direct response to an interaction. ``_ratelimit_not_before`` is
+        # Discord's, armed by the reactive 429 path, and is waived for
+        # nothing -- exempting it would hammer an endpoint that has already
+        # said stop. Collapsing the two into one field makes the second
+        # guarantee impossible to keep. ``_deferred_refresh_task`` holds the
+        # single pending retry, so N refreshes inside the window produce one
+        # scheduled task, not N.
+        self._cooldown_not_before: float = 0.0
+        self._ratelimit_not_before: float = 0.0
         self._deferred_refresh_task: Optional[asyncio.Task] = None
         # Set when reload() is called inside a cooldown window so the single
         # deferred task re-fetches (via reload) at the boundary instead of a
@@ -831,34 +860,9 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         self.user_id = coerce_snowflake_id(self.user_id)
         self.guild_id = coerce_snowflake_id(self.guild_id)
 
-        # Reserved-kwarg footgun: user_id is a framework-managed identity
-        # field (access control, session derivation, instance scoping) that
-        # push/pop reconstruction re-derives from the interaction. A consumer
-        # who passes their own non-interaction value (e.g. an internal account
-        # id) gets it on the first construction but a silently-diverged value
-        # after navigation, so the failure surfaces far from the mistake. The
-        # warning fires once per class at construction and names the fix --
-        # application ids belong on a non-reserved kwarg name. (The
-        # admin-subject case -- an explicit user_id naming a different subject
-        # than the clicker -- also trips this; the warning is informational,
-        # not an error.)
-        if (
-            _user_id_supplied
-            and self.interaction is not None
-            and self.user_id is not None
-            and self.user_id != self.interaction.user.id
-        ):
-            cls_name = type(self).__qualname__
-            if cls_name not in _user_id_divergence_warned:
-                _user_id_divergence_warned.add(cls_name)
-                logger.warning(
-                    f"{cls_name} received an explicit user_id={self.user_id} that "
-                    f"differs from the interaction user ({self.interaction.user.id}). "
-                    f"'user_id' is a framework-managed identity kwarg -- it is "
-                    f"re-derived from the interaction on push/pop, so a custom value "
-                    f"silently diverges after navigation. Use a non-reserved kwarg "
-                    f"name for application ids."
-                )
+        # Recorded for _warn_if_locked_out, which runs at send once the
+        # subclass __init__ has finished and allowed_users exists.
+        self._explicit_user_id = _user_id_supplied
 
         if self.session_id is None and self.user_id is not None:
             # The fully-qualified class path isolates view hierarchies
@@ -934,16 +938,114 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         """
         return self._persistence_key or self.id
 
+    def _warn_if_locked_out(self) -> None:
+        """Warn once per class when a non-user ``user_id`` locks out its author.
+
+        ``user_id`` names the view's owner, and the framework reads it for
+        access control, session derivation, and instance scoping. An id that
+        addresses something other than a Discord user is read the same way,
+        and the access check then measures every clicker against a value none
+        of them can match.
+
+        Two conditions have to agree before this says anything, because either
+        one alone describes working code. Naming an owner who is not the
+        clicker is supported (the game examples hand the challenger ownership
+        from the opponent's Accept click, and an admin who posts a panel for
+        somebody else is doing the same thing on purpose), so a locked-out
+        author proves nothing by itself. And an application's own identifier is
+        inert until something reads it, so an id that fails
+        :func:`~cascadeui.utils.is_snowflake` proves nothing either. Together
+        they describe one thing only: an id that cannot name a Discord user,
+        sitting where the access check reads it, locking out the author.
+
+        The pairing leaves one shape quiet. An id that is not a snowflake still
+        keys the instance index, so a view that sets ``instance_limit`` and
+        admits its author through ``allowed_users`` scopes every user onto one
+        key while this stays silent. That shape surfaces on its own: under the
+        default ``instance_policy`` the second user to open the view replaces
+        the first.
+
+        Two reasons this runs from the send pipeline and nowhere else.
+        ``allowed_users`` is conventionally assigned after ``super().__init__()``
+        returns, so the question has no answer at the construction site. And
+        ``_navigate_to`` supplies ``user_id`` as an explicit kwarg, which makes
+        every pushed child of a divergent-owner parent look explicit too:
+        checking there would warn once per class all the way down the nav tree.
+        The root view answers for itself at its own send; its children inherit
+        the owner and stay quiet.
+        """
+        if not self._explicit_user_id:
+            return
+        if self.interaction is None or self.user_id is None:
+            return
+        if is_snowflake(self.user_id):
+            return
+        author = self.interaction.user.id
+        if author == self.user_id:
+            return
+
+        # Mirrors interaction_check's own order: allowed_users overrides
+        # owner_only, so the branch that rejects is the one to name.
+        if self.allowed_users is not None:
+            blocker = "allowed_users does not include them"
+            locked_out = author not in self.allowed_users
+        elif self.owner_only:
+            blocker = "owner_only admits only user_id"
+            locked_out = True
+        else:
+            return
+        if not locked_out:
+            return
+
+        cls_name = type(self).__qualname__
+        if cls_name in _user_id_lock_out_warned:
+            return
+        _user_id_lock_out_warned.add(cls_name)
+        logger.warning(
+            f"{cls_name} was built by user {author} with user_id={self.user_id}, "
+            f"which is not a Discord ID, and {author} cannot interact with the "
+            f"result ({blocker}). user_id names the view's owner and is read for "
+            f"access control, session identity, and instance scoping. Give "
+            f"application data a kwarg name of its own."
+        )
+
     def _build_selector(self):
         """Build a selector function if the subclass overrides state_selector.
 
         Returns None if state_selector is not overridden (base implementation),
         which means the subscriber receives all matching notifications.
+
+        The view's theme rides along with whatever the subclass selects. A
+        theme is a render input that appears in no view's data, so a selector
+        tracking content alone never sees a theme change and paints on with a
+        stale accent. A fixed theme yields a constant key and notifies no more
+        often than before; a view that sets its own colors rebuilds once and
+        stops at the render hash, shipping no edit.
         """
         # Only use a selector if the subclass actually overrides state_selector
         if type(self).state_selector is not _StatefulMixin.state_selector:
-            return lambda state: self.state_selector(state)
+            return lambda state: (self.state_selector(state), self._theme_key())
         return None
+
+    def _theme_key(self):
+        """Identity of the theme this view renders with now, or None.
+
+        ``get_theme`` is a render hook and takes no state argument, so a
+        dynamic override reads the live store. That holds here because the
+        store evaluates selectors against ``self.state`` itself, making the
+        live read and the selector's argument the same object. A raising
+        override degrades to None rather than poisoning the comparison.
+
+        The name, not the ``Theme``: ``get_theme`` falls back to a bare
+        ``Theme("fallback")`` built on each call, and the class defines no
+        ``__eq__``, so comparing objects reports a change on every dispatch
+        for any view without a registered theme.
+        """
+        try:
+            theme = self.get_theme()
+        except Exception:
+            return None
+        return getattr(theme, "name", None)
 
     def state_selector(self, state):
         """Extract the state slice this view cares about.
@@ -1013,6 +1115,11 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             The sent ``discord.Message`` on success, or ``None`` when a
             policy gate blocked the send.
         """
+        # Diagnostics only, and cheap: the subclass __init__ has returned by
+        # now, so allowed_users exists and the reserved-user_id question can
+        # finally be answered. Never blocks the send.
+        self._warn_if_locked_out()
+
         # -- Stage 0: pre-send gate --
         # on_pre_send() is the public veto hook: a permission or data check
         # that runs FIRST, before any preload, placement walk, state
@@ -1514,7 +1621,9 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 ):
                     continue
                 callback = getattr(item, "original_callback", None)
-                callback_name = callback.__qualname__ if callback else "none"
+                # A partial or any other callable object carries no
+                # __qualname__, and this runs inside every build_ui.
+                callback_name = getattr(callback, "__qualname__", None) or "none"
                 label = getattr(item, "label", "") or ""
                 content_key = f"{callback_name}:{label}"
                 entries.append((item, content_key, container_idx, pos))
@@ -1789,6 +1898,116 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         """
         return True
 
+    # Subclass config: the rebuild this view supplies for its own navigation
+    # edits, used whenever the caller passes no rebuild= of its own.
+    #
+    # It exists because the two component versions disagree about what an
+    # edit needs. A V2 view IS its component tree, so swapping view= is the
+    # whole render and the default None is correct. A V1 view's content lives
+    # in an embed the edit must carry, and pop() has no rebuild to pass (the
+    # back button is library code with nothing to hand it). So a V1 view that
+    # renders an embed names its own::
+    #
+    #     class Hub(StatefulView):
+    #         nav_rebuild = staticmethod(lambda v: {"embed": v.build_embed()})
+    #
+    # A callable taking the destination view; a returned dict splats into the
+    # edit. Wrap it in staticmethod() -- a bare lambda on a class body would
+    # bind as a method and receive self. An explicit rebuild= always wins,
+    # matching the class-attribute-then-argument precedence the policy
+    # attributes use.
+    nav_rebuild: ClassVar[Optional[Callable]] = None
+
+    def get_nav_state(self) -> dict:
+        """Return the view state that should survive a :meth:`pop`.
+
+        ``pop`` does not restore the parent object -- it reconstructs one
+        from the keyword arguments captured at construction and re-runs
+        :meth:`on_load`. Data is therefore fresh, but anything the view
+        selected *since* construction is not a constructor kwarg and reverts
+        to its default: the page a user paged to, the tab they opened, the
+        tier they picked. The failure is quiet and lands far from its cause,
+        because the rebuilt view renders its defaults without complaint.
+
+        Override to name what should carry across. ``push`` captures this on
+        the view being pushed away from, and the matching :meth:`pop` hands
+        it back to :meth:`restore_nav_state` on the reconstruction, before
+        ``on_load`` runs::
+
+            def get_nav_state(self):
+                return {"severity": self._severity}
+
+            def restore_nav_state(self, state):
+                self._severity = state.get("severity", self._severity)
+
+        The returned mapping is held on the navigation stack and never
+        serialized, so it may carry live objects. It lives as long as the
+        stack entry does.
+
+        This is for view-local selection state. Data genuinely shared
+        *between* a parent and its child belongs in ``shared_data`` (via
+        ``update_session``), which lives on the session and already outlives
+        both views.
+
+        Default returns an empty mapping, so a view that needs none of this
+        pays nothing.
+        """
+        return {}
+
+    def restore_nav_state(self, state: dict) -> None:
+        """Reapply the state captured by :meth:`get_nav_state`.
+
+        Called on a view reconstructed by :meth:`pop`, after ``__init__`` and
+        before :meth:`on_load`, so a preload reads the restored selection
+        rather than the constructor's default. Receives whatever
+        ``get_nav_state`` returned at push time (an empty mapping when the
+        view did not override it).
+
+        Read defensively -- treat every key as optional. The stack entry was
+        written by an earlier version of this view, and a key the class no
+        longer sets is the caller's to tolerate.
+
+        Args:
+            state: The mapping captured at push time.
+        """
+        return
+
+    def _capture_nav_state(self) -> dict:
+        """Run ``get_nav_state``, degrading to an empty mapping on failure.
+
+        A broken override costs the restore, never the navigation: the user
+        still reaches the view they clicked toward, and lands on the
+        constructor's defaults rather than on an error.
+        """
+        try:
+            state = self.get_nav_state()
+        except Exception as exc:
+            logger.warning(f"get_nav_state raised in {type(self).__name__}: {exc}")
+            return {}
+        if state is None:
+            return {}
+        if not isinstance(state, dict):
+            logger.warning(
+                f"get_nav_state in {type(self).__name__} returned "
+                f"{type(state).__name__}, expected dict; nav state discarded"
+            )
+            return {}
+        return state
+
+    def _apply_nav_state(self, state: dict) -> None:
+        """Run ``restore_nav_state``, swallowing a raising override.
+
+        Same containment as :meth:`_capture_nav_state`: a failed restore
+        leaves the view on its defaults instead of stranding the user
+        mid-navigation with no way back.
+        """
+        if not state:
+            return
+        try:
+            self.restore_nav_state(state)
+        except Exception as exc:
+            logger.warning(f"restore_nav_state raised in {type(self).__name__}: {exc}")
+
     async def on_load(self) -> None:
         """Async data preload and tree rebuild before the view is displayed.
 
@@ -1878,16 +2097,27 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         value of ``None`` (the V2 idiom: mutate the component tree, return
         nothing) calls ``refresh()`` with no extra kwargs.
 
+        A view with no ``build_ui`` still refreshes. Its tree is composed
+        elsewhere (in ``__init__``, or by a rebuild method such as a tab
+        switch or a wizard step advance), so the already-composed tree is
+        what ships. This is what a throttled refresh depends on: the
+        deferred edit re-enters this method at the cooldown boundary, and
+        returning without an edit would drop it. The render-hash
+        short-circuit in :meth:`refresh` makes the call free when the tree
+        is unchanged.
+
         Args:
             state: The current application state.
         """
         build = getattr(self, "build_ui", None)
+        kwargs = {}
         if build is not None:
             result = build()
             if inspect.isawaitable(result):
                 result = await result
-            kwargs = result if isinstance(result, dict) else {}
-            await self.refresh(**kwargs)
+            if isinstance(result, dict):
+                kwargs = result
+        await self.refresh(**kwargs)
 
     async def reload(self, **kwargs) -> None:
         """Re-run :meth:`on_load`, then edit the message to show the result.
@@ -1909,13 +2139,16 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         consumed before ``super().reload()`` whose effect is not already in
         pre-gate view state is otherwise dropped when the reload defers.
         """
+        # reload() never takes the acting waiver. Its gate throttles the
+        # on_load fetch, not just the edit, so waiving it for interaction-
+        # driven reloads would turn a manual refresh button into an
+        # unbounded query against the caller's data source.
         now = time.monotonic()
-        wait = self._refresh_not_before - now
+        wait = self._throttle_until() - now
         if wait > 0:
             self._reload_pending = True
             self._pending_reload_kwargs = kwargs
-            if self._deferred_refresh_task is None or self._deferred_refresh_task.done():
-                self._deferred_refresh_task = self.create_task(self._deferred_refresh(wait))
+            self._queue_deferred_refresh(wait)
             return
         await self._run_on_load()
         await self.refresh()
@@ -1943,13 +2176,29 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         if not self._message:
             return
 
+        # Is this edit the direct answer to a click on this view's own
+        # message? Resolved before the gate, because the answer decides
+        # which windows apply. Deliberately broader than the fast-path test
+        # below: an already-acked slot (the auto-defer timer beat the
+        # callback) still means a user is waiting on this edit, and only
+        # changes which endpoint ships it.
+        interaction = _CURRENT_INTERACTION.get()
+        acting = (
+            interaction is not None
+            and interaction.type == discord.InteractionType.component
+            and interaction.message is not None
+            and interaction.message.id == self._message.id
+        )
+
         # Throttle gate. Checked before the digest + edit path so a view
         # in cooldown costs one clock read, not a digest hash + REST call.
+        # An acting edit waives the cooldown but not the rate-limit window
+        # -- a page turn should not queue behind background pacing, but no
+        # edit outruns a 429.
         now = time.monotonic()
-        wait = self._refresh_not_before - now
+        wait = self._throttle_until(acting=acting) - now
         if wait > 0:
-            if self._deferred_refresh_task is None or self._deferred_refresh_task.done():
-                self._deferred_refresh_task = self.create_task(self._deferred_refresh(wait))
+            self._queue_deferred_refresh(wait)
             return
 
         store = self.state_store
@@ -2021,15 +2270,11 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             # in discord.py, so cancellation leaves the interaction "not
             # done" and the fall-through paths behave as if the fast path
             # was never attempted.
-            interaction = _CURRENT_INTERACTION.get()
-            acting = (
-                interaction is not None
-                and interaction.type == discord.InteractionType.component
-                and interaction.message is not None
-                and interaction.message.id == self._message.id
-                and not interaction.response.is_done()
-            )
-            if acting and not self._ephemeral:
+            # ``acting`` is resolved above the throttle gate. The fast path
+            # needs one condition beyond it: the response slot must still be
+            # open, since the edit rides the ack packet.
+            slot_open = acting and not interaction.response.is_done()
+            if slot_open and not self._ephemeral:
                 fast_path_timeout = max(0.5, self.auto_defer_delay - 1.0)
                 try:
                     await asyncio.wait_for(
@@ -2039,7 +2284,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     self._last_tree_digest = self._compute_tree_digest()
                     if perf_on:
                         store._record_edit()
-                    self._stamp_cooldown()
+                    self._stamp_cooldown(acting=acting)
                     return
                 except asyncio.TimeoutError:
                     logger.debug(
@@ -2073,7 +2318,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     # channel path to ship the edit (no ack-budget concern,
                     # unlike the cancelled-fast-path TimeoutError case above).
                     pass
-                except discord.HTTPException as e:
+                except (discord.HTTPException, discord.RateLimited) as e:
                     if self._handle_rate_limit(e):
                         return
                     # Any other HTTP error falls through to the channel path
@@ -2103,7 +2348,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     self._last_tree_digest = self._compute_tree_digest()
                     if perf_on:
                         store._record_edit()
-                    self._stamp_cooldown()
+                    self._stamp_cooldown(acting=acting)
                     return
                 except asyncio.TimeoutError:
                     logger.warning(
@@ -2112,7 +2357,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     )
                     self._last_tree_digest = None
                     return
-                except discord.HTTPException as e:
+                except (discord.HTTPException, discord.RateLimited) as e:
                     if self._handle_rate_limit(e):
                         return
                     # Token expired (15-min lifetime) -- fall through to channel endpoint
@@ -2123,7 +2368,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 self._last_tree_digest = self._compute_tree_digest()
                 if perf_on:
                     store._record_edit()
-                self._stamp_cooldown()
+                self._stamp_cooldown(acting=acting)
             except discord.NotFound:
                 # The message was deleted out from under the view (admin
                 # delete, purge, channel delete) and this edit just observed
@@ -2147,7 +2392,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     f"the next refresh re-ships."
                 )
                 self._last_tree_digest = None
-            except discord.HTTPException as e:
+            except (discord.HTTPException, discord.RateLimited) as e:
                 if not self._handle_rate_limit(e):
                     raise
         finally:
@@ -2158,23 +2403,116 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                         "view_class": type(self).__name__,
                         "refresh_ms": (time.perf_counter() - t0) * 1000,
                         "skipped": skipped,
-                        "timestamp": datetime.now().isoformat(),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
                     }
                 )
 
-    def _handle_rate_limit(self, error: "discord.HTTPException") -> bool:
-        """Detect a 429 response and arm the reactive backoff window.
+    def _handle_rate_limit(self, error: BaseException) -> bool:
+        """Detect a rate-limit and arm the reactive backoff window.
 
         Returns ``True`` when ``error`` is a rate-limit and the next-allowed
         timestamp has been stamped (caller should swallow the exception).
         Returns ``False`` for any other HTTP error (caller should re-raise
         or handle per its own contract).
+
+        Two exception types reach here, and only one of them carries the
+        delay as an attribute. ``discord.RateLimited`` exposes
+        ``retry_after`` directly. It appears only when the client sets
+        ``max_ratelimit_timeout``, and from either side of the request: the
+        bucket can predict the wait is too long and refuse to send, or a real
+        429 can come back asking for longer than the ceiling allows. Either
+        way the delay it carries is authoritative. It subclasses
+        ``DiscordException`` rather than ``HTTPException``, so every seam
+        that calls this names it explicitly in its ``except``.
+
+        A 429 ``HTTPException`` carries no ``retry_after`` at all --
+        discord.py's parser keeps only ``code`` and ``message`` from the
+        body -- so the delay is read from the ``Retry-After`` response
+        header instead.
+
+        Reaching this path at all narrows what the 429 can be, and the
+        answer is not "the view is busy" -- it is "the bot is banned".
+        discord.py absorbs and retries every ordinary rate-limit itself, and
+        raises only when the reply carries no ``Via`` header: its own test
+        for a request Cloudflare blocked before Discord saw it. The window
+        armed here therefore paces a bot that cannot reach Discord at all,
+        not one that is merely being told to slow down. A header-less ban
+        falls back to ``_CLOUDFLARE_BAN_BACKOFF``, which explains why that
+        value is minutes-scale and why no interactive latency rides on it.
         """
+        if isinstance(error, discord.RateLimited):
+            self._ratelimit_not_before = time.monotonic() + error.retry_after
+            self._schedule_backoff_retry()
+            return True
         if getattr(error, "status", None) != 429:
             return False
-        retry = getattr(error, "retry_after", 1.0)
-        self._refresh_not_before = time.monotonic() + retry
+        headers = getattr(getattr(error, "response", None), "headers", None) or {}
+        try:
+            retry = max(0.0, float(headers.get("Retry-After", _CLOUDFLARE_BAN_BACKOFF)))
+        except (TypeError, ValueError):
+            retry = _CLOUDFLARE_BAN_BACKOFF
+        self._ratelimit_not_before = time.monotonic() + retry
+        self._schedule_backoff_retry()
         return True
+
+    def _schedule_backoff_retry(self) -> None:
+        """Queue the edit this rate-limit just discarded to ship at the boundary.
+
+        Every seam that catches a 429 stamps the window and returns, so the
+        edit in flight is dropped. Most views live through that: their next
+        state notification renders whatever is current and the loss is
+        invisible. One view does not. ``_arm_refresh_button`` sets
+        ``_refresh_armed`` *before* its edit, and that flag then drops every
+        notification that could repair it -- so a 429 on the arming edit
+        leaves a frozen panel with no refresh button and nothing left to give
+        it one, which is exactly the outcome the 810s handoff exists to
+        prevent.
+
+        Shares the single ``_deferred_refresh_task`` slot with the cooldown
+        path, so a burst of 429s queues one retry rather than one per failure,
+        and re-entry from inside that task is allowed -- a retry that is
+        rate-limited again schedules its own successor, so the view recovers
+        whenever the block finally lifts instead of giving up after one try.
+        Automatic retry is only defensible because the window is
+        minutes-scale (see ``_CLOUDFLARE_BAN_BACKOFF``): at a one-second
+        backoff this would be a bot hammering a ban that 429s help sustain.
+        """
+        if self.is_finished() or not self._message:
+            return
+        wait = self._ratelimit_not_before - time.monotonic()
+        if wait > 0:
+            self._queue_deferred_refresh(wait)
+
+    def _queue_deferred_refresh(self, wait: float) -> None:
+        """Own the single deferred-refresh slot.
+
+        One task, whoever is asking -- the cooldown gate, the reload gate, or
+        a rate-limit that just discarded an edit -- so a burst queues one
+        retry rather than one per caller.
+
+        The running task may replace itself. Without that, a deferred render
+        blocked on re-entry finds itself registered as the pending retry,
+        declines, and then clears the slot on its way out: the edit is lost
+        with nothing left to ship it and nothing to report it. The ``finally``
+        in :meth:`_deferred_refresh` only disowns the slot when it still
+        points at the outgoing task, so a successor scheduled here survives.
+        """
+        current = self._deferred_refresh_task
+        if current is None or current.done() or current is asyncio.current_task():
+            self._deferred_refresh_task = self.create_task(self._deferred_refresh(wait))
+
+    def _throttle_until(self, *, acting: bool = False) -> float:
+        """The monotonic timestamp before which no edit should ship.
+
+        Background edits answer to both windows. An *acting* edit -- one made
+        in direct response to a user's click on this view's own message --
+        waives the library's cooldown but never Discord's rate limit: a user
+        who pressed a button is owed a response, while an endpoint returning
+        429 is owed silence regardless of who asked.
+        """
+        if acting:
+            return self._ratelimit_not_before
+        return max(self._cooldown_not_before, self._ratelimit_not_before)
 
     async def _bounded(self, coro):
         """Await a Discord HTTP coroutine under the ``edit_timeout`` ceiling.
@@ -2247,14 +2585,22 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
 
             validate_placement(self)
 
-    def _stamp_cooldown(self) -> None:
+    def _stamp_cooldown(self, *, acting: bool = False) -> None:
         """Arm the proactive cooldown window after a successful edit.
 
         No-op when ``refresh_cooldown_ms`` is ``None``, so zero-config
         views never touch the throttle state on the hot path.
+
+        Also a no-op for an *acting* edit. The window paces the library's
+        own background re-renders, and an edit a user just asked for is not
+        one of them. Stamping it here would let someone holding a button
+        push the window ahead of every background reload indefinitely,
+        starving the updates the cooldown was configured to pace.
         """
+        if acting:
+            return
         if self.refresh_cooldown_ms:
-            self._refresh_not_before = time.monotonic() + (self.refresh_cooldown_ms / 1000)
+            self._cooldown_not_before = time.monotonic() + (self.refresh_cooldown_ms / 1000)
 
     async def _deferred_refresh(self, wait: float) -> None:
         """Sleep until the cooldown boundary, then re-render.
@@ -2265,12 +2611,47 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         store state). Either way the deferred edit ships what the view should
         look like *at the moment it fires*, not what it looked like when the
         cooldown kicked in.
+
+        An armed view is the exception: its tree is deliberately frozen on
+        the refresh button, so the edit ships as-is with no rebuild.
+        ``_handle_state_notification`` enforces that freeze for notifications,
+        but this path calls ``on_state_changed`` directly and would otherwise
+        walk straight past it.
+
+        The sleep re-checks the window rather than trusting the *wait* it was
+        handed, because the window can grow while this task sleeps (a 429 on
+        a concurrent edit, a background stamp). Waking into a still-active
+        window and simply re-entering :meth:`refresh` would lose the edit
+        outright: the gate finds this very task registered as the pending
+        retry, declines to schedule a replacement, and the ``finally`` below
+        then clears the last reference to it. Nothing is left to ship the
+        edit and nothing reports that.
         """
+        # A deferred render is background work by definition: whatever click
+        # spawned it has long since been acked, and its response slot is
+        # spent. ``asyncio.create_task`` copies the caller's context, so the
+        # interaction bound at scheduling time would otherwise still be
+        # readable here -- and the render would answer to it, claiming the
+        # acting waiver it is no longer owed, skipping the cooldown stamp,
+        # and editing through a response slot whose ack window has closed.
+        # Clearing it is safe: the task holds its own copy of the context,
+        # so this is invisible to the caller.
+        _CURRENT_INTERACTION.set(None)
         try:
-            await asyncio.sleep(wait)
-            if self.is_finished() or not self._message:
-                return
-            if self._reload_pending:
+            while True:
+                await asyncio.sleep(wait)
+                if self.is_finished() or not self._message:
+                    return
+                wait = self._throttle_until() - time.monotonic()
+                if wait <= 0:
+                    break
+            if self._refresh_armed:
+                # Rebuilding here would clear the refresh button, and the
+                # armed flag then drops every notification that could put it
+                # back -- the user would be left with a stale panel and no
+                # recovery path once the webhook token expires.
+                await self.refresh()
+            elif self._reload_pending:
                 self._reload_pending = False
                 kwargs = self._pending_reload_kwargs
                 self._pending_reload_kwargs = {}
@@ -2278,7 +2659,12 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             else:
                 await self.on_state_changed(self.state_store.state)
         finally:
-            self._deferred_refresh_task = None
+            # Only disown the slot if it still points at this task. The render
+            # above can be rate-limited, and that path schedules a successor
+            # into this same slot -- clearing it unconditionally would drop the
+            # replacement and leave nothing to ship the edit.
+            if self._deferred_refresh_task is asyncio.current_task():
+                self._deferred_refresh_task = None
 
     # // ========================================( Dispatch )======================================== // #
 
@@ -2993,8 +3379,11 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         build the Back+Exit footer in one call).
 
         When the destination view defines :meth:`on_load`, the restored
-        parent reloads its data automatically on pop, so the back button
-        needs no rebuild wiring.
+        parent reloads its DATA automatically on pop, so the back button
+        needs no rebuild wiring for that. Selection state is a separate
+        question: ``pop`` reconstructs the parent rather than restoring it,
+        so anything chosen after construction returns to its default unless
+        the view names it in :meth:`get_nav_state`.
 
         For ``PersistentView``/``PersistentLayoutView`` subclasses, pass
         ``custom_id`` so the button survives a restart.

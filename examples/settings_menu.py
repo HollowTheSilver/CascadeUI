@@ -104,6 +104,11 @@ def _bool_icon(value):
     return "\N{WHITE HEAVY CHECK MARK}" if value else "\N{CROSS MARK}"
 
 
+def _resolve_theme(scoped_state):
+    """Look up the theme this user selected, or ``None`` to fall back."""
+    return get_theme(_read_user_settings(scoped_state)["theme"])
+
+
 # // ========================================( Settings Hub )======================================== // #
 
 
@@ -189,9 +194,22 @@ class SettingsHubView(MenuView):
         )
         self.add_exit_button(row=1)
 
+    def get_theme(self):
+        """Resolve the per-user theme from scoped state.
+
+        Overriding ``get_theme()`` is the dynamic-theme idiom: it hands the
+        library the theme rather than looking one up privately. The library
+        reads this hook at every render seam and carries its result on the
+        view's state selector, so a theme switched from another panel
+        repaints this one even though its selector tracks only its own
+        fields. Only this hook feeds the selector: a theme resolved inside
+        ``build_embed`` reaches the embed but never triggers a repaint.
+        """
+        return _resolve_theme(self.scoped_state) or super().get_theme()
+
     def build_embed(self):
         s = _read_user_settings(self.scoped_state)
-        theme = get_theme(s["theme"]) or get_theme("default")
+        theme = self.get_theme()
 
         embed = discord.Embed(
             title="\N{GEAR} Server Settings",
@@ -294,9 +312,13 @@ class AppearanceView(StatefulView):
             )
         )
 
+    def get_theme(self):
+        """Per-user theme from scoped state, same idiom as the hub."""
+        return _resolve_theme(self.scoped_state) or super().get_theme()
+
     def build_embed(self):
         s = _read_user_settings(self.scoped_state)
-        theme = get_theme(s["theme"]) or get_theme("default")
+        theme = self.get_theme()
 
         embed = discord.Embed(
             title="\N{ARTIST PALETTE} Appearance",
@@ -426,9 +448,13 @@ class NotificationsView(StatefulView):
             )
         )
 
+    def get_theme(self):
+        """Per-user theme from scoped state, same idiom as the hub."""
+        return _resolve_theme(self.scoped_state) or super().get_theme()
+
     def build_embed(self):
         s = _read_user_settings(self.scoped_state)
-        theme = get_theme(s["theme"]) or get_theme("default")
+        theme = self.get_theme()
 
         undo_depth = self.undo_depth
         redo_depth = self.redo_depth
@@ -530,9 +556,13 @@ class LocaleView(StatefulView):
             )
         )
 
+    def get_theme(self):
+        """Per-user theme from scoped state, same idiom as the hub."""
+        return _resolve_theme(self.scoped_state) or super().get_theme()
+
     def build_embed(self):
         s = _read_user_settings(self.scoped_state)
-        theme = get_theme(s["theme"]) or get_theme("default")
+        theme = self.get_theme()
 
         embed = discord.Embed(
             title="\N{GLOBE WITH MERIDIANS} Language & Region",
@@ -591,7 +621,7 @@ class SettingsMenuExample(commands.Cog, name="settings_menu_example"):
         view = SettingsHubView(context=context)
         # send() returns None when blocked by session limiting. No-op here
         # under replace policy, but the guard is the canonical pattern.
-        if await view.send(embed=view.build_embed()) is None:
+        if await view.send() is None:
             return
 
 

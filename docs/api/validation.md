@@ -38,11 +38,11 @@ Value must be in the `allowed` list.
 
 ### `min_value(n, msg=None)`
 
-Numeric value must be at least `n`. Non-numeric values fail with a type error message.
+Numeric value must be at least `n`. Non-numeric values fail with a type error message, and `NaN` fails because it is not `>= n`.
 
 ### `max_value(n, msg=None)`
 
-Numeric value must be at most `n`. Non-numeric values fail with a type error message.
+Numeric value must be at most `n`. Non-numeric values fail with a type error message, and `NaN` fails because it is not `<= n`.
 
 ### `emoji(msg=None)`
 
@@ -68,6 +68,8 @@ Runs all validators for a single field definition.
 - `all_values` (dict): All field values (for cross-field validation)
 
 **Returns:** `List[ValidationResult]` of failed checks (empty if all pass).
+
+A blank value (`None`, or an empty or whitespace string) on a `field_def` that does not set `"required": True` returns `[]` without running any validators. `0` and `False` are values, not blanks.
 
 ### `validate_fields(values, field_defs)`
 
@@ -98,3 +100,5 @@ async def unique_name(value, field, all_values):
     exists = await db.check(value)
     return ValidationResult(not exists, "Already taken" if exists else "")
 ```
+
+The runner awaits any awaitable a validator returns: a coroutine function, an async `__call__` object, or `functools.partial` wrapping either. A validator returning anything other than a `ValidationResult` (or an awaitable of one) raises `TypeError` naming the validator and field.

@@ -188,6 +188,13 @@ class _NavigationMixin:
                     "class_name": type(self)._class_session_key(),
                     "module": self.__class__.__module__,
                     "kwargs": self._init_kwargs if self._init_kwargs else {},
+                    # Selection state the kwargs snapshot cannot carry: it was
+                    # chosen after construction. pop() hands this back to
+                    # restore_nav_state on the reconstruction. The entry is
+                    # view-local and never serialized, so live objects are fine
+                    # here. A raising override costs the restore, not the
+                    # navigation -- the user still reaches the child view.
+                    "view_state": self._capture_nav_state(),
                 }
                 new_view._nav_stack = list(self._nav_stack) + [entry]
             elif action_type == "NAVIGATION_POP":
@@ -371,6 +378,14 @@ class _NavigationMixin:
             **saved_kwargs,
         )
 
+        # Reapply the selection the parent held when it was pushed away from.
+        # The kwargs above rebuild what the parent was CONSTRUCTED with; this
+        # restores what it had SELECTED since. It runs before
+        # _settle_navigation, so on_load (and any rebuild hook) reads the
+        # restored value rather than the constructor's default.
+        if new_view is not None:
+            new_view._apply_nav_state(entry.get("view_state") or {})
+
         await self._settle_navigation(new_view, interaction, rebuild)
 
         return new_view
@@ -415,6 +430,13 @@ class _NavigationMixin:
         # below still runs for views that use it for post-construction
         # setup other than data loading.
         await new_view._run_on_load()
+
+        # Fall back to the destination's own default rebuild. pop() passes no
+        # rebuild (the back button is library code with nothing to hand it), so
+        # a V1 destination names its own edit through nav_rebuild. A V2
+        # destination leaves it None and ships components alone.
+        if rebuild is None:
+            rebuild = getattr(new_view, "nav_rebuild", None)
 
         edit_kwargs: dict = {}
         if rebuild is not None:
@@ -514,11 +536,12 @@ class _NavigationMixin:
                     f"Navigation fast path raced an ack in {type(self).__name__}; "
                     f"using the deferred edit."
                 )
-            except discord.HTTPException as e:
+            except (discord.HTTPException, discord.RateLimited) as e:
                 # 429: stamp the backoff and report failure so the navigation
                 # rolls back to the live source rather than hammering the rate
                 # limit; the user re-clicks to retry. Other transient failures
-                # fall through to the deferred path.
+                # fall through to the deferred path. RateLimited is a sibling
+                # of HTTPException, not a subclass, so it is named explicitly.
                 if self._handle_rate_limit(e):
                     return False
 

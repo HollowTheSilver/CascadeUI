@@ -116,8 +116,8 @@ Sets scoped state for the given scope type and ID.
 
 Returns a read-only `MappingProxyType` over the internal active-view
 registry (`view_id -> view instance`). The returned mapping is **live,
-not a snapshot** -- subsequent `register_view` / `unregister_view` calls
-on the store show through -- but mutation raises `TypeError`, so the
+not a snapshot** (subsequent `register_view` / `unregister_view` calls
+on the store show through), but mutation raises `TypeError`, so the
 privacy boundary stays intact.
 
 ```python
@@ -224,7 +224,7 @@ class MyBot(commands.Bot):
 - `*middlewares` -- middleware instances in the order they should appear in the dispatch chain.
 - `store` -- optional explicit store. Defaults to the global singleton from `get_store()`.
 
-**Idempotency.** `initialize` is always awaited, even when the middleware is already installed. Middlewares contract their `initialize` methods as idempotent -- subsequent calls return immediately -- so the always-await policy is safe.
+**Idempotency.** `initialize` is always awaited, even when the middleware is already installed. Middlewares contract their `initialize` methods as idempotent (subsequent calls return immediately), so the always-await policy is safe.
 
 ---
 

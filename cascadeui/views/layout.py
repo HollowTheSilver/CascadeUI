@@ -14,6 +14,21 @@ from .base import _StatefulMixin
 
 logger = logging.getLogger(__name__)
 
+# // ========================================( Helpers )======================================== // #
+
+
+def _count_nodes(item: Item) -> int:
+    """Count *item* and everything under it, the way Discord counts.
+
+    Matches discord.py's own accounting: the node itself plus every
+    descendant, including a Section's accessory. Leaf items report 1.
+    """
+    walk = getattr(item, "walk_children", None)
+    if walk is None:
+        return 1
+    return 1 + sum(1 for _ in walk())
+
+
 # // ========================================( Classes )======================================== // #
 
 
@@ -104,20 +119,32 @@ class StatefulLayoutView(_StatefulMixin, LayoutView):
         except ValueError as exc:
             if "maximum number of children exceeded" not in str(exc):
                 raise
-            count = getattr(self, "_total_children", None)
-            at = f" (already at {count} components)" if count is not None else ""
-            raise ValueError(
-                f"Invalid V2 layout: this LayoutView would exceed Discord's "
-                f"40-component limit for a single message{at}, counted "
-                f"recursively across every Container, Section, ActionRow, "
-                f"button, and text node.\n"
-                f"  Fix: trim the tree -- drop or merge content nodes (fold "
-                f"adjacent TextDisplays, remove a divider or Section "
-                f"accessory), compact the pager to prev / go-to / next + Back "
-                f"+ Exit in one ActionRow via "
-                f"PaginatedRegion.control_buttons(view, compact=True), or "
-                f"split the content across multiple messages."
-            ) from exc
+            raise ValueError(self._over_capacity_message(item)) from exc
+
+    def _over_capacity_message(self, item: Item) -> str:
+        """Explain a 40-component rejection in terms of the two counts.
+
+        Reporting only the view's own count reads as a contradiction when
+        the overflow arrives as one oversized subtree: an empty view
+        genuinely holds zero components. The size of what is being added is
+        the number that explains the rejection.
+        """
+        held = getattr(self, "_total_children", 0) or 0
+        incoming = _count_nodes(item)
+        return (
+            f"Invalid V2 layout: this LayoutView would exceed Discord's "
+            f"40-component limit for a single message. It holds {held} "
+            f"component(s) and {type(item).__name__} adds {incoming} more "
+            f"({held + incoming} > 40), counted recursively across every "
+            f"Container, Section, ActionRow, button, and text node "
+            f"(a Section's accessory counts too).\n"
+            f"  Fix: trim the tree -- drop or merge content nodes (fold "
+            f"adjacent TextDisplays, remove a divider or Section "
+            f"accessory), compact the pager to prev / go-to / next + Back "
+            f"+ Exit in one ActionRow via "
+            f"PaginatedRegion.control_buttons(view, compact=True), or "
+            f"split the content across multiple messages."
+        )
 
     def _install_refresh_button(self, button: StatefulButton) -> None:
         """V2 wraps the refresh button in an ActionRow before adding it."""

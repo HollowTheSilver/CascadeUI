@@ -4,7 +4,7 @@ on:
   push:
     branches: [main, dev]
   pull_request:
-    branches: [main]
+    branches: [main, dev]
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -22,6 +22,22 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[dev,sqlite]"
+      - run: pytest tests/ -v
+
+  # PostgresBackend needs asyncpg (the `postgres` extra) and a Docker
+  # daemon for the testcontainers fixture, so the matrix above skips it.
+  # One interpreter covers it: the backend talks to asyncpg, not to
+  # interpreter internals. Runs the whole suite because the extra also
+  # materializes PostgresBackend cases inside the parametrized suites
+  # (test_backends.py, test_backends_raw_sql.py).
+  postgres:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -e ".[dev,sqlite,postgres]"
       - run: pytest tests/ -v
 
   lint:

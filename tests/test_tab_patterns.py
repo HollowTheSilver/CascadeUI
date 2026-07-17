@@ -482,3 +482,42 @@ class TestCompositesInsideTabs:
         assert has_revealed() is False
         await view.box._toggle(_make_interaction())  # internal composite toggle
         assert has_revealed() is True  # the tab was rebuilt via _refresh_tabs
+
+
+class TestTabViewInitialRender:
+    """V1 tab content reaches the first message, not just the pop edit."""
+
+    async def test_send_ships_the_active_tab_embed(self):
+        """Tab builders are async, so only send() can put them on the message.
+
+        The tab row is added in __init__ and always ships; the embed is the
+        content. Without it the first message is a row of tab buttons over an
+        empty body, while a later pop -- which routes through
+        nav_rebuild -- renders correctly.
+        """
+
+        async def tab_a():
+            return discord.Embed(title="Tab A")
+
+        interaction = _make_interaction()
+        view = TabView(interaction=interaction, tabs={"A": tab_a, "B": tab_a})
+
+        await view.send()
+
+        embed = interaction.response.send_message.call_args.kwargs.get("embed")
+        assert embed is not None
+        assert embed.title == "Tab A"
+
+    async def test_explicit_embed_wins(self):
+        """A caller-supplied embed is not replaced by the tab builder."""
+
+        async def tab_a():
+            return discord.Embed(title="Tab A")
+
+        interaction = _make_interaction()
+        view = TabView(interaction=interaction, tabs={"A": tab_a})
+
+        await view.send(embed=discord.Embed(title="Caller"))
+
+        embed = interaction.response.send_message.call_args.kwargs.get("embed")
+        assert embed.title == "Caller"

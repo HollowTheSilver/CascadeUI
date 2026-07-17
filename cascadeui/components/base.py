@@ -26,6 +26,13 @@ class StatefulComponent:
         """Create a callback that updates state."""
         component_id = getattr(component, "custom_id", None) or str(id(component))
 
+        # Keep the caller's own function reachable. Once this returns,
+        # ``component.callback`` is the wrapper below, and every stateful
+        # component in a view shares its identity -- so anything that wants
+        # to tell two components apart by what they DO has to read through
+        # the wrapper to the function it closes over.
+        component._cascadeui_user_callback = original_callback
+
         # Pre-compute whether to pass select values to the callback.
         # When the component is a select and the callback accepts a second
         # positional parameter, component.values is passed automatically.

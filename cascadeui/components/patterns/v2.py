@@ -1198,6 +1198,19 @@ class PaginatedRegion:
     Each instance holds its own page index, so two regions can live in one
     view without sharing a cursor.
 
+    That index lives on the region, and the region is built in the host's
+    ``__init__`` -- so a ``pop`` that reconstructs the host builds a fresh
+    region on page one. Name it in the host's ``get_nav_state`` to carry it::
+
+        def get_nav_state(self):
+            return {"page": self.pager.page}
+
+        def restore_nav_state(self, state):
+            self.pager.set_page(state.get("page", 0))
+
+    The host opts in deliberately: only it knows whether returning to a
+    drill-down should resume where the user left off or start clean.
+
     The host owns the data and the per-item rendering; the region owns the
     page index, the slice math, and the navigation row. Inside the host's
     ``build_ui()`` the host sets the current item list on the region, reads
@@ -1394,9 +1407,22 @@ class PaginatedRegion:
         return self._items[start : start + self._per_page]
 
     def set_page(self, index: int) -> None:
-        """Jump to a zero-based page index, clamped to the valid range."""
-        self._page = index
-        self._clamp()
+        """Jump to a zero-based page index, clamped once the items are known.
+
+        Clamping waits while the region is empty. A host that loads its items
+        in ``on_load`` sets the page before they arrive -- ``restore_nav_state``
+        runs first, so a page carried across a ``pop`` lands here against an
+        empty list -- and clamping then would quietly rewrite the index to
+        zero, losing the page the user was on.
+
+        Nothing out of range can render regardless: the ``items`` setter
+        re-clamps on assignment, and both read paths -- ``page_items`` for
+        the content and the nav builder for the button state -- clamp before
+        they read.
+        """
+        self._page = max(0, index)
+        if self._items:
+            self._clamp()
 
     def _clamp(self) -> None:
         self._page = max(0, min(self._page, self.page_count - 1))
@@ -1466,6 +1492,12 @@ class PaginatedRegion:
         is a bare ``discord.ui.Button``, not a ``StatefulButton``, which is
         why the annotation stays the unparameterized ``List``.
         """
+        # Button state is a read of the cursor, and the cursor can be set
+        # before the items it indexes arrive (set_page defers its clamp for
+        # exactly that case). Clamp here as page_items does, so a host that
+        # builds its controls before assigning items cannot render prev/next
+        # flags and an indicator that disagree with the content.
+        self._clamp()
         total = self.page_count
         show_jump = (not compact) and total >= self.jump_threshold
         at_first = self._page == 0
@@ -1629,6 +1661,17 @@ class Collapsible:
     to its expanded label. Clicking again collapses. Each instance holds
     its own collapsed/expanded state, so two collapsibles in one view are
     independent.
+
+    That state lives on the collapsible, which the host builds in
+    ``__init__`` -- so a ``pop`` that reconstructs the host brings it back
+    collapsed. Name it in the host's ``get_nav_state`` to carry it::
+
+        def get_nav_state(self):
+            return {"open": self.picker.expanded}
+
+        def restore_nav_state(self, state):
+            if state.get("open"):
+                self.picker.expand()
 
     The collapsible owns the toggle mechanism (the boolean, the trigger,
     the rebuild) and leaves the content and the collapse policy to the

@@ -493,8 +493,8 @@ For portability across backends, use the documented subset:
 #### When raw SQL is wrong
 
 Reach for raw SQL when the namespace API genuinely cannot express what
-you need. Anything CascadeUI's UI state covers -- `persistent_views`,
-`application_slots`, `cascadeui_kv` -- should flow through the
+you need. Anything CascadeUI's UI state covers (`persistent_views`,
+`application_slots`, `cascadeui_kv`) should flow through the
 namespace API. The escape hatch is for code outside that domain.
 
 `InMemoryBackend` does not declare `Capability.RAW_SQL`; tests against
@@ -528,6 +528,9 @@ class MyBackend:
     async def row_select(self, namespace, where=None): ...
     async def row_delete(self, namespace, where): ...
     async def row_delete_where_lt(self, namespace, column, value): ...
+    # Optional. Omit it and the flush falls back to a row_upsert loop;
+    # implement it to collapse a flush into one round-trip.
+    async def row_upsert_many(self, namespace, rows, key_columns): ...
 
     # Schema metadata (Capability.SCHEMA_META)
     async def get_schema_version(self, table): ...
@@ -813,7 +816,7 @@ drives the reattach pipeline during startup:
 
 ### View identity: `user_id` and `session_id` follow the construction context
 
-What identity a persistent view carries -- and whether it has a session -- is
+What identity a persistent view carries, and whether it has a session, is
 decided by the context it is constructed with:
 
 - **An interaction or command context** (`context=ctx`) derives the invoker's
@@ -849,8 +852,8 @@ honest model: the panel belongs to the channel, not a person.
 
 ### Runtime dependencies via `on_bind`
 
-A persistent view often needs runtime handles -- a database pool, the bot
-itself, a service client -- to load its data. These cannot ride the
+A persistent view often needs runtime handles (a database pool, the bot
+itself, a service client) to load its data. These cannot ride the
 constructor: the registry row is JSON, and a pool or bot is not
 serializable. Passing one as a constructor kwarg declines the registry write
 (with a directed error naming the kwarg and pointing here), so the view would
@@ -1036,6 +1039,31 @@ Library-owned migrators run automatically during `apply_migrations` in the
 setup pipeline. A missing migrator for a required version step raises
 `PersistenceInitError`. Fresh installs skip this path entirely because
 the DDL creates tables at the current version.
+
+### Registering migrators as data
+
+The decorators above register at import time, which is the right shape when
+each migrator is a function you wrote. When they are built as data (generated
+from a table, loaded from a manifest), pass them to the middleware instead:
+
+```python
+await setup_middleware(
+    PersistenceMiddleware(
+        backend=SQLiteBackend("state.db"),
+        bot=bot,
+        migrators={
+            "schema": {("persistent_views", 1): _migrate_views_1_to_2},
+            "kwargs": {("mybot.cogs.panel.TicketPanel", 1): _migrate_panel_1_to_2},
+        },
+    )
+)
+```
+
+Both keys are optional; each maps `(name, from_version)` to an async callable.
+Registration is idempotent and runs before the migrations and rehydration that
+consume it, so re-constructing the middleware never raises a duplicate-key
+error. The two paths write to the same registry -- use whichever fits how the
+migrator was authored.
 
 ## Pruning
 

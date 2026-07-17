@@ -892,6 +892,44 @@ class TestPaginatedRegionSlicing:
         region.items = [1, 2]
         assert region.page == 0
 
+    def test_set_page_defers_clamping_until_items_arrive(self):
+        """A host that loads items in on_load sets the page before they land.
+
+        restore_nav_state runs ahead of on_load, so a page carried across a
+        pop reaches an empty region. Clamping there would rewrite it to zero
+        and lose the user's place for a list that is about to exist.
+        """
+        region = PaginatedRegion(per_page=3, items=[])
+        region.set_page(3)
+        assert region.page == 3  # held, not clamped against an empty list
+
+        region.items = list(range(10))  # on_load lands
+        assert region.page == 3
+        assert region.page_items == [9]
+
+    def test_deferred_page_still_clamps_once_the_list_is_known(self):
+        """Holding the index is not the same as trusting it."""
+        region = PaginatedRegion(per_page=3, items=[])
+        region.set_page(99)
+
+        region.items = list(range(10))
+
+        assert region.page == 3  # last real page
+
+    def test_page_items_clamps_an_out_of_range_index_on_read(self):
+        """Nothing out of range can render, even while the clamp is deferred."""
+        region = PaginatedRegion(per_page=3, items=[])
+        region.set_page(9)
+
+        assert region.page_items == []
+        assert region.page == 0  # the read corrected it
+
+    def test_set_page_rejects_negative_without_items(self):
+        """A negative index needs no item list to be wrong."""
+        region = PaginatedRegion(per_page=3, items=[])
+        region.set_page(-5)
+        assert region.page == 0
+
     def test_carousel_per_page_one(self):
         region = PaginatedRegion(per_page=1, items=["a", "b", "c"])
         assert region.page_count == 3

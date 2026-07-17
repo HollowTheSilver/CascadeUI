@@ -19,6 +19,7 @@ from cascadeui.utils.coercion import (
     coerce_snowflake_id,
     coerce_snowflake_id_set,
     coerce_snowflake_match,
+    is_snowflake,
 )
 
 # // ========================================( Helpers )======================================== // #
@@ -152,3 +153,54 @@ class TestCoerceSnowflakeMatch:
         out = coerce_snowflake_match({"role_id": "42"}, frozenset())
         assert out == {"role_id": "42"}
         assert isinstance(out["role_id"], str)
+
+
+# // ========================================( Class )======================================== // #
+
+
+class TestIsSnowflake:
+    """Separates real Discord IDs from an application's own identifiers."""
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            1239295935075582032,  # user, 2024
+            267377019096268800,  # user, 2017
+            1077911318827442236,  # application
+            86890631690977280,  # user, 2015
+        ],
+    )
+    def test_real_ids_accepted(self, value):
+        assert is_snowflake(value) is True
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            0,
+            1,
+            42,  # database row id
+            999,
+            99999,  # match id
+            1_000_000_000,  # application counter
+            1752600000,  # unix seconds
+            1752600000000,  # unix milliseconds
+        ],
+    )
+    def test_application_ids_rejected(self, value):
+        # Every one of these leaves the timestamp bits near zero, decoding to
+        # Discord's epoch day.
+        assert is_snowflake(value) is False
+
+    @pytest.mark.parametrize("value", [None, "1239295935075582032", 1.5, True, False, object()])
+    def test_non_integers_rejected(self, value):
+        # bool is an int subclass; True must not read as a snowflake.
+        assert is_snowflake(value) is False
+
+    def test_negative_and_oversized_rejected(self):
+        assert is_snowflake(-1239295935075582032) is False
+        assert is_snowflake(2**64) is False
+
+    def test_future_dated_id_rejected(self):
+        # Beyond clock skew, a timestamp Discord has not reached yet cannot
+        # name an entity that exists.
+        assert is_snowflake((2**41 - 1) << 22) is False

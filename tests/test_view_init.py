@@ -43,67 +43,147 @@ class TestSnowflakeIdCoercion:
             StatefulView(user_id="123")
 
 
-class TestUserIdDivergenceWarning:
-    """An explicit user_id kwarg that diverges from the interaction user is
-    a reserved-kwarg footgun: user_id is framework-managed and re-derived on
-    push/pop. Construction warns once per class and names the fix.
+class TestUserIdLockOutWarning:
+    """``user_id`` names the view's owner. Two conditions have to agree before
+    the warning fires: the id cannot name a Discord user, and the author it
+    locks out is the one who built the view. Either alone describes working
+    code: a game the challenger owns diverges on purpose, and an application
+    id is inert until an access check reads it.
     """
 
-    async def test_divergent_user_id_warns(self, caplog):
-        class _DivergentView(StatefulView):
-            pass
+    # A real Discord snowflake: its timestamp bits decode to 2024, so
+    # is_snowflake accepts it and the warning declines to fire.
+    REAL_ID = 1239295935075582032
+
+    @staticmethod
+    def _warn_records(caplog):
+        return [r.getMessage() for r in caplog.records if "cannot interact with" in r.getMessage()]
+
+    async def test_author_locked_out_warns(self, caplog):
+        """owner_only plus a foreign user_id locks the author out of their own view."""
+        from cascadeui.views.base import _user_id_lock_out_warned
+
+        class _LockedOut(StatefulView):
+            owner_only = True
+
+        _user_id_lock_out_warned.discard(_LockedOut.__qualname__)
+        view = _LockedOut(interaction=_make_interaction(user_id=100), user_id=999)
 
         with caplog.at_level(logging.WARNING, logger="cascadeui.views.base"):
-            _DivergentView(interaction=_make_interaction(user_id=100), user_id=999)
+            view._warn_if_locked_out()
 
-        msgs = [
-            r.getMessage()
-            for r in caplog.records
-            if "framework-managed identity kwarg" in r.getMessage()
-        ]
+        msgs = self._warn_records(caplog)
         assert msgs
         assert "user_id=999" in msgs[0]
-        assert "non-reserved kwarg" in msgs[0]
+
+    async def test_real_snowflake_owner_is_silent(self, caplog):
+        """An admin posting a panel for someone else locks themselves out on purpose."""
+        from cascadeui.views.base import _user_id_lock_out_warned
+
+        class _ForTarget(StatefulView):
+            owner_only = True
+
+        _user_id_lock_out_warned.discard(_ForTarget.__qualname__)
+        view = _ForTarget(interaction=_make_interaction(user_id=100), user_id=self.REAL_ID)
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui.views.base"):
+            view._warn_if_locked_out()
+
+        assert not self._warn_records(caplog)
+
+    async def test_divergent_owner_with_allowed_author_is_silent(self, caplog):
+        """The game shape: the challenger owns it, the opponent clicked, both may play."""
+        from cascadeui.views.base import _user_id_lock_out_warned
+
+        class _Game(StatefulView):
+            def __init__(self, *args, opponent_id, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.allowed_users = {self.user_id, opponent_id}
+
+        _user_id_lock_out_warned.discard(_Game.__qualname__)
+        view = _Game(interaction=_make_interaction(user_id=100), user_id=999, opponent_id=100)
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui.views.base"):
+            view._warn_if_locked_out()
+
+        assert not self._warn_records(caplog)
+
+    async def test_divergent_owner_without_access_control_is_silent(self, caplog):
+        """No owner_only and no allowed_users means anyone can click; nothing is wrong."""
+        from cascadeui.views.base import _user_id_lock_out_warned
+
+        class _Open(StatefulView):
+            owner_only = False
+
+        _user_id_lock_out_warned.discard(_Open.__qualname__)
+        view = _Open(interaction=_make_interaction(user_id=100), user_id=999)
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui.views.base"):
+            view._warn_if_locked_out()
+
+        assert not self._warn_records(caplog)
 
     async def test_matching_user_id_no_warning(self, caplog):
-        class _MatchView(StatefulView):
-            pass
+        class _Match(StatefulView):
+            owner_only = True
+
+        view = _Match(interaction=_make_interaction(user_id=100), user_id=100)
 
         with caplog.at_level(logging.WARNING, logger="cascadeui.views.base"):
-            _MatchView(interaction=_make_interaction(user_id=100), user_id=100)
+            view._warn_if_locked_out()
 
-        assert not [
-            r for r in caplog.records if "framework-managed identity kwarg" in r.getMessage()
-        ]
+        assert not self._warn_records(caplog)
 
     async def test_derived_user_id_no_warning(self, caplog):
-        # No explicit user_id -- derived from the interaction, no divergence.
-        class _DerivedView(StatefulView):
-            pass
+        """No explicit user_id: the author owns it by derivation, nothing to check."""
+
+        class _Derived(StatefulView):
+            owner_only = True
+
+        view = _Derived(interaction=_make_interaction(user_id=100))
 
         with caplog.at_level(logging.WARNING, logger="cascadeui.views.base"):
-            _DerivedView(interaction=_make_interaction(user_id=100))
+            view._warn_if_locked_out()
 
-        assert not [
-            r for r in caplog.records if "framework-managed identity kwarg" in r.getMessage()
-        ]
+        assert not self._warn_records(caplog)
+
+    async def test_allowed_users_branch_names_itself(self, caplog):
+        """allowed_users overrides owner_only, so it is the rule to name.
+
+        Both gates are on here. interaction_check rejects on allowed_users and
+        never reaches owner_only, so a message blaming owner_only would point at
+        the wrong line.
+        """
+        from cascadeui.views.base import _user_id_lock_out_warned
+
+        class _BothGates(StatefulView):
+            owner_only = True
+
+        _user_id_lock_out_warned.discard(_BothGates.__qualname__)
+        view = _BothGates(interaction=_make_interaction(user_id=100), user_id=999)
+        view.allowed_users = {555}
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui.views.base"):
+            view._warn_if_locked_out()
+
+        msgs = self._warn_records(caplog)
+        assert msgs
+        assert "allowed_users does not include them" in msgs[0]
+        assert "owner_only" not in msgs[0]
 
     async def test_warns_once_per_class(self, caplog):
-        # push/pop reconstruction re-injects user_id; the per-class dedupe
-        # keeps that from spamming the log on every navigation hop.
-        from cascadeui.views.base import _user_id_divergence_warned
+        from cascadeui.views.base import _user_id_lock_out_warned
 
-        class _OnceView(StatefulView):
-            pass
+        class _Once(StatefulView):
+            owner_only = True
 
-        _user_id_divergence_warned.discard(_OnceView.__qualname__)
+        _user_id_lock_out_warned.discard(_Once.__qualname__)
 
         with caplog.at_level(logging.WARNING, logger="cascadeui.views.base"):
-            _OnceView(interaction=_make_interaction(user_id=100), user_id=1)
-            _OnceView(interaction=_make_interaction(user_id=100), user_id=2)
+            _Once(interaction=_make_interaction(user_id=100), user_id=1)._warn_if_locked_out()
+            _Once(interaction=_make_interaction(user_id=100), user_id=2)._warn_if_locked_out()
 
-        msgs = [r for r in caplog.records if "framework-managed identity kwarg" in r.getMessage()]
-        assert len(msgs) == 1  # deduped to once per class
+        assert len(self._warn_records(caplog)) == 1
 
 
 class TestInitKwargs:

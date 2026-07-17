@@ -149,6 +149,11 @@ class ScoreView(StatefulLayoutView):
         return state.get("scores", {}).get(self.persistence_key)
 ```
 
+Select what the view displays and nothing more. A theme resolved through
+`get_theme()` rides the selector for you, so a panel tracking only its own
+fields still repaints when the theme changes elsewhere. See
+[Dynamic Themes](theming.md#dynamic-themes).
+
 Views unsubscribe automatically on exit or timeout.
 
 !!! warning "Read the `state` argument, not `self.state`"
@@ -191,8 +196,8 @@ interactions from other users are handled normally instead of being discarded.
 ## Application Slots
 
 An **application slot** is a named bucket under `state["application"][name]`.
-Every feature that wants a place in the state tree -- a game's fleet
-positions, a dashboard's visit counts, a wizard's in-flight step -- gets one
+Every feature that wants a place in the state tree (a game's fleet
+positions, a dashboard's visit counts, a wizard's in-flight step) gets one
 slot and owns the shape inside it. Slot ownership is claimed by the first
 write and inherited by everyone who reaches for the same name afterward.
 
@@ -399,7 +404,7 @@ across restarts.
 !!! note "Independent invocations do not share a session by default"
     Every view invocation gets its own `session_id` because the auto-derived
     identity includes a per-instance UUID suffix. Two users opening the same
-    view class -- or the same user opening it twice -- produce distinct
+    view class, or the same user opening it twice, produce distinct
     sessions with independent `shared_data`. Push/pop chains still stay on
     one session because `_navigate_to` forwards `session_id` explicitly.
     Views that want repeat-open continuity (undo history surviving
@@ -455,7 +460,7 @@ view will ever reattach to -- the data would live on as tombstones.
 
 If you want cross-view data that **does** survive restarts, reach for scoped
 state instead. Scoped slots are keyed by `user_id`, `guild_id`, or explicit
-identifiers -- all stable across restarts -- and opt into persistence via
+identifiers (all stable across restarts) and opt into persistence via
 `persistent_slots = ("scoped",)`. Two panels that need to coordinate across
 restarts subscribe to the same scoped slot; a long wizard stores its
 in-flight step in a scoped slot keyed to the user. The session layer keeps

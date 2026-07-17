@@ -93,8 +93,21 @@ theme change lands on the next refresh.
 
 All three are auto-registered on import. `"default"` is set as the default theme.
 
-| Name | Primary Color | Accent Colour | Header Emoji |
-|------|--------------|---------------|--------------|
-| `default` | Blue | Blue | *(none)* |
-| `dark` | Purple | Purple | Moon |
-| `light` | Gold | Gold | Sun |
+| Name | Import | Primary Color | Accent Colour | Header Emoji |
+|------|--------|--------------|---------------|--------------|
+| `default` | `default_theme` | Blue | Blue | *(none)* |
+| `dark` | `dark_theme` | Purple | Purple | Moon |
+| `light` | `light_theme` | Gold | Gold | Sun |
+
+The two columns are not interchangeable. The name is a string and is what
+`get_theme()` and `set_default_theme()` take; the import is the `Theme` object
+and is what a view's `theme=` kwarg or class-level `theme` attribute takes.
+
+```python
+from cascadeui import dark_theme, set_default_theme
+
+set_default_theme("dark")           # by name
+
+class Panel(StatefulLayoutView):
+    theme = dark_theme              # by object
+```

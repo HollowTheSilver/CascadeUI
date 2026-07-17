@@ -360,6 +360,10 @@ construct empty. V1 `rebuild` returns a dict of edit kwargs
 built by async classmethods like `PaginatedLayoutView.from_data` come
 fully populated -- omit `rebuild` entirely.
 
+Omitting `rebuild` does not skip the rebuild. The destination's own
+[`nav_rebuild`](../api/views.md#nav_rebuild) applies instead, which is how
+the V1 patterns render themselves without every call site passing one.
+
 `rebuild=` handles sync post-construction tree or embed setup. Views
 whose content comes from a database or other async source define
 [`on_load()`](#navigating-database-backed-views); the library calls it
@@ -370,15 +374,83 @@ source on navigation.
 
 - `push()` stops the current view, stacks it, and creates a new view instance
 - `pop()` stops the current view and reconstructs the previous one
-- Constructor kwargs are preserved automatically for faithful reconstruction
+- Constructor kwargs are captured automatically and replayed on that reconstruction
 - The new view inherits `session_id`, keeping navigation within one session
+
+### What a Pop Restores, and What It Does Not
+
+`pop()` does not hand back the object you left. It builds a **new** one from
+the keyword arguments the original was constructed with, then re-runs
+`on_load()`. So the data is fresh and the constructor arguments are intact --
+but anything the view *selected* since construction was never an argument, and
+a new object starts at its defaults.
+
+That distinction is quiet. The rebuilt view renders its defaults without
+complaint, and the write that follows lands somewhere the user never chose:
+
+```python
+class PolicyView(StatefulView):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._severity = "high"      # a default, not a kwarg
+
+    # ...the admin picks "low", drills into a sub-screen, presses Back...
+    # ...and the rebuilt view is editing "high" again.
+```
+
+Three tools carry state across that boundary. Pick by what the state *is*:
+
+| The state | The tool |
+|-----------|----------|
+| Something this view selected (a page, a tab, a tier) | `get_nav_state()` / `restore_nav_state()` |
+| Something the parent and child both read | `shared_data` via `update_session()` |
+| Post-construction setup that is not data loading | `rebuild=` on the `push()` / `pop()` call |
+
+Name what should survive and the library replays it:
+
+```python
+def get_nav_state(self):
+    return {"severity": self._severity}
+
+def restore_nav_state(self, state):
+    self._severity = state.get("severity", self._severity)
+```
+
+`restore_nav_state()` runs after `__init__` and **before** `on_load()`, so a
+preload reads the restored selection rather than the default: one fetch,
+against the right row. The mapping rides the navigation stack and is never
+serialized, so it may hold live objects.
+
+The built-in patterns already do this for their own cursors: a paginated view
+comes back on the page the user left, tabs on the tab they opened, a wizard on
+its step, and a form with the values they typed.
+
+The V2 composites stop short of that, deliberately. A `PaginatedRegion`'s page
+and a `Collapsible`'s expanded state live on the host that built them, and only
+the host knows whether returning to a drill-down should resume where the user
+left off or start clean. Name them and they ride along like anything else:
+
+```python
+def get_nav_state(self):
+    return {"page": self.pager.page}
+
+def restore_nav_state(self, state):
+    self.pager.set_page(state.get("page", 0))
+```
+
+A host that names nothing gets a region back on page one, the same state a
+fresh open shows.
+
+`shared_data` sits on the session rather than the view, so it already outlives
+both ends of a push. Reach for it when a parent and child genuinely share data,
+and for `get_nav_state()` when the state belongs to one view.
 
 ### Pushing Pre-Constructed Instances
 
 `push()` and `replace()` accept either a view class (the default form
 shown above) or a pre-constructed view instance. The instance form
-pairs with async classmethod constructors -- `PaginatedLayoutView.from_data`
-and `from_cursor` -- where the view is built before the navigation call.
+pairs with async classmethod constructors (`PaginatedLayoutView.from_data`
+and `from_cursor`) where the view is built before the navigation call.
 
 ```python
 class HubView(StatefulLayoutView):
@@ -458,9 +530,10 @@ the out-of-band counterpart for an in-view Refresh button: it runs
     Store the database handle under a kwarg the framework does not manage
     (`db=` above). The
     [reserved constructor parameters](../api/views.md#shared-constructor-parameters)
-    -- `context`, `interaction`, `message`, `state_store`, `session_id`,
-    `user_id`, `guild_id`, `parent` -- are re-derived on push/pop, so a repo
-    smuggled through one of them diverges after navigation.
+    (`context`, `interaction`, `message`, `state_store`, `session_id`,
+    `user_id`, `guild_id`, `parent`) are read for access control, session
+    derivation, and instance scoping. A repo smuggled through `user_id` is
+    read as the view's owner, and every click is gated on it.
 
 See [`examples/v2_db_navigation.py`](https://github.com/HollowTheSilver/CascadeUI/tree/main/examples/v2_db_navigation.py)
 for a runnable cog.
@@ -479,6 +552,24 @@ component tree from scratch. The library re-adds the back button after
 each recomposition via `_restore_navigation_artifacts`, so a view that
 combines `auto_back_button = True` with a pattern's interactive
 controls keeps both reachable across every state-driven rebuild.
+
+!!! warning "V1 views: name your own rebuild"
+
+    A V1 view's content is its embed, and the back button is library code
+    with no `rebuild=` to pass. So a plain `StatefulView` with
+    `auto_back_button = True` pops back with its own buttons above the
+    **child's** embed until it says what its edit needs:
+
+    ```python
+    class Hub(StatefulView):
+        auto_back_button = True
+        nav_rebuild = staticmethod(lambda v: {"embed": v.build_embed()})
+    ```
+
+    The built-in V1 patterns (`PaginatedView`, `TabView`, `WizardView`,
+    `FormView`, `MenuView`) already set one. V2 views need nothing: a
+    `StatefulLayoutView` *is* its component tree, so swapping `view=` is
+    the whole render.
 
 ### Push vs. Replace
 
@@ -741,7 +832,7 @@ class GameView(StatefulLayoutView):
 ```
 
 The setter coerces both `int` IDs and snowflake-shaped objects (`Member`,
-`User`, `Object`).
+`User`, `Object`) via `coerce_snowflake_id_set()`.
 
 ### Custom Access Control
 
@@ -771,8 +862,9 @@ if not joined:
     return  # Library already responded ephemerally
 ```
 
-`register_participant` is `async`, returns `bool`, accepts `int` or snowflake.
-Pass `interaction` so rejection hooks respond on the right interaction.
+`register_participant` is `async`, returns `bool`, accepts `int` or snowflake
+(coerced via `coerce_snowflake_id()`). Pass `interaction` so rejection hooks
+respond on the right interaction.
 
 ### Participant Capacity: `participant_limit`
 

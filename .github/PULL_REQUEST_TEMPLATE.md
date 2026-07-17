@@ -29,6 +29,7 @@
 - [ ] Code formatted (`black --check cascadeui/`, `isort --check cascadeui/`)
 - [ ] Documentation updated where applicable
 - [ ] API reference (`docs/api/`) updated if public surface (classes, methods, attributes) changed
+- [ ] `CHANGELOG.md` entry added under the correct section (Breaking / Added / Changed / Deprecated / Removed / Fixed / Security), unless the change is invisible to someone upgrading
 - [ ] Commit messages follow the project convention (`feat:`, `fix:`, `docs:`, etc.)
 
 ## AI disclosure

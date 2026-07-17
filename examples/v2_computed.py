@@ -264,7 +264,7 @@ class PollView(StatefulLayoutView):
 class ComputedCog(commands.Cog, name="v2_computed_example"):
     """Quick poll demonstrating @computed for memoized derived state."""
 
-    def __init__(self, bot):
+    def __init__(self, bot) -> None:
         self.bot = bot
 
     @commands.hybrid_command(name="poll", description="Open a quick poll")
@@ -283,5 +283,5 @@ class ComputedCog(commands.Cog, name="v2_computed_example"):
         await view.send()
 
 
-async def setup(bot):
-    await bot.add_cog(ComputedCog(bot))
+async def setup(bot) -> None:
+    await bot.add_cog(ComputedCog(bot=bot))

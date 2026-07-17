@@ -10,6 +10,15 @@ from cascadeui.views.layout import StatefulLayoutView
 from cascadeui.views.patterns import PaginatedLayoutView
 
 
+def _tree_text(view) -> str:
+    """Every TextDisplay in the view's tree, joined.
+
+    A page turn is only correct if the body changed, and the edit call
+    reports nothing about what the edit carried.
+    """
+    return "\n".join(item.content for item in view.walk_children() if isinstance(item, TextDisplay))
+
+
 class TestPaginatedLayoutViewInit:
     """Basic init and inheritance tests."""
 
@@ -63,10 +72,17 @@ class TestPaginatedLayoutViewNavigation:
         view._message = MagicMock()
         view._message.edit = AsyncMock()
 
+        assert "Page 1" in _tree_text(view)
+
         view.current_page = 1
         await view._update_page()
 
         view._message.edit.assert_called_once()
+        # The name promises content. Asserting the edit fired would pass on
+        # an _update_page that shipped the same tree it already had.
+        rendered = _tree_text(view)
+        assert "Page 2" in rendered
+        assert "Page 1" not in rendered
 
     async def test_update_page_rebuilds_view(self):
         interaction = _make_interaction()
@@ -80,8 +96,11 @@ class TestPaginatedLayoutViewNavigation:
         view.current_page = 1
         await view._update_page()
 
-        # View should have been rebuilt
         assert view._message.edit.called
+        # The tree is recomposed from scratch, so the old children are gone
+        # rather than mutated in place.
+        assert view.children != initial_children
+        assert "Page B" in _tree_text(view)
 
 
 class TestPaginatedLayoutViewFromData:
@@ -205,3 +224,60 @@ class TestPaginatedLayoutViewJump:
         assert "paginated_first" not in all_custom_ids
         assert "paginated_last" not in all_custom_ids
         assert "paginated_indicator" in all_custom_ids
+
+
+class TestPaginatedLayoutViewCursorRestore:
+    """Cursor mode preloads the current page through ``on_load``.
+
+    The V2 half of the contract ``TestFromCursor`` covers for V1: both
+    versions restore a page index across a ``pop`` through the shared mixin,
+    so both owe a fetch for the slot that index lands on.
+    """
+
+    @staticmethod
+    def _make_fetch(total_items, track_calls=None):
+        async def fetch(offset: int, limit: int):
+            if track_calls is not None:
+                track_calls.append((offset, limit))
+            return list(range(offset, min(offset + limit, total_items)))
+
+        return fetch
+
+    @staticmethod
+    def _formatter(chunk):
+        return TextDisplay(f"Items: {chunk}")
+
+    async def test_on_load_fetches_the_page_restored_across_a_pop(self):
+        """The restored slot is fetched and the tree recomposed around it."""
+        calls = []
+        view = PaginatedLayoutView.from_cursor(
+            self._make_fetch(40, track_calls=calls),
+            total=40,
+            per_page=4,
+            formatter=self._formatter,
+            interaction=_make_interaction(),
+        )
+        assert view.pages[7] is None
+
+        view.restore_nav_state({"current_page": 7})
+        await view.on_load()
+
+        assert calls == [(28, 4)]
+        assert isinstance(view.pages[7], TextDisplay)
+
+    async def test_on_load_is_a_no_op_for_an_already_loaded_page(self):
+        """No refetch, and no recompose, for a slot the cache already holds."""
+        calls = []
+        view = PaginatedLayoutView.from_cursor(
+            self._make_fetch(40, track_calls=calls),
+            total=40,
+            per_page=4,
+            formatter=self._formatter,
+            interaction=_make_interaction(),
+        )
+        await view._ensure_page_loaded(0)
+        calls.clear()
+
+        await view.on_load()
+
+        assert calls == []

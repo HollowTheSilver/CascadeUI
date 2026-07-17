@@ -399,4 +399,4 @@ class LobbyExample(commands.Cog, name="v2_lobby_example"):
 
 
 async def setup(bot) -> None:
-    await bot.add_cog(LobbyExample(bot))
+    await bot.add_cog(LobbyExample(bot=bot))

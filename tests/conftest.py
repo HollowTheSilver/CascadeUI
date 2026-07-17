@@ -1,7 +1,6 @@
 """Shared fixtures for CascadeUI tests."""
 
 import os
-import uuid
 
 import pytest
 
@@ -85,34 +84,7 @@ async def postgres_dsn(postgres_container):
     if not postgres_available:
         pytest.skip("asyncpg or testcontainers not installed")
 
-    import asyncpg
+    from tests._pg_helpers import postgres_test_db
 
-    admin_dsn = postgres_container.get_connection_url().replace(
-        "postgresql+psycopg2://", "postgresql://"
-    )
-    db_name = f"cascadeui_test_{uuid.uuid4().hex[:12]}"
-
-    admin = await asyncpg.connect(admin_dsn)
-    try:
-        await admin.execute(f'CREATE DATABASE "{db_name}"')
-    finally:
-        await admin.close()
-
-    # Build the per-test DSN by swapping the database segment of the URL.
-    base, _, _existing = admin_dsn.rpartition("/")
-    dsn = f"{base}/{db_name}"
-
-    try:
+    async with postgres_test_db(postgres_container) as dsn:
         yield dsn
-    finally:
-        admin = await asyncpg.connect(admin_dsn)
-        try:
-            # Force-disconnect any lingering listeners before drop.
-            await admin.execute(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                "WHERE datname = $1 AND pid <> pg_backend_pid()",
-                db_name,
-            )
-            await admin.execute(f'DROP DATABASE IF EXISTS "{db_name}"')
-        finally:
-            await admin.close()

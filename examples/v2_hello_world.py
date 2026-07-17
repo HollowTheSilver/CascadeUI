@@ -123,7 +123,7 @@ class CounterView(StatefulLayoutView):
 
 
 class HelloCog(commands.Cog):
-    def __init__(self, bot: commands.Bot):
+    def __init__(self, bot) -> None:
         self.bot = bot
 
     @commands.hybrid_command(name="hello", description="Open the counter")
@@ -141,5 +141,5 @@ class HelloCog(commands.Cog):
         await view.send()
 
 
-async def setup(bot: commands.Bot):
-    await bot.add_cog(HelloCog(bot))
+async def setup(bot) -> None:
+    await bot.add_cog(HelloCog(bot=bot))

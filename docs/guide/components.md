@@ -195,7 +195,7 @@ All five share the same contract:
 
 - `custom_id` derived from label via `TextInput._slug()`
 - Optional `validators` list auto-collected by `Modal`
-- Value write-back: `.value` or `.values` populated after submit
+- Value write-back: `.value` or `.values` populated after validators pass; a rejected submission leaves the wrapper at its pre-submit state
 - Each renders as a `discord.ui.Label` wrapping the inner input. The
   label string moves to `Label.text`; an optional `description=` kwarg
   populates `Label.description` for a secondary helper line beneath
@@ -342,7 +342,7 @@ Inside a CascadeUI view callback, use `self.open_modal()` instead of
 has already consumed the response slot. See
 [Opening Modals from Callbacks](views.md#opening-modals-from-callbacks).
 
-After submit, each input's `.value` / `.values` is populated. `modal.values_by_input` provides a dict keyed by input instance.
+After validators pass, each input's `.value` / `.values` is populated (a rejected submission leaves them untouched). `modal.values_by_input` provides a dict keyed by input instance, populated at the same point.
 
 ### Structured forms and edit-in-place
 
@@ -767,7 +767,7 @@ distinct `custom_id=` values so their components do not collide.
 !!! warning "The host owns the selection -- rebuild after `on_select`"
     `choice_row` is stateless: it reads `selected` at build time and renders
     the active option(s) from it. Your `on_select` callback must store the new
-    value and rebuild the row -- `build_ui()` then `refresh()`, or a state
+    value and rebuild the row: `build_ui()` then `refresh()`, or a state
     dispatch that triggers `on_state_changed`. Without a rebuild, the control
     snaps back to the build-time selection on the next click.
 
@@ -1098,6 +1098,10 @@ when you call `send()`.
 | `Section` must hold 1-3 children (empty) | accepts (empty) | rejects |
 | `ActionRow` must hold at least 1 child (empty) | accepts | rejects |
 | `MediaGallery` must hold 1-10 items | accepts | rejects |
+| `TextDisplay` content over 4000 characters | accepts | rejects |
+| `Button` label over 80 characters | accepts | rejects |
+| `Select` placeholder over 150 characters | accepts | rejects |
+| `SelectOption` label / value / description over 100 characters | accepts | rejects |
 | Two components share a `custom_id` | accepts | rejects (code 50035) |
 
 ### Builders are guardrails
@@ -1287,18 +1291,50 @@ Modify component behavior without changing the component:
     should use `self.respond(interaction, ...)` for any replies -- it handles
     the response/followup routing automatically.
 
-### `with_loading_state(button)`
+### `with_loading_state(component, loading_label="Loading...", loading_emoji=None)`
 
-Disables the button and changes its label to "Loading..." while the callback
-runs.
+Disables the component and swaps its label while the callback runs.
 
-### `with_confirmation(button, *, message, confirmed_message, cancelled_message)`
+### `with_confirmation(component, title="Confirm Action", message="Are you sure?", ...)`
 
-Shows a confirmation prompt before executing the callback.
+Shows an ephemeral yes/no prompt before executing the callback. Labels, styles,
+an `on_cancel` hook, and the prompt timeout are all overridable; the
+[API reference](../api/components.md) lists them.
 
-### `with_cooldown(button, *, seconds, scope="user")`
+### `with_cooldown(component, seconds=5, message=None, scope="user", key=None)`
 
-Per-user (default), per-guild, or global cooldown.
+Throttles one control for one clicker: per-user (the default), per-guild,
+per-user-per-guild, or global. This is the spam guard. `refresh_cooldown_ms`
+looks like one and is not -- it paces a view's background re-renders and exempts
+the edits a click asks for, so it would slow every viewer of a shared panel down
+without touching the clicking. See
+[Pacing a Panel vs. Guarding a Button](performance.md#pacing-a-panel-vs-guarding-a-button).
+
+```python
+def build_ui(self):
+    self.clear_items()
+    reroll = StatefulButton(label="Re-roll", callback=self._reroll)
+    with_cooldown(reroll, seconds=5, message="Wait {remaining}s.")
+    self.add_item(ActionRow(reroll))
+```
+
+Wrapping a component the build method rebuilds each render is the expected
+shape: deadlines live on the owning view, so they outlive the component they
+were recorded on. The deadline is named after the button's `custom_id` when
+you set one, and after the callback otherwise. Controls that end up sharing a
+name share a deadline: several buttons wired to one callback, or buttons built
+in a loop, whose per-item callbacks all carry the factory's name. Give those a
+`custom_id=` or an explicit `key=`.
+
+Miss it and the library says so. On a rejected click, if two or more controls
+share that defaulted name while calling different callbacks, it logs one
+warning per view class naming the count and the fix. Controls deliberately
+wired to one callback, and anything with an explicit `custom_id=` or `key=`,
+stay silent.
+
+Stacked wrappers do not change this: `with_cooldown(with_confirmation(button))`
+still reads the callback you wrote, not `with_confirmation`'s closure, so each
+control keeps its own deadline.
 
 ---
 
@@ -1308,7 +1344,7 @@ A composite component holds state across interactions and lives *inside* a view,
 
 ### `PaginatedRegion`
 
-Pages one slice of a `StatefulLayoutView`'s tree while the host renders everything else. Reach for `PaginatedLayoutView` when the page list *is* the message; reach for `PaginatedRegion` when one section of a multi-section view needs its own page index while the surrounding layout -- a header, other cards, a second list -- stays put.
+Pages one slice of a `StatefulLayoutView`'s tree while the host renders everything else. Reach for `PaginatedLayoutView` when the page list *is* the message; reach for `PaginatedRegion` when one section of a multi-section view needs its own page index while the surrounding layout (a header, other cards, a second list) stays put.
 
 !!! note "Why `PaginatedLayoutView` takes a `formatter` but `PaginatedRegion` does not"
     A `PaginatedLayoutView` owns the whole message, so it needs a `formatter` to render each page -- there is no other render hook to call. A `PaginatedRegion` lives inside a host view whose `build_ui()` or `on_load()` already renders everything, so it only slices the item list and the host renders the slice alongside the rest of the layout.

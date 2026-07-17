@@ -386,3 +386,79 @@ class TestThemeResolutionSeams:
             assert divider(large=False).spacing == SeparatorSpacing.small
         # Outside a theme context the default stays small.
         assert divider().spacing == SeparatorSpacing.small
+
+
+# // ========================================( Selector theme key )======================================== // #
+
+
+class TestSelectorCarriesTheme:
+    """A view's theme rides its state selector, so a theme change is never
+    filtered out by a selector that only tracks the view's own content."""
+
+    @staticmethod
+    def _view(selector_value, theme_name):
+        """A view whose selector ignores the theme and whose theme is dynamic.
+
+        Mirrors the shape that produced the bug: a settings sub-page tracking
+        only its own toggles, painting itself with a theme resolved from state.
+        """
+        register_theme(Theme("dusk", {"accent_colour": discord.Color.purple()}))
+        register_theme(Theme("dawn", {"accent_colour": discord.Color.gold()}))
+
+        class _V(StatefulView):
+            def state_selector(self, state):
+                return selector_value
+
+            def get_theme(self):
+                return get_theme(theme_name[0]) or super().get_theme()
+
+        return _V()
+
+    def test_theme_key_reflects_the_resolved_theme(self):
+        name = ["dusk"]
+        view = self._view("static", name)
+        assert view._theme_key() == "dusk"
+
+        name[0] = "dawn"
+        assert view._theme_key() == "dawn"
+
+    def test_selector_value_changes_when_only_the_theme_changes(self):
+        """The content half is constant; the theme half carries the change."""
+        name = ["dusk"]
+        view = self._view("static", name)
+        selector = view._build_selector()
+
+        before = selector({})
+        name[0] = "dawn"
+        after = selector({})
+
+        assert before != after
+        assert before[0] == after[0]  # content half unchanged
+        assert (before[1], after[1]) == ("dusk", "dawn")
+
+    def test_fixed_theme_view_selector_is_stable(self):
+        """A view with no dynamic theme selects the same value as before."""
+
+        class _Fixed(StatefulView):
+            def state_selector(self, state):
+                return "static"
+
+        view = _Fixed()
+        selector = view._build_selector()
+        assert selector({}) == selector({})
+
+    def test_no_selector_override_still_returns_none(self):
+        """Views without a selector stay unfiltered; the theme adds no gate."""
+        assert StatefulView()._build_selector() is None
+
+    def test_raising_get_theme_degrades_to_none(self):
+        """A broken override must not poison the comparison."""
+
+        class _Broken(StatefulView):
+            def state_selector(self, state):
+                return "static"
+
+            def get_theme(self):
+                raise RuntimeError("boom")
+
+        assert _Broken()._theme_key() is None

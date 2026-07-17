@@ -90,6 +90,7 @@ from cascadeui import (
     progress_bar,
     read_slot,
     stats_card,
+    with_cooldown,
 )
 
 logger = logging.getLogger(__name__)
@@ -1252,13 +1253,6 @@ class MyShipsView(StatefulLayoutView):
     auto_refresh_ephemeral = True
     refresh_button_label = "Refresh"
 
-    # Spam-clicking Regenerate during setup can ship 5+ message edits per
-    # second to the same channel, which Discord rate-limits at the channel
-    # level. A 250 ms proactive cooldown caps the edit rate at ~4/sec; the
-    # deferred refresh re-enters on_state_changed at fire time so the user
-    # always sees the LATEST fleet, never an interim flicker.
-    refresh_cooldown_ms = 250
-
     def state_selector(self, state):
         """Return the state tuple this view depends on.
 
@@ -1338,14 +1332,22 @@ class MyShipsView(StatefulLayoutView):
 
         buttons = []
         if in_setup:
-            buttons.append(
-                StatefulButton(
-                    label="Regenerate",
-                    style=discord.ButtonStyle.primary,
-                    emoji="\N{GAME DIE}",
-                    callback=self._reroll,
-                )
+            regenerate = StatefulButton(
+                label="Regenerate",
+                style=discord.ButtonStyle.primary,
+                emoji="\N{GAME DIE}",
+                callback=self._reroll,
             )
+            # Caps re-rolls at ~2/sec, per player. The deadline lives on the
+            # view, so it survives this button being rebuilt by the refresh
+            # the click triggers.
+            with_cooldown(
+                regenerate,
+                seconds=0.5,
+                scope="user",
+                message="Re-rolling too fast. Try again in {remaining}s.",
+            )
+            buttons.append(regenerate)
         buttons.append(
             StatefulButton(
                 label="Close",

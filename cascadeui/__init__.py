@@ -11,7 +11,12 @@ import logging as _logging
 
 _logging.getLogger(__name__).addHandler(_logging.NullHandler())
 
-from .components.base import DynamicPersistentButton, StatefulButton, StatefulSelect
+from .components.base import (
+    DynamicPersistentButton,
+    StatefulButton,
+    StatefulComponent,
+    StatefulSelect,
+)
 from .components.buttons import (
     DangerButton,
     LinkButton,
@@ -96,10 +101,16 @@ from .state.middleware import LoggingMiddleware, PersistenceMiddleware, UndoMidd
 from .state.singleton import get_store
 from .state.slots import access_slot, read_slot, slot_property
 from .state.store import StateStore
-from .state.types import StateData
+from .state.types import Action, StateData
 from .theming.context import get_current_theme
 from .theming.core import Theme, get_default_theme, get_theme, register_theme, set_default_theme
 from .theming.themes import dark_theme, default_theme, light_theme
+from .utils.coercion import (
+    coerce_snowflake_id,
+    coerce_snowflake_id_set,
+    coerce_snowflake_match,
+    is_snowflake,
+)
 from .utils.decorators import cascade_component, cascade_reducer
 from .utils.errors import safe_execute, with_error_boundary, with_retry
 from .utils.fetch import fetch_as_file
@@ -145,14 +156,17 @@ from .views.patterns.types import (
 from .views.persistent import PersistentLayoutView, PersistentView
 from .views.view import StatefulView
 
-# Optional backend -- only present when aiosqlite is installed
+# Optional backends -- only present when their extra is installed
 if "SQLiteBackend" in _persistence_all:
     from .persistence import SQLiteBackend  # noqa: F401
+
+if "PostgresBackend" in _persistence_all:
+    from .persistence import PostgresBackend  # noqa: F401
 
 # // ========================================( Script )======================================== // #
 
 
-__version__ = "3.5.0"
+__version__ = "3.6.0"
 
 # Export public API
 __all__ = [
@@ -196,6 +210,7 @@ __all__ = [
     "TabLayoutView",
     "WizardLayoutView",
     # Components
+    "StatefulComponent",
     "StatefulButton",
     "StatefulSelect",
     "DynamicPersistentButton",
@@ -272,6 +287,7 @@ __all__ = [
     "StateStore",
     "ActionCreators",
     "StateData",
+    "Action",
     "access_slot",
     "read_slot",
     "slot_property",
@@ -322,6 +338,10 @@ __all__ = [
     "cascade_component",
     "slugify",
     "is_emoji",
+    "is_snowflake",
+    "coerce_snowflake_id",
+    "coerce_snowflake_id_set",
+    "coerce_snowflake_match",
     "fetch_as_file",
     # DevTools
     "InspectorView",
@@ -330,3 +350,6 @@ __all__ = [
 
 if "SQLiteBackend" in _persistence_all:
     __all__.append("SQLiteBackend")
+
+if "PostgresBackend" in _persistence_all:
+    __all__.append("PostgresBackend")

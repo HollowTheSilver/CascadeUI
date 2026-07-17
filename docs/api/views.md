@@ -19,14 +19,24 @@ theme=None,            # Per-view Theme override
 Pass either `context` or `interaction` -- both extract the user, guild, and interaction for `send()`. Use `context` from prefix/hybrid commands, `interaction` from app commands or component callbacks. A bare `discord.TextChannel` has no `.author`, so passing one as `context` derives no `user_id` and no `session_id`; the view is ownerless. See [View identity](../guide/persistence.md#view-identity-user_id-and-session_id-follow-the-construction-context) for the full model.
 
 !!! warning "Reserved constructor parameters"
-    Eight constructor kwargs are framework-managed: `context`, `interaction`,
-    `message`, `state_store`, `session_id`, `user_id`, `guild_id`, and `parent`.
-    They are stripped from the captured init kwargs and re-derived on push/pop
-    reconstruction. The reconstructed view receives the framework-derived value
-    for these names, not whatever was passed at construction, so application data
-    stored under a reserved name (e.g. `user_id=target_player_id`) diverges
-    silently on the first push or pop. Use a distinct, non-reserved kwarg name
-    for application IDs.
+    Eight constructor kwargs already mean something to the library: `context`,
+    `interaction`, `message`, `state_store`, `session_id`, `user_id`,
+    `guild_id`, and `parent`. Application data under one of these names is not
+    stored, it is read: `user_id` names the view's owner, and access control,
+    session derivation, and instance scoping all consult it. An internal
+    account id passed as `user_id` turns the access check into one no clicker
+    can pass. Give application IDs a kwarg name of your own.
+
+    Naming an owner who is not the clicker is a supported shape: widen
+    `allowed_users` to whoever should be able to click. The library warns at
+    send only when both halves of the mistake are present: the id is not a
+    Discord ID, and it locks out the author who built the view.
+
+    `is_snowflake(value)` is the check behind that warning. It decodes the
+    creation timestamp packed into an integer and reports whether it falls in
+    the window real Discord IDs occupy. It confirms an id could be a Discord
+    ID, never that the user exists; call it directly to screen an untrusted
+    integer before trusting it as a `user_id`.
 
 ## Shared Methods
 
@@ -35,6 +45,8 @@ These methods are available on all view classes (V1 and V2):
 #### `send(...)`
 
 Sends the view as a message. V1 accepts `content`, `embed`, `embeds`, `file`, `files`, `ephemeral`. V2 accepts `file`, `files`, `ephemeral` (V2 sends the view as its own content, so no content/embed params). The `file` / `files` pair mirrors discord.py's `Messageable.send` signature and pairs with the V2 media builders (`gallery`, `image_section`, `file_attachment`) for `attachment://` references. See [Local file attachments](../guide/components.md#local-file-attachments).
+
+The V1 patterns (`PaginatedView`, `TabView`, `WizardView`, `FormView`, `MenuView`) supply their own content when the caller passes neither `embed` nor `content`, so `await view.send()` renders the first page, tab, step, or hub card. An explicit `embed=` or `content=` wins. See [View Patterns](../guide/patterns.md).
 
 **Return value:** the sent `discord.Message` on success, or `None` when the view was blocked before reaching Discord. Three conditions produce `None`:
 
@@ -131,9 +143,11 @@ Passing extra kwargs alongside an instance raises `TypeError` -- the instance is
 
 The Discord message edit fires on every push regardless of whether `rebuild` is supplied. `rebuild` is an optional pre-edit hook for views that need post-construction setup: V2 views with empty trees can run `v.build_ui()`, V1 views can return a dict of edit kwargs (e.g., `rebuild=lambda v: {"embed": v.build_embed()}`). Views built by async classmethods like `from_data` come fully populated and need no rebuild. Sync or async callables both work.
 
+Omitting `rebuild` does not mean no rebuild runs: the destination's own [`nav_rebuild`](#nav_rebuild) applies instead, which is how every V1 pattern renders itself on arrival. An explicit `rebuild=` wins over it.
+
 #### `pop(interaction, *, rebuild=None)`
 
-Pops the top entry from the navigation stack, reconstructs that view with its original kwargs, and returns it. Returns `None` if the stack is empty. Non-reconstructible kwargs (`context`, `interaction`, etc.) are re-supplied by the framework.
+Pops the top entry from the navigation stack, reconstructs that view with its original kwargs, and returns it. Returns `None` if the stack is empty. Non-reconstructible kwargs (`context`, `interaction`, etc.) are re-supplied by the framework. `rebuild` takes the same shape as `push(rebuild=...)` and is rarely needed, since the restored view's [`nav_rebuild`](#nav_rebuild) already names how it renders.
 
 #### `batch()`
 
@@ -206,7 +220,7 @@ Returns the view's theme (per-view override or global default).
 
 #### `await on_pre_send(interaction)` *(override)*
 
-Pre-send veto gate. Default returns `True`. The library calls it first in the send pipeline -- before `on_load()`, placement validation, instance enforcement, and the Discord call -- so a `False` return aborts the send before any of that work. An abort is clean: no message ships and no state registers, so a vetoed send leaves zero side effects. The interaction's response slot is still open, so an override can `respond()` to explain the veto; on a proceed, the slot stays available for the actual send (no forced `defer` onto the followup path). `interaction` is the triggering interaction, or `None` for a channel/context send.
+Pre-send veto gate. Default returns `True`. The library calls it first in the send pipeline (before `on_load()`, placement validation, instance enforcement, and the Discord call), so a `False` return aborts the send before any of that work. An abort is clean: no message ships and no state registers, so a vetoed send leaves zero side effects. The interaction's response slot is still open, so an override can `respond()` to explain the veto; on a proceed, the slot stays available for the actual send (no forced `defer` onto the followup path). `interaction` is the triggering interaction, or `None` for a channel/context send.
 
 ```python
 async def on_pre_send(self, interaction):
@@ -218,12 +232,49 @@ async def on_pre_send(self, interaction):
 
 #### `await on_load()` *(override)*
 
-Async preload hook. Default is a no-op. The library calls it automatically before the initial send (inside `send()`) and before every push/pop edit, so navigating to a child or back to a parent re-fetches its source. Override to load from a database or other async source and build the view's component tree against the result. A data-loading view fetches its own source through `on_load()` on navigation, so its push and pop calls carry no `rebuild=` argument. See [Navigating database-backed views](../guide/views.md#navigating-database-backed-views).
+Async preload hook. The default is a no-op on `StatefulView` and `StatefulLayoutView`, but several built-in patterns override it: `TabLayoutView`, `WizardLayoutView`, and `LeaderboardLayoutView` build their content here, and `PaginatedView` / `PaginatedLayoutView` fetch the current page in cursor mode. A subclass of any of those calls `super().on_load()` before its own work, or it loses what the base does and renders its controls above nothing. The library calls the hook automatically before the initial send (inside `send()`) and before every push/pop edit, so navigating to a child or back to a parent re-fetches its source. Override to load from a database or other async source and build the view's component tree against the result. A data-loading view fetches its own source through `on_load()` on navigation, so its push and pop calls carry no `rebuild=` argument. See [Navigating database-backed views](../guide/views.md#navigating-database-backed-views).
 
 ```python
 async def on_load(self):
     self.rows = await self.repo.list_tasks()
     self.build_ui()
+```
+
+#### `nav_rebuild` *(class attribute)* {#nav_rebuild}
+
+The rebuild this view supplies for its own navigation edits, used whenever the caller passes no `rebuild=`. A callable taking the destination view; a returned dict splats into the edit. `None` by default.
+
+V2 views leave it `None` and should: a V2 view *is* its component tree, so swapping `view=` is the whole render. A **V1** view's content lives in its embed, and `pop()` has no `rebuild=` to pass (the back button is library code with nothing to hand it), so a V1 view that renders an embed names its own, or the pop swaps the buttons and leaves the child's content on the message:
+
+```python
+class Hub(StatefulView):
+    nav_rebuild = staticmethod(lambda v: {"embed": v.build_embed()})
+```
+
+Wrap it in `staticmethod()`; a bare lambda on a class body binds as a method and receives `self`. An explicit `rebuild=` always wins, matching the class-attribute-then-argument precedence the policy attributes use. The V1 patterns (`PaginatedView`, `TabView`, `WizardView`, `FormView`, `MenuView`) all set one already.
+
+#### `get_nav_state()` *(override)*
+
+Returns the view state that should survive a `pop()`. Default returns `{}`, so a view that needs none of this pays nothing. `push()` captures it on the view being pushed away from; the matching `pop()` hands it to `restore_nav_state()`.
+
+`pop()` reconstructs the parent from its constructor kwargs and re-runs `on_load()`: data comes back fresh, but anything the view *selected* since construction was never a kwarg and reverts to its default. Override this pair to name what should carry. The returned mapping rides the navigation stack and is never serialized, so it may hold live objects.
+
+The built-in patterns implement it for their own cursors: `PaginatedView` and `PaginatedLayoutView` carry `current_page`, `TabView`/`TabLayoutView` the active tab, `WizardView`/`WizardLayoutView` the current step (snapped to a visible one), and `FormView`/`FormLayoutView` the entered values. Call `super()` when overriding one of those. See [What a pop restores](../guide/views.md#what-a-pop-restores-and-what-it-does-not).
+
+```python
+def get_nav_state(self):
+    return {"severity": self._severity}
+```
+
+#### `restore_nav_state(state)` *(override)*
+
+Reapplies what `get_nav_state()` captured. Called on a view reconstructed by `pop()`, after `__init__` and **before** `on_load()`, so a preload reads the restored selection rather than the constructor's default. Default is a no-op.
+
+Read defensively: treat every key as optional. The stack entry was written by an earlier version of this view, and a key the class no longer sets is the caller's to tolerate. An override that raises costs the restore, not the navigation: the user still lands on the view, on its defaults.
+
+```python
+def restore_nav_state(self, state):
+    self._severity = state.get("severity", self._severity)
 ```
 
 #### `await reload()`
@@ -265,6 +316,8 @@ Concurrent calls are coalesced automatically - if a second state change arrives 
 #### `state_selector(state)` *(override)*
 
 Returns a slice of state. If the return value hasn't changed, `on_state_changed` won't fire.
+
+Select the state your view *displays*. A theme resolved through `get_theme()` is added to the comparison for you, so a theme switch re-renders even when the value you selected is unchanged: a theme is a render input that appears in no view's data, and a selector tracking content alone never sees it change. A view with a fixed theme adds no notifications. A view that resolves its theme without returning it from `get_theme()` hands the library nothing to carry. See [Dynamic Themes](../guide/theming.md#dynamic-themes).
 
 #### `await register_participant(user_id, *, interaction=None) -> bool`
 
@@ -324,7 +377,7 @@ Called before every component callback. Returns `True` to allow, `False` to bloc
 - `exit_policy` (str): What bare `exit()` calls do when no `delete_message` argument is supplied. `"disable"` (default) freezes the components in place; `"delete"` removes the message. Always overridden by an explicit `delete_message=` argument or by an `exit()` method override. Independent of `replace_policy`.
 - `auto_defer` (bool): Enable the auto-defer safety net (default: `True`).
 - `auto_defer_delay` (float): Seconds before auto-deferring (default: `2.5`).
-- `refresh_cooldown_ms` (int | None): Proactive minimum gap between successive Discord edits, in milliseconds. Refreshes arriving inside an active window are coalesced into one deferred re-render that fires at the window boundary. `None` (default) disables the proactive cooldown; the reactive 429 backoff is always active regardless. Validated as a positive int (`0` is rejected).
+- `refresh_cooldown_ms` (int | None): Proactive minimum gap between successive **background** Discord edits, in milliseconds. State-driven refreshes arriving inside an active window are coalesced into one deferred re-render that fires at the window boundary. Edits made in direct answer to a click on this view's own message are exempt and ship immediately. This paces the re-renders the library starts, and is not a spam guard. To throttle one expensive control per clicker, wrap it with `with_cooldown`. `None` (default) disables the proactive cooldown; the reactive 429 backoff is always active regardless. Validated as a positive int (`0` is rejected).
 - `serialize_interactions` (bool): Serialize rapid button clicks with an `asyncio.Lock` (default: `True`). Set to `False` for views that handle parallel callbacks.
 - `edit_timeout` (float | None): Maximum seconds any single Discord edit may stall before it is cancelled. Bounds the edits the library issues after the initial send -- state-driven refresh, exit/teardown, and navigation edits. discord.py issues edits with no total HTTP timeout, so without this a stalled connection would pin the view until the socket drops. Default `60.0` (clears realistic attachment uploads while capping a true hang). Set to `None` to disable the bound (unbounded, matching discord.py's own default). The acting-view fast path keeps its own tighter bound, which protects the 3-second ack deadline rather than guarding against a hang.
 - `session_continuity` (bool): Governs `session_id` auto-derivation polarity. Default `False` gives every invocation a per-instance UUID suffix, so repeat opens of the same view class are independent sessions with their own nav stack, undo timeline, and `shared_data`. Set to `True` on views that want repeat-open state coalescing (undo history surviving close-and-reopen, `shared_data` continuity across gestures); the opt-in collapses derivation back to the class-coalesced shape. Push/pop chains stay on one session regardless because `_navigate_to` forwards `session_id` explicitly.
@@ -345,7 +398,7 @@ V2 views ARE the message content -- `send()` takes no `content` or `embed` param
 
 #### V2-Specific Class Attributes
 
-- `validate_placement` (bool): Run the V2 placement validator before every Discord round-trip. When `True` (default), the assembled component tree is walked at three seams -- the initial `send()`, every state-driven `refresh()` after the render-hash short-circuit, and the in-place edits from `push()` / `pop()` navigation -- and any composition Discord rejects with HTTP 400 raises `ValueError` with a path string identifying the violation node and a suggested fix. Type rejections cover Container nesting, Section nesting, Section accessory not in `{Button, Thumbnail}`, standalone `Button` / `Select` / `Thumbnail` at LayoutView or Container level, Modal-only types (`Label`, `RadioGroup`, `CheckboxGroup`, `Checkbox`, `FileUpload`) anywhere in the tree, and ActionRow children outside the Button/Select union. Size rejections cover empty Containers, empty Sections, empty ActionRows, and MediaGallery items outside the 1-10 range. Set to `False` only when the validator's matrix lags a discord.py or Discord update; opting out otherwise signals an actual placement bug, prefer fixing the tree. See [V2 Placement Rules](../guide/components.md#v2-placement-rules) for the full matrix and the builders-as-guardrails framing.
+- `validate_placement` (bool): Run the V2 placement validator before every Discord round-trip. When `True` (default), the assembled component tree is walked at three seams -- the initial `send()`, every state-driven `refresh()` after the render-hash short-circuit, and the in-place edits from `push()` / `pop()` navigation -- and any composition Discord rejects with HTTP 400 raises `ValueError` with a path string identifying the violation node and a suggested fix. Type rejections cover Container nesting, Section nesting, Section accessory not in `{Button, Thumbnail}`, standalone `Button` / `Select` / `Thumbnail` at LayoutView or Container level, Modal-only types (`Label`, `RadioGroup`, `CheckboxGroup`, `Checkbox`, `FileUpload`) anywhere in the tree, and ActionRow children outside the Button/Select union. Size rejections cover empty Containers, empty Sections, empty ActionRows, MediaGallery items outside the 1-10 range, and text-length caps on TextDisplay content (4000 chars), Button label (80), Select placeholder (150), and SelectOption label / value / description (100). Set to `False` only when the validator's matrix lags a discord.py or Discord update; opting out otherwise signals an actual placement bug, prefer fixing the tree. See [V2 Placement Rules](../guide/components.md#v2-placement-rules) for the full matrix and the builders-as-guardrails framing.
 
 #### V2-Specific Methods
 
@@ -465,7 +518,7 @@ FormLayoutView(
     context=None,
     title="Form",
     fields=[
-        {"id": str, "type": "text"|"select"|"boolean", "label": str,
+        {"id": str, "type": "text"|"integer"|"float"|"date"|"boolean"|"select"|"multi_select", "label": str,
          "validators": [...], "placeholder": str, "default": Any, "required": bool},
         ...
     ],
@@ -617,6 +670,8 @@ MenuLayoutView(
 ```
 
 Each category generates an `action_section()` item that pushes to the specified view class when clicked. The `description`, `emoji`, `style`, and `rebuild` keys are optional.
+
+A category whose `"view"` is the other component version raises `TypeError` at construction rather than on the click (see [V1 and V2 Views Cannot Push/Pop Between Each Other](../guide/known-limitations.md#v1-and-v2-views-cannot-pushpop-between-each-other)).
 
 #### Class Attributes
 
@@ -820,7 +875,7 @@ MenuView(
 
 V1 equivalent of `MenuLayoutView`. Each category generates a `StatefulButton`. Override `build_embed()` for the hub card. Override `_build_extra_items()` to add controls alongside category buttons. Override `_build_category_button(category, index)` to customize individual buttons.
 
-Supports the same `menu_style`, `auto_exit_button`, and `on_category_selected` as `MenuLayoutView`.
+Supports the same `menu_style`, `auto_exit_button`, `on_category_selected`, and cross-version category validation as `MenuLayoutView`.
 
 #### `TabView`
 
@@ -848,10 +903,12 @@ Override `async def on_finish(self, interaction)` to customize finish behavior. 
 FormView(
     context=None,
     title="Form",
-    fields=[{"id": str, "type": "text"|"select"|"boolean", "label": str, "validators": [...], ...}, ...],
+    fields=[{"id": str, "type": "text"|"integer"|"float"|"date"|"boolean"|"select"|"multi_select", "label": str, "validators": [...], ...}, ...],
     **kwargs,
 )
 ```
+
+Non-text (`select`, `boolean`) fields share V1's five action rows; a field that overflows the budget raises `ValueError` at construction, naming the field. `FormLayoutView` has no equivalent row cap.
 
 #### `PaginatedView`
 

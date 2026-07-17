@@ -56,11 +56,26 @@ async def sql_backend(request, tmp_path):
     and PostgresBackend. Skips PostgresBackend when asyncpg /
     testcontainers / Docker are unavailable.
     """
+    if request.param == "PostgresBackend":
+        # Resolve the SYNC postgres_container fixture lazily so the SQLite
+        # branch never pays the container cost, then build the per-test DB
+        # inline: getfixturevalue on the async postgres_dsn fixture raises
+        # "Runner.run() cannot be called from a running event loop" under
+        # pytest-asyncio.
+        from tests._pg_helpers import postgres_test_db
+
+        container = request.getfixturevalue("postgres_container")
+        async with postgres_test_db(container) as dsn:
+            inst = PostgresBackend(dsn)
+            await inst.initialize()
+            try:
+                yield inst
+            finally:
+                await inst.close()
+        return
+
     if request.param == "SQLiteBackend":
         inst = SQLiteBackend(str(tmp_path / "raw.db"))
-    elif request.param == "PostgresBackend":
-        dsn = request.getfixturevalue("postgres_dsn")
-        inst = PostgresBackend(dsn)
     else:
         pytest.skip(f"Unknown backend: {request.param}")
     await inst.initialize()

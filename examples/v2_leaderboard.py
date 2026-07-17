@@ -279,7 +279,7 @@ class ServerLeaderboard(LeaderboardLayoutView):
 class LeaderboardCog(commands.Cog, name="v2_leaderboard_example"):
     """Server leaderboard command demonstrating ``LeaderboardLayoutView``."""
 
-    def __init__(self, bot: commands.Bot):
+    def __init__(self, bot) -> None:
         self.bot = bot
 
     @commands.hybrid_command(
@@ -315,5 +315,5 @@ class LeaderboardCog(commands.Cog, name="v2_leaderboard_example"):
         await view.send(ephemeral=True)
 
 
-async def setup(bot: commands.Bot):
-    await bot.add_cog(LeaderboardCog(bot))
+async def setup(bot) -> None:
+    await bot.add_cog(LeaderboardCog(bot=bot))

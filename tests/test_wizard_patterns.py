@@ -785,3 +785,55 @@ class TestWizardSchema:
         """
         view = WizardView(interaction=_make_interaction())
         assert view._steps == []
+
+
+class TestWizardViewInitialRender:
+    """V1 step content reaches the first message, not just the pop edit."""
+
+    async def test_send_ships_the_current_step_embed(self):
+        """Step builders are async, so only send() can put them on the message."""
+
+        async def step_one():
+            return discord.Embed(title="Step One")
+
+        interaction = _make_interaction()
+        view = WizardView(
+            interaction=interaction,
+            steps=[{"id": "one", "title": "One", "builder": step_one}],
+        )
+
+        await view.send()
+
+        embed = interaction.response.send_message.call_args.kwargs.get("embed")
+        assert embed is not None
+        assert embed.title == "Step One"
+
+    async def test_send_ships_nav_alone_for_a_builderless_step(self):
+        """A step with no builder contributes no embed and must not raise."""
+        interaction = _make_interaction()
+        view = WizardView(
+            interaction=interaction,
+            steps=[{"id": "one", "title": "One"}],
+        )
+
+        await view.send()
+
+        assert interaction.response.send_message.call_args.kwargs.get("embed") is None
+
+    async def test_refresh_ships_the_edit_for_a_builderless_step(self):
+        """The nav row still has to reach Discord when a step has no builder.
+
+        _sync_wizard_nav relabels the buttons in memory either way; skipping
+        the edit when no embed comes back leaves the cursor advanced and the
+        display on the previous step.
+        """
+        interaction = _make_interaction()
+        view = WizardView(
+            interaction=interaction,
+            steps=[{"id": "one", "title": "One"}, {"id": "two", "title": "Two"}],
+        )
+        view._message = AsyncMock()
+
+        await view._refresh_wizard()
+
+        assert view._message.edit.await_count == 1

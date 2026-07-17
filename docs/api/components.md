@@ -400,7 +400,7 @@ link_section(
 
 ### `confirm_section(text, *, on_confirm, on_cancel, confirm_label="Confirm", cancel_label="Cancel", confirm_emoji="✅", cancel_emoji="❌")`
 
-A confirm/cancel prompt. Returns a `[TextDisplay, ActionRow]` list (not a single component) -- the prompt text plus a paired success/danger button row -- so splat it into `card(...)` or add it directly to a view.
+A confirm/cancel prompt. Returns a `[TextDisplay, ActionRow]` list rather than a single component: the prompt text plus a paired success/danger button row. Splat it into `card(...)` or add it directly to a view.
 
 ```python
 card(
@@ -560,7 +560,7 @@ def build_ui(self):
     self.add_item(card("## Tasks", *rows, *self.pager.controls(self)))
 ```
 
-`controls(view)` returns `[]` on a single page and one nav `ActionRow` otherwise. A click updates the index and re-runs the host's render path -- whichever the host provides: its `build_ui()`, a `TabLayoutView`'s tab refresh, or `reload()` -- so the new slice renders before the refresh. First/last jump buttons and a go-to-page modal appear once the page count reaches `jump_threshold`. Customization mirrors `PaginatedLayoutView`: subclass and override the `{first,prev,indicator,next,last}_button_{label,emoji,style}` class attributes or `jump_threshold`.
+`controls(view)` returns `[]` on a single page and one nav `ActionRow` otherwise. A click updates the index and re-runs whichever render path the host provides: its `build_ui()`, a `TabLayoutView`'s tab refresh, or `reload()`. The new slice renders before the refresh. First/last jump buttons and a go-to-page modal appear once the page count reaches `jump_threshold`. Customization mirrors `PaginatedLayoutView`: subclass and override the `{first,prev,indicator,next,last}_button_{label,emoji,style}` class attributes or `jump_threshold`.
 
 #### `control_buttons(view, *, compact=False) -> list`
 
@@ -606,7 +606,7 @@ def build_ui(self):
 
 `render(view)` returns `[trigger]` collapsed, or the trigger plus `reveal()` (ordered by `trigger_first`) expanded. A click flips the state, fires `on_toggle`, and re-runs the host's render path (the same `build_ui`/`reload` seam `PaginatedRegion` uses). The trigger relabels/restyles via `expanded_label` / `expanded_style` / `expanded_emoji`. Two collapsibles in one view need distinct `key=` values.
 
-By default the trigger is a bare `ActionRow(button)`. Pass `summary` -- a zero-argument synchronous callable read on every render, like `reveal` -- to fuse the trigger into an `action_section` instead: a Section carrying the summary text with the trigger button as its accessory. This is the shape a card-based disclosure wants, where the Edit button sits beside its summary line rather than in a row of its own. The whole disclosure then splats into one `card(...)`:
+By default the trigger is a bare `ActionRow(button)`. Pass `summary` (a zero-argument synchronous callable read on every render, like `reveal`) to fuse the trigger into an `action_section` instead: a Section carrying the summary text with the trigger button as its accessory. This is the shape a card-based disclosure wants, where the Edit button sits beside its summary line rather than in a row of its own. The whole disclosure then splats into one `card(...)`:
 
 ```python
 self.rep = Collapsible(
@@ -670,11 +670,11 @@ bar.render(current)  # Returns string like "████████░░░░
 
 All wrappers attempt to use `interaction.response` internally, with an `is_done()` fallback for auto-defer compatibility. Wrapped callbacks should use `self.respond(interaction, ...)` for any replies -- it handles the response/followup routing automatically.
 
-### `with_loading_state(button, loading_label="Loading...", loading_emoji=None)`
+### `with_loading_state(component, loading_label="Loading...", loading_emoji=None)`
 
-Shows a loading indicator while the callback runs. The button is disabled and its label is replaced during execution.
+Shows a loading indicator while the callback runs. The component is disabled and its label is replaced during execution.
 
-### `with_confirmation(button, title="Confirm Action", message="Are you sure?", ...)`
+### `with_confirmation(component, title="Confirm Action", message="Are you sure?", ...)`
 
 Adds an ephemeral yes/no prompt before the callback runs. Additional parameters:
 
@@ -685,13 +685,37 @@ Adds an ephemeral yes/no prompt before the callback runs. Additional parameters:
 - `on_cancel` -- optional async callback on cancel
 - `timeout` -- prompt timeout in seconds (default: 60)
 
-### `with_cooldown(button, seconds=5, message=None, scope="user")`
+### `with_cooldown(component, seconds=5, message=None, scope="user", key=None)`
 
 Enforces a cooldown between clicks. Expired entries are automatically cleaned up.
 
-- `seconds` -- cooldown duration
+This is the per-user spam guard: it throttles one expensive control for one
+clicker. `refresh_cooldown_ms` is the wrong tool for that job -- it paces a
+whole view's background re-renders and exempts edits a click asked for.
+
+- `seconds` -- cooldown duration; fractional values work, and the rejection notice reports the remainder to one decimal (`0.2s`)
 - `message` -- custom message (use `{remaining}` for time left)
-- `scope` -- `"user"` (default), `"guild"`, or `"global"`
+- `scope` -- `"user"` (default), `"guild"`, `"user_guild"`, or `"global"`; the same
+  four-value grammar as `state_scope` and `instance_scope`
+- `key` -- names the deadline on the owning view. Defaults to the `custom_id`
+  when you pass one, otherwise to the wrapped callback's qualified name; both
+  are stable across rebuilds. Pass one when neither names this control alone:
+  several components wired to one callback, or callables minted per item
+  (factory closures, lambdas, partials), which all share a qualified name
+
+On a rejected click, `with_cooldown` logs one warning per view class when two
+or more controls share a defaulted key while calling different callbacks.
+Deliberate sharing and any explicit `key=` or `custom_id=` stay silent.
+
+Deadlines live on the owning view, not in the wrap call, so wrapping a component
+your build method constructs fresh each render works -- the deadline outlives the
+component it was recorded on. They last as long as the view instance: a fresh
+open, or a `pop()` that reconstructs the view, starts clean.
+
+Wrappers compose. `with_cooldown(with_confirmation(button))` keys its deadline
+on the callback you wrote, not on `with_confirmation`'s closure, so stacking
+`with_loading_state`, `with_confirmation`, and `with_cooldown` on one component
+keeps their state apart.
 
 ---
 
@@ -709,16 +733,31 @@ slugify("Tickets #1")     # "tickets_1"
 
 ### `@cascade_component(component_id=None)`
 
-Decorator for registering a component callback in the shared component registry. Pair with `get_component(component_id)` to retrieve registered callbacks.
+Decorates a view method so that calling it dispatches `COMPONENT_INTERACTION` before the body runs. The payload carries `component_id`, `view_id`, `user_id`, and `handler`. Reach for it to record an interaction a plain callback would not dispatch on its own.
 
 ```python
-from cascadeui import cascade_component, get_component
+from cascadeui import cascade_component
 
-@cascade_component("reroll")
-async def reroll_callback(interaction):
-    ...
-
-callback = get_component("reroll")
+class BoardView(StatefulLayoutView):
+    @cascade_component("reroll")
+    async def reroll(self, interaction):
+        self._board = new_board()
+        await self.refresh()
 ```
 
-When `component_id` is omitted, the decorated function's `__name__` is used.
+The decorated function is a method: it takes `self` and dispatches through the view it belongs to. When `component_id` is omitted, the function's `__name__` is used.
+
+### `register_component(name, component_class)` / `get_component(name)`
+
+The V1 composition registry. `register_component` stores a component *class* under a name; `get_component` returns that class, or `None` when the name was never registered.
+
+```python
+from cascadeui import register_component, get_component
+
+register_component("confirm_row", ConfirmationButtons)
+
+cls = get_component("confirm_row")
+cls(on_confirm=save, on_cancel=discard).add_to_view(view)
+```
+
+This registry holds classes and is unrelated to `@cascade_component`, which dispatches actions. Registering under a name that already exists replaces the entry.

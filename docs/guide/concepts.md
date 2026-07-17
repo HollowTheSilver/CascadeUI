@@ -45,8 +45,8 @@ UI. The state store is the single source of truth. To change what the user sees:
 dispatch an action, let the reducer transform state, and let the subscriber
 pipeline handle the rest.
 
-For the full details -- subscribers, selectors, scoped state, batching, and
-custom reducers for shapes that outgrow the slot model -- see the
+For the full details (subscribers, selectors, scoped state, batching, and
+custom reducers for shapes that outgrow the slot model), see the
 [State Management](state.md) guide.
 
 ---
@@ -227,7 +227,7 @@ complete list with defaults.
 | `auto_back_button` | `False` | Add a back button when pushed onto a nav stack |
 | `enable_undo` | `False` | Track undo/redo history for this view |
 | `undo_limit` | `20` | Max undo snapshots |
-| `refresh_cooldown_ms` | `None` | Proactive edit cooldown in milliseconds; refreshes during the window schedule one deferred edit and re-read store state at fire time |
+| `refresh_cooldown_ms` | `None` | Proactive cooldown in milliseconds on **background** re-renders; those arriving during the window schedule one deferred edit and re-read store state at fire time. Edits answering a click on the view's own message are exempt -- for per-user spam control on one control, use `with_cooldown` |
 | `edit_timeout` | `60.0` | Max seconds any single Discord edit (refresh, exit, navigation) may stall before being cancelled; `None` disables the bound |
 
 ### The three-tier precedence model
@@ -456,8 +456,8 @@ CascadeUI's `refresh()` prefers the acting-view fast path when possible:
 if the current component click targets the view's own message and the
 response slot is still open, the refresh ships through
 `interaction.response.edit_message()` in one HTTP round trip (ack + edit
-combined). If any gate fails -- no bound interaction, response already
-deferred, cross-view dispatch, modal submit -- `refresh()` falls through
+combined). If any gate fails (no bound interaction, response already
+deferred, cross-view dispatch, modal submit), `refresh()` falls through
 to the channel endpoint (`self._message.edit()`), which has no token
 expiry and works indefinitely. `exit()` always uses the channel endpoint,
 so it works whether or not the interaction has been responded to.
@@ -624,7 +624,7 @@ async def my_callback(self, interaction):
 
 **`self.open_modal()`** -- opens a modal dialog, with a fallback if the
 response slot is already consumed. `send_modal()` must be the first
-response to an interaction -- it cannot follow a `defer()`. Under
+response to an interaction; it cannot follow a `defer()`. Under
 `serialize_interactions`, a queued interaction may be auto-deferred before
 the callback runs, making `send_modal()` impossible. `open_modal()` checks
 `is_done()` and sends an ephemeral "please try again" fallback instead of

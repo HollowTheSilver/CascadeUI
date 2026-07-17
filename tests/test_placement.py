@@ -2,6 +2,7 @@
 
 
 import pytest
+from discord import SelectOption
 from discord.ui import (
     ActionRow,
     Button,
@@ -246,6 +247,122 @@ class TestActionRowRejections:
 
 
 # // ========================================( Negative Tests: Builders Pass Clean )======================================== // #
+
+
+class TestTextDisplaySize:
+    """TextDisplay content over Discord's 4000-char cap is caught pre-flight.
+
+    discord.py stores content as a plain string with no length check, so an
+    oversized body used to pass the validator and 400 at send. The validator
+    already enforced the parallel MediaGallery cap but skipped this one.
+    """
+
+    def test_oversized_top_level_rejected(self):
+        v = _view_with(TextDisplay("x" * 4001))
+        with pytest.raises(ValueError, match="4000-character cap"):
+            validate_placement(v)
+
+    def test_oversized_container_child_rejected(self):
+        v = _view_with(Container(TextDisplay("y" * 5000)))
+        with pytest.raises(ValueError, match="TextDisplay content"):
+            validate_placement(v)
+
+    def test_oversized_section_child_rejected(self):
+        v = _view_with(Container(Section(TextDisplay("z" * 4001), accessory=Thumbnail("u"))))
+        with pytest.raises(ValueError, match="TextDisplay content"):
+            validate_placement(v)
+
+    def test_exactly_at_cap_passes(self):
+        v = _view_with(TextDisplay("a" * 4000))
+        validate_placement(v)
+
+
+class TestButtonLabelSize:
+    """Button label over Discord's 80-char cap is caught pre-flight.
+
+    discord.py stores label as a plain string with no length check, so an
+    oversized label used to pass the validator and 400 at send. Buttons are
+    visited at two seams: ActionRow children and Section accessories.
+    """
+
+    def test_oversized_label_in_actionrow_rejected(self):
+        v = _view_with(ActionRow(Button(custom_id="b", label="L" * 81)))
+        with pytest.raises(ValueError, match="Button label is 81 characters"):
+            validate_placement(v)
+
+    def test_oversized_label_as_section_accessory_rejected(self):
+        s = Section(TextDisplay("hi"), accessory=Button(custom_id="b", label="Z" * 90))
+        v = _view_with(Container(s))
+        with pytest.raises(ValueError, match="80-character cap"):
+            validate_placement(v)
+
+    def test_exactly_at_cap_passes(self):
+        v = _view_with(ActionRow(Button(custom_id="b", label="L" * 80)))
+        validate_placement(v)
+
+
+class TestSelectPlaceholderSize:
+    """Select placeholder over Discord's 150-char cap is caught pre-flight."""
+
+    def test_oversized_placeholder_rejected(self):
+        v = _view_with(ActionRow(Select(custom_id="s", placeholder="p" * 151)))
+        with pytest.raises(ValueError, match="Select placeholder is 151 characters"):
+            validate_placement(v)
+
+    def test_exactly_at_cap_passes(self):
+        v = _view_with(ActionRow(Select(custom_id="s", placeholder="p" * 150)))
+        validate_placement(v)
+
+    def test_auto_populated_select_without_options_passes(self):
+        # UserSelect exposes no ``.options``; the option walk must not crash.
+        v = _view_with(ActionRow(UserSelect(custom_id="us", placeholder="pick")))
+        validate_placement(v)
+
+
+class TestSelectOptionTextSize:
+    """SelectOption label / value / description over Discord's 100-char cap are
+    each caught pre-flight; discord.py stores all three unchecked."""
+
+    def test_oversized_option_label_rejected(self):
+        select = Select(custom_id="s", options=[SelectOption(label="A" * 101, value="v")])
+        v = _view_with(ActionRow(select))
+        with pytest.raises(ValueError, match="SelectOption label is 101 characters"):
+            validate_placement(v)
+
+    def test_oversized_option_value_rejected(self):
+        select = Select(custom_id="s", options=[SelectOption(label="A", value="v" * 101)])
+        v = _view_with(ActionRow(select))
+        with pytest.raises(ValueError, match="SelectOption value is 101 characters"):
+            validate_placement(v)
+
+    def test_oversized_option_description_rejected(self):
+        select = Select(
+            custom_id="s",
+            options=[SelectOption(label="A", value="v", description="d" * 101)],
+        )
+        v = _view_with(ActionRow(select))
+        with pytest.raises(ValueError, match="SelectOption description is 101 characters"):
+            validate_placement(v)
+
+    def test_oversized_option_path_names_option_index(self):
+        select = Select(
+            custom_id="s",
+            options=[
+                SelectOption(label="ok", value="v0"),
+                SelectOption(label="B" * 101, value="v1"),
+            ],
+        )
+        v = _view_with(ActionRow(select))
+        with pytest.raises(ValueError, match=r"options\[1\]"):
+            validate_placement(v)
+
+    def test_all_fields_exactly_at_cap_pass(self):
+        select = Select(
+            custom_id="s",
+            options=[SelectOption(label="A" * 100, value="v" * 100, description="d" * 100)],
+        )
+        v = _view_with(ActionRow(select))
+        validate_placement(v)
 
 
 class TestBuildersPassClean:

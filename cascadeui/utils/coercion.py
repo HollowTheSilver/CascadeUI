@@ -1,9 +1,55 @@
 # // ========================================( Modules )======================================== // #
 
 
+import time
 from typing import Any, Dict, FrozenSet, Iterable, Optional, Set
 
+from discord.utils import DISCORD_EPOCH
+
+# // ========================================( Constants )======================================== // #
+
+
+# A snowflake carries its creation time in bits 63-22, counted from Discord's
+# epoch. An id whose timestamp bits decode to the epoch day itself carries no
+# timestamp at all -- those bits are effectively zero, which is what an
+# application's own counter looks like. Discord did not exist on that day, so
+# the floor rejects every such id without excluding any real one: the earliest
+# real snowflakes on record are four orders of magnitude above it.
+_SNOWFLAKE_FLOOR_MS = DISCORD_EPOCH + 86_400_000
+
+# Tolerance for clock skew between this host and Discord's id generators.
+_SNOWFLAKE_SKEW_MS = 86_400_000
+
+
 # // ========================================( Functions )======================================== // #
+
+
+def is_snowflake(value: Any) -> bool:
+    """Return whether *value* is shaped like a real Discord snowflake ID.
+
+    Decodes the creation timestamp Discord packs into bits 63-22 and reports
+    whether it lands in the window where real IDs exist: after Discord's epoch
+    day and no later than now. An application's own identifier (a database row
+    ID, a match number, a Unix timestamp) leaves those bits near zero and
+    decodes to the epoch day, so it fails.
+
+    The check is a heuristic on shape, not a lookup. It answers "could this
+    integer be a Discord ID at all", never "does this user exist". An
+    application ID large enough to land inside the window passes, and nothing
+    short of asking Discord could say otherwise.
+
+    Args:
+        value: Any value. Non-integers (and ``bool``) return ``False``.
+
+    Returns:
+        ``True`` if *value* could be a Discord snowflake, ``False`` otherwise.
+    """
+    if not isinstance(value, int) or isinstance(value, bool):
+        return False
+    if value < 0 or value.bit_length() > 64:
+        return False
+    created_ms = (value >> 22) + DISCORD_EPOCH
+    return _SNOWFLAKE_FLOOR_MS <= created_ms <= (time.time() * 1000) + _SNOWFLAKE_SKEW_MS
 
 
 def coerce_snowflake_id(value) -> Optional[int]:

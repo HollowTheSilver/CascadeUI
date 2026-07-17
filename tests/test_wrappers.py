@@ -1,20 +1,30 @@
 """Tests for component wrappers: with_loading_state, with_cooldown, with_confirmation."""
 
+import logging
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 import pytest
+from discord.ui import ActionRow
 from helpers import make_interaction
 
+from cascadeui.components.base import StatefulButton
 from cascadeui.components.wrappers import with_confirmation, with_cooldown, with_loading_state
 from cascadeui.views.base import _StatefulMixin
+from cascadeui.views.layout import StatefulLayoutView
 
 # // ========================================( Helpers )======================================== // #
 
 
 def _make_button(callback=None, label="Test", emoji=None, stateful_view=False):
     """Create a minimal mock component for wrapper tests.
+
+    ``_cascadeui_wrapped`` is seeded to a real ``set`` because a bare
+    ``MagicMock`` answers every ``getattr`` with a new mock, which would let
+    the wrappers' re-wrap guard read a truthy marker container that never
+    stores anything: the guard would silently no-op and these tests would
+    prove nothing about it.
 
     Args:
         stateful_view: When True, ``component.view`` is an ``AsyncMock`` spec'd
@@ -26,13 +36,18 @@ def _make_button(callback=None, label="Test", emoji=None, stateful_view=False):
     btn.label = label
     btn.emoji = emoji
     btn.disabled = False
+    btn._cascadeui_wrapped = set()
     if stateful_view:
         btn.view = AsyncMock(spec=_StatefulMixin)
         btn.view._message = MagicMock(id=555)
         btn.view.is_finished = MagicMock(return_value=False)
     else:
+        # A plain (non-CascadeUI) host view. Mock it, but give the cooldown
+        # store a real dict: a MagicMock would hand back a mock from
+        # setdefault and the deadline comparison would raise on it.
         btn.view = MagicMock()
         btn.view.is_finished.return_value = False
+        btn.view._cascadeui_cooldowns = {}
     return btn
 
 
@@ -460,3 +475,432 @@ class TestWithConfirmation:
 
         await cancel_btn.callback(cancel_interaction)  # must not raise
         on_cancel.assert_awaited_once()
+
+
+# // ========================================( Idempotence )======================================== // #
+
+
+class TestWrapperIdempotence:
+    """Re-wrapping a component must not stack another layer.
+
+    Every wrapper installs itself by reassigning ``component.callback``
+    around the previous one, so a build method that wraps a component
+    outliving the rebuild adds a layer per render. The nesting is unbounded
+    and grows with session length.
+
+    These use real ``StatefulButton`` instances rather than the module's
+    ``_make_button`` mock: ``getattr`` on a ``MagicMock`` auto-creates the
+    marker attribute, so the guard silently no-ops and a mock-backed test
+    proves nothing.
+    """
+
+    def _depth(self, button, wrapper_name):
+        """Count nested wrapper frames on the button's callback chain."""
+        depth, cb = 0, button.callback
+        while getattr(cb, "__closure__", None):
+            nxt = None
+            for cell in cb.__closure__:
+                inner = cell.cell_contents
+                if callable(inner) and getattr(inner, "__name__", "") == wrapper_name:
+                    nxt = inner
+            if nxt is None:
+                break
+            depth += 1
+            cb = nxt
+        return depth + 1
+
+    async def test_with_cooldown_re_wrap_does_not_nest(self):
+        button = StatefulButton(label="Fire", callback=AsyncMock())
+        for _ in range(5):
+            with_cooldown(button, seconds=5)
+        assert self._depth(button, "cooldown_callback") == 1
+
+    async def test_with_loading_state_re_wrap_does_not_nest(self):
+        button = StatefulButton(label="Fire", callback=AsyncMock())
+        for _ in range(5):
+            with_loading_state(button)
+        assert self._depth(button, "loading_callback") == 1
+
+    async def test_with_confirmation_re_wrap_demands_one_confirmation(self):
+        """Three renders used to demand three clicks of "Yes" for one action."""
+        ran = []
+
+        async def action(interaction):
+            ran.append(1)
+
+        button = StatefulButton(label="Delete", callback=action)
+        button._view = None
+        for _ in range(3):
+            with_confirmation(button, title="Sure?")
+
+        interaction = make_interaction()
+        interaction.response.is_done.return_value = False
+        interaction.original_response = AsyncMock(return_value=MagicMock())
+        await button.callback(interaction)
+
+        assert interaction.response.send_message.await_count == 1
+        prompt_view = interaction.response.send_message.call_args[1]["view"]
+        confirm = next(c for c in prompt_view.children if c.label == "Yes")
+
+        confirm_interaction = make_interaction()
+        confirm_interaction.response.edit_message = AsyncMock()
+        await confirm.callback(confirm_interaction)
+
+        assert ran == [1]  # one confirmation, one action
+
+    async def test_distinct_wrappers_still_compose(self):
+        """The guard is per-wrapper, not per-component: stacking a cooldown
+        and a confirmation on one button stays legal.
+        """
+        button = StatefulButton(label="Fire", callback=AsyncMock())
+        with_cooldown(button, seconds=5)
+        with_confirmation(button)
+        assert button._cascadeui_wrapped == {"with_cooldown", "with_confirmation"}
+
+    async def test_fresh_instances_wrap_independently(self):
+        """A rebuild that constructs a NEW component must still wrap it:
+        the marker lives on the instance, not the class.
+        """
+        first = StatefulButton(label="Fire", callback=AsyncMock())
+        second = StatefulButton(label="Fire", callback=AsyncMock())
+        with_cooldown(first, seconds=5)
+        with_cooldown(second, seconds=5)
+        assert "with_cooldown" in first._cascadeui_wrapped
+        assert "with_cooldown" in second._cascadeui_wrapped
+
+
+class TestCooldownSurvivesRebuild:
+    """Deadlines live on the owning view, so a rebuilt component keeps them.
+
+    A reactive view constructs a fresh component on every render and wraps it
+    again. Holding deadlines in the wrap call discarded the one recorded on
+    click N before click N+1 landed. Because an accepted click is what
+    triggers the rebuild, the cooldown never fired at all. It failed silently:
+    no error, no warning, simply no throttling.
+    """
+
+    def _make_panel(self, seconds=999, **wrap_kwargs):
+        ran = []
+
+        class _Panel(StatefulLayoutView):
+            async def _act(self, interaction):
+                ran.append(1)
+
+            def build_ui(self):
+                self.clear_items()
+                button = StatefulButton(label="Drift", callback=self._act, custom_id="d")
+                with_cooldown(button, seconds=seconds, **wrap_kwargs)
+                self.add_item(ActionRow(button))
+
+        view = _Panel(interaction=make_interaction())
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+        return view, ran
+
+    def _button(self, view):
+        return view.children[0].children[0]
+
+    def _click(self, user_id=42):
+        interaction = make_interaction()
+        interaction.user.id = user_id
+        interaction.guild_id = 7
+        interaction.response.is_done.return_value = False
+        return interaction
+
+    async def test_cooldown_holds_across_a_rebuild(self):
+        view, ran = self._make_panel()
+        view.build_ui()
+        first = self._button(view)
+        await first.callback(self._click())
+
+        view.build_ui()  # the accepted click triggers the reload that rebuilds
+        second = self._button(view)
+        assert first is not second
+
+        interaction = self._click()
+        await second.callback(interaction)
+
+        assert ran == [1]  # the second click was rejected
+        assert interaction.response.send_message.await_count == 1
+
+    async def test_cooldown_is_still_per_user_across_a_rebuild(self):
+        view, ran = self._make_panel(scope="user")
+        view.build_ui()
+        await self._button(view).callback(self._click(user_id=42))
+        view.build_ui()
+        await self._button(view).callback(self._click(user_id=99))
+
+        assert ran == [1, 1]  # a different clicker is unaffected
+
+    async def test_a_new_view_instance_starts_clean(self):
+        """Deadlines last for the view instance, not forever."""
+        first_view, first_ran = self._make_panel()
+        first_view.build_ui()
+        await self._button(first_view).callback(self._click())
+
+        second_view, second_ran = self._make_panel()
+        second_view.build_ui()
+        await self._button(second_view).callback(self._click())
+
+        assert second_ran == [1]
+
+    async def test_two_buttons_with_distinct_callbacks_do_not_share_a_cooldown(self):
+        """The default key must tell two ordinary buttons apart.
+
+        A StatefulButton's ``callback`` is the stateful wrapper, and every
+        stateful component in the library shares that wrapper's qualname,
+        so keying on it gave a whole view one cooldown, and clicking Approve
+        silently throttled Deny. The key has to read through to the caller's
+        own function.
+        """
+        fired = []
+
+        class _Panel(StatefulLayoutView):
+            async def _approve(self, interaction):
+                fired.append("approve")
+
+            async def _deny(self, interaction):
+                fired.append("deny")
+
+            def build_ui(self):
+                self.clear_items()
+                approve = StatefulButton(label="Approve", callback=self._approve, custom_id="a")
+                deny = StatefulButton(label="Deny", callback=self._deny, custom_id="d")
+                with_cooldown(approve, seconds=999, scope="user")
+                with_cooldown(deny, seconds=999, scope="user")
+                self.add_item(ActionRow(approve, deny))
+
+        view = _Panel(interaction=make_interaction())
+        view._message = MagicMock()
+        view.build_ui()
+        approve, deny = view.children[0].children
+
+        await approve.callback(self._click())
+        rejection = self._click()
+        await deny.callback(rejection)
+
+        assert fired == ["approve", "deny"]  # the second button is unaffected
+        assert rejection.response.send_message.await_count == 0
+
+    @pytest.mark.parametrize(
+        "first_wrapper", [with_confirmation, with_loading_state], ids=lambda w: w.__name__
+    )
+    async def test_composed_wrappers_keep_two_buttons_apart(self, first_wrapper):
+        """A wrapper installed first must not become the cooldown's identity.
+
+        Each wrapper replaces ``component.callback`` with its own closure, so
+        the callback a later ``with_cooldown`` finds is shared by every
+        component that wrapper touched. Keying on it gave the whole view one
+        deadline, and clicking Approve threw a cooldown at Deny.
+        """
+        fired = []
+
+        async def _approve(interaction):
+            fired.append("approve")
+
+        async def _deny(interaction):
+            fired.append("deny")
+
+        approve = discord.ui.Button(label="Approve")
+        approve.callback = _approve
+        deny = discord.ui.Button(label="Deny")
+        deny.callback = _deny
+
+        view = MagicMock()
+        view.is_finished.return_value = False
+        view._cascadeui_cooldowns = {}
+
+        for button in (approve, deny):
+            first_wrapper(button)
+            with_cooldown(button, seconds=999, scope="user")
+            button._view = view
+
+        await approve.callback(self._click())
+        rejection = self._click()
+        await deny.callback(rejection)
+
+        rejected = [c.args[0] for c in rejection.response.send_message.call_args_list if c.args]
+        assert not any("cooldown" in str(text).lower() for text in rejected)
+
+    async def test_custom_id_separates_controls_minted_by_one_factory(self):
+        """A callback minted per item carries the factory's qualname, not its own.
+
+        Ten buttons built in a loop are ten distinct callbacks, and every one
+        of them answers to ``make_cb.<locals>.callback``, so keying on the
+        qualname alone gave the whole loop one deadline. An explicit
+        ``custom_id`` is the caller's own name for the control.
+        """
+        ran = []
+
+        def make_cb(name):
+            async def callback(interaction):
+                ran.append(name)
+
+            return callback
+
+        class _Panel(StatefulLayoutView):
+            def build_ui(self):
+                self.clear_items()
+                row = []
+                for name in ("alice", "bob"):
+                    button = StatefulButton(
+                        label=f"Kick {name}",
+                        callback=make_cb(name),
+                        custom_id=f"kick_{name}",
+                    )
+                    with_cooldown(button, seconds=999, scope="user")
+                    row.append(button)
+                self.add_item(ActionRow(*row))
+
+        view = _Panel(interaction=make_interaction())
+        view._message = MagicMock()
+        view.build_ui()
+        alice, bob = view.children[0].children
+
+        await alice.callback(self._click())
+        rejection = self._click()
+        await bob.callback(rejection)
+
+        assert ran == ["alice", "bob"]
+        assert rejection.response.send_message.await_count == 0
+
+    async def test_custom_id_key_survives_a_rebuild(self):
+        """A custom_id key outlives the component the render replaced.
+
+        The key names the control, not the object, so the deadline has to
+        find its way back to the fresh button an accepted click rebuilt.
+        """
+        ran = []
+
+        def make_cb(name):
+            async def callback(interaction):
+                ran.append(name)
+
+            return callback
+
+        class _Panel(StatefulLayoutView):
+            def build_ui(self):
+                self.clear_items()
+                button = StatefulButton(
+                    label="Kick alice", callback=make_cb("alice"), custom_id="kick_alice"
+                )
+                with_cooldown(button, seconds=999, scope="user")
+                self.add_item(ActionRow(button))
+
+        view = _Panel(interaction=make_interaction())
+        view._message = MagicMock()
+        view.build_ui()
+
+        await view.children[0].children[0].callback(self._click())
+
+        # The accepted click is what triggers the rebuild.
+        view.build_ui()
+        rejection = self._click()
+        await view.children[0].children[0].callback(rejection)
+
+        assert ran == ["alice"]  # the rebuilt button is still throttled
+        assert rejection.response.send_message.await_count == 1
+
+    async def _click_two(self, view):
+        first, second = view.children[0].children
+        await first.callback(self._click())
+        await second.callback(self._click())
+
+    async def test_shared_default_key_warns_once(self, caplog):
+        """A loop's controls answer to one name, and the log says so."""
+        from cascadeui.components.wrappers import _shared_cooldown_warned
+
+        def make_kick(name):
+            async def callback(interaction):
+                pass
+
+            return callback
+
+        class _KickPanel(StatefulLayoutView):
+            def build_ui(self):
+                self.clear_items()
+                row = []
+                for name in ("alice", "bob"):
+                    button = StatefulButton(label=f"Kick {name}", callback=make_kick(name))
+                    with_cooldown(button, seconds=999, scope="user")
+                    row.append(button)
+                self.add_item(ActionRow(*row))
+
+        _shared_cooldown_warned.clear()
+        view = _KickPanel(interaction=make_interaction())
+        view._message = MagicMock()
+        view.build_ui()
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui.components.wrappers"):
+            await self._click_two(view)
+
+        hits = [r for r in caplog.records if "share the cooldown name" in r.getMessage()]
+        assert len(hits) == 1
+        assert "custom_id=" in hits[0].getMessage()
+
+    async def test_controls_deliberately_sharing_one_callback_stay_silent(self, caplog):
+        """Several controls on one callback is the shape ``key=`` documents.
+
+        A bound method is a fresh object on every attribute read, so a
+        detector comparing by identity reports this as a collision.
+        """
+        from cascadeui.components.wrappers import _shared_cooldown_warned
+
+        class _Panel(StatefulLayoutView):
+            async def _pick(self, interaction):
+                pass
+
+            def build_ui(self):
+                self.clear_items()
+                row = []
+                for name in ("a", "b"):
+                    button = StatefulButton(label=name, callback=self._pick)
+                    with_cooldown(button, seconds=999, scope="user")
+                    row.append(button)
+                self.add_item(ActionRow(*row))
+
+        _shared_cooldown_warned.clear()
+        view = _Panel(interaction=make_interaction())
+        view._message = MagicMock()
+        view.build_ui()
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui.components.wrappers"):
+            await self._click_two(view)
+
+        assert not [r for r in caplog.records if "share the cooldown name" in r.getMessage()]
+
+    async def test_explicit_key_separates_components_sharing_a_callback(self):
+        """Several components wired to one callback share the default key
+        (it derives from the callback), so each needs its own ``key`` to
+        avoid throttling the others.
+        """
+        ran = []
+
+        class _Panel(StatefulLayoutView):
+            async def _pick(self, interaction):
+                ran.append(1)
+
+            def build_ui(self):
+                self.clear_items()
+                row = []
+                for option in ("a", "b"):
+                    button = StatefulButton(label=option, callback=self._pick, custom_id=option)
+                    with_cooldown(button, seconds=999, key=f"pick_{option}")
+                    row.append(button)
+                self.add_item(ActionRow(*row))
+
+        view = _Panel(interaction=make_interaction())
+        view._message = MagicMock()
+        view.build_ui()
+
+        interaction = make_interaction()
+        interaction.user.id = 42
+        interaction.response.is_done.return_value = False
+        await view.children[0].children[0].callback(interaction)
+
+        other = make_interaction()
+        other.user.id = 42
+        other.response.is_done.return_value = False
+        await view.children[0].children[1].callback(other)
+
+        assert ran == [1, 1]  # distinct keys -> independent cooldowns

@@ -145,7 +145,7 @@ attribute concurrently.
 
 **Decision:** Persistence is off by default. Slots participate by
 declaring `persistent_slots = ("slot_name",)` on the view class or by
-calling `state_slot(..., persistent=True)`.
+calling `access_slot(..., persistent=True)`.
 
 **Alternatives considered:** Opt-out (persist everything by default);
 all-or-nothing (middleware-wide flag).
@@ -161,7 +161,7 @@ applications that mix both.
 
 **Decision:** Backends implement a Python `Protocol` and declare their
 capabilities via a `Capability` flag enum (`KV`, `RELATIONAL`,
-`SCHEMA_META`).
+`TTL_INDEX`, `SCHEMA_META`, `RAW_SQL`).
 
 **Alternatives considered:** Abstract base class forcing a SQL-shaped
 interface; hard-coded SQLite integration.
@@ -176,8 +176,8 @@ backend authors have a working contract to match.
 
 ### 4. V1 and V2 component systems are peers, not a migration
 
-**Decision:** Every pattern ships V1 and V2 variants (except
-Leaderboard, which is V2-only). V1 is not deprecated in favor of V2.
+**Decision:** Every pattern ships V1 and V2 variants, except Leaderboard
+and Roles, which are V2-only. V1 is not deprecated in favor of V2.
 
 **Alternatives considered:** V2-only with a compatibility shim for V1;
 V1-only with a slow V2 port.
@@ -192,10 +192,9 @@ one shape of bot.
 
 ### 5. Single `_StatefulMixin` instead of duplicated V1 and V2 bases
 
-**Decision:** All view-agnostic logic lives in `_StatefulMixin`
-(~1960 lines). `StatefulView` and `StatefulLayoutView` are thin
-subclasses that supply their version-specific `send()` signature and
-component layout overrides.
+**Decision:** All view-agnostic logic lives in `_StatefulMixin`.
+`StatefulView` and `StatefulLayoutView` are thin subclasses that supply
+their version-specific `send()` signature and component layout overrides.
 
 **Alternatives considered:** Separate `StatefulView` and
 `StatefulLayoutView` hierarchies with independent copies of access
@@ -328,6 +327,72 @@ silent value overwrite). The ids the stabilizer assigns are already
 collision-free by tree-position anchoring, so only caller-supplied ids
 reach this check, where a collision is always a genuine mistake.
 
+### 13. Pre-flight placement validation over Discord's HTTP 400
+
+**Decision:** V2 component trees are checked against Discord's placement
+and size rules before they ship, at three seams: the initial send, every
+refresh, and each navigation edit.
+
+**Alternatives considered:** Let Discord reject the payload and surface the
+400; validate once at send.
+
+**Reason:** A 400 names the request, not the node, so a caller reads
+"Invalid Form Body" and reverse-engineers which of forty components was
+illegal. The validator names the offending node, its path, and the fix.
+All three seams matter because a tree that was legal at send can be made
+illegal by a rebuild; checking only the first render would catch the
+mistakes that are easiest to catch anyway.
+
+### 14. `setup_middleware` as the single install seam
+
+**Decision:** Middleware installs through one awaited call that runs each
+middleware's `initialize(store)` in order. Cogs do not install middleware.
+
+**Alternatives considered:** Per-middleware install functions; a
+constructor-time registry; letting each cog install what it needs.
+
+**Reason:** Ordering is load-bearing and initialization is asynchronous:
+backends connect, migrations apply, and rehydration blocks before the
+first view renders. One awaited seam makes both facts visible at a single
+call site the bot author owns. Cogs are excluded deliberately, since a cog
+that mutated the store's middleware chain would change behavior for every
+other cog in the process without the author's consent.
+
+### 15. Two throttles, split by the question they answer
+
+**Decision:** `refresh_cooldown_ms` paces the re-renders the library
+starts and exempts edits made in answer to a click. `with_cooldown` guards
+one control, for one clicker.
+
+**Alternatives considered:** A single view-wide throttle governing every
+edit; one policy attribute selecting between the two behaviors.
+
+**Reason:** One throttle cannot answer both questions. Pacing a background
+re-render is a per-view concern; stopping button-mashing is a per-user
+one. A view-wide throttle asked to do the second slows every viewer of a
+shared panel for one person's clicking, and taxes the interaction it was
+never meant to govern. Splitting them lets each tool do the job its name
+claims, and is what makes the interaction exemption safe: without a
+working per-control guard, exempting clicks would leave no spam control at
+all.
+
+### 16. `get_nav_state()` for what reconstruction cannot replay
+
+**Decision:** `pop()` rebuilds a view from its constructor kwargs and
+re-runs `on_load()`. Anything else that should survive is named by the
+view through `get_nav_state()` / `restore_nav_state()`.
+
+**Alternatives considered:** Hold the parent instance and restore it;
+mutate the captured `_init_kwargs` so a selection replays as a kwarg.
+
+**Reason:** Holding the instance keeps its subscriptions, tasks, and
+message references alive behind a screen nobody is looking at, which is
+the leak the navigation stack exists to avoid. Mutating captured kwargs
+works until a value is not JSON-serializable, at which point the registry
+row is declined and a persistent view silently fails to reattach.
+`restore_nav_state()` runs before `on_load()`, so a preload reads the
+restored selection rather than fetching twice to correct itself.
+
 ---
 
 ## When CascadeUI Fits
@@ -378,7 +443,8 @@ on the layers below it:
 │  StateStore (pub/sub, batching, @computed, middleware   │
 │              chain, active-view registry)               │
 ├─────────────────────────────────────────────────────────┤
-│  PersistenceBackend Protocol (InMemory, SQLite, custom) │
+│ PersistenceBackend Protocol (InMemory, SQLite, Postgres,│
+│                              custom)                    │
 ├─────────────────────────────────────────────────────────┤
 │  discord.py (View, LayoutView, Interaction, Webhook)    │
 └─────────────────────────────────────────────────────────┘
@@ -394,8 +460,8 @@ Each layer is replaceable:
   the module-level `@computed` registry re-seeds on every store
   construction.
 - `PersistenceBackend` accepts any Protocol-conforming implementation.
-  Swapping SQLite for Redis or Postgres requires no changes above the
-  backend layer.
+  Swapping SQLite for Postgres, or for a backend the library does not
+  ship, requires no changes above the backend layer.
 
 ---
 
