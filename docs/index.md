@@ -9,7 +9,7 @@ A state management and UI framework for [discord.py](https://github.com/Rapptz/d
 - **Predictable state flow** -- every UI change follows the same path: action → reducer → subscriber → refresh. No scattered mutation, no mystery state.
 - **V2-first components** -- built for Discord's modern component system (LayoutView, Container, Section, TextDisplay) with full V1 support for embed-based views.
 - **Pre-built patterns** -- forms, wizards, tabs, and pagination ship ready to use with customizable buttons, hooks, and per-step validation.
-- **Persistence that survives restarts** -- built-in SQLite backend (via `aiosqlite`), an in-memory backend for tests, and a capability-flag Protocol for custom backends. Debounced writes, opt-in per-slot persistence, and views that re-attach to their Discord messages after a bot restart.
+- **Persistence that survives restarts** -- built-in SQLite (via `aiosqlite`) and PostgreSQL (via `asyncpg`) backends, an in-memory backend for tests, and a capability-flag Protocol for custom backends. Debounced writes, opt-in per-slot persistence, and views that re-attach to their Discord messages after a bot restart.
 
 ## Data Flow
 

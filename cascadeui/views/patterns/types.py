@@ -54,6 +54,11 @@ class FormField:
     Validation runs in ``__post_init__``: unknown ``type`` values raise
     ``ValueError`` at construction time rather than at first click.
 
+    ``secret=True`` masks the field's value in the form display (a password
+    or token), so it renders as fixed dots instead of the entered text.
+    Discord modals cannot mask the input itself, so this covers the display
+    only.
+
     Subclassing note: ``FormField`` follows standard dataclass inheritance
     rules. Adding a new *required* field in a subclass triggers Python's
     "non-default argument follows default argument" ``TypeError`` because
@@ -78,6 +83,7 @@ class FormField:
     validators: Optional[List[Callable]] = None
     style: Optional[discord.TextStyle] = None
     group: Optional[str] = None
+    secret: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, str) or not self.id:
@@ -317,8 +323,9 @@ def _normalize_fields(
     Raises ``ValueError`` when both ``fields`` and ``schema`` are supplied.
     Returns an empty list when both are ``None`` -- a zero-field form is a
     valid zero-config state, not an error. Typed ``FormField`` items lower
-    to dicts via ``to_dict()``; raw dicts pass through unchanged so
-    hand-written fields stay valid.
+    to dicts via ``to_dict()``; raw dicts pass through, with a missing
+    ``type`` filled to ``"text"`` so a hand-written dict matches the
+    ``FormField`` default and renders a control.
     """
     if schema is not None and fields is not None:
         raise ValueError(f"{cls_name} accepts either 'fields=' or 'schema=', not both.")
@@ -336,7 +343,10 @@ def _normalize_fields(
         if isinstance(item, FormField):
             out.append(item.to_dict())
         elif isinstance(item, dict):
-            out.append(item)
+            # A dict with no "type" renders no control at all; FormField
+            # defaults type="text", so fill it to match rather than mutate
+            # the caller's dict.
+            out.append(item if "type" in item else {**item, "type": "text"})
         else:
             raise TypeError(
                 f"{cls_name} field entries must be FormField or dict "

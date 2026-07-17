@@ -44,8 +44,9 @@ V2 features on display:
       uniqueness check)
     - Field grouping via the ``group`` kwarg -- fields with the same
       group label render together under one ``card()`` per group
-    - ``on_field_changed`` hook -- selecting a country pre-fills the
-      email field with a default domain hint for the next modal open
+    - ``on_field_changed`` hook -- selecting a country updates the
+      email field's placeholder with a domain hint for the next modal
+      open, keeping the suggestion out of the validated values
     - ``MODAL_SUBMITTED`` dispatch flows through the Redux pipeline, so
       text-edit hops show up in ``/inspect`` History with the form's
       view id as source
@@ -109,7 +110,7 @@ class RegistrationFormView(FormLayoutView):
     The entire form is defined by ``fields=[...]``. Text fields render
     via the grouped "Edit Text Fields" button that ``FormLayoutView``
     emits automatically; the select field renders inline as its own
-    action row. On submit, ``_handle_submit`` receives the validated
+    action row. On submit, ``on_submit`` receives the validated
     values and renders a confirmation embed.
     """
 
@@ -167,6 +168,11 @@ class RegistrationFormView(FormLayoutView):
                 label="Password",
                 type="text",
                 required=True,
+                # secret masks the value in the form display: the entered
+                # password renders as dots, not plaintext. Discord modals
+                # cannot mask the input itself, so this covers the
+                # form's own display only.
+                secret=True,
                 placeholder="8+ chars, letters and digits",
                 style=discord.TextStyle.short,
                 min_length=8,
@@ -236,11 +242,15 @@ class RegistrationFormView(FormLayoutView):
         value (useful for diff-aware analytics, undo-style fallbacks,
         or skipping work when the value is unchanged).
 
-        Here the email domain is derived from the country choice, so
-        picking a country pre-fills the email field with a default
-        domain hint the next time the text modal opens.
+        Here the country choice updates the email field's *placeholder*
+        with a matching domain hint, so the text modal suggests it the
+        next time it opens. The hint rides the placeholder, not
+        ``self.values``: a suggestion is not an entered value, so it must
+        never land in the data the form validates and submits. (Writing a
+        complete, valid dependent value into ``self.values`` here would be
+        fine; a partial hint like a bare domain is not a value.)
         """
-        if field_id == "country" and new and not self.values.get("email"):
+        if field_id == "country" and new:
             default_domain = {
                 "us": "example.com",
                 "uk": "example.co.uk",
@@ -248,7 +258,10 @@ class RegistrationFormView(FormLayoutView):
                 "de": "example.de",
                 "jp": "example.co.jp",
             }.get(new, "example.com")
-            self.values["email"] = f"@{default_domain}"
+            for field in self.fields:
+                if field.get("id") == "email":
+                    field["placeholder"] = f"you@{default_domain}"
+                    break
 
     async def on_submit(self, interaction, values):
         """Render a confirmation embed and close the form."""
@@ -286,8 +299,9 @@ class V2FormExample(commands.Cog, name="v2_form_example"):
         age, and bio through a single modal. Pick a country from the
         dropdown, then hit Submit. Four builtin validator factories,
         one typed integer field with numeric range, and one async
-        uniqueness check run on submit; failures surface per-field in
-        an ephemeral embed.
+        uniqueness check run on submit; failures surface per-field
+        inline on the form body, and a successful submit sends an
+        ephemeral confirmation.
         """
         view = RegistrationFormView(context=context)
         await view.send()

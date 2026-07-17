@@ -90,6 +90,16 @@ field_defs = [
 
 Each field definition is a dict with at minimum an `"id"` key. The `"validators"` key holds a list of validator callables.
 
+!!! note "Blank values on optional fields skip validators"
+    When a field is not `required` and its value is blank (`None` or an
+    empty or whitespace string), the runner returns no errors without
+    running the field's validators. Most built-in validators (`min_length`,
+    `regex`, `choices`, `min_value`, `max_value`) reject blank input, which
+    would make every validated optional field secretly required. `0` and
+    `False` count as values, not blanks, so a numeric field defaulting to
+    `0` still runs its validators. The required-check, not the validators,
+    is what blocks a blank *required* field.
+
 ## Running Validation
 
 ### Single field
@@ -141,6 +151,12 @@ async def unique_name(value, field, all_values):
     return ValidationResult(True)
 ```
 
+The runner works the same for a plain coroutine function, an object whose
+`__call__` is async, or a `functools.partial` wrapping either: anything
+`inspect.isawaitable` recognizes once called. A validator that returns
+something other than a `ValidationResult` (or an awaitable resolving to one)
+raises `TypeError` naming the validator and the field.
+
 ### Cross-field validation
 
 The `all_values` parameter gives access to every field's value, enabling cross-field checks:
@@ -151,6 +167,15 @@ def passwords_match(value, field, all_values):
         return ValidationResult(False, "Passwords do not match")
     return ValidationResult(True)
 ```
+
+!!! note "`all_values` keys differ between forms and standalone modals"
+    In a `FormView`, `all_values` is keyed by your field `id` (`"password"`).
+    In a standalone `Modal`, fields have no separate id, so `all_values` is
+    keyed by the input's `custom_id`, which is derived from the label
+    (a field labelled "Password" keys as `"input_password"`). A cross-field
+    validator written for one reads a different key in the other. Each context
+    is internally consistent; the difference matters only when moving a
+    validator between the two.
 
 ## Integration with FormView
 

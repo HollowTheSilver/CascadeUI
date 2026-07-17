@@ -137,9 +137,10 @@ The split has three consequences:
   request. Disqualified cases (modal submits, cross-view dispatches,
   missing message, already-deferred responses) fall through to the
   channel `PATCH` endpoint with no behavior change. On a 429 the
-  reactive backoff arms and the edit is swallowed; on any other HTTP
-  error the edit falls through to the channel path so a transient
-  interaction-endpoint failure never loses the refresh. On a stall
+  reactive backoff arms and the edit is re-queued to ship once the
+  window clears; on any other HTTP error the edit falls through to the
+  channel path so a transient interaction-endpoint failure never loses
+  the refresh. On a stall
   past `auto_defer_delay - 1.0` seconds (default 1.5s), the
   `wait_for` guard cancels the in-flight edit and `refresh()` returns
   immediately rather than falling through -- a second edit on top of
@@ -359,7 +360,7 @@ and `StatefulLayoutView`:
 | `auto_defer` | `True` | The ack safety net. A background timer acknowledges the interaction if the callback has not responded in time. | Keep it on. Turning it off removes the only thing standing between a slow callback and Discord's 3-second ack wall. |
 | `auto_defer_delay` | `2.5` | How long the safety net waits before acking (seconds). | A view's callback can run long; lowering it acks sooner. The default leaves headroom under the 3s wall. |
 | `serialize_interactions` | `True` | Serializes callbacks behind a lock so rapid clicks cannot fire racing `message.edit()` calls. | Keep it on for views that edit one shared message. It serializes the edits, not the data loads. |
-| `refresh_cooldown_ms` | `None` | A proactive throttle: edits inside the window are coalesced into one deferred re-render, and a `reload()` in the window defers its `on_load()` fetch too, not just the edit. | A view re-renders rapidly and you want fewer REST round-trips. The reactive 429 backoff is always on regardless. |
+| `refresh_cooldown_ms` | `None` | A proactive throttle on **background** re-renders: state-driven edits inside the window coalesce into one deferred render, and a `reload()` in the window defers its `on_load()` fetch too, not just the edit. Edits answering a click on the view's own message are exempt. | A view re-renders rapidly on its own and you want fewer REST round-trips. Not a spam guard (see below). The reactive 429 backoff is always on regardless. |
 | `edit_timeout` | `60.0` | The ceiling on every edit the library issues after the initial send. A stalled edit is cancelled at this bound. | Uploads or large payloads need longer than 60s per edit. Set `None` to await with no ceiling. |
 | `timeout` | `180` (discord.py default) | The discord.py view timeout, in seconds. Values over 900s engage the ephemeral refresh handoff automatically. | Long-lived panels. A persistent view sets `timeout = None`. |
 
@@ -376,12 +377,63 @@ the ack is still delivered. The 3-second wall only becomes a risk when
 the safety net is weakened (`auto_defer = False`, or `auto_defer_delay`
 raised toward 3s) *and* the render is slow.
 
+### Pacing a Panel vs. Guarding a Button
+
+Two throttles exist and they solve different problems. Reaching for the
+wrong one is the common mistake, so pick by the question you are
+answering:
+
+| The question | The tool | Scope |
+|--------------|----------|-------|
+| "This panel re-renders itself too often." | `refresh_cooldown_ms` | The whole view. Paces re-renders the library starts. |
+| "This one control is expensive and people mash it." | `with_cooldown` | One component, one clicker. |
+| "Discord is telling the bot to slow down." | Nothing. It is automatic. | Always on, never configurable. |
+
+`refresh_cooldown_ms` paces **background** work: a live scoreboard
+re-rendering on every ingest, a panel that reloads on a timer. Edits made
+in direct answer to a click are exempt: a user who pressed a button is
+owed a response, and making them wait out a window some unrelated
+background reload happened to arm is not pacing, it is a lag bug.
+
+That exemption is also why it is the wrong spam guard. It is view-wide,
+so it would punish every viewer of a shared panel for one person's
+clicking. It no longer touches the clicks anyway:
+
+```python
+# Wrong: this paces the panel's own re-renders. It does nothing to the
+# clicking, and it slows every other viewer down.
+class BoardView(StatefulLayoutView):
+    refresh_cooldown_ms = 2500
+
+# Right: throttle the control, for the clicker, and leave the rest alone.
+def build_ui(self):
+    self.clear_items()
+    refresh = StatefulButton(label="Refresh", callback=self._reload_data)
+    with_cooldown(refresh, seconds=5, scope="user")
+    self.add_item(ActionRow(refresh))
+```
+
+`with_cooldown` holds its deadlines on the owning view, so wrapping a
+component your build method constructs fresh each render works: the
+deadline outlives the component. Its default key is the `custom_id` you
+set, or the wrapped callback's qualified name when you set none. Two
+buttons calling two named handlers get two cooldowns for free. Buttons
+built in a loop do not: their per-item callbacks all carry the factory's
+qualified name, so they default to one shared deadline and throttle each
+other. Give those a `custom_id=` or an explicit `key=`, the same fix that
+separates buttons deliberately wired to one handler. Scope follows the
+same four-value grammar as `state_scope` (`"user"`, `"guild"`,
+`"user_guild"`, `"global"`).
+
+Neither knob touches Discord's own rate limiting. That backoff is always
+on, never configurable, and reads the delay Discord asks for.
+
 ---
 
 ## Keep HTTP Off the Render Path
 
-`build_ui()` runs synchronously on the render path -- the lead-up to
-the interaction's response -- and `on_load()`, though async, is awaited
+`build_ui()` runs synchronously on the render path (the lead-up to
+the interaction's response), and `on_load()`, though async, is awaited
 before the first paint. Any HTTP a view issues in either still competes
 with that interaction's own acknowledgement and adds directly to how
 long the view takes to appear.

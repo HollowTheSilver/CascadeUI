@@ -7,8 +7,8 @@ body:
       value: >
         Use this template for proposals that affect CascadeUI's public
         API surface, add new pre-built patterns, or change how existing
-        systems work. Bug fixes and small improvements should use the
-        Feature Request template instead.
+        systems work. Bug reports should use the Bug Report template, and
+        small improvements the Feature Request template.
 
 
         For early-stage ideas where you want to talk through the

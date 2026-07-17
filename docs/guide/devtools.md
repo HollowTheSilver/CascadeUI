@@ -92,8 +92,8 @@ Discord has no owner-only visibility, so this restricts the picker to admins;
 stays available to the owner in a guild where they are not an admin.
 
 `DevToolsCog` carries `is_owner_tool = True`. A bot that routes owner-only
-cogs differently -- syncing them to a control guild so they never reach a
-member's slash picker, for example -- reads `getattr(cog, "is_owner_tool",
+cogs differently (syncing them to a control guild so they never reach a
+member's slash picker, for example) reads `getattr(cog, "is_owner_tool",
 False)` to detect the cog instead of matching its class name. Your own
 owner-gated cogs can carry the same marker so one check covers them all.
 
@@ -148,8 +148,8 @@ requires `confirm:True` as a parameter to prevent accidental use.
 ## InspectorView
 
 The visual inspector is a `TabLayoutView` with six tabs. It uses
-CascadeUI's own V2 component system -- `card()`, `key_value()`,
-`action_section()`, `alert()`, `divider()` -- and stays within
+CascadeUI's own V2 component system (`card()`, `key_value()`,
+`action_section()`, `alert()`, `divider()`) and stays within
 Discord's 40-component limit by rendering lists as markdown inside
 single `TextDisplay` components.
 
@@ -192,7 +192,7 @@ count, session index entries, and subscriber count.
 Lists active user sessions:
 
 - Session ID (e.g., `MyView:user_123`)
-- View count, navigation stack depth, creation timestamp
+- View count, navigation stack depth, creation timestamp (UTC)
 
 Up to 6 sessions shown.
 
@@ -207,7 +207,7 @@ Up to 6 sessions shown.
 
 Shows the last 20 dispatched actions in reverse chronological order:
 
-- Timestamp (HH:MM:SS), action type, source view ID (truncated)
+- Timestamp (HH:MM:SS UTC), action type, source view ID (truncated)
 
 Click **Refresh** to see the latest actions during active debugging.
 
@@ -238,8 +238,8 @@ then interact with views in another channel.
 
 The tab itself shows aggregated percentiles and top-N subscribers to
 stay within Discord's component and message limits. **Export Report**
-produces a complete snapshot -- every dispatch, every subscriber
-timing, and every refresh sample -- as a markdown file with a trailing
+produces a complete snapshot (every dispatch, every subscriber
+timing, and every refresh sample) as a markdown file with a trailing
 JSON appendix, delivered as an ephemeral attachment. Attach the file
 to a bug report or review comment when a screenshot's summary data is
 not enough.

@@ -507,22 +507,14 @@ class Modal(discord.ui.Modal, StatefulComponent):
             elif isinstance(inner, discord.ui.Checkbox):
                 values[inner.custom_id] = inner.value
 
-        # Write submitted values back onto the original CascadeUI wrapper
-        # instances so callers can read ``.value`` / ``.values`` directly
-        # instead of reaching into the slug-keyed ``values`` dict.
-        self.values_by_input = {}
-        for wrapped, discord_input in self._wrapped_pairs:
-            if isinstance(wrapped, (CheckboxGroup, FileUpload)):
-                wrapped.values = discord_input.values
-                self.values_by_input[wrapped] = discord_input.values
-            else:
-                wrapped.value = discord_input.value
-                self.values_by_input[wrapped] = discord_input.value
-
         # Run validation if validators were provided
         if self.validators:
             field_defs = [
-                {"id": field_id, "validators": field_validators}
+                {
+                    "id": field_id,
+                    "validators": field_validators,
+                    "required": getattr(self.inputs.get(field_id), "required", False),
+                }
                 for field_id, field_validators in self.validators.items()
             ]
             errors = await validate_fields(values, field_defs)
@@ -536,6 +528,20 @@ class Modal(discord.ui.Modal, StatefulComponent):
                         lines.append(f"**{name}**: {err.message}")
                 await interaction.response.send_message("\n".join(lines), ephemeral=True)
                 return
+
+        # Write submitted values back onto the original CascadeUI wrapper
+        # instances so callers can read ``.value`` / ``.values`` directly.
+        # This runs after validation so a rejected value never appears on the
+        # wrapper, matching the documented "populated after validation passes"
+        # contract.
+        self.values_by_input = {}
+        for wrapped, discord_input in self._wrapped_pairs:
+            if isinstance(wrapped, (CheckboxGroup, FileUpload)):
+                wrapped.values = discord_input.values
+                self.values_by_input[wrapped] = discord_input.values
+            else:
+                wrapped.value = discord_input.value
+                self.values_by_input[wrapped] = discord_input.value
 
         # Dispatch state update
         if self.view_id:

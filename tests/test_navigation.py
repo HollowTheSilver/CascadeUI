@@ -5,9 +5,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import discord
 import pytest
+from discord.ui import ActionRow
 from helpers import RenderableLayoutView
 from helpers import make_interaction as _make_interaction
 
+from cascadeui.components.base import StatefulButton
 from cascadeui.state.actions import ActionCreators
 from cascadeui.state.reducers import (
     reduce_navigation_pop,
@@ -17,6 +19,19 @@ from cascadeui.state.reducers import (
 from cascadeui.state.singleton import get_store
 from cascadeui.views.layout import StatefulLayoutView
 from cascadeui.views.view import StatefulView
+
+
+def _tree_text(view) -> str:
+    """Every TextDisplay in a V2 view's tree, joined.
+
+    A pop restores a cursor and rebuilds the body from it. Asserting only
+    that a body exists cannot tell the restored tab's content from the
+    first tab's, so these tests read what the tree actually says.
+    """
+    return "\n".join(
+        item.content for item in view.walk_children() if isinstance(item, discord.ui.TextDisplay)
+    )
+
 
 # // ========================================( Reducer No-Op Verification )======================================== // #
 
@@ -469,6 +484,176 @@ class TestNavigationMessageState:
         restored_state = get_store().state["views"][restored.id]
         assert restored_state["message_id"] == original_msg_id
         assert restored_state["channel_id"] is not None
+
+
+class TestNavigationState:
+    """get_nav_state / restore_nav_state carry a view's selection across pop.
+
+    pop reconstructs the parent from its construction kwargs and re-runs
+    on_load, so data comes back fresh but anything selected SINCE
+    construction (a page, a tab, a tier) silently reverts to the
+    constructor's default. These hooks are what carry it.
+    """
+
+    async def test_selection_survives_pop(self):
+        class _Root(StatefulView):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.severity = "high"  # the default
+
+            def get_nav_state(self):
+                return {"severity": self.severity}
+
+            def restore_nav_state(self, state):
+                self.severity = state.get("severity", self.severity)
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+        root.severity = "low"  # selected after construction; not a kwarg
+
+        child = await root.push(_Sub)
+        restored = await child.pop()
+
+        assert restored is not root  # pop reconstructs, it does not restore
+        assert restored.severity == "low"
+
+    async def test_restore_runs_before_on_load(self):
+        """The ordering is the whole point: a preload that reads the
+        selection must see the restored value, not the default. Restoring
+        after on_load would force a second fetch to correct it.
+        """
+        seen = []
+
+        class _Root(StatefulView):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.severity = "high"
+
+            def get_nav_state(self):
+                return {"severity": self.severity}
+
+            def restore_nav_state(self, state):
+                self.severity = state.get("severity", self.severity)
+
+            async def on_load(self):
+                seen.append(self.severity)
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+        assert seen == ["high"]  # the initial send
+        root.severity = "low"
+
+        child = await root.push(_Sub)
+        await child.pop()
+
+        # The restored parent's preload read the restored tier, not the default.
+        assert seen == ["high", "low"]
+
+    async def test_view_without_override_captures_nothing(self):
+        class _Root(StatefulView):
+            pass
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+
+        child = await root.push(_Sub)
+
+        assert child._nav_stack[-1]["view_state"] == {}
+        assert await child.pop() is not None
+
+    async def test_raising_get_nav_state_does_not_break_navigation(self):
+        """A broken override costs the restore, never the navigation."""
+
+        class _Root(StatefulView):
+            def get_nav_state(self):
+                raise RuntimeError("boom")
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+
+        child = await root.push(_Sub)
+        assert child._nav_stack[-1]["view_state"] == {}
+        assert await child.pop() is not None
+
+    async def test_raising_restore_nav_state_does_not_break_navigation(self):
+        class _Root(StatefulView):
+            def get_nav_state(self):
+                return {"severity": "low"}
+
+            def restore_nav_state(self, state):
+                raise RuntimeError("boom")
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+
+        child = await root.push(_Sub)
+        assert await child.pop() is not None  # the user still gets back
+
+    async def test_non_dict_return_is_discarded(self):
+        class _Root(StatefulView):
+            def get_nav_state(self):
+                return ["not", "a", "dict"]
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+
+        child = await root.push(_Sub)
+        assert child._nav_stack[-1]["view_state"] == {}
+
+    async def test_nav_state_is_captured_per_push(self):
+        """Each push snapshots the selection as it stands at that moment."""
+
+        class _Root(StatefulView):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.page = 0
+
+            def get_nav_state(self):
+                return {"page": self.page}
+
+            def restore_nav_state(self, state):
+                self.page = state.get("page", self.page)
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+
+        root.page = 3
+        child = await root.push(_Sub)
+        back = await child.pop()
+        assert back.page == 3
+
+        back.page = 7
+        child2 = await back.push(_Sub)
+        back2 = await child2.pop()
+        assert back2.page == 7
 
 
 class TestNavigationOnLoad:
@@ -1240,3 +1425,667 @@ class TestNavigationInstanceForm:
         assert isinstance(restored, _Root)
         # New _Root instance reconstructed via the registry, not the original.
         assert restored.id != original_id
+
+
+class TestPatternNavigationState:
+    """Every stateful pattern carries its cursor across a pop.
+
+    Each sets its cursor in __init__ and none take it as a constructor
+    kwarg, so a reconstruction reverted it: the paginator went back to page
+    one, tabs to the first tab, the wizard to step one, and the form handed
+    back empty fields. All are reachable with no consumer code.
+    """
+
+    async def _child(self):
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        return _Sub
+
+    async def test_paginated_keeps_the_readers_page(self):
+        from cascadeui import PaginatedView
+
+        sub = await self._child()
+        view = await PaginatedView.from_data(
+            items=[f"row{i}" for i in range(20)],
+            per_page=5,
+            formatter=lambda chunk: "\n".join(chunk),
+            interaction=_make_interaction(user_id=1, guild_id=100),
+        )
+        await view.send()
+        view.current_page = 3
+
+        child = await view.push(sub)
+        back = await child.pop()
+
+        assert back.current_page == 3
+        # The nav follows the cursor: page 4 of 4 cannot go forward.
+        assert back._indicator_btn.label == "Page 4/4"
+
+    async def test_paginated_clamps_a_stale_page_index(self):
+        """The list can be shorter than it was at push time."""
+        from cascadeui import PaginatedView
+
+        sub = await self._child()
+        view = await PaginatedView.from_data(
+            items=[f"row{i}" for i in range(20)],
+            per_page=5,
+            formatter=lambda chunk: "\n".join(chunk),
+            interaction=_make_interaction(user_id=1, guild_id=100),
+        )
+        await view.send()
+        view.current_page = 3
+
+        child = await view.push(sub)
+        # The rebuilt parent renders a shorter list.
+        child._nav_stack[-1]["kwargs"]["pages"] = ["only one page"]
+        back = await child.pop()
+
+        assert back.current_page == 0  # clamped, not an IndexError
+
+    async def test_tabs_keep_the_open_tab(self):
+        """The buttons must follow the cursor, not just the attribute.
+
+        They are built in __init__ against the first tab, so restoring the
+        index alone left the third tab's content under a row still
+        highlighting the first. A test asserting only `_active_tab`
+        stayed green through it.
+        """
+        from cascadeui import TabView
+
+        sub = await self._child()
+
+        async def builder():
+            return {}
+
+        view = TabView(
+            tabs={"Overview": builder, "Stats": builder, "Config": builder},
+            interaction=_make_interaction(user_id=1, guild_id=100),
+        )
+        await view.send()
+        view._active_tab = 2
+
+        child = await view.push(sub)
+        back = await child.pop()
+
+        assert back._active_tab == 2
+        styles = [b.style for b in back._tab_buttons]
+        assert styles[2] == back.active_tab_style
+        assert styles[0] == back.inactive_tab_style
+
+    async def test_wizard_keeps_the_current_step(self):
+        """The nav must follow the cursor, not just the attribute.
+
+        Back and the step indicator are built in __init__ against step one,
+        so restoring the index alone left step three's content under a
+        disabled Back button reading "Step 1/4".
+        """
+        from cascadeui import WizardView
+
+        sub = await self._child()
+
+        async def builder():
+            return {}
+
+        steps = [{"name": f"s{i}", "builder": builder} for i in range(4)]
+        view = WizardView(steps=steps, interaction=_make_interaction(user_id=1, guild_id=100))
+        await view.send()
+        view._current_step = 2
+
+        child = await view.push(sub)
+        back = await child.pop()
+
+        assert back._current_step == 2
+        assert back._back_btn.disabled is False  # step 3 of 4 can go back
+        assert back._step_indicator.label == "Step 3/4"
+
+    async def test_wizard_snaps_to_a_visible_step(self):
+        """A step visible at push time can be hidden by the time the user
+        comes back, and landing on a hidden one strands them.
+        """
+        from cascadeui import WizardView
+
+        sub = await self._child()
+
+        async def builder():
+            return {}
+
+        steps = [
+            {"name": "s0", "builder": builder},
+            {"name": "s1", "builder": builder},
+            {"name": "s2", "builder": builder, "condition": lambda v: False},
+        ]
+        view = WizardView(steps=steps, interaction=_make_interaction(user_id=1, guild_id=100))
+        await view.send()
+        view._current_step = 2  # hidden by the time it is restored
+
+        child = await view.push(sub)
+        back = await child.pop()
+
+        assert back._current_step == 1  # nearest visible
+
+    async def test_form_keeps_entered_values(self):
+        from cascadeui import FormView
+
+        sub = await self._child()
+        fields = [
+            {"id": "email", "label": "Email", "type": "string"},
+            {"id": "name", "label": "Name", "type": "string"},
+        ]
+        view = FormView(
+            fields=fields, title="Signup", interaction=_make_interaction(user_id=1, guild_id=100)
+        )
+        await view.send()
+        view.values["email"] = "ada@example.com"
+
+        child = await view.push(sub)
+        back = await child.pop()
+
+        assert back.values == {"email": "ada@example.com"}
+
+    async def test_form_keeps_pending_drafts(self):
+        """A value the user typed that failed to parse survives a pop too.
+
+        The draft lives in _raw_drafts, not values; get_nav_state carries
+        both, so an invalid entry the user has not yet fixed is not silently
+        lost when they open a picker and press Back.
+        """
+        from cascadeui import FormView
+
+        sub = await self._child()
+        fields = [{"id": "age", "label": "Age", "type": "integer", "min_value": 13}]
+        view = FormView(
+            fields=fields, title="Signup", interaction=_make_interaction(user_id=1, guild_id=100)
+        )
+        await view.send()
+        view._raw_drafts["age"] = "5"  # out-of-range, held as a draft rather than stored
+
+        child = await view.push(sub)
+        back = await child.pop()
+
+        assert back._raw_drafts == {"age": "5"}
+
+    async def test_form_survives_pop_with_its_fields(self):
+        """The form's own constructor kwargs were never captured.
+
+        FormView takes its __init__ from _BaseFormMixin, a plain class that
+        never triggers __init_subclass__, and the capture wrapper keyed off
+        whether a class declared __init__ itself. So a popped form came back
+        with no fields and the default title: pressing Back destroyed it.
+        """
+        from cascadeui import FormView
+
+        sub = await self._child()
+        fields = [{"id": "email", "label": "Email", "type": "string"}]
+        view = FormView(
+            fields=fields, title="Signup", interaction=_make_interaction(user_id=1, guild_id=100)
+        )
+        await view.send()
+
+        child = await view.push(sub)
+        back = await child.pop()
+
+        assert [f["id"] for f in back.fields] == ["email"]
+        assert back.title == "Signup"
+
+    async def test_form_drops_values_for_fields_it_no_longer_declares(self):
+        from cascadeui import FormView
+
+        sub = await self._child()
+        view = FormView(
+            fields=[{"id": "email", "label": "Email", "type": "string"}],
+            title="Signup",
+            interaction=_make_interaction(user_id=1, guild_id=100),
+        )
+        await view.send()
+        view.values["email"] = "ada@example.com"
+        view.values["gone"] = "orphan"  # no field declares this
+
+        child = await view.push(sub)
+        back = await child.pop()
+
+        assert back.values == {"email": "ada@example.com"}
+
+
+class TestNavigationDefaultRebuild:
+    """A destination view supplies its own edit kwargs when the caller has none.
+
+    pop() passes no rebuild (the back button is library code and has
+    nothing to hand it), so a V1 destination could not put its embed on the
+    navigation edit. The components swapped and the message kept the CHILD's
+    embed underneath the parent's buttons.
+
+    These assert what the EDIT carried, not what the attribute holds: calling
+    the lambda directly would pass whether or not navigation ever consults it.
+    """
+
+    def _nav_interaction(self, message_id):
+        interaction = _make_interaction(user_id=1, guild_id=100)
+        interaction.type = discord.InteractionType.component
+        interaction.message = MagicMock()
+        interaction.message.id = message_id
+        interaction.response.is_done.return_value = False
+        interaction.response.edit_message = AsyncMock()
+        return interaction
+
+    async def test_v2_destination_ships_components_alone(self):
+        """V2 views are their component tree; nothing extra rides the edit."""
+
+        class _Root(StatefulLayoutView):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.add_item(ActionRow(StatefulButton(label="Root", custom_id="r")))
+
+        class _Sub(StatefulLayoutView):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.add_item(ActionRow(StatefulButton(label="Sub", custom_id="s")))
+
+        assert _Root.nav_rebuild is None
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+        child = await root.push(_Sub)
+
+        interaction = self._nav_interaction(root._message.id)
+        await child.pop(interaction=interaction)
+
+        shipped = interaction.response.edit_message.await_args.kwargs
+        assert "embed" not in shipped
+
+    async def test_v1_pop_edit_carries_the_parents_embed(self):
+        class _Parent(StatefulView):
+            nav_rebuild = staticmethod(lambda v: {"embed": v.build_embed()})
+
+            def build_embed(self):
+                return discord.Embed(title="PARENT")
+
+        class _Child(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Parent(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send(embed=root.build_embed())
+        child = await root.push(_Child)
+
+        interaction = self._nav_interaction(root._message.id)
+        await child.pop(interaction=interaction)
+
+        shipped = interaction.response.edit_message.await_args.kwargs
+        assert "embed" in shipped, "the pop edit shipped no embed"
+        assert shipped["embed"].title == "PARENT"
+
+    async def test_explicit_rebuild_wins_over_the_default(self):
+        """The caller's rebuild is not overridden by the destination's."""
+
+        class _Parent(StatefulView):
+            nav_rebuild = staticmethod(lambda v: {"embed": discord.Embed(title="DEFAULT")})
+
+            async def on_state_changed(self, state):
+                pass
+
+        class _Child(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Parent(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+        child = await root.push(_Child)
+
+        interaction = self._nav_interaction(root._message.id)
+        await child.pop(
+            interaction=interaction,
+            rebuild=lambda v: {"embed": discord.Embed(title="EXPLICIT")},
+        )
+
+        shipped = interaction.response.edit_message.await_args.kwargs
+        assert shipped["embed"].title == "EXPLICIT"
+
+
+class TestCompositeNavigationState:
+    """A host carries its composites' state through its own nav-state hooks.
+
+    PaginatedRegion and Collapsible hold their cursor on the instance, and
+    the host builds them in __init__, so a pop that reconstructs the host
+    builds fresh ones on page one, collapsed. They need no hooks of their
+    own: their existing public state API (page/set_page, expanded/expand)
+    is what the host names in get_nav_state. The host opts in deliberately,
+    because only it knows whether returning should resume or start clean.
+    """
+
+    async def test_host_carries_region_page_and_collapsible_state(self):
+        from cascadeui.components.patterns.v2 import Collapsible, PaginatedRegion, card
+
+        class _Panel(StatefulLayoutView):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.pager = PaginatedRegion(per_page=5, key="tasks")
+                self.filters = Collapsible(label="Filters", reveal=lambda: card("f"), key="filters")
+                self.add_item(card("panel"))
+
+            async def on_load(self):
+                # Items arrive AFTER restore_nav_state has run.
+                self.pager.items = [f"task{i}" for i in range(20)]
+
+            def get_nav_state(self):
+                return {"page": self.pager.page, "open": self.filters.expanded}
+
+            def restore_nav_state(self, state):
+                self.pager.set_page(state.get("page", 0))
+                if state.get("open"):
+                    self.filters.expand()
+
+        class _Sub(StatefulLayoutView):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.add_item(card("sub"))
+
+        root = _Panel(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+        root.pager.set_page(3)
+        root.filters.expand()
+
+        child = await root.push(_Sub)
+        back = await child.pop()
+
+        assert back.pager.page == 3
+        assert back.filters.expanded is True
+        assert back.pager.page_items == ["task15", "task16", "task17", "task18", "task19"]
+
+    async def test_host_without_hooks_still_resets_its_composites(self):
+        """Opting in is the host's call; nothing happens by default."""
+        from cascadeui.components.patterns.v2 import PaginatedRegion, card
+
+        class _Panel(StatefulLayoutView):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.pager = PaginatedRegion(per_page=5, items=list(range(20)), key="t")
+                self.add_item(card("panel"))
+
+        class _Sub(StatefulLayoutView):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.add_item(card("sub"))
+
+        root = _Panel(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+        root.pager.set_page(3)
+
+        child = await root.push(_Sub)
+        back = await child.pop()
+
+        assert back.pager.page == 0
+
+
+class TestV2PatternPopRendersContent:
+    """A popped V2 pattern renders its content, not just its nav row.
+
+    Tabs and wizards build their body from async builders that cannot run in
+    __init__, and both built it only in send(). pop() never calls send(), so
+    a view returned to from a drill-down rendered its nav row above nothing
+    at all. Restoring the cursor without rebuilding the tree made that worse,
+    not better: the buttons claimed step three while the body was empty.
+
+    These assert the rendered CHILDREN. Asserting only the cursor is what let
+    the gap through: the index restored correctly the whole time.
+    """
+
+    def _nav_interaction(self, message_id=7):
+        interaction = _make_interaction(user_id=1, guild_id=100)
+        interaction.type = discord.InteractionType.component
+        interaction.message = MagicMock()
+        interaction.message.id = message_id
+        interaction.response.is_done.return_value = False
+        interaction.response.edit_message = AsyncMock()
+        return interaction
+
+    def _prime(self, view):
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+        view._message.id = 7
+        return view
+
+    async def _child(self):
+        from cascadeui.components.patterns.v2 import card
+
+        class _Sub(StatefulLayoutView):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.add_item(card("sub"))
+
+        return _Sub
+
+    async def test_tab_layout_view_pop_rebuilds_the_active_tab(self):
+        from cascadeui import TabLayoutView
+        from cascadeui.components.patterns.v2 import card
+
+        def _tab(name):
+            # Content differs per tab, so restoring the cursor while
+            # rendering another tab's body fails here.
+            async def body():
+                return [card(f"TAB-{name}")]
+
+            return body
+
+        sub = await self._child()
+        view = TabLayoutView(
+            tabs={name: _tab(name) for name in "ABC"},
+            interaction=self._nav_interaction(),
+        )
+        await view.send()
+        self._prime(view)
+        view._active_tab = 2
+        await view._refresh_tabs()
+
+        child = await view.push(sub, interaction=self._nav_interaction())
+        back = await child.pop(interaction=self._nav_interaction())
+
+        assert back._active_tab == 2
+        assert "TAB-C" in _tree_text(back)
+
+    async def test_wizard_layout_view_pop_rebuilds_the_current_step(self):
+        from cascadeui import WizardLayoutView
+        from cascadeui.components.patterns.v2 import card
+
+        def _step(index):
+            async def body():
+                return [card(f"STEP-{index}")]
+
+            return body
+
+        sub = await self._child()
+        steps = [{"name": f"s{i}", "builder": _step(i)} for i in range(3)]
+        view = WizardLayoutView(steps=steps, interaction=self._nav_interaction())
+        await view.send()
+        self._prime(view)
+        view._current_step = 2
+        await view._refresh_wizard()
+
+        child = await view.push(sub, interaction=self._nav_interaction())
+        back = await child.pop(interaction=self._nav_interaction())
+
+        assert back._current_step == 2
+        assert "STEP-2" in _tree_text(back)
+        # The nav buttons agree with the step beside them.
+        assert back._back_btn.disabled is False  # step 3 of 3 can go back
+
+    async def test_leaderboard_pop_keeps_the_readers_page(self):
+        """Pages are fetched in on_load, which runs AFTER restore_nav_state.
+
+        Treating an empty page list as "nothing to restore" dropped the index
+        outright, so the flagship paginated consumer never benefited.
+        """
+        from cascadeui import LeaderboardLayoutView
+
+        class _Board(LeaderboardLayoutView):
+            leaderboard_per_page = 2
+
+            def get_entries(self):
+                return [(i, {"score": i}) for i in range(10)]
+
+        sub = await self._child()
+        view = _Board(interaction=self._nav_interaction())
+        await view.send()
+        self._prime(view)
+        assert len(view.pages) == 5
+        view.current_page = 2
+
+        child = await view.push(sub, interaction=self._nav_interaction())
+        back = await child.pop(interaction=self._nav_interaction())
+
+        assert back.current_page == 2
+        # Page 2 holds ranks 5 and 6. Asserting the cursor alone would pass
+        # on a view that restored the index and rendered page one.
+        rendered = _tree_text(back)
+        assert "<@4>" in rendered and "<@5>" in rendered
+        assert "<@0>" not in rendered
+
+    async def test_restored_page_past_a_shrunk_list_clamps(self):
+        """The held index must never reach an indexing read out of range."""
+        from cascadeui import LeaderboardLayoutView
+
+        entries = [(i, {"score": i}) for i in range(10)]
+
+        class _Board(LeaderboardLayoutView):
+            leaderboard_per_page = 2
+
+            def get_entries(self):
+                return list(entries)
+
+        sub = await self._child()
+        view = _Board(interaction=self._nav_interaction())
+        await view.send()
+        self._prime(view)
+        view.current_page = 4
+
+        child = await view.push(sub, interaction=self._nav_interaction())
+        entries[:] = [(0, {"score": 0})]  # the board shrinks to one page
+        back = await child.pop(interaction=self._nav_interaction())
+
+        assert back.current_page == 0  # clamped, not an IndexError
+
+
+class TestV1PatternPopCarriesTheEmbed:
+    """A popped V1 pattern renders its own content, not the child's.
+
+    V1 content lives in the embed, and the navigation edit only carries one
+    if the caller supplies a rebuild. pop() has none to supply: the back
+    button is library code. So each V1 pattern names its own via
+    `nav_rebuild`, and the edit ships the parent's embed beside the
+    parent's buttons instead of leaving the child's content on screen.
+
+    These assert what the EDIT carried. Asserting the cursor is what let the
+    gap through: the cursor was right the whole time.
+    """
+
+    def _nav_interaction(self, message_id):
+        interaction = _make_interaction(user_id=1, guild_id=100)
+        interaction.type = discord.InteractionType.component
+        interaction.message = MagicMock()
+        interaction.message.id = message_id
+        interaction.response.is_done.return_value = False
+        interaction.response.edit_message = AsyncMock()
+        return interaction
+
+    async def _child(self):
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        return _Sub
+
+    async def _popped_edit_kwargs(self, view):
+        sub = await self._child()
+        child = await view.push(sub)
+        interaction = self._nav_interaction(view._message.id)
+        await child.pop(interaction=interaction)
+        return interaction.response.edit_message.await_args.kwargs
+
+    async def test_tab_view_pop_ships_the_active_tabs_embed(self):
+        from cascadeui import TabView
+
+        def _tab(name):
+            # Content differs per tab, so shipping the wrong one fails here
+            # rather than passing on an embed every tab happens to share.
+            async def body():
+                return discord.Embed(title=f"TAB-{name}")
+
+            return body
+
+        view = TabView(
+            tabs={name: _tab(name) for name in "ABC"},
+            interaction=_make_interaction(user_id=1, guild_id=100),
+        )
+        await view.send()
+        view._active_tab = 2
+
+        shipped = await self._popped_edit_kwargs(view)
+
+        assert shipped["embed"].title == "TAB-C"
+
+    async def test_wizard_view_pop_ships_the_current_steps_embed(self):
+        from cascadeui import WizardView
+
+        def _step(index):
+            async def body():
+                return discord.Embed(title=f"STEP-{index}")
+
+            return body
+
+        steps = [{"name": f"s{i}", "builder": _step(i)} for i in range(4)]
+        view = WizardView(steps=steps, interaction=_make_interaction(user_id=1, guild_id=100))
+        await view.send()
+        view._current_step = 2
+
+        shipped = await self._popped_edit_kwargs(view)
+
+        assert shipped["embed"].title == "STEP-2"
+
+    async def test_form_view_pop_ships_the_form_embed(self):
+        from cascadeui import FormView
+
+        view = FormView(
+            fields=[{"id": "email", "label": "Email", "type": "string"}],
+            title="Signup",
+            interaction=_make_interaction(user_id=1, guild_id=100),
+        )
+        await view.send()
+        view.values["email"] = "ada@example.com"
+
+        shipped = await self._popped_edit_kwargs(view)
+
+        assert shipped["embed"].title == "Signup"
+        # The typed value is the thing a pop dropped. A title-only assertion
+        # passes on an embed rendered from a fresh, empty values dict.
+        assert "ada@example.com" in str(shipped["embed"].to_dict())
+
+    async def test_paginated_view_pop_ships_the_current_pages_embed(self):
+        from cascadeui import PaginatedView
+
+        view = await PaginatedView.from_data(
+            items=[f"row{i}" for i in range(20)],
+            per_page=5,
+            formatter=lambda chunk: discord.Embed(title="PAGE-" + chunk[0]),
+            interaction=_make_interaction(user_id=1, guild_id=100),
+        )
+        await view.send()
+        view.current_page = 3
+
+        shipped = await self._popped_edit_kwargs(view)
+
+        assert shipped["embed"].title == "PAGE-row15"  # page 4's first row
+
+    async def test_a_wizard_step_without_a_builder_ships_no_embed(self):
+        """A step with nothing to render contributes nothing to the edit."""
+        from cascadeui import WizardView
+
+        view = WizardView(
+            steps=[{"name": "s0"}, {"name": "s1"}],
+            interaction=_make_interaction(user_id=1, guild_id=100),
+        )
+        await view.send()
+
+        shipped = await self._popped_edit_kwargs(view)
+
+        assert "embed" not in shipped

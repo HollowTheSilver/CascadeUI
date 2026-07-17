@@ -863,6 +863,51 @@ class TestFromCursor:
         with pytest.raises(ValueError, match="new_total must be a non-negative int"):
             await view.refresh_pages(new_total=-1)
 
+    # // ----( Navigation restore )---- // #
+
+    async def test_on_load_fetches_the_page_restored_across_a_pop(self):
+        """A restored cursor can land on a slot cursor mode never fetched.
+
+        ``restore_nav_state`` lives on the mixin both versions share, so a
+        popped V1 view comes back on the page it left. Cursor mode holds
+        ``None`` in every slot it has not fetched, and the navigation edit
+        renders whatever ``current_page`` points at -- so the preload is what
+        stands between the restore and a "Loading..." card with nothing left
+        to replace it.
+        """
+        calls = []
+        view = PaginatedView.from_cursor(
+            self._make_fetch(40, track_calls=calls),
+            total=40,
+            per_page=4,
+            formatter=self._embed_formatter,
+            interaction=_make_interaction(),
+        )
+        assert view.pages[7] is None
+
+        view.restore_nav_state({"current_page": 7})
+        await view.on_load()
+
+        assert calls == [(28, 4)]
+        assert isinstance(view.pages[7], discord.Embed)
+
+    async def test_on_load_is_a_no_op_for_an_already_loaded_page(self):
+        """The preload never refetches a slot the cache already holds."""
+        calls = []
+        view = PaginatedView.from_cursor(
+            self._make_fetch(40, track_calls=calls),
+            total=40,
+            per_page=4,
+            formatter=self._embed_formatter,
+            interaction=_make_interaction(),
+        )
+        await view._ensure_page_loaded(0)
+        calls.clear()
+
+        await view.on_load()
+
+        assert calls == []
+
 
 # // ========================================( Send Kwargs Propagation )======================================== // #
 

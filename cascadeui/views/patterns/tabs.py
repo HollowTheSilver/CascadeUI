@@ -229,6 +229,47 @@ class _BaseTabMixin:
         """
         return None
 
+    def _sync_tab_styles(self) -> None:
+        """Point the tab buttons at the active tab.
+
+        Derived from ``_active_tab`` rather than a construction-time
+        constant, so any path that lands on a tab other than the first (a
+        switch, or a tab carried back across a ``pop``) gets buttons that
+        agree with the content beside them.
+        """
+        for i, button in enumerate(self._tab_buttons):
+            button.style = (
+                self.active_tab_style if i == self._active_tab else self.inactive_tab_style
+            )
+
+    def get_nav_state(self) -> dict:
+        """Carry the open tab across a ``pop``.
+
+        ``_active_tab`` is assigned in ``__init__`` and is not a constructor
+        kwarg, so a reconstruction reverts to the first tab: open the third
+        tab, drill into a detail view, press Back, and land on the first.
+        """
+        return {"active_tab": self._active_tab}
+
+    def restore_nav_state(self, state: dict) -> None:
+        """Restore the open tab, clamped to the current tab list.
+
+        A subclass can build a different set of tabs than it had at push
+        time (a permission change, a feature flag), so an index that no
+        longer exists falls back to the first tab rather than raising on the
+        next render.
+
+        The buttons re-style here rather than only in the render path: they
+        were built during ``__init__`` against the first tab, and restoring
+        the index without them leaves the third tab's content under a row
+        still highlighting the first.
+        """
+        index = state.get("active_tab")
+        if index is None or not self._tab_names:
+            return
+        self._active_tab = max(0, min(int(index), len(self._tab_names) - 1))
+        self._sync_tab_styles()
+
     def _make_switch_callback(self, index: int):
         async def callback(interaction: Interaction):
             self._active_tab = index
@@ -322,12 +363,52 @@ class TabView(_BaseTabMixin, StatefulView):
                 button.row = row_idx
                 self.add_item(button)
 
+    async def send(
+        self,
+        content: Optional[str] = None,
+        *,
+        embed: Optional[discord.Embed] = None,
+        embeds: Optional[List[discord.Embed]] = None,
+        file: Optional[discord.File] = None,
+        files: Optional[List[discord.File]] = None,
+        ephemeral: bool = False,
+    ):
+        """Send the view, using the active tab's content when none is given.
+
+        Tab builders are async and cannot run in ``__init__``, so the first
+        message would otherwise ship the tab row over an empty body. This is
+        the same render ``_nav_edit_kwargs`` supplies on a ``pop``. An
+        explicit ``embed`` or ``content`` wins.
+        """
+        if embed is None and content is None:
+            embed = (await self._nav_edit_kwargs()).get("embed")
+        return await super().send(
+            content=content,
+            embed=embed,
+            embeds=embeds,
+            file=file,
+            files=files,
+            ephemeral=ephemeral,
+        )
+
+    nav_rebuild = staticmethod(lambda v: v._nav_edit_kwargs())
+
+    async def _nav_edit_kwargs(self) -> dict:
+        """The embed a navigation edit needs to show the active tab.
+
+        ``pop()`` passes no rebuild of its own, so without this the edit
+        would restyle the tab row and leave whatever the child view put on
+        the message. V1 tab content lives in the embed, so the embed is the
+        render.
+        """
+        if not self._tab_names:
+            return {}
+        builder = self._tabs[self._tab_names[self._active_tab]]
+        return {"embed": await builder()}
+
     async def _refresh_tabs(self):
         """Mutate tab button styles in place and rebuild active content."""
-        for i, button in enumerate(self._tab_buttons):
-            button.style = (
-                self.active_tab_style if i == self._active_tab else self.inactive_tab_style
-            )
+        self._sync_tab_styles()
 
         tab_name = self._tab_names[self._active_tab]
         builder = self._tabs[tab_name]
@@ -402,17 +483,15 @@ class TabLayoutView(_BaseTabMixin, StatefulLayoutView):
             self._tab_rows.append(row)
             self.add_item(row)
 
-    async def _refresh_tabs(self):
-        """Mutate tab buttons in place and rebuild active tab content.
+    async def _compose_tab_tree(self) -> None:
+        """Compose the tree for the active tab: tab rows, content, extras.
 
-        The tab-button ActionRow and any items registered through
-        ``_build_extra_items()`` keep their identity across refreshes;
-        only the tab content children are rebuilt.
+        The single build seam. ``on_load`` runs it before every render the
+        library drives (the send pipeline, each push/pop edit, ``reload``)
+        and ``_refresh_tabs`` runs it on a tab click; both need the same
+        tree, so neither owns a private copy of this sequence.
         """
-        for i, button in enumerate(self._tab_buttons):
-            button.style = (
-                self.active_tab_style if i == self._active_tab else self.inactive_tab_style
-            )
+        self._sync_tab_styles()
 
         # Clear and re-add in order: tab rows, content, extras.
         self.clear_items()
@@ -440,38 +519,25 @@ class TabLayoutView(_BaseTabMixin, StatefulLayoutView):
         # Restore the navigation back button if push() added one.
         self._restore_navigation_artifacts()
 
-        await self.refresh()
+    async def on_load(self) -> None:
+        """Build the active tab's content before the view is displayed.
 
-    async def send(self, **kwargs):
-        """Build initial tab content before sending.
-
-        Tab builders are async and cannot run in ``__init__``, so the
-        first tab's content is built here before the message is sent.
-        Children are re-assembled in canonical order (tab row, content,
-        extras) so items registered by ``_build_extra_items()`` render
-        beneath the initial tab content on first display.
+        Tab builders are async and cannot run in ``__init__``, so the tree
+        holds only the tab row until this runs. This hook, not ``send()``,
+        is the build seam: ``pop()`` never calls ``send()``, while the
+        library runs ``on_load`` before every render it drives (the send
+        pipeline, each push/pop edit, ``reload``). A tab view returned to
+        from a drill-down therefore renders its content, not a bare tab row.
         """
         if self._tab_names:
-            builder = self._tabs[self._tab_names[self._active_tab]]
-            from ...theming.context import theme_context
+            await self._compose_tab_tree()
 
-            with theme_context(self.get_theme()):
-                content = await builder()
+    async def _refresh_tabs(self):
+        """Rebuild the active tab's content and ship the edit.
 
-            self.clear_items()
-            for row in self._tab_rows:
-                self.add_item(row)
-            if isinstance(content, list):
-                for item in content:
-                    self.add_item(item)
-            else:
-                self.add_item(content)
-            for extra in self._extra_items:
-                self.add_item(extra)
-
-            # Restore the auto-back button if push() added one -- matches
-            # _refresh_tabs so a tab view used as a push() rebuild target
-            # keeps its back button instead of stranding the user.
-            self._restore_navigation_artifacts()
-
-        return await super().send(**kwargs)
+        The tab-button ActionRow and any items registered through
+        ``_build_extra_items()`` keep their identity across refreshes;
+        only the tab content children are rebuilt.
+        """
+        await self._compose_tab_tree()
+        await self.refresh()

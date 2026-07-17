@@ -2,7 +2,7 @@
 
 
 import warnings
-from typing import Any, Callable, ClassVar, Dict, List, Optional
+from typing import Any, ClassVar, Dict, List, Optional
 
 import discord
 from discord import Interaction
@@ -22,8 +22,8 @@ class _BaseMenuMixin:
 
     Holds the customization attributes, the ``on_category_selected`` hook,
     and the ``_make_push_callback`` factory. V1 and V2 subclasses supply
-    the per-category render path and the default rebuild lambda that
-    ``push()`` should use when a category dict omits its own.
+    the per-category render path and the ``nav_rebuild`` shape a plain
+    destination falls back to when it names none of its own.
 
     Internal. Not exported. The public hierarchy
     (``MenuView`` / ``MenuLayoutView``) is unchanged.
@@ -31,6 +31,11 @@ class _BaseMenuMixin:
 
     menu_style: ClassVar[discord.ButtonStyle] = discord.ButtonStyle.primary
     auto_exit_button: ClassVar[bool] = True
+
+    # The method this menu's own ``nav_rebuild`` calls on a destination.
+    # A category destination that lacks it renders some other way, so the
+    # fallback stays clear of it. V1 and V2 subclasses each name theirs.
+    _category_render_hook: ClassVar[str] = ""
 
     _BUTTON_STYLE_ATTRS: ClassVar[tuple] = (
         *_StatefulMixin._BUTTON_STYLE_ATTRS,
@@ -40,11 +45,6 @@ class _BaseMenuMixin:
         *_StatefulMixin._BOOL_ATTRS,
         "auto_exit_button",
     )
-
-    # Subclasses provide the default rebuild lambda for push() since the
-    # V1 contract (returns embed kwargs) and V2 contract (rebuilds tree)
-    # differ. Set on each concrete subclass.
-    _default_rebuild: ClassVar[Optional[Callable]] = None
 
     async def on_category_selected(
         self, category: Dict[str, Any], index: int, interaction: Interaction
@@ -56,9 +56,47 @@ class _BaseMenuMixin:
         """
         return None
 
+    def _validate_categories(self, categories: List[Dict[str, Any]]) -> None:
+        """Reject a destination this menu could never navigate to.
+
+        A message carries its component version one way, so ``push()`` blocks
+        a V1 menu from reaching a V2 destination. The category list names
+        every destination up front, which makes construction the seam that
+        can answer for it: left to the push, the mismatch reaches the user
+        as a dead button.
+        """
+        from discord.ui import LayoutView as _LayoutView
+
+        self_is_v2 = isinstance(self, _LayoutView)
+        for category in categories:
+            view_cls = category.get("view")
+            if not isinstance(view_cls, type):
+                continue
+            if issubclass(view_cls, _LayoutView) is self_is_v2:
+                continue
+            source = "V2 (LayoutView)" if self_is_v2 else "V1 (View)"
+            target = "V1 (View)" if self_is_v2 else "V2 (LayoutView)"
+            raise TypeError(
+                f"{type(self).__name__} is {source} and category "
+                f"{category.get('label')!r} points at {view_cls.__name__}, "
+                f"which is {target}. A menu cannot push across versions. "
+                f"Fix: give the category a {source} view."
+            )
+
     def _make_push_callback(self, category: Dict[str, Any], index: int):
         view_cls = category["view"]
-        rebuild = category.get("rebuild", self._default_rebuild)
+        # An explicit per-category rebuild wins. Otherwise a destination that
+        # names its own nav_rebuild keeps it, and one that renders through
+        # some other seam entirely (on_load, or its own __init__) is left
+        # alone, since the menu's fallback calls a method it does not have.
+        # What remains is the plain view the fallback was written for.
+        rebuild = category.get("rebuild")
+        if (
+            rebuild is None
+            and getattr(view_cls, "nav_rebuild", None) is None
+            and hasattr(view_cls, self._category_render_hook)
+        ):
+            rebuild = type(self).nav_rebuild
 
         async def callback(interaction: Interaction):
             await self.on_category_selected(category, index, interaction)
@@ -92,8 +130,9 @@ class MenuView(_BaseMenuMixin, StatefulView):
         style (ButtonStyle): Per-category override. Falls back to
             ``menu_style``. Optional.
         rebuild (callable): Per-category rebuild callable passed to
-            ``push(rebuild=...)``. Falls back to the default V1 rebuild
-            (``lambda v: {"embed": v.build_embed()}``). Optional.
+            ``push(rebuild=...)``. A destination naming its own
+            ``nav_rebuild`` uses that; one naming none falls back to
+            ``lambda v: {"embed": v.build_embed()}``. Optional.
 
     Customization:
         Override ``menu_style`` to set the default button style for all
@@ -109,7 +148,35 @@ class MenuView(_BaseMenuMixin, StatefulView):
         category button is rendered. Default creates a ``StatefulButton``.
     """
 
-    _default_rebuild = staticmethod(lambda v: {"embed": v.build_embed()})
+    _category_render_hook: ClassVar[str] = "build_embed"
+    nav_rebuild = staticmethod(lambda v: {"embed": v.build_embed()})
+
+    async def send(
+        self,
+        content: Optional[str] = None,
+        *,
+        embed: Optional[discord.Embed] = None,
+        embeds: Optional[List[discord.Embed]] = None,
+        file: Optional[discord.File] = None,
+        files: Optional[List[discord.File]] = None,
+        ephemeral: bool = False,
+    ):
+        """Send the view, using ``build_embed()`` when no content is given.
+
+        The hub card is the menu's own render, so sending without one ships
+        the category buttons over an empty body. An explicit ``embed`` or
+        ``content`` wins.
+        """
+        if embed is None and content is None:
+            embed = self.build_embed()
+        return await super().send(
+            content=content,
+            embed=embed,
+            embeds=embeds,
+            file=file,
+            files=files,
+            ephemeral=ephemeral,
+        )
 
     def __init__(
         self,
@@ -120,6 +187,7 @@ class MenuView(_BaseMenuMixin, StatefulView):
         super().__init__(*args, **kwargs)
 
         self._categories: List[Dict[str, Any]] = categories or []
+        self._validate_categories(self._categories)
         self._category_buttons: List[StatefulButton] = []
 
         self._build_category_buttons()
@@ -202,8 +270,9 @@ class MenuLayoutView(_BaseMenuMixin, StatefulLayoutView):
         style (ButtonStyle): Per-category override. Falls back to
             ``menu_style``. Optional.
         rebuild (callable): Per-category rebuild callable passed to
-            ``push(rebuild=...)``. Falls back to ``lambda v: v.build_ui()``.
-            Optional.
+            ``push(rebuild=...)``. A destination naming its own
+            ``nav_rebuild`` uses that; one naming none falls back to
+            ``lambda v: v.build_ui()``. Optional.
 
     Customization:
         Override ``menu_style`` to set the default button style for all
@@ -219,7 +288,8 @@ class MenuLayoutView(_BaseMenuMixin, StatefulLayoutView):
         category is rendered. Default creates an ``action_section()``.
     """
 
-    _default_rebuild = staticmethod(lambda v: v.build_ui())
+    _category_render_hook: ClassVar[str] = "build_ui"
+    nav_rebuild = staticmethod(lambda v: v.build_ui())
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -244,6 +314,7 @@ class MenuLayoutView(_BaseMenuMixin, StatefulLayoutView):
         super().__init__(*args, **kwargs)
 
         self._categories: List[Dict[str, Any]] = categories or []
+        self._validate_categories(self._categories)
         self.build_ui()
 
     def build_header(self):

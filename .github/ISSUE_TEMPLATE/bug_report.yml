@@ -65,7 +65,9 @@ body:
       description: >
         Run `python -m cascadeui` and paste the output here. This
         prints your CascadeUI version, discord.py version, Python
-        version, OS, and installed backends.
+        version, OS, and installed backends. If the bug involves
+        persistence, say which backend you configured -- the output
+        lists what is installed, not what is in use.
       render: shell
     validations:
       required: true

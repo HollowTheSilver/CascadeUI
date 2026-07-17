@@ -92,7 +92,9 @@ def min_value(n: Union[int, float], msg: Optional[str] = None):
 
     def validator(value, field, all_values):
         try:
-            if float(value) < n:
+            # Phrased as ``not (>=)`` rather than ``<`` so NaN, which is
+            # neither, fails the bound instead of passing it.
+            if not (float(value) >= n):
                 return ValidationResult(False, msg or f"Must be at least {n}")
         except (TypeError, ValueError):
             return ValidationResult(False, msg or f"Must be a number >= {n}")
@@ -106,7 +108,7 @@ def max_value(n: Union[int, float], msg: Optional[str] = None):
 
     def validator(value, field, all_values):
         try:
-            if float(value) > n:
+            if not (float(value) <= n):
                 return ValidationResult(False, msg or f"Must be at most {n}")
         except (TypeError, ValueError):
             return ValidationResult(False, msg or f"Must be a number <= {n}")
@@ -136,11 +138,29 @@ async def validate_field(
     validators = field_def.get("validators", [])
     errors = []
 
+    # An empty value on an optional field passes without running validators.
+    # Most validators reject blank (min_length, regex, choices, min/max_value),
+    # so running them would make every validated optional field secretly
+    # required; the required-check owns the blank-required case separately.
+    # 0 and False are values, not blanks, so only None and blank strings skip.
+    is_empty = value is None or (isinstance(value, str) and not value.strip())
+    if is_empty and not field_def.get("required", False):
+        return errors
+
     for validator in validators:
-        if inspect.iscoroutinefunction(validator):
-            result = await validator(value, field_def, all_values)
-        else:
-            result = validator(value, field_def, all_values)
+        result = validator(value, field_def, all_values)
+        # Await after the call so a plain coroutine function, an async
+        # ``__call__`` object (the documented awaitable shape), and a
+        # ``functools.partial`` wrapping either all resolve.
+        if inspect.isawaitable(result):
+            result = await result
+        if not isinstance(result, ValidationResult):
+            name = getattr(validator, "__qualname__", None) or repr(validator)
+            raise TypeError(
+                f"Validator {name} for field {field_def.get('id')!r} must return "
+                f"a ValidationResult (or an awaitable of one), got "
+                f"{type(result).__name__}."
+            )
         if not result.valid:
             errors.append(result)
 

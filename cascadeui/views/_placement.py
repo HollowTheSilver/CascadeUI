@@ -37,6 +37,32 @@ _MODAL_ONLY_TYPES: Tuple[Type, ...] = (Label, RadioGroup, CheckboxGroup, Checkbo
 _MEDIA_GALLERY_MIN_ITEMS = 1
 _MEDIA_GALLERY_MAX_ITEMS = 10
 
+# TextDisplay's content-length cap. Discord's component reference limits a
+# text display's ``content`` to 4000 characters. discord.py stores it as a
+# plain string with no length check, so an oversized body constructs cleanly
+# and only fails at HTTP send. The grid builder enforces the same cap at
+# construction (``components/patterns/v2.py``); this keeps the general
+# validator in step with it.
+_TEXTDISPLAY_MAX_CHARS = 4000
+
+# Button label-length cap. Discord's component reference limits a button's
+# ``label`` to 80 characters. discord.py stores it as a plain string with no
+# length check, so an oversized label constructs cleanly and only fails at
+# HTTP send.
+_BUTTON_LABEL_MAX = 80
+
+# Select placeholder-length cap. Discord's component reference limits a
+# select's ``placeholder`` to 150 characters. discord.py stores it as a plain
+# string with no length check, so oversized placeholder text constructs
+# cleanly and only fails at HTTP send.
+_SELECT_PLACEHOLDER_MAX = 150
+
+# SelectOption text cap. Discord's component reference limits each select
+# option's ``label``, ``value``, and ``description`` to 100 characters.
+# discord.py stores all three as plain strings with no length check, so
+# oversized option text constructs cleanly and only fails at HTTP send.
+_SELECT_OPTION_TEXT_MAX = 100
+
 # Section's documented child-count minimum. Discord's API docs at
 # ``developers/components/reference.mdx`` describe the Section
 # ``components`` field as "One to three child components". The
@@ -138,7 +164,10 @@ def _validate_top_level(item, path: List[str]) -> None:
     if isinstance(item, MediaGallery):
         _check_media_gallery_size(item, path)
         return
-    if isinstance(item, (TextDisplay, File, Separator)):
+    if isinstance(item, TextDisplay):
+        _check_textdisplay_size(item, path)
+        return
+    if isinstance(item, (File, Separator)):
         return
     if isinstance(item, _MODAL_ONLY_TYPES):
         _raise_placement_error(
@@ -205,7 +234,10 @@ def _validate_container(container: Container, path: List[str]) -> None:
         if isinstance(child, MediaGallery):
             _check_media_gallery_size(child, child_path)
             continue
-        if isinstance(child, (TextDisplay, File, Separator)):
+        if isinstance(child, TextDisplay):
+            _check_textdisplay_size(child, child_path)
+            continue
+        if isinstance(child, (File, Separator)):
             continue
         if isinstance(child, _MODAL_ONLY_TYPES):
             _raise_placement_error(
@@ -265,6 +297,7 @@ def _validate_section(section: Section, path: List[str]) -> None:
                 "outer Container, or replace one of the Sections with a TextDisplay.",
             )
         if isinstance(child, TextDisplay):
+            _check_textdisplay_size(child, child_path)
             continue
         # Children that are clearly wrong-domain raise; truly unknown
         # types pass through so a future Discord type does not break.
@@ -281,7 +314,10 @@ def _validate_section(section: Section, path: List[str]) -> None:
             )
 
     accessory = section.accessory
-    if isinstance(accessory, (Button, Thumbnail)):
+    if isinstance(accessory, Button):
+        _check_button_label(accessory, path + [f"accessory({type(accessory).__name__})"])
+        return
+    if isinstance(accessory, Thumbnail):
         return
     # Known wrong-domain accessory types raise with a directed message.
     # Truly unknown Item subclasses pass through -- Discord may add a
@@ -316,7 +352,11 @@ def _validate_action_row(row: ActionRow, path: List[str]) -> None:
     _check_action_row_size(row, path)
     for index, child in enumerate(row.children):
         child_path = path + [f"{type(child).__name__}[{index}]"]
-        if isinstance(child, (Button, BaseSelect)):
+        if isinstance(child, Button):
+            _check_button_label(child, child_path)
+            continue
+        if isinstance(child, BaseSelect):
+            _check_select_text(child, child_path)
             continue
         if isinstance(
             child,
@@ -332,6 +372,101 @@ def _validate_action_row(row: ActionRow, path: List[str]) -> None:
 
 
 # // ========================================( Cap Helpers )======================================== // #
+
+
+def _check_textdisplay_size(item: TextDisplay, path: List[str]) -> None:
+    """Reject a ``TextDisplay`` whose content exceeds Discord's 4000-char cap.
+
+    discord.py stores ``content`` as a plain string with no length check, so
+    an oversized body constructs cleanly and fails only at HTTP send, far from
+    where it was built. The validator catches it here at the same seams it
+    catches the MediaGallery cap.
+    """
+    content = getattr(item, "content", None)
+    if content is None:
+        return
+    length = len(content)
+    if length > _TEXTDISPLAY_MAX_CHARS:
+        raise ValueError(
+            f"Invalid V2 placement: TextDisplay content is {length} characters, "
+            f"over Discord's {_TEXTDISPLAY_MAX_CHARS}-character cap.\n"
+            f"  Path: {' -> '.join(path)}\n"
+            f"  Discord rejects this composition with HTTP 400.\n"
+            f"  Fix: Shorten the TextDisplay, or split it across several."
+        )
+
+
+def _check_button_label(button: Button, path: List[str]) -> None:
+    """Reject a ``Button`` whose label exceeds Discord's 80-char cap.
+
+    discord.py stores ``label`` as a plain string with no length check, so an
+    oversized label constructs cleanly and fails only at HTTP send, far from
+    where it was built. The validator catches it here at every seam a Button is
+    visited: ActionRow children and Section accessories.
+    """
+    label = getattr(button, "label", None)
+    if label is None:
+        return
+    length = len(label)
+    if length > _BUTTON_LABEL_MAX:
+        raise ValueError(
+            f"Invalid V2 placement: Button label is {length} characters, "
+            f"over Discord's {_BUTTON_LABEL_MAX}-character cap.\n"
+            f"  Path: {' -> '.join(path)}\n"
+            f"  Discord rejects this composition with HTTP 400.\n"
+            f"  Fix: Shorten the Button label to {_BUTTON_LABEL_MAX} characters or fewer."
+        )
+
+
+def _check_select_text(select: BaseSelect, path: List[str]) -> None:
+    """Reject a select whose placeholder or option text exceeds Discord's caps.
+
+    Discord limits a select's ``placeholder`` to 150 characters and each
+    ``SelectOption``'s ``label``, ``value``, and ``description`` to 100
+    characters. discord.py stores all four as plain strings with no length
+    check, so oversized text constructs cleanly and fails only at HTTP send.
+    Auto-populated selects (User / Role / Channel / Mentionable) and unknown
+    select types expose no ``options``, so that read defaults to an empty list.
+    """
+    placeholder = getattr(select, "placeholder", None)
+    if placeholder is not None and len(placeholder) > _SELECT_PLACEHOLDER_MAX:
+        raise ValueError(
+            f"Invalid V2 placement: Select placeholder is {len(placeholder)} characters, "
+            f"over Discord's {_SELECT_PLACEHOLDER_MAX}-character cap.\n"
+            f"  Path: {' -> '.join(path)}\n"
+            f"  Discord rejects this composition with HTTP 400.\n"
+            f"  Fix: Shorten the Select placeholder to {_SELECT_PLACEHOLDER_MAX} characters or fewer."
+        )
+    for index, option in enumerate(getattr(select, "options", [])):
+        option_path = path + [f"options[{index}]"]
+        label = getattr(option, "label", None)
+        if label is not None and len(label) > _SELECT_OPTION_TEXT_MAX:
+            raise ValueError(
+                f"Invalid V2 placement: SelectOption label is {len(label)} characters, "
+                f"over Discord's {_SELECT_OPTION_TEXT_MAX}-character cap.\n"
+                f"  Path: {' -> '.join(option_path)}\n"
+                f"  Discord rejects this composition with HTTP 400.\n"
+                f"  Fix: Shorten the SelectOption label to {_SELECT_OPTION_TEXT_MAX} characters or fewer."
+            )
+        value = getattr(option, "value", None)
+        if value is not None and len(value) > _SELECT_OPTION_TEXT_MAX:
+            raise ValueError(
+                f"Invalid V2 placement: SelectOption value is {len(value)} characters, "
+                f"over Discord's {_SELECT_OPTION_TEXT_MAX}-character cap.\n"
+                f"  Path: {' -> '.join(option_path)}\n"
+                f"  Discord rejects this composition with HTTP 400.\n"
+                f"  Fix: Shorten the SelectOption value to {_SELECT_OPTION_TEXT_MAX} characters or fewer."
+            )
+        description = getattr(option, "description", None)
+        if description is not None and len(description) > _SELECT_OPTION_TEXT_MAX:
+            raise ValueError(
+                f"Invalid V2 placement: SelectOption description is {len(description)} "
+                f"characters, over Discord's {_SELECT_OPTION_TEXT_MAX}-character cap.\n"
+                f"  Path: {' -> '.join(option_path)}\n"
+                f"  Discord rejects this composition with HTTP 400.\n"
+                f"  Fix: Shorten the SelectOption description to {_SELECT_OPTION_TEXT_MAX} "
+                f"characters or fewer."
+            )
 
 
 def _check_media_gallery_size(gallery: MediaGallery, path: List[str]) -> None:

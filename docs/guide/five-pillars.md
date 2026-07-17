@@ -385,6 +385,7 @@ Every class attribute, grouped by pillar, with its default value:
     auto_defer_delay = 2.5
     serialize_interactions = True
     edit_timeout = 60.0  # per-edit Discord HTTP ceiling; None = unbounded
+    refresh_cooldown_ms = None  # paces background re-renders; clicks are exempt
     auto_refresh_ephemeral = None  # derives from timeout; pin with True/False
     reopen_failure_message = "Could not refresh this view..."
     enable_undo = False
@@ -406,9 +407,11 @@ Every class attribute, grouped by pillar, with its default value:
 
     ```python
     auto_back_button = False
+    nav_rebuild = None  # edit kwargs a pop supplies for itself (V1 embeds)
     # push(view, rebuild=) -- method
     # pop(rebuild=) -- method
     # replace(view) -- method
+    # get_nav_state() / restore_nav_state(state) -- override pair
     ```
 
 ---

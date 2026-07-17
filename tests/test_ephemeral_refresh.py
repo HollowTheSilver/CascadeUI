@@ -8,14 +8,17 @@ Covers the v2.2.0 fixes:
   freezing them
 """
 
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 import pytest
+from discord.ui import ActionRow
 from helpers import RenderableLayoutView
 from helpers import make_interaction as _make_interaction
 
 from cascadeui import InstanceLimitError
+from cascadeui.components.base import StatefulButton
 from cascadeui.views.layout import StatefulLayoutView
 from cascadeui.views.view import StatefulView
 
@@ -85,6 +88,63 @@ class TestArmRefreshButton:
         await view._arm_refresh_button()
 
         assert view._refresh_armed is True
+        view._message.edit.assert_awaited_once()
+
+    async def test_arm_ships_inside_an_active_cooldown_window(self):
+        """The arming edit answers to the 900s token expiry, not to the
+        library's own pacing.
+
+        A view carrying ``refresh_cooldown_ms`` would otherwise queue its
+        handoff behind the cooldown window, and a window longer than the
+        90-second arming margin would strand it entirely.
+        """
+
+        class _View(StatefulLayoutView):
+            auto_refresh_ephemeral = True
+            refresh_cooldown_ms = 120000  # longer than the 90s arming margin
+
+        view = _View(interaction=_make_interaction())
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+        view._cooldown_not_before = time.monotonic() + 120
+
+        await view._arm_refresh_button()
+
+        view._message.edit.assert_awaited_once()
+        assert view._deferred_refresh_task is None
+
+    async def test_deferred_refresh_does_not_rebuild_over_the_armed_tree(self):
+        """An armed view is frozen on its refresh button.
+
+        ``_handle_state_notification`` enforces that freeze, but
+        ``_deferred_refresh`` calls ``on_state_changed`` directly and used to
+        walk past it: the rebuild cleared the button, and the armed flag then
+        dropped every notification that could put it back, leaving a dead
+        panel at the token expiry.
+        """
+        rebuilds = []
+
+        class _View(StatefulLayoutView):
+            auto_refresh_ephemeral = True
+
+            def build_ui(self):
+                rebuilds.append(1)
+                self.clear_items()
+                self.add_item(ActionRow(StatefulButton(label="Normal", custom_id="n")))
+
+        view = _View(interaction=_make_interaction())
+        view.build_ui()
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+        view._refresh_armed = True
+        view._install_refresh_button(view._build_refresh_button())
+        armed_tree = list(view.children)
+        rebuilds.clear()
+
+        await view._deferred_refresh(0.01)
+
+        assert rebuilds == []  # build_ui must not run
+        assert list(view.children) == armed_tree
         view._message.edit.assert_awaited_once()
 
     async def test_arm_retries_without_emoji_on_50035(self):

@@ -249,11 +249,36 @@ class TestStatefulLayoutViewComponentBudget:
         view = StatefulLayoutView()
         view.add_item(Container(*[TextDisplay(f"a{i}") for i in range(10)]))  # 11 nodes
         with pytest.raises(ValueError) as exc_info:
-            view.add_item(Container(*[TextDisplay(f"b{i}") for i in range(40)]))
+            view.add_item(Container(*[TextDisplay(f"b{i}") for i in range(40)]))  # 41 nodes
         msg = str(exc_info.value)
         assert "40-component" in msg
         assert "control_buttons" in msg
-        assert "already at 11 components" in msg
+        # Both sides of the arithmetic, so the reader can see why it failed.
+        assert "holds 11 component(s)" in msg
+        assert "adds 41 more" in msg
+        assert "(52 > 40)" in msg
+
+    def test_message_reports_the_incoming_subtree_not_just_the_view(self):
+        """An oversized subtree onto an empty view reports the incoming size.
+
+        The view genuinely holds zero components, so its own count alone
+        cannot explain the rejection. The size of what is being added is
+        the number that does.
+        """
+        view = StatefulLayoutView()
+        with pytest.raises(ValueError) as exc_info:
+            view.add_item(Container(*[TextDisplay(f"t{i}") for i in range(50)]))
+        msg = str(exc_info.value)
+        assert "holds 0 component(s)" in msg
+        assert "Container adds 51 more" in msg
+        assert "(51 > 40)" in msg
+
+    def test_message_counts_a_section_accessory(self):
+        """Discord counts the accessory; a message that did not would mislead."""
+        view = StatefulLayoutView()
+        section = Section(TextDisplay("x"), accessory=Thumbnail("https://e.com/i.png"))
+        view.add_item(section)
+        assert view._total_children == 3  # Section + TextDisplay + Thumbnail
 
     def test_chains_discord_py_error(self):
         # The friendly error chains discord.py's terse original via `from`.
@@ -656,7 +681,7 @@ class TestReloadThrottleCoalescing:
 
         view = LoadingView(interaction=interaction)
         # Simulate an active cooldown window.
-        view._refresh_not_before = time.monotonic() + 30
+        view._cooldown_not_before = time.monotonic() + 30
 
         await view.reload()
         # The fetch was deferred, not run.
@@ -1010,6 +1035,30 @@ class TestStableCustomIds:
                 build_fn(self)
 
         return _V(interaction=_make_interaction())
+
+    def test_callback_without_a_qualname_does_not_crash_the_build(self):
+        """The anchor reads the callback's name, and not every callable has one.
+
+        A ``functools.partial`` carries no ``__qualname__``, and stabilization
+        runs inside every ``build_ui``, so reading it unguarded took down the
+        whole render rather than the one id it could not name.
+        """
+        import functools
+
+        async def handler(item_id, interaction):
+            pass
+
+        def build(view):
+            view.clear_items()
+            view.add_item(
+                ActionRow(StatefulButton(label="Go", callback=functools.partial(handler, 7)))
+            )
+
+        view = self._make_view_with_build(build)
+        view.build_ui()
+
+        button = view.children[0].children[0]
+        assert button.custom_id  # anchored, not raised
 
     def test_explicit_custom_id_preserved(self):
         def build(view):
@@ -1690,27 +1739,42 @@ class TestRenderHashShortCircuit:
             store.disable_perf()
 
 
-class _FakeRateLimit(discord.HTTPException):
-    """Minimal 429 stand-in for throttling tests.
+class _FakeResponse:
+    """Stand-in for the ``aiohttp`` response behind an ``HTTPException``.
 
-    ``discord.HTTPException.__init__`` requires a live ``aiohttp`` response
-    object; the real path is unreachable from a unit test. Bypassing the
-    parent init and setting the two attributes ``_handle_rate_limit``
-    actually reads (``status`` and ``retry_after``) keeps the subclass
-    check in ``refresh()`` honest.
+    ``HTTPException.__init__`` reads ``status`` and formats ``reason`` into
+    its message, so both are required for the real constructor to run.
     """
 
-    def __init__(self, retry_after: float = 0.5):
-        Exception.__init__(self, "429 rate limit")
-        self.status = 429
-        self.retry_after = retry_after
+    def __init__(self, status: int, headers: dict = None):
+        self.status = status
+        self.reason = "Too Many Requests" if status == 429 else "Error"
+        self.headers = headers or {}
+
+
+def _FakeRateLimit(retry_after: float = 0.5) -> discord.HTTPException:
+    """Build a 429 through the real ``HTTPException`` constructor.
+
+    A hand-rolled subclass that assigns ``self.retry_after`` tests a path
+    production cannot reach: the real parser keeps only ``code`` and
+    ``message`` from the body and never stores ``retry_after``, so the
+    delay is only ever available from the ``Retry-After`` header. Building
+    the exception the way discord.py does keeps the header the single
+    source, matching what ``_handle_rate_limit`` reads at runtime.
+    """
+    return discord.HTTPException(
+        _FakeResponse(429, {"Retry-After": str(retry_after)}),
+        {"message": "You are being rate limited.", "code": 0},
+    )
 
 
 class TestRefreshThrottling:
     """Reactive 429 backoff (always on) + proactive cooldown (opt-in via
-    ``refresh_cooldown_ms``) share the ``_refresh_not_before`` timestamp.
-    Refreshes landing inside the window defer via a single scheduled task
-    that re-enters ``on_state_changed`` once the window expires.
+    ``refresh_cooldown_ms``) arm separate windows: ``_ratelimit_not_before``
+    and ``_cooldown_not_before``. Refreshes landing inside either window
+    defer via a single scheduled task that re-enters ``on_state_changed``
+    once the window expires. Acting-interaction edits waive the cooldown
+    window only -- the rate-limit window binds every edit.
     """
 
     def _make_view(self, build_fn, **class_attrs):
@@ -1766,12 +1830,12 @@ class TestRefreshThrottling:
 
     async def test_cooldown_off_does_not_advance_throttle(self):
         """With ``refresh_cooldown_ms = None`` (default), successful edits
-        leave ``_refresh_not_before`` at 0 -- the proactive path is dead.
+        leave ``_cooldown_not_before`` at 0 -- the proactive path is dead.
         """
         view = self._make_view(self._build_simple)
         self._prime(view)
         await view.refresh()
-        assert view._refresh_not_before == 0.0
+        assert view._cooldown_not_before == 0.0
 
     async def test_proactive_cooldown_stamps_after_success(self):
         view = self._make_view(self._build_simple, refresh_cooldown_ms=200)
@@ -1779,7 +1843,9 @@ class TestRefreshThrottling:
         before = time.monotonic()
         await view.refresh()
         # Stamp should be at least now + cooldown (minus small scheduling slack).
-        assert view._refresh_not_before >= before + 0.19
+        assert view._cooldown_not_before >= before + 0.19
+        # The cooldown must not bleed into Discord's window.
+        assert view._ratelimit_not_before == 0.0
 
     async def test_refresh_in_cooldown_window_defers(self):
         """Second rapid refresh inside the window must not hit message.edit."""
@@ -1851,9 +1917,135 @@ class TestRefreshThrottling:
 
         view.on_state_changed.assert_not_awaited()
 
+    async def test_deferred_render_does_not_inherit_the_spawning_interaction(self):
+        """``asyncio.create_task`` copies the caller's context, so the
+        interaction bound when a deferred task was scheduled is still
+        readable inside it. A deferred render must not answer to it.
+
+        Two things go wrong if it does. It claims the acting waiver it is no
+        longer owed and skips the cooldown stamp, leaving the next background
+        edit unpaced; and it edits through a response slot whose 3-second ack
+        window closed long before the boundary arrived.
+        """
+        loads = []
+
+        class _V(StatefulLayoutView):
+            refresh_cooldown_ms = 200
+
+            async def on_load(self):
+                loads.append(1)
+                self.clear_items()
+                self.add_item(ActionRow(StatefulButton(label="Loaded", custom_id="l")))
+
+        view = _V(interaction=_make_interaction())
+        view.add_item(ActionRow(StatefulButton(label="Initial", custom_id="i")))
+        view._message = MagicMock()
+        view._message.id = 555
+        view._message.edit = AsyncMock()
+        view._last_tree_digest = None
+
+        await view.refresh()  # arms the cooldown window
+        armed_at = view._cooldown_not_before
+        assert armed_at > 0
+
+        # A click on a manual-refresh button: reload() takes no acting waiver,
+        # so it defers -- and the task is created with the interaction bound.
+        interaction = _make_interaction()
+        interaction.type = discord.InteractionType.component
+        interaction.message = MagicMock()
+        interaction.message.id = 555
+        interaction.response.is_done.return_value = False  # slot never acked
+        interaction.response.edit_message = AsyncMock()
+
+        token = _CURRENT_INTERACTION.set(interaction)
+        try:
+            await view.reload()
+        finally:
+            _CURRENT_INTERACTION.reset(token)
+        assert view._reload_pending is True
+
+        await asyncio.sleep(0.45)  # let the boundary task run
+
+        assert loads == [1]  # the coalesced reload did fetch
+        # The boundary render is background work: it stamps the window it owes.
+        assert view._cooldown_not_before > armed_at
+        # ...and it never touches the spent response slot.
+        interaction.response.edit_message.assert_not_awaited()
+        assert view._message.edit.await_count == 2
+
+    async def test_deferred_refresh_survives_a_window_extended_mid_sleep(self):
+        """A window that grows while the task sleeps must not lose the edit.
+
+        The task wakes, finds the window still active, and re-enters
+        ``refresh()``. The gate sees this very task registered as the pending
+        retry and declines to schedule a replacement; the task's ``finally``
+        then clears the last reference to it. Nothing remains to ship the
+        edit, and nothing reports the loss -- so the deferred sleep re-checks
+        the window instead of trusting the wait it was handed.
+        """
+        view = self._make_view(self._build_simple, refresh_cooldown_ms=200)
+        self._prime(view)
+
+        await view.refresh()  # ships, stamps a 200ms window
+        assert view._message.edit.await_count == 1
+
+        view._last_tree_digest = 0  # force the next edit past the digest skip
+        await view.refresh()  # inside the window -> deferred
+        assert view._message.edit.await_count == 1
+        assert view._deferred_refresh_task is not None
+
+        # Extend the window while the task sleeps.
+        await asyncio.sleep(0.1)
+        view._ratelimit_not_before = time.monotonic() + 0.3
+
+        # Past the ORIGINAL boundary, the task must still be waiting.
+        await asyncio.sleep(0.2)
+        assert view._message.edit.await_count == 1
+        assert view._deferred_refresh_task is not None
+
+        # Past the EXTENDED boundary, the edit finally ships.
+        await asyncio.sleep(0.35)
+        assert view._message.edit.await_count == 2
+
+    async def test_deferred_refresh_ships_edit_without_build_ui(self):
+        """A view that composes its tree outside ``build_ui`` still ships a
+        throttled edit at the cooldown boundary.
+
+        Tabs and wizards mutate the tree from their own rebuild methods and
+        define no ``build_ui``, so the default ``on_state_changed`` the
+        deferred task re-enters had nothing to rebuild and returned without
+        editing. The throttled refresh was then dropped outright rather than
+        delayed, stranding the message on the previous tree.
+        """
+
+        class _NoBuildUI(StatefulLayoutView):
+            refresh_cooldown_ms = 50
+
+        view = _NoBuildUI(interaction=_make_interaction())
+        view.add_item(ActionRow(StatefulButton(label="Before", custom_id="a")))
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+        view._last_tree_digest = None
+
+        await view.refresh()
+        assert view._message.edit.await_count == 1
+
+        # Recompose the way a tab switch does, then refresh inside the window.
+        view.clear_items()
+        view.add_item(ActionRow(StatefulButton(label="After", custom_id="b")))
+        await view.refresh()
+        assert view._message.edit.await_count == 1
+
+        await asyncio.sleep(0.12)
+        assert view._message.edit.await_count == 2
+
     async def test_reactive_429_stamps_backoff_window(self):
-        """429 raised by ``message.edit`` → ``_refresh_not_before`` set
-        from ``retry_after``, exception swallowed.
+        """429 raised by ``message.edit`` → ``_ratelimit_not_before`` set
+        from the ``Retry-After`` header, exception swallowed.
+
+        The upper bound is what makes this honest: the one-second fallback
+        would satisfy a lower bound on its own, so a window that lands at
+        0.75 proves the header was actually read.
         """
         view = self._make_view(self._build_simple)
         self._prime(view)
@@ -1862,7 +2054,45 @@ class TestRefreshThrottling:
         before = time.monotonic()
         await view.refresh()  # must not raise
 
-        assert view._refresh_not_before >= before + 0.7
+        assert before + 0.7 <= view._ratelimit_not_before <= before + 0.8
+        # A 429 is Discord's window, not the library's opt-in pacing.
+        assert view._cooldown_not_before == 0.0
+
+    async def test_reactive_429_without_header_backs_off_for_a_ban(self):
+        """A header-less 429 is a Cloudflare ban, and is paced like one.
+
+        discord.py absorbs and retries every ordinary rate-limit itself; it
+        raises only when the response carries no ``Via`` header, its own test
+        for an IP-level block. A one-second window would put the view back on
+        the wire ~1Hz against a block each attempt can extend, so the
+        fallback is minutes-scale. The lower bound is what makes this honest:
+        a one-second fallback would satisfy any looser assertion.
+        """
+        view = self._make_view(self._build_simple)
+        self._prime(view)
+        error = discord.HTTPException(_FakeResponse(429), {"message": "banned", "code": 0})
+        view._message.edit = AsyncMock(side_effect=error)
+
+        before = time.monotonic()
+        await view.refresh()
+
+        assert view._ratelimit_not_before >= before + 30
+
+    async def test_rate_limited_sibling_exception_is_caught(self):
+        """``discord.RateLimited`` subclasses ``DiscordException``, not
+        ``HTTPException``, so an ``except discord.HTTPException`` clause
+        misses it entirely. It is also the only rate-limit type that carries
+        ``retry_after`` as an attribute, so the window comes straight off it.
+        """
+        view = self._make_view(self._build_simple)
+        self._prime(view)
+        assert not issubclass(discord.RateLimited, discord.HTTPException)
+        view._message.edit = AsyncMock(side_effect=discord.RateLimited(2.0))
+
+        before = time.monotonic()
+        await view.refresh()  # must not raise
+
+        assert before + 1.9 <= view._ratelimit_not_before <= before + 2.1
 
     async def test_reactive_429_defers_next_refresh(self):
         view = self._make_view(self._build_simple)
@@ -1890,17 +2120,12 @@ class TestRefreshThrottling:
         must propagate to the caller.
         """
 
-        class _OtherError(discord.HTTPException):
-            def __init__(self):
-                Exception.__init__(self, "500")
-                self.status = 500
-                self.retry_after = 0
-
+        error = discord.HTTPException(_FakeResponse(500), {"message": "server error", "code": 0})
         view = self._make_view(self._build_simple)
         self._prime(view)
-        view._message.edit = AsyncMock(side_effect=_OtherError())
+        view._message.edit = AsyncMock(side_effect=error)
 
-        with pytest.raises(_OtherError):
+        with pytest.raises(discord.HTTPException):
             await view.refresh()
 
     async def test_render_hash_skip_does_not_stamp_cooldown(self):
@@ -1915,7 +2140,153 @@ class TestRefreshThrottling:
         await view.refresh()
 
         view._message.edit.assert_not_called()
-        assert view._refresh_not_before == 0.0
+        assert view._cooldown_not_before == 0.0
+
+
+class TestActingEditCooldownExemption:
+    """An edit answering a click on this view's own message waives the
+    proactive cooldown, but never the reactive 429 window.
+
+    ``refresh_cooldown_ms`` paces the library's own background re-renders.
+    Applying it to interaction-driven edits taxed page turns by up to the
+    full window on any view that also reloads out of band, because the
+    background reloads kept the window permanently armed. The rate-limit
+    window is Discord's answer rather than the library's pacing, so no
+    edit waives it.
+    """
+
+    def _make_view(self, **class_attrs):
+        class _V(StatefulLayoutView):
+            def build_ui(self):
+                self.clear_items()
+                self.add_item(ActionRow(StatefulButton(label="Fire", custom_id="a")))
+
+        for name, value in class_attrs.items():
+            setattr(_V, name, value)
+        view = _V(interaction=_make_interaction())
+        view.build_ui()
+        view._message = MagicMock()
+        view._message.id = 555
+        view._message.edit = AsyncMock()
+        view._last_tree_digest = None
+        return view
+
+    def _acting_interaction(self, message_id=555, is_done=True):
+        """A component click on the view's own message.
+
+        ``is_done=True`` by default so the edit routes through the channel
+        endpoint: it isolates the cooldown decision from the fast path,
+        which has its own separate qualification.
+        """
+        interaction = _make_interaction()
+        interaction.type = discord.InteractionType.component
+        interaction.message = MagicMock()
+        interaction.message.id = message_id
+        interaction.response.is_done.return_value = is_done
+        return interaction
+
+    async def _refresh_as(self, view, interaction):
+        token = _CURRENT_INTERACTION.set(interaction)
+        try:
+            await view.refresh()
+        finally:
+            _CURRENT_INTERACTION.reset(token)
+
+    async def test_acting_edit_ships_inside_cooldown_window(self):
+        """An acting refresh ships immediately inside an open cooldown window."""
+        view = self._make_view(refresh_cooldown_ms=5000)
+        view._cooldown_not_before = time.monotonic() + 5  # window wide open
+
+        await self._refresh_as(view, self._acting_interaction())
+
+        view._message.edit.assert_awaited_once()
+        assert view._deferred_refresh_task is None
+
+    async def test_background_edit_still_defers_inside_cooldown_window(self):
+        """The exemption is scoped to acting edits; background pacing holds."""
+        view = self._make_view(refresh_cooldown_ms=5000)
+        view._cooldown_not_before = time.monotonic() + 5
+
+        await view.refresh()  # no bound interaction
+
+        view._message.edit.assert_not_called()
+        assert view._deferred_refresh_task is not None
+        view._deferred_refresh_task.cancel()
+
+    async def test_acting_edit_defers_inside_ratelimit_window(self):
+        """A 429 binds every edit. Waiving it would hammer an endpoint that
+        has already said stop.
+        """
+        view = self._make_view(refresh_cooldown_ms=5000)
+        view._ratelimit_not_before = time.monotonic() + 5
+
+        await self._refresh_as(view, self._acting_interaction())
+
+        view._message.edit.assert_not_called()
+        assert view._deferred_refresh_task is not None
+        view._deferred_refresh_task.cancel()
+
+    async def test_acting_edit_does_not_stamp_the_cooldown(self):
+        """Otherwise a user holding a button pushes the window ahead of
+        every background reload indefinitely.
+        """
+        view = self._make_view(refresh_cooldown_ms=5000)
+
+        await self._refresh_as(view, self._acting_interaction())
+
+        view._message.edit.assert_awaited_once()
+        assert view._cooldown_not_before == 0.0
+
+    async def test_background_edit_still_stamps_the_cooldown(self):
+        view = self._make_view(refresh_cooldown_ms=5000)
+        before = time.monotonic()
+
+        await view.refresh()
+
+        assert view._cooldown_not_before >= before + 4.9
+
+    async def test_cross_view_click_is_not_acting(self):
+        """A click on a different message is a background edit here."""
+        view = self._make_view(refresh_cooldown_ms=5000)
+        view._cooldown_not_before = time.monotonic() + 5
+
+        await self._refresh_as(view, self._acting_interaction(message_id=999))
+
+        view._message.edit.assert_not_called()
+        assert view._deferred_refresh_task is not None
+        view._deferred_refresh_task.cancel()
+
+    async def test_reload_never_takes_the_acting_waiver(self):
+        """reload()'s gate throttles the on_load FETCH, not just the edit.
+        Waiving it for clicks would turn a manual refresh button into an
+        unbounded query against the caller's data source.
+        """
+        loads = []
+
+        class _V(StatefulLayoutView):
+            refresh_cooldown_ms = 5000
+
+            async def on_load(self):
+                loads.append(1)
+
+            async def refresh(self, **kwargs):
+                pass
+
+        view = _V(interaction=_make_interaction())
+        view._message = MagicMock()
+        view._message.id = 555
+        view._cooldown_not_before = time.monotonic() + 5
+
+        token = _CURRENT_INTERACTION.set(self._acting_interaction())
+        try:
+            await view.reload()
+        finally:
+            _CURRENT_INTERACTION.reset(token)
+
+        assert loads == []  # the fetch was deferred, not run
+        assert view._reload_pending is True
+        if view._deferred_refresh_task is not None:
+            view._deferred_refresh_task.cancel()
 
 
 class TestActingViewFastPath:
@@ -2076,9 +2447,15 @@ class TestActingViewFastPath:
 
     async def test_fast_path_429_arms_backoff_and_swallows(self):
         """429 on ``interaction.response.edit_message`` routes through
-        ``_handle_rate_limit`` exactly like the channel path -- sets
-        the backoff window, swallows the exception, does NOT fall
-        through to the channel endpoint (no retry storm).
+        ``_handle_rate_limit`` exactly like the channel path: it arms the
+        backoff window, swallows the exception, and does NOT immediately
+        fall through to the channel endpoint. The edit is re-queued to ship
+        once the window clears rather than retried on the spot.
+
+        The upper bound matters as much here as on the channel-path sibling:
+        this branch shares the same ``_handle_rate_limit``, so a regression to
+        the ban fallback would land here too, and a lower bound alone would
+        stay green through it.
         """
         view = self._make_view(self._build_simple)
         self._prime(view)
@@ -2092,8 +2469,10 @@ class TestActingViewFastPath:
         finally:
             _CURRENT_INTERACTION.reset(token)
 
-        assert view._refresh_not_before >= before + 0.7
+        assert before + 0.7 <= view._ratelimit_not_before <= before + 0.8
         view._message.edit.assert_not_called()
+        if view._deferred_refresh_task is not None:
+            view._deferred_refresh_task.cancel()
 
     async def test_fast_path_general_http_error_falls_through(self):
         """Non-429 HTTP errors (500, 502, network blip) on the fast
@@ -2143,7 +2522,7 @@ class TestActingViewFastPath:
         server-side is indeterminate, and a redundant edit is cheaper
         than a stuck UI.
 
-        ``_refresh_not_before`` is NOT armed: a stall is not a
+        ``_ratelimit_not_before`` is NOT armed: a stall is not a
         rate-limit signal, so the next refresh should not be throttled.
         """
 
@@ -2183,7 +2562,7 @@ class TestActingViewFastPath:
         # 60s sleep -- proves the wait_for guard fired.
         assert elapsed < 2.0
         # Stall is not a rate-limit signal: backoff window stays at zero.
-        assert view._refresh_not_before == 0.0
+        assert view._ratelimit_not_before == 0.0
         # Digest invalidated so the next refresh ships unconditionally.
         assert view._last_tree_digest is None
 
@@ -2376,3 +2755,109 @@ class TestDisplayLayoutView:
         interaction = _make_interaction()
         with pytest.raises(TypeError, match="container"):
             DisplayLayoutView(interaction=interaction)
+
+
+class TestRateLimitSchedulesARetry:
+    """A rate-limit arms the backoff window; something must still ship the edit.
+
+    Every 429 seam stamps the window and returns, so the edit in flight is
+    dropped. Most views live through that -- their next state notification
+    renders whatever is current. An armed ephemeral view does not: the armed
+    flag is set before the arming edit and then drops every notification that
+    could repair it, so a 429 there left a frozen panel with no refresh button
+    and nothing left to give it one.
+    """
+
+    def _make_view(self, cooldown=None):
+        class _V(StatefulLayoutView):
+            def build_ui(self):
+                self.clear_items()
+                self.add_item(ActionRow(StatefulButton(label="Fire", custom_id="a")))
+
+        if cooldown is not None:
+            _V.refresh_cooldown_ms = cooldown
+        view = _V(interaction=_make_interaction())
+        view.build_ui()
+        view._message = MagicMock()
+        view._message.id = 555
+        view._last_tree_digest = None
+        return view
+
+    async def test_a_rate_limited_refresh_queues_a_retry(self):
+        view = self._make_view()
+        view._message.edit = AsyncMock(side_effect=_FakeRateLimit(retry_after=0.2))
+
+        await view.refresh()  # 429 -> swallowed, window armed
+
+        assert view._deferred_refresh_task is not None
+        view._deferred_refresh_task.cancel()
+
+    async def test_the_queued_retry_ships_the_edit_at_the_boundary(self):
+        view = self._make_view()
+        # 429 once, then succeed -- the retry is what lands the edit.
+        view._message.edit = AsyncMock(side_effect=[_FakeRateLimit(retry_after=0.15), None])
+
+        await view.refresh()
+        assert view._message.edit.await_count == 1  # only the failed attempt
+
+        await asyncio.sleep(0.35)
+
+        assert view._message.edit.await_count == 2  # the retry shipped it
+
+    async def test_a_rate_limited_arming_edit_still_reaches_the_message(self):
+        """The case with no second chance: the armed flag freezes every other
+        repair, so if this edit does not land the panel is dead at the token
+        expiry. The queued retry is the only thing standing between a 429 here
+        and a user holding a frozen view with no refresh button.
+        """
+
+        class _Eph(StatefulLayoutView):
+            auto_refresh_ephemeral = True
+
+            def build_ui(self):
+                self.clear_items()
+                self.add_item(ActionRow(StatefulButton(label="Normal", custom_id="n")))
+
+        view = _Eph(interaction=_make_interaction())
+        view.build_ui()
+        view._message = MagicMock()
+        view._message.id = 555
+        view._ephemeral = True
+        view._last_tree_digest = None
+        view._message.edit = AsyncMock(side_effect=[_FakeRateLimit(retry_after=0.15), None])
+
+        await view._arm_refresh_button()
+        assert view._refresh_armed is True
+        assert view._message.edit.await_count == 1  # the arming edit 429'd
+
+        await asyncio.sleep(0.35)
+
+        # The retry shipped, and it shipped the ARMED tree (no rebuild).
+        assert view._message.edit.await_count == 2
+        assert view._refresh_armed is True
+
+    async def test_a_retry_that_is_rate_limited_again_schedules_a_successor(self):
+        """One try is not enough: the view must recover when the block lifts."""
+        view = self._make_view()
+        view._message.edit = AsyncMock(
+            side_effect=[
+                _FakeRateLimit(retry_after=0.1),
+                _FakeRateLimit(retry_after=0.1),
+                None,
+            ]
+        )
+
+        await view.refresh()
+        await asyncio.sleep(0.5)
+
+        assert view._message.edit.await_count == 3  # failed, failed, landed
+        assert view._deferred_refresh_task is None  # settled, nothing left pending
+
+    async def test_no_retry_is_queued_for_a_finished_view(self):
+        view = self._make_view()
+        view._message.edit = AsyncMock(side_effect=_FakeRateLimit(retry_after=0.2))
+        view.stop()
+
+        await view.refresh()
+
+        assert view._deferred_refresh_task is None

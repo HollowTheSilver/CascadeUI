@@ -1,7 +1,12 @@
 # // ========================================( Modules )======================================== // #
 
 
-from .coercion import coerce_snowflake_id, coerce_snowflake_id_set
+from .coercion import (
+    coerce_snowflake_id,
+    coerce_snowflake_id_set,
+    coerce_snowflake_match,
+    is_snowflake,
+)
 from .decorators import cascade_component, cascade_reducer
 from .errors import safe_execute, with_error_boundary, with_retry
 from .fetch import fetch_as_file
@@ -22,5 +27,7 @@ __all__ = [
     "get_task_manager",
     "coerce_snowflake_id",
     "coerce_snowflake_id_set",
+    "coerce_snowflake_match",
+    "is_snowflake",
     "fetch_as_file",
 ]

@@ -612,6 +612,7 @@ for row in rows:
 - `PaginatedView.from_cursor()` for lazy cursor-driven pagination with LRU page cache
 - `DisplayLayoutView` for one-shot V2 sends from a pre-built container
 - Automatic state-driven rebuilds: define `build_ui()`, the library handles the edit (≈ React `render()`)
+- `refresh_cooldown_ms` to pace library-initiated re-renders, with always-on reactive 429 backoff that retries at the window boundary
 - Theming with per-view overrides and a `ContextVar` that propagates through builders (≈ `React.Context`)
 
 ### Components
@@ -632,7 +633,7 @@ for row in rows:
 - `check_instance_available()` for fail-fast pre-checks before constructing expensive views
 - Auto-defer with `respond()`, `open_modal()`, and `_safe_defer()` helpers
 - Interaction serialization so rapid clicks process sequentially
-- Refresh throttling via `refresh_cooldown_ms` and reactive 429 backoff
+- `with_cooldown()` to rate-limit one control per clicker, surviving the component being rebuilt
 - `edit_timeout` ceiling that cancels stalled Discord edits before they pin a view
 - Silent snowflake coercion at every public boundary
 - Class-attribute validation at subclass-definition time

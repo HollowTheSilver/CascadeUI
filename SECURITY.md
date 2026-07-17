@@ -47,12 +47,18 @@ Security concerns most likely involve:
   by default - views opt in per-slot via `persistent_slots`. A vulnerability
   here would involve data crossing a scope boundary it should not cross
   (e.g. one user reading another user's scoped state).
-- **Persistence backends** exposed without access controls. The shipped
-  `SQLiteBackend` writes to a local file; `InMemoryBackend` is
-  process-local; third-party backends implementing the
-  `PersistenceBackend` Protocol are outside the library's trust boundary.
-  Report issues in shipped backends; issues in third-party backends belong
-  to those projects.
+- **Persistence backends** exposed without access controls.
+  `InMemoryBackend` is process-local and `SQLiteBackend` writes to a local
+  file, so both inherit the host's filesystem boundary. `PostgresBackend`
+  is the one shipped backend with a network surface: it takes credentials
+  in a connection string, honors the caller's `sslmode`, and holds a
+  dedicated `LISTEN`/`NOTIFY` connection for cross-process invalidation.
+  Credential handling, `sslmode` forwarding, and `NOTIFY` payload
+  construction are in scope. The connection string reaches `asyncpg`
+  unparsed, so libpq's handling of it is not. Third-party backends
+  implementing the `PersistenceBackend` Protocol are outside the library's
+  trust boundary: report issues in shipped backends, and issues in
+  third-party backends to those projects.
 - **Information leakage** through ephemeral message handling, including
   token-refresh handoffs, `_reopen_ephemeral` factories, and the
   armed-refresh-view freeze window.

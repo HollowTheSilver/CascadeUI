@@ -120,7 +120,7 @@ naturally. Shortly before the wall, CascadeUI replaces
 the view's children with a single "Continue Session" button. When the user
 clicks it, the click carries a brand new interaction token (independent of the
 original), and CascadeUI spawns a fresh ephemeral with another full 15-minute
-window. The handoff preserves all state -- no need to close and reopen
+window. The handoff preserves all state: no need to close and reopen
 from a parent panel. See `auto_refresh_ephemeral` in
 [`api/views.md`](../api/views.md) for the customization knobs
 (`refresh_warning_seconds`, `refresh_button_label`, `refresh_button_emoji`,
@@ -197,7 +197,7 @@ been stress-tested with hundreds of concurrent users on a single
 view. The auto-defer timer pre-acks the queued click, the
 acting-view fast path is then disqualified, the refresh falls
 through to the channel endpoint, and the work completes
-correctly -- but Discord's client may briefly show *"This
+correctly; Discord's client may nonetheless briefly show *"This
 interaction failed"* before the channel-endpoint edit lands.
 
 **What actually happens:** the click DID succeed. State mutated, the
@@ -324,7 +324,7 @@ sent.
 | Buttons per ActionRow | 5 |
 | Select menus per ActionRow | 1 (consumes the entire row) |
 | Options per Select menu | 25 |
-| Options per `CheckboxGroup` | 10 |
+| Options per `CheckboxGroup` | 1-10 |
 | Options per `RadioGroup` | 2-10 |
 | Total components per V2 LayoutView | 40 |
 | Components per ActionRow (V2) | 5 |

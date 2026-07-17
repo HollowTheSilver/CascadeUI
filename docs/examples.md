@@ -101,6 +101,12 @@ Display-only showcase for the grid helpers (`emoji_grid()` and `button_grid()`).
 
 **Commands:** `/emoji_grid`, `/button_grid`
 
+### v2_attachments.py
+
+Display-only showcase for the V2 media builders (`gallery()`, `image_section()`, `file_attachment()`) with local file uploads. Demonstrates the `MediaInput` union and the rule that the reference and the bytes travel separately: the builder emits an `attachment://<filename>` reference into the tree, while the matching `discord.File` rides along via `send(files=[...])` or `refresh(attachments=[...])`. Sending one without the other renders an unresolved placeholder, which `/attach_swap` shows being corrected in place.
+
+**Commands:** `/attach_gallery`, `/attach_section`, `/attach_download`, `/attach_swap`
+
 ### v2_battleship.py
 
 Two-player 10x10 Battleship with a standard fleet, text-rendered emoji grids, a fleet setup phase with re-roll consensus, ephemeral private fleet panels via `attach_child()`, turn-based select targeting, and automatic cleanup via `_cleanup_attached_children()` on game end. Demonstrates `attach_child()`, `register_participant()`, dispatch-then-cleanup ordering, the ephemeral interaction-bound constraint, and live cross-view reactivity (Re-Roll dispatches update both the ephemeral and the public ready card via the standard subscriber pipeline). A phase-aware `exit()` override deletes an abandoned setup but freezes the finished board as a record. `/battleship leaderboard` renders server rankings on a Section-mode `LeaderboardLayoutView` with avatar thumbnails and an Overview stats card.

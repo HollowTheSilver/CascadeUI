@@ -16,6 +16,23 @@ All patterns follow the same customization grammar:
 - **`_build_extra_items()`** is a hook called once during init to
   register components that persist across content changes.
 
+Every pattern renders its own first message, so `await view.send()` is the
+whole call. A V2 pattern *is* its component tree and needs nothing further,
+and its `send()` takes no `embed` or `content` at all. A V1 pattern's content
+is an embed, and each one supplies its own; pass `embed=` or `content=` there
+to override what the pattern would have built:
+
+```python
+class SetupWizard(WizardView):   # V1: content is an embed
+    ...
+
+view = SetupWizard(interaction=interaction, steps=steps)
+
+await view.send()                       # the wizard's own first step
+# ...or override it:
+await view.send(embed=discord.Embed(title="Welcome"))
+```
+
 ---
 
 ## MenuView / MenuLayoutView
@@ -93,13 +110,26 @@ parameter:
 | `style` | No | Per-category `ButtonStyle` override (falls back to `menu_style`) |
 | `rebuild` | No | Per-category rebuild callable for `push(rebuild=...)` |
 
+!!! warning "Cross-version categories are rejected at construction"
+    A category whose `"view"` is the other component version raises
+    `TypeError` when the menu is constructed: a V1 `MenuView` cannot list a
+    `StatefulLayoutView`-based destination, and a V2 `MenuLayoutView` cannot
+    list a `StatefulView`-based one. `push()` rejects the same mismatch on
+    click (see
+    [V1 and V2 Views Cannot Push/Pop Between Each Other](known-limitations.md#v1-and-v2-views-cannot-pushpop-between-each-other)),
+    so validating the category list up front keeps the dead button away from
+    the user.
+
 ### Default Rebuild Behavior
 
-Each category button pushes to its target view class with a default
-`rebuild` callable:
+A destination that names its own `nav_rebuild` renders its own way, and the
+menu leaves it alone. Every built-in pattern does this, so a category
+opening a `FormView` or a `PaginatedView` needs no `"rebuild"` key.
 
-- **V2:** `lambda v: v.build_ui()` -- rebuilds the component tree
-- **V1:** `lambda v: {"embed": v.build_embed()}` -- rebuilds the embed
+A plain view names none, so the menu supplies the shape its version needs:
+
+- **V2:** `lambda v: v.build_ui()` - rebuilds the component tree
+- **V1:** `lambda v: {"embed": v.build_embed()}` - rebuilds the embed
 
 Override per category with the `"rebuild"` key when a sub-view needs
 different synchronous initialization:
@@ -110,8 +140,8 @@ different synchronous initialization:
 ```
 
 When a sub-view loads its content from a database or other async source,
-define `on_load()` on the sub-view and omit the `"rebuild"` key entirely --
-the library calls `on_load()` before the push edit, so the sub-view
+define `on_load()` on the sub-view and omit the `"rebuild"` key entirely.
+The library calls `on_load()` before the push edit, so the sub-view
 re-fetches on every navigation. See
 [Navigating database-backed views](views.md#navigating-database-backed-views).
 
@@ -209,15 +239,16 @@ fields = [
 |-----------|----------|-------------|
 | `id` | Yes | Unique identifier, used as key in `self.values` |
 | `label` | No | Display label (defaults to `id`) |
-| `type` | Yes | `"text"`, `"integer"`, `"float"`, `"date"`, `"boolean"`, `"select"`, or `"multi_select"` |
+| `type` | No (defaults to `"text"`) | `"text"`, `"integer"`, `"float"`, `"date"`, `"boolean"`, `"select"`, or `"multi_select"` |
 | `required` | No | Whether the field must be filled before submit |
 | `options` | Select only | List of `{"label", "value"}` dicts |
 | `placeholder` | No | Placeholder text for selects and text inputs |
 | `validators` | No | List of validator callables (see [Validation](../api/validation.md)) |
-| `default` | Text only | Pre-filled value for the text input |
+| `default` | No | Initial value, seeded into `self.values` at construction for any field type; also pre-fills the modal input for `text`/`integer`/`float`/`date` fields. A `default` on a `select` or `boolean` field pre-selects that option and satisfies its `required` check without user interaction. |
 | `style` | Text only | `discord.TextStyle.short` (default) or `.long` |
+| `secret` | No | Mask the value in the form display (a password or token) as fixed dots. Discord modals cannot mask the input itself, so this covers the display only. |
 | `min_length` / `max_length` | Text only | Character limits on text input |
-| `min_value` / `max_value` | Numeric only | Range limits on `integer` and `float` fields |
+| `min_value` / `max_value` | Numeric only | Range limits on `integer` and `float` fields, enforced at parse time: an out-of-range or non-finite (`"nan"`, `"inf"`) value is held as an unparsed draft, the same as malformed text, and never reaches `self.values`. |
 | `group` | No | Field-group label (see [Field Groups](#field-groups)) |
 
 ### Typed schemas (`FormField` / `FormSchema`)
@@ -271,7 +302,7 @@ ephemeral responses. Two attributes hold error state:
 
 | Attribute | Shape | Rendered where |
 |-----------|-------|----------------|
-| `_field_errors` | `dict[str, str]` | Under the offending field (V2: red `alert()`; V1: inline in the embed) |
+| `_field_errors` | `dict[str, list[str]]` | Under the offending field (V2: red `alert()`; V1: inline in the embed) |
 | `_form_error` | `Optional[str]` | At the top of the form for cross-field errors |
 
 Validators populate `_field_errors` automatically on submit. To set a
@@ -286,7 +317,13 @@ async def on_submit(self, interaction, values):
     ...
 ```
 
-Submit is short-circuited while either attribute is non-empty.
+The form reaches `on_submit` only once validation passes (every required
+field filled, every value parsed, every validator satisfied), so cross-field
+checks belong there. Setting `_form_error` and returning (as above) keeps
+the form open with the message shown, and the next submit re-runs the check.
+
+A field change clears only that field's own error; the others stay until
+they change or the next submit re-checks them.
 
 ### `on_field_changed(field_id, value)`
 
@@ -310,9 +347,26 @@ modals. The form creates a grouped "Edit Text Fields" button that opens
 a single `Modal` containing all text fields. When exactly one text field
 exists, the button label auto-adapts to "Edit {label}".
 
-Values entered in the modal are always written back to `self.values`,
-even when validation fails. Reopening the modal shows previously entered
-text, not stale defaults.
+A value that parses is written back to `self.values` even when a later
+validator rejects it: validators run against parsed data, so an integer
+field with a range validator still has its parsed int in `self.values`
+if the range check fails. A value that fails to *parse* (`"abc"` for an
+integer field) is held apart from `self.values`, which keeps only parsed
+values. Either way, reopening the modal prefills what was typed: a
+successful parse from `self.values`, a failed parse from its pending raw
+draft. The form's own display reads the same draft, so a typed field
+mid-fix shows what was entered rather than "Not set", until it parses or
+clears.
+
+A submit where one field fails to parse and another fails a validator
+shows both errors at once. The two error sets merge before the form
+re-renders, so fixing one does not need a second submit to find the next.
+
+!!! warning "Duplicate field labels are rejected at construction"
+    A modal input's `custom_id` derives from its label, so two
+    modal-rendered fields (`text`, `integer`, `float`, or `date`) whose
+    labels slugify to the same id raise `ValueError` at construction,
+    naming both fields. Give them distinct labels.
 
 ### Customization
 
@@ -345,7 +399,11 @@ called `exit()`, `push()`, or `replace()`.
 ### V1 vs V2
 
 - **V1 (`FormView`):** Displays field status in an embed. Controls use
-  row-based layout.
+  row-based layout, capped at Discord's five action rows; each `select` or
+  `boolean` field consumes one row (a `boolean` field's Yes/No pair shares a
+  row). A field that does not fit raises `ValueError` at construction, naming
+  the field. Use `FormLayoutView` for forms with more non-text fields than
+  V1's five rows hold.
 - **V2 (`FormLayoutView`):** Displays field status in a `Container` with
   `TextDisplay`. Controls wrapped in `ActionRow`. Full immediate-mode
   rebuild on every value change -- select `default` states are preserved
@@ -523,8 +581,20 @@ async def on_finish(self, interaction):
   buttons placed on row 4.
 - **V2 (`WizardLayoutView`):** Step builders return a list of V2
   components (or a single component). Nav buttons placed in an
-  `ActionRow`. `send()` is overridden to build the first step's
-  content before sending, since async builders cannot run in `__init__`.
+  `ActionRow`. The first step's content is built in `on_load()`, since
+  async builders cannot run in `__init__`.
+
+!!! warning "Overriding `on_load()` on a wizard"
+
+    `WizardLayoutView` builds its step content in `on_load()`. A subclass
+    that overrides the hook must call `super().on_load()`, or the view
+    renders its nav row above nothing:
+
+    ```python
+    async def on_load(self):
+        await super().on_load()   # builds the current step
+        self.totals = await self.repo.totals()
+    ```
 
 ---
 
@@ -541,7 +611,7 @@ Tabbed interface with button-based tab switching.
       dashboard, a profile). Cost: one ActionRow is permanently spent on the
       tab bar.
     - **push/pop navigation** (`push()` / `pop()`) is for *hierarchical*
-      drill-down -- a hub to a detail to a sub-detail -- with back history.
+      drill-down (a hub to a detail to a sub-detail) with back history.
       Reach for it when each view is heavy or the flow is a tree, not a flat
       set of peers.
     - **`tab_nav()`** is the tab *look* without the pattern's lifecycle: a row
@@ -618,7 +688,20 @@ def _build_tab_rows(self, buttons):
   assigned from the row index.
 - **V2 (`TabLayoutView`):** Tab builders return a list of V2 components.
   Each row produced by `_build_tab_rows` is wrapped in its own
-  `ActionRow` before being added to the layout.
+  `ActionRow` before being added to the layout. The active tab's content
+  is built in `on_load()`.
+
+!!! warning "Overriding `on_load()` on a tab view"
+
+    `TabLayoutView` builds its tab content in `on_load()`. A subclass that
+    overrides the hook must call `super().on_load()`, or the view renders
+    its tab row above nothing:
+
+    ```python
+    async def on_load(self):
+        await super().on_load()   # builds the active tab
+        self.badge = await self.repo.unread_count()
+    ```
 
 ---
 
@@ -1293,7 +1376,12 @@ async def reload_after_insert(self, interaction):
 
 ### Combining Patterns with Navigation
 
-Patterns work with `push()` and `pop()` like any other view:
+Patterns work with `push()` and `pop()` like any other view, and each carries
+its own cursor back: a popped paginated view returns to the page the user
+left, tabs to the open tab, a wizard to its step, and a form with the values
+already typed. See
+[What a pop restores](views.md#what-a-pop-restores-and-what-it-does-not) for
+the boundary and how to carry your own state across it.
 
 ```python
 async def open_settings(self, interaction):

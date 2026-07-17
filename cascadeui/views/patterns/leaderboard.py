@@ -719,6 +719,10 @@ class LeaderboardLayoutView(_BaseLeaderboardMixin, PaginatedLayoutView):
         state matched to the real total, not the empty-list ``__init__``
         snapshot.
         """
+        # The paginated base preloads a cursor page here. A leaderboard is
+        # always eager-mode, so the call is a no-op, but the preload seam
+        # belongs to the base and overrides chain through it.
+        await super().on_load()
         await self.rebuild_pages()
         # rebuild_nav=True re-runs _build_nav_buttons against the final page
         # count (entries are fetched async here, so __init__ saw an empty

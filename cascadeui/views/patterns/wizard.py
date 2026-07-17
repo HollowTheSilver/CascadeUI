@@ -192,6 +192,64 @@ class _BaseWizardMixin:
             return self.finish_button_label or "Finish"
         return self.next_button_label or "Next"
 
+    def _sync_wizard_nav(self) -> None:
+        """Point the nav buttons at the current step.
+
+        Derived from ``_current_step`` rather than a construction-time
+        constant, so any path that lands on a step other than the first (a
+        step advance, or a step carried back across a ``pop``) gets buttons
+        that agree with the content beside them.
+        """
+        self._back_btn.disabled = self._prev_visible_index(self._current_step) is None
+        self._step_indicator.label = self._resolve_step_label()
+
+        is_last = self._next_visible_index(self._current_step) is None
+        self._next_btn.label = self._resolve_next_label(is_last)
+        self._next_btn.style = self.finish_button_style if is_last else self.next_button_style
+        self._next_btn.emoji = self.finish_button_emoji if is_last else self.next_button_emoji
+
+    # // ----( Navigation state )---- // #
+
+    def get_nav_state(self) -> dict:
+        """Carry the current step across a ``pop``.
+
+        ``_current_step`` is assigned in ``__init__`` and is not a
+        constructor kwarg, so a reconstruction sends the user back to step
+        one: open a help screen from step four, press Back, and start over.
+
+        Only the step index travels. Whatever the wizard collects lives on
+        the subclass, which names it by overriding these hooks and calling
+        ``super()``.
+        """
+        return {"current_step": self._current_step}
+
+    def restore_nav_state(self, state: dict) -> None:
+        """Restore the current step, snapping to a visible one.
+
+        Step conditions are evaluated against live view state, so a step
+        that was visible at push time can be hidden by the time the user
+        comes back. Landing on a hidden step would strand them somewhere
+        the Back and Next buttons do not agree exists, so the restore snaps
+        to the nearest visible step instead.
+
+        The nav buttons re-sync here rather than only in the render path:
+        they were built during ``__init__`` against step one, and restoring
+        the index without them leaves the fourth step's content under a Back
+        button still disabled as though the user had never left the first.
+        """
+        index = state.get("current_step")
+        if index is None or not self._steps:
+            return
+        index = max(0, min(int(index), len(self._steps) - 1))
+        if self._is_step_visible(self._steps[index]):
+            self._current_step = index
+        else:
+            visible = self._visible_step_indices()
+            if not visible:
+                return
+            self._current_step = min(visible, key=lambda i: abs(i - index))
+        self._sync_wizard_nav()
+
     # // ----( Navigation callbacks )---- // #
 
     async def _go_back(self, interaction: Interaction):
@@ -332,21 +390,64 @@ class WizardView(_BaseWizardMixin, StatefulView):
 
         Mutates the existing button instances in place; ``_build_nav_buttons``-registered
         items stay stable across step changes.
+
+        The edit is unconditional. A step with no builder contributes no
+        embed, but ``_sync_wizard_nav`` has already relabelled the nav row
+        and that still has to ship, or the cursor advances while the display
+        keeps the previous step. ``refresh`` short-circuits on its render
+        hash, so a genuinely unchanged tree costs nothing.
         """
-        self._back_btn.disabled = self._prev_visible_index(self._current_step) is None
-        self._step_indicator.label = self._resolve_step_label()
+        self._sync_wizard_nav()
 
-        is_last = self._next_visible_index(self._current_step) is None
-        self._next_btn.label = self._resolve_next_label(is_last)
-        self._next_btn.style = self.finish_button_style if is_last else self.next_button_style
-        self._next_btn.emoji = self.finish_button_emoji if is_last else self.next_button_emoji
+        kwargs = await self._nav_edit_kwargs()
+        await self.refresh(**kwargs)
 
-        if self._steps:
-            step = self._steps[self._current_step]
-            builder = step.get("builder")
-            if builder:
-                embed = await builder()
-                await self.refresh(embed=embed)
+    async def send(
+        self,
+        content: Optional[str] = None,
+        *,
+        embed: Optional[discord.Embed] = None,
+        embeds: Optional[List[discord.Embed]] = None,
+        file: Optional[discord.File] = None,
+        files: Optional[List[discord.File]] = None,
+        ephemeral: bool = False,
+    ):
+        """Send the view, using the current step's content when none is given.
+
+        Step builders are async and cannot run in ``__init__``, so the first
+        message would otherwise ship the nav row over an empty body. This is
+        the same render ``_nav_edit_kwargs`` supplies on a ``pop``. A step
+        with no builder contributes nothing and the nav ships alone; an
+        explicit ``embed`` or ``content`` wins.
+        """
+        if embed is None and content is None:
+            embed = (await self._nav_edit_kwargs()).get("embed")
+        return await super().send(
+            content=content,
+            embed=embed,
+            embeds=embeds,
+            file=file,
+            files=files,
+            ephemeral=ephemeral,
+        )
+
+    nav_rebuild = staticmethod(lambda v: v._nav_edit_kwargs())
+
+    async def _nav_edit_kwargs(self) -> dict:
+        """The embed a navigation edit needs to show the current step.
+
+        ``pop()`` passes no rebuild of its own, so without this the edit
+        would restore the nav row and leave whatever the child view put on
+        the message. V1 step content lives in the embed, so the embed is the
+        render. A step with no builder contributes nothing, and the edit
+        ships the nav alone.
+        """
+        if not self._steps:
+            return {}
+        builder = self._steps[self._current_step].get("builder")
+        if not builder:
+            return {}
+        return {"embed": await builder()}
 
 
 # // ========================================( V2: WizardLayoutView )======================================== // #
@@ -507,25 +608,24 @@ class WizardLayoutView(_BaseWizardMixin, StatefulLayoutView):
 
     async def _refresh_wizard(self):
         """Update step content and mutate nav buttons in place."""
-        self._back_btn.disabled = self._prev_visible_index(self._current_step) is None
-        self._step_indicator.label = self._resolve_step_label()
-
-        is_last = self._next_visible_index(self._current_step) is None
-        self._next_btn.label = self._resolve_next_label(is_last)
-        self._next_btn.style = self.finish_button_style if is_last else self.next_button_style
-        self._next_btn.emoji = self.finish_button_emoji if is_last else self.next_button_emoji
-
+        self._sync_wizard_nav()
         await self._rebuild_step_content()
         await self.refresh()
 
-    async def send(self, **kwargs):
-        """Build initial step content before sending.
+    async def on_load(self) -> None:
+        """Build the current step's content before the view is displayed.
 
-        Step builders are async and cannot run in ``__init__``, so the
-        first step's content is assembled here before the message is
-        sent.
+        Step builders are async and cannot run in ``__init__``, so the tree
+        holds only the nav row until this runs. This hook, not ``send()``,
+        is the build seam: ``pop()`` never calls ``send()``, while the
+        library runs ``on_load`` before every render it drives (the send
+        pipeline, each push/pop edit, ``reload``). A wizard returned to from
+        a drill-down therefore renders its step, not a bare nav row.
+
+        The nav sync rides along because the step it points at is the step
+        being built -- restoring one without the other would show step
+        three's content under step one's buttons.
         """
         if self._steps:
+            self._sync_wizard_nav()
             await self._rebuild_step_content()
-
-        return await super().send(**kwargs)

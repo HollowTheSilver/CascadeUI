@@ -6,7 +6,7 @@ import contextvars
 import copy
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Set, Tuple, Union
 
@@ -120,7 +120,7 @@ class BatchContext:
             "type": "BATCH_COMPLETE",
             "payload": {"actions": actions},
             "source": self.source_id,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
         logger.debug(f"Batch complete: {len(actions)} actions")
@@ -1077,7 +1077,7 @@ class StateStore:
             "type": action_type,
             "payload": payload or {},
             "source": source_id,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
         logger.debug(f"Dispatching action {action_type} from source {source_id}")

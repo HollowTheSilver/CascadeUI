@@ -23,6 +23,286 @@ preserved below for historical reference but are not the supported baseline.
 
 ---
 
+## [3.6.0] - 2026-07-17
+
+### Breaking
+
+- **`refresh_cooldown_ms` no longer throttles interaction-driven edits.** It
+  paces the re-renders the library starts (a panel reloading on its own) and
+  exempts edits made in direct answer to a click on the view's own message. It
+  was never a spam guard: it is view-wide, so it slowed every viewer of a shared
+  panel for one person's clicking, and on a panel that also reloads out of band
+  the window stayed armed, taxing page turns by up to its full length.
+  Migration: to throttle one control per clicker, wrap it with `with_cooldown`,
+  which now survives the component being rebuilt. `reload()` is unchanged and
+  still defers its `on_load()` fetch inside the window: that gate protects
+  your data source, not Discord. The two throttles are now documented together,
+  keyed on the question being asked, and `v2_battleship` demonstrates the
+  button-level guard.
+- **`TabLayoutView`, `WizardLayoutView`, and `PaginatedLayoutView` build their
+  content in `on_load()`.** Their `send()` overrides are gone. A subclass that
+  overrides `on_load()` must now call `super().on_load()`, or a tab or wizard
+  renders its nav row above nothing and a cursor-mode paginator never leaves
+  "Loading...". Subclasses that override neither are unaffected.
+
+### Added
+
+- **`get_nav_state()` / `restore_nav_state()`.** A view can name the state that
+  should survive a `pop()`. Reconstruction replays constructor kwargs and
+  re-runs `on_load()`, so data returns fresh, but anything selected *since*
+  construction was never a kwarg and reverted to its default, silently, with the
+  next write landing on a row the user never opened. `restore_nav_state()` runs
+  before `on_load()`, so a preload reads the restored selection rather than
+  fetching twice to correct it. The mapping rides the navigation stack and is
+  never serialized, so it may hold live objects. Defaults to `{}`. The built-in
+  patterns name their own cursors, so their fix below is automatic; the V2
+  composites do not, by design: a `PaginatedRegion`'s page and a
+  `Collapsible`'s expanded state are the host's to name. The guide now states
+  the reconstruction boundary: what returns fresh, what reverts, and which of
+  `get_nav_state()`, `shared_data`, or `rebuild=` carries which.
+- **`nav_rebuild`.** The rebuild a view supplies for its own navigation
+  edits, used whenever the caller passes none. A V2 view is its component tree
+  and needs nothing here. A V1 view's content is its embed, and `pop()` has no
+  `rebuild=` to pass, so a V1 view names its own with
+  `nav_rebuild = staticmethod(lambda v: {"embed": v.build_embed()})`. An
+  explicit `rebuild=` still wins.
+- **`with_cooldown(key=...)`.** Names the deadline a component reads, for
+  controls a name cannot tell apart. The default reads the `custom_id` when you
+  set one and the wrapped callback's qualified name otherwise; buttons built in
+  a loop share their factory's name, so those take a `custom_id=` or a `key=`.
+  A rejected click checks whether the controls sharing that name call
+  different callbacks, and logs one warning per view class when they do, so a
+  loop that needed a name says so instead of throttling silently. `seconds` is
+  typed `float`: sub-second guards always worked, and the rejection notice
+  already reported the remainder to one decimal, but the annotation said
+  otherwise.
+- **`is_snowflake(value)`.** Reports whether an integer is shaped like a real
+  Discord ID, by decoding the creation time Discord packs into it. A database
+  row ID or a match number leaves those bits near zero and decodes to Discord's
+  epoch day, so it fails. Sits beside `coerce_snowflake_id`, which accepts any
+  integer by design.
+- **Six names that were public but unreachable now import from the package
+  root.** `is_snowflake`, `coerce_snowflake_id`, `coerce_snowflake_id_set`, and
+  `coerce_snowflake_match` (coercion was the one utility module the root never
+  re-exported), plus `Action`, which pairs with the already-exported `StateData`
+  in every reducer signature, and `StatefulComponent`. Each was already public
+  in its own subpackage, so the subpackage paths keep working.
+- **`secret` form field option.** A field marked `secret=True` masks its value
+  in the form display as fixed dots, for a password or token. Discord modals
+  cannot mask the input itself, so this covers the form's own display; the
+  entered value still reaches `on_submit` and validators normally.
+
+### Changed
+
+- **A rate-limited edit is retried instead of dropped.** Every 429 seam stamped
+  the backoff window and returned, leaving nothing to ship the edit; views
+  recovered only on their next state change, and an armed ephemeral view (which
+  drops notifications by design) never recovered at all. The backoff now
+  queues the edit to ship at the window boundary, through the same single task
+  the cooldown uses, and a retry that is rate-limited again schedules its own
+  successor.
+
+### Fixed
+
+- **A throttled refresh was dropped, not delayed, on views without `build_ui`.**
+  The deferred render delegated to `on_state_changed`, whose default did nothing
+  when there was no `build_ui` to run, so tab switches and wizard steps on
+  `TabView` / `TabLayoutView` / `WizardView` / `WizardLayoutView` were swallowed
+  outright. Not opt-in: the 429 backoff engages this path on any view.
+- **The 429 backoff always waited exactly one second.** It read a `retry_after`
+  attribute that `discord.HTTPException` does not carry, so every rate-limit fell
+  through to the fallback. The delay now comes from the `Retry-After` header, and
+  a header-less 429 (which discord.py raises only for a Cloudflare ban) backs
+  off minutes rather than knocking once a second on an IP block.
+- **`discord.RateLimited` escaped every edit seam.** It subclasses
+  `DiscordException`, not `HTTPException`, so `except discord.HTTPException`
+  never caught it, and it is the only rate-limit type that carries a real
+  `retry_after`. Now handled wherever a 429 is.
+- **`refresh_cooldown_ms` could defeat the ephemeral refresh handoff.** The
+  arming edit queued behind the cooldown window and the deferred render then
+  rebuilt over the refresh button, leaving a frozen panel with no way back and
+  no notification able to repair it.
+- **A refresh was lost when its backoff window grew mid-flight.** The waiting
+  task woke, found the window still active, saw itself registered as the pending
+  retry, declined to schedule a replacement, and cleared the last reference to
+  itself on the way out.
+- **A deferred render answered to the click that spawned it.** Task creation
+  copies the caller's context, so a background render read a spent interaction
+  and edited through a response slot whose window had closed.
+- **A theme change did not reach views whose selector tracks their own
+  content.** `state_selector` decides whether a view re-renders, and a theme
+  is a render input that appears in no view's data, so a panel watching its
+  own toggles went deaf to a theme switch and kept painting the old accent,
+  while the panel that made the switch repainted. A theme resolved through
+  `get_theme()` now rides the selector. A fixed theme yields a constant and
+  notifies no more often than before; a view that sets its own colors rebuilds
+  once and stops at the render hash, shipping no edit. `settings_menu` looked
+  its theme up privately rather than returning it from `get_theme()`, so it
+  now uses the override the theming guide teaches and `v2_settings` already
+  used.
+- **A V1 pattern's first message shipped no content.** `TabView`, `WizardView`,
+  and `FormView` sent their controls over an empty body: V1 content is an embed,
+  and only `PaginatedView` computed one in `send()`. The embed each pattern
+  already builds for a `pop()` now renders the first message too, and `MenuView`
+  supplies its `build_embed()` without the caller passing it. An explicit
+  `embed=` or `content=` still wins.
+- **A V1 wizard step with no builder froze the display.** The step advanced and
+  the nav row relabelled, but the edit was skipped whenever the step contributed
+  no embed, leaving the previous step on the message. The edit now ships either
+  way, as it already did on V2.
+- **A popped view lost its place.** `PaginatedView` / `PaginatedLayoutView` came
+  back on page one, `TabView` / `TabLayoutView` on the first tab, `WizardView` /
+  `WizardLayoutView` on step one (now snapped to a visible step), and
+  `FormView` / `FormLayoutView` with the typed values gone.
+- **A popped form came back with no fields at all.** `FormView` and
+  `FormLayoutView` take their `__init__` from a plain mixin, and the kwargs
+  capture only installed on classes declaring their own, so a form
+  reconstructed by `pop()` had no fields, no title, and no schema.
+- **A popped V1 view kept the child's embed.** The navigation edit shipped
+  components alone unless the caller passed `rebuild=`, and `pop()` has nothing
+  to pass: the back button is library code. V1 content lives in the embed, so
+  the parent's buttons rendered over the child's content. Every V1 pattern
+  (`PaginatedView`, `TabView`, `WizardView`, `FormView`, `MenuView`) now names
+  its own edit through the new `nav_rebuild` class attribute, and any V1
+  view can do the same.
+- **A popped V1 tab or wizard kept the first tab's buttons.** The tab row and
+  the wizard's Back button are built during `__init__` against the first
+  tab/step, so restoring the cursor left the third tab's content under a row
+  still highlighting the first, and step three's under a Back button disabled
+  as though the user had never left step one.
+- **Clearing an optional form select crashed the interaction.** An optional
+  select lets Discord deliver an empty selection, and the callback read the
+  first element without checking, so clearing a choice raised `IndexError` and
+  the user saw "This interaction failed". An empty selection now clears the
+  field to "not set".
+- **A form revealed its errors one submit at a time.** A single field that
+  failed to parse (an age outside its range, a malformed date), or a blank
+  required field, short-circuited the submit, so validator errors on other
+  fields (a bad email, a short password) stayed hidden until the first was
+  fixed and the form resubmitted. Parse errors, blank-required errors, and
+  validator errors now all surface together, with validators still skipping
+  any field whose raw value never parsed and any field already flagged as
+  required.
+- **Changing one form field cleared every field's validation message.** A
+  form showing errors wiped all of them the moment the user touched any other
+  field, so picking a select or toggling a boolean erased still-accurate
+  messages on unrelated fields. A field change now clears only that field's
+  own error; the rest stay until they change or the next submit re-checks
+  them.
+- **A V1 form silently dropped fields past its row budget.** A form with more
+  select and boolean fields than Discord's five action rows hold discarded the
+  overflow with no error, leaving a required field unfillable. Construction now
+  raises, naming the field that does not fit and pointing at `FormLayoutView`.
+- **Two form fields with the same label crashed on the Edit click.** Modal input
+  ids derive from the label, so two fields labelled alike collided when the
+  modal opened. The clash is now rejected at construction, naming both fields.
+- **A form field's `default` was ignored outside the modal.** A declared
+  `default` reached only the modal prefill, so a required field with a default
+  still displayed "not set" and blocked submission, and select defaults never
+  rendered. Defaults now seed the form's values at construction.
+- **A form's integer field could submit the raw text you typed.** When a typed
+  field failed to parse, the raw string was written into the form's values, and
+  any later field change cleared the error that blocked submission, so an
+  integer field could submit `"twenty"`. Unparsed input is now held apart from
+  the values; the modal still prefills what you typed, and the values carry only
+  parsed results.
+- **A rejected modal value was written back before validation.** `Modal`
+  populated each input wrapper's `.value` before running validators, so a caller
+  reading it after a failed submit saw the rejected input, contradicting the
+  documented "populated after validation passes" contract. The write-back now
+  follows validation.
+- **A validator on an optional form field made it secretly required.** Most
+  validators reject a blank value, and the runner ran them over every field, so
+  an optional field left empty failed its own validator. Blank optional fields
+  now skip validation; the required-check still owns the blank-required case,
+  and `0` and `False` count as values, not blanks.
+- **A validator that returned the wrong shape crashed far from the mistake.** A
+  validator that forgot to return a `ValidationResult` raised a bare
+  `AttributeError`, and an object with an async `__call__` (a database-backed
+  uniqueness check, the documented awaitable shape) was called but never
+  awaited. The runner now awaits any awaitable result and raises a directed
+  `TypeError` naming the validator and field on a wrong return.
+- **A form field written as a dict with no `type` rendered no control.** Typed
+  `FormField` entries default to `text`, but a hand-written dict passed through
+  untouched, so a field with no `type` had no input and, if required, left the
+  form unsubmittable. A missing `type` now fills to `text` to match.
+- **A numeric form field accepted `nan` and `inf`.** `float()` parses both, and
+  a NaN compares False to every bound, so a field limited to 0-100 accepted a
+  value that was neither, displayed "nan", and would have written invalid JSON
+  on persistence. Float parsing and the `min_value` / `max_value` validators
+  now reject non-finite numbers.
+- **A menu category pointing at a pattern view crashed on click.** Both menus
+  forced their own render shape onto every push: `MenuView` called
+  `build_embed()` and `MenuLayoutView` called `build_ui()` on destinations
+  that define neither, raising `AttributeError`. Every pattern was affected in
+  both versions, so eight of the ten menu-to-pattern paths were dead. A
+  destination that names its own `nav_rebuild` now keeps it, one that renders
+  through another seam is left alone, and a plain view still takes the menu's.
+- **A menu category naming a cross-version view failed on click.** A message
+  carries its component version one way, so a V1 menu can never reach a V2
+  destination. The category list names every destination at construction, but
+  the mismatch waited for the push and reached the user as a dead button. Both
+  menus now reject it where the category is declared.
+- **Wrapping a component twice stacked the wrapper.** `with_loading_state`,
+  `with_confirmation`, and `with_cooldown` each wrapped the previous callback, so
+  a build method that wraps on every render nested without bound: three renders
+  meant three confirmations for one click.
+- **A `functools.partial` callback crashed every V2 render.** Stabilizing a
+  component's `custom_id` reads the callback's qualified name, which a partial
+  does not carry, so a button wired to one raised `AttributeError` inside
+  `build_ui` unless it also passed an explicit `custom_id`.
+- **`with_cooldown` did nothing on a rebuilt component.** Deadlines lived in the
+  wrap call, and an accepted click triggers the rebuild that discards them, so
+  the cooldown never fired. They now live on the owning view, named after the
+  callback you wrote: each wrapper records that callback before burying it, so
+  stacking `with_confirmation` or `with_loading_state` underneath does not
+  collapse a view's controls onto one deadline.
+- **A view that names an owner other than the clicker warned on every run.** The
+  notice claimed an explicit `user_id` is re-derived from the interaction on
+  push/pop and diverges after navigation; navigation carries the value forward
+  unchanged, and naming an owner who is not the clicker is a supported shape the
+  game examples are built on. The check ran before the subclass assigned
+  `allowed_users`, so it could not tell that shape from an application id passed
+  under a reserved name. It now runs at send and fires only when the id is not a
+  Discord ID *and* the author it locks out is the one who built the view, so
+  handing ownership to a real user (a game the challenger owns, an admin
+  posting a panel for someone else) is silent.
+- **The Inspector showed two clocks.** Actions stamped their time from the
+  host's local zone while the Inspector's own stamps read UTC, so the History
+  tab mixed both and a daylight-saving change rewound the action log for an
+  hour. Every action now stamps UTC.
+- **The 40-component error contradicted itself.** An oversized card added to an
+  empty view reported that the limit was exceeded "already at 0 components". It
+  now reports what the view holds, what the item adds, and the sum.
+- **An oversized `TextDisplay` failed at Discord instead of pre-flight.** The V2
+  placement validator enforced the MediaGallery item cap but skipped the
+  `TextDisplay` 4000-character limit, so a body over that length passed
+  validation and returned an opaque HTTP 400 at send, far from where it was
+  built. The validator now rejects it at send, refresh, and navigation with a
+  directed error naming the component.
+- **Oversized Button labels, Select placeholders, and SelectOption text failed
+  at Discord instead of pre-flight.** The same validator gap that skipped the
+  `TextDisplay` cap also skipped these string limits: a Button `label` over 80
+  characters, a Select `placeholder` over 150, or a SelectOption `label`,
+  `value`, or `description` over 100 passed validation and returned an opaque
+  HTTP 400 at send. The validator now rejects each at send, refresh, and
+  navigation with a directed error naming the component.
+- **The component wrapper reference had wrong signatures.** No wrapper has
+  keyword-only parameters, all three accept any component (not just buttons),
+  and `with_cooldown`'s `"user_guild"` scope was missing.
+- **The `migrators=` bulk-registration form was missing from the persistence
+  guide,** which documented only the decorator path.
+- **The `@cascade_component` reference documented a registry that does not
+  exist.** The decorator dispatches `COMPONENT_INTERACTION` from a view method
+  rather than storing callbacks, so the `get_component()` pairing it showed
+  returned `None` and its module-level snippet could not run. `register_component()`
+  / `get_component()` now have their own entry as the V1 composition registry.
+- **Reference gaps.** The landing page omitted the PostgreSQL backend, the
+  examples index omitted `v2_attachments.py`, and the built-in theme objects had
+  no entry naming them apart from the theme names they register under.
+
+---
+
 ## [3.5.0] - 2026-07-11
 
 ### Breaking

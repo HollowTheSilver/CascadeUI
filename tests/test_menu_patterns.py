@@ -7,7 +7,8 @@ import pytest
 from discord.ui import Container, TextDisplay
 from helpers import make_interaction as _make_interaction
 
-from cascadeui.views.patterns import MenuLayoutView, MenuView
+from cascadeui.views import StatefulLayoutView, StatefulView
+from cascadeui.views.patterns import FormLayoutView, FormView, MenuLayoutView, MenuView
 
 
 class _DummySubView(MenuView):
@@ -212,7 +213,11 @@ class TestMenuViewPush:
             args, kwargs = mock_push.call_args
             assert args[0] is _DummySubView
             assert args[1] is interaction
-            assert "rebuild" in kwargs
+            # _DummySubView subclasses MenuView, so it inherits nav_rebuild
+            # and keeps it. Routing for destinations that name none lives in
+            # test_destination_naming_no_rebuild_takes_the_menu_default,
+            # which this fixture cannot reach.
+            assert kwargs["rebuild"] is None
 
     async def test_custom_rebuild_passed_through(self):
         custom_rebuild = MagicMock()
@@ -229,6 +234,46 @@ class TestMenuViewPush:
 
             _, kwargs = mock_push.call_args
             assert kwargs["rebuild"] is custom_rebuild
+
+    async def test_destination_naming_its_own_rebuild_keeps_it(self):
+        """A pattern destination renders its own way; the menu must not overrule it.
+
+        Every V1 pattern names a ``nav_rebuild`` and none of them defines
+        ``build_embed``, so a menu that forced its own embed shape onto the
+        push raised ``AttributeError`` on the click.
+        """
+        view = MenuView(
+            interaction=_make_interaction(),
+            categories=[{"label": "Form", "view": FormView}],
+        )
+
+        callback = view._category_buttons[0].callback
+        with patch.object(view, "push", new_callable=AsyncMock) as mock_push:
+            await callback(_make_interaction())
+
+            _, kwargs = mock_push.call_args
+            # None lets _apply_navigation_edit fall back to FormView.nav_rebuild.
+            assert kwargs["rebuild"] is None
+
+    async def test_destination_naming_no_rebuild_takes_the_menu_default(self):
+        """A plain view names no rebuild, so nothing else would supply its embed."""
+
+        class _PlainPage(StatefulView):
+            def build_embed(self):
+                return discord.Embed(title="Plain")
+
+        view = MenuView(
+            interaction=_make_interaction(),
+            categories=[{"label": "Plain", "view": _PlainPage}],
+        )
+
+        callback = view._category_buttons[0].callback
+        with patch.object(view, "push", new_callable=AsyncMock) as mock_push:
+            await callback(_make_interaction())
+
+            _, kwargs = mock_push.call_args
+            assert kwargs["rebuild"] is MenuView.nav_rebuild
+            assert kwargs["rebuild"](_PlainPage())["embed"].title == "Plain"
 
 
 # // ========================================( V2: MenuLayoutView )======================================== // #
@@ -473,6 +518,51 @@ class TestMenuLayoutViewBuildUi:
 class TestMenuLayoutViewPush:
     """V2 MenuLayoutView category push callback wiring."""
 
+    @staticmethod
+    def _callback_for(view, label):
+        for child in view.walk_children():
+            if (
+                getattr(child, "callback", None) is not None
+                and getattr(child, "label", None) == label
+            ):
+                return child.callback
+        raise AssertionError(f"no category button labelled {label!r}")
+
+    async def test_v2_pattern_destination_gets_no_menu_rebuild(self):
+        """A V2 pattern renders through on_load and defines no build_ui.
+
+        The menu's fallback calls build_ui, so forcing it onto such a
+        destination raised AttributeError on the click.
+        """
+        view = MenuLayoutView(
+            interaction=_make_interaction(),
+            categories=[{"label": "Form", "view": FormLayoutView}],
+        )
+
+        with patch.object(view, "push", new_callable=AsyncMock) as mock_push:
+            await self._callback_for(view, "Form")(_make_interaction())
+
+            _, kwargs = mock_push.call_args
+            assert kwargs["rebuild"] is None
+
+    async def test_plain_v2_destination_takes_the_menu_default(self):
+        """A plain V2 view defines build_ui, so the menu's fallback fits it."""
+
+        class _PlainPage(StatefulLayoutView):
+            def build_ui(self):
+                return None
+
+        view = MenuLayoutView(
+            interaction=_make_interaction(),
+            categories=[{"label": "Plain", "view": _PlainPage}],
+        )
+
+        with patch.object(view, "push", new_callable=AsyncMock) as mock_push:
+            await self._callback_for(view, "Plain")(_make_interaction())
+
+            _, kwargs = mock_push.call_args
+            assert kwargs["rebuild"] is MenuLayoutView.nav_rebuild
+
     async def test_push_callback_calls_push(self):
         view = MenuLayoutView(
             interaction=_make_interaction(),
@@ -497,7 +587,8 @@ class TestMenuLayoutViewPush:
             args, kwargs = mock_push.call_args
             assert args[0] is _DummySubLayoutView
             assert args[1] is interaction
-            assert "rebuild" in kwargs
+            # Inherits nav_rebuild from MenuLayoutView, as the V1 sibling does.
+            assert kwargs["rebuild"] is None
 
     async def test_custom_rebuild_per_category(self):
         custom_rebuild = MagicMock()
@@ -520,3 +611,37 @@ class TestMenuLayoutViewPush:
 
             _, kwargs = mock_push.call_args
             assert kwargs["rebuild"] is custom_rebuild
+
+
+class TestMenuViewInitialRender:
+    """The hub card ships without the caller passing it explicitly."""
+
+    async def test_send_ships_build_embed_by_default(self):
+        """build_embed() is the menu's render; send() supplies it.
+
+        Callers previously wrote send(embed=view.build_embed()) at every call
+        site. The library owns that now; an explicit embed still wins.
+        """
+        interaction = _make_interaction()
+        view = MenuView(
+            interaction=interaction,
+            categories=[{"label": "One", "view": _DummySubView}],
+        )
+
+        await view.send()
+
+        embed = interaction.response.send_message.call_args.kwargs.get("embed")
+        assert embed is not None
+
+    async def test_explicit_embed_wins(self):
+        """The pre-existing send(embed=...) call shape is unchanged."""
+        interaction = _make_interaction()
+        view = MenuView(
+            interaction=interaction,
+            categories=[{"label": "One", "view": _DummySubView}],
+        )
+
+        await view.send(embed=discord.Embed(title="Caller"))
+
+        embed = interaction.response.send_message.call_args.kwargs.get("embed")
+        assert embed.title == "Caller"

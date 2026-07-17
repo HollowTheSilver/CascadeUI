@@ -96,6 +96,13 @@ class TestBuiltInValidators:
         result = v("abc", {}, {})
         assert not result.valid
 
+    def test_numeric_bounds_reject_nan(self):
+        # NaN compares False to every bound, so a naive ``< n`` check lets it
+        # pass. Both bounds must reject it.
+        nan = float("nan")
+        assert not min_value(0)(nan, {}, {}).valid
+        assert not max_value(100)(nan, {}, {}).valid
+
 
 class TestValidateField:
     """validate_field runs multiple validators against a single field value."""
@@ -135,6 +142,55 @@ class TestValidateField:
         errors = await validate_field("anything", field_def, {})
         assert len(errors) == 1
         assert errors[0].message == "Custom async failure"
+
+    async def test_empty_optional_value_skips_validators(self):
+        """A blank optional field passes without running its validators.
+
+        Most validators reject blank, so running them on an untouched optional
+        field made it secretly required. The required-check owns the blank
+        case for required fields separately.
+        """
+        from cascadeui.validation import min_length
+
+        fd = {"id": "email", "required": False, "validators": [min_length(5)]}
+        assert await validate_field(None, fd, {}) == []
+        assert await validate_field("   ", fd, {}) == []
+
+    async def test_empty_required_value_still_runs_validators(self):
+        from cascadeui.validation import min_length
+
+        fd = {"id": "email", "required": True, "validators": [min_length(5)]}
+        assert len(await validate_field(None, fd, {})) == 1
+
+    async def test_zero_and_false_are_values_not_blanks(self):
+        # 0 and False are legitimate values; the empty-skip must not treat
+        # them as blank and pass a bound they actually violate.
+        from cascadeui.validation import min_value
+
+        fd = {"id": "n", "required": False, "validators": [min_value(1)]}
+        assert len(await validate_field(0, fd, {})) == 1
+
+    async def test_async_callable_object_is_awaited(self):
+        """An object with an async ``__call__`` is the documented awaitable
+        shape (a DB-backed uniqueness check), but ``iscoroutinefunction`` is
+        False for it, so it was called and never awaited."""
+
+        class AsyncUnique:
+            async def __call__(self, value, field, all_values):
+                return ValidationResult(False, "taken")
+
+        errors = await validate_field("x", {"id": "u", "validators": [AsyncUnique()]}, {})
+        assert [e.message for e in errors] == ["taken"]
+
+    async def test_validator_returning_non_result_raises_directed_error(self):
+        """A validator that forgets to return a ValidationResult crashed with
+        a far-away AttributeError; it now raises naming the validator and field."""
+
+        def forgot_return(value, field, all_values):
+            pass
+
+        with pytest.raises(TypeError, match="ValidationResult"):
+            await validate_field("x", {"id": "email", "validators": [forgot_return]}, {})
 
 
 class TestValidateFields:

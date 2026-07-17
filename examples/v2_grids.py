@@ -67,25 +67,10 @@ class GridShowcaseView(StatefulLayoutView):
     """
 
     owner_only = True
-    # ``instance_limit = None`` leaves the showcase unthrottled so a
-    # recording can stack multiple grids in one channel. The
-    # ``instance_policy`` and ``replace_policy`` values stay inert
-    # while ``instance_limit`` is None -- the replacement path never
-    # fires until the limit is set.
+    # Unthrottled so a recording can stack several grids in one channel.
     instance_limit = None
-    instance_scope = "user_guild"
-    instance_policy = "replace"
-    replace_policy = "delete"
     exit_policy = "disable"
     timeout = 180.0
-    # Pre-flight V2 placement validation runs on every ``send``,
-    # ``refresh``, and navigation edit, catching invalid trees (nesting,
-    # accessory misuse, Modal-only types, size-bound violations) before
-    # Discord 400s. Set ``validate_placement = False`` to opt out when
-    # the validator's matrix lags a Discord or discord.py update and a
-    # subclass intentionally builds a tree the validator rejects. The
-    # showcase routes through library builders end-to-end so the default
-    # (``True``) is correct.
 
     def __init__(self, *args, items=None, **kwargs):
         super().__init__(*args, **kwargs)

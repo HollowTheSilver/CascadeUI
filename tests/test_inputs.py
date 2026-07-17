@@ -166,6 +166,33 @@ class TestSubmittedValuePropagation:
         modal = Modal(title="T", inputs=[TextInput(label="X")])
         assert modal.values_by_input == {}
 
+    async def test_rejected_value_is_not_written_to_the_wrapper(self):
+        """The wrapper is documented as populated only after validation passes.
+
+        The write-back used to run before the validation gate, so a caller
+        reading ``.value`` after a failed submit saw the rejected input.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        from cascadeui.validation import ValidationResult
+
+        def reject(value, field, all_values):
+            return ValidationResult(False, "no")
+
+        field = TextInput(label="Email", required=True, validators=[reject])
+        modal = Modal(title="T", inputs=[field])
+        for wrapped, discord_input in modal._wrapped_pairs:
+            discord_input._value = "rejected"
+
+        interaction = MagicMock()
+        interaction.user.id = 1
+        interaction.response.is_done.return_value = False
+        interaction.response.send_message = AsyncMock()
+        await modal.on_submit(interaction)
+
+        assert field.value is None  # not populated on failure
+        assert modal.values_by_input == {}
+
     def test_wrapped_pairs_track_input_instances(self):
         a = TextInput(label="Name")
         b = TextInput(label="Age")
@@ -764,7 +791,9 @@ class TestModalValidationErrorLabel:
         def _always_fail(value, field, all_values):
             return ValidationResult(False, "Enter a single emoji.")
 
-        field = TextInput(label="Emoji", validators=[_always_fail])
+        # Required so the validator fires on the empty submitted value; an
+        # optional blank field skips validation.
+        field = TextInput(label="Emoji", required=True, validators=[_always_fail])
         assert field.custom_id == "input_emoji"  # the derived slug
         modal = Modal(title="T", inputs=[field])
 

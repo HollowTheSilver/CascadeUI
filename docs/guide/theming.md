@@ -159,6 +159,17 @@ class SettingsView(StatefulLayoutView):
 the appearance page restyles the hub's summary card, category card, and
 footer note on the same state change, with no per-card color plumbing.
 
+Overriding the hook is also what gets the view repainted at all. A theme is
+a render input that lives in no view's data, so a `state_selector` written
+to track a page's own fields would filter the switch out and leave the page
+on its old color. The library reads `get_theme()` and carries the result on
+the selector for you, which is why the settings sub-pages above repaint
+without naming the theme in their selectors. Two things sit outside that:
+a view that looks the theme up privately rather than returning it from
+`get_theme()` hands the library nothing to carry, and `subscribed_actions`
+filters before the selector runs, so a view must be subscribed to the
+action that carries the change.
+
 ### Reading the Theme Context
 
 For custom builder functions or helpers that need to read the active theme:

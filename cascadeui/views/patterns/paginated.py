@@ -122,6 +122,7 @@ class _BasePaginatedMixin:
         the only guards are the ``_first_btn`` / ``_last_btn`` None-checks for
         views below the jump threshold.
         """
+        self._clamp_page()
         total = len(self.pages)
         at_first = self.current_page == 0
         at_last = self.current_page >= total - 1
@@ -135,6 +136,62 @@ class _BasePaginatedMixin:
             self._indicator_btn.label = self._resolve_goto_label()
         else:
             self._indicator_btn.label = self._resolve_indicator_label()
+
+    # // ----( Navigation state )---- // #
+
+    def get_nav_state(self) -> dict:
+        """Carry the user's page across a ``pop``.
+
+        ``current_page`` is assigned in ``__init__`` and is not a constructor
+        kwarg, so a reconstruction reverts it to zero: page through to four,
+        open a detail view, press Back, and land on page one. The pages
+        themselves survive (they ride the kwargs snapshot); only the cursor
+        into them is lost.
+        """
+        return {"current_page": self.current_page}
+
+    def restore_nav_state(self, state: dict) -> None:
+        """Restore the page index, clamping once the page list is known.
+
+        The list can be shorter than it was at push time -- a reconstruction
+        re-runs ``from_data``'s formatter over whatever the source holds now,
+        and rows may have been deleted meanwhile -- so a stale index must
+        never reach an indexing read.
+
+        Clamping waits while ``pages`` is empty. A subclass that fetches its
+        pages in ``on_load`` (the leaderboard does) has none yet: this runs
+        first. The index is held rather than discarded, and ``_clamp_page``
+        re-runs from the render seams once the real list exists.
+        """
+        page = state.get("current_page")
+        if page is None:
+            return
+        self.current_page = max(0, int(page))
+        if self.pages:
+            self._clamp_page()
+            self._sync_nav_state()
+
+    async def on_load(self) -> None:
+        """Fetch the current page before the view renders.
+
+        Only cursor mode has anything to do here: an eager view holds every
+        page already, while a cursor view holds ``None`` in any slot it has
+        not fetched or has since evicted. ``restore_nav_state`` can land the
+        cursor on such a slot across a ``pop``, which would otherwise render
+        the "Loading..." placeholder with nothing left to replace it.
+        """
+        if self._is_cursor_mode and self.pages and self.pages[self.current_page] is None:
+            await self._ensure_page_loaded(self.current_page)
+
+    def _clamp_page(self) -> None:
+        """Pull ``current_page`` back into range for the current page list.
+
+        Called from the render seams rather than only from the writers,
+        because the page can be set before the list it indexes exists.
+        """
+        if not self.pages:
+            return
+        self.current_page = max(0, min(self.current_page, len(self.pages) - 1))
 
     # // ----( Callback factories )---- // #
 
@@ -207,7 +264,17 @@ class _BasePaginatedMixin:
         formatter: Callable,
         **kwargs,
     ):
-        """Create a paginated view by chunking items and applying a formatter."""
+        """Create a paginated view by chunking items and applying a formatter.
+
+        A coroutine, because the formatter runs here -- once per chunk, up
+        front -- and it may itself be async. Its sibling ``from_cursor`` is
+        *not* a coroutine: it formats nothing at construction, so it has
+        nothing to await. The await-ness of the two is the eager/lazy
+        difference, not an inconsistency::
+
+            view = await PaginatedView.from_data(items, 10, fmt)   # awaited
+            view = PaginatedView.from_cursor(fetch, total=n, ...)  # not
+        """
         chunks = [items[i : i + per_page] for i in range(0, len(items), per_page)]
         pages = []
         for chunk in chunks:
@@ -229,6 +296,13 @@ class _BasePaginatedMixin:
         **kwargs,
     ):
         """Create a paginated view that loads pages lazily through a cursor.
+
+        Not a coroutine, unlike ``from_data``: nothing is fetched or
+        formatted here, so there is nothing to await. Call it without
+        ``await`` and await ``send()`` as usual (the example below shows the
+        shape). ``from_data`` awaits because it applies the formatter to
+        every chunk up front; this one defers both the fetch and the format
+        to the first render.
 
         Instead of pre-chunking an in-memory list (``from_data``), cursor
         mode calls ``fetch_fn(offset, limit)`` on demand as the caller
@@ -655,10 +729,32 @@ class PaginatedView(_BasePaginatedMixin, StatefulView):
             ephemeral=ephemeral,
         )
 
+    nav_rebuild = staticmethod(lambda v: v._nav_edit_kwargs())
+
+    async def _nav_edit_kwargs(self) -> dict:
+        """The embed/content a navigation edit needs to show the current page.
+
+        ``pop()`` passes no rebuild of its own, so without this the edit
+        would swap the buttons and leave whatever the child view put on the
+        message. V1 content lives in the embed, so the embed is the render.
+
+        The navigation edit path awaits this. This implementation does no
+        I/O: its pages are formatted up front.
+        """
+        self._clamp_page()
+        if not self.pages:
+            return {}
+        return self._extract_page(self.pages[self.current_page])
+
     async def _update_page(self):
         """Mutate nav buttons in place and refresh the page content."""
         if not self.pages:
             return
+
+        # The cursor can be set before the list it indexes exists (a page
+        # carried across a pop lands before the pages do), so clamp ahead of
+        # both the fetch and the read.
+        self._clamp_page()
 
         # Cursor mode: load the target page before extracting content. No-op
         # for eager mode and for cached cursor pages.
@@ -814,6 +910,11 @@ class PaginatedLayoutView(_BasePaginatedMixin, StatefulLayoutView):
             self.add_item(placeholder)
             self._page_content_items.append(placeholder)
             return
+
+        # The cursor can be set before the list it indexes exists -- a page
+        # carried across a pop is restored before on_load fetches the pages.
+        # Clamp before indexing rather than trusting the writer.
+        self._clamp_page()
 
         # Callable page formatters run inside the view's theme context
         # so card() calls in user formatters inherit the view's accent.
@@ -990,20 +1091,31 @@ class PaginatedLayoutView(_BasePaginatedMixin, StatefulLayoutView):
         # detect a jump_threshold crossing and rebuild (not just re-sync).
         self._nav_built_for_count = len(self.pages)
 
-    async def send(self, *args, **kwargs):
-        """Preload page 0 in cursor mode, then rebuild and ship.
+    def restore_nav_state(self, state: dict) -> None:
+        """Restore the page index and rebuild the tree to match it.
 
-        The sync ``__init__`` already ran ``_compose_pagination_tree`` against
-        the ``None`` placeholder (cursor mode fills ``pages`` with ``None``
-        slots until fetched), so the tree currently shows a transient
-        "Loading..." card. Fetch page 0, then clear and re-add content in the same order
-        ``_update_page`` uses so the first ship is visually identical to
-        every subsequent page turn.
+        The base restores the cursor; a V2 view is its components, so the
+        tree has to be recomposed against the restored page or the message
+        would render page one under a nav row that reads page four.
         """
-        if self._is_cursor_mode and self.pages and self.pages[0] is None:
-            await self._ensure_page_loaded(0)
+        super().restore_nav_state(state)
+        if self.pages:
             self._recompose_page_tree()
-        return await super().send(*args, **kwargs)
+
+    async def on_load(self) -> None:
+        """Fetch the current page, then rebuild the tree around it.
+
+        The base does the fetch; a V2 view *is* its component tree, so a slot
+        that arrives here empty leaves a "Loading..." card the recompose has
+        to replace. Only recompose when something was actually fetched: this
+        runs on every navigation edit, and an eager view has nothing to do.
+        """
+        needs_recompose = (
+            self._is_cursor_mode and self.pages and self.pages[self.current_page] is None
+        )
+        await super().on_load()
+        if needs_recompose:
+            self._recompose_page_tree()
 
     def _recompose_page_tree(self, *, rebuild_nav: bool = False) -> None:
         """Clear the tree and re-add page content, extras, and the back button.
