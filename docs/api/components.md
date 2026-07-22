@@ -150,11 +150,23 @@ class RoleToggleButton(
 `discord.py` requires `template=` on every subclass at class-
 definition time; abstract intermediate bases are not supported.
 
+`auto_defer_delay` (default `2.5`s) sets when the built-in ack backstop
+defers a slow `on_click`. Dynamic items dispatch outside a view's
+auto-defer, so each button carries its own timer.
+
 ### `on_click(interaction) -> None`
 
 Override hook for click handling. Default: no-op. Captured values
 from the `custom_id` template are available as instance attributes
-set by the subclass `__init__`.
+set by the subclass `__init__`. Use `self.respond(...)` for replies (see below).
+
+### `await respond(interaction, content=None, *, ephemeral=False, **kwargs)`
+
+Sends an interaction response, falling back to `interaction.followup.send`
+when the response slot is already acked. The ack backstop armed around
+`on_click` can consume the slot mid-click, so a bare
+`interaction.response.send_message` raises `InteractionResponded` under load;
+`respond()` routes around that. Mirrors the view-level `respond()`.
 
 ### `from_custom_id(cls, interaction, item, match) -> cls` (classmethod)
 
@@ -168,11 +180,13 @@ restoration).
 ### Auto-registration
 
 Every subclass declaring a `template=` registers into a module-level
-registry at class-definition time. `setup_middleware(
-PersistenceMiddleware(..., bot=bot))` then calls
-`bot.add_dynamic_items(*subclasses)` once during initialization, so
-every click routes correctly after a restart with no additional
-user setup.
+registry at class-definition time. The persistent-view reattach pass
+run by `setup_middleware(PersistenceMiddleware(..., bot=bot))` calls
+`bot.add_dynamic_items(*subclasses)`, so every click routes correctly
+after a restart with no additional user setup. A subclass imported
+after that pass (a cog loaded later) is wired in by the same re-drive
+when `PersistenceManager.reattach()` runs, matching the late-import
+recovery for persistent views.
 
 ---
 
@@ -222,6 +236,9 @@ Modal(
 - Validators are read from each input's `validators` list and collected internally. On failure, an ephemeral error message is sent and the callback is skipped. Each validator receives whatever its input submits: `str` for text, `bool` for a checkbox, `list[str]` for a checkbox group, `list[discord.Attachment]` for an upload.
 - `view_id` -- links the modal to a view's state. A `MODAL_SUBMITTED` action is dispatched before the callback runs.
 - If no `callback` is provided, the interaction is deferred automatically.
+- `auto_defer_delay` (class attribute, default `2.5`) -- the ack backstop in seconds. `Modal.on_submit` arms an auto-defer timer across the whole submission (the access check, the validators, and the callback), so a slow validator or a raising handler cannot leave the interaction unacknowledged. Raise it on a subclass with a slow async validator; it validates at class-definition time (positive number).
+
+**Responding from `on_submit`:** an override that sends its own reply should use `await self.respond(interaction, ...)` rather than `interaction.response.send_message()`. Like the view helper, `Modal.respond()` is `is_done()`-aware: it falls back to a followup when the ack backstop has already fired, so a reply sent after a slow validator does not raise `InteractionResponded`.
 
 **Opening modals from CascadeUI callbacks:** use [`self.open_modal(interaction, modal)`](views.md#open_modal) instead of `interaction.response.send_modal()`. It handles the case where auto-defer has already consumed the response slot by sending an ephemeral fallback.
 
@@ -447,9 +464,9 @@ for row in rows:
     self.add_item(row)
 ```
 
-### `choice_row(options, *, on_select, selected=None, multi=False, disabled=False, button_threshold=5, active_style=primary, inactive_style=secondary, placeholder=None, custom_id="choice")`
+### `choice_row(options, *, on_select, selected=None, multi=False, disabled=False, allow_reselect=False, button_threshold=5, active_style=primary, inactive_style=secondary, placeholder=None, custom_id="choice")`
 
-A single-select (or multi-select) "choose one/any" control. Renders a segmented button `ActionRow` at or below `button_threshold` options (active = highlighted, and disabled in single-select), or a `StatefulSelect` dropdown for 6-25 options. Raises `ValueError` past 25. `on_select` receives the picked value (single) or the list of selected values (multi); the builder handles the string round-trip Discord forces on select option values, so the callback always gets the real Python value. `disabled=True` greys out the whole control (every button, or the dropdown) for a read-only or locked state.
+A single-select (or multi-select) "choose one/any" control. Renders a segmented button `ActionRow` at or below `button_threshold` options (active = highlighted, and disabled in single-select), or a `StatefulSelect` dropdown for 6-25 options. Raises `ValueError` past 25. `on_select` receives the picked value (single) or the list of selected values (multi); the builder handles the string round-trip Discord forces on select option values, so the callback always gets the real Python value. `disabled=True` greys out the whole control (every button, or the dropdown) for a read-only or locked state. `allow_reselect=True` keeps the active single-select option clickable so a re-pick fires `on_select` again (default `False` makes a re-pick a no-op in both button and dropdown forms); it is ignored in multi-select, where active options already toggle.
 
 ```python
 choice_row(

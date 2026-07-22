@@ -295,6 +295,16 @@ class _BaseWizardMixin:
     def step_count(self) -> int:
         return len(self._steps)
 
+    async def refresh_content(self) -> None:
+        """Re-render the current step's content in place.
+
+        The public re-render for a subclass callback that mutated data and
+        needs the active step redrawn. V1 rebuilds the embed, V2 recomposes the
+        tree. Distinct from ``reload()``, which re-runs ``on_load()`` (a data
+        re-fetch) before re-rendering.
+        """
+        await self._refresh_wizard()
+
 
 # // ========================================( V1: WizardView )======================================== // #
 
@@ -384,6 +394,9 @@ class WizardView(_BaseWizardMixin, StatefulView):
             callback=self._go_next,
         )
         self.add_item(self._next_btn)
+
+    async def _reload_render(self) -> None:
+        await self._refresh_wizard()
 
     async def _refresh_wizard(self):
         """Update navigation state and rebuild current step content.

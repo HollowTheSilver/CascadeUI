@@ -39,7 +39,6 @@ Usage:
 
 
 import asyncio
-import logging
 
 import discord
 from discord.ext import commands
@@ -47,9 +46,6 @@ from discord.ext.commands import Context
 from discord.ui import ActionRow, TextDisplay
 
 from cascadeui import PaginatedLayoutView, StatefulButton, card, divider
-
-logger = logging.getLogger(__name__)
-
 
 # // ========================================( Data )======================================== // #
 

@@ -156,9 +156,14 @@ class _BaseLeaderboardMixin:
         **_StatefulMixin._ENUM_ATTRS,
         "entry_layout": {"lines", "sections"},
     }
+    # Opt-in: render Discord default avatars immediately, then resolve the real
+    # ones off the render path and reload(force=True) when ready. Avoids the
+    # choose-your-poison of sync-cache-defaults vs a serial per-row fetch storm.
+    avatar_backfill: ClassVar[bool] = False
     _BOOL_ATTRS: ClassVar[tuple] = (
         *_BasePaginatedMixin._BOOL_ATTRS,
         "show_title_divider",
+        "avatar_backfill",
     )
 
     @classmethod
@@ -314,13 +319,96 @@ class _BaseLeaderboardMixin:
         different source, or to force the TextDisplay fallback (return
         ``None``) even when a bot is set.
         """
-        bot = getattr(self, "_bot", None)
+        cached = getattr(self, "_avatar_cache", {}).get(user_id)
+        if cached:
+            return cached
+        bot = self.bot
         if bot is None:
             return None
         user = bot.get_user(user_id)
         if user is not None:
             return user.display_avatar.with_size(128).url
         return _default_avatar_url(user_id)
+
+    def _maybe_schedule_avatar_backfill(self, top, avatar_urls) -> None:
+        """Schedule an off-path avatar resolve when section-mode entries missed
+        the cache and rendered defaults.
+
+        Runs at most once per entry set: the signature guard stops the
+        resolve -> reload(force=True) cycle from looping when some ids stay
+        unresolvable. No-op unless ``avatar_backfill`` is set and a bot is
+        available. The miss signal is the default-avatar URL the default
+        ``get_avatar_url`` returns on a cache miss, so this pairs with the
+        default resolver, not a custom ``get_avatar_url`` override.
+        """
+        if not self.avatar_backfill or self.bot is None:
+            return
+        signature = self._entries_signature_for(top)
+        if getattr(self, "_avatar_backfilled_signature", None) == signature:
+            return
+        unresolved = [
+            uid
+            for idx, (uid, _stats) in enumerate(top)
+            if avatar_urls[idx] == _default_avatar_url(uid)
+        ]
+        if not unresolved:
+            return
+        self._avatar_backfilled_signature = signature
+        self.task_manager.create_task(self.id, self._backfill_avatars(unresolved))
+
+    async def _backfill_avatars(self, user_ids: list) -> None:
+        """Resolve missed avatars off-path, then reload to render them."""
+        # This runs in a task that inherited the acting-interaction contextvar;
+        # clear it so the reload below cannot route through the acting-view fast
+        # path on a stale interaction (mirrors _deferred_refresh's reset).
+        from ...state.store import _CURRENT_INTERACTION
+
+        _CURRENT_INTERACTION.set(None)
+        try:
+            resolved = await self.resolve_avatar_urls(user_ids)
+        except asyncio.CancelledError:
+            # Cancelled before completing (view teardown, or a navigation that
+            # later rolled back to this view). Clear the schedule stamp so a
+            # recovered view re-schedules the backfill instead of rendering
+            # default avatars until the entry set changes.
+            self._avatar_backfilled_signature = None
+            raise
+        if not resolved:
+            return
+        cache = self.__dict__.setdefault("_avatar_cache", {})
+        cache.update(resolved)
+        await self.reload(force=True)
+
+    async def resolve_avatar_urls(self, user_ids: list) -> dict:
+        """Resolve avatar URLs for cache-missed entries, off the render path.
+
+        Called by the ``avatar_backfill`` pass in a background task after the
+        first render painted defaults. The default fetches each id via the bot
+        (one HTTP round-trip per id, acceptable off-path). Override to batch via
+        ``guild.query_members(user_ids=...)`` for a large top-N, or to resolve
+        from another source. Return a ``{user_id: url}`` mapping; omit ids that
+        cannot be resolved.
+        """
+        bot = self.bot
+        if bot is None:
+            return {}
+        resolved: dict = {}
+        for uid in user_ids:
+            try:
+                user = await bot.fetch_user(uid)
+            except Exception:
+                continue
+            resolved[uid] = user.display_avatar.with_size(128).url
+        return resolved
+
+    @property
+    def bot(self) -> Optional[discord.Client]:
+        """The ``discord.Client`` from the ``bot=`` kwarg (or ``on_bind``), or ``None``.
+
+        Read-only. ``get_avatar_url`` and ``resolve_avatar_urls`` overrides read
+        this to resolve avatars instead of reaching into ``_bot``.
+        """
+        return getattr(self, "_bot", None)
 
     @property
     def ranked_entries(self) -> List[Tuple[int, dict]]:
@@ -500,6 +588,7 @@ class _BaseLeaderboardMixin:
                 *(self.get_avatar_url(uid, stats) for uid, stats in top),
                 return_exceptions=False,
             )
+            self._maybe_schedule_avatar_backfill(top, avatar_urls)
         else:
             avatar_urls = []
 

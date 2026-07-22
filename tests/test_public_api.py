@@ -9,7 +9,10 @@ though the underlying object still imports from its own subpackage.
 # // ========================================( Modules )======================================== // #
 
 
+import ast
 import importlib
+import os
+import pkgutil
 
 import pytest
 
@@ -83,3 +86,137 @@ class TestSnowflakeHelpersAreImportable:
         from cascadeui.utils import is_snowflake as utils_is_snowflake
 
         assert utils_is_snowflake is root_is_snowflake
+
+
+# // ========================================( Class )======================================== // #
+
+
+# Modules whose entire public surface is internal machinery. A name added to one
+# of these is still internal (a reducer, a DDL string), so the module is skipped
+# wholesale rather than listing every name it will ever hold.
+_INTERNAL_MODULES = frozenset(
+    {
+        "cascadeui.state.reducers",  # reduce_* -- registered, never called by users
+        "cascadeui.persistence.schema",  # SQL DDL string constants
+        "cascadeui.persistence.schema_postgres",  # PostgreSQL DDL string constants
+    }
+)
+
+# Public-looking names deliberately kept OUT of the root API. Every name a
+# library module defines must be either in ``cascadeui.__all__`` or here; a new
+# name that is neither fails ``test_no_accidental_internal_public`` and forces a
+# deliberate export-or-internal decision at the point the name is added.
+_INTERNAL_NAMES = frozenset(
+    {
+        "logger",  # the module-level logging.getLogger(__name__) idiom
+        # Internal typing surface (cascadeui/state/types.py + siblings)
+        "ComponentId",
+        "GuildId",
+        "SessionId",
+        "UserId",
+        "ViewId",
+        "Timestamp",
+        "HookFn",
+        "MiddlewareFn",
+        "ReducerFn",
+        "SelectorFn",
+        "SubscriberFn",
+        "T",
+        "ActionPayload",
+        "AxisLabels",
+        "CellKey",
+        # DevTools @computed registrations (read via store.computed[...])
+        "application_keys",
+        "state_size_bytes",
+        "total_sessions",
+        "total_views",
+        # Persistence internals (register_* helpers ARE exported; these are not)
+        "NAMESPACE_APPLICATION",
+        "NAMESPACE_REGISTRY",
+        "KwargsMigrator",
+        "Migrator",
+        "get_kwargs_migrator",
+        "get_schema_migrator",
+        "is_persistent_slot",
+        # Postgres backend LISTEN/NOTIFY channel name; only surfaces when asyncpg is installed
+        "CHANNEL_INVALIDATION",
+        "BatchContext",
+        # Theming context managers (get_current_theme is exported; these are not)
+        "set_current_theme",
+        "theme_context",
+        # Logging internals (setup_logging + ColorScheme/FormatTemplate/JSONFormatter export)
+        "COLOR_SCHEMES",
+        "FORMAT_TEMPLATES",
+        "ColoredStreamFormatter",
+        "FileFormatter",
+        # Misc internal
+        "is_viewstore_trace_enabled",
+        "TaskManager",
+        "MAX_TEXT_FIELDS",
+    }
+)
+
+
+def _defined_public_names(source: str) -> set:
+    """Top-level names a module DEFINES (not imports), minus underscore-prefixed.
+
+    Uses the AST rather than ``dir(module)`` so module-level constants and type
+    aliases (which carry no ``__module__``) are captured alongside classes and
+    functions, and re-exported / imported names are excluded.
+    """
+    tree = ast.parse(source)
+    imported: set = set()
+    defined: set = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imported.add((alias.asname or alias.name).split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                imported.add(alias.asname or alias.name)
+        elif isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            defined.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    defined.add(target.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            defined.add(node.target.id)
+    return {n for n in defined if not n.startswith("_") and n not in imported}
+
+
+class TestNoAccidentalInternalPublic:
+    """Every public name a module defines is exported or explicitly internal.
+
+    Closes the residual gap the ``__all__``-subset tests cannot see: a public
+    name that reaches NO ``__all__`` list. That is the shape that shipped an
+    unreachable-exports defect. A new public class, function, or constant
+    must be added to ``cascadeui.__all__`` (public) or ``_INTERNAL_NAMES``
+    (internal), or this test fails at the point the name is introduced.
+    """
+
+    def test_no_accidental_internal_public(self):
+        offenders: dict = {}
+        for info in pkgutil.walk_packages(cascadeui.__path__, cascadeui.__name__ + "."):
+            name = info.name
+            if name in _INTERNAL_MODULES:
+                continue
+            if name.rsplit(".", 1)[-1].startswith("_"):
+                continue  # underscore module -- internal by path convention
+            try:
+                module = importlib.import_module(name)
+            except Exception:
+                continue
+            path = getattr(module, "__file__", None)
+            if not path or not os.path.exists(path):
+                continue
+            with open(path, encoding="utf-8") as handle:
+                public = _defined_public_names(handle.read())
+            leaked = sorted(public - set(cascadeui.__all__) - _INTERNAL_NAMES)
+            if leaked:
+                offenders[name] = leaked
+        assert not offenders, (
+            "Public names that reach neither cascadeui.__all__ nor _INTERNAL_NAMES "
+            "-- export each from the package root or add it to _INTERNAL_NAMES: "
+            f"{offenders}"
+        )

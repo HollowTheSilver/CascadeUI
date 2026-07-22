@@ -165,6 +165,13 @@ class _NavigationMixin:
                 if not new_view._init_kwargs.get("state_store"):
                     new_view.state_store = self.state_store
 
+                # The class path constructs with the acting interaction; the
+                # instance path binds it here, or a later navigation from
+                # this view (the interaction-or-self.interaction fallback)
+                # degrades to the no-edit programmatic path.
+                if current_interaction is not None:
+                    new_view.interaction = current_interaction
+
             new_view._ephemeral = self._ephemeral
 
             # Rebind the batch source so BATCH_COMPLETE carries the new
@@ -179,6 +186,14 @@ class _NavigationMixin:
             if action_type in ("NAVIGATION_PUSH", "NAVIGATION_POP") and self._message:
                 new_view._message = self._message
                 new_view._webhook_message = self._webhook_message
+                # Carry the ephemeral arming deadline, never recompute it: the
+                # webhook token belongs to the original send, so a mid-chain
+                # hop's handoff timer must sleep only the remainder of the
+                # original 900s window. The timer itself is scheduled
+                # post-commit in _settle_navigation -- armed here, it would
+                # orphan on rollback (_rollback_navigation never cancels the
+                # destination's tasks) and clobber the recovered source.
+                new_view._ephemeral_arm_deadline = self._ephemeral_arm_deadline
 
             # Forward-transfer the navigation stack.  Push appends an entry
             # for the current view; pop strips the last entry.  Replace
@@ -589,9 +604,12 @@ class _NavigationMixin:
         """Edit the message to the destination, then commit or roll back.
 
         Shared tail of push()/pop(). ``_apply_navigation_edit`` reports whether
-        the destination reached the message; on success the deferred source
-        teardown commits, on failure -- a contained edit error or a raising
-        preload/rebuild -- the navigation rolls back to the live source view.
+        the destination reached the message. On success the source's attachment
+        tracking hands off to the destination, the deferred source teardown
+        commits, and the destination's ephemeral handoff timer (when the source
+        carried an arming deadline) is scheduled. On failure -- a contained
+        edit error or a raising preload/rebuild -- the navigation rolls back
+        to the live source view.
         """
         try:
             edited = await self._apply_navigation_edit(new_view, interaction, rebuild)
@@ -602,7 +620,52 @@ class _NavigationMixin:
             await self._rollback_navigation(new_view)
             raise
         if edited:
+            # Migrate attachment tracking onto the destination (same message,
+            # same lifecycle) -- the same hand-off _reopen_ephemeral performs
+            # for its refreshed instance. Without it, a navigating parent
+            # orphans its attached children (the cleanup cascade dies with
+            # the source) and a navigating child escapes its own parent's
+            # cascade. The migration is destructive on the source's tracking,
+            # so it waits for the confirmed edit: a rolled-back push must find
+            # the source still holding its children and its parent link.
+            # replace() never reaches this tail, so its one-way behavior
+            # (attachments do not carry over) is preserved. Runs before the
+            # teardown commit so the source is fully live during the hand-off.
+            #
+            # Snapshot: attach_child prunes the source's list as it
+            # re-parents each child onto the destination.
+            for child in list(self._attached_children):
+                if child is new_view:
+                    # The destination taking over the message supersedes its
+                    # old child link; attach_child rejects self-attachment.
+                    continue
+                new_view.attach_child(child)
+            parent = self._attached_to
+            if parent is not None and not parent.is_finished():
+                parent.attach_child(new_view)
+                try:
+                    parent._attached_children.remove(self)
+                except ValueError:
+                    pass
+            self._attached_to = None
+
             await self._commit_source_teardown()
+            # The source's arm timer was cancelled in _navigate_to and the
+            # destination inherited the deadline with the message refs.
+            # Scheduling waits until here, after the edit confirmed, because
+            # a timer armed pre-edit would survive rollback and clobber the
+            # recovered source. The carried deadline means the timer sleeps
+            # only the time remaining to the 900s token cliff; the next hop's
+            # cancel_tasks reaps this task, so the chain holds one live timer.
+            # The gate reads the deadline, not auto_refresh_ephemeral -- the
+            # flag's derivation runs only at send, so it is unset on
+            # navigation targets.
+            if (
+                new_view._ephemeral_arm_deadline is not None
+                and not new_view._refresh_armed
+                and not new_view.is_finished()
+            ):
+                new_view.create_task(new_view._schedule_ephemeral_refresh())
         else:
             await self._rollback_navigation(new_view)
 

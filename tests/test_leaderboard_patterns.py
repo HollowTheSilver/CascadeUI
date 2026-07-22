@@ -124,6 +124,21 @@ class TestLeaderboardLayoutViewInit:
         assert view.pages == []
 
 
+class TestLeaderboardBotProperty:
+    """The read-only ``bot`` property exposes the injected client for overrides."""
+
+    def test_returns_injected_client(self):
+        interaction = _make_interaction()
+        bot = MagicMock(spec=discord.Client)
+        view = LeaderboardLayoutView(interaction=interaction, bot=bot)
+        assert view.bot is bot
+
+    def test_none_without_bot(self):
+        interaction = _make_interaction()
+        view = LeaderboardLayoutView(interaction=interaction)
+        assert view.bot is None
+
+
 class TestLeaderboardLayoutViewRendering:
     """Component tree construction via paginated pages."""
 
@@ -341,6 +356,105 @@ class TestDefaultAvatarResolution:
         await view.on_bind(bot)
         assert view._bot is bot
         assert await view.get_avatar_url(111, {}) == "https://cdn.example/avatar.png"
+
+
+class TestAvatarBackfill:
+    """avatar_backfill renders defaults immediately, then resolves the real
+    avatars off-path and reloads -- no sync-cache-defaults vs fetch-storm tradeoff.
+    """
+
+    def _capture(self, view):
+        """Capture backfill scheduling on a per-instance mock task manager.
+
+        Replaces the view's ``task_manager`` reference (instance-level) rather
+        than mutating the shared singleton's ``create_task``, which would poison
+        subscriber fan-out for every later test.
+        """
+        scheduled = []
+
+        def _cap(owner, coro):
+            scheduled.append((owner, coro))
+            coro.close()  # do not leave the backfill coroutine unawaited
+
+        view.task_manager = MagicMock()
+        view.task_manager.create_task = _cap
+        return scheduled
+
+    async def test_schedules_backfill_on_cache_miss(self):
+        from cascadeui.views.patterns.leaderboard import _default_avatar_url
+
+        class _Board(LeaderboardLayoutView):
+            avatar_backfill = True
+
+        view = _Board(interaction=_make_interaction(), bot=MagicMock(spec=discord.Client))
+        scheduled = self._capture(view)
+
+        top = [(111, {}), (222, {})]
+        # 111 missed the cache (default url); 222 resolved to a real url.
+        avatar_urls = [_default_avatar_url(111), "https://real/222.png"]
+        view._maybe_schedule_avatar_backfill(top, avatar_urls)
+
+        assert len(scheduled) == 1
+        assert scheduled[0][0] == view.id
+
+    async def test_no_backfill_when_all_resolved(self):
+        class _Board(LeaderboardLayoutView):
+            avatar_backfill = True
+
+        view = _Board(interaction=_make_interaction(), bot=MagicMock(spec=discord.Client))
+        scheduled = self._capture(view)
+
+        top = [(111, {})]
+        view._maybe_schedule_avatar_backfill(top, ["https://real/111.png"])
+
+        assert scheduled == []
+
+    async def test_no_backfill_when_disabled(self):
+        from cascadeui.views.patterns.leaderboard import _default_avatar_url
+
+        view = LeaderboardLayoutView(
+            interaction=_make_interaction(), bot=MagicMock(spec=discord.Client)
+        )  # avatar_backfill defaults False
+        scheduled = self._capture(view)
+
+        view._maybe_schedule_avatar_backfill([(111, {})], [_default_avatar_url(111)])
+
+        assert scheduled == []
+
+    async def test_signature_guard_prevents_reschedule(self):
+        from cascadeui.views.patterns.leaderboard import _default_avatar_url
+
+        class _Board(LeaderboardLayoutView):
+            avatar_backfill = True
+
+        view = _Board(interaction=_make_interaction(), bot=MagicMock(spec=discord.Client))
+        scheduled = self._capture(view)
+
+        top = [(111, {})]
+        avatar_urls = [_default_avatar_url(111)]
+        view._maybe_schedule_avatar_backfill(top, avatar_urls)
+        view._maybe_schedule_avatar_backfill(top, avatar_urls)  # same entries: no re-schedule
+
+        assert len(scheduled) == 1
+
+    async def test_backfill_resolves_caches_and_reloads(self):
+        class _Board(LeaderboardLayoutView):
+            avatar_backfill = True
+
+        user = MagicMock()
+        user.display_avatar.with_size.return_value.url = "https://real/111.png"
+        bot = MagicMock(spec=discord.Client)
+        bot.fetch_user = AsyncMock(return_value=user)
+
+        view = _Board(interaction=_make_interaction(), bot=bot)
+        view.reload = AsyncMock()
+
+        await view._backfill_avatars([111])
+
+        assert view._avatar_cache[111] == "https://real/111.png"
+        view.reload.assert_awaited_once_with(force=True)
+        # get_avatar_url now serves the cached real avatar, not a default.
+        assert await view.get_avatar_url(111, {}) == "https://real/111.png"
 
 
 class TestPageFrameHooks:

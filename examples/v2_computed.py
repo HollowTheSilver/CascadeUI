@@ -29,8 +29,6 @@ Usage:
 # // ========================================( Modules )======================================== // #
 
 
-import logging
-
 import discord
 from discord.ext import commands
 from discord.ext.commands import Context
@@ -49,8 +47,6 @@ from cascadeui import (
     read_slot,
     stats_card,
 )
-
-logger = logging.getLogger(__name__)
 
 # // ========================================( Config )======================================== // #
 

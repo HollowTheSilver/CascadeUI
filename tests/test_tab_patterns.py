@@ -521,3 +521,54 @@ class TestTabViewInitialRender:
 
         embed = interaction.response.send_message.call_args.kwargs.get("embed")
         assert embed.title == "Caller"
+
+
+# // ========================================( refresh_content (public re-render) )======================================== // #
+
+
+class TestRefreshContent:
+    """refresh_content() re-renders in place: V1 ships the embed, V2 the tree."""
+
+    async def test_v1_ships_the_embed(self):
+        async def embed_builder():
+            return discord.Embed(title="V1 content")
+
+        view = TabView(
+            interaction=_make_interaction(),
+            tabs={"A": embed_builder, "B": embed_builder},
+        )
+        view.refresh = AsyncMock()
+        await view.refresh_content()
+        embed = view.refresh.call_args.kwargs.get("embed")
+        assert embed is not None
+        assert embed.title == "V1 content"
+
+    async def test_v2_recomposes_the_active_tab(self):
+        state = {"text": "before"}
+
+        async def builder():
+            return [Container(TextDisplay(state["text"]))]
+
+        view = TabLayoutView(
+            interaction=_make_interaction(),
+            tabs={"A": builder, "B": builder},
+        )
+        view.refresh = AsyncMock()
+        state["text"] = "after"
+        await view.refresh_content()
+        tree = " ".join(
+            getattr(t, "content", "") for t in view.walk_children() if isinstance(t, TextDisplay)
+        )
+        assert "after" in tree
+        view.refresh.assert_awaited()
+
+    async def test_v1_reload_ships_the_embed(self):
+        async def eb():
+            return discord.Embed(title="reloaded")
+
+        view = TabView(interaction=_make_interaction(), tabs={"A": eb, "B": eb})
+        view.refresh = AsyncMock()
+        await view.reload()
+        embed = view.refresh.call_args.kwargs.get("embed")
+        assert embed is not None  # was the empty-kwargs no-op before the fix
+        assert embed.title == "reloaded"

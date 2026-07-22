@@ -8,14 +8,17 @@ Covers the primitive's contracts:
   subclass; there is no "abstract intermediate base" pattern.
 - Default ``from_custom_id`` extracts and snowflake-coerces captures.
 - ``callback`` binds ``_CURRENT_INTERACTION`` during ``on_click``.
-- Bot registration happens inside ``PersistenceMiddleware.initialize``.
+- Bot registration rides the persistent-view reattach pass: driven by
+  ``PersistenceMiddleware.initialize``, re-driven by
+  ``PersistenceManager.reattach`` for late-imported subclasses.
 """
 
 # // ========================================( Modules )======================================== // #
 
 
+import asyncio
 import re
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import discord
 import pytest
@@ -98,6 +101,15 @@ class TestSubclassRegistration:
 
             class _MissingTemplate(DynamicPersistentButton):  # noqa: F841
                 pass
+
+    def test_non_positive_auto_defer_delay_rejected(self, clean_registry):
+        with pytest.raises(ValueError, match="auto_defer_delay"):
+
+            class _BadDelay(
+                DynamicPersistentButton,
+                template=r"baddelay:(?P<role_id>[0-9]+)",
+            ):
+                auto_defer_delay = -5
 
     def test_qualified_key_prevents_bare_name_collision(self, clean_registry):
         # The registry key includes module + qualname so two classes
@@ -260,7 +272,12 @@ class TestCallbackContextVar:
 
 
 class TestBotRegistration:
-    """``PersistenceMiddleware.initialize`` registers subclasses with the bot."""
+    """The reattach pass registers subclasses with the bot.
+
+    ``PersistenceMiddleware.initialize`` drives the initial pass;
+    ``PersistenceManager.reattach`` re-drives it so subclasses imported
+    after initialize still route clicks.
+    """
 
     async def test_add_dynamic_items_called_with_registered_subclasses(self, clean_registry):
         # Declare a fresh subclass the middleware should register.
@@ -301,6 +318,44 @@ class TestBotRegistration:
         passed_classes = bot.add_dynamic_items.call_args.args
         assert _RegBotButton in passed_classes
 
+    async def test_reattach_re_drives_late_registered_subclass(self, clean_registry):
+        # A subclass imported AFTER initialize() lands in the module
+        # registry but missed the initial add_dynamic_items pass; its
+        # clicks would never route. reattach() must re-drive registration
+        # with the late class included -- the same recovery the view path
+        # gets for late-imported PersistentView classes.
+        from cascadeui.persistence.backends.memory import InMemoryBackend
+        from cascadeui.state.middleware.persistence import PersistenceMiddleware
+        from cascadeui.state.singleton import get_store
+
+        bot = MagicMock(spec=discord.Client)
+        store = get_store()
+        store._cleanup_listener_installed = True
+
+        middleware = PersistenceMiddleware(backend=InMemoryBackend(), bot=bot)
+        await middleware.initialize(store)
+        bot.add_dynamic_items.assert_called_once()
+
+        # Defined after initialize: stands in for a cog loaded later.
+        class _LateButton(
+            DynamicPersistentButton,
+            template=r"late:(?P<role_id>[0-9]+)",
+        ):
+            def __init__(self, *, role_id: int):
+                super().__init__(
+                    discord.ui.Button(
+                        label="lt",
+                        custom_id=f"late:{role_id}",
+                        style=discord.ButtonStyle.primary,
+                    )
+                )
+                self.role_id = role_id
+
+        await store.persistence_manager.reattach()
+
+        assert bot.add_dynamic_items.call_count == 2
+        assert _LateButton in bot.add_dynamic_items.call_args.args
+
 
 # // ========================================( Custom ID Stabilization )======================================== // #
 
@@ -328,3 +383,130 @@ class TestCustomIdStabilization:
 
         item = _StableButton(role_id=999)
         assert item._provided_custom_id is True
+
+
+# // ========================================( Ack Backstop )======================================== // #
+
+
+class TestDynamicButtonAckBackstop:
+    """The dynamic-dispatch path has no ``_scheduled_task`` timer, so
+    ``callback`` arms its own auto-defer timer before ``on_click``. A slow
+    handler (a role toggle's REST mutations) still acks within the 3s window,
+    and a fast silent handler is acked by the post-callback defer.
+    """
+
+    def _mock_interaction(self):
+        interaction = MagicMock()
+        interaction.response.is_done = MagicMock(return_value=False)
+        interaction.response.defer = AsyncMock()
+        return interaction
+
+    async def test_timer_fires_during_slow_on_click(self, clean_registry):
+        """A slow ``on_click`` (simulating a role-mutation REST call) triggers
+        the auto-defer timer while it runs, proving the timer is armed before
+        ``on_click``. A trailing defer alone could not ack in time.
+        """
+        deferred_during = {}
+
+        class _SlowButton(
+            DynamicPersistentButton,
+            template=r"slow:(?P<role_id>[0-9]+)",
+        ):
+            auto_defer_delay = 0.05
+
+            def __init__(self, *, role_id: int):
+                super().__init__(discord.ui.Button(label="x", custom_id=f"slow:{role_id}"))
+                self.role_id = role_id
+
+            async def on_click(self, interaction):
+                await asyncio.sleep(0.15)
+                deferred_during["value"] = interaction.response.defer.called
+
+        button = _SlowButton(role_id=1)
+        interaction = self._mock_interaction()
+        await button.callback(interaction)
+
+        assert deferred_during["value"] is True
+
+    async def test_post_callback_defer_acks_fast_silent_handler(self, clean_registry):
+        """A fast ``on_click`` that edits via the channel endpoint (never
+        touching the interaction response) is acked by the post-callback defer.
+        """
+
+        class _FastButton(
+            DynamicPersistentButton,
+            template=r"fast:(?P<role_id>[0-9]+)",
+        ):
+            auto_defer_delay = 10  # the timer would not fire on its own
+
+            def __init__(self, *, role_id: int):
+                super().__init__(discord.ui.Button(label="x", custom_id=f"fast:{role_id}"))
+                self.role_id = role_id
+
+            async def on_click(self, interaction):
+                pass
+
+        button = _FastButton(role_id=1)
+        interaction = self._mock_interaction()
+        await button.callback(interaction)
+
+        interaction.response.defer.assert_called_once()
+
+
+# // ========================================( respond() helper )======================================== // #
+
+
+class TestRespond:
+    """``respond()`` is is_done-aware, so a reply survives the auto-defer timer."""
+
+    def _make_button(self):
+        class _RespondButton(
+            DynamicPersistentButton,
+            template=r"respondbtn:(?P<role_id>[0-9]+)",
+        ):
+            def __init__(self, *, role_id: int):
+                super().__init__(discord.ui.Button(label="x", custom_id=f"respondbtn:{role_id}"))
+                self.role_id = role_id
+
+        return _RespondButton(role_id=1)
+
+    async def test_open_slot_uses_send_message(self, clean_registry):
+        from helpers import make_interaction
+
+        button = self._make_button()
+        interaction = make_interaction(is_done=False)
+        await button.respond(interaction, "hi", ephemeral=True)
+        interaction.response.send_message.assert_awaited_once()
+        interaction.followup.send.assert_not_awaited()
+
+    async def test_acked_slot_uses_followup(self, clean_registry):
+        from helpers import make_interaction
+
+        button = self._make_button()
+        interaction = make_interaction(is_done=True)
+        await button.respond(interaction, "hi", ephemeral=True)
+        interaction.followup.send.assert_awaited_once()
+        interaction.response.send_message.assert_not_awaited()
+
+    async def test_slow_on_click_using_respond_survives_the_timer(self, clean_registry):
+        from helpers import make_interaction
+
+        class _SlowButton(
+            DynamicPersistentButton,
+            template=r"slowbtn:(?P<role_id>[0-9]+)",
+        ):
+            auto_defer_delay = 0.05
+
+            def __init__(self, *, role_id: int):
+                super().__init__(discord.ui.Button(label="x", custom_id=f"slowbtn:{role_id}"))
+                self.role_id = role_id
+
+            async def on_click(self, interaction):
+                await asyncio.sleep(0.15)  # outlast the auto-defer timer
+                await self.respond(interaction, "done", ephemeral=True)
+
+        button = _SlowButton(role_id=1)
+        interaction = make_interaction(is_done=False)
+        await button.callback(interaction)  # must not raise InteractionResponded
+        # The timer acked mid-click, so respond routed via followup.
+        interaction.followup.send.assert_awaited()

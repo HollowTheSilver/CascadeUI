@@ -23,6 +23,186 @@ preserved below for historical reference but are not the supported baseline.
 
 ---
 
+## [3.7.0] - 2026-07-21
+
+### Added
+
+- **`ack_first` view flag.** Opt-in per-view acknowledgement before the access
+  checks and the callback run, for views whose callbacks do synchronous work
+  that can stall the event loop. Trades the one-request acting-view refresh path
+  for a guaranteed early ack.
+- **`auto_defer_delay` is now a tunable on `Modal` and `DynamicPersistentButton`.**
+  Both carry the ack-backstop delay views already have (default 2.5s), and both
+  validate it at definition time, so a subclass setting it to a non-positive or
+  non-numeric value fails when the class is defined.
+- **`respond()` helpers for `DynamicPersistentButton` and `Modal`, plus a public
+  `respond_safe`.** These auto-defer-armed surfaces now expose an `is_done()`-aware
+  responder, so a reply sent from an `on_click`, a `Modal.on_submit` override, or a
+  roles event hook (`on_role_assigned` and its siblings, via `respond_safe`) falls
+  back to a followup instead of raising `InteractionResponded` when the ack timer
+  has already fired.
+- **`respond()` warns when it is handed a stateful view.** Passing a CascadeUI
+  view as a raw `view=` kwarg skips that view's own `send()`, leaving it live but
+  unregistered: invisible to the inspector, instance limits, and state cleanup,
+  and its timeout later fires a destroy for a view that was never created. The
+  warning names the `send()` call that replaces it.
+- **`avatar_backfill` for section-mode leaderboards.** Opt-in flag that renders
+  Discord default avatars immediately, then resolves the real avatars off the
+  render path and reloads when they arrive, avoiding both a wrong-avatar first
+  render and a per-row fetch storm on large guilds. Pairs with an overridable
+  `resolve_avatar_urls` hook.
+- **`LeaderboardLayoutView.bot` read-only property.** Exposes the client passed
+  via `bot=` (or injected by `on_bind`) so a `resolve_avatar_urls` /
+  `get_avatar_url` override resolves avatars through `self.bot` instead of
+  reaching into a private attribute.
+- **`FormView` and `FormLayoutView` expose `text_edit_modal_auto_defer_delay`.**
+  The grouped text-edit modal these patterns build internally now takes its ack
+  backstop from this class attribute (default 2.5s), so a form subclass with a
+  slow async field validator can raise it without reconstructing the modal.
+- **Public error setters on `FormView` / `FormLayoutView`.** `set_form_error(msg)`
+  and `set_field_error(field_id, *msgs)` write the error state and re-render the
+  form so it shows. They replace the previously documented approach of setting the
+  private `_form_error` / `_field_errors` and calling `refresh()`, which set the
+  state but never rendered it. Called from an `on_submit` override, they reject a
+  cross-field rule and keep the form open (a per-field validator sees only its own
+  field, so a constraint spanning fields belongs in `on_submit`).
+- **`set_page(n)` on `PaginatedView` / `PaginatedLayoutView`.** Jumps to a
+  zero-based page, clamps to range, fires `on_page_changed`, and re-renders.
+  Setting `current_page` directly does not re-render; `set_page` is the supported
+  cursor move.
+- **`refresh_content()` on the tab and wizard patterns.** A public in-place
+  re-render for a subclass callback that mutated data and needs the active tab or
+  step redrawn without a re-fetch. On V1 it rebuilds the embed; on V2 it recomposes
+  the tree.
+- **`allow_reselect` on `choice_row`.** Single-select disables the active option
+  by default (re-picking is a no-op); set `allow_reselect=True` to keep it
+  clickable so a re-pick fires `on_select` again, for a control whose callback has
+  a side effect beyond selection (re-opening the active option's editor). Ignored
+  in multi-select, where active options already toggle.
+- **Five public names now import from the package root.** `RetryConfig` (the
+  config object for the `with_retry` decorator), `Transaction` (the raw-SQL
+  transaction protocol a backend's `transaction()` returns), and `ColorScheme`,
+  `FormatTemplate`, `JSONFormatter` (the `setup_logging` customization types)
+  were reachable only via deep module paths; each is now exported from
+  `cascadeui`.
+
+### Changed
+
+- **A component-less display view tears down without a wasted edit.** A static
+  `DisplayLayoutView` (a card of text and images, no interactive components)
+  previously shipped one no-op PATCH per teardown: `on_timeout` and
+  `exit(delete_message=False)` froze the tree and re-sent an identical message.
+  The freeze now reports how many components it disabled, and the cosmetic edit is
+  skipped when nothing froze, so a posted-and-forgotten notice self-cleans for
+  free. Views with interactive components are unaffected (the disable edit still
+  ships). `exit()` is documented as the teardown seam: bare `stop()` cancels the
+  timeout but leaves the view in the active-view registry.
+- **Library logging is now non-blocking.** `setup_logging` routes console and
+  file output through a `QueueHandler`/`QueueListener`, so a log call drops the
+  record on an in-memory queue and a background thread performs the file/console
+  I/O -- the event loop no longer blocks on logging, which matters most at DEBUG.
+  For the built-in console and file formatters the output is byte-identical;
+  levels, colours, file rotation, and the action stream are unchanged. A repeat
+  `setup_logging()` call now reconfigures cleanly instead of double-logging, and
+  `setup_logging(handler=...)` now also installs the action stream (the
+  custom-handler path previously skipped it).
+
+### Removed
+
+- **The unused `AsyncLogger` class.** Its async-queue mechanism now lives in
+  `setup_logging` (see Changed). `AsyncLogger` was never exported from the
+  package root or `cascadeui.utils`; code that reached it via
+  `cascadeui.utils.logging.AsyncLogger` should call `setup_logging()` instead.
+
+### Fixed
+
+- **Component clicks with slow access checks no longer expire under load.** When
+  a view's `interaction_check` override does I/O (an uncached member or role
+  lookup on a busy bot), the interaction could cross Discord's 3-second
+  acknowledgement deadline before the click was acked, surfacing as an
+  interaction-failed (10062) storm on later, unrelated buttons. The auto-defer
+  safety net now arms before the access checks run, so a slow check keeps its
+  ack backstop; a rejected check still shows its message via followup.
+- **Modal submissions no longer expire under a slow access check, a slow
+  validator, or a raising handler.** A modal acknowledged only inside
+  `on_submit`, so a slow `interaction_check` override (which Discord runs before
+  `on_submit`) or a slow validator could cross the 3-second deadline, and a
+  validator or callback that raised left the interaction unacknowledged
+  entirely. The modal now arms its ack backstop across the whole submission
+  dispatch, and a validation-error message routes through the followup when the
+  ack has already landed.
+- **Role panels and other dynamic buttons acknowledge before their handler
+  runs.** A `DynamicPersistentButton` click (role-reaction panels included)
+  ran its handler, the role add/remove requests and all, with no acknowledgement
+  timer, so a slow mutation on a busy panel dropped the click. Dynamic buttons
+  now arm an ack timer before the handler.
+- **Views sent from a slash command survive a slow preload.** A view's `on_load`
+  and setup ran on the interaction clock during `send()`, so a slow preload
+  could expire the interaction before the send acked it. A send-scoped ack timer
+  now covers the pre-send work.
+- **Owner-only DevTools commands defer before bulk work.** The `/cascadeui`
+  commands that do bulk or I/O work (`exit`, `exitall`, `flush`, `purge`,
+  `reset`) could exceed the acknowledgement deadline on a busy store; they now
+  defer up front.
+- **Missed acknowledgements are diagnosable.** When the auto-defer timer's own
+  ack fails because the interaction already expired, it logs at warning with the
+  elapsed time since the interaction was created (the sign of a congested event
+  loop) instead of a silent debug line. A view whose `on_state_changed` override
+  overruns the ack budget while an interaction is in flight now warns once per
+  class, matching the existing
+  `on_load` warning, and the persistent-view restart repaint logs its duration.
+- **`auto_refresh_ephemeral` handoff survives push/pop navigation.** A
+  long-lived ephemeral view lost its refresh handoff at the first `push()` or
+  `pop()`, so a multi-step flow crossed the 900s webhook-token cliff with no
+  "Continue Session" button and errored on a later, unrelated click. The arming
+  deadline now rides the navigation chain and re-arms on the destination once
+  the edit confirms.
+- **Reopening an ephemeral view keeps its navigation identity and session.** A
+  reopened view rebuilt from constructor kwargs alone, so it lost its
+  post-construction selection, navigation stack, reopen factory, and undo/redo
+  timeline, and its `Back` button degenerated. It now carries all of these,
+  rejoins its original session so `shared_data` survives the swap, and no longer
+  deletes its own attached child views while reopening.
+- **A non-ephemeral `send()` clears a stale ephemeral flag.** A view instance
+  reused for a public send after an ephemeral one kept its ephemeral marker,
+  which routed its refreshes through a slower edit path and misread real
+  permission errors as token expiry.
+- **Attached child views survive navigation.** A parent view orphaned its
+  attached children the moment it navigated, and a child that navigated escaped
+  its parent's cleanup. Children now re-parent onto the destination across
+  `push()` and `pop()`.
+- **Pushing a pre-constructed view instance binds the acting interaction.** A
+  later navigation from a `push(instance)` destination that fell back to the
+  stored interaction took a no-edit path; the instance now binds the acting
+  interaction the same way the class path does.
+- **Late-imported `DynamicPersistentButton` subclasses recover via
+  `reattach()`.** A dynamic button defined in a cog loaded after
+  `setup_middleware` was never wired into dispatch, so its clicks silently never
+  routed. `reattach()` now re-drives dynamic-item registration, matching the
+  recovery already available to late-imported persistent views.
+- **Reattached persistent views restore their original session.** Restart
+  re-derived a suffix-free session key, so two panels of the same class opened by
+  the same user collided on one session. The `session_id` captured at
+  registration is now restored, keeping each view's original session identity.
+- **`reload()` re-renders on the V1 tab, wizard, form, and paginated patterns.**
+  It shipped an edit with no `embed`, so a V1 `reload()` re-fetched via `on_load`
+  but never updated the visible embed. Each V1 pattern now routes `reload()`'s
+  render step through its embed-carrying rebuild.
+- **Form controls route through the stateful callback wrapper.** Every select,
+  boolean button, text-edit button, and submit button on `FormView` and
+  `FormLayoutView` had its callback replaced after construction, which dropped
+  the component-interaction dispatch (form clicks never reached the action
+  history or the inspector) and left the acting interaction unbound, so each
+  field change paid two Discord round-trips instead of one.
+- **`choice_row` in dropdown form honors its no-op re-pick contract.** Its
+  docstring states that re-picking the active option is a no-op, and the button
+  form disables the active option to enforce that; the dropdown form (6 or more
+  options) fired `on_select` on a re-pick anyway, so the control's behavior
+  flipped at `button_threshold`. The dropdown now swallows a single-select
+  re-pick of the active value unless `allow_reselect=True` (see Added).
+
+---
+
 ## [3.6.0] - 2026-07-17
 
 ### Breaking

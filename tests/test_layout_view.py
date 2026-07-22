@@ -916,11 +916,15 @@ class TestOnTimeoutLogLevel:
     """on_timeout downgrades the expected ephemeral token-expiry edit
     failure to DEBUG; a non-ephemeral edit failure stays WARNING. The
     branch is gated on ``_ephemeral``, so any edit exception exercises it.
+
+    The view carries a freezable button so on_timeout ships the disable edit;
+    a component-less display view skips the edit entirely (nothing to freeze).
     """
 
     async def test_ephemeral_edit_failure_logs_debug(self, caplog):
         interaction = _make_interaction()
         view = RenderableLayoutView(interaction=interaction)
+        view.add_item(ActionRow(StatefulButton(label="Fire")))
         await view.send()
         view._ephemeral = True
         view._message = MagicMock()
@@ -944,6 +948,7 @@ class TestOnTimeoutLogLevel:
     async def test_non_ephemeral_edit_failure_logs_warning(self, caplog):
         interaction = _make_interaction()
         view = RenderableLayoutView(interaction=interaction)
+        view.add_item(ActionRow(StatefulButton(label="Fire")))
         await view.send()
         view._ephemeral = False
         view._message = MagicMock()
@@ -957,6 +962,61 @@ class TestOnTimeoutLogLevel:
         ]
         assert warning_records
         assert all(r.levelno == logging.WARNING for r in warning_records)
+
+
+class TestFreezeSkipsNoOpEdit:
+    """A component-less display view tears down without a cosmetic PATCH.
+
+    _freeze_components returns the count of newly-disabled items; on_timeout
+    and exit(delete_message=False) skip the message edit when it returns 0,
+    so a static card (text and images, no interactive components) posts and
+    self-cleans without ever shipping a no-op edit that re-sends an identical
+    tree.
+    """
+
+    def test_freeze_returns_count_of_newly_disabled(self):
+        view = RenderableLayoutView(interaction=_make_interaction())
+        view.add_item(ActionRow(StatefulButton(label="Fire")))
+        assert view._freeze_components() == 1  # the one button
+        assert view._freeze_components() == 0  # already disabled, nothing new
+
+    def test_display_only_freeze_returns_zero(self):
+        # RenderableLayoutView holds a single TextDisplay -- no disabled attr.
+        view = RenderableLayoutView(interaction=_make_interaction())
+        assert view._freeze_components() == 0
+
+    async def test_on_timeout_skips_edit_for_display_view(self):
+        view = RenderableLayoutView(interaction=_make_interaction())
+        await view.send()
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+
+        await view.on_timeout()
+
+        view._message.edit.assert_not_called()  # nothing to freeze -> no PATCH
+
+    async def test_on_timeout_edits_when_a_component_freezes(self):
+        view = RenderableLayoutView(interaction=_make_interaction())
+        view.add_item(ActionRow(StatefulButton(label="Fire")))
+        await view.send()
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+
+        await view.on_timeout()
+
+        view._message.edit.assert_awaited_once()  # a button froze -> one PATCH
+
+    async def test_exit_keep_message_skips_edit_for_display_view(self):
+        view = RenderableLayoutView(interaction=_make_interaction())
+        await view.send()
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+        view._message.delete = AsyncMock()
+
+        await view.exit(delete_message=False)
+
+        view._message.edit.assert_not_called()
+        view._message.delete.assert_not_called()  # message left intact
 
 
 class TestStatefulLayoutViewInteraction:
@@ -2861,3 +2921,198 @@ class TestRateLimitSchedulesARetry:
         await view.refresh()
 
         assert view._deferred_refresh_task is None
+
+
+class TestSendPipelineAckBackstop:
+    """A direct slash-command send arms an ack backstop over its pre-send I/O
+    (on_load, on_pre_send, enforcement, seeding), which has no _scheduled_task
+    timer of its own.
+    """
+
+    async def test_slow_on_load_defers_via_send_timer(self):
+        """A slow on_load during send() triggers the send-scoped timer, acking
+        the interaction before Stage 5 would otherwise blow the 3s wall.
+        """
+
+        class _SlowLoad(RenderableLayoutView):
+            async def on_load(self):
+                await asyncio.sleep(0.15)
+
+        interaction = _make_interaction(is_done=False)
+        interaction.response.defer = AsyncMock()
+        view = _SlowLoad(interaction=interaction)
+        view.auto_defer_delay = 0.05  # fires during the 0.15s on_load
+
+        await view.send()
+
+        interaction.response.defer.assert_called()
+
+    async def test_fast_send_does_not_defer(self):
+        """A fast send cancels the timer before it fires, so the send itself is
+        the ack (no premature defer).
+        """
+        interaction = _make_interaction(is_done=False)
+        interaction.response.defer = AsyncMock()
+        view = RenderableLayoutView(interaction=interaction)
+        view.auto_defer_delay = 10  # would never fire during a fast send
+
+        await view.send()
+
+        interaction.response.defer.assert_not_called()
+
+    async def test_veto_cancels_send_timer(self):
+        """An on_pre_send veto cancels the send-scoped timer, so no phantom
+        defer fires after send() returns None.
+        """
+
+        class _Veto(RenderableLayoutView):
+            async def on_pre_send(self, interaction):
+                return False
+
+        interaction = _make_interaction(is_done=False)
+        interaction.response.defer = AsyncMock()
+        view = _Veto(interaction=interaction)
+        view.auto_defer_delay = 0.05
+
+        result = await view.send()
+
+        assert result is None
+        await asyncio.sleep(0.1)  # a leaked timer would fire by now
+        interaction.response.defer.assert_not_called()
+
+    async def test_on_pre_send_runs_on_open_slot(self):
+        """The send-scoped timer arms AFTER on_pre_send, so a slow veto hook
+        keeps its documented open response slot instead of being deferred.
+        """
+        slot_open = {}
+
+        class _Gate(RenderableLayoutView):
+            async def on_pre_send(self, interaction):
+                await asyncio.sleep(0.15)  # slow veto
+                slot_open["value"] = not interaction.response.is_done()
+                return False
+
+        interaction = _make_interaction(is_done=False)
+        interaction.response.defer = AsyncMock()
+        view = _Gate(interaction=interaction)
+        view.auto_defer_delay = 0.05  # would fire mid-veto if armed before it
+
+        await view.send()
+
+        assert slot_open["value"] is True
+
+    async def test_stage5_40060_ships_via_followup(self):
+        """A server-side 40060 on send_message (a cancelled send-defer landing
+        in the ack race) ships via followup instead of rolling the send back.
+        """
+        interaction = _make_interaction(is_done=False)
+        err = discord.HTTPException(MagicMock(status=400), {"code": 40060, "message": "x"})
+        interaction.response.send_message = AsyncMock(side_effect=err)
+        interaction.followup.send = AsyncMock(return_value=MagicMock())
+        view = RenderableLayoutView(interaction=interaction)
+
+        await view.send()
+
+        interaction.followup.send.assert_called_once()
+
+
+class TestReopenInstanceLimit:
+    """A reopen swap must not self-replace a limited view: the dying instance
+    is excluded from the replacement's instance-limit count.
+    """
+
+    async def test_replacing_view_id_excluded_from_count(self):
+        from cascadeui.state.singleton import get_store
+
+        class _Limited(StatefulLayoutView):
+            instance_limit = 1
+            instance_policy = "replace"
+
+        store = get_store()
+        old = _Limited(interaction=_make_interaction(user_id=1, guild_id=1))
+        store._register_view(old)
+        old.exit = AsyncMock()
+        try:
+            new = _Limited(interaction=_make_interaction(user_id=1, guild_id=1))
+            new._replacing_view_id = old.id
+
+            await new._enforce_instance_limit()
+
+            old.exit.assert_not_called()  # excluded from count -> not replaced
+        finally:
+            store._unregister_view(old.id)
+
+
+class TestReactiveRenderDurationWarning:
+    """A slow overridden on_state_changed warns once per class at the reactive
+    rebuild seam -- the always-on budget mirror of _run_on_load. The budget is an
+    ack deadline, so the timing only runs while an interaction is in flight.
+    """
+
+    async def test_slow_reactive_rebuild_warns_once(self, caplog):
+        from cascadeui.state.store import _CURRENT_INTERACTION
+        from cascadeui.views.base import _slow_render_warned
+
+        class _SlowRender(StatefulLayoutView):
+            async def on_state_changed(self, state):
+                await asyncio.sleep(0.05)
+
+        _slow_render_warned.discard("_SlowRender")
+
+        view = _SlowRender(interaction=_make_interaction())
+        view.auto_defer_delay = 0.01  # 0.05s rebuild overruns the budget
+
+        token = _CURRENT_INTERACTION.set(_make_interaction())
+        try:
+            with caplog.at_level(logging.WARNING, logger="cascadeui.views.base"):
+                await view._run_state_changed({})
+                await view._run_state_changed({})  # second call must not re-warn
+        finally:
+            _CURRENT_INTERACTION.reset(token)
+
+        warnings = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING and "on_state_changed" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+
+    async def test_no_warning_when_no_interaction_is_in_flight(self, caplog):
+        """A timeout-driven rebuild races no ack, so the budget does not apply.
+
+        Three views timing out at once each fire a rebuild plus a message edit;
+        the elapsed time there is the edit, not the rebuild, and warning on it
+        would train operators to ignore the diagnostic.
+        """
+        from cascadeui.state.store import _CURRENT_INTERACTION
+        from cascadeui.views.base import _slow_render_warned
+
+        class _SlowBackgroundRender(StatefulLayoutView):
+            async def on_state_changed(self, state):
+                await asyncio.sleep(0.05)
+
+        _slow_render_warned.discard("_SlowBackgroundRender")
+
+        view = _SlowBackgroundRender(interaction=_make_interaction())
+        view.auto_defer_delay = 0.01
+
+        assert _CURRENT_INTERACTION.get() is None
+        with caplog.at_level(logging.WARNING, logger="cascadeui.views.base"):
+            await view._run_state_changed({})
+
+        assert not any("on_state_changed() took" in r.getMessage() for r in caplog.records)
+
+    async def test_default_on_state_changed_not_timed(self, caplog):
+        """A view that does not override on_state_changed is not warned (the
+        default path is build_ui + edit, which this coarse budget cannot isolate).
+        """
+        from cascadeui.views.base import _slow_render_warned
+
+        _slow_render_warned.clear()
+        view = StatefulLayoutView(interaction=_make_interaction())
+        view.refresh = AsyncMock()  # the default on_state_changed calls refresh()
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui.views.base"):
+            await view._run_state_changed({})
+
+        assert not any("on_state_changed() took" in r.getMessage() for r in caplog.records)

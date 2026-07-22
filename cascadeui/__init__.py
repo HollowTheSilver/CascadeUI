@@ -86,6 +86,7 @@ from .persistence import (
     PersistenceManager,
     RegistryPersistence,
     SlotPolicy,
+    Transaction,
 )
 from .persistence import __all__ as _persistence_all
 from .persistence import (
@@ -112,9 +113,9 @@ from .utils.coercion import (
     is_snowflake,
 )
 from .utils.decorators import cascade_component, cascade_reducer
-from .utils.errors import safe_execute, with_error_boundary, with_retry
+from .utils.errors import RetryConfig, safe_execute, with_error_boundary, with_retry
 from .utils.fetch import fetch_as_file
-from .utils.logging import setup_logging
+from .utils.logging import ColorScheme, FormatTemplate, JSONFormatter, setup_logging
 from .utils.strings import is_emoji, slugify
 from .utils.tasks import get_task_manager
 from .validation import (
@@ -145,6 +146,7 @@ from .views.patterns import (
     TabView,
     WizardLayoutView,
     WizardView,
+    respond_safe,
 )
 from .views.patterns.types import (
     FormField,
@@ -166,7 +168,7 @@ if "PostgresBackend" in _persistence_all:
 # // ========================================( Script )======================================== // #
 
 
-__version__ = "3.6.0"
+__version__ = "3.7.0"
 
 # Export public API
 __all__ = [
@@ -189,6 +191,7 @@ __all__ = [
     # Persistence
     "PersistenceManager",
     "PersistenceBackend",
+    "Transaction",
     "Capability",
     "InMemoryBackend",
     "RegistryPersistence",
@@ -207,6 +210,7 @@ __all__ = [
     "PersistentLeaderboardLayoutView",
     "PersistentRolesLayoutView",
     "RolesLayoutView",
+    "respond_safe",
     "TabLayoutView",
     "WizardLayoutView",
     # Components
@@ -327,12 +331,16 @@ __all__ = [
     "light_theme",
     # Logging
     "setup_logging",
+    "ColorScheme",
+    "FormatTemplate",
+    "JSONFormatter",
     # Middleware install
     "setup_middleware",
     # Utilities
     "get_task_manager",
     "with_error_boundary",
     "with_retry",
+    "RetryConfig",
     "safe_execute",
     "cascade_reducer",
     "cascade_component",

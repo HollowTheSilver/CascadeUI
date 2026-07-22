@@ -67,6 +67,28 @@ so the volume is high enough to bury a typical debug session. Leave
 chasing a routing question. Turn it back off once the symptom is
 resolved.
 
+### Customizing log output
+
+`setup_logging()` accepts `colors=` and `template=` to control the console
+appearance. Pass a preset name (`"ocean"`, `"forest"`, `"minimal"`) or a
+`ColorScheme` / `FormatTemplate` instance for full control, and a
+`JSONFormatter` as `file_formatter=` for machine-readable file logs:
+
+```python
+from cascadeui import setup_logging, ColorScheme, JSONFormatter
+
+setup_logging(
+    colors=ColorScheme(info="\x1b[36;1m"),   # cyan info lines
+    template="minimal",                       # preset name, or a FormatTemplate instance
+    file_formatter=JSONFormatter(),           # structured JSON file output
+)
+```
+
+All four types import from the package root. Because logging runs through the
+async queue, a `JSONFormatter` used as `file_formatter=` folds a traceback into
+the `message` field rather than a separate `exception` key; its docstring notes
+the synchronous-handler workaround if you need the structured key.
+
 ---
 
 ## DevToolsCog

@@ -676,6 +676,7 @@ class TestDevToolsCogReset:
     def _make_ctx(self):
         ctx = MagicMock()
         ctx.send = AsyncMock()
+        ctx.defer = AsyncMock()
         return ctx
 
     async def test_reset_uses_build_initial_state_helper(self):
@@ -745,6 +746,7 @@ class TestDevToolsCogExitAll:
     def _make_ctx(self):
         ctx = MagicMock()
         ctx.send = AsyncMock()
+        ctx.defer = AsyncMock()
         ctx.guild = None  # DM / no guild scope -- exercise the exit-all path
         return ctx
 
@@ -783,6 +785,7 @@ class TestDevToolsCogGuildScope:
     def _ctx(self, guild_id=100):
         ctx = MagicMock()
         ctx.send = AsyncMock()
+        ctx.defer = AsyncMock()
         if guild_id is None:
             ctx.guild = None
         else:
@@ -839,6 +842,7 @@ class TestDevToolsCogGroupListing:
         cog = DevToolsCog(bot=MagicMock())
         ctx = MagicMock()
         ctx.send = AsyncMock()
+        ctx.defer = AsyncMock()
 
         await cog.cascadeui_group.callback(cog, ctx)
 
@@ -886,6 +890,7 @@ class TestDevToolsCogRegistryCommands:
     def _make_ctx(self):
         ctx = MagicMock()
         ctx.send = AsyncMock()
+        ctx.defer = AsyncMock()
         return ctx
 
     async def test_persistent_lists_registered_classes(self):
@@ -1017,6 +1022,7 @@ class TestDevToolsCogDiagnosticCommands:
     def _make_ctx(self):
         ctx = MagicMock()
         ctx.send = AsyncMock()
+        ctx.defer = AsyncMock()
         return ctx
 
     async def test_history_empty_reports_none(self):

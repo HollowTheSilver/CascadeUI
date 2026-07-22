@@ -128,7 +128,7 @@ Flag enum advertising which method sets a backend implements. Any combination vi
 - `Capability.RELATIONAL` -- `row_upsert`, `row_upsert_many`, `row_select`, `row_delete`, `row_delete_where_lt`
 - `Capability.SCHEMA_META` -- `get_schema_version`, `set_schema_version`
 - `Capability.TTL_INDEX` -- declares the backend has an indexed TTL column. Required when any `SlotPolicy` declares `ttl_days`.
-- `Capability.RAW_SQL` -- `execute`, `fetch`, `fetch_one`, `executemany`, and the `transaction()` context manager. Declared by the SQL backends; `InMemoryBackend` omits it.
+- `Capability.RAW_SQL` -- `execute`, `fetch`, `fetch_one`, `executemany`, and the `transaction()` context manager (which yields a `Transaction`, the typed protocol importable from the package root that a custom backend's `transaction()` returns). Declared by the SQL backends; `InMemoryBackend` omits it.
 
 `PersistenceMiddleware.initialize` raises `PersistenceConfigError` at config time when a declared capability's method is missing.
 

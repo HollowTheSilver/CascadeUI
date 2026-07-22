@@ -257,6 +257,105 @@ class TestSubmittedValuePropagation:
         assert captured == {"a": "Kael", "b": "42", "by_input_a": "Kael"}
 
 
+class TestModalAckBackstop:
+    """discord.py's modal dispatch has no auto-defer timer, so ``on_submit``
+    arms one before the (potentially slow, I/O-bound) validators run on the 3s
+    interaction clock.
+    """
+
+    async def test_timer_fires_during_slow_validator(self):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        from cascadeui.validation import ValidationResult
+
+        deferred_during = {}
+
+        async def slow_reject(value, field, all_values):
+            # Simulate a DB-backed validator on the 3s clock.
+            await asyncio.sleep(0.15)
+            deferred_during["value"] = interaction.response.defer.called
+            return ValidationResult(False, "no")
+
+        field = TextInput(label="Email", required=True, validators=[slow_reject])
+        modal = Modal(title="T", inputs=[field])
+        modal.auto_defer_delay = 0.05  # fires before the 0.15s validator ends
+        for wrapped, discord_input in modal._wrapped_pairs:
+            discord_input._value = "x"
+
+        interaction = MagicMock()
+        interaction.user.id = 1
+        interaction.response.is_done.return_value = False
+        interaction.response.send_message = AsyncMock()
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+
+        await modal.on_submit(interaction)
+
+        assert deferred_during["value"] is True
+
+    async def test_scheduled_task_covers_slow_interaction_check(self):
+        """A slow interaction_check override is acked before the 3s wall.
+
+        discord.py's dispatcher runs interaction_check before on_submit, so
+        on_submit's own timer cannot cover it; the Modal._scheduled_task
+        override arms a backstop for the whole dispatch.
+        """
+        import asyncio
+
+        from helpers import make_interaction
+
+        acked_during_check = {}
+
+        class SlowCheckModal(Modal):
+            auto_defer_delay = 0.05
+
+            async def interaction_check(self, interaction):
+                await asyncio.sleep(0.15)
+                acked_during_check["value"] = interaction.response.defer.await_count >= 1
+                return True
+
+            async def on_submit(self, interaction):
+                pass
+
+        modal = SlowCheckModal(title="T", inputs=[])
+        interaction = make_interaction()
+
+        await modal._scheduled_task(interaction, [], {})
+
+        assert acked_during_check["value"] is True
+
+    async def test_scheduled_task_acks_on_raise(self):
+        """A fast-raising on_submit does not leave the interaction unacked.
+
+        discord.py's Modal.on_error only logs, so without the override's
+        post-dispatch defer a raising validator or callback would strand the
+        interaction as "This interaction failed".
+        """
+        from helpers import make_interaction
+
+        class RaiseModal(Modal):
+            async def interaction_check(self, interaction):
+                return True
+
+            async def on_submit(self, interaction):
+                raise RuntimeError("fast failure")
+
+        modal = RaiseModal(title="T", inputs=[])
+        interaction = make_interaction()
+
+        await modal._scheduled_task(interaction, [], {})
+
+        assert interaction.response.is_done()
+
+    def test_negative_auto_defer_delay_rejected_at_definition(self):
+        """A non-positive auto_defer_delay fails when the Modal subclass is defined."""
+        with pytest.raises(ValueError, match="auto_defer_delay must be a positive number"):
+
+            class BadModal(Modal):
+                auto_defer_delay = -1
+
+
 class TestModalPostSubmitDeferHardening:
     """The trailing post-submit ack mirrors the view's ``_scheduled_task``
     defer: a dead (10062) or already-acked interaction must not turn a
@@ -848,3 +947,25 @@ class TestOpenModalEmptyGuard:
         view = StatefulLayoutView(interaction=make_interaction())
         with pytest.raises(ValueError, match="no components"):
             await view.open_modal(make_interaction(), Modal(title="Empty", inputs=[]))
+
+
+class TestModalRespond:
+    """``Modal.respond()`` is is_done-aware for on_submit-override replies."""
+
+    async def test_open_slot_uses_send_message(self):
+        from helpers import make_interaction
+
+        modal = Modal(title="T", inputs=[TextInput(label="X")])
+        interaction = make_interaction(is_done=False)
+        await modal.respond(interaction, "hi", ephemeral=True)
+        interaction.response.send_message.assert_awaited_once()
+        interaction.followup.send.assert_not_awaited()
+
+    async def test_acked_slot_uses_followup(self):
+        from helpers import make_interaction
+
+        modal = Modal(title="T", inputs=[TextInput(label="X")])
+        interaction = make_interaction(is_done=True)
+        await modal.respond(interaction, "hi", ephemeral=True)
+        interaction.followup.send.assert_awaited_once()
+        interaction.response.send_message.assert_not_awaited()

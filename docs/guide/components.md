@@ -342,6 +342,12 @@ Inside a CascadeUI view callback, use `self.open_modal()` instead of
 has already consumed the response slot. See
 [Opening Modals from Callbacks](views.md#opening-modals-from-callbacks).
 
+`Modal` arms an ack backstop before its validators and submit handler run, so a
+slow async validator or callback does not drop the submission; `auto_defer_delay`
+(default `2.5`s) tunes when that defer fires. A `Modal` subclass overriding
+`on_submit` sends replies through `self.respond(interaction, ...)`, which falls
+back to a followup when that backstop has already acked.
+
 After validators pass, each input's `.value` / `.values` is populated (a rejected submission leaves them untouched). `modal.values_by_input` provides a dict keyed by input instance, populated at the same point.
 
 ### Structured forms and edit-in-place
@@ -763,6 +769,13 @@ becomes a set, the buttons become toggles (no disabled state, since an
 active option must be clickable to turn it off), and `on_select` receives
 the full list of selected values. Two `choice_row` controls in one view need
 distinct `custom_id=` values so their components do not collide.
+
+Single-select disables the active option because re-picking it is normally a
+no-op. When re-picking *is* a real action (the callback reopens the active
+option's editor, say), pass `allow_reselect=True` to keep the active option
+clickable so a re-pick fires `on_select` again. The flag applies to both the
+button and dropdown forms, so the behavior stays the same on either side of
+`button_threshold`.
 
 !!! warning "The host owns the selection -- rebuild after `on_select`"
     `choice_row` is stateless: it reads `selected` at build time and renders
