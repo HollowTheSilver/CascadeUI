@@ -106,6 +106,130 @@ class TestAutoDeferFires:
         assert fired
 
 
+# // ========================================( Timer Arms Before Checks )======================================== // #
+
+
+class TestAutoDeferArmsBeforeChecks:
+    """The auto-defer timer is armed before ``interaction_check``, so a slow
+    access-control check (an uncached ``guild.fetch_member`` in a role-based
+    override) still gets an ack backstop inside the 3s window.
+    """
+
+    async def test_timer_fires_during_slow_interaction_check(self):
+        """A slow ``interaction_check`` triggers the auto-defer timer while the
+        check is still running, proving the timer is armed before the check.
+
+        Under the old ordering (timer armed after the checks) no timer exists
+        while the check runs, so ``defer`` has not been called when the check
+        completes.
+        """
+
+        class SlowCheckView(StatefulView):
+            async def interaction_check(self, interaction):
+                # Simulate an uncached member/role lookup on the 3s clock.
+                await asyncio.sleep(0.15)
+                # Record whether the timer already acked mid-check.
+                self._deferred_during_check = interaction.response.defer.called
+                return True
+
+        view = SlowCheckView(interaction=_make_interaction())
+        view.auto_defer_delay = 0.05  # fires well before the 0.15s check ends
+        view.owner_only = False
+        view._deferred_during_check = None
+
+        interaction = _make_interaction(is_done=False)
+
+        async def fast_callback(inter):
+            pass
+
+        item = _make_item(fast_callback)
+        await view._scheduled_task(item, interaction)
+
+        assert view._deferred_during_check is True
+
+    async def test_rejected_check_still_acks_via_post_callback_defer(self):
+        """A silent-False check (an override that rejects without responding)
+        now leaves the interaction acked, not stranded: the widened finally
+        posts a defer once the check returns False.
+        """
+
+        class RejectView(StatefulView):
+            async def interaction_check(self, interaction):
+                return False  # reject, send nothing
+
+        view = RejectView(interaction=_make_interaction())
+        view.auto_defer_delay = 10  # timer would not fire on its own
+        view.owner_only = False
+
+        interaction = _make_interaction(is_done=False)
+
+        called = False
+
+        async def callback(inter):
+            nonlocal called
+            called = True
+
+        item = _make_item(callback)
+        await view._scheduled_task(item, interaction)
+
+        assert called is False  # rejected: callback never ran
+        interaction.response.defer.assert_called_once()  # but the interaction was acked
+
+
+# // ========================================( Ack First )======================================== // #
+
+
+class TestAckFirst:
+    """``ack_first`` acks the interaction before the checks and callback run,
+    so a callback that synchronously blocks the loop still lands its ack.
+    """
+
+    async def test_ack_first_defers_before_callback(self):
+        class _AckFirst(StatefulView):
+            ack_first = True
+
+        view = _AckFirst(interaction=_make_interaction())
+        view.owner_only = False
+
+        interaction = _make_interaction(is_done=False)
+
+        async def flip_done(*args, **kwargs):
+            interaction.response.is_done.return_value = True
+
+        interaction.response.defer = AsyncMock(side_effect=flip_done)
+
+        acked_before_callback = {}
+
+        async def callback(inter):
+            acked_before_callback["value"] = inter.response.is_done()
+
+        item = _make_item(callback)
+        await view._scheduled_task(item, interaction)
+
+        assert acked_before_callback["value"] is True
+
+    async def test_default_does_not_pre_defer(self):
+        """The default (ack_first=False) leaves the response slot open for the
+        callback, preserving the acting-view one-call refresh path.
+        """
+        view = StatefulView(interaction=_make_interaction())
+        view.owner_only = False
+        view.auto_defer_delay = 10  # timer would not fire during the fast callback
+
+        interaction = _make_interaction(is_done=False)
+        interaction.response.defer = AsyncMock()
+
+        acked_before_callback = {}
+
+        async def callback(inter):
+            acked_before_callback["value"] = inter.response.is_done()
+
+        item = _make_item(callback)
+        await view._scheduled_task(item, interaction)
+
+        assert acked_before_callback["value"] is False
+
+
 # // ========================================( Post-Callback Defer )======================================== // #
 
 
@@ -300,6 +424,30 @@ class TestAutoDeferErrorHandling:
 
         # Timer should not crash
         await view._auto_defer_timer(interaction)
+
+    async def test_ack_miss_logs_warning_with_elapsed(self, caplog):
+        """When the timer's own defer hits 10062 (the interaction expired before
+        the ack landed), it surfaces at WARNING with elapsed-since-creation, so
+        an operator sees the ack missed and by how much, not only the downstream
+        post-callback echo.
+        """
+        import datetime
+
+        view = StatefulView(interaction=_make_interaction())
+        view.auto_defer_delay = 0.01
+        view.owner_only = False
+
+        interaction = _make_interaction(is_done=False)
+        interaction.created_at = discord.utils.utcnow() - datetime.timedelta(seconds=4)
+        interaction.response.defer = AsyncMock(side_effect=discord.NotFound(MagicMock(), ""))
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui.views._interaction"):
+            await view._auto_defer_timer(interaction)
+
+        assert any(
+            rec.levelno == logging.WARNING and "since interaction creation" in rec.getMessage()
+            for rec in caplog.records
+        )
 
     async def test_safe_defer_bounds_a_stalled_ack(self):
         """``_safe_defer`` cancels a stalled defer at ``auto_defer_delay`` and

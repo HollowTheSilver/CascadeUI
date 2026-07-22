@@ -296,6 +296,16 @@ class _BaseTabMixin:
         await self._call_hook_safe(self.on_tab_switched, index)
         await self._refresh_tabs()
 
+    async def refresh_content(self) -> None:
+        """Re-render the current tab's content in place.
+
+        The public re-render for a subclass callback that mutated data and
+        needs the active tab redrawn. V1 rebuilds the embed, V2 recomposes the
+        tree. Distinct from ``reload()``, which re-runs ``on_load()`` (a data
+        re-fetch) before re-rendering.
+        """
+        await self._refresh_tabs()
+
 
 # // ========================================( V1: TabView )======================================== // #
 
@@ -405,6 +415,9 @@ class TabView(_BaseTabMixin, StatefulView):
             return {}
         builder = self._tabs[self._tab_names[self._active_tab]]
         return {"embed": await builder()}
+
+    async def _reload_render(self) -> None:
+        await self._refresh_tabs()
 
     async def _refresh_tabs(self):
         """Mutate tab button styles in place and rebuild active content."""

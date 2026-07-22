@@ -10,12 +10,13 @@ from .config import (
 )
 from .manager import PersistenceManager
 from .migrations import register_kwargs_migrator, register_migrator
-from .protocols import Capability, PersistenceBackend
+from .protocols import Capability, PersistenceBackend, Transaction
 
 __all__ = [
     "InMemoryBackend",
     "Capability",
     "PersistenceBackend",
+    "Transaction",
     "PersistenceManager",
     "RegistryPersistence",
     "ApplicationPersistence",

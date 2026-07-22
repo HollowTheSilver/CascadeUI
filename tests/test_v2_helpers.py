@@ -1560,6 +1560,96 @@ class TestChoiceRowMultiDropdown:
         assert seen["v"] == [2, 5]
 
 
+class TestChoiceRowReselect:
+    """allow_reselect keeps the active single-select option clickable.
+
+    Default (allow_reselect=False): the active button is disabled and a
+    dropdown re-pick of the active value is a no-op, so re-picking never fires
+    on_select. allow_reselect=True keeps the active option live in both forms,
+    for a control whose callback has a side effect beyond selection.
+    """
+
+    def test_default_active_button_disabled(self):
+        row = choice_row({"A": 1, "B": 2, "C": 3}, selected=2, on_select=_noop_select)
+        _, b, _ = list(row.children)
+        assert b.disabled is True
+
+    def test_allow_reselect_active_button_enabled(self):
+        row = choice_row(
+            {"A": 1, "B": 2, "C": 3}, selected=2, on_select=_noop_select, allow_reselect=True
+        )
+        a, b, c = list(row.children)
+        assert b.disabled is False  # active option stays clickable
+        assert a.disabled is False and c.disabled is False
+        assert b.style == discord.ButtonStyle.primary  # still highlighted
+
+    def test_allow_reselect_still_honors_whole_control_disable(self):
+        # disabled=True overrides allow_reselect: the whole control locks.
+        row = choice_row(
+            {"A": 1, "B": 2},
+            selected=1,
+            on_select=_noop_select,
+            allow_reselect=True,
+            disabled=True,
+        )
+        assert all(btn.disabled is True for btn in row.children)
+
+    async def test_allow_reselect_active_button_fires_with_active_value(self):
+        seen = {}
+
+        async def on_sel(interaction, value):
+            seen["v"] = value
+
+        row = choice_row(
+            {"A": "alpha", "B": "beta"}, selected="alpha", on_select=on_sel, allow_reselect=True
+        )
+        active_button = list(row.children)[0]
+        # For buttons the reselect contract IS the enabled state -- Discord only
+        # delivers clicks to an enabled component, and the callback has no
+        # internal active-value guard. Assert it stays clickable (this is what
+        # allow_reselect controls), then confirm the active button carries its
+        # own value through the closure.
+        assert active_button.disabled is False
+        await active_button.original_callback(make_interaction())
+        assert seen["v"] == "alpha"
+
+    async def test_dropdown_repick_active_is_noop_by_default(self):
+        seen = {"fired": False}
+
+        async def on_sel(interaction, value):
+            seen["fired"] = True
+
+        # 8 options -> dropdown; value 3 is active, option value "3" is a re-pick.
+        row = choice_row({f"O{i}": i for i in range(8)}, selected=3, on_select=on_sel)
+        select = list(row.children)[0]
+        await select.original_callback(make_interaction(), ["3"])
+        assert seen["fired"] is False  # re-pick of active value swallowed
+
+    async def test_dropdown_pick_nonactive_fires_by_default(self):
+        seen = {}
+
+        async def on_sel(interaction, value):
+            seen["v"] = value
+
+        row = choice_row({f"O{i}": i for i in range(8)}, selected=3, on_select=on_sel)
+        select = list(row.children)[0]
+        await select.original_callback(make_interaction(), ["5"])
+        assert seen["v"] == 5  # a real change still fires
+
+    async def test_dropdown_repick_active_fires_with_allow_reselect(self):
+        seen = {}
+
+        async def on_sel(interaction, value):
+            seen["v"] = value
+
+        row = choice_row(
+            {f"O{i}": i for i in range(8)}, selected=3, on_select=on_sel, allow_reselect=True
+        )
+        select = list(row.children)[0]
+        await select.original_callback(make_interaction(), ["3"])
+        assert seen["v"] == 3  # re-pick now fires
+
+
 # // ========================================( Collapsible )======================================== // #
 
 

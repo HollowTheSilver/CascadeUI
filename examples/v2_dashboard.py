@@ -294,7 +294,7 @@ class DashboardView(TabLayoutView):
 
     async def _refresh_overview(self, interaction):
         """Refresh the overview tab to update live stats."""
-        await self._refresh_tabs()
+        await self.refresh_content()
 
     async def _go_to_modules(self, interaction):
         """Switch to the Modules tab from the Overview quick action."""
@@ -338,7 +338,7 @@ class DashboardView(TabLayoutView):
 
         async def callback(interaction):
             self._modules[module_name] = not self._modules[module_name]
-            await self._refresh_tabs()
+            await self.refresh_content()
 
         return callback
 
@@ -355,11 +355,11 @@ class DashboardView(TabLayoutView):
     async def _on_reset_modules(self, interaction):
         self._modules = dict(_MODULE_DEFAULTS)
         self._reset_zone.collapse()
-        await self._refresh_tabs()
+        await self.refresh_content()
 
     async def _on_cancel_reset(self, interaction):
         self._reset_zone.collapse()
-        await self._refresh_tabs()
+        await self.refresh_content()
 
     # // ==================( Controls Tab )================== // #
 
@@ -454,28 +454,28 @@ class DashboardView(TabLayoutView):
 
     async def _show_prefs(self, interaction):
         self._controls_view = "Preferences"
-        await self._refresh_tabs()
+        await self.refresh_content()
 
     async def _show_appearance(self, interaction):
         self._controls_view = "Appearance"
-        await self._refresh_tabs()
+        await self.refresh_content()
 
     async def _on_notifications(self, interaction, active):
         self._notifications = active
-        await self._refresh_tabs()
+        await self.refresh_content()
 
     async def _on_notif_types(self, interaction, values):
         # multi=True hands on_select the full selected list, not one value.
         self._notif_types = set(values)
-        await self._refresh_tabs()
+        await self.refresh_content()
 
     async def _on_interval(self, interaction, value):
         self._refresh_interval = value
-        await self._refresh_tabs()
+        await self.refresh_content()
 
     async def _on_theme(self, interaction, value):
         self._theme_preset = value
-        await self._refresh_tabs()
+        await self.refresh_content()
 
     async def _on_save(self, interaction):
         await self.respond(interaction, "Preferences saved.", ephemeral=True)
@@ -485,7 +485,7 @@ class DashboardView(TabLayoutView):
         self._notif_types = {"Mentions", "DMs"}
         self._refresh_interval = "30s"
         self._theme_preset = "Default"
-        await self._refresh_tabs()
+        await self.refresh_content()
 
     # // ==================( About Tab )================== // #
 

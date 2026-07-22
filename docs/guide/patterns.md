@@ -297,30 +297,28 @@ Fields without a `group` key render ungrouped at the top of the form.
 
 ### Inline validation errors {#inline-validation}
 
-Form validation errors are rendered inside the form rather than as
-ephemeral responses. Two attributes hold error state:
+Form validation errors render inside the form rather than as ephemeral
+responses. Validators populate field errors automatically on submit. To set
+an error from custom code, use the public setters, which write the error
+state and re-render the form so it shows:
 
-| Attribute | Shape | Rendered where |
-|-----------|-------|----------------|
-| `_field_errors` | `dict[str, list[str]]` | Under the offending field (V2: red `alert()`; V1: inline in the embed) |
-| `_form_error` | `Optional[str]` | At the top of the form for cross-field errors |
-
-Validators populate `_field_errors` automatically on submit. To set a
-form-level error from custom code:
+- `await self.set_form_error(msg)` sets a form-level (cross-field) error at
+  the top of the form; pass `None` to clear.
+- `await self.set_field_error(field_id, *msgs)` sets inline error(s) under
+  one field; call with no messages to clear that field's errors.
 
 ```python
 async def on_submit(self, interaction, values):
     if values["start"] > values["end"]:
-        self._form_error = "Start date must be before end date."
-        await self.refresh()
+        await self.set_form_error("Start date must be before end date.")
         return
     ...
 ```
 
 The form reaches `on_submit` only once validation passes (every required
 field filled, every value parsed, every validator satisfied), so cross-field
-checks belong there. Setting `_form_error` and returning (as above) keeps
-the form open with the message shown, and the next submit re-runs the check.
+checks belong there. Setting an error and returning keeps the form open with
+the message shown, and the next submit re-runs the check.
 
 A field change clears only that field's own error; the others stay until
 they change or the next submit re-checks them.
@@ -375,6 +373,7 @@ re-renders, so fixing one does not need a second submit to find the next.
 | `text_edit_button_label` | `None` (auto) | Label for the text-edit modal button |
 | `text_edit_button_emoji` | `"✏️"` | Emoji on the text-edit button |
 | `text_edit_button_style` | `secondary` | Style of the text-edit button |
+| `text_edit_modal_auto_defer_delay` | `2.5` | Ack backstop (seconds) for the internal text-edit modal; raise for a slow async field validator |
 
 ### `on_submit(interaction, values)`
 
@@ -574,6 +573,7 @@ async def on_finish(self, interaction):
 |----------|------|-------------|
 | `current_step` | `int` | Zero-based index of the active step |
 | `step_count` | `int` | Total number of steps |
+| `refresh_content()` | async method | Re-render the current step in place after a subclass callback mutated data (V1 rebuilds the embed, V2 recomposes the tree). Distinct from `reload()`, which re-runs `on_load()` first. |
 
 ### V1 vs V2
 
@@ -664,6 +664,7 @@ async def on_tab_switched(self, index):
 |--------|------|-------------|
 | `active_tab` | `str` (property) | Name of the currently active tab |
 | `switch_tab(name)` | async method | Switch to a tab by name programmatically |
+| `refresh_content()` | async method | Re-render the active tab in place after a subclass callback mutated data (V1 rebuilds the embed, V2 recomposes the tree). Distinct from `reload()`, which re-runs `on_load()` first. |
 
 `switch_tab()` raises `ValueError` if the tab name is not found.
 
@@ -822,6 +823,18 @@ Each navigation button exposes a `{label, emoji, style}` triple:
 When the page count reaches `jump_threshold` or above, three extra
 controls appear: first-page and last-page jump buttons, and a
 go-to-page modal triggered by clicking the page indicator.
+
+### `set_page(n)`
+
+Jump to a zero-based page programmatically. Clamps `n` to the valid
+range, fires `on_page_changed`, and re-renders. This is the supported
+cursor move: assigning `current_page` directly changes the index but
+does not re-render.
+
+```python
+async def _jump_to_last(self, interaction):
+    await self.set_page(self.page_count - 1)
+```
 
 ### `on_page_changed(page)`
 
@@ -1028,6 +1041,7 @@ change (multi-line, different separator).
 | `format_primary(rank, user_id, stats)` | Section render mode only -- first line of the two-line section body. Default delegates to `format_rank` + `format_name`. |
 | `format_secondary(rank, user_id, stats)` | Section render mode only -- second line of the section body. Default delegates to `format_stats`. |
 | `get_avatar_url(user_id, stats)` | Async hook returning an avatar URL for the section's `Thumbnail` accessory. The default resolves from the bot's user cache when a `bot=` kwarg is passed (member avatar on a hit, Discord default avatar on a miss); without a bot it returns `None`, triggering the stacked `TextDisplay` fallback. |
+| `resolve_avatar_urls(user_ids)` *(async)* | Section-mode avatar backfill, used when `avatar_backfill = True`. Receives a list of user ids and returns a `{user_id: url}` dict, resolved off the render path. Default resolves per user; override for a CDN or warmed cache. |
 | `build_title(page)` | Optional components replacing the rankings card's masthead (the `banner` image + `## title` heading) inside the Container. `None` (default) composes the masthead from the declarative `banner` / `title` pair. Same return shapes and `page` semantics as `build_header`. |
 | `build_header(page)` | Content above the rankings card. The value is prepended as-is: a `Container` renders as its own card (an Overview `stats_card`, a banner), anything else floats as a bare top-level item (no return-type branching, unlike `build_footer`). Read `ranked_entries` for aggregate stats. Return a component, a list, or `None` (default). `page` is the zero-based page index, so a frame can target only some pages. |
 | `build_footer(page)` | Optional footer components, placed by return type: a raw component (caption, link row, image) folds inside the rankings card; a `Container` (`card(...)`) renders as its own card below it. Same return shapes and `page` semantics as `build_header`. |
@@ -1060,6 +1074,7 @@ class MmrBoard(LeaderboardLayoutView):
 - `entry_separator` (default `" -- "`) -- string rendered between the name and stat columns inside `format_entry` (`"lines"` mode). Override on a subclass for visual variety (`" | "`, `" • "`, etc.) without rewriting `format_entry`.
 - `card_color` (default `None`) -- optional accent color for the rankings card. `None` falls through to the active theme's accent. Set to a `discord.Color` on a subclass to give the rankings card its own accent (useful when a `build_header` Overview card carries its own color and a deliberate two-color layout is wanted).
 - `show_title_divider` (default `True`) -- whether to render a horizontal divider below the title and above the rest of the card content. Set to `False` for a more compact card.
+- `avatar_backfill` (default `False`) -- section render mode only. Paints Discord default avatars immediately, then resolves the real avatars off the render path (via the `resolve_avatar_urls` hook) and reloads once they arrive. Avoids a first render that blocks on avatar resolution and a per-row fetch on the render path. See [Avatar backfill on large guilds](#avatar-backfill).
 
 ### Section render mode {#section-render-mode}
 
@@ -1089,6 +1104,60 @@ by a newline -- the content stays intact without a subclass touching the
 accessory. `format_primary` (the first line: rank + name) uses the
 library default; override it or `get_avatar_url` only when a different
 shape is needed.
+
+#### Avatar backfill on large guilds {#avatar-backfill}
+
+By default `get_avatar_url` resolves each row on the render path. When avatar
+resolution is slow (a large guild, a cold cache, or an override that fetches
+per user), set `avatar_backfill = True` to paint the leaderboard immediately
+with Discord default avatars, then resolve the real avatars off the render path
+and reload once they arrive:
+
+```python
+class BigBoard(LeaderboardLayoutView):
+    entry_layout = "sections"
+    avatar_backfill = True
+
+view = BigBoard(context=ctx, entries=entries, bot=bot)
+```
+
+The first paint never blocks on avatar resolution, and there is no per-row fetch
+on the render path: the backfill runs once, off-path, then triggers a single
+reload. Backfill only resolves entries that missed the cache but are still
+fetchable: a real member whose avatar was not cached at first render. It does
+not help an id that can never resolve (a deleted account, a synthetic id with no
+matching Discord user). That row keeps its default avatar after the backfill
+pass runs, since there is nothing new to fetch for it.
+
+Override `resolve_avatar_urls(user_ids)` (a list of user ids, returning a
+`{user_id: url}` dict) to resolve from a custom source instead of the per-user
+default, which issues one `fetch_user` call per missed id. A bulk fetch through
+the guild's member cache resolves the whole batch in one request. `self.bot` is
+the client passed via the `bot=` constructor kwarg (or injected through `on_bind`
+on the persistent variant); `avatar_backfill` already requires it, so it is set
+inside the override:
+
+```python
+class BigBoard(LeaderboardLayoutView):
+    entry_layout = "sections"
+    avatar_backfill = True
+
+    async def resolve_avatar_urls(self, user_ids):
+        guild = self.bot.get_guild(self.guild_id)
+        if guild is None:
+            return {}
+        members = await guild.query_members(user_ids=user_ids, limit=len(user_ids))
+        return {member.id: member.display_avatar.with_size(128).url for member in members}
+```
+
+`query_members` only returns ids that are actual guild members, so ids it
+cannot resolve are simply absent from the returned dict: no filtering needed
+on the caller's side.
+
+Demonstrating the backfill trigger needs a large real-member guild with a cold
+avatar cache; a synthetic-id example row would schedule a resolve that never
+completes. This guide section is the reference for `avatar_backfill` -- the
+shipped examples use the eager per-row `get_avatar_url` instead.
 
 ### Persistent variant
 
@@ -1238,7 +1307,10 @@ to suppress the hint entirely. Per-category dynamic hints override
     dispatch path routes through `DynamicPersistentButton` which has
     no view instance at click time -- the hook classmethods read
     class attributes (`cls.assigned_message`, etc.) and respond to
-    the interaction directly. `super()` calls work normally.
+    the interaction directly. A hook that sends its own reply uses the
+    module-level `respond_safe(interaction, ...)` helper
+    (`from cascadeui import respond_safe`), the `is_done()`-aware
+    responder for these no-`self` contexts. `super()` calls work normally.
 
 | Hook | Purpose |
 |------|---------|

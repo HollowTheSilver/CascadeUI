@@ -376,7 +376,10 @@ class PersistenceManager:
           is pruned.
 
         Requires ``self._bot``. No-op when bot is absent (data-only
-        persistence mode).
+        persistence mode). Every pass also re-registers the full
+        ``DynamicPersistentButton`` registry with the bot via
+        ``add_dynamic_items``, so dynamic-item dispatch stays current
+        across re-drives.
         """
         summary: dict[str, list[str]] = {
             "restored": [],
@@ -392,6 +395,20 @@ class PersistenceManager:
         self.last_reattach_summary = summary
         if self._bot is None:
             return summary
+
+        # Re-drive dynamic-item registration on every pass so a
+        # DynamicPersistentButton subclass imported after the initial
+        # reattach (a cog loaded later, a hot-reloaded extension) routes
+        # clicks without a restart -- the same recovery reattach() gives
+        # late-imported view classes. The full registry is passed each
+        # time: discord.py keys dynamic items on their compiled template,
+        # so re-registration is an idempotent dict write and a reloaded
+        # class cleanly replaces its predecessor. Lazy import breaks the
+        # components <-> persistence cycle.
+        from ..components.base import _dynamic_button_classes
+
+        if _dynamic_button_classes:
+            self._bot.add_dynamic_items(*_dynamic_button_classes.values())
 
         # Skip keys already restored on a prior pass so reattach() only
         # processes rows that are new (a class imported after the initial
@@ -524,7 +541,9 @@ class PersistenceManager:
 
         Idempotent: keys restored on a prior pass are skipped, so an
         already-live panel is never re-fetched or double-registered.
-        Transiently ``unreachable`` / ``failed`` rows are retried. Returns the
+        Transiently ``unreachable`` / ``failed`` rows are retried. Each pass
+        also re-drives dynamic-item registration, so a late-imported
+        ``DynamicPersistentButton`` subclass recovers the same way. Returns the
         same summary shape as :meth:`reattach_persistent_views`, covering only
         the rows this pass processed.
         """
@@ -706,10 +725,19 @@ class PersistenceManager:
             if row.get("guild_id") is not None:
                 view.guild_id = int(row["guild_id"])
 
-            # __init__ ran with user_id=None so session auto-derivation
-            # was skipped; re-derive now that identity is known.
-            if view.user_id and not view.session_id:
-                view.session_id = f"{type(view)._class_session_key()}:user_{view.user_id}"
+            # __init__ ran with user_id=None so session auto-derivation was
+            # skipped. Prefer the session_id captured at registration so a
+            # restored view rejoins its original session -- isolated or
+            # continuity, whichever it had -- rather than a re-derived
+            # suffix-free key that collides across same-class same-user panels.
+            # Fall back to deriving for rows written before the session_id
+            # column was persisted.
+            if not view.session_id:
+                persisted = row.get("session_id")
+                if persisted:
+                    view.session_id = persisted
+                elif view.user_id:
+                    view.session_id = f"{type(view)._class_session_key()}:user_{view.user_id}"
 
             self._bot.add_view(view, message_id=message.id)
 
@@ -833,6 +861,8 @@ class PersistenceManager:
             await self._bot.wait_until_ready()
         except Exception:
             return
+        start = time.monotonic()
+        rendered = 0
         for view in views:
             if view.is_finished():
                 continue
@@ -840,11 +870,22 @@ class PersistenceManager:
             try:
                 async with self._store.batch(source_id=view.id):
                     await view.on_restore(self._bot)
+                rendered += 1
             except Exception as exc:
                 logger.error(
                     f"on_restore failed for persistent view {persistence_key!r}: {exc}",
                     exc_info=exc,
                 )
+        # The render loop is serial: each on_restore runs inside store.batch,
+        # whose depth/action state is instance-shared, so concurrency would
+        # interleave independent panels into false-nested batches. For many
+        # panels this is a slow repaint tail on already-interactive views, so
+        # surface its duration. Startup is unaffected (this runs post-ready).
+        if rendered:
+            logger.info(
+                f"Post-ready restore rendered {rendered} view(s) in "
+                f"{time.monotonic() - start:.1f}s"
+            )
 
     def _on_post_ready_restore_done(self, task: asyncio.Task) -> None:
         self._post_ready_restore_tasks.discard(task)

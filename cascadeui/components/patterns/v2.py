@@ -654,6 +654,7 @@ def choice_row(
     selected: Any = None,
     multi: bool = False,
     disabled: bool = False,
+    allow_reselect: bool = False,
     button_threshold: int = 5,
     active_style: discord.ButtonStyle = discord.ButtonStyle.primary,
     inactive_style: discord.ButtonStyle = discord.ButtonStyle.secondary,
@@ -668,12 +669,15 @@ def choice_row(
     when the option count outgrows a button row.
 
     The active option(s) render highlighted. In single-select the active
-    button is also disabled (re-picking it is a no-op); in multi-select the
-    buttons become toggles, so an active option can be clicked to turn it
-    off. ``on_select`` receives the picked value (single) or the full list
-    of currently-selected values (multi). Discord requires select option
-    values to be strings; the builder maps to and from that string form, so
-    ``on_select`` always sees the real Python value.
+    button is disabled by default (re-picking it is a no-op); set
+    ``allow_reselect=True`` to keep it clickable so a re-pick fires
+    ``on_select`` again, for a control whose callback has a side effect
+    beyond selection (re-opening the active option's editor). In
+    multi-select the buttons become toggles, so an active option can be
+    clicked to turn it off. ``on_select`` receives the picked value (single)
+    or the full list of currently-selected values (multi). Discord requires
+    select option values to be strings; the builder maps to and from that
+    string form, so ``on_select`` always sees the real Python value.
 
     The builder is stateless -- it reads ``selected`` at build time and
     renders the active option(s) from it. The host view owns the selection:
@@ -696,6 +700,11 @@ def choice_row(
             non-interactive (every button, or the dropdown). Use it for a
             read-only state -- a locked or closed choice -- where the
             selection still shows but cannot change.
+        allow_reselect: Single-select only. When ``True``, the active option
+            stays clickable and a re-pick fires ``on_select`` with the active
+            value again. Default ``False`` keeps the active option inert (a
+            re-pick is a no-op). Ignored in multi-select, where active options
+            are always clickable toggles.
         button_threshold: Render as buttons when the option count is at or
             below this (default 5, Discord's per-row button cap); render as
             a dropdown above it. ``0`` forces a dropdown for every count.
@@ -751,9 +760,19 @@ def choice_row(
     active = _selected_set(selected, multi)
     if len(choices) <= button_threshold:
         return _choice_button_row(
-            choices, active, on_select, multi, active_style, inactive_style, custom_id, disabled
+            choices,
+            active,
+            on_select,
+            multi,
+            active_style,
+            inactive_style,
+            custom_id,
+            disabled,
+            allow_reselect,
         )
-    return _choice_select_row(choices, active, on_select, multi, placeholder, custom_id, disabled)
+    return _choice_select_row(
+        choices, active, on_select, multi, placeholder, custom_id, disabled, allow_reselect
+    )
 
 
 def _make_single_choice_callback(value: Any, on_select: Callable):
@@ -784,6 +803,7 @@ def _choice_button_row(
     inactive_style: discord.ButtonStyle,
     custom_id: str,
     disabled: bool,
+    allow_reselect: bool,
 ) -> ActionRow:
     buttons = []
     for i, choice in enumerate(choices):
@@ -794,9 +814,10 @@ def _choice_button_row(
             button_disabled = disabled
         else:
             callback = _make_single_choice_callback(choice.value, on_select)
-            # The active option is disabled (re-picking is a no-op), and the
-            # whole control is disabled when the caller passes disabled=True.
-            button_disabled = disabled or is_active
+            # The active option is disabled (re-picking is a no-op) unless the
+            # caller opts into allow_reselect; the whole control is disabled
+            # when the caller passes disabled=True.
+            button_disabled = disabled or (is_active and not allow_reselect)
         buttons.append(
             StatefulButton(
                 label=choice.label,
@@ -818,6 +839,7 @@ def _choice_select_row(
     placeholder: Optional[str],
     custom_id: str,
     disabled: bool,
+    allow_reselect: bool,
 ) -> ActionRow:
     idx_to_value = [choice.value for choice in choices]
     options = [
@@ -839,7 +861,15 @@ def _choice_select_row(
         if multi:
             await on_select(interaction, resolved)
         else:
-            await on_select(interaction, resolved[0] if resolved else None)
+            picked = resolved[0] if resolved else None
+            # Match the button form: a single-select re-pick of the active
+            # option is a no-op unless allow_reselect is set. Without this
+            # guard the dropdown fires on_select on a re-pick while the button
+            # form cannot, so the control's behavior would flip at
+            # button_threshold. The host's post-callback defer acks the click.
+            if not allow_reselect and picked in active:
+                return
+            await on_select(interaction, picked)
 
     select = StatefulSelect(
         options=options,

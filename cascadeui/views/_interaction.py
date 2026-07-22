@@ -11,6 +11,7 @@ from discord import Interaction
 from discord.ui import Item
 
 from ..components.base import StatefulButton
+from ..state.actions import ActionCreators
 
 logger = logging.getLogger(__name__)
 
@@ -58,20 +59,36 @@ class _InteractionMixin:
         try:
             item._refresh_state(interaction, interaction.data)  # type: ignore
 
-            allow = await item._run_checks(interaction) and await self.interaction_check(
-                interaction
-            )
-            if not allow:
-                return
+            # ack_first: opt-in immediate ack, before the checks and the
+            # callback. Reaches earlier than the auto-defer timer or any
+            # user-side defer, so a callback that synchronously blocks the loop
+            # still has its ack in flight. Trades the acting-view one-call
+            # refresh path (edit-as-ack) for a guaranteed early ack.
+            if self.ack_first:
+                await self._safe_defer(interaction)
 
-            if self.timeout:
-                self._BaseView__timeout_expiry = time.monotonic() + self.timeout  # type: ignore
-
+            # Arm the auto-defer timer BEFORE the access-control checks, not
+            # after them. interaction_check is a documented override seam for
+            # role-based access control, where a consumer runs an uncached
+            # guild.fetch_member on the 3s interaction clock. Without the timer
+            # armed first, a slow check has no ack backstop and Discord drops
+            # the interaction (10062). A deferred interaction can still be
+            # rejected: on_unauthorized routes through respond(), which posts
+            # the rejection via followup once the slot is acked.
             defer_task = None
-            if self.auto_defer:
+            if self.auto_defer and not interaction.response.is_done():
                 defer_task = asyncio.create_task(self._auto_defer_timer(interaction))
 
             try:
+                allow = await item._run_checks(interaction) and await self.interaction_check(
+                    interaction
+                )
+                if not allow:
+                    return
+
+                if self.timeout:
+                    self._BaseView__timeout_expiry = time.monotonic() + self.timeout  # type: ignore
+
                 if self.serialize_interactions:
                     async with self._interaction_lock:
                         await item.callback(interaction)
@@ -102,7 +119,8 @@ class _InteractionMixin:
                         else:
                             logger.warning(
                                 f"Post-callback defer failed in {self.__class__.__name__}: "
-                                f"status={e.status} code={e.code}"
+                                f"status={e.status} code={e.code} "
+                                f"({self._elapsed_since(interaction)})"
                             )
                     except Exception:
                         logger.debug(
@@ -112,6 +130,19 @@ class _InteractionMixin:
         except Exception as e:
             return await self.on_error(interaction, e, item)
 
+    @staticmethod
+    def _elapsed_since(interaction) -> str:
+        """Elapsed time since the interaction was created, for ack diagnostics.
+
+        Degrades to a placeholder rather than raising: a diagnostic must never
+        crash the ack path it is reporting on.
+        """
+        try:
+            secs = (discord.utils.utcnow() - interaction.created_at).total_seconds()
+            return f"{secs:.2f}s since interaction creation"
+        except Exception:
+            return "elapsed unknown"
+
     async def _auto_defer_timer(self, interaction: Interaction):
         """Background timer that defers the interaction if the callback hasn't responded."""
         try:
@@ -120,6 +151,17 @@ class _InteractionMixin:
                 await interaction.response.defer()
         except asyncio.CancelledError:
             pass
+        except discord.NotFound:
+            # 10062: the interaction expired before this ack landed. The timer
+            # normally acks in time, so a miss means the loop was congested
+            # through the 3s window (hot-path I/O elsewhere, a slow ack POST).
+            # WARNING with elapsed makes the missed ack diagnosable at its
+            # source, not only through the downstream post-callback echo.
+            logger.warning(
+                f"Auto-defer ack missed the 3s deadline in {self.__class__.__name__}: "
+                f"{self._elapsed_since(interaction)} (event-loop congestion or "
+                f"slow pre-callback work)"
+            )
         except Exception:
             logger.debug(f"Auto-defer failed for interaction in {self.__class__.__name__}")
 
@@ -156,6 +198,19 @@ class _InteractionMixin:
             Additional keyword arguments forwarded to ``send_message``
             or ``followup.send`` (e.g. ``embed=``, ``view=``).
         """
+        # A stateful view handed over as a raw view= kwarg skips _send_pipeline,
+        # so it renders but is never registered: invisible to the inspector,
+        # instance limits, and state cleanup, and its timeout fires a
+        # VIEW_DESTROYED for a view that was never created.
+        passed_view = kwargs.get("view")
+        if passed_view is not None and hasattr(passed_view, "_send_pipeline"):
+            name = type(passed_view).__name__
+            logger.warning(
+                f"{name} was passed to respond() as view=. Stateful views must be "
+                f"sent through their own send() to be registered. "
+                f"Fix: await {name}(..., interaction=interaction).send(ephemeral=True)"
+            )
+
         if not interaction.response.is_done():
             await interaction.response.send_message(content, ephemeral=ephemeral, **kwargs)
         else:
@@ -379,6 +434,13 @@ class _InteractionMixin:
             return
         self._reopen_in_flight = True
 
+        # Capture selection state off the live instance before anything
+        # mutates it. The replacement rebuilds from constructor kwargs, so
+        # anything chosen since construction (page, tab, tier) must ride
+        # this snapshot -- the same view_state hand-off pop() performs
+        # from its nav-stack entry.
+        nav_snapshot = self._capture_nav_state()
+
         # Construct the replacement view. _reopen_factory wins when set;
         # otherwise fall back to the captured push/pop kwargs snapshot.
         try:
@@ -402,6 +464,46 @@ class _InteractionMixin:
             await self.on_reopen_failure(interaction, error=None)
             return
 
+        # Carry navigation identity onto the replacement before send() runs
+        # on_load, matching pop's restore-before-on_load contract. A
+        # mid-chain sub-view can reopen here (the arm deadline rides the
+        # navigation chain), so without the carry its stack, root-class
+        # accounting, and post-construction selection all reset to a
+        # fresh-root default.
+        new_view._nav_stack = list(self._nav_stack)
+        new_view._instance_root_class = self._instance_root_class
+        new_view._apply_nav_state(nav_snapshot)
+
+        # Carry the session so the replacement rejoins the original session
+        # rather than deriving a fresh isolated one: a reopen is the same
+        # logical session continuing past the token cliff, not a new open, so
+        # shared_data survives. SESSION_CREATED no-ops on the existing session
+        # (send() runs before the old view's exit empties it), preserving its
+        # shared_data.
+        if self.session_id:
+            new_view.session_id = self.session_id
+
+        # The factory must survive every cycle, not just the first: left
+        # unset, the NEXT reopen falls back to the kwargs path the factory
+        # exists to avoid. A factory that installs its own wins.
+        if new_view._reopen_factory is None:
+            new_view._reopen_factory = self._reopen_factory
+
+        # Re-inject the Back button for a mid-chain reopen. send() builds
+        # from build_ui/on_load, which never adds it -- push() does that as
+        # a separate step. Added before send() so the first render carries
+        # it (the same button-then-on_load order push() uses); pattern
+        # rebuild seams re-add it via _restore_navigation_artifacts.
+        if new_view._nav_stack and new_view.auto_back_button:
+            if getattr(new_view, "_auto_back_item", None) is None:
+                new_view._add_back_button()
+
+        # A reopen is a 1-for-1 swap for the dying instance, not a second
+        # instance. Tell send()'s instance-limit check to exclude self, so a
+        # limited view under replace policy does not self-replace mid-send and
+        # tear itself down before the carries above transfer to the replacement.
+        new_view._replacing_view_id = self.id
+
         # Carry the interaction into the new view's send() so the response
         # is the new ephemeral message.  send() will register and dispatch.
         new_view.interaction = interaction
@@ -411,6 +513,43 @@ class _InteractionMixin:
             logger.error(f"Failed to send refreshed ephemeral: {e}")
             self._reopen_in_flight = False
             return
+
+        # Transfer the undo/redo timeline onto the replacement's state row.
+        # Runs after send() (the new row exists) and before exit() (the old
+        # row still does). Same VIEW_UPDATED shape _navigate_to uses for
+        # push/pop, so the transfer goes through the reducer rather than
+        # writing into the live state["views"] row in place.
+        old_view_state = self.state_store.state.get("views", {}).get(self.id, {})
+        stack_updates = {}
+        if old_view_state.get("undo_stack"):
+            stack_updates["undo_stack"] = list(old_view_state["undo_stack"])
+        if old_view_state.get("redo_stack"):
+            stack_updates["redo_stack"] = list(old_view_state["redo_stack"])
+        if stack_updates:
+            await new_view.dispatch(
+                "VIEW_UPDATED",
+                ActionCreators.view_updated(new_view.id, **stack_updates),
+            )
+
+        # Carry participants onto the replacement so a multi-user ephemeral
+        # keeps its membership across the reopen (mirrors _navigate_to's carry).
+        # Runs after send() so new_view is registered; the membership guard
+        # keeps it idempotent against any the replacement already auto-claimed.
+        for pid in self._participants:
+            if pid not in new_view._participants:
+                new_view._participants.add(pid)
+                self.state_store._register_participant(new_view, pid)
+
+        # Re-parent this view's own children onto the replacement -- the
+        # same hand-off _settle_navigation performs after a confirmed
+        # navigation edit. Without it, exit() below cascades into
+        # _cleanup_attached_children and deletes children that should
+        # outlive the reopen. attach_child prunes the source list as it
+        # re-parents, so the exit cascade finds nothing.
+        for child in list(self._attached_children):
+            if child is new_view:
+                continue
+            new_view.attach_child(child)
 
         # Migrate the tracked-child slot from this instance to the refreshed
         # one. Without this transfer, a parent that called attach_child(self)

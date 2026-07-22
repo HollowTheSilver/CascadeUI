@@ -119,6 +119,15 @@ one-shot use case:
 Use it for ephemeral confirmations, stats readouts, and error panels that
 don't warrant a dedicated class.
 
+A posted-and-forgotten display card (an announcement or receipt with no
+interactive components) needs no explicit teardown: when there is nothing to
+disable, the timeout and `exit()` skip the cosmetic freeze edit, so the view
+cleans up its state on timeout without a wasted request. To tear it down
+immediately while leaving the message on screen, call
+`exit(delete_message=False)`; it is the teardown seam, unlike discord.py's
+`stop()`, which cancels the timeout but leaves the view in the active-view
+registry.
+
 ---
 
 ## V1 Views (Classic)
@@ -937,6 +946,17 @@ class MyView(StatefulLayoutView):
     auto_defer_delay = 2.5   # Seconds before the timed defer fires
     serialize_interactions = True  # Default -- sequential callback processing
 ```
+
+!!! warning "`ack_first` -- acknowledge before the callback (advanced)"
+    `ack_first = False` by default. When `True`, the view acknowledges the
+    interaction *immediately* -- before the access checks and the callback run,
+    earlier than even the timed defer. Reach for it only when a callback does
+    synchronous work that can stall the event loop past the 2.5s timer (heavy
+    CPU work between awaits, for example). It trades the one-request acting-view
+    refresh (edit-as-ack) for a guaranteed early ack, so a normal view is faster
+    *without* it. Do not combine `ack_first = True` with `open_modal()` in the
+    same callback: a modal must be the first response, and the early ack has
+    already consumed that slot.
 
 This means most callbacks need no interaction handling at all:
 

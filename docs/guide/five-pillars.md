@@ -160,6 +160,7 @@ dies with its last member.
 |-----------|---------|---------|
 | `auto_defer` | `True` | Auto-defer unacknowledged interactions |
 | `auto_defer_delay` | `2.5` | Seconds before auto-defer fires |
+| `ack_first` | `False` | Ack before the checks/callback (advanced escape hatch) |
 | `serialize_interactions` | `True` | Process clicks sequentially via asyncio.Lock |
 | `edit_timeout` | `60.0` | Max seconds a Discord edit may stall before cancellation; `None` disables |
 
@@ -383,6 +384,7 @@ Every class attribute, grouped by pillar, with its default value:
     error_message = "An unexpected error occurred..."
     auto_defer = True
     auto_defer_delay = 2.5
+    ack_first = False  # advanced -- ack before the checks/callback
     serialize_interactions = True
     edit_timeout = 60.0  # per-edit Discord HTTP ceiling; None = unbounded
     refresh_cooldown_ms = None  # paces background re-renders; clicks are exempt

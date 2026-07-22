@@ -418,7 +418,7 @@ class CharacterCreatorView(WizardLayoutView):
             self._name = (name_input.value or "").strip()
             if portrait_input.values:
                 self._portrait = portrait_input.values[0].url
-            await self._refresh_wizard()
+            await self.refresh_content()
 
         return Modal(
             title="Name your character",
@@ -436,7 +436,7 @@ class CharacterCreatorView(WizardLayoutView):
             self._race = value
             self._class = ""
             self._subclass = ""
-        await self._refresh_wizard()
+        await self.refresh_content()
 
     async def validate_identity(self):
         if not self._name:
@@ -486,11 +486,11 @@ class CharacterCreatorView(WizardLayoutView):
             # any stale subclass choice.
             self._class = value
             self._subclass = ""
-        await self._refresh_wizard()
+        await self.refresh_content()
 
     async def _on_subclass_selected(self, interaction, value):
         self._subclass = value
-        await self._refresh_wizard()
+        await self.refresh_content()
 
     async def validate_class(self):
         if not self._class:
@@ -561,11 +561,11 @@ class CharacterCreatorView(WizardLayoutView):
         if ability in self._scores and self._points_remaining > 0:
             if self._scores[ability] < MAX_SCORE:
                 self._scores[ability] += 1
-        await self._refresh_wizard()
+        await self.refresh_content()
 
     async def _reset_scores(self, interaction):
         self._scores = {a: STARTING_SCORE for a in ABILITIES}
-        await self._refresh_wizard()
+        await self.refresh_content()
 
     async def validate_abilities(self):
         if self._points_remaining != 0:
@@ -681,7 +681,7 @@ class CharacterCreatorView(WizardLayoutView):
             self._origin = origin_input.value or ""
             self._tools = list(tools_input.values or [])
             self._haunted = bool(haunted_input.value)
-            await self._refresh_wizard()
+            await self.refresh_content()
 
         return Modal(
             title="Character Background",
@@ -694,15 +694,15 @@ class CharacterCreatorView(WizardLayoutView):
 
     async def _on_alignment_selected(self, interaction, value):
         self._alignment = value
-        await self._refresh_wizard()
+        await self.refresh_content()
 
     async def _on_languages_selected(self, interaction, values):
         self._languages = sorted(values)
-        await self._refresh_wizard()
+        await self.refresh_content()
 
     async def _on_destiny_toggled(self, interaction):
         self._heroic_destiny = not self._heroic_destiny
-        await self._refresh_wizard()
+        await self.refresh_content()
 
     async def validate_background(self):
         if len(self._backstory) < 20:
@@ -792,7 +792,10 @@ class CharacterCreatorView(WizardLayoutView):
             TextDisplay("-# Character created successfully."),
             color=discord.Color.green(),
         )
-        await self.respond(interaction, view=DisplayLayoutView(container=body), ephemeral=True)
+        # send() registers the summary with the inspector, instance limits, and
+        # state cleanup; a raw view= kwarg bypasses all three.
+        summary = DisplayLayoutView(container=body, interaction=interaction)
+        await summary.send(ephemeral=True)
         await self.exit()
 
 

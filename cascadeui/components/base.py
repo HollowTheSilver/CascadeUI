@@ -1,6 +1,7 @@
 # // ========================================( Modules )======================================== // #
 
 
+import asyncio
 import inspect
 import logging
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Union
@@ -268,8 +269,8 @@ class StatefulSelect(discord.ui.Select, StatefulComponent):
 # DynamicPersistentButton subclass that declares a template. The qualified key prevents
 # cross-module collisions when two unrelated cogs define a class with the same bare
 # name. Populated at class-definition time via __init_subclass__; consumed by
-# PersistenceMiddleware.initialize which registers the full set with the bot via
-# bot.add_dynamic_items(*classes).
+# PersistenceManager.reattach_persistent_views, which registers the full set with the
+# bot via bot.add_dynamic_items(*classes) on every reattach pass.
 _dynamic_button_classes: Dict[str, type] = {}
 
 
@@ -316,10 +317,13 @@ class DynamicPersistentButton(
     right now."
 
     Subclass registration is automatic: every subclass declaring a
-    ``template=`` lands in a module-level registry. When
-    ``setup_middleware(PersistenceMiddleware(..., bot=bot))`` runs,
-    the middleware calls ``bot.add_dynamic_items(*classes)`` so every
-    subclass routes correctly after a restart.
+    ``template=`` lands in a module-level registry. The reattach pass
+    run by ``setup_middleware(PersistenceMiddleware(..., bot=bot))``
+    calls ``bot.add_dynamic_items(*classes)`` so every subclass routes
+    correctly after a restart; a subclass imported later (a cog loaded
+    after setup) is wired in by the same re-drive when
+    ``PersistenceManager.reattach()`` runs, matching the recovery for
+    late-imported persistent views.
 
     Snowflake capture coercion is automatic for groups named
     ``user_id``, ``guild_id``, ``channel_id``, ``role_id``, or
@@ -349,10 +353,14 @@ class DynamicPersistentButton(
 
             async def on_click(self, interaction):
                 # self.category and self.role_id set by __init__
-                ...
+                await self.respond(interaction, "Toggled!", ephemeral=True)
     """
 
     _persistent: bool = True
+
+    # Ack backstop for the dynamic-dispatch path, which has no view-level
+    # ``_scheduled_task`` timer. Mirrors ``_StatefulMixin.auto_defer_delay``.
+    auto_defer_delay: float = 2.5
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -371,8 +379,16 @@ class DynamicPersistentButton(
         unconditionally; the only class that never appears here is
         ``DynamicPersistentButton`` itself, because a class's
         ``__init_subclass__`` runs on its subclasses, not on itself.
+
+        Also validates ``auto_defer_delay`` (must be a positive number) at
+        definition time, mirroring ``Modal``.
         """
         super().__init_subclass__(**kwargs)
+        delay = cls.auto_defer_delay
+        if not isinstance(delay, (int, float)) or isinstance(delay, bool) or delay <= 0:
+            raise ValueError(
+                f"{cls.__name__}.auto_defer_delay must be a positive number, got {delay!r}"
+            )
         _dynamic_button_classes[f"{cls.__module__}.{cls.__qualname__}"] = cls
 
     @classmethod
@@ -392,6 +408,25 @@ class DynamicPersistentButton(
         captures = coerce_snowflake_match(match.groupdict(), _SNOWFLAKE_CAPTURES)
         return cls(**captures)
 
+    async def _auto_defer_timer(self, interaction) -> None:
+        """Defer the interaction if ``on_click`` has not responded in time.
+
+        Dynamic items dispatch outside a view's ``_scheduled_task``, so this is
+        the click's only ack backstop. A role toggle runs one or two REST role
+        mutations before its response, on the 3s interaction clock; without this
+        timer a slow mutation drops the interaction (10062). Armed before
+        ``on_click``, not after, because a trailing defer fires too late to beat
+        the wall when the pre-response work is itself the slow part.
+        """
+        try:
+            await asyncio.sleep(self.auto_defer_delay)
+            if not interaction.response.is_done():
+                await interaction.response.defer()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.debug(f"Auto-defer failed for dynamic item {self.__class__.__name__}")
+
     async def callback(self, interaction):
         """Dispatch to :meth:`on_click`, binding ``_CURRENT_INTERACTION``.
 
@@ -401,12 +436,62 @@ class DynamicPersistentButton(
         acting-view fast path in ``_StatefulMixin.refresh()`` when a
         :class:`PersistentView` hosts this button and reacts to the
         same state change.
+
+        An auto-defer timer is armed before ``on_click`` (the dynamic
+        dispatch path has no ``_scheduled_task`` backstop), and a
+        post-callback defer acks a fast handler that edited via the
+        channel endpoint without touching the interaction response.
         """
         token = _CURRENT_INTERACTION.set(interaction)
+        defer_task = asyncio.create_task(self._auto_defer_timer(interaction))
         try:
             await self.on_click(interaction)
         finally:
             _CURRENT_INTERACTION.reset(token)
+            if not defer_task.done():
+                defer_task.cancel()
+            if not interaction.response.is_done():
+                try:
+                    await interaction.response.defer()
+                except discord.HTTPException as e:
+                    if getattr(e, "code", None) == 40060:
+                        logger.debug(
+                            f"Post-callback defer raced an existing ack in "
+                            f"{self.__class__.__name__} (40060)"
+                        )
+                    else:
+                        logger.warning(
+                            f"Post-callback defer failed in {self.__class__.__name__}: "
+                            f"status={getattr(e, 'status', '?')} code={getattr(e, 'code', '?')}"
+                        )
+                except Exception:
+                    logger.debug(
+                        f"Post-callback defer failed in {self.__class__.__name__} "
+                        f"(interaction may have expired)"
+                    )
+
+    async def respond(
+        self,
+        interaction,
+        content: Optional[str] = None,
+        *,
+        ephemeral: bool = False,
+        **kwargs,
+    ) -> None:
+        """Send an interaction response, falling back to followup if already acked.
+
+        ``callback`` arms an auto-defer timer before ``on_click`` runs, so a
+        direct ``interaction.response.send_message`` raises
+        ``InteractionResponded`` once that timer has acked. This checks
+        ``interaction.response.is_done()`` and routes to
+        ``interaction.followup.send`` when the slot is already consumed.
+        The dynamic-item path has no view instance, so this mirrors
+        ``_StatefulMixin.respond`` on the button itself.
+        """
+        if not interaction.response.is_done():
+            await interaction.response.send_message(content, ephemeral=ephemeral, **kwargs)
+        else:
+            await interaction.followup.send(content, ephemeral=ephemeral, **kwargs)
 
     async def on_click(self, interaction) -> None:
         """Handle the click. Default: no-op.
@@ -414,5 +499,10 @@ class DynamicPersistentButton(
         Subclasses override to implement click behavior. The captured
         values from the ``custom_id`` template are available as
         instance attributes that the subclass ``__init__`` set.
+
+        Use ``self.respond(interaction, ...)`` for replies: ``callback``
+        arms an auto-defer timer around this method, so a bare
+        ``interaction.response.send_message`` raises ``InteractionResponded``
+        once the timer has acked.
         """
         pass

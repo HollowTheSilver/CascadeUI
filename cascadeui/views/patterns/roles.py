@@ -40,20 +40,27 @@ def _category_slug(name: str) -> str:
 # // ========================================( Role Toggle Button )======================================== // #
 
 
-async def _respond_safe(
-    interaction: discord.Interaction, content: Optional[str] = None, **kwargs
+async def respond_safe(
+    interaction: discord.Interaction,
+    content: Optional[str] = None,
+    *,
+    ephemeral: bool = False,
+    **kwargs,
 ) -> None:
     """Send an interaction response, falling back to followup if already acked.
 
-    Mirrors ``_StatefulMixin.respond`` but as a module-level helper
-    because ``_RoleToggleButton.on_click`` has no view instance to call
-    ``self.respond`` on. Used by every default hook in
-    ``_BaseRolesMixin``.
+    The public safe-responder for the ``_BaseRolesMixin`` event hooks
+    (``on_role_assigned`` and its siblings), which are classmethods with no
+    button or view instance to reach a ``respond`` method on. Role clicks run
+    inside the dynamic button's auto-defer window, so a bare
+    ``interaction.response.send_message`` in a hook override raises
+    ``InteractionResponded`` once the timer has acked; this routes to
+    ``interaction.followup.send`` when the slot is already consumed.
     """
-    if interaction.response.is_done():
-        await interaction.followup.send(content, **kwargs)
+    if not interaction.response.is_done():
+        await interaction.response.send_message(content, ephemeral=ephemeral, **kwargs)
     else:
-        await interaction.response.send_message(content, **kwargs)
+        await interaction.followup.send(content, ephemeral=ephemeral, **kwargs)
 
 
 class _RoleToggleButton(
@@ -105,7 +112,7 @@ class _RoleToggleButton(
                 f"_RoleToggleButton click with unknown slug {self.category_slug!r}; "
                 f"panel state out of sync with code"
             )
-            await _respond_safe(
+            await self.respond(
                 interaction,
                 "This role panel is out of date. An admin needs to re-post it.",
                 ephemeral=True,
@@ -134,8 +141,10 @@ class _BaseRolesMixin:
     dispatch path goes through ``DynamicPersistentButton`` which has no
     view instance at click time -- the hook classmethods read class
     attributes (``cls.assigned_message``, etc.) and send responses via
-    the module-level ``_respond_safe`` helper. Override signature uses
-    ``cls`` instead of ``self``; ``super()`` still works normally.
+    the public ``respond_safe`` helper. A hook override calls
+    ``respond_safe(interaction, ...)`` for its own replies. Override
+    signature uses ``cls`` instead of ``self``; ``super()`` still works
+    normally.
     """
 
     # Declared by concrete subclasses. Empty list on the base is the
@@ -312,7 +321,7 @@ class _BaseRolesMixin:
         """
         guild = interaction.guild
         if guild is None:
-            await _respond_safe(interaction, "Role panels only work in a server.", ephemeral=True)
+            await respond_safe(interaction, "Role panels only work in a server.", ephemeral=True)
             return
 
         member = interaction.user
@@ -375,7 +384,7 @@ class _BaseRolesMixin:
     ) -> None:
         """Called after a role is added (no swap). Default: ephemeral assigned_message."""
         message = cls.assigned_message.format(role=role.name, category=category.name)
-        await _respond_safe(interaction, message, ephemeral=True)
+        await respond_safe(interaction, message, ephemeral=True)
 
     @classmethod
     async def on_role_removed(
@@ -387,7 +396,7 @@ class _BaseRolesMixin:
     ) -> None:
         """Called after a role is removed. Default: ephemeral removed_message."""
         message = cls.removed_message.format(role=role.name, category=category.name)
-        await _respond_safe(interaction, message, ephemeral=True)
+        await respond_safe(interaction, message, ephemeral=True)
 
     @classmethod
     async def on_role_swap(
@@ -403,7 +412,7 @@ class _BaseRolesMixin:
         message = cls.swap_message.format(
             role=role_added.name, category=category.name, removed=removed
         )
-        await _respond_safe(interaction, message, ephemeral=True)
+        await respond_safe(interaction, message, ephemeral=True)
 
     @classmethod
     async def on_role_required_block(
@@ -415,7 +424,7 @@ class _BaseRolesMixin:
     ) -> None:
         """Called when a required-category removal is rejected. Default: ephemeral required_message."""
         message = cls.required_message.format(role=role.name, category=category.name)
-        await _respond_safe(interaction, message, ephemeral=True)
+        await respond_safe(interaction, message, ephemeral=True)
 
     @classmethod
     async def on_role_error(
@@ -429,7 +438,7 @@ class _BaseRolesMixin:
         discord.HTTPException) or a string describing the failure.
         """
         message = cls.role_error_message.format(error=error)
-        await _respond_safe(interaction, message, ephemeral=True)
+        await respond_safe(interaction, message, ephemeral=True)
 
 
 # // ========================================( V2 Roles )======================================== // #

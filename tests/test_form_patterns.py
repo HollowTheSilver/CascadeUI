@@ -17,6 +17,7 @@ from helpers import make_interaction as _make_interaction
 
 from cascadeui.components.base import StatefulButton, StatefulSelect
 from cascadeui.components.inputs import Modal as CascadeModal
+from cascadeui.state.store import _CURRENT_INTERACTION
 from cascadeui.validation import min_length, regex
 from cascadeui.views.patterns.form import (
     MAX_TEXT_FIELDS,
@@ -1882,3 +1883,223 @@ class TestFormViewInitialRender:
 
         embed = interaction.response.send_message.call_args.kwargs.get("embed")
         assert embed.title == "Caller"
+
+
+# // ========================================( Text-edit modal ack backstop )======================================== // #
+
+
+class TestTextEditModalBackstop:
+    """The internal text-edit modal takes its ack backstop from the form class."""
+
+    def test_override_reaches_modal_v1(self):
+        class SlowForm(FormView):
+            text_edit_modal_auto_defer_delay = 5.0
+
+        view = SlowForm(
+            interaction=_make_interaction(),
+            fields=[{"id": "u", "type": "text", "label": "Username"}],
+        )
+        modal = _build_form_modal(view, "Edit")
+        assert modal.auto_defer_delay == 5.0
+
+    def test_override_reaches_modal_v2(self):
+        class SlowLayoutForm(FormLayoutView):
+            text_edit_modal_auto_defer_delay = 4.0
+
+        view = SlowLayoutForm(
+            interaction=_make_interaction(),
+            fields=[{"id": "u", "type": "text", "label": "Username"}],
+        )
+        modal = _build_form_modal(view, "Edit")
+        assert modal.auto_defer_delay == 4.0
+
+    def test_non_positive_backstop_rejected_at_definition(self):
+        with pytest.raises(ValueError, match="text_edit_modal_auto_defer_delay"):
+
+            class BadForm(FormView):
+                text_edit_modal_auto_defer_delay = 0
+
+
+# // ========================================( Inline error setters )======================================== // #
+
+
+class TestFormErrorSetters:
+    """set_form_error / set_field_error write the error state AND re-render it."""
+
+    def _tree_text(self, view):
+        from discord.ui import TextDisplay
+
+        return " ".join(
+            getattr(t, "content", "") for t in view.walk_children() if isinstance(t, TextDisplay)
+        )
+
+    async def test_set_form_error_renders_on_v2(self):
+        view = FormLayoutView(
+            interaction=_make_interaction(),
+            fields=[{"id": "n", "type": "text", "label": "Name"}],
+        )
+        view.refresh = AsyncMock()
+        await view.set_form_error("start must precede end")
+        assert view._form_error == "start must precede end"
+        assert "start must precede end" in self._tree_text(view)
+        view.refresh.assert_awaited()
+
+    async def test_set_field_error_renders_on_v2(self):
+        view = FormLayoutView(
+            interaction=_make_interaction(),
+            fields=[{"id": "n", "type": "text", "label": "Name"}],
+        )
+        view.refresh = AsyncMock()
+        await view.set_field_error("n", "too short")
+        assert view._field_errors["n"] == ["too short"]
+        assert "too short" in self._tree_text(view)
+
+    async def test_set_form_error_renders_on_v1(self):
+        view = FormView(
+            interaction=_make_interaction(),
+            fields=[{"id": "n", "type": "text", "label": "Name"}],
+        )
+        view.refresh = AsyncMock()
+        await view.set_form_error("start must precede end")
+        assert view._form_error == "start must precede end"
+        embed = view.refresh.call_args.kwargs.get("embed")
+        assert embed is not None
+        assert "start must precede end" in (embed.description or "")
+
+    async def test_set_form_error_none_clears_v2(self):
+        view = FormLayoutView(
+            interaction=_make_interaction(),
+            fields=[{"id": "n", "type": "text", "label": "Name"}],
+        )
+        view.refresh = AsyncMock()
+        await view.set_form_error("boom")
+        await view.set_form_error(None)
+        assert view._form_error is None
+        assert "boom" not in self._tree_text(view)
+
+
+class TestOnSubmitCrossFieldReject:
+    """on_submit rejects a cross-field rule via set_form_error / set_field_error
+    and keeps the form open. The submit flow no longer auto-exits after on_submit
+    when on_submit set an error -- the setter's documented contract.
+    """
+
+    @staticmethod
+    def _submit_button(view):
+        walker = getattr(view, "walk_children", None)
+        items = list(walker()) if callable(walker) else list(view.children)
+        for item in items:
+            if isinstance(item, StatefulButton) and getattr(item, "custom_id", "") == "form_submit":
+                return item
+        raise AssertionError("no submit button found")
+
+    @pytest.mark.parametrize("view_cls", [FormView, FormLayoutView])
+    async def test_set_field_error_in_on_submit_keeps_form_open(self, view_cls):
+        class _RejectingForm(view_cls):
+            async def on_submit(self, interaction, values):
+                await self.set_field_error("age", "too young")
+
+        view = _RejectingForm(
+            interaction=_make_interaction(),
+            fields=[{"id": "age", "type": "integer", "label": "Age", "default": 5}],
+        )
+        view.refresh = AsyncMock()
+        view.exit = AsyncMock()
+
+        await self._submit_button(view).original_callback(_make_interaction())
+
+        view.exit.assert_not_called()  # rejection keeps the form open
+        assert view._field_errors.get("age") == ["too young"]
+
+    @pytest.mark.parametrize("view_cls", [FormView, FormLayoutView])
+    async def test_clean_on_submit_still_auto_exits(self, view_cls):
+        class _CleanForm(view_cls):
+            async def on_submit(self, interaction, values):
+                pass  # no error, no explicit exit -> the flow auto-exits
+
+        view = _CleanForm(
+            interaction=_make_interaction(),
+            fields=[{"id": "age", "type": "integer", "label": "Age", "default": 5}],
+        )
+        view.refresh = AsyncMock()
+        view.exit = AsyncMock()
+
+        await self._submit_button(view).original_callback(_make_interaction())
+
+        view.exit.assert_awaited_once()  # unchanged: a clean submit still exits
+
+
+class TestFormReload:
+    """reload() re-renders the V1 form embed instead of shipping an empty edit."""
+
+    async def test_v1_reload_ships_the_embed(self):
+        view = FormView(
+            interaction=_make_interaction(),
+            fields=[{"id": "n", "type": "text", "label": "Name"}],
+        )
+        view.refresh = AsyncMock()
+        await view.reload()
+        embed = view.refresh.call_args.kwargs.get("embed")
+        assert embed is not None  # was the empty-kwargs no-op before the fix
+
+
+class TestStatefulCallbackWiring:
+    """Form controls route through the stateful callback wrapper.
+
+    Assigning ``.callback`` after construction overwrites the wrapper that
+    ``StatefulButton`` / ``StatefulSelect`` install, which drops the
+    COMPONENT_INTERACTION dispatch and leaves ``_CURRENT_INTERACTION`` unbound,
+    so every form refresh misses the acting-view fast path.
+    """
+
+    @staticmethod
+    def _find(view, custom_id):
+        walker = getattr(view, "walk_children", None)
+        items = list(walker()) if walker else list(view.children)
+        for item in items:
+            if getattr(item, "custom_id", None) == custom_id:
+                return item
+        raise AssertionError(f"no component with custom_id {custom_id!r}")
+
+    @staticmethod
+    def _probe(view_cls, fields):
+        seen = {}
+
+        class _ProbeForm(view_cls):
+            async def on_field_changed(self, field_id, old_value, new_value):
+                seen["interaction"] = _CURRENT_INTERACTION.get()
+
+        view = _ProbeForm(interaction=_make_interaction(), fields=fields)
+        view.refresh = AsyncMock()
+        return view, seen
+
+    @pytest.mark.parametrize("view_cls", [FormView, FormLayoutView])
+    async def test_boolean_button_binds_the_interaction(self, view_cls):
+        view, seen = self._probe(view_cls, [{"id": "ok", "type": "boolean", "label": "Ready"}])
+        interaction = _make_interaction()
+
+        await self._find(view, "form_ok_yes").callback(interaction)
+
+        assert seen["interaction"] is interaction
+
+    @pytest.mark.parametrize("view_cls", [FormView, FormLayoutView])
+    async def test_select_receives_values_through_the_wrapper(self, view_cls, monkeypatch):
+        view, _ = self._probe(
+            view_cls,
+            [
+                {
+                    "id": "color",
+                    "type": "select",
+                    "label": "Color",
+                    "options": [{"label": "Red", "value": "red"}],
+                }
+            ],
+        )
+        select = self._find(view, "form_color")
+        monkeypatch.setattr(type(select), "values", property(lambda s: ["red"]))
+
+        # The inner callback takes (interaction, values); only the wrapper
+        # supplies the second argument.
+        await select.callback(_make_interaction())
+
+        assert view.values["color"] == "red"

@@ -8,7 +8,7 @@ from .coercion import (
     is_snowflake,
 )
 from .decorators import cascade_component, cascade_reducer
-from .errors import safe_execute, with_error_boundary, with_retry
+from .errors import RetryConfig, safe_execute, with_error_boundary, with_retry
 from .fetch import fetch_as_file
 from .strings import is_emoji, slugify
 from .tasks import get_task_manager
@@ -21,6 +21,7 @@ __all__ = [
     "cascade_component",
     "with_error_boundary",
     "with_retry",
+    "RetryConfig",
     "safe_execute",
     "slugify",
     "is_emoji",

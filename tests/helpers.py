@@ -65,7 +65,11 @@ def make_interaction(user_id=100, guild_id=200, is_done=False, message=None):
     interaction.response.send_modal = AsyncMock(side_effect=_flip_done)
     interaction.response.edit_message = AsyncMock(side_effect=_flip_done)
     interaction.data = {}
-    interaction.original_response = AsyncMock(
-        return_value=MagicMock(id=999, channel=MagicMock(id=888))
-    )
+    # The message original_response() returns carries awaitable edit/delete so a
+    # probe that drives send() -> background-subscriber refresh() (which awaits
+    # self._message.edit(...)) does not trip on a non-awaitable MagicMock.
+    _response_message = MagicMock(id=999, channel=MagicMock(id=888))
+    _response_message.edit = AsyncMock(return_value=_response_message)
+    _response_message.delete = AsyncMock()
+    interaction.original_response = AsyncMock(return_value=_response_message)
     return interaction

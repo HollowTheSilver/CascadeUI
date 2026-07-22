@@ -87,6 +87,17 @@ and manual responses are safe to combine.
 These are limitations in discord.py's implementation, not the Discord API
 itself. Future discord.py releases may resolve them.
 
+### DynamicPersistentButton Timer Cannot Cover `from_custom_id`
+
+`DynamicPersistentButton` arms its auto-defer timer inside `callback()`, but
+discord.py runs `from_custom_id` (which reconstructs the button from the matched
+`custom_id`) and `interaction_check` *before* `callback()`. A subclass whose
+`from_custom_id` override does slow I/O (a database lookup to restore state, for
+example) runs that work on the 3-second interaction clock with no ack backstop,
+because `DynamicItem` exposes no per-item dispatch hook the way `Modal` does.
+Keep `from_custom_id` overrides cheap and do slow work inside `on_click`, where
+the timer covers it.
+
 ### Ephemeral Messages Cannot Be Fetched
 
 Ephemeral messages have no permanent message ID accessible to the bot. This

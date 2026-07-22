@@ -195,6 +195,22 @@ class _BasePaginatedMixin:
 
     # // ----( Callback factories )---- // #
 
+    async def set_page(self, page: int) -> None:
+        """Jump to a zero-based page index and re-render.
+
+        Clamps to the valid range, fires the ``on_page_changed`` hook, and
+        edits the message. The public counterpart to the nav buttons, for a
+        subclass that needs a programmatic "jump to page N" control (a search
+        hit, a "find me" button). Setting ``current_page`` directly does not
+        re-render; this is the supported way to move the cursor.
+        """
+        if not self.pages:
+            return
+        target = max(0, min(len(self.pages) - 1, page))
+        self.current_page = target
+        await self._call_hook_safe(self.on_page_changed, target)
+        await self._update_page()
+
     def _make_step_callback(self, delta: int):
         async def callback(interaction: Interaction):
             new_page = max(0, min(len(self.pages) - 1, self.current_page + delta))
@@ -745,6 +761,9 @@ class PaginatedView(_BasePaginatedMixin, StatefulView):
         if not self.pages:
             return {}
         return self._extract_page(self.pages[self.current_page])
+
+    async def _reload_render(self) -> None:
+        await self._update_page()
 
     async def _update_page(self):
         """Mutate nav buttons in place and refresh the page content."""

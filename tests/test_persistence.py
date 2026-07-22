@@ -16,6 +16,7 @@ import json
 import logging
 from unittest.mock import MagicMock
 
+import discord
 import pytest
 from helpers import make_interaction
 
@@ -719,7 +720,7 @@ class TestReattachUnreachable:
 
 class TestReattachIdempotent:
     """reattach() re-drives the reattach, skipping keys already restored on a
-    prior pass (B1(c)) so a class imported after the initial reattach attaches
+    prior pass so a class imported after the initial reattach attaches
     without re-touching already-live panels."""
 
     async def test_reattach_skips_already_restored_keys(self):
@@ -916,6 +917,89 @@ class TestManagerReattachInitKwargsDuplicate:
         # The literal stringified theme from the row never reaches the
         # constructor -- the class-level ``theme`` (None by default) wins.
         assert view.theme is None
+
+
+# // ========================================( Reattach Session Id )======================================== // #
+
+
+class TestReattachSessionId:
+    """Reattach restores the session_id captured at registration, so a
+    restored view rejoins its original session instead of a re-derived
+    suffix-free key that collides across same-class same-user panels.
+    """
+
+    async def _reattach(self, session_id, user_id):
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        class _Panel(PersistentLayoutView):
+            pass
+
+        be = InMemoryBackend()
+        await be.initialize()
+        await be.row_upsert(
+            TABLE_PERSISTENT_VIEWS,
+            {
+                "persistence_key": "panel:sess",
+                "view_class": _Panel.__qualname__,
+                "custom_id": None,
+                "message_id": 1,
+                "channel_id": 2,
+                "guild_id": None,
+                "user_id": user_id,
+                "session_id": session_id,
+                "init_kwargs": json.dumps({"persistence_key": "panel:sess"}),
+                "kwargs_schema_version": 1,
+                "schema_version": 1,
+                "created_at": 1,
+                "updated_at": 1,
+            },
+            ["persistence_key"],
+        )
+        mgr = PersistenceManager(store=get_store(), registry=RegistryPersistence(backend=be))
+        await mgr.rehydrate()
+
+        async def _fake_register(self):
+            pass
+
+        async def _fake_update(self, message):
+            pass
+
+        _Panel._register_state = _fake_register
+        _Panel._update_message_state = _fake_update
+        _Panel._validate_custom_ids = lambda self: None
+
+        captured = {}
+
+        class _FakeBot:
+            def add_view(self, view, message_id):
+                captured["view"] = view
+
+        class _Msg:
+            id = 1
+
+        mgr._bot = _FakeBot()
+        outcome = await mgr._reattach_one(
+            row=mgr._registry_rows[0],
+            view_cls=_Panel,
+            init_kwargs={"persistence_key": "panel:sess"},
+            message=_Msg(),
+            class_name=_Panel.__qualname__,
+            restored_views=[],
+        )
+        assert outcome == "restored"
+        return _Panel, captured["view"]
+
+    async def test_restores_persisted_session_id(self):
+        """A row carrying the original session_id restores it verbatim."""
+        _cls, view = await self._reattach("MyPanel:user_42:abcd1234", 42)
+        assert view.session_id == "MyPanel:user_42:abcd1234"
+
+    async def test_derives_when_row_lacks_session_id(self):
+        """A row written before the column was persisted (None) falls back
+        to deriving from the restored user_id.
+        """
+        cls, view = await self._reattach(None, 42)
+        assert view.session_id == f"{cls._class_session_key()}:user_42"
 
 
 # // ========================================( Reattach on_bind )======================================== // #
@@ -1406,7 +1490,9 @@ class TestReattachConcurrency:
         await self._seed_rows(be, _P, 4)
 
         mgr = PersistenceManager(
-            store=get_store(), registry=RegistryPersistence(backend=be), bot=object()
+            store=get_store(),
+            registry=RegistryPersistence(backend=be),
+            bot=MagicMock(spec=discord.Client),
         )
         await mgr.rehydrate()
 
@@ -1441,7 +1527,7 @@ class TestReattachConcurrency:
         mgr = PersistenceManager(
             store=get_store(),
             registry=RegistryPersistence(backend=be),
-            bot=object(),
+            bot=MagicMock(spec=discord.Client),
             restore_concurrency=2,
         )
         await mgr.rehydrate()
@@ -1479,7 +1565,7 @@ class TestReattachConcurrency:
         mgr = PersistenceManager(
             store=get_store(),
             registry=RegistryPersistence(backend=be),
-            bot=object(),
+            bot=MagicMock(spec=discord.Client),
             restore_concurrency=4,
         )
         await mgr.rehydrate()
@@ -1519,7 +1605,9 @@ class TestReattachConcurrency:
         await self._seed_rows(be, _P, 2)
 
         mgr = PersistenceManager(
-            store=get_store(), registry=RegistryPersistence(backend=be), bot=object()
+            store=get_store(),
+            registry=RegistryPersistence(backend=be),
+            bot=MagicMock(spec=discord.Client),
         )
         await mgr.rehydrate()
         # Inject a malformed row that has no "view_class" key.
@@ -1564,7 +1652,9 @@ class TestReattachConcurrency:
         )
 
         mgr = PersistenceManager(
-            store=get_store(), registry=RegistryPersistence(backend=be), bot=object()
+            store=get_store(),
+            registry=RegistryPersistence(backend=be),
+            bot=MagicMock(spec=discord.Client),
         )
         await mgr.rehydrate()
 

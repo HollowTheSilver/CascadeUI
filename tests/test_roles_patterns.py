@@ -517,3 +517,32 @@ class TestDynamicButtonIntegration:
     def test_button_custom_id_encodes_category_and_role(self):
         button = _RoleToggleButton(category_slug="test_slug", role_id=9999, label="TestLabel")
         assert button.item.custom_id == "roles:test_slug:9999"
+
+
+class TestRespondSafe:
+    """``respond_safe`` is the public is_done-aware responder for the hook classmethods."""
+
+    async def test_root_export(self):
+        from cascadeui import respond_safe as exported
+
+        assert callable(exported)
+
+    async def test_open_slot_uses_send_message(self):
+        from helpers import make_interaction
+
+        from cascadeui import respond_safe
+
+        interaction = make_interaction(is_done=False)
+        await respond_safe(interaction, "hi", ephemeral=True)
+        interaction.response.send_message.assert_awaited_once()
+        interaction.followup.send.assert_not_awaited()
+
+    async def test_acked_slot_uses_followup(self):
+        from helpers import make_interaction
+
+        from cascadeui import respond_safe
+
+        interaction = make_interaction(is_done=True)
+        await respond_safe(interaction, "hi", ephemeral=True)
+        interaction.followup.send.assert_awaited_once()
+        interaction.response.send_message.assert_not_awaited()

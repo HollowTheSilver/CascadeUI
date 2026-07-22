@@ -1394,6 +1394,9 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
 
         view_type = store.state.get("views", {}).get(match, {}).get("type", "Unknown")
 
+        # Defer before the view exit (a Discord edit). A slash command has no
+        # auto-defer backstop, so a slow exit blows the 3s interaction wall.
+        await ctx.defer(ephemeral=True)
         active = store.get_active_views()
         if match in active:
             try:
@@ -1412,6 +1415,8 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
     @cascadeui_group.command(name="exitall", description="Exit all active CascadeUI views.")
     async def exit_all(self, ctx: Context) -> None:
         """Exit active views in the executing guild and clean their ghosts."""
+        # Defer up front: exiting N views is N Discord edits, past the 3s wall.
+        await ctx.defer(ephemeral=True)
         store = get_store()
         gid = self._scope_guild(ctx)
         views = dict(store.state.get("views", {}))
@@ -1452,6 +1457,8 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
         if manager is None:
             return await ctx.send("Persistence is not enabled.", ephemeral=True)
 
+        # Defer before the disk/DB write, which can outlast the 3s wall.
+        await ctx.defer(ephemeral=True)
         await manager.flush_all()
         state_json = json.dumps(store.state, default=str)
         size_kb = len(state_json.encode()) / 1024
@@ -1478,6 +1485,7 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
         if not total:
             return await ctx.send("No stale entries to purge.", ephemeral=True)
 
+        await ctx.defer(ephemeral=True)
         inspector_id = next(
             (
                 vid
@@ -1506,6 +1514,9 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
             )
 
         store = get_store()
+
+        # Defer before the exit-all loop + flush: both are I/O past the 3s wall.
+        await ctx.defer(ephemeral=True)
 
         # Exit all live views. Failures are debug-logged and counted but
         # never block the reset -- a broken view's exit() must not leave

@@ -8,17 +8,20 @@ Covers the v2.2.0 fixes:
   freezing them
 """
 
+import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 import pytest
-from discord.ui import ActionRow
+from discord.ui import ActionRow, TextDisplay
 from helpers import RenderableLayoutView
 from helpers import make_interaction as _make_interaction
 
 from cascadeui import InstanceLimitError
 from cascadeui.components.base import StatefulButton
+from cascadeui.state.actions import ActionCreators
+from cascadeui.state.singleton import get_store
 from cascadeui.views.layout import StatefulLayoutView
 from cascadeui.views.view import StatefulView
 
@@ -711,6 +714,40 @@ class TestAttachChildRefreshHandoff:
         assert new_child._attached_to is None
         assert new_child not in parent._attached_children
 
+    async def test_reopen_reparents_own_children_instead_of_deleting(self):
+        """The reopening view's OWN attached children survive the handoff.
+
+        exit() at the end of _reopen_ephemeral cascades into
+        _cleanup_attached_children, which exits every still-tracked child
+        with delete_message=True. Children must be re-parented onto the
+        replacement first so the exit cascade finds nothing to delete.
+        """
+
+        class _Refreshable(StatefulLayoutView):
+            auto_refresh_ephemeral = True
+
+        old_parent = _Refreshable(interaction=_make_interaction())
+        old_parent._message = MagicMock()
+        old_parent._message.delete = AsyncMock()
+        old_parent._message.edit = AsyncMock()
+
+        child = StatefulLayoutView(interaction=_make_interaction())
+        old_parent.attach_child(child)
+
+        new_parent = _Refreshable(interaction=_make_interaction())
+        old_parent._reopen_factory = lambda: new_parent
+        new_parent.send = AsyncMock()
+
+        # exit() runs for real so the cascade is exercised; only the
+        # child's exit is spied to prove it never fires.
+        with patch.object(child, "exit", new=AsyncMock()) as child_exit:
+            await old_parent._reopen_ephemeral(_make_interaction())
+            child_exit.assert_not_awaited()
+
+        assert child in new_parent._attached_children
+        assert child._attached_to is new_parent
+        assert old_parent._attached_children == []
+
 
 # // ========================================( on_reopen_failure Hook )======================================== // #
 
@@ -811,6 +848,240 @@ class TestOnReopenFailure:
         refresh_interaction.response.send_message.assert_not_called()
 
 
+# // ========================================( Reopen Carries Identity )======================================== // #
+
+
+class TestReopenCarriesIdentity:
+    """A reopened ephemeral carries the navigation identity forward.
+
+    Since the arm deadline rides the navigation chain, the view that reopens
+    can be a mid-chain sub-view, not just a fresh root. _reopen_ephemeral must
+    hand off the post-construction selection, nav stack, root-class accounting,
+    reopen factory, undo/redo timeline, and the Back button, or the replacement
+    comes back as a stateless root.
+    """
+
+    async def test_reopen_applies_nav_state_stack_and_root(self):
+        """Post-construction selection, _nav_stack, and _instance_root_class
+        transfer to the replacement before send() runs on_load.
+        """
+
+        class _NavCarry(StatefulLayoutView):
+            auto_refresh_ephemeral = True
+
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self._sel = "default"
+
+            def get_nav_state(self):
+                return {"sel": self._sel}
+
+            def restore_nav_state(self, state):
+                self._sel = state.get("sel", self._sel)
+
+        entry = {"class_name": "Parent", "module": "m", "kwargs": {}, "view_state": {}}
+        old = _NavCarry(interaction=_make_interaction())
+        old._message = MagicMock()
+        old._message.delete = AsyncMock()
+        old._message.edit = AsyncMock()
+        old._sel = "chosen"
+        old._nav_stack = [entry]
+        old._instance_root_class = "RootView"
+
+        new = _NavCarry(interaction=_make_interaction())
+        old._reopen_factory = lambda: new
+        new.send = AsyncMock()
+        old.exit = AsyncMock()
+
+        await old._reopen_ephemeral(_make_interaction())
+
+        assert new._sel == "chosen"
+        assert new._nav_stack == [entry]
+        assert new._instance_root_class == "RootView"
+
+    async def test_reopen_carries_session_for_continuity(self):
+        """The replacement rejoins the old view's session so shared_data
+        survives the token-cliff swap instead of resetting to a fresh one.
+        """
+
+        class _Refreshable(StatefulLayoutView):
+            auto_refresh_ephemeral = True
+
+        old = _Refreshable(interaction=_make_interaction())
+        old._message = MagicMock()
+        old._message.delete = AsyncMock()
+        old._message.edit = AsyncMock()
+        old.session_id = "session-continuity-1"
+
+        new = _Refreshable(interaction=_make_interaction())
+        old._reopen_factory = lambda: new
+        new.send = AsyncMock()
+        old.exit = AsyncMock()
+
+        await old._reopen_ephemeral(_make_interaction())
+
+        assert new.session_id == "session-continuity-1"
+
+    async def test_reopen_carries_participants(self):
+        """A multi-user ephemeral keeps its participants across the reopen."""
+
+        class _Refreshable(StatefulLayoutView):
+            auto_refresh_ephemeral = True
+
+        old = _Refreshable(interaction=_make_interaction())
+        old._message = MagicMock()
+        old._message.delete = AsyncMock()
+        old._message.edit = AsyncMock()
+        old._participants.add(42)
+        old._participants.add(99)
+
+        new = _Refreshable(interaction=_make_interaction())
+        old._reopen_factory = lambda: new
+        new.send = AsyncMock()
+        old.exit = AsyncMock()
+
+        await old._reopen_ephemeral(_make_interaction())
+
+        assert 42 in new._participants
+        assert 99 in new._participants
+
+    async def test_reopen_carries_factory_for_next_cycle(self):
+        """The replacement inherits the reopen factory so a second reopen
+        does not fall back to the _init_kwargs path the factory replaced.
+        """
+
+        class _Refreshable(StatefulLayoutView):
+            auto_refresh_ephemeral = True
+
+        old = _Refreshable(interaction=_make_interaction())
+        old._message = MagicMock()
+        old._message.delete = AsyncMock()
+        old._message.edit = AsyncMock()
+
+        new = _Refreshable(interaction=_make_interaction())
+        factory = lambda: new
+        old._reopen_factory = factory
+        new.send = AsyncMock()
+        old.exit = AsyncMock()
+
+        await old._reopen_ephemeral(_make_interaction())
+
+        assert new._reopen_factory is factory
+
+    async def test_reopen_transfers_undo_redo_timeline(self):
+        """The old view's undo/redo stacks dispatch onto the replacement's
+        state row before the old row is destroyed at exit().
+        """
+
+        class _Refreshable(StatefulLayoutView):
+            auto_refresh_ephemeral = True
+
+        old = _Refreshable(interaction=_make_interaction())
+        old._message = MagicMock()
+        old._message.delete = AsyncMock()
+        old._message.edit = AsyncMock()
+
+        store = get_store()
+        undo = [{"application_slots": {}, "shared_data": None}]
+        redo = [{"application_slots": {}, "shared_data": None}]
+        store.state.setdefault("views", {})[old.id] = {
+            "undo_stack": undo,
+            "redo_stack": redo,
+        }
+        try:
+            new = _Refreshable(interaction=_make_interaction())
+            old._reopen_factory = lambda: new
+            new.send = AsyncMock()
+            new.dispatch = AsyncMock()
+            old.exit = AsyncMock()
+
+            await old._reopen_ephemeral(_make_interaction())
+
+            new.dispatch.assert_awaited_once()
+            action_type, payload = new.dispatch.await_args.args
+            assert action_type == "VIEW_UPDATED"
+            assert payload == ActionCreators.view_updated(new.id, undo_stack=undo, redo_stack=redo)
+        finally:
+            store.state.get("views", {}).pop(old.id, None)
+
+    async def test_reopen_readds_back_button_for_mid_chain_view(self):
+        """A reopened view with a non-empty stack gets its Back button back --
+        send() builds from build_ui/on_load, which never adds it.
+        """
+
+        class _Refreshable(StatefulLayoutView):
+            auto_refresh_ephemeral = True
+            auto_back_button = True
+
+        old = _Refreshable(interaction=_make_interaction())
+        old._message = MagicMock()
+        old._message.delete = AsyncMock()
+        old._message.edit = AsyncMock()
+        old._nav_stack = [{"class_name": "Parent", "module": "m", "kwargs": {}, "view_state": {}}]
+
+        new = _Refreshable(interaction=_make_interaction())
+        old._reopen_factory = lambda: new
+        new.send = AsyncMock()
+        old.exit = AsyncMock()
+
+        await old._reopen_ephemeral(_make_interaction())
+
+        assert getattr(new, "_auto_back_item", None) is not None
+
+    async def test_reopen_root_view_adds_no_back_button(self):
+        """A root-stack reopen adds no Back button -- there is nowhere to go."""
+
+        class _Refreshable(StatefulLayoutView):
+            auto_refresh_ephemeral = True
+            auto_back_button = True
+
+        old = _Refreshable(interaction=_make_interaction())
+        old._message = MagicMock()
+        old._message.delete = AsyncMock()
+        old._message.edit = AsyncMock()
+
+        new = _Refreshable(interaction=_make_interaction())
+        old._reopen_factory = lambda: new
+        new.send = AsyncMock()
+        old.exit = AsyncMock()
+
+        await old._reopen_ephemeral(_make_interaction())
+
+        assert getattr(new, "_auto_back_item", None) is None
+
+
+# // ========================================( Ephemeral Flag Reset On Send )======================================== // #
+
+
+class TestEphemeralFlagResetOnSend:
+    """send() sets _ephemeral to match the current send, so a reused instance
+    does not carry a stale flag from an earlier ephemeral context.
+    """
+
+    async def test_non_ephemeral_send_clears_stale_flag(self):
+        """A view carrying a stale _ephemeral=True, sent non-ephemerally,
+        ends with the flag cleared -- otherwise its refreshes take the
+        ephemeral no-op branch and exit misclassifies real 401s.
+        """
+        interaction = _make_interaction()
+        view = RenderableLayoutView(interaction=interaction)
+        view._ephemeral = True
+
+        await view.send(ephemeral=False)
+
+        assert view._ephemeral is False
+
+    async def test_ephemeral_send_sets_flag(self):
+        """The ephemeral path still sets the flag."""
+        interaction = _make_interaction()
+        view = RenderableLayoutView(interaction=interaction)
+        assert view._ephemeral is False
+
+        await view.send(ephemeral=True)
+
+        assert view._ephemeral is True
+
+
 class TestEphemeralRearmOnNavRollback:
     """A failed-navigation rollback re-arms the source's ephemeral refresh
     handoff -- cancelled in _navigate_to ahead of the deferred teardown -- so a
@@ -883,3 +1154,103 @@ class TestEphemeralRearmOnNavRollback:
             await source._rollback_navigation(new_view)
 
         assert scheduled == []
+
+
+class TestEphemeralHandoffOnNavSuccess:
+    """A successful push carries the ephemeral arming deadline onto the
+    destination and schedules its handoff timer at the post-commit seam in
+    _settle_navigation -- the same guard shape as the rollback re-arm, but on
+    the new view. The carried deadline (stamped once at the original send)
+    means a mid-chain hop sleeps only the remaining time to the 900s token
+    cliff, and the next hop's cancel_tasks reaps the prior destination's
+    timer so the chain holds one live timer.
+    """
+
+    @staticmethod
+    def _http_error(status=503):
+        return discord.HTTPException(MagicMock(status=status), "boom")
+
+    async def test_push_carries_deadline_and_schedules_handoff(self):
+        class _Source(RenderableLayoutView):
+            auto_refresh_ephemeral = True
+
+        class _Dest(RenderableLayoutView):
+            async def on_state_changed(self, state):
+                pass
+
+        source = _Source(interaction=_make_interaction(user_id=1, guild_id=100))
+        await source.send()
+        source._ephemeral = True
+        deadline = time.monotonic() + 500
+        source._ephemeral_arm_deadline = deadline
+
+        dest = await source.push(_Dest)
+        try:
+            # Carried, not recomputed: the token belongs to the original send.
+            assert dest._ephemeral_arm_deadline == deadline
+            assert dest.task_manager.get_task_count(dest.id) == 1
+        finally:
+            dest.task_manager.cancel_tasks(dest.id)
+
+    async def test_second_hop_cancels_prior_destination_timer(self):
+        class _Source(RenderableLayoutView):
+            auto_refresh_ephemeral = True
+
+        class _Mid(RenderableLayoutView):
+            async def on_state_changed(self, state):
+                pass
+
+        class _Deep(RenderableLayoutView):
+            async def on_state_changed(self, state):
+                pass
+
+        source = _Source(interaction=_make_interaction(user_id=1, guild_id=100))
+        await source.send()
+        source._ephemeral = True
+        source._ephemeral_arm_deadline = time.monotonic() + 500
+
+        mid = await source.push(_Mid)
+        mid_timer = next(iter(mid.task_manager._tasks[mid.id]))
+
+        deep = await mid.push(_Deep)
+        try:
+            # The second hop's cancel_tasks(mid.id) reaps the first
+            # destination's timer; only the new destination holds one.
+            for _ in range(3):
+                await asyncio.sleep(0)
+            assert mid_timer.done()
+            assert mid.task_manager.get_task_count(mid.id) == 0
+            assert deep.task_manager.get_task_count(deep.id) == 1
+        finally:
+            deep.task_manager.cancel_tasks(deep.id)
+
+    async def test_rollback_leaves_no_destination_timer(self):
+        class _Source(RenderableLayoutView):
+            auto_refresh_ephemeral = True
+
+        class _Dest(RenderableLayoutView):
+            async def on_state_changed(self, state):
+                pass
+
+        source = _Source(interaction=_make_interaction(user_id=1, guild_id=100))
+        await source.send()
+        source._ephemeral = True
+        source._ephemeral_arm_deadline = time.monotonic() + 500
+
+        # Every edit endpoint fails -> _rollback_navigation.
+        nav = _make_interaction(user_id=1, guild_id=100, is_done=False)
+        nav.response.edit_message = AsyncMock(side_effect=self._http_error())
+        nav.response.defer = AsyncMock(side_effect=self._http_error())
+        nav.edit_original_response = AsyncMock(side_effect=self._http_error())
+        source._message.edit = AsyncMock(side_effect=self._http_error())
+
+        dest = await source.push(_Dest, interaction=nav)
+        try:
+            # The deadline carried in the navigation batch, but the timer
+            # never armed: scheduling is post-commit and the edit never
+            # confirmed. The rollback re-armed the recovered source instead.
+            assert dest._ephemeral_arm_deadline is not None
+            assert dest.task_manager.get_task_count(dest.id) == 0
+            assert source.task_manager.get_task_count(source.id) == 1
+        finally:
+            source.task_manager.cancel_tasks(source.id)

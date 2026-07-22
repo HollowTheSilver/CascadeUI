@@ -439,6 +439,143 @@ class TestParticipantPropagation:
         assert 2 not in new._participants
 
 
+class TestNavigationAttachmentTransfer:
+    """Push/pop migrate attachment tracking onto the destination.
+
+    A navigating parent's attached children re-parent onto the new view so
+    the cleanup cascade survives the hop, and a navigating child's own
+    parent tracks the destination in its place. replace() is a one-way
+    transition -- attachments do not carry over.
+    """
+
+    async def test_push_reparents_children_onto_destination(self):
+        class _Parent(StatefulView):
+            pass
+
+        class _Child(StatefulView):
+            pass
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        parent = _Parent(interaction=_make_interaction(user_id=1, guild_id=100))
+        await parent.send()
+        child = _Child(interaction=_make_interaction(user_id=1, guild_id=100))
+        parent.attach_child(child)
+
+        sub = await parent.push(_Sub)
+
+        assert child._attached_to is sub
+        assert child in sub._attached_children
+        assert child not in parent._attached_children
+
+    async def test_navigating_child_stays_under_parent_tracking(self):
+        class _Game(StatefulView):
+            pass
+
+        class _Panel(StatefulView):
+            pass
+
+        class _SubPanel(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        game = _Game(interaction=_make_interaction(user_id=1, guild_id=100))
+        await game.send()
+        panel = _Panel(interaction=_make_interaction(user_id=1, guild_id=100))
+        await panel.send()
+        game.attach_child(panel)
+
+        sub = await panel.push(_SubPanel)
+
+        # The parent's cleanup cascade now covers the destination, not the
+        # torn-down source.
+        assert sub in game._attached_children
+        assert sub._attached_to is game
+        assert panel not in game._attached_children
+        assert panel._attached_to is None
+
+    async def test_pop_reparents_children_onto_restored_view(self):
+        class _Root(StatefulView):
+            pass
+
+        class _Child(StatefulView):
+            pass
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+        sub = await root.push(_Sub)
+
+        child = _Child(interaction=_make_interaction(user_id=1, guild_id=100))
+        sub.attach_child(child)
+
+        restored = await sub.pop()
+
+        assert child._attached_to is restored
+        assert child in restored._attached_children
+
+    async def test_rollback_keeps_source_tracking_intact(self):
+        """A failed destination edit rolls the navigation back. The
+        migration waits for the confirmed edit, so the recovered source
+        still tracks its child and the torn-down destination adopted
+        nothing."""
+
+        class _Parent(StatefulView):
+            pass
+
+        class _Child(StatefulView):
+            pass
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        parent = _Parent(interaction=_make_interaction(user_id=1, guild_id=100))
+        await parent.send()
+        child = _Child(interaction=_make_interaction(user_id=1, guild_id=100))
+        parent.attach_child(child)
+
+        # Every edit endpoint fails -> _rollback_navigation.
+        err = discord.HTTPException(MagicMock(status=503), "boom")
+        nav = _make_interaction(user_id=1, guild_id=100, is_done=False)
+        nav.response.edit_message = AsyncMock(side_effect=err)
+        nav.response.defer = AsyncMock(side_effect=err)
+        nav.edit_original_response = AsyncMock(side_effect=err)
+        parent._message.edit = AsyncMock(side_effect=err)
+
+        sub = await parent.push(_Sub, interaction=nav)
+
+        assert child._attached_to is parent
+        assert child in parent._attached_children
+        assert child not in sub._attached_children
+
+    async def test_replace_does_not_carry_attachments(self):
+        class _Old(StatefulView):
+            pass
+
+        class _Child(StatefulView):
+            pass
+
+        class _New(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        old = _Old(interaction=_make_interaction(user_id=1, guild_id=100))
+        await old.send()
+        child = _Child(interaction=_make_interaction(user_id=1, guild_id=100))
+        old.attach_child(child)
+
+        new = await old.replace(_New)
+
+        assert new._attached_children == []
+        assert child._attached_to is old
+
+
 class TestNavigationMessageState:
     """Push/pop targets inherit the parent's message; the state row must
     carry message_id and channel_id so tooling (inspector, persistence,
@@ -1425,6 +1562,46 @@ class TestNavigationInstanceForm:
         assert isinstance(restored, _Root)
         # New _Root instance reconstructed via the registry, not the original.
         assert restored.id != original_id
+
+    async def test_push_instance_binds_acting_interaction(self):
+        """The instance path binds the acting interaction, matching the
+        class path's ``interaction=current_interaction`` construction.
+        Without the bind, a later navigation from the pushed view falls
+        back to a stale (or missing) interaction and degrades to the
+        no-edit programmatic path."""
+
+        class _Root(StatefulView):
+            pass
+
+        class _Sub(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+
+        child = _Sub(interaction=_make_interaction(user_id=1, guild_id=100))
+        nav = _make_interaction(user_id=1, guild_id=100)
+        pushed = await root.push(child, interaction=nav)
+
+        assert pushed.interaction is nav
+
+    async def test_replace_instance_binds_acting_interaction(self):
+        class _Origin(StatefulView):
+            pass
+
+        class _Destination(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        origin = _Origin(interaction=_make_interaction(user_id=1, guild_id=100))
+        await origin.send()
+
+        dest = _Destination(interaction=_make_interaction(user_id=1, guild_id=100))
+        nav = _make_interaction(user_id=1, guild_id=100)
+        replaced = await origin.replace(dest, interaction=nav)
+
+        assert replaced.interaction is nav
 
 
 class TestPatternNavigationState:

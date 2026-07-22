@@ -286,12 +286,16 @@ def _build_form_modal(form, title: str) -> CascadeModal:
 
         await form._update_form_display()
 
-    return CascadeModal(
+    modal = CascadeModal(
         title=title,
         inputs=inputs,
         callback=on_modal_submit,
         view_id=form.id,
     )
+    # Carry the form's configured backstop onto the modal instance; the value is
+    # validated on the form subclass via _POSITIVE_NUMBER_ATTRS before it lands here.
+    modal.auto_defer_delay = form.text_edit_modal_auto_defer_delay
+    return modal
 
 
 # // ========================================( Shared Mixin )======================================== // #
@@ -313,9 +317,17 @@ class _BaseFormMixin:
     text_edit_button_label: ClassVar[Optional[str]] = None
     text_edit_button_emoji: ClassVar[EmojiInput] = "\u270f\ufe0f"
     text_edit_button_style: ClassVar[discord.ButtonStyle] = discord.ButtonStyle.secondary
+    # The pattern builds its text-edit modal internally, so this is the only
+    # surface a subclass has to raise that modal's ack backstop for a slow
+    # async field validator.
+    text_edit_modal_auto_defer_delay: ClassVar[float] = 2.5
     _BUTTON_STYLE_ATTRS: ClassVar[tuple] = (
         *_StatefulMixin._BUTTON_STYLE_ATTRS,
         "text_edit_button_style",
+    )
+    _POSITIVE_NUMBER_ATTRS: ClassVar[tuple] = (
+        *_StatefulMixin._POSITIVE_NUMBER_ATTRS,
+        "text_edit_modal_auto_defer_delay",
     )
 
     def __init__(
@@ -475,6 +487,29 @@ class _BaseFormMixin:
         """
         self._field_errors.pop(fid, None)
         self._form_error = None
+
+    async def set_form_error(self, message: Optional[str]) -> None:
+        """Set a form-level (cross-field) error and re-render so it shows.
+
+        Use inside an ``on_submit`` override for a check that spans fields
+        and cannot be expressed as a per-field validator: set the message
+        and return, and the form stays open with the error at the top. Pass
+        ``None`` to clear. Re-rendering runs through ``_update_form_display``,
+        the only path the error state reaches the display through.
+        """
+        self._form_error = message
+        await self._update_form_display()
+
+    async def set_field_error(self, field_id: str, *messages: str) -> None:
+        """Set inline error(s) under one field and re-render the form.
+
+        Call with no ``messages`` to clear that field's errors.
+        """
+        if messages:
+            self._field_errors[field_id] = list(messages)
+        else:
+            self._field_errors.pop(field_id, None)
+        await self._update_form_display()
 
     def _build_form(self):
         """Construct the initial form display.
@@ -669,23 +704,15 @@ class FormView(_BaseFormMixin, StatefulView):
                     for opt in field.get("options", [])
                 ]
 
-                select = StatefulSelect(
-                    placeholder=field.get("placeholder", f"Select {field_label}..."),
-                    options=options,
-                    min_values=1 if field_required else 0,
-                    max_values=1,
-                    custom_id=f"form_{field_id}",
-                    row=current_row,
-                )
-
-                # Capture field_id and select per-iteration via default args
-                def make_select_callback(fid, sel):
-                    async def callback(interaction):
+                # Capture field_id per-iteration; the chosen values arrive as the
+                # callback's second parameter.
+                def make_select_callback(fid):
+                    async def callback(interaction, values):
                         old_value = self.values.get(fid)
                         # An optional select (min_values=0) delivers an empty
                         # list when the user clears it; None is the "not set"
                         # value the display and required-check already expect.
-                        new_value = sel.values[0] if sel.values else None
+                        new_value = values[0] if values else None
                         self.values[fid] = new_value
                         if old_value != new_value:
                             self._clear_field_error(fid)
@@ -696,7 +723,15 @@ class FormView(_BaseFormMixin, StatefulView):
 
                     return callback
 
-                select.callback = make_select_callback(field_id, select)
+                select = StatefulSelect(
+                    placeholder=field.get("placeholder", f"Select {field_label}..."),
+                    options=options,
+                    min_values=1 if field_required else 0,
+                    max_values=1,
+                    custom_id=f"form_{field_id}",
+                    row=current_row,
+                    callback=make_select_callback(field_id),
+                )
                 self.add_item(select)
                 current_row += 1  # Select takes a full row
 
@@ -720,19 +755,10 @@ class FormView(_BaseFormMixin, StatefulView):
                 if max_values is None:
                     max_values = max(1, len(options))
 
-                select = StatefulSelect(
-                    placeholder=field.get("placeholder", f"Select {field_label}..."),
-                    options=options,
-                    min_values=1 if field_required else 0,
-                    max_values=max_values,
-                    custom_id=f"form_{field_id}",
-                    row=current_row,
-                )
-
-                def make_multi_select_callback(fid, sel):
-                    async def callback(interaction):
+                def make_multi_select_callback(fid):
+                    async def callback(interaction, values):
                         old_value = self.values.get(fid)
-                        new_value = list(sel.values)
+                        new_value = list(values)
                         self.values[fid] = new_value
                         if list(old_value or []) != new_value:
                             self._clear_field_error(fid)
@@ -743,26 +769,20 @@ class FormView(_BaseFormMixin, StatefulView):
 
                     return callback
 
-                select.callback = make_multi_select_callback(field_id, select)
+                select = StatefulSelect(
+                    placeholder=field.get("placeholder", f"Select {field_label}..."),
+                    options=options,
+                    min_values=1 if field_required else 0,
+                    max_values=max_values,
+                    custom_id=f"form_{field_id}",
+                    row=current_row,
+                    callback=make_multi_select_callback(field_id),
+                )
                 self.add_item(select)
                 current_row += 1
 
             elif field_type == "boolean":
-                yes_button = StatefulButton(
-                    label=f"{field_label}: Yes",
-                    style=discord.ButtonStyle.success,
-                    custom_id=f"form_{field_id}_yes",
-                    row=current_row,
-                )
-
-                no_button = StatefulButton(
-                    label=f"{field_label}: No",
-                    style=discord.ButtonStyle.danger,
-                    custom_id=f"form_{field_id}_no",
-                    row=current_row,
-                )
-
-                # Capture field_id per-iteration via default arg
+                # Capture field_id per-iteration
                 def make_bool_callback(fid, value):
                     async def callback(interaction):
                         old_value = self.values.get(fid)
@@ -774,8 +794,21 @@ class FormView(_BaseFormMixin, StatefulView):
 
                     return callback
 
-                yes_button.callback = make_bool_callback(field_id, True)
-                no_button.callback = make_bool_callback(field_id, False)
+                yes_button = StatefulButton(
+                    label=f"{field_label}: Yes",
+                    style=discord.ButtonStyle.success,
+                    custom_id=f"form_{field_id}_yes",
+                    row=current_row,
+                    callback=make_bool_callback(field_id, True),
+                )
+
+                no_button = StatefulButton(
+                    label=f"{field_label}: No",
+                    style=discord.ButtonStyle.danger,
+                    custom_id=f"form_{field_id}_no",
+                    row=current_row,
+                    callback=make_bool_callback(field_id, False),
+                )
 
                 self.add_item(yes_button)
                 self.add_item(no_button)
@@ -792,19 +825,13 @@ class FormView(_BaseFormMixin, StatefulView):
                 style=self.text_edit_button_style,
                 custom_id="form_edit_text",
                 row=text_button_row,
+                callback=self._open_text_modal,
             )
-            text_button.callback = self._open_text_modal
             self.add_item(text_button)
             current_row = text_button_row + 1
 
         # Add submit button on the next available row (or last row if full)
         submit_row = min(current_row, 4)
-        submit_button = StatefulButton(
-            label="Submit",
-            style=discord.ButtonStyle.primary,
-            custom_id="form_submit",
-            row=submit_row,
-        )
 
         async def submit_callback(interaction):
             # Always re-validate on submit: _validate_form derives every
@@ -815,10 +842,19 @@ class FormView(_BaseFormMixin, StatefulView):
             valid, field_errors, form_error = await self._validate_form()
 
             if valid:
+                # Validation passed, so clear any stale error state: an error
+                # present after on_submit is one on_submit set itself.
+                self._field_errors = {}
+                self._form_error = None
                 await self.on_submit(interaction, self.values)
-                # ``on_submit`` overrides that bypass ``interaction.response``
-                # leave the interaction unacked; the post-callback defer in
-                # ``_scheduled_task`` handles that case.
+                # on_submit may reject a cross-field rule via set_form_error /
+                # set_field_error; if it did, keep the form open (the setter
+                # already re-rendered) rather than exiting. Otherwise an
+                # override that bypasses interaction.response leaves the ack to
+                # the post-callback defer; skip cleanup if it already
+                # exited/pushed/replaced.
+                if self._form_error or self._field_errors:
+                    return
                 if not self.is_finished():
                     await self.exit()
             else:
@@ -826,7 +862,13 @@ class FormView(_BaseFormMixin, StatefulView):
                 self._form_error = form_error
                 await self._update_form_display()
 
-        submit_button.callback = submit_callback
+        submit_button = StatefulButton(
+            label="Submit",
+            style=discord.ButtonStyle.primary,
+            custom_id="form_submit",
+            row=submit_row,
+            callback=submit_callback,
+        )
         self.add_item(submit_button)
 
     def _build_form_embed(self) -> discord.Embed:
@@ -876,6 +918,9 @@ class FormView(_BaseFormMixin, StatefulView):
                 )
 
         return embed
+
+    async def _reload_render(self) -> None:
+        await self._update_form_display()
 
     async def _update_form_display(self):
         """Rebuild the form embed and ship it."""
@@ -965,21 +1010,15 @@ class FormLayoutView(_BaseFormMixin, StatefulLayoutView):
                     for opt in field.get("options", [])
                 ]
 
-                select = StatefulSelect(
-                    placeholder=field.get("placeholder", f"Select {field_label}..."),
-                    options=options,
-                    min_values=1 if field_required else 0,
-                    max_values=1,
-                    custom_id=f"form_{field_id}",
-                )
-
-                def make_select_callback(fid, sel):
-                    async def callback(interaction):
+                # Capture field_id per-iteration; the chosen values arrive as the
+                # callback's second parameter.
+                def make_select_callback(fid):
+                    async def callback(interaction, values):
                         old_value = self.values.get(fid)
                         # An optional select (min_values=0) delivers an empty
                         # list when the user clears it; None is the "not set"
                         # value the display and required-check already expect.
-                        new_value = sel.values[0] if sel.values else None
+                        new_value = values[0] if values else None
                         self.values[fid] = new_value
                         if old_value != new_value:
                             self._clear_field_error(fid)
@@ -990,7 +1029,14 @@ class FormLayoutView(_BaseFormMixin, StatefulLayoutView):
 
                     return callback
 
-                select.callback = make_select_callback(field_id, select)
+                select = StatefulSelect(
+                    placeholder=field.get("placeholder", f"Select {field_label}..."),
+                    options=options,
+                    min_values=1 if field_required else 0,
+                    max_values=1,
+                    custom_id=f"form_{field_id}",
+                    callback=make_select_callback(field_id),
+                )
                 self.add_item(ActionRow(select))
 
             elif field_type == "multi_select":
@@ -1013,18 +1059,10 @@ class FormLayoutView(_BaseFormMixin, StatefulLayoutView):
                 if max_values is None:
                     max_values = max(1, len(options))
 
-                select = StatefulSelect(
-                    placeholder=field.get("placeholder", f"Select {field_label}..."),
-                    options=options,
-                    min_values=1 if field_required else 0,
-                    max_values=max_values,
-                    custom_id=f"form_{field_id}",
-                )
-
-                def make_multi_select_callback(fid, sel):
-                    async def callback(interaction):
+                def make_multi_select_callback(fid):
+                    async def callback(interaction, values):
                         old_value = self.values.get(fid)
-                        new_value = list(sel.values)
+                        new_value = list(values)
                         self.values[fid] = new_value
                         if list(old_value or []) != new_value:
                             self._clear_field_error(fid)
@@ -1035,22 +1073,18 @@ class FormLayoutView(_BaseFormMixin, StatefulLayoutView):
 
                     return callback
 
-                select.callback = make_multi_select_callback(field_id, select)
+                select = StatefulSelect(
+                    placeholder=field.get("placeholder", f"Select {field_label}..."),
+                    options=options,
+                    min_values=1 if field_required else 0,
+                    max_values=max_values,
+                    custom_id=f"form_{field_id}",
+                    callback=make_multi_select_callback(field_id),
+                )
                 self.add_item(ActionRow(select))
 
             elif field_type == "boolean":
-                yes_button = StatefulButton(
-                    label=f"{field_label}: Yes",
-                    style=discord.ButtonStyle.success,
-                    custom_id=f"form_{field_id}_yes",
-                )
-
-                no_button = StatefulButton(
-                    label=f"{field_label}: No",
-                    style=discord.ButtonStyle.danger,
-                    custom_id=f"form_{field_id}_no",
-                )
-
+                # Capture field_id per-iteration
                 def make_bool_callback(fid, value):
                     async def callback(interaction):
                         old_value = self.values.get(fid)
@@ -1062,8 +1096,19 @@ class FormLayoutView(_BaseFormMixin, StatefulLayoutView):
 
                     return callback
 
-                yes_button.callback = make_bool_callback(field_id, True)
-                no_button.callback = make_bool_callback(field_id, False)
+                yes_button = StatefulButton(
+                    label=f"{field_label}: Yes",
+                    style=discord.ButtonStyle.success,
+                    custom_id=f"form_{field_id}_yes",
+                    callback=make_bool_callback(field_id, True),
+                )
+
+                no_button = StatefulButton(
+                    label=f"{field_label}: No",
+                    style=discord.ButtonStyle.danger,
+                    custom_id=f"form_{field_id}_no",
+                    callback=make_bool_callback(field_id, False),
+                )
 
                 self.add_item(ActionRow(yes_button, no_button))
 
@@ -1076,17 +1121,11 @@ class FormLayoutView(_BaseFormMixin, StatefulLayoutView):
                 emoji=self.text_edit_button_emoji,
                 style=self.text_edit_button_style,
                 custom_id="form_edit_text",
+                callback=self._open_text_modal,
             )
-            text_button.callback = self._open_text_modal
             self.add_item(ActionRow(text_button))
 
         # Submit button
-        submit_button = StatefulButton(
-            label="Submit",
-            style=discord.ButtonStyle.primary,
-            custom_id="form_submit",
-        )
-
         async def submit_callback(interaction):
             # Always re-validate on submit: _validate_form derives every
             # field's current error (drafts included), so a submit surfaces
@@ -1096,11 +1135,19 @@ class FormLayoutView(_BaseFormMixin, StatefulLayoutView):
             valid, field_errors, form_error = await self._validate_form()
 
             if valid:
+                # Validation passed, so clear any stale error state: an error
+                # present after on_submit is one on_submit set itself.
+                self._field_errors = {}
+                self._form_error = None
                 await self.on_submit(interaction, self.values)
-                # ``on_submit`` overrides that bypass ``interaction.response``
-                # leave the interaction unacked; the post-callback defer in
-                # ``_scheduled_task`` handles that case. Skip cleanup if
-                # on_submit already called exit/push/replace.
+                # on_submit may reject a cross-field rule via set_form_error /
+                # set_field_error; if it did, keep the form open (the setter
+                # already re-rendered) rather than exiting. Otherwise an
+                # override that bypasses interaction.response leaves the ack to
+                # the post-callback defer; skip cleanup if it already
+                # exited/pushed/replaced.
+                if self._form_error or self._field_errors:
+                    return
                 if not self.is_finished():
                     await self.exit()
             else:
@@ -1108,7 +1155,12 @@ class FormLayoutView(_BaseFormMixin, StatefulLayoutView):
                 self._form_error = form_error
                 await self._update_form_display()
 
-        submit_button.callback = submit_callback
+        submit_button = StatefulButton(
+            label="Submit",
+            style=discord.ButtonStyle.primary,
+            custom_id="form_submit",
+            callback=submit_callback,
+        )
         self.add_item(ActionRow(submit_button))
 
     def _rebuild_display(self):

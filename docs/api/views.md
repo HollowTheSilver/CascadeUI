@@ -78,6 +78,19 @@ await self.respond(interaction, embed=my_embed, ephemeral=True)
 
 Use `self.respond()` instead of `interaction.response.send_message()` in any CascadeUI callback that needs to send feedback to the user.
 
+!!! warning "Don't pass a CascadeUI view as `view=`"
+    `respond()` forwards `view=` straight to `send_message`, which bypasses the
+    view's own `send()` and its registration. A stateful view sent that way is
+    live but invisible to the inspector, instance limits, and state cleanup, and
+    its timeout later fires a destroy for a view that was never created. Send a
+    CascadeUI view through its own `send()`
+    (`await MyView(interaction=interaction).send(ephemeral=True)`); `respond()`
+    warns when it detects one. `view=` is fine for a plain `discord.ui.View`.
+
+#### `respond_safe(interaction, content=None, *, ephemeral=False, **kwargs)` {#respond_safe}
+
+The free-function sibling of `respond()`, for contexts with no view instance -- chiefly the `@classmethod` hooks on `RolesLayoutView` (`on_role_assigned` and siblings), which dispatch through `DynamicPersistentButton` and have no `self`. Same `is_done()`-aware behavior: it sends the response, or falls back to a followup when the ack backstop has already fired. Import from the package root (`from cascadeui import respond_safe`).
+
 #### `open_modal(interaction, modal, *, fallback_message=None)` {#open_modal}
 
 Opens a modal dialog, with a graceful fallback if the response slot is already consumed. `send_modal()` must be the first response to an interaction -- it cannot follow a `defer()`. Under `serialize_interactions`, a queued interaction may be auto-deferred before the callback runs. This method checks `is_done()` and sends an ephemeral fallback instead of raising `InteractionResponded`.
@@ -377,6 +390,7 @@ Called before every component callback. Returns `True` to allow, `False` to bloc
 - `exit_policy` (str): What bare `exit()` calls do when no `delete_message` argument is supplied. `"disable"` (default) freezes the components in place; `"delete"` removes the message. Always overridden by an explicit `delete_message=` argument or by an `exit()` method override. Independent of `replace_policy`.
 - `auto_defer` (bool): Enable the auto-defer safety net (default: `True`).
 - `auto_defer_delay` (float): Seconds before auto-deferring (default: `2.5`).
+- `ack_first` (bool): Acknowledge the interaction immediately, before the access checks and the callback run (default: `False`). An advanced escape hatch for callbacks that synchronously block the event loop past `auto_defer_delay`; it trades the acting-view one-request refresh for a guaranteed early ack. Do not combine with `open_modal()` in the same callback: a modal must be the first response, and the early ack has already consumed the slot.
 - `refresh_cooldown_ms` (int | None): Proactive minimum gap between successive **background** Discord edits, in milliseconds. State-driven refreshes arriving inside an active window are coalesced into one deferred re-render that fires at the window boundary. Edits made in direct answer to a click on this view's own message are exempt and ship immediately. This paces the re-renders the library starts, and is not a spam guard. To throttle one expensive control per clicker, wrap it with `with_cooldown`. `None` (default) disables the proactive cooldown; the reactive 429 backoff is always active regardless. Validated as a positive int (`0` is rejected).
 - `serialize_interactions` (bool): Serialize rapid button clicks with an `asyncio.Lock` (default: `True`). Set to `False` for views that handle parallel callbacks.
 - `edit_timeout` (float | None): Maximum seconds any single Discord edit may stall before it is cancelled. Bounds the edits the library issues after the initial send -- state-driven refresh, exit/teardown, and navigation edits. discord.py issues edits with no total HTTP timeout, so without this a stalled connection would pin the view until the socket drops. Default `60.0` (clears realistic attachment uploads while capping a true hang). Set to `None` to disable the bound (unbounded, matching discord.py's own default). The acting-view fast path keeps its own tighter bound, which protects the 3-second ack deadline rather than guarding against a hang.
@@ -458,9 +472,9 @@ Each tab builder is an async function that returns a list of V2 components. The 
 
 #### Methods
 
-##### `await _refresh_tabs()`
+##### `await refresh_content()`
 
-Re-runs the current tab's builder and edits the message. Use from Refresh button callbacks.
+Re-renders the current tab's content in place (V1 rebuilds the embed, V2 recomposes the tree). Use from a subclass callback that mutated data and needs the active tab redrawn.
 
 ##### `on_tab_switched(self, index)` *(override)*
 
@@ -485,6 +499,12 @@ WizardLayoutView(
 
 - `builder(self)` -- async, returns a list of V2 components for the step
 - `validator(self, interaction)` -- async, returns `True` to proceed or `False` to block
+
+#### Methods
+
+##### `await refresh_content()`
+
+Re-renders the current step's content in place (V1 rebuilds the embed, V2 recomposes the tree). Use from a subclass callback that mutated data and needs the active step redrawn without re-fetching.
 
 ##### `on_finish(self, interaction)` *(override)*
 
@@ -532,15 +552,26 @@ Validators declared in the field dict attach directly to the generated `TextInpu
 
 #### Text-Edit Button Customization
 
-Three class attributes mirror the `refresh_button_*` grammar:
+Three class attributes mirror the `refresh_button_*` grammar; a fourth (`text_edit_modal_auto_defer_delay`) tunes the modal the button opens:
 
 | Attribute | Default | Purpose |
 |---|---|---|
 | `text_edit_button_label` | `None` | `None` → smart default: `"Edit {label}"` for one text field, `"Edit Text Fields"` for multiple. |
 | `text_edit_button_emoji` | `"\u270f\ufe0f"` (✏️) | Emoji on the grouped button. Set `None` to disable. |
 | `text_edit_button_style` | `ButtonStyle.secondary` | Button style. |
+| `text_edit_modal_auto_defer_delay` | `2.5` | Ack backstop in seconds for the grouped text-edit modal. Raise for a slow async field validator. |
 
-`FormView` (V1) exposes the same three attributes and 5-field ceiling.
+`FormView` (V1) exposes the same four attributes and 5-field ceiling.
+
+#### Instance Methods
+
+##### `set_form_error(message)`
+
+Sets a form-level error banner and re-renders the form so it shows. Use this instead of assigning the private `_form_error` and calling `refresh()`, which set the state but never rendered it.
+
+##### `set_field_error(field_id, *messages)`
+
+Sets one or more error messages on a single field and re-renders. Pass the field's `id` and the message(s). Both methods live on the shared form mixin, so `FormView` (V1) and `FormLayoutView` (V2) expose them identically.
 
 ---
 
@@ -621,6 +652,7 @@ await view.send()
 | `entry_separator` | `" -- "` | Separator between name and stat columns inside `format_entry` (lines mode). |
 | `card_color` | `None` | Optional `discord.Color` for the rankings card accent. `None` falls through to the active theme. |
 | `show_title_divider` | `True` | Toggle the divider rendered below the title. |
+| `avatar_backfill` | `False` | Section mode only. Renders default avatars immediately, resolves the real ones off the render path via `resolve_avatar_urls`, then reloads. Avoids a blocking first render and per-row fetches on large guilds. |
 
 **Constructor.** Besides `entries=` / `title=` / `subtitle=` / `banner=`, `LeaderboardLayoutView` accepts an optional `bot=` kwarg. Passing it lets the default `get_avatar_url` resolve avatars from the bot's user cache in Section mode. The persistent variant receives the bot through `on_bind` instead (it is stripped from the persistence round-trip).
 
@@ -636,11 +668,13 @@ await view.send()
 | `format_entry(rank, user_id, stats)` | Composes the four column hooks. Override only when row layout itself needs to change. |
 | `format_primary` / `format_secondary` | Section-mode two-line body. |
 | `get_avatar_url(user_id, stats)` *(async)* | Section-mode `Thumbnail` URL. The default resolves from the bot's user cache when a `bot=` kwarg is passed (member avatar on a cache hit, a Discord default avatar on a miss), and returns `None` without a bot so the entry falls back to the two-line `TextDisplay`. Override to resolve from another source. |
+| `resolve_avatar_urls(user_ids)` *(async)* | Section-mode avatar backfill (with `avatar_backfill = True`). Takes a list of user ids, returns a `{user_id: url}` dict, resolved off the render path. Default resolves per user; override for a custom source. |
 | `build_title(page)` | Optional components replacing the rankings card's masthead (the `banner` image + `## title` heading) inside the Container. `None` (default) composes the masthead from the declarative `banner` / `title` pair. Same return shapes and `page` semantics as `build_header`. |
 | `build_header(page)` | Content above the rankings card. The value is prepended as-is: a `Container` renders as its own card (an Overview `stats_card`, a banner), anything else floats as a bare top-level item (no return-type branching, unlike `build_footer`). Read `ranked_entries` for aggregate stats. Returns a component, a list, or `None` (default). `page` is the zero-based page index. |
 | `build_footer(page)` | Content below the rankings, placed by return type: a raw component folds inside the rankings card below the entries, a `Container` renders as its own standalone card below it. Same return shapes and `page` semantics as `build_header`. |
 | `on_leaderboard_empty()` | Returns the V2 component list shown when `entries` is empty. |
 | `ranked_entries` *(property)* | The loaded top-N `(user_id, stats)` slice for the current render; read it in `build_header` / `build_footer` / `build_title` to compute aggregate stats without re-fetching. |
+| `bot` *(property, read-only)* | The client passed via `bot=` (or injected by `on_bind`). Read it in a `resolve_avatar_urls` / `get_avatar_url` override to resolve avatars through `self.bot` instead of a private attribute. `None` when no bot was supplied. |
 | `on_state_changed(state)` *(async, override)* | Calls `rebuild_pages()` then the paginated refresh; live-data subclasses subscribe to data actions and override `get_entries()`. |
 
 **Out-of-band refresh.** `reload()` re-fetches entries, recomposes the tree, and edits the message (the public path for a manual refresh button or `on_restore`); `rebuild_pages()` rebuilds only the page list. Both accept `force=True` to bypass the entry-signature short-circuit when something outside the row data changed the render: a filter, or a select's highlighted option read by `build_header`.
@@ -758,7 +792,7 @@ RoleCategory(
 
 #### Override Hooks
 
-Hooks on `RolesLayoutView` are `@classmethod` (not instance methods). The dispatch path routes through `DynamicPersistentButton` which has no view instance at click time; hook classmethods read class attributes and respond to the interaction directly. `super()` works normally.
+Hooks on `RolesLayoutView` are `@classmethod` (not instance methods). The dispatch path routes through `DynamicPersistentButton` which has no view instance at click time; hook classmethods read class attributes and respond to the interaction directly. An override sends its own reply through the public `respond_safe(interaction, ...)` helper (`from cascadeui import respond_safe`), which falls back to a followup when the ack backstop has already fired. `super()` works normally.
 
 | Hook | Purpose |
 |---|---|
@@ -928,6 +962,7 @@ Pages can be `Embed` objects, strings, or dicts with `"embed"` and/or `"content"
 
 **Instance Methods:**
 
+- `await set_page(n)` -- Jumps to zero-based page `n`, clamped to range, fires `on_page_changed`, and re-renders. The supported cursor move; setting `current_page` directly does not re-render.
 - `await refresh_data(items)` -- Re-paginates with new data. Raises `RuntimeError` if not created via `from_data()`.
 - `_build_extra_items()` *(override)* -- Hook for adding components below navigation buttons (rows 1-4).
 
@@ -1003,8 +1038,7 @@ async def sync_scores(user_id):
 Retries an async callable on failure with exponential backoff. Accepts an optional `RetryConfig(max_attempts, base_delay, max_delay, exceptions)`; defaults to three attempts with a 1-second base delay.
 
 ```python
-from cascadeui import with_retry
-from cascadeui.utils.errors import RetryConfig
+from cascadeui import RetryConfig, with_retry
 
 @with_retry(RetryConfig(max_attempts=5, base_delay=2.0))
 async def fetch_profile(user_id):

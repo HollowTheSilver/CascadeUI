@@ -837,3 +837,36 @@ class TestWizardViewInitialRender:
         await view._refresh_wizard()
 
         assert view._message.edit.await_count == 1
+
+
+class TestWizardRefreshContent:
+    """refresh_content() re-renders the current step (V1's carries the embed)."""
+
+    async def test_v1_rerenders(self):
+        async def embed_builder():
+            return discord.Embed(title="step")
+
+        view = WizardView(
+            interaction=_make_interaction(),
+            steps=[
+                {"name": "A", "builder": embed_builder},
+                {"name": "B", "builder": embed_builder},
+            ],
+        )
+        view.refresh = AsyncMock()
+        await view.refresh_content()
+        embed = view.refresh.call_args.kwargs.get("embed")
+        assert embed is not None  # not the empty-kwargs no-op reload() shipped
+
+    async def test_v1_reload_ships_the_embed(self):
+        async def sb():
+            return discord.Embed(title="step")
+
+        view = WizardView(
+            interaction=_make_interaction(),
+            steps=[{"name": "A", "builder": sb}, {"name": "B", "builder": sb}],
+        )
+        view.refresh = AsyncMock()
+        await view.reload()
+        embed = view.refresh.call_args.kwargs.get("embed")
+        assert embed is not None

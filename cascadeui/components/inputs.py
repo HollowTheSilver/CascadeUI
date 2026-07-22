@@ -1,6 +1,7 @@
 # // ========================================( Modules )======================================== // #
 
 
+import asyncio
 import logging
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -433,6 +434,26 @@ class Modal(discord.ui.Modal, StatefulComponent):
         subscribers can distinguish per-view submissions.
     """
 
+    # Ack backstop for discord.py's modal dispatch, which has no auto-defer
+    # timer. A slow async validator or the MODAL_SUBMITTED fan-out runs on the
+    # 3s interaction clock; this timer acks before the wall.
+    auto_defer_delay: float = 2.5
+
+    def __init_subclass__(cls, **kwargs):
+        """Reject a non-positive ``auto_defer_delay`` at subclass-definition time.
+
+        A value at or below zero (or the wrong type) silently defeats the ack
+        backstop, so it fails when the subclass is defined rather than as a
+        dropped interaction at runtime. Mirrors the view side's
+        ``_POSITIVE_NUMBER_ATTRS`` check.
+        """
+        super().__init_subclass__(**kwargs)
+        delay = cls.auto_defer_delay
+        if not isinstance(delay, (int, float)) or isinstance(delay, bool) or delay <= 0:
+            raise ValueError(
+                f"{cls.__name__}.auto_defer_delay must be a positive number, got {delay!r}"
+            )
+
     def __init__(
         self,
         title: str,
@@ -492,78 +513,147 @@ class Modal(discord.ui.Modal, StatefulComponent):
                 f"  Fix: Give the colliding inputs distinct labels."
             )
 
+    async def _auto_defer_timer(self, interaction: Interaction) -> None:
+        """Defer the submission if ``on_submit`` has not responded in time.
+
+        discord.py's modal dispatch has no auto-defer; a slow async validator
+        or the ``MODAL_SUBMITTED`` fan-out runs on the 3s interaction clock.
+        Without this timer a slow validator drops the submit (10062).
+        """
+        try:
+            await asyncio.sleep(self.auto_defer_delay)
+            if not interaction.response.is_done():
+                await interaction.response.defer()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.debug("Modal auto-defer timer failed (interaction may have expired)")
+
+    async def _scheduled_task(self, interaction, components, resolved):
+        """Arm the ack backstop before discord.py's dispatcher runs ``interaction_check``.
+
+        discord.py's ``Modal._scheduled_task`` awaits ``interaction_check``
+        before ``on_submit`` and its default ``on_error`` only logs, so
+        ``on_submit``'s own timer cannot cover a slow ``interaction_check``
+        override or a fast raise from a validator or callback. This override
+        arms a backstop for the whole dispatch and, in the ``finally``, acks any
+        interaction the dispatch left unanswered (the raise path). ``on_submit``
+        keeps its own timer as a second layer for the submission body.
+        """
+        defer_task = None
+        if not interaction.response.is_done():
+            defer_task = asyncio.create_task(self._auto_defer_timer(interaction))
+        try:
+            await super()._scheduled_task(interaction, components, resolved)
+        finally:
+            if defer_task is not None and not defer_task.done():
+                defer_task.cancel()
+            # Ack anything the dispatch left unanswered (the raise path: discord.py's
+            # Modal.on_error only logs). Reuses the is_done-aware post-submit helper.
+            await self._safe_post_submit_defer(interaction)
+
+    async def respond(
+        self, interaction: Interaction, content=None, *, ephemeral: bool = False, **kwargs
+    ) -> None:
+        """Send an interaction response, falling back to followup if already acked.
+
+        ``on_submit`` arms an auto-defer timer before the validators and the
+        user callback run, so a direct ``interaction.response.send_message``
+        raises ``InteractionResponded`` once that timer has acked. This checks
+        ``interaction.response.is_done()`` and routes to
+        ``interaction.followup.send`` when the slot is already consumed. A
+        ``Modal`` subclass overriding ``on_submit`` calls ``self.respond(...)``
+        for replies; mirrors ``_StatefulMixin.respond``.
+        """
+        if not interaction.response.is_done():
+            await interaction.response.send_message(content, ephemeral=ephemeral, **kwargs)
+        else:
+            await interaction.followup.send(content, ephemeral=ephemeral, **kwargs)
+
     async def on_submit(self, interaction: Interaction):
         """Handle modal submission with optional validation."""
-        # Collect values from the underlying discord.py components,
-        # unwrapping ``ui.Label`` to reach the actual input carrying
-        # the submitted value.
-        values = {}
-        for child in self.children:
-            inner = _unwrap_label(child)
-            if isinstance(inner, (discord.ui.TextInput, discord.ui.RadioGroup)):
-                values[inner.custom_id] = inner.value
-            elif isinstance(inner, (discord.ui.CheckboxGroup, discord.ui.FileUpload)):
-                values[inner.custom_id] = inner.values
-            elif isinstance(inner, discord.ui.Checkbox):
-                values[inner.custom_id] = inner.value
+        # discord.py's modal dispatch has no auto-defer timer, so arm one
+        # before the validators and state dispatch (both potentially slow and
+        # I/O-bound) run on the 3s interaction clock.
+        defer_task = asyncio.create_task(self._auto_defer_timer(interaction))
+        try:
+            # Collect values from the underlying discord.py components,
+            # unwrapping ``ui.Label`` to reach the actual input carrying
+            # the submitted value.
+            values = {}
+            for child in self.children:
+                inner = _unwrap_label(child)
+                if isinstance(inner, (discord.ui.TextInput, discord.ui.RadioGroup)):
+                    values[inner.custom_id] = inner.value
+                elif isinstance(inner, (discord.ui.CheckboxGroup, discord.ui.FileUpload)):
+                    values[inner.custom_id] = inner.values
+                elif isinstance(inner, discord.ui.Checkbox):
+                    values[inner.custom_id] = inner.value
 
-        # Run validation if validators were provided
-        if self.validators:
-            field_defs = [
-                {
-                    "id": field_id,
-                    "validators": field_validators,
-                    "required": getattr(self.inputs.get(field_id), "required", False),
+            # Run validation if validators were provided
+            if self.validators:
+                field_defs = [
+                    {
+                        "id": field_id,
+                        "validators": field_validators,
+                        "required": getattr(self.inputs.get(field_id), "required", False),
+                    }
+                    for field_id, field_validators in self.validators.items()
+                ]
+                errors = await validate_fields(values, field_defs)
+                if errors:
+                    lines = []
+                    for field_id, field_errors in errors.items():
+                        # Field label ("Emoji"), not the derived custom_id slug ("input_emoji").
+                        field = self.inputs.get(field_id)
+                        name = getattr(field, "label", field_id)
+                        for err in field_errors:
+                            lines.append(f"**{name}**: {err.message}")
+                    # is_done-aware: the auto-defer timer may have acked during a
+                    # slow validator, so a bare send_message would raise
+                    # InteractionResponded.
+                    await self.respond(interaction, "\n".join(lines), ephemeral=True)
+                    return
+
+            # Write submitted values back onto the original CascadeUI wrapper
+            # instances so callers can read ``.value`` / ``.values`` directly.
+            # This runs after validation so a rejected value never appears on the
+            # wrapper, matching the documented "populated after validation passes"
+            # contract.
+            self.values_by_input = {}
+            for wrapped, discord_input in self._wrapped_pairs:
+                if isinstance(wrapped, (CheckboxGroup, FileUpload)):
+                    wrapped.values = discord_input.values
+                    self.values_by_input[wrapped] = discord_input.values
+                else:
+                    wrapped.value = discord_input.value
+                    self.values_by_input[wrapped] = discord_input.value
+
+            # Dispatch state update
+            if self.view_id:
+                from ..state.singleton import get_store
+
+                store = get_store()
+
+                payload = {
+                    "view_id": self.view_id,
+                    "values": values,
+                    "user_id": interaction.user.id,
                 }
-                for field_id, field_validators in self.validators.items()
-            ]
-            errors = await validate_fields(values, field_defs)
-            if errors:
-                lines = []
-                for field_id, field_errors in errors.items():
-                    # Field label ("Emoji"), not the derived custom_id slug ("input_emoji").
-                    field = self.inputs.get(field_id)
-                    name = getattr(field, "label", field_id)
-                    for err in field_errors:
-                        lines.append(f"**{name}**: {err.message}")
-                await interaction.response.send_message("\n".join(lines), ephemeral=True)
-                return
 
-        # Write submitted values back onto the original CascadeUI wrapper
-        # instances so callers can read ``.value`` / ``.values`` directly.
-        # This runs after validation so a rejected value never appears on the
-        # wrapper, matching the documented "populated after validation passes"
-        # contract.
-        self.values_by_input = {}
-        for wrapped, discord_input in self._wrapped_pairs:
-            if isinstance(wrapped, (CheckboxGroup, FileUpload)):
-                wrapped.values = discord_input.values
-                self.values_by_input[wrapped] = discord_input.values
-            else:
-                wrapped.value = discord_input.value
-                self.values_by_input[wrapped] = discord_input.value
+                await store.dispatch("MODAL_SUBMITTED", payload, source_id=self.view_id)
 
-        # Dispatch state update
-        if self.view_id:
-            from ..state.singleton import get_store
+            # Call user callback if provided
+            if self.user_callback:
+                await self.user_callback(interaction, values)
 
-            store = get_store()
-
-            payload = {
-                "view_id": self.view_id,
-                "values": values,
-                "user_id": interaction.user.id,
-            }
-
-            await store.dispatch("MODAL_SUBMITTED", payload, source_id=self.view_id)
-
-        # Call user callback if provided
-        if self.user_callback:
-            await self.user_callback(interaction, values)
-            # Safety net: defer if the callback forgot to respond
+            # Ack the submission if nothing above responded. The validation-error
+            # path already responded via respond() and returned; a fast callback
+            # here may have edited via the channel endpoint without acking.
             await self._safe_post_submit_defer(interaction)
-        else:
-            await self._safe_post_submit_defer(interaction)
+        finally:
+            if not defer_task.done():
+                defer_task.cancel()
 
     async def _safe_post_submit_defer(self, interaction: Interaction) -> None:
         """Acknowledge the modal submission if the callback left it unanswered.

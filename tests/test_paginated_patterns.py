@@ -704,3 +704,61 @@ class TestPaginatedLayoutSendKwargsPropagation:
             await view.send(file=photo)
 
         assert mock_super_send.call_args.kwargs["file"] is photo
+
+
+# // ========================================( set_page (public cursor move) )======================================== // #
+
+
+class TestSetPage:
+    """set_page() clamps, fires on_page_changed, and re-renders the target page."""
+
+    def _view(self, pages_count=3):
+        pages = [[Container(TextDisplay(chr(65 + i)))] for i in range(pages_count)]
+        view = PaginatedLayoutView(interaction=_make_interaction(), pages=pages)
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+        return view
+
+    async def test_renders_the_target_not_a_stale_page(self):
+        view = self._view(pages_count=3)  # pages A, B, C
+        await view.set_page(2)
+        assert view.current_page == 2
+        text = " ".join(
+            getattr(t, "content", "") for t in view.walk_children() if isinstance(t, TextDisplay)
+        )
+        assert "C" in text
+        assert "A" not in text
+
+    async def test_clamps_out_of_range(self):
+        view = self._view(pages_count=3)
+        await view.set_page(99)
+        assert view.current_page == 2
+        await view.set_page(-5)
+        assert view.current_page == 0
+
+    async def test_fires_on_page_changed(self):
+        calls = []
+
+        class Tracked(PaginatedLayoutView):
+            async def on_page_changed(self, page):
+                calls.append(page)
+
+        view = Tracked(
+            interaction=_make_interaction(),
+            pages=[[Container(TextDisplay("A"))], [Container(TextDisplay("B"))]],
+        )
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+        await view.set_page(1)
+        assert calls == [1]
+        assert view.current_page == 1
+
+    async def test_v1_reload_ships_the_embed(self):
+        view = PaginatedView(
+            interaction=_make_interaction(),
+            pages=[discord.Embed(title="P0"), discord.Embed(title="P1")],
+        )
+        view.refresh = AsyncMock()
+        await view.reload()
+        embed = view.refresh.call_args.kwargs.get("embed")
+        assert embed is not None  # was the empty-kwargs no-op before the fix

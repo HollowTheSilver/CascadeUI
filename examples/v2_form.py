@@ -42,6 +42,9 @@ V2 features on display:
     - Four builtin validator factories (``min_length``, ``max_length``,
       ``regex``, ``choices``) + one async validator (simulated username
       uniqueness check)
+    - Cross-field rule in ``on_submit`` via ``set_field_error`` -- a
+      constraint spanning two fields (age vs country) that a per-field
+      validator cannot express; setting the error keeps the form open
     - Field grouping via the ``group`` kwarg -- fields with the same
       group label render together under one ``card()`` per group
     - ``on_field_changed`` hook -- selecting a country updates the
@@ -118,7 +121,6 @@ class RegistrationFormView(FormLayoutView):
     instance_scope = "user"  # one open form per user, across guilds
     instance_policy = "reject"  # block a second concurrent form for the same user
     instance_limit_message = "You already have a registration form open. Finish or close it first."
-    replace_policy = "delete"
     exit_policy = "delete"
     state_scope = None
     owner_only = True
@@ -264,7 +266,17 @@ class RegistrationFormView(FormLayoutView):
                     break
 
     async def on_submit(self, interaction, values):
-        """Render a confirmation embed and close the form."""
+        """Confirm registration, or reject a cross-field rule and stay open."""
+        # Cross-field rule: a per-field validator sees only its own field, so a
+        # constraint that spans two fields belongs here, in on_submit. Japan's
+        # age of majority is 20: set_field_error surfaces the failure inline
+        # on the age field and re-renders; returning keeps the form open so the
+        # user can fix it (set_form_error is the sibling for a banner above
+        # every field, e.g. a whole-form business rule).
+        if values["country"] == "jp" and values["age"] < 20:
+            await self.set_field_error("age", "Must be 20 or older to register with country JP.")
+            return
+
         embed = discord.Embed(
             title="\N{WHITE HEAVY CHECK MARK} Registration Complete",
             color=discord.Color.green(),

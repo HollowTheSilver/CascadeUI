@@ -45,6 +45,9 @@ _user_id_lock_out_warned: set = set()
 # send/navigation.
 _slow_on_load_warned: set = set()
 
+# Sibling of _slow_on_load_warned for the reactive rebuild seam (on_state_changed).
+_slow_render_warned: set = set()
+
 # Kwargs that are ephemeral per-invocation and must NOT be saved for
 # push/pop reconstruction.  _navigate_to() re-supplies these when
 # building the next view, so persisting them would be wrong.
@@ -209,7 +212,21 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
 
     # Subclass config: auto-defer safety net
     auto_defer: bool = True
+    # Seconds before the auto-defer timer acks an unresponded interaction. The
+    # ceiling is Discord's 3s interaction wall, measured from interaction
+    # CREATION (not callback dispatch), so gateway latency already eats into it.
+    # Two ack-coupled EDIT budgets derive from this by -1.0 -- the acting-view
+    # fast-path timeout and _ack_bounded -- so lowering it for ack headroom also
+    # shrinks the in-place edit window. A starved event loop delays the timer
+    # regardless, so keep hot-path I/O off the loop rather than retuning this.
     auto_defer_delay: float = 2.5
+    # Opt-in: ack the interaction before the access checks and the callback run,
+    # so a callback that synchronously blocks the loop still lands its ack. Costs
+    # the acting-view one-call refresh fast path (every refresh takes two calls),
+    # and a callback on an ack_first view cannot open a modal: open_modal needs
+    # the un-acked response slot, so after the early ack it falls back to an
+    # ephemeral message instead.
+    ack_first: bool = False
 
     # Subclass config: refresh throttling
     # When set to a positive int, enforces a minimum gap (in milliseconds)
@@ -330,6 +347,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
     _BOOL_ATTRS: ClassVar[tuple] = (
         "owner_only",
         "auto_defer",
+        "ack_first",
         "serialize_interactions",
         "enable_undo",
         "auto_back_button",
@@ -1095,6 +1113,24 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         )
         await self.dispatch("VIEW_UPDATED", payload)
 
+    async def _send_defer_timer(self, ephemeral: bool) -> None:
+        """Defer a slow send's interaction before the 3s wall (N3 backstop).
+
+        The send pipeline's pre-ack stages (on_pre_send, on_load, instance
+        enforcement, seeding) run on the interaction clock when send() is
+        entered from a slash command. Defers with the pending send's ephemeral
+        flag so a followup after this ack renders in the right visibility.
+        Cancelled before the send when the pre-send work finishes in time.
+        """
+        try:
+            await asyncio.sleep(self.auto_defer_delay)
+            if self.interaction is not None and not self.interaction.response.is_done():
+                await self.interaction.response.defer(ephemeral=ephemeral)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.debug(f"Send-scoped auto-defer failed in {type(self).__name__}")
+
     async def _send_pipeline(self, send_kwargs, *, ephemeral=False):
         """Shared send pipeline for V1 and V2 views.
 
@@ -1120,6 +1156,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         # finally be answered. Never blocks the send.
         self._warn_if_locked_out()
 
+        send_defer_task = None
         # -- Stage 0: pre-send gate --
         # on_pre_send() is the public veto hook: a permission or data check
         # that runs FIRST, before any preload, placement walk, state
@@ -1128,75 +1165,106 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         # response slot is still open, so an override can respond() to explain
         # the veto -- and, when it proceeds, the slot stays available for the
         # actual send (no forced defer). Default returns True.
-        if not await self.on_pre_send(self.interaction):
-            self.stop()
-            self.state_store._unsubscribe(self.id)
-            self.state_store._undo_enabled_views.pop(self.id, None)
-            return None
-
-        # -- Stage 0a: async preload --
-        # on_load() is the public hook where a view fetches from a
-        # database or other async source and builds its tree against the
-        # result. It runs before placement validation and the Discord
-        # send so the first render reflects loaded data, not the
-        # synchronous-__init__ placeholder. Default is a no-op, so views
-        # without async preload pay nothing. Matches where the built-in
-        # pattern overrides (leaderboard, paginated cursor mode) already
-        # preload -- before the tree is validated and shipped.
-        await self._run_on_load()
-
-        # -- Stage 1: instance enforcement --
+        # The N3 backstop must stand down on EVERY exit from the pre-send
+        # stages -- the early returns (veto, instance limit, participant
+        # rejection) and any raise, not only the normal fall-through -- or the
+        # timer fires a phantom defer after send() already returned None. The
+        # try/finally guarantees the single cancel site covers all of them.
         try:
-            await self._enforce_instance_limit()
-        except InstanceLimitError as e:
-            await self.on_instance_limit(e)
-            self.stop()
-            self.state_store._unsubscribe(self.id)
-            self.state_store._undo_enabled_views.pop(self.id, None)
-            return None
+            if not await self.on_pre_send(self.interaction):
+                self.stop()
+                self.state_store._unsubscribe(self.id)
+                self.state_store._undo_enabled_views.pop(self.id, None)
+                return None
 
-        # -- Stage 2+3: state registration and participant claiming --
-        # Batched so SESSION_CREATED + VIEW_CREATED collapse into one
-        # BATCH_COMPLETE. On participant-rejection rollback, the queued
-        # VIEW_DESTROYED joins the same batch and the whole self-cancelling
-        # sequence fires as a single notification -- subscribers never see
-        # a transient "view exists" state. ``source_id`` threads this view
-        # through so its initial ``on_state_changed`` awaits inline and the
-        # first render lands flush with the send response.
-        async with self.state_store.batch(source_id=self.id):
-            self.state_store._register_view(self)
-            await self._register_state()
+            # N3: arm a send-scoped ack backstop AFTER the veto. The genuinely
+            # slow pre-send stages (on_load, instance enforcement, seed) run on
+            # the 3s interaction clock, and a slow on_load would expire the
+            # interaction before Stage 5 acks. Arming after on_pre_send keeps
+            # that hook's documented open response slot (an override may respond
+            # raw); a component-callback send is already covered by
+            # _scheduled_task's timer. The finally below stands it down on
+            # every exit.
+            if (
+                self.auto_defer
+                and self.interaction is not None
+                and not self.interaction.response.is_done()
+            ):
+                send_defer_task = asyncio.create_task(self._send_defer_timer(ephemeral))
 
-            # Seed hook fires after registration so the view exists in
-            # state, but inside the batch so any seeding dispatches join
-            # the same BATCH_COMPLETE notification. Subscribers see the
-            # seeded slot from frame one. Default is a no-op.
-            await self.seed_initial_state(self.state_store.state)
+            # -- Stage 0a: async preload --
+            # on_load() is the public hook where a view fetches from a
+            # database or other async source and builds its tree against the
+            # result. It runs before placement validation and the Discord
+            # send so the first render reflects loaded data, not the
+            # synchronous-__init__ placeholder. Default is a no-op, so views
+            # without async preload pay nothing. Matches where the built-in
+            # pattern overrides (leaderboard, paginated cursor mode) already
+            # preload -- before the tree is validated and shipped.
+            await self._run_on_load()
 
-            if type(self).auto_register_participants:
-                if not await self._auto_register_participants():
-                    self.stop()
-                    self.task_manager.cancel_tasks(self.id)
-                    self.state_store._unsubscribe(self.id)
-                    self.state_store._undo_enabled_views.pop(self.id, None)
-                    await self.state_store._destroy_view(self.id, source_id=self.id)
-                    return None
+            # -- Stage 1: instance enforcement --
+            try:
+                await self._enforce_instance_limit()
+            except InstanceLimitError as e:
+                await self.on_instance_limit(e)
+                self.stop()
+                self.state_store._unsubscribe(self.id)
+                self.state_store._undo_enabled_views.pop(self.id, None)
+                return None
 
-        # -- Stage 4: ephemeral refresh-handoff derivation --
-        # auto_refresh_ephemeral is Optional[bool]. None means "derive
-        # from the declared timeout"; explicit True or False overrides
-        # the derivation. The declared timeout is the sole source of
-        # truth for longevity -- the library never rewrites it. The
-        # 900s threshold is the webhook token cliff: any view that
-        # wants to live past it needs the handoff, anything inside it
-        # does not.
-        if ephemeral:
-            self._ephemeral = True
-            if self.auto_refresh_ephemeral is None:
+            # -- Stage 2+3: state registration and participant claiming --
+            # Batched so SESSION_CREATED + VIEW_CREATED collapse into one
+            # BATCH_COMPLETE. On participant-rejection rollback, the queued
+            # VIEW_DESTROYED joins the same batch and the whole self-cancelling
+            # sequence fires as a single notification -- subscribers never see
+            # a transient "view exists" state. ``source_id`` threads this view
+            # through so its initial ``on_state_changed`` awaits inline and the
+            # first render lands flush with the send response.
+            async with self.state_store.batch(source_id=self.id):
+                self.state_store._register_view(self)
+                await self._register_state()
+
+                # Seed hook fires after registration so the view exists in
+                # state, but inside the batch so any seeding dispatches join
+                # the same BATCH_COMPLETE notification. Subscribers see the
+                # seeded slot from frame one. Default is a no-op.
+                await self.seed_initial_state(self.state_store.state)
+
+                if type(self).auto_register_participants:
+                    if not await self._auto_register_participants():
+                        self.stop()
+                        self.task_manager.cancel_tasks(self.id)
+                        self.state_store._unsubscribe(self.id)
+                        self.state_store._undo_enabled_views.pop(self.id, None)
+                        await self.state_store._destroy_view(self.id, source_id=self.id)
+                        return None
+
+            # -- Stage 4: ephemeral refresh-handoff derivation --
+            # auto_refresh_ephemeral is Optional[bool]. None means "derive
+            # from the declared timeout"; explicit True or False overrides
+            # the derivation. The declared timeout is the sole source of
+            # truth for longevity -- the library never rewrites it. The
+            # 900s threshold is the webhook token cliff: any view that
+            # wants to live past it needs the handoff, anything inside it
+            # does not.
+            # _ephemeral tracks the current send unconditionally, so an instance
+            # reused for a non-ephemeral send (a replace() destination that
+            # inherited a stale True) does not keep the flag set. The handoff
+            # derivation runs only for an ephemeral send: a public send has no
+            # webhook cliff to outlive.
+            self._ephemeral = ephemeral
+            if ephemeral and self.auto_refresh_ephemeral is None:
                 if self.timeout is None or self.timeout > 900:
                     self.auto_refresh_ephemeral = True
                 else:
                     self.auto_refresh_ephemeral = False
+        finally:
+            # Pre-send stages are done (or bailed). If the work overran, the
+            # timer already fired and Stage 5 routes through followup; otherwise
+            # cancel it before it fires.
+            if send_defer_task is not None and not send_defer_task.done():
+                send_defer_task.cancel()
 
         # -- Stage 5: Discord send --
         # Capture any caller-supplied attachments before the send so the
@@ -1230,8 +1298,18 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             elif self.interaction:
                 send_kwargs["ephemeral"] = ephemeral
                 if not self.interaction.response.is_done():
-                    await self.interaction.response.send_message(**send_kwargs)
-                    message = await self.interaction.original_response()
+                    try:
+                        await self.interaction.response.send_message(**send_kwargs)
+                    except discord.HTTPException as e:
+                        # 40060: a cancelled send-scoped defer (N3) landed
+                        # server-side in the narrow ack-window race, acking the
+                        # slot after the is_done() check returned False. Ship via
+                        # followup instead of rolling the send back.
+                        if getattr(e, "code", None) != 40060:
+                            raise
+                        message = await self.interaction.followup.send(**send_kwargs, wait=True)
+                    else:
+                        message = await self.interaction.original_response()
                 else:
                     message = await self.interaction.followup.send(**send_kwargs, wait=True)
 
@@ -1736,16 +1814,24 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             # dedicated branch.
         return hash(tuple(parts))
 
-    def _freeze_components(self):
+    def _freeze_components(self) -> int:
         """Disable all interactive components in this view.
 
         V2 LayoutViews nest buttons inside ActionRow/Container, so the
         full tree is walked to reach them. V1 Views have flat children.
+
+        Returns the count of components newly disabled. A component-less
+        display view (a card of text and images) freezes nothing, so
+        callers skip the cosmetic edit rather than ship a no-op PATCH that
+        only re-sends an identical tree.
         """
         items = self.walk_children() if self._is_layout() else self.children
+        frozen = 0
         for item in items:
-            if hasattr(item, "disabled"):
+            if hasattr(item, "disabled") and not item.disabled:
                 item.disabled = True
+                frozen += 1
+        return frozen
 
     async def on_timeout(self) -> None:
         """Called when the view times out. Disables all components and cleans up state."""
@@ -1762,8 +1848,10 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         self.state_store._undo_enabled_views.pop(self.id, None)
         await self.state_store._destroy_view(self.id, source_id=self.id)
 
-        if self._message:
-            self._freeze_components()
+        # Skip the edit when the freeze changed nothing: a component-less
+        # display view (or one already fully disabled) would otherwise ship a
+        # no-op PATCH that re-sends an identical tree on every timeout.
+        if self._message and self._freeze_components():
             try:
                 await self._bounded(self._message.edit(view=self))
             except discord.NotFound:
@@ -1865,7 +1953,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         async with self._update_lock:
             while True:
                 self._update_pending = False
-                await self.on_state_changed(self.state_store.state)
+                await self._run_state_changed(self.state_store.state)
                 if not self._update_pending:
                     break
 
@@ -2062,6 +2150,43 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     f"render path -- resolve from cache or batch fetches into one round-trip."
                 )
 
+    async def _run_state_changed(self, state) -> None:
+        """Run ``on_state_changed()``, warning once per class if it overruns budget.
+
+        A reactive rebuild seam (a live board rebuilding on a state change)
+        competes with the interaction ack the same way ``on_load`` does, but its
+        duration is otherwise only sampled under DevTools perf profiling, so a
+        production board renders through no surfaced timing. This warns at the
+        always-on seam when an OVERRIDE overruns ``auto_defer_delay``. The
+        default ``on_state_changed`` (build_ui + refresh) is not timed here --
+        its cost is the user's build_ui plus the message edit, neither of which
+        this coarse budget cleanly isolates.
+
+        The budget is an acknowledgement deadline, so the timing runs only while
+        an interaction is in flight. A rebuild driven by a timeout or an
+        out-of-band dispatch races no ack, and its elapsed time is dominated by
+        the message edit rather than by the rebuild.
+        """
+        if (
+            type(self).on_state_changed is _StatefulMixin.on_state_changed
+            or _CURRENT_INTERACTION.get() is None
+        ):
+            await self.on_state_changed(state)
+            return
+        start = time.monotonic()
+        await self.on_state_changed(state)
+        elapsed = time.monotonic() - start
+        if elapsed > self.auto_defer_delay:
+            cls_name = type(self).__name__
+            if cls_name not in _slow_render_warned:
+                _slow_render_warned.add(cls_name)
+                logger.warning(
+                    f"{cls_name}.on_state_changed() took {elapsed:.1f}s, over "
+                    f"auto_defer_delay ({self.auto_defer_delay}s). A slow reactive "
+                    f"rebuild competes with interaction acks. Keep HTTP off the "
+                    f"render path -- resolve from cache or batch fetches."
+                )
+
     async def seed_initial_state(self, state):
         """Initialize per-view state slots before the first subscriber notification.
 
@@ -2151,6 +2276,17 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             self._queue_deferred_refresh(wait)
             return
         await self._run_on_load()
+        await self._reload_render()
+
+    async def _reload_render(self) -> None:
+        """Render step of :meth:`reload`, after ``on_load`` runs.
+
+        The base ships a bare ``refresh()``, which is correct for V2 views
+        whose ``on_load`` rebuilds the component tree that ``refresh()`` then
+        ships. A V1 pattern whose content is an embed overrides this to route
+        through its embed-carrying render, so ``reload()`` updates the embed
+        instead of shipping an edit with no kwargs.
+        """
         await self.refresh()
 
     async def refresh(self, **kwargs) -> None:
@@ -2657,7 +2793,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 self._pending_reload_kwargs = {}
                 await self.reload(**kwargs)
             else:
-                await self.on_state_changed(self.state_store.state)
+                await self._run_state_changed(self.state_store.state)
         finally:
             # Only disown the slot if it still points at this task. The render
             # above can be rate-limited, and that path schedules a successor
@@ -2996,6 +3132,14 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         view_type = self._instance_root_class or type(self)._class_session_key()
         display_type = type(self).__name__
         existing = self.state_store._get_active_views(view_type, scope_key)
+        # Exclude the view this send is replacing: an ephemeral reopen swaps a
+        # fresh instance in for the dying one, so counting the still-registered
+        # old instance would trigger a self-replace that exits it mid-send --
+        # and the post-send identity carries (children, undo, session) would
+        # then find it already gone.
+        replacing_id = getattr(self, "_replacing_view_id", None)
+        if replacing_id is not None:
+            existing = [v for v in existing if v.id != replacing_id]
         overflow = len(existing) - self.instance_limit + 1
 
         if overflow <= 0:
@@ -3231,6 +3375,13 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         the existing components in place, ``"delete"`` removes the
         message. Pass an explicit ``True`` or ``False`` to override
         the policy entirely.
+
+        This is the teardown seam for a live view, not discord.py's
+        ``stop()``: ``stop()`` only cancels the timeout task and leaves
+        the view registered in the active-view registry, so a view stopped
+        without ``exit()`` (or a natural timeout) leaks that entry. A static
+        display view freezes nothing, so ``exit(delete_message=False)`` tears
+        down its state without a cosmetic message edit.
         """
         if delete_message is None:
             delete_message = self.exit_policy == "delete"
@@ -3264,9 +3415,12 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     await self._bounded(self._message.delete())
                 elif self._is_layout():
                     # V2 messages ARE their components -- edit(view=None) would
-                    # produce an empty message (error 50006).  Freeze instead.
-                    self._freeze_components()
-                    await self._bounded(self._message.edit(view=self))
+                    # produce an empty message (error 50006).  Freeze instead,
+                    # and skip the edit when nothing froze: a component-less
+                    # display view only re-sends an identical tree, so exit
+                    # tears down state and leaves the message untouched.
+                    if self._freeze_components():
+                        await self._bounded(self._message.edit(view=self))
                 else:
                     await self._bounded(self._message.edit(view=None))
             except discord.NotFound:

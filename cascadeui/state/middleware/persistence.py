@@ -295,7 +295,8 @@ class PersistenceMiddleware:
            view's ``on_message_delete`` hook.
         6. Stash the manager on the store for later prune, slot-policy
            registration, and shutdown.
-        7. Reattach persistent views (when ``bot`` is available).
+        7. Reattach persistent views and register dynamic items (when
+           ``bot`` is available).
         """
         if self._initialized:
             return
@@ -332,17 +333,10 @@ class PersistenceMiddleware:
         manager._start_ttl_sweeper()
 
         if bot is not None:
+            # The reattach pass also registers every DynamicPersistentButton
+            # subclass with the bot, so dispatch-time click routing needs no
+            # separate wiring here.
             await manager.reattach_persistent_views()
-
-            # Register every DynamicPersistentButton subclass with the
-            # bot so discord.py can route dispatch-time clicks by
-            # ``custom_id`` template match. Lazy import avoids a cycle
-            # with components/base.py through the state -> middleware
-            # chain.
-            from ...components.base import _dynamic_button_classes
-
-            if _dynamic_button_classes:
-                bot.add_dynamic_items(*_dynamic_button_classes.values())
         else:
             # Warn loudly when the bot is absent but PersistentView
             # subclasses are registered. Without a bot, those views

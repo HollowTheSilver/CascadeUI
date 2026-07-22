@@ -198,7 +198,9 @@ async def reload_feature(self):
 `reattach()` is idempotent: panels already attached on a prior pass are
 skipped (no re-fetch, no double registration), and transiently `unreachable` /
 `failed` rows are retried. It returns the same five-bucket summary as
-`reattach_persistent_views()`, covering only the rows it processed.
+`reattach_persistent_views()`, covering only the rows it processed. Each pass
+also re-registers every `DynamicPersistentButton` subclass with the bot, so a
+dynamic button defined in the late-loaded cog routes clicks too.
 
 ## Backends
 
@@ -982,11 +984,13 @@ class RoleToggleButton(
             await member.add_roles(role)
 ```
 
-Subclasses auto-register at class-definition time. The same
-`await setup_middleware(PersistenceMiddleware(..., bot=bot))` call
-that reattaches `PersistentView` instances also calls
-`bot.add_dynamic_items(*subclasses)` so every `DynamicPersistentButton`
-routes correctly after a restart. No separate wiring step.
+Subclasses auto-register at class-definition time. The reattach pass
+inside `await setup_middleware(PersistenceMiddleware(..., bot=bot))`
+calls `bot.add_dynamic_items(*subclasses)` so every
+`DynamicPersistentButton` routes correctly after a restart. No separate
+wiring step. A subclass imported after that pass (a cog loaded later)
+is wired in by the same `reattach()` re-drive that recovers
+late-imported view classes.
 
 Named capture groups in the template are passed as keyword arguments to
 `__init__` by the default `from_custom_id`. Captures named `user_id`,
