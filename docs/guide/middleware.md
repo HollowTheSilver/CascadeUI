@@ -46,13 +46,13 @@ async def block_spam(action, state, next_fn):
 The canonical install path is `setup_middleware`, which routes every middleware through a uniform install + `async initialize(store)` pipeline. Call it once from the bot author's `setup_hook`:
 
 ```python
-from cascadeui import setup_middleware
-from cascadeui.persistence import SQLiteBackend
-from cascadeui.state.middleware import (
+from cascadeui import (
     LoggingMiddleware,
     PersistenceMiddleware,
     UndoMiddleware,
+    setup_middleware,
 )
+from cascadeui.persistence import SQLiteBackend
 
 class MyBot(commands.Bot):
     async def setup_hook(self):
@@ -75,7 +75,7 @@ class MyBot(commands.Bot):
 Logs every dispatched action at INFO level:
 
 ```python
-from cascadeui.state.middleware import LoggingMiddleware
+from cascadeui import LoggingMiddleware
 
 await setup_middleware(LoggingMiddleware())
 ```
@@ -95,8 +95,7 @@ The middleware uses a state identity check to skip actions that don't mutate sta
 Captures state snapshots for views with `enable_undo = True`. Install once during setup:
 
 ```python
-from cascadeui import setup_middleware
-from cascadeui.state.middleware import UndoMiddleware
+from cascadeui import UndoMiddleware, setup_middleware
 
 await setup_middleware(UndoMiddleware())
 ```

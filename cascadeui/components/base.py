@@ -12,6 +12,7 @@ from discord.ui import Item
 from ..state.actions import ActionCreators
 from ..state.store import _CURRENT_INTERACTION
 from ..utils.coercion import coerce_snowflake_match
+from ..utils.responses import ack_backstop, open_modal_safe, respond_safe, trailing_ack
 from .types import MAX_SELECT_OPTIONS
 
 logger = logging.getLogger(__name__)
@@ -418,14 +419,9 @@ class DynamicPersistentButton(
         ``on_click``, not after, because a trailing defer fires too late to beat
         the wall when the pre-response work is itself the slow part.
         """
-        try:
-            await asyncio.sleep(self.auto_defer_delay)
-            if not interaction.response.is_done():
-                await interaction.response.defer()
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.debug(f"Auto-defer failed for dynamic item {self.__class__.__name__}")
+        await ack_backstop(
+            interaction, self.auto_defer_delay, owner=self.__class__.__name__, log=logger
+        )
 
     async def callback(self, interaction):
         """Dispatch to :meth:`on_click`, binding ``_CURRENT_INTERACTION``.
@@ -450,25 +446,7 @@ class DynamicPersistentButton(
             _CURRENT_INTERACTION.reset(token)
             if not defer_task.done():
                 defer_task.cancel()
-            if not interaction.response.is_done():
-                try:
-                    await interaction.response.defer()
-                except discord.HTTPException as e:
-                    if getattr(e, "code", None) == 40060:
-                        logger.debug(
-                            f"Post-callback defer raced an existing ack in "
-                            f"{self.__class__.__name__} (40060)"
-                        )
-                    else:
-                        logger.warning(
-                            f"Post-callback defer failed in {self.__class__.__name__}: "
-                            f"status={getattr(e, 'status', '?')} code={getattr(e, 'code', '?')}"
-                        )
-                except Exception:
-                    logger.debug(
-                        f"Post-callback defer failed in {self.__class__.__name__} "
-                        f"(interaction may have expired)"
-                    )
+            await trailing_ack(interaction, owner=self.__class__.__name__, log=logger)
 
     async def respond(
         self,
@@ -488,10 +466,24 @@ class DynamicPersistentButton(
         The dynamic-item path has no view instance, so this mirrors
         ``_StatefulMixin.respond`` on the button itself.
         """
-        if not interaction.response.is_done():
-            await interaction.response.send_message(content, ephemeral=ephemeral, **kwargs)
-        else:
-            await interaction.followup.send(content, ephemeral=ephemeral, **kwargs)
+        await respond_safe(interaction, content, ephemeral=ephemeral, **kwargs)
+
+    async def open_modal(
+        self,
+        interaction,
+        modal: discord.ui.Modal,
+        *,
+        fallback_message: Optional[str] = None,
+    ) -> bool:
+        """Open a modal, with a fallback if the response slot is consumed.
+
+        The sibling of :meth:`respond` for the one response type that cannot
+        follow a defer. ``callback`` arms an auto-defer timer before
+        ``on_click`` runs, so a bare ``interaction.response.send_modal``
+        raises once that timer has acked; this routes to an ephemeral
+        fallback instead. Returns ``True`` when the modal opened.
+        """
+        return await open_modal_safe(interaction, modal, fallback_message=fallback_message)
 
     async def on_click(self, interaction) -> None:
         """Handle the click. Default: no-op.

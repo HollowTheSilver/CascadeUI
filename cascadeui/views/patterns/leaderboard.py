@@ -5,9 +5,9 @@ import asyncio
 from typing import ClassVar, Dict, List, Optional, Tuple, Union
 
 import discord
-from discord.ui import Container, Item, Section, TextDisplay, Thumbnail
+from discord.ui import Container, Item, TextDisplay
 
-from ...components.patterns.v2 import card, divider, gallery, gap
+from ...components.patterns.v2 import card, divider, gallery, gap, image_section
 from ...components.types import MediaInput
 from ..base import _StatefulMixin
 from ..persistent import _PersistentMixin
@@ -80,6 +80,13 @@ class _BaseLeaderboardMixin:
     (``LeaderboardLayoutView`` / ``PersistentLeaderboardLayoutView``)
     is unchanged.
     """
+
+    # Entries without a ``display_name`` render as ``<@id>`` mentions, so
+    # a stock leaderboard would notify every ranked player on the initial
+    # send and again on every settlement refresh. The rows still render as
+    # mention links; they just stop pinging. Override with a permissive
+    # AllowedMentions on a board that genuinely wants to notify.
+    allowed_mentions = discord.AllowedMentions.none()
 
     # Total entries to consider from the data source
     leaderboard_top_n: int = 10
@@ -615,18 +622,15 @@ class _BaseLeaderboardMixin:
                     secondary = self.format_secondary(rank, uid, stats)
                     avatar = avatar_urls[start + offset]
                     if avatar:
-                        items.append(
-                            Section(
-                                TextDisplay(primary),
-                                TextDisplay(secondary),
-                                accessory=Thumbnail(media=avatar),
-                            )
-                        )
+                        items.append(image_section(primary, secondary, url=avatar))
                     else:
                         # Section requires a non-None accessory. When no avatar
-                        # resolves for an entry, collapse to a stacked two-line
-                        # TextDisplay so the entry still renders cleanly.
-                        items.append(TextDisplay(f"{primary}\n{secondary}"))
+                        # resolves for an entry, collapse to a stacked
+                        # TextDisplay so the entry still renders cleanly. An
+                        # empty half is dropped rather than joined, matching
+                        # how image_section handles the same case above.
+                        stacked = "\n".join(part for part in (primary, secondary) if part)
+                        items.append(TextDisplay(stacked))
             else:
                 lines = [
                     self.format_entry(start + offset + 1, uid, stats)

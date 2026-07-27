@@ -171,6 +171,26 @@ class ChannelSelect(discord.ui.ChannelSelect, StatefulComponent):
     CascadeUI coerces each entry to the discord.py shape, wrapping
     bare IDs/Snowflakes with ``type="channel"`` automatically. Use
     :meth:`set_default_values` to update defaults after construction.
+
+    **The callback receives partial channels, not full ones.** Where
+    :class:`RoleSelect` and :class:`UserSelect` hand back complete
+    ``Role`` and ``Member`` objects, this select yields discord.py's
+    ``AppCommandChannel`` / ``AppCommandThread`` -- ``__slots__`` partials
+    carrying only what the interaction payload resolved. They have no
+    ``permissions_for()``, so a bot-permission check written against a
+    full channel raises ``AttributeError`` on the first pick.
+
+    ``.permissions`` is present but answers a different question: it is
+    the *invoking user's* permissions in that channel, not the bot's. An
+    admin checking it for send access gets their own allow, which is the
+    case a bot-permission guard exists to refuse. Call ``.resolve()`` for
+    the cached full channel, or ``await .fetch()`` when the cache may
+    miss, then check permissions on the result::
+
+        async def on_pick(interaction, values):
+            channel = values[0].resolve() or await values[0].fetch()
+            if not channel.permissions_for(interaction.guild.me).send_messages:
+                ...
     """
 
     _DEFAULT_VALUE_TYPE = "channel"

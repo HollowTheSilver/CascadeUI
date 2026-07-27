@@ -59,6 +59,12 @@ from cascadeui import (
     key_value,
 )
 
+# Named escapes live out here rather than inline: a backslash inside the
+# expression part of an f-string is a SyntaxError before Python 3.12, and this
+# module has to import on every version the library supports.
+_DONE_BOX = "\N{WHITE HEAVY CHECK MARK}"
+_TODO_BOX = "\N{WHITE LARGE SQUARE}"
+
 # // ========================================( Repository )======================================== // #
 
 
@@ -156,7 +162,7 @@ class TaskListView(StatefulLayoutView):
             self.tasks_pager.items = tasks
             sections = [
                 action_section(
-                    f"{'\N{WHITE HEAVY CHECK MARK}' if task['done'] else '\N{WHITE LARGE SQUARE}'} **{task['title']}**",
+                    f"{_DONE_BOX if task['done'] else _TODO_BOX} **{task['title']}**",
                     label="Open",
                     callback=self._make_open(task_id),
                 )
@@ -210,6 +216,11 @@ class TaskListView(StatefulLayoutView):
             # reload() = on_load() + refresh(): re-read the repo and re-render
             # this view so the new task appears immediately.
             await self.reload()
+            # The new row lands last, which is off-screen for anyone not
+            # already on the final page: reload() re-reads the data but
+            # never moves the cursor. show_page() is the region's
+            # jump-and-rerender, so the user sees what they just created.
+            await self.tasks_pager.show_page(self.tasks_pager.page_count - 1)
 
         await self.open_modal(
             interaction,

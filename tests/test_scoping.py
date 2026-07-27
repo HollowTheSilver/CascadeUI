@@ -1,10 +1,14 @@
 """Tests for scoped state across all four scope values."""
 
+from unittest.mock import MagicMock
+
 import pytest
+from helpers import make_interaction as _make_interaction
 
 from cascadeui import StateStore
 from cascadeui.state.singleton import get_store
 from cascadeui.state.slots import read_slot
+from cascadeui.views.layout import StatefulLayoutView
 
 # // ========================================( Store-level round-trip )======================================== // #
 
@@ -1113,3 +1117,54 @@ class TestMergeScoped:
         StateStore.merge_scoped(state, "user", {"a": 1}, subkey="stats", user_id=1)
         StateStore.merge_scoped(state, "user", {"b": 2}, subkey="stats", user_id=1)
         assert state["application"]["scoped"]["user:1"]["stats"] == {"a": 1, "b": 2}
+
+
+class TestScopeKeyFalsyIdentifiers:
+    """``0`` is a value, not an absent id, on the scoped-state path.
+
+    The two scope-key callers want different answers for a falsy id. The
+    scoped-state writer must not drop a write for ``user_id=0`` (a
+    sentinel account, a DM standing in for a guild); the instance index
+    treats the same value as no id, because an unindexed view is exempt
+    from the limit while a ``"user:0"`` bucket would pool every such view
+    together.
+    """
+
+    def test_strict_builder_accepts_falsy_ids(self):
+        assert StateStore._build_scope_key("user", user_id=0) == "user:0"
+        assert StateStore._build_scope_key("guild", guild_id=0) == "guild:0"
+        assert StateStore._build_scope_key("user_guild", user_id=0, guild_id=0) == (
+            "user_guild:0:0"
+        )
+
+    def test_strict_builder_still_rejects_absent_ids(self):
+        with pytest.raises(ValueError, match="user_id is required"):
+            StateStore._build_scope_key("user")
+        with pytest.raises(ValueError, match="guild_id is required"):
+            StateStore._build_scope_key("guild")
+
+    def test_scope_key_distinguishes_zero_from_none(self):
+        assert StateStore.scope_key("user", user_id=0) == "user:0"
+        assert StateStore.scope_key("user", user_id=None) is None
+
+    def test_instance_index_treats_falsy_as_absent(self):
+        """The lenient caller normalizes before delegating, so an unindexed
+        view stays exempt rather than sharing a "user:0" bucket.
+        """
+        view = MagicMock()
+        view.instance_scope = "user"
+        view.user_id = 0
+        view.guild_id = None
+        assert StateStore._build_instance_scope_key(view) is None
+
+    async def test_zero_user_id_write_is_not_dropped(self):
+        """The end-to-end symptom: a scoped write from a view whose id is 0."""
+        store = get_store()
+
+        class _Scoped(StatefulLayoutView):
+            state_scope = "user"
+
+        view = _Scoped(interaction=_make_interaction(), user_id=0, guild_id=1)
+        await view.dispatch_scoped({"seen": True})
+
+        assert store.get_scoped("user", user_id=0) == {"seen": True}

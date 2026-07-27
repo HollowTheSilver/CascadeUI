@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 import pytest
+from helpers import RenderableLayoutView
 
 from cascadeui.components.base import StatefulButton, StatefulComponent, StatefulSelect
 from cascadeui.components.v1_composition import (
@@ -344,3 +345,154 @@ class TestButtonOwnerOnly:
 
         assert btn_default._button_owner_only is False
         assert btn_owner._button_owner_only is True
+
+
+class TestBuilderCustomIdAndDisabled:
+    """Interactive builders expose custom_id so persistent panels can use them.
+
+    Without it, every builder-produced button carries an auto id anchored
+    on the view instance, which changes on every restart.
+    """
+
+    @staticmethod
+    async def _cb(interaction):
+        pass
+
+    def test_button_row_suffixes_per_button(self):
+        from cascadeui.components.patterns.v2 import button_row
+
+        row = button_row({"Yes": self._cb, "No": self._cb}, custom_id="vote")
+        assert [b.custom_id for b in row.children] == ["vote_0", "vote_1"]
+
+    def test_button_row_without_custom_id_is_unchanged(self):
+        from cascadeui.components.patterns.v2 import button_row
+
+        row = button_row({"Yes": self._cb})
+        assert row.children[0]._provided_custom_id is False
+
+    def test_confirm_section_names_each_half(self):
+        from cascadeui.components.patterns.v2 import confirm_section
+
+        _, row = confirm_section("Sure?", on_confirm=self._cb, on_cancel=self._cb, custom_id="wipe")
+        assert [b.custom_id for b in row.children] == ["wipe_confirm", "wipe_cancel"]
+
+    def test_tab_nav_suffixes_per_tab(self):
+        from cascadeui.components.patterns.v2 import tab_nav
+
+        row = tab_nav({"A": self._cb, "B": self._cb}, custom_id="tab")
+        assert [b.custom_id for b in row.children] == ["tab_0", "tab_1"]
+
+    def test_cycle_and_toggle_buttons_take_custom_id(self):
+        from cascadeui.components.patterns.v2 import cycle_button, toggle_button
+
+        cycler = cycle_button(values=["a", "b"], on_change=self._cb, custom_id="preset")
+        toggler = toggle_button(active=True, on_toggle=self._cb, custom_id="dark")
+        assert cycler.custom_id == "preset"
+        assert toggler.custom_id == "dark"
+
+    def test_link_section_takes_disabled_like_its_siblings(self):
+        from cascadeui.components.patterns.v2 import link_section
+
+        section = link_section("Docs", label="Open", url="https://x.dev", disabled=True)
+        assert section.accessory.disabled is True
+
+    def test_image_section_renders_multiple_text_lines(self):
+        from cascadeui.components.patterns.v2 import image_section
+
+        section = image_section("Ada", "12W / 20G", url="https://x.dev/a.png")
+        assert [c.content for c in section.children] == ["Ada", "12W / 20G"]
+
+    def test_image_section_rejects_a_fourth_line(self):
+        from cascadeui.components.patterns.v2 import image_section
+
+        with pytest.raises(ValueError, match="3-children-per-Section"):
+            image_section("a", "b", "c", "d", url="https://x.dev/a.png")
+
+    def test_gallery_takes_per_item_spoilers(self):
+        from cascadeui.components.patterns.v2 import gallery
+
+        g = gallery("https://x.dev/1.png", "https://x.dev/2.png", spoilers=[True, False])
+        assert [i.spoiler for i in g.items] == [True, False]
+
+    def test_gallery_spoilers_length_must_match(self):
+        from cascadeui.components.patterns.v2 import gallery
+
+        with pytest.raises(ValueError, match="spoilers length"):
+            gallery("https://x.dev/1.png", spoilers=[True, False])
+
+    def test_stats_card_takes_spoiler_like_card(self):
+        from cascadeui.components.patterns.v2 import stats_card
+
+        assert stats_card("Title", {"a": 1}, spoiler=True).spoiler is True
+
+
+class TestComposedCustomIdLength:
+    """The builders concatenate, so the composed length is theirs to answer for.
+
+    A base well inside Discord's 100-char cap can be pushed past it by a
+    suffix the caller never sees, and discord.py stores custom_id
+    unchecked, so it would surface as an HTTP 400 naming no component.
+    """
+
+    @staticmethod
+    async def _cb(interaction):
+        pass
+
+    def test_confirm_section_rejects_an_overlong_composition(self):
+        from cascadeui.components.patterns.v2 import confirm_section
+
+        with pytest.raises(ValueError, match="over Discord's 100-character cap"):
+            confirm_section("Sure?", on_confirm=self._cb, on_cancel=self._cb, custom_id="x" * 95)
+
+    def test_button_row_boundary_is_exactly_100(self):
+        from cascadeui.components.patterns.v2 import button_row
+
+        row = button_row({"A": self._cb}, custom_id="x" * 98)
+        assert len(row.children[0].custom_id) == 100
+
+        with pytest.raises(ValueError, match="100-character cap"):
+            button_row({"A": self._cb}, custom_id="x" * 99)
+
+    def test_error_names_the_shortening_target(self):
+        from cascadeui.components.patterns.v2 import tab_nav
+
+        with pytest.raises(ValueError, match="at most 98 characters"):
+            tab_nav({"A": self._cb}, custom_id="x" * 99)
+
+
+class TestImageSectionEmptyLines:
+    """An empty line is dropped rather than rendered.
+
+    Discord rejects a text display with empty content and fails the whole
+    message, so a formatter returning "" for one entry would otherwise
+    take down every component beside it.
+    """
+
+    def test_empty_secondary_is_dropped(self):
+        from cascadeui.components.patterns.v2 import image_section
+
+        section = image_section("Ada", "", url="https://x.dev/a.png")
+        assert [c.content for c in section.children] == ["Ada"]
+
+    def test_empty_middle_line_is_dropped(self):
+        from cascadeui.components.patterns.v2 import image_section
+
+        section = image_section("Ada", "", "12W", url="https://x.dev/a.png")
+        assert [c.content for c in section.children] == ["Ada", "12W"]
+
+    def test_all_lines_empty_raises(self):
+        from cascadeui.components.patterns.v2 import image_section
+
+        with pytest.raises(ValueError, match="at least one non-empty text line"):
+            image_section("", "", url="https://x.dev/a.png")
+
+    def test_a_dropped_line_still_leaves_a_valid_section(self):
+        """A Section with one text child and an accessory is legal, which is
+        why dropping beats raising here.
+        """
+        from cascadeui.components.patterns.v2 import image_section
+        from cascadeui.views._placement import validate_placement
+
+        view = RenderableLayoutView()
+        view.add_item(image_section("Ada", "", url="https://x.dev/a.png"))
+        validate_placement(view)

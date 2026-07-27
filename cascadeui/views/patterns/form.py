@@ -27,6 +27,11 @@ logger = logging.getLogger(__name__)
 # at definition time rather than on first click.
 MAX_TEXT_FIELDS = 5
 
+# Discord's modal-title cap. The grouped edit label doubles as the modal
+# title, so the tighter of its two caps (title 45, button label 80) is the
+# one that governs it.
+_MODAL_TITLE_MAX = 45
+
 # Escaped asterisk for required-field markers in TextDisplay and embed
 # field names. Unescaped ``*`` in Discord markdown triggers italics when
 # multiple markers appear on adjacent lines.
@@ -90,7 +95,14 @@ def _resolve_modal_edit_label(override: Optional[str], modal_fields: List[Dict[s
         return override
     if len(modal_fields) == 1:
         only = modal_fields[0]
-        return f"Edit {only.get('label', only.get('id'))}"
+        singular = f"Edit {only.get('label', only.get('id'))}"
+        # Doubles as the modal title, which Discord caps at 45. A long
+        # field label would otherwise compose a title the caller never
+        # typed and cannot see, so fall back to the generic form rather
+        # than failing the modal open.
+        if len(singular) <= _MODAL_TITLE_MAX:
+            return singular
+        return "Edit Fields"
     if all(f.get("type") == "text" for f in modal_fields):
         return "Edit Text Fields"
     return "Edit Fields"
@@ -324,6 +336,14 @@ class _BaseFormMixin:
     _BUTTON_STYLE_ATTRS: ClassVar[tuple] = (
         *_StatefulMixin._BUTTON_STYLE_ATTRS,
         "text_edit_button_style",
+    )
+    _STR_OR_NONE_ATTRS: ClassVar[tuple] = (
+        *_StatefulMixin._STR_OR_NONE_ATTRS,
+        "text_edit_button_label",
+    )
+    _EMOJI_ATTRS: ClassVar[tuple] = (
+        *_StatefulMixin._EMOJI_ATTRS,
+        "text_edit_button_emoji",
     )
     _POSITIVE_NUMBER_ATTRS: ClassVar[tuple] = (
         *_StatefulMixin._POSITIVE_NUMBER_ATTRS,
@@ -931,10 +951,7 @@ class FormView(_BaseFormMixin, StatefulView):
         content: Optional[str] = None,
         *,
         embed: Optional[discord.Embed] = None,
-        embeds: Optional[List[discord.Embed]] = None,
-        file: Optional[discord.File] = None,
-        files: Optional[List[discord.File]] = None,
-        ephemeral: bool = False,
+        **kwargs,
     ):
         """Send the view, using the form's own embed when none is given.
 
@@ -948,10 +965,7 @@ class FormView(_BaseFormMixin, StatefulView):
         return await super().send(
             content=content,
             embed=embed,
-            embeds=embeds,
-            file=file,
-            files=files,
-            ephemeral=ephemeral,
+            **kwargs,
         )
 
     nav_rebuild = staticmethod(lambda v: v._nav_edit_kwargs())

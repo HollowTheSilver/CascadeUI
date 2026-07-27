@@ -171,7 +171,6 @@ class PollView(StatefulLayoutView):
     exit_policy = "delete"
     auto_defer = True
     serialize_interactions = True
-    auto_refresh_ephemeral = False
 
     # Subscribe to POLL_VOTE so the view rebuilds when anyone votes.
     # The default ``on_state_changed()`` calls ``build_ui()`` then

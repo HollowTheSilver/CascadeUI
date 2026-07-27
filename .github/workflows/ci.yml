@@ -23,6 +23,10 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[dev,sqlite]"
       - run: pytest tests/ -v
+      # examples/ is outside `testpaths`, so nothing else in CI parses it.
+      # A syntax error legal on one interpreter and not another (a backslash
+      # in an f-string expression before 3.12) otherwise reaches a release.
+      - run: python -m compileall -q examples/
 
   # PostgresBackend needs asyncpg (the `postgres` extra) and a Docker
   # daemon for the testcontainers fixture, so the matrix above skips it.
@@ -50,3 +54,16 @@ jobs:
       - run: pip install "black>=26.3" "isort>=8.0"
       - run: black --check --line-length 100 cascadeui/
       - run: isort --check --profile black --line-length 100 cascadeui/
+
+  # The deploy workflow builds the site, but only on push to main -- after a
+  # merge, and never on a pull request. Gating the strict build here means a
+  # broken nav entry or dead cross-reference fails review rather than deploy.
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install ".[docs]"
+      - run: mkdocs build --strict

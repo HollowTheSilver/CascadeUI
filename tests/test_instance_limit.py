@@ -1487,3 +1487,34 @@ class TestParticipantsProperty:
         copy = view.participants
         # frozenset is immutable, but verify the internal set is untouched
         assert view.participants == frozenset({111})
+
+
+class TestInstanceLimitRaiseRollsBack:
+    """A raising ``on_instance_limit`` override must not leak the view.
+
+    Raising from the override is a documented shape (the default hook
+    re-raises when there is no interaction to answer on), so the rollback
+    belongs in a finally. Without it the rejected view stays subscribed
+    and never stopped, which is permanent under ``timeout=None``.
+    """
+
+    async def test_raising_override_still_tears_down(self):
+        store = get_store()
+
+        class _Limited(StatefulView):
+            instance_limit = 1
+            instance_policy = "reject"
+
+            async def on_instance_limit(self, error):
+                raise RuntimeError("operator chose to propagate")
+
+        first = _Limited(interaction=_make_interaction())
+        await first.send()
+
+        second = _Limited(interaction=_make_interaction())
+        with pytest.raises(RuntimeError, match="operator chose to propagate"):
+            await second.send()
+
+        assert second.is_finished()
+        assert second.id not in store.subscribers
+        assert second.id not in store._active_views

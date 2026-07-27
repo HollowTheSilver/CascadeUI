@@ -378,10 +378,7 @@ class TabView(_BaseTabMixin, StatefulView):
         content: Optional[str] = None,
         *,
         embed: Optional[discord.Embed] = None,
-        embeds: Optional[List[discord.Embed]] = None,
-        file: Optional[discord.File] = None,
-        files: Optional[List[discord.File]] = None,
-        ephemeral: bool = False,
+        **kwargs,
     ):
         """Send the view, using the active tab's content when none is given.
 
@@ -395,10 +392,7 @@ class TabView(_BaseTabMixin, StatefulView):
         return await super().send(
             content=content,
             embed=embed,
-            embeds=embeds,
-            file=file,
-            files=files,
-            ephemeral=ephemeral,
+            **kwargs,
         )
 
     nav_rebuild = staticmethod(lambda v: v._nav_edit_kwargs())

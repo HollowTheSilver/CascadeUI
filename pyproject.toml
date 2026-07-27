@@ -1,10 +1,13 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
+# 77 is the floor for the PEP 639 SPDX `license = "MIT"` string below.
+# Earlier setuptools rejects a string here at validation, so a build with
+# --no-build-isolation or a pinned older setuptools fails outright.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "pycascadeui"
-version = "3.7.0"
+version = "3.8.0"
 description = "Redux-inspired UI framework for discord.py"
 readme = "README.md"
 license = "MIT"

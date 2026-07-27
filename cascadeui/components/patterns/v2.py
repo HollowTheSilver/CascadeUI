@@ -2,6 +2,7 @@
 
 
 import inspect
+import logging
 from typing import (
     Any,
     Callable,
@@ -31,11 +32,92 @@ from discord.ui import (
     Thumbnail,
 )
 
+from ...utils.hooks import call_hook_safe
 from ..base import StatefulButton, StatefulSelect
 from ..types import MAX_SELECT_OPTIONS, EmojiInput, MediaInput
 
+logger = logging.getLogger(__name__)
+
+
+async def _guard_hook(hook, *args, owner) -> None:
+    """Run a composite's post-event hook without letting it skip the render.
+
+    These hooks fire after the cursor or flag has already moved but before
+    the edit ships, so a raising override would leave the composite's state
+    ahead of what the user can see. The view-side patterns get the same
+    protection through ``_StatefulMixin._call_hook_safe``.
+    """
+    await call_hook_safe(hook, *args, owner=type(owner).__name__, log=logger)
+
+
 # Discord content-length ceiling for a single TextDisplay component.
 _TEXTDISPLAY_MAX_CHARS = 4000
+
+# Discord's custom_id ceiling. discord.py stores the value unchecked, so an
+# oversized id constructs cleanly and fails only at HTTP send.
+_CUSTOM_ID_MAX_CHARS = 100
+
+
+def _check_custom_id_length(base: Optional[str], builder: str) -> Optional[str]:
+    """Reject an oversized ``custom_id`` the builder passes through unchanged.
+
+    The sibling of :func:`_stamp_custom_id` for builders that emit one
+    button and append no suffix. Both paths owe the caller the same
+    construction-time error: routing only the composing builders through a
+    check leaves the others reporting the same mistake as a later, less
+    directed failure.
+    """
+    if base is not None and len(base) > _CUSTOM_ID_MAX_CHARS:
+        raise ValueError(
+            f"{builder}: custom_id {base!r} is {len(base)} characters, over "
+            f"Discord's {_CUSTOM_ID_MAX_CHARS}-character cap.\n"
+            f"  Fix: shorten custom_id to at most {_CUSTOM_ID_MAX_CHARS} "
+            f"characters."
+        )
+    return base
+
+
+def _stamp_custom_id(base: Optional[str], suffix: str) -> Optional[str]:
+    """Suffix a caller's base ``custom_id``, rejecting an oversized result.
+
+    The builders compose these ids rather than passing the caller's string
+    through, so the length of what ships is the library's to answer for: a
+    base well inside the cap can be pushed past it by a suffix the caller
+    never sees. Raising here names the base; the alternative surfaces as an
+    HTTP 400 with no component named.
+    """
+    if base is None:
+        return None
+    composed = f"{base}_{suffix}"
+    if len(composed) > _CUSTOM_ID_MAX_CHARS:
+        raise ValueError(
+            f"custom_id {composed!r} is {len(composed)} characters, over "
+            f"Discord's {_CUSTOM_ID_MAX_CHARS}-character cap. The builder "
+            f"appends {'_' + suffix!r} to the base custom_id.\n"
+            f"  Fix: shorten custom_id to at most "
+            f"{_CUSTOM_ID_MAX_CHARS - len(suffix) - 1} characters."
+        )
+    return composed
+
+
+def _require_text(value: str, builder: str, param: str) -> str:
+    """Reject a caller-formatted string that would ship an empty TextDisplay.
+
+    Discord requires non-empty ``content`` and rejects the whole payload, so
+    one blank line takes down every component beside it. The condition is
+    data-triggered: a formatter renders nine entries and fails on the tenth
+    whose optional fields all happen to be absent. Naming the builder and the
+    parameter points at the formatter; the pre-flight validator that
+    backstops this can only name the primitive.
+    """
+    if not value:
+        raise ValueError(
+            f"{builder}: {param} is empty. Discord rejects a TextDisplay with "
+            f"no content, and the whole message fails with it.\n"
+            f"  Fix: pass a non-empty string, or skip the component when the "
+            f"formatter has nothing to render."
+        )
+    return value
 
 
 def _coerce_media_ref(value: MediaInput) -> str:
@@ -115,7 +197,10 @@ def card(
         theme = get_current_theme()
         if theme:
             color = theme.get_style("accent_colour")
-    items = [TextDisplay(c) if isinstance(c, str) else c for c in children]
+    items = [
+        TextDisplay(_require_text(c, "card", "a string child")) if isinstance(c, str) else c
+        for c in children
+    ]
     container = Container(
         *items,
         accent_colour=color,
@@ -177,10 +262,11 @@ def action_section(
         "callback": callback,
         "disabled": disabled,
     }
+    _check_custom_id_length(custom_id, "action_section")
     if custom_id is not None:
         button_kwargs["custom_id"] = custom_id
     return Section(
-        TextDisplay(text),
+        TextDisplay(_require_text(text, "action_section", "text")),
         accessory=StatefulButton(**button_kwargs),
     )
 
@@ -230,17 +316,18 @@ def toggle_section(
         "callback": callback,
         "disabled": disabled,
     }
+    _check_custom_id_length(custom_id, "toggle_section")
     if custom_id is not None:
         button_kwargs["custom_id"] = custom_id
     return Section(
-        TextDisplay(text),
+        TextDisplay(_require_text(text, "toggle_section", "text")),
         accessory=StatefulButton(**button_kwargs),
     )
 
 
 def image_section(
     text: str,
-    *,
+    *more_text: str,
     url: MediaInput,
     description: Optional[str] = None,
     spoiler: bool = False,
@@ -250,8 +337,17 @@ def image_section(
     Text on the left, image on the right. Useful for profile cards,
     server info panels, or any content with an associated icon.
 
+    Extra positional strings become additional text lines in the same
+    Section, which is how a two-line entry (a name above a stat line,
+    beside an avatar) renders without hand-building the ``Section``.
+    Discord caps a Section at three text children.
+
     Args:
         text: Display text (supports markdown).
+        *more_text: Additional text lines rendered under ``text`` inside
+            the same Section. At most two, per Discord's three-child cap.
+            Empty lines are skipped, so a formatter that produces nothing
+            for one entry shortens that entry instead of failing the send.
         url: Image reference for the thumbnail. Accepts either a URL
             string (remote or ``attachment://`` form) or a
             :class:`discord.File` instance whose ``.uri`` is used.
@@ -266,15 +362,33 @@ def image_section(
     Example::
 
         image_section(
-            f"**{member.display_name}**\\nAdmin",
+            f"**{member.display_name}**",
+            "Admin",
             url=member.display_avatar.url,
         )
     """
+    # An empty line is dropped rather than rendered. Discord rejects a text
+    # display with empty content and fails the whole message, so a formatter
+    # that returns "" for one entry would otherwise take down every component
+    # beside it. A Section with one text child plus an accessory is legal, so
+    # the entry still renders.
+    lines = tuple(line for line in (text, *more_text) if line)
+    if not lines:
+        raise ValueError(
+            "image_section: at least one non-empty text line is required. "
+            "Discord rejects a Section with no text children."
+        )
+    if len(lines) > 3:
+        raise ValueError(
+            f"image_section: {len(lines)} text lines exceeds Discord's "
+            f"3-children-per-Section limit. Merge lines with a newline, or "
+            f"move the overflow into its own component."
+        )
     kwargs = {"media": _coerce_media_ref(url), "spoiler": spoiler}
     if description is not None:
         kwargs["description"] = description
     return Section(
-        TextDisplay(text),
+        *(TextDisplay(line) for line in lines),
         accessory=Thumbnail(**kwargs),
     )
 
@@ -285,6 +399,7 @@ def link_section(
     label: str,
     url: str,
     emoji: EmojiInput = None,
+    disabled: bool = False,
 ) -> Section:
     """Build a Section with a link button accessory.
 
@@ -298,6 +413,9 @@ def link_section(
         label: Button label.
         url: Destination URL. The button opens this URL in a browser.
         emoji: Optional button emoji.
+        disabled: Render the link greyed out and unclickable. Matches
+            the ``disabled`` parameter on the other ``*_section``
+            builders.
 
     Returns:
         A ``Section`` with a ``TextDisplay`` and link-style ``Button``
@@ -312,12 +430,13 @@ def link_section(
         )
     """
     return Section(
-        TextDisplay(text),
+        TextDisplay(_require_text(text, "link_section", "text")),
         accessory=discord.ui.Button(
             label=label,
             style=discord.ButtonStyle.link,
             url=url,
             emoji=emoji,
+            disabled=disabled,
         ),
     )
 
@@ -331,6 +450,7 @@ def confirm_section(
     cancel_label: str = "Cancel",
     confirm_emoji: EmojiInput = "\u2705",
     cancel_emoji: EmojiInput = "\u274c",
+    custom_id: Optional[str] = None,
 ) -> List:
     """Build a confirm/cancel prompt as a list of V2 children.
 
@@ -350,6 +470,9 @@ def confirm_section(
         cancel_label: Cancel button label. Defaults to ``"Cancel"``.
         confirm_emoji: Confirm button emoji. Defaults to a green check.
         cancel_emoji: Cancel button emoji. Defaults to a red cross.
+        custom_id: Base id for the two buttons, which become
+            ``{custom_id}_confirm`` and ``{custom_id}_cancel``. Required
+            inside a ``PersistentLayoutView``; omit it anywhere else.
 
     Returns:
         A ``[TextDisplay, ActionRow]`` list ready to splat into
@@ -369,18 +492,20 @@ def confirm_section(
         )
     """
     return [
-        TextDisplay(text),
+        TextDisplay(_require_text(text, "confirm_section", "text")),
         ActionRow(
             StatefulButton(
                 label=confirm_label,
                 style=discord.ButtonStyle.success,
                 emoji=confirm_emoji,
+                custom_id=_stamp_custom_id(custom_id, "confirm"),
                 callback=on_confirm,
             ),
             StatefulButton(
                 label=cancel_label,
                 style=discord.ButtonStyle.danger,
                 emoji=cancel_emoji,
+                custom_id=_stamp_custom_id(custom_id, "cancel"),
                 callback=on_cancel,
             ),
         ),
@@ -395,6 +520,7 @@ def button_row(
     *,
     style: discord.ButtonStyle = discord.ButtonStyle.secondary,
     emoji: EmojiInput = None,
+    custom_id: Optional[str] = None,
 ) -> ActionRow:
     """Build an ActionRow from a ``{label: callback}`` mapping.
 
@@ -409,6 +535,10 @@ def button_row(
             order determines button order.
         style: Shared button style (default: secondary).
         emoji: Shared button emoji.
+        custom_id: Base id for the row, suffixed per button as
+            ``{custom_id}_0``, ``{custom_id}_1``, and so on in mapping
+            order. Required inside a ``PersistentLayoutView``; omit it
+            anywhere else.
 
     Returns:
         A single ``ActionRow`` containing one ``StatefulButton`` per
@@ -438,8 +568,14 @@ def button_row(
         )
     return ActionRow(
         *(
-            StatefulButton(label=label, style=style, emoji=emoji, callback=callback)
-            for label, callback in buttons.items()
+            StatefulButton(
+                label=label,
+                style=style,
+                emoji=emoji,
+                custom_id=_stamp_custom_id(custom_id, str(i)),
+                callback=callback,
+            )
+            for i, (label, callback) in enumerate(buttons.items())
         )
     )
 
@@ -452,6 +588,7 @@ def cycle_button(
     style: discord.ButtonStyle = discord.ButtonStyle.secondary,
     emoji: EmojiInput = None,
     start: int = 0,
+    custom_id: Optional[str] = None,
 ) -> StatefulButton:
     """Build a button that cycles through a fixed list of values.
 
@@ -475,6 +612,8 @@ def cycle_button(
         style: Button style (default: secondary).
         emoji: Optional button emoji.
         start: Index to start at (default: 0).
+        custom_id: Explicit id for the button. Required inside a
+            ``PersistentLayoutView``; omit it anywhere else.
 
     Returns:
         A ``StatefulButton`` with ``_cycle_index``, ``_cycle_values``,
@@ -494,6 +633,7 @@ def cycle_button(
     """
     if not values:
         raise ValueError("cycle_button: values must not be empty.")
+    _check_custom_id_length(custom_id, "cycle_button")
     resolved_labels = list(labels) if labels is not None else [str(v) for v in values]
     if len(resolved_labels) != len(values):
         raise ValueError(
@@ -514,6 +654,7 @@ def cycle_button(
         label=resolved_labels[start],
         style=style,
         emoji=emoji,
+        custom_id=custom_id,
         callback=_cycle_callback,
     )
     button._cycle_index = start
@@ -528,6 +669,7 @@ def toggle_button(
     on_toggle: Callable,
     labels: Tuple[str, str] = ("Enabled", "Disabled"),
     emoji: EmojiInput = None,
+    custom_id: Optional[str] = None,
 ) -> StatefulButton:
     """Build a standalone boolean toggle button.
 
@@ -548,6 +690,8 @@ def toggle_button(
         labels: ``(active_label, inactive_label)`` tuple. Defaults to
             ``("Enabled", "Disabled")``.
         emoji: Optional button emoji.
+        custom_id: Explicit id for the button. Required inside a
+            ``PersistentLayoutView``; omit it anywhere else.
 
     Returns:
         A ``StatefulButton`` with ``_toggle_active`` attribute set
@@ -562,6 +706,8 @@ def toggle_button(
         )]
     """
 
+    _check_custom_id_length(custom_id, "toggle_button")
+
     async def _toggle_callback(interaction):
         button._toggle_active = not button._toggle_active
         button.label = labels[0] if button._toggle_active else labels[1]
@@ -574,6 +720,7 @@ def toggle_button(
         label=labels[0] if active else labels[1],
         style=discord.ButtonStyle.success if active else discord.ButtonStyle.danger,
         emoji=emoji,
+        custom_id=custom_id,
         callback=_toggle_callback,
     )
     button._toggle_active = active
@@ -824,7 +971,7 @@ def _choice_button_row(
                 emoji=choice.emoji,
                 style=active_style if is_active else inactive_style,
                 disabled=button_disabled,
-                custom_id=f"{custom_id}_{i}",
+                custom_id=_stamp_custom_id(custom_id, str(i)),
                 callback=callback,
             )
         )
@@ -908,7 +1055,7 @@ def key_value(data: Dict[str, Any]) -> TextDisplay:
         # **Channels:** 12
     """
     lines = [f"**{key}:** {value}" for key, value in data.items()]
-    return TextDisplay("\n".join(lines))
+    return TextDisplay(_require_text("\n".join(lines), "key_value", "data"))
 
 
 _ALERT_STYLES = {
@@ -956,6 +1103,7 @@ def stats_card(
     *,
     color: Optional[Union[discord.Colour, int]] = None,
     footer: Optional[str] = None,
+    spoiler: bool = False,
 ) -> Container:
     """Build a titled Container showing a dict of stats as key-value lines.
 
@@ -974,6 +1122,8 @@ def stats_card(
             is used automatically.
         footer: Optional footer line rendered in Discord's subtext
             style (``-# {footer}``) below the stats.
+        spoiler: Render the whole card blurred until clicked. Matches
+            ``card()``'s parameter of the same name.
 
     Returns:
         A ``Container`` with a heading ``TextDisplay``, a divider,
@@ -995,15 +1145,16 @@ def stats_card(
         theme = get_current_theme()
         if theme:
             color = theme.get_style("accent_colour")
-    heading = title if title.startswith("#") else f"## {title}"
-    children: List[Any] = [
-        TextDisplay(heading),
-        Separator(visible=True, spacing=SeparatorSpacing.small),
-        key_value(stats),
-    ]
+    # A falsy title renders no heading rather than a bare "## ", matching
+    # how LeaderboardLayoutView.build_title treats an empty title.
+    children: List[Any] = []
+    if title:
+        children.append(TextDisplay(title if title.startswith("#") else f"## {title}"))
+        children.append(Separator(visible=True, spacing=SeparatorSpacing.small))
+    children.append(key_value(stats))
     if footer:
         children.append(TextDisplay(f"-# {footer}"))
-    container = Container(*children, accent_colour=color)
+    container = Container(*children, accent_colour=color, spoiler=spoiler)
     # Same theme-managed contract as ``card()``: see the note there.
     container._cascadeui_theme_accent = theme_managed
     return container
@@ -1110,6 +1261,7 @@ def tab_nav(
     active: Optional[str] = None,
     active_style: discord.ButtonStyle = discord.ButtonStyle.primary,
     inactive_style: discord.ButtonStyle = discord.ButtonStyle.secondary,
+    custom_id: Optional[str] = None,
 ) -> ActionRow:
     """Build an ActionRow of tab-styled buttons for manual-control views.
 
@@ -1130,6 +1282,10 @@ def tab_nav(
             match a key in ``tabs``. Defaults to the first key.
         active_style: Style for the active tab (default: primary).
         inactive_style: Style for inactive tabs (default: secondary).
+        custom_id: Base id for the row, suffixed per tab as
+            ``{custom_id}_0``, ``{custom_id}_1``, and so on in mapping
+            order. Required inside a ``PersistentLayoutView``; omit it
+            anywhere else.
 
     Returns:
         An ``ActionRow`` of ``StatefulButton`` tabs.
@@ -1168,9 +1324,10 @@ def tab_nav(
             StatefulButton(
                 label=label,
                 style=active_style if label == active else inactive_style,
+                custom_id=_stamp_custom_id(custom_id, str(i)),
                 callback=callback,
             )
-            for label, callback in tabs.items()
+            for i, (label, callback) in enumerate(tabs.items())
         )
     )
 
@@ -1437,7 +1594,14 @@ class PaginatedRegion:
         return self._items[start : start + self._per_page]
 
     def set_page(self, index: int) -> None:
-        """Jump to a zero-based page index, clamped once the items are known.
+        """Move the cursor to a zero-based page index without re-rendering.
+
+        Synchronous and render-free, unlike the same-named
+        ``_BasePaginatedMixin.set_page``, which is ``async`` and edits the
+        message. The split is deliberate: this one runs before the region
+        is attached to anything (``restore_nav_state`` on a popped host),
+        where there is no tree to re-render yet. Use :meth:`show_page` for
+        the "jump and re-render" gesture the view-side method performs.
 
         Clamping waits while the region is empty. A host that loads its items
         in ``on_load`` sets the page before they arrive -- ``restore_nav_state``
@@ -1560,8 +1724,9 @@ class PaginatedRegion:
 
         # Middle node: clickable go-to when jumps are available (full mode
         # at or above jump_threshold, or any compact row), else a
-        # non-interactive page indicator. The indicator uses secondary
-        # regardless of indicator_button_style, matching _BasePaginatedMixin.
+        # non-interactive page indicator. indicator_button_style governs the
+        # clickable node only; the disabled indicator stays secondary, since
+        # a disabled button in an accent colour reads as one that is broken.
         if show_jump or compact:
             buttons.append(
                 StatefulButton(
@@ -1625,7 +1790,7 @@ class PaginatedRegion:
         async def callback(interaction: discord.Interaction):
             self._page += delta
             self._clamp()
-            await self.on_page_changed(self._page)
+            await _guard_hook(self.on_page_changed, self._page, owner=self)
             await self._rerender()
 
         return callback
@@ -1636,7 +1801,7 @@ class PaginatedRegion:
         async def callback(interaction: discord.Interaction):
             self._page = target_fn()
             self._clamp()
-            await self.on_page_changed(self._page)
+            await _guard_hook(self.on_page_changed, self._page, owner=self)
             await self._rerender()
 
         return callback
@@ -1668,10 +1833,25 @@ class PaginatedRegion:
                     return
                 region.set_page(max(1, min(page_num, total)) - 1)
                 await view._safe_defer(modal_interaction)
-                await region.on_page_changed(region.page)
+                await _guard_hook(region.on_page_changed, region.page, owner=region)
                 await region._rerender()
 
         await view.open_modal(interaction, _GotoModal())
+
+    async def show_page(self, index: int) -> None:
+        """Jump to a zero-based page index and re-render the host.
+
+        The counterpart to ``_BasePaginatedMixin.set_page`` on the view
+        side: seeks the cursor, fires ``on_page_changed``, and ships the
+        edit. Reach for this from a host callback that wants a
+        programmatic jump (a search hit, a "find me" button). Requires the
+        region to be attached (``controls(view)`` must have run), since
+        there is no host to re-render before that.
+        """
+        self.set_page(index)
+        await _guard_hook(self.on_page_changed, self._page, owner=self)
+        if self._view is not None:
+            await self._rerender()
 
     async def _rerender(self) -> None:
         # Re-run the host's render path and ship the edit; shared with
@@ -1927,7 +2107,7 @@ class Collapsible:
 
     async def _toggle(self, interaction: discord.Interaction) -> None:
         self._expanded = not self._expanded
-        await self.on_toggle(self._expanded)
+        await _guard_hook(self.on_toggle, self._expanded, owner=self)
         await _rerender_host(self._view)
 
 
@@ -1937,6 +2117,7 @@ class Collapsible:
 def gallery(
     *media: MediaInput,
     descriptions: Optional[Sequence[Optional[str]]] = None,
+    spoilers: Optional[Sequence[bool]] = None,
 ) -> MediaGallery:
     """Build a MediaGallery from image references.
 
@@ -1949,6 +2130,9 @@ def gallery(
             :class:`discord.File` instance whose ``.uri`` is used.
             File-backed references require the same ``discord.File``
             objects to be passed via ``view.send(files=[...])``.
+        spoilers: Optional sequence of per-item spoiler flags, one per
+            media reference. Matches the parallel-sequence shape
+            ``descriptions`` uses; pad with ``False`` for unblurred items.
         descriptions: Optional sequence of descriptions matching each
             reference positionally. Use ``None`` for items without a
             description.
@@ -1982,6 +2166,12 @@ def gallery(
             f"media length ({len(media)}). Pad with None for references that "
             f"should have no description."
         )
+    if spoilers is not None and len(spoilers) != len(media):
+        raise ValueError(
+            f"gallery: spoilers length ({len(spoilers)}) must match media "
+            f"length ({len(media)}). Pad with False for references that "
+            f"should render unblurred."
+        )
 
     items = []
     for i, ref in enumerate(media):
@@ -1989,6 +2179,8 @@ def gallery(
         kwargs = {"media": _coerce_media_ref(ref)}
         if desc is not None:
             kwargs["description"] = desc
+        if spoilers is not None and spoilers[i]:
+            kwargs["spoiler"] = True
         items.append(MediaGalleryItem(**kwargs))
     return MediaGallery(*items)
 

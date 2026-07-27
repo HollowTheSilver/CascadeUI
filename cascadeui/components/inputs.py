@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 import discord
 from discord import CheckboxGroupOption, Interaction, RadioGroupOption, TextStyle
 
+from ..utils.responses import ack_backstop, respond_safe, trailing_ack
 from ..utils.strings import slugify
 from ..validation import validate_fields
 from .base import StatefulComponent
@@ -27,6 +28,24 @@ def _validate_range(owner: str, name: str, value: Optional[int], lo: int, hi: in
     """
     if value is not None and not lo <= value <= hi:
         raise ValueError(f"{owner} {name}={value} is out of range; Discord accepts {lo}-{hi}.")
+
+
+# Discord caps a modal title and each input label at 45 characters, and
+# rejects an empty one. discord.py stores both unchecked, so a label built
+# from a schema field or a record name fails only when the modal opens.
+_MODAL_TEXT_MAX = 45
+
+
+def _validate_text(owner: str, name: str, value: str) -> None:
+    """Reject a modal title or label Discord will not accept."""
+    if not value:
+        raise ValueError(f"{owner} {name} must not be empty; Discord rejects a blank {name}.")
+    if len(value) > _MODAL_TEXT_MAX:
+        raise ValueError(
+            f"{owner} {name} is {len(value)} characters, over Discord's "
+            f"{_MODAL_TEXT_MAX}-character cap. Shorten it, or move the detail "
+            f"into the placeholder or description."
+        )
 
 
 # // ========================================( Classes )======================================== // #
@@ -79,6 +98,7 @@ class TextInput(StatefulComponent):
         self.required = required
         self.min_length = min_length
         self.max_length = max_length
+        _validate_text(f"TextInput {label!r}", "label", label)
         _validate_range(f"TextInput {label!r}", "min_length", min_length, 0, 4000)
         _validate_range(f"TextInput {label!r}", "max_length", max_length, 1, 4000)
         self.style = style
@@ -145,6 +165,7 @@ class Checkbox(StatefulComponent):
         description: Optional[str] = None,
     ):
         self.label = label
+        _validate_text(f"Checkbox {label!r}", "label", label)
         self.description = description
         self.default = default
         self.validators: List[Callable] = list(validators) if validators else []
@@ -202,6 +223,7 @@ class CheckboxGroup(StatefulComponent):
         description: Optional[str] = None,
     ):
         self.label = label
+        _validate_text(f"CheckboxGroup {label!r}", "label", label)
         self.description = description
         self.options = self._process_options(options, CheckboxGroupOption)
         # Discord rejects an out-of-range option count with HTTP 400 when
@@ -284,6 +306,7 @@ class RadioGroup(StatefulComponent):
         description: Optional[str] = None,
     ):
         self.label = label
+        _validate_text(f"RadioGroup {label!r}", "label", label)
         self.description = description
         self.options = CheckboxGroup._process_options(options, RadioGroupOption)
         # Discord rejects an out-of-range option count with HTTP 400 when
@@ -350,6 +373,7 @@ class FileUpload(StatefulComponent):
         description: Optional[str] = None,
     ):
         self.label = label
+        _validate_text(f"FileUpload {label!r}", "label", label)
         self.description = description
         self.required = required
         self.min_values = min_values
@@ -462,6 +486,7 @@ class Modal(discord.ui.Modal, StatefulComponent):
         timeout: Optional[float] = None,
         **kwargs,
     ):
+        _validate_text("Modal", "title", title)
         super().__init__(title=title, timeout=timeout)
 
         self.view_id = kwargs.get("view_id")
@@ -520,14 +545,9 @@ class Modal(discord.ui.Modal, StatefulComponent):
         or the ``MODAL_SUBMITTED`` fan-out runs on the 3s interaction clock.
         Without this timer a slow validator drops the submit (10062).
         """
-        try:
-            await asyncio.sleep(self.auto_defer_delay)
-            if not interaction.response.is_done():
-                await interaction.response.defer()
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.debug("Modal auto-defer timer failed (interaction may have expired)")
+        await ack_backstop(
+            interaction, self.auto_defer_delay, owner=self.__class__.__name__, log=logger
+        )
 
     async def _scheduled_task(self, interaction, components, resolved):
         """Arm the ack backstop before discord.py's dispatcher runs ``interaction_check``.
@@ -565,10 +585,7 @@ class Modal(discord.ui.Modal, StatefulComponent):
         ``Modal`` subclass overriding ``on_submit`` calls ``self.respond(...)``
         for replies; mirrors ``_StatefulMixin.respond``.
         """
-        if not interaction.response.is_done():
-            await interaction.response.send_message(content, ephemeral=ephemeral, **kwargs)
-        else:
-            await interaction.followup.send(content, ephemeral=ephemeral, **kwargs)
+        await respond_safe(interaction, content, ephemeral=ephemeral, **kwargs)
 
     async def on_submit(self, interaction: Interaction):
         """Handle modal submission with optional validation."""
@@ -658,22 +675,8 @@ class Modal(discord.ui.Modal, StatefulComponent):
     async def _safe_post_submit_defer(self, interaction: Interaction) -> None:
         """Acknowledge the modal submission if the callback left it unanswered.
 
-        Mirrors the post-callback defer in the view's ``_scheduled_task``:
-        the submission's state dispatch has already landed, so a dead or
+        The submission's state dispatch has already landed, so a dead or
         already-acked interaction on the trailing ack must not turn a
         successful submit into an unhandled error routed to ``on_error``.
         """
-        if interaction.response.is_done():
-            return
-        try:
-            await interaction.response.defer()
-        except discord.NotFound:
-            # 10062: the interaction token is already gone -- nothing to ack.
-            logger.debug("Modal post-submit defer hit a dead interaction (10062)")
-        except discord.HTTPException as e:
-            # 40060 (already acknowledged) is a benign cancellation race; any
-            # other status is a genuine ack failure the user saw as a toast.
-            if e.code == 40060:
-                logger.debug("Modal post-submit defer raced an existing ack (40060)")
-            else:
-                logger.warning(f"Modal post-submit defer failed: status={e.status} code={e.code}")
+        await trailing_ack(interaction, owner=self.__class__.__name__, log=logger)

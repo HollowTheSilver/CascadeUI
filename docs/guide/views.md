@@ -304,6 +304,34 @@ Edits the view's message with `view=self` plus any extra kwargs. Does NOT
 rebuild components -- call `build_ui()` first. Handles `discord.NotFound`
 silently. V2 callers pass no args; V1 callers pass `embed=` or `content=`.
 
+Only `content`, `embed`, `embeds`, `attachments`, and `allowed_mentions` are
+accepted. `refresh()` picks its edit endpoint at runtime, and a kwarg only one
+endpoint supports (`suppress`, `delete_after`) raises `TypeError` rather than
+working some of the time. Edit `view.message` directly for a one-off that
+needs a non-portable field.
+
+### Mention rules: `allowed_mentions`
+
+A view that names users in its rendered body re-pings them on every re-render
+unless it says otherwise: a leaderboard rebuilt on each score change, a roster
+that redraws on every join. Each edit is a fresh message payload, and Discord
+notifies on every one.
+
+Set the class attribute once and it applies to the initial send and to every
+refresh, navigation edit, and teardown freeze the view makes:
+
+```python
+class ScoreBoard(StatefulLayoutView):
+    allowed_mentions = discord.AllowedMentions.none()
+```
+
+`None` (the default) defers to the bot's client-level `AllowedMentions`, which
+holds on all three edit endpoints. Pass `allowed_mentions=` to `send()` or
+`refresh()` to override the attribute for one message, which is what a winner
+announcement that genuinely should notify wants. `LeaderboardLayoutView`
+suppresses by default, since a ranking that re-pings its top ten on every
+update is rarely what the caller intended.
+
 ### `set_class_attribute(name, value)`
 
 Override a class attribute for this instance only. Useful when a policy needs
@@ -723,8 +751,26 @@ class MyView(StatefulLayoutView):
     exit_policy = "disable"  # default -- freeze the view
 ```
 
-Set `exit_policy = "delete"` for close buttons and `on_timeout` to delete the
-message.
+Set `exit_policy = "delete"` to have close buttons delete the message instead.
+The exit controls the library builds (`make_exit_button`, `add_exit_button`,
+`make_nav_row`) all consult the policy; pass `delete_message=True` or `False`
+to one of them to override it for that button alone.
+
+!!! warning "Push/pop stacks should agree on the policy"
+
+    `exit_policy` is declared per class, but `push()` and `pop()` edit one
+    message in place. A stack whose screens disagree tears the same message
+    down differently depending on how deep the user went. Each class is
+    individually valid, so nothing at definition time can see the
+    disagreement. The library logs a warning on the first navigation step
+    that crosses one. Declare the policy on a shared base class when every
+    screen should agree; a destination that deliberately differs (a
+    confirmation that deletes while the hub freezes) is a legitimate shape
+    and still works.
+
+`on_timeout` is not governed by this policy. A timed-out view always freezes,
+because an expiry is not a close gesture, and its message may still hold
+content the user is looking at. Override `on_timeout` to delete on expiry.
 
 Both policies follow the
 [three-tier precedence model](concepts.md#the-three-tier-precedence-model):
@@ -793,8 +839,8 @@ async def game(self, interaction: discord.Interaction):
         )
         return
 
-    view = GameView(user_id=interaction.user.id, guild_id=interaction.guild.id)
-    await view.send(interaction)
+    view = GameView(interaction=interaction)
+    await view.send()
 ```
 
 This is useful when `__init__` is expensive (e.g. fetching data from a database)
@@ -1194,8 +1240,7 @@ Enable undo/redo on any view:
 ```python
 from cascadeui import UndoMiddleware, get_store
 
-store = get_store()
-store.add_middleware(UndoMiddleware(store))
+await setup_middleware(UndoMiddleware())
 
 class EditableView(StatefulLayoutView):
     enable_undo = True

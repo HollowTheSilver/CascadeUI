@@ -1618,3 +1618,65 @@ class TestShowTitleDivider:
 
         assert isinstance(children[0], TextDisplay)
         assert not isinstance(children[1], Separator)
+
+
+class TestEmptySecondaryDoesNotFailThePage:
+    """``format_secondary`` returning "" must shorten one row, not break the page.
+
+    The hook is typed ``-> str`` with no non-empty requirement, and the
+    condition is data-triggered: a board renders for nine players and fails
+    when a tenth arrives whose optional fields all happen to be absent.
+    Discord rejects an empty text display and fails the whole message, so
+    that one row would take every other component down with it.
+    """
+
+    @staticmethod
+    def _entries(n=3):
+        return [(700000000000000000 + i, {"wins": i, "games": i * 2}) for i in range(n)]
+
+    def _build(self, cls):
+        return cls(interaction=_make_interaction(), entries=self._entries(), title="Board")
+
+    async def test_section_row_drops_the_empty_half(self):
+        from cascadeui.views._placement import validate_placement
+
+        class Board(LeaderboardLayoutView):
+            entry_layout = "sections"
+
+            def format_secondary(self, rank, user_id, stats):
+                # Every optional chip absent for one entry.
+                return "" if rank == 2 else f"{stats['wins']}W"
+
+            async def get_avatar_url(self, user_id, stats):
+                return "https://cdn.example/a.png"
+
+        view = self._build(Board)
+        await view.on_load()
+
+        # Assert the shape directly, not just that the validator is quiet:
+        # the row must carry no empty child at all.
+        blanks = [c for c in view.walk_children() if isinstance(c, TextDisplay) and c.content == ""]
+        assert blanks == []
+        validate_placement(view)
+
+    async def test_stacked_fallback_drops_the_empty_half(self):
+        """The no-avatar path stacks the two halves; an empty one is skipped
+        rather than joined into a dangling newline.
+        """
+        from cascadeui.views._placement import validate_placement
+
+        class Board(LeaderboardLayoutView):
+            entry_layout = "sections"
+
+            def format_secondary(self, rank, user_id, stats):
+                return ""
+
+            async def get_avatar_url(self, user_id, stats):
+                return None
+
+        view = self._build(Board)
+        await view.on_load()
+
+        validate_placement(view)
+        stacked = [c for c in view.walk_children() if isinstance(c, TextDisplay)]
+        assert all(not c.content.endswith("\n") for c in stacked)

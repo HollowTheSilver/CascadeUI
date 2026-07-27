@@ -459,6 +459,133 @@ class TestExitPolicy:
         )
 
 
+# // ========================================( exit_policy Through Helpers )======================================== // #
+
+
+class TestExitPolicyThroughHelpers:
+    """The exit controls the library ships honor exit_policy.
+
+    make_exit_button / add_exit_button / make_nav_row forward
+    ``delete_message=None`` so the class attribute stays reachable. A
+    concrete default here would occupy the explicit-argument tier and
+    silently strand the policy.
+    """
+
+    @staticmethod
+    def _armed(view):
+        """Attach a mock message whose edit/delete calls are observable."""
+        view._message = MagicMock()
+        view._message.delete = AsyncMock()
+        view._message.edit = AsyncMock()
+        return view._message
+
+    async def test_v2_add_exit_button_deletes_under_delete_policy(self):
+        class _View(StatefulLayoutView):
+            exit_policy = "delete"
+
+        view = _View(interaction=_make_interaction())
+        button = view.add_exit_button()
+        message = self._armed(view)
+
+        await button.callback(_make_interaction())
+
+        assert message.delete.await_count == 1
+        assert message.edit.await_count == 0
+
+    async def test_v2_add_exit_button_freezes_under_disable_policy(self):
+        class _View(StatefulLayoutView):
+            exit_policy = "disable"
+
+        view = _View(interaction=_make_interaction())
+        button = view.add_exit_button()
+        message = self._armed(view)
+
+        await button.callback(_make_interaction())
+
+        assert message.delete.await_count == 0
+        assert message.edit.await_count == 1
+
+    async def test_v1_add_exit_button_deletes_under_delete_policy(self):
+        class _View(StatefulView):
+            exit_policy = "delete"
+
+        view = _View(interaction=_make_interaction())
+        button = view.add_exit_button()
+        message = self._armed(view)
+
+        await button.callback(_make_interaction())
+
+        assert message.delete.await_count == 1
+
+    async def test_make_exit_button_deletes_under_delete_policy(self):
+        class _View(StatefulLayoutView):
+            exit_policy = "delete"
+
+        view = _View(interaction=_make_interaction())
+        button = view.make_exit_button()
+        view.add_item(ActionRow(button))
+        message = self._armed(view)
+
+        await button.callback(_make_interaction())
+
+        assert message.delete.await_count == 1
+
+    async def test_make_nav_row_exit_deletes_under_delete_policy(self):
+        class _View(StatefulLayoutView):
+            exit_policy = "delete"
+
+        view = _View(interaction=_make_interaction())
+        row = view.make_nav_row(back=False)
+        view.add_item(row)
+        message = self._armed(view)
+
+        await row.children[0].callback(_make_interaction())
+
+        assert message.delete.await_count == 1
+
+    async def test_explicit_true_overrides_disable_policy(self):
+        """The explicit argument is the winning tier in both directions."""
+
+        class _View(StatefulLayoutView):
+            exit_policy = "disable"
+
+        view = _View(interaction=_make_interaction())
+        button = view.add_exit_button(delete_message=True)
+        message = self._armed(view)
+
+        await button.callback(_make_interaction())
+
+        assert message.delete.await_count == 1
+
+    async def test_explicit_false_overrides_delete_policy(self):
+        class _View(StatefulLayoutView):
+            exit_policy = "delete"
+
+        view = _View(interaction=_make_interaction())
+        button = view.add_exit_button(delete_message=False)
+        message = self._armed(view)
+
+        await button.callback(_make_interaction())
+
+        assert message.delete.await_count == 0
+        assert message.edit.await_count == 1
+
+    async def test_on_timeout_freezes_regardless_of_delete_policy(self):
+        """An expiry is not a close gesture, so exit_policy does not apply."""
+
+        class _View(StatefulLayoutView):
+            exit_policy = "delete"
+
+        view = _View(interaction=_make_interaction())
+        view.add_exit_button()
+        message = self._armed(view)
+
+        await view.on_timeout()
+
+        assert message.delete.await_count == 0
+        assert message.edit.await_count == 1
+
+
 # // ========================================( on_instance_limit Hook )======================================== // #
 
 

@@ -65,6 +65,7 @@ class StatefulLayoutView(_StatefulMixin, LayoutView):
         *,
         file: Optional[discord.File] = None,
         files: Optional[Sequence[discord.File]] = None,
+        allowed_mentions: Optional[discord.AllowedMentions] = None,
         ephemeral: bool = False,
     ):
         """Send this V2 view as a message.
@@ -86,6 +87,9 @@ class StatefulLayoutView(_StatefulMixin, LayoutView):
             files: Sequence of attachments uploaded with the message.
                 Mutually exclusive with ``file``. discord.py raises
                 ``TypeError`` when both are supplied.
+            allowed_mentions: Mention rules for this message. Overrides
+                the ``allowed_mentions`` class attribute; when both are
+                ``None`` the bot's client-level rules apply.
             ephemeral: Whether the message should be ephemeral
                 (interaction-context only).
 
@@ -99,6 +103,9 @@ class StatefulLayoutView(_StatefulMixin, LayoutView):
             send_kwargs["file"] = file
         if files is not None:
             send_kwargs["files"] = files
+        mentions = self._resolve_allowed_mentions(allowed_mentions)
+        if mentions is not None:
+            send_kwargs["allowed_mentions"] = mentions
         return await self._send_pipeline(send_kwargs, ephemeral=ephemeral)
 
     def add_item(self, item: Item):
@@ -163,9 +170,13 @@ class StatefulLayoutView(_StatefulMixin, LayoutView):
         try:
             self._freeze_components()
             if not interaction.response.is_done():
-                await self._ack_bounded(interaction.response.edit_message(view=self))
+                await self._ack_bounded(
+                    interaction.response.edit_message(**self._freeze_edit_kwargs())
+                )
             else:
-                await self._bounded(interaction.edit_original_response(view=self))
+                await self._bounded(
+                    interaction.edit_original_response(**self._freeze_edit_kwargs())
+                )
         except asyncio.TimeoutError:
             logger.debug(
                 f"Back-navigation freeze stalled past {self.edit_timeout}s "
@@ -176,7 +187,9 @@ class StatefulLayoutView(_StatefulMixin, LayoutView):
             # interaction before edit_message's own guard. The ack landed but
             # the frozen view did not ship -- send it through the deferred endpoint.
             try:
-                await self._bounded(interaction.edit_original_response(view=self))
+                await self._bounded(
+                    interaction.edit_original_response(**self._freeze_edit_kwargs())
+                )
             except (asyncio.TimeoutError, discord.HTTPException):
                 pass
         except discord.HTTPException as e:
@@ -205,7 +218,7 @@ class StatefulLayoutView(_StatefulMixin, LayoutView):
         back_emoji: EmojiInput = "◀",
         exit_style: discord.ButtonStyle = discord.ButtonStyle.secondary,
         exit_emoji: EmojiInput = "❌",
-        delete_message: bool = False,
+        delete_message: Optional[bool] = None,
         back_custom_id: Optional[str] = None,
         exit_custom_id: Optional[str] = None,
     ) -> ActionRow:
@@ -220,9 +233,10 @@ class StatefulLayoutView(_StatefulMixin, LayoutView):
         ``back_label`` / ``back_style`` / ``back_emoji`` (and the ``exit_``
         equivalents) customize each button -- a relabeled Back such as
         ``make_nav_row(back_label="Leagues", back_emoji="\U0001f3e0")`` needs
-        no manual composition. For persistent subclasses, pass
-        ``back_custom_id`` / ``exit_custom_id`` so the buttons survive a
-        restart.
+        no manual composition. ``delete_message`` defaults to ``None``, which
+        defers the Exit button to the view's ``exit_policy``. For persistent
+        subclasses, pass ``back_custom_id`` / ``exit_custom_id`` so the
+        buttons survive a restart.
         """
         if not back and not exit:
             raise ValueError("make_nav_row() requires at least one of back= or exit=.")
@@ -253,15 +267,19 @@ class StatefulLayoutView(_StatefulMixin, LayoutView):
         label="Exit",
         style=discord.ButtonStyle.secondary,
         emoji="\u274c",
-        delete_message=False,
+        delete_message=None,
         custom_id=None,
-        **kwargs,
     ):
         """Add a button that exits this view, wrapped in an ActionRow.
 
         Thin wrapper over :meth:`make_exit_button` that attaches the
-        result inside an ``ActionRow``. For ``PersistentLayoutView``
-        subclasses, pass a ``custom_id``.
+        result inside an ``ActionRow``. ``delete_message=None`` (the
+        default) defers to the view's ``exit_policy``. For
+        ``PersistentLayoutView`` subclasses, pass a ``custom_id``.
+
+        Takes no ``row``: V2 lays out by tree position, not row index, so
+        a V1-style ``row=`` argument raises here rather than being
+        accepted and ignored.
         """
         button = self.make_exit_button(
             label=label,

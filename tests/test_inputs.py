@@ -969,3 +969,60 @@ class TestModalRespond:
         await modal.respond(interaction, "hi", ephemeral=True)
         interaction.followup.send.assert_awaited_once()
         interaction.response.send_message.assert_not_awaited()
+
+
+class TestModalTextCaps:
+    """Discord caps a modal title and each input label at 45 characters.
+
+    discord.py stores both unchecked, so a label built from a schema field
+    or a record name fails only when the modal opens, far from where it
+    was set, and only for the data that happens to be long.
+    """
+
+    def test_oversized_modal_title_rejected(self):
+        with pytest.raises(ValueError, match="over Discord's 45-character cap"):
+            Modal(title="T" * 46, inputs=[])
+
+    def test_empty_modal_title_rejected(self):
+        with pytest.raises(ValueError, match="must not be empty"):
+            Modal(title="", inputs=[])
+
+    def test_boundary_title_accepted(self):
+        assert Modal(title="T" * 45, inputs=[]).title == "T" * 45
+
+    def test_oversized_input_label_rejected(self):
+        with pytest.raises(ValueError, match="over Discord's 45-character cap"):
+            TextInput("L" * 46)
+
+    def test_empty_input_label_rejected(self):
+        with pytest.raises(ValueError, match="must not be empty"):
+            TextInput("")
+
+
+class TestFormEditLabelFitsTheModalTitle:
+    """The grouped edit label doubles as the modal title.
+
+    A long field label would compose a title the caller never typed and
+    cannot see, so the singular form degrades to the generic one rather
+    than failing the modal open.
+    """
+
+    def test_short_label_uses_the_singular_form(self):
+        from cascadeui.views.patterns.form import _resolve_modal_edit_label
+
+        fields = [{"id": "n", "label": "Name", "type": "text"}]
+        assert _resolve_modal_edit_label(None, fields) == "Edit Name"
+
+    def test_long_label_falls_back_to_the_generic_form(self):
+        from cascadeui.views.patterns.form import _resolve_modal_edit_label
+
+        fields = [{"id": "n", "label": "A" * 60, "type": "text"}]
+        result = _resolve_modal_edit_label(None, fields)
+        assert result == "Edit Fields"
+        assert len(result) <= 45
+
+    def test_an_explicit_override_is_left_alone(self):
+        from cascadeui.views.patterns.form import _resolve_modal_edit_label
+
+        fields = [{"id": "n", "label": "A" * 60, "type": "text"}]
+        assert _resolve_modal_edit_label("Custom", fields) == "Custom"

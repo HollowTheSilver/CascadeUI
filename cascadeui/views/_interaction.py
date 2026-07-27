@@ -12,6 +12,13 @@ from discord.ui import Item
 
 from ..components.base import StatefulButton
 from ..state.actions import ActionCreators
+from ..utils.responses import (
+    ack_backstop,
+    elapsed_since,
+    open_modal_safe,
+    respond_safe,
+    trailing_ack,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -102,68 +109,28 @@ class _InteractionMixin:
                 # show "This interaction failed". Common when callbacks use
                 # dispatch() → on_state_changed → refresh() which edits
                 # the message via the channel endpoint, not the interaction.
-                if self.auto_defer and not interaction.response.is_done():
-                    try:
-                        await interaction.response.defer()
-                    except discord.HTTPException as e:
-                        # 40060 means Discord acknowledged a request the
-                        # acting-view fast path cancelled locally (cancellation
-                        # race) -- the interaction is already acked, so this is
-                        # benign and routine. Any other status is a genuine ack
-                        # failure the user saw as an interaction-failed toast.
-                        if e.code == 40060:
-                            logger.debug(
-                                f"Post-callback defer raced an existing ack in "
-                                f"{self.__class__.__name__} (40060)"
-                            )
-                        else:
-                            logger.warning(
-                                f"Post-callback defer failed in {self.__class__.__name__}: "
-                                f"status={e.status} code={e.code} "
-                                f"({self._elapsed_since(interaction)})"
-                            )
-                    except Exception:
-                        logger.debug(
-                            f"Post-callback defer failed in {self.__class__.__name__} "
-                            f"(interaction may have expired)"
-                        )
+                if self.auto_defer:
+                    await trailing_ack(interaction, owner=self.__class__.__name__, log=logger)
         except Exception as e:
             return await self.on_error(interaction, e, item)
 
-    @staticmethod
-    def _elapsed_since(interaction) -> str:
-        """Elapsed time since the interaction was created, for ack diagnostics.
-
-        Degrades to a placeholder rather than raising: a diagnostic must never
-        crash the ack path it is reporting on.
-        """
-        try:
-            secs = (discord.utils.utcnow() - interaction.created_at).total_seconds()
-            return f"{secs:.2f}s since interaction creation"
-        except Exception:
-            return "elapsed unknown"
+    _elapsed_since = staticmethod(elapsed_since)
 
     async def _auto_defer_timer(self, interaction: Interaction):
-        """Background timer that defers the interaction if the callback hasn't responded."""
-        try:
-            await asyncio.sleep(self.auto_defer_delay)
-            if not interaction.response.is_done():
-                await interaction.response.defer()
-        except asyncio.CancelledError:
-            pass
-        except discord.NotFound:
-            # 10062: the interaction expired before this ack landed. The timer
-            # normally acks in time, so a miss means the loop was congested
-            # through the 3s window (hot-path I/O elsewhere, a slow ack POST).
-            # WARNING with elapsed makes the missed ack diagnosable at its
-            # source, not only through the downstream post-callback echo.
-            logger.warning(
-                f"Auto-defer ack missed the 3s deadline in {self.__class__.__name__}: "
-                f"{self._elapsed_since(interaction)} (event-loop congestion or "
-                f"slow pre-callback work)"
-            )
-        except Exception:
-            logger.debug(f"Auto-defer failed for interaction in {self.__class__.__name__}")
+        """Background timer that defers the interaction if the callback hasn't responded.
+
+        Warns on expiry: this timer normally acks in time, so a miss means
+        the loop was congested through the whole 3s window (hot-path I/O
+        elsewhere, a slow ack POST), which is worth surfacing at its source
+        rather than only through the downstream post-callback echo.
+        """
+        await ack_backstop(
+            interaction,
+            self.auto_defer_delay,
+            owner=self.__class__.__name__,
+            log=logger,
+            warn_on_expiry=True,
+        )
 
     async def respond(
         self,
@@ -211,10 +178,7 @@ class _InteractionMixin:
                 f"Fix: await {name}(..., interaction=interaction).send(ephemeral=True)"
             )
 
-        if not interaction.response.is_done():
-            await interaction.response.send_message(content, ephemeral=ephemeral, **kwargs)
-        else:
-            await interaction.followup.send(content, ephemeral=ephemeral, **kwargs)
+        await respond_safe(interaction, content, ephemeral=ephemeral, **kwargs)
 
     async def open_modal(
         self,
@@ -254,20 +218,7 @@ class _InteractionMixin:
             ``Modal(inputs=[])`` followed by ``add_item()`` is a valid build
             path and the tree is only complete at open time.
         """
-        if not modal.children:
-            raise ValueError(
-                f"Modal {modal.title!r} has no components. A modal needs at "
-                f"least one input; Discord rejects an empty one with HTTP 400.\n"
-                f"  Fix: pass at least one TextInput to Modal(inputs=[...]), or "
-                f"add one via modal.add_item() before open_modal()."
-            )
-        if not interaction.response.is_done():
-            await interaction.response.send_modal(modal)
-            return True
-        else:
-            msg = fallback_message or "Could not open the dialog. Please try again."
-            await interaction.followup.send(msg, ephemeral=True)
-            return False
+        return await open_modal_safe(interaction, modal, fallback_message=fallback_message)
 
     async def _safe_defer(self, interaction: Interaction) -> None:
         """Defer the interaction if it hasn't been acknowledged yet.
@@ -306,6 +257,15 @@ class _InteractionMixin:
                     f"Ack defer hit a dead interaction (10062) in "
                     f"{type(self).__name__}; nothing left to acknowledge."
                 )
+            except discord.InteractionResponded:
+                # A ClientException subclass, on a different branch from
+                # HTTPException entirely, so the
+                # handler below cannot see it. The auto-defer timer can ack
+                # inside this call's own await window: on 3.10/3.11
+                # wait_for schedules the coroutine as a Task, which widens
+                # that window enough to lose the race. The slot is acked
+                # either way, which is all this method wanted.
+                logger.debug(f"Ack defer raced an existing ack in {type(self).__name__}.")
             except discord.HTTPException as e:
                 logger.debug(
                     f"Ack defer failed in {type(self).__name__}: "
@@ -519,26 +479,13 @@ class _InteractionMixin:
         # row still does). Same VIEW_UPDATED shape _navigate_to uses for
         # push/pop, so the transfer goes through the reducer rather than
         # writing into the live state["views"] row in place.
-        old_view_state = self.state_store.state.get("views", {}).get(self.id, {})
-        stack_updates = {}
-        if old_view_state.get("undo_stack"):
-            stack_updates["undo_stack"] = list(old_view_state["undo_stack"])
-        if old_view_state.get("redo_stack"):
-            stack_updates["redo_stack"] = list(old_view_state["redo_stack"])
-        if stack_updates:
-            await new_view.dispatch(
-                "VIEW_UPDATED",
-                ActionCreators.view_updated(new_view.id, **stack_updates),
-            )
+        await self._carry_undo_stacks_to(new_view)
 
         # Carry participants onto the replacement so a multi-user ephemeral
         # keeps its membership across the reopen (mirrors _navigate_to's carry).
         # Runs after send() so new_view is registered; the membership guard
         # keeps it idempotent against any the replacement already auto-claimed.
-        for pid in self._participants:
-            if pid not in new_view._participants:
-                new_view._participants.add(pid)
-                self.state_store._register_participant(new_view, pid)
+        self._carry_participants_to(new_view)
 
         # Re-parent this view's own children onto the replacement -- the
         # same hand-off _settle_navigation performs after a confirmed
@@ -546,24 +493,7 @@ class _InteractionMixin:
         # _cleanup_attached_children and deletes children that should
         # outlive the reopen. attach_child prunes the source list as it
         # re-parents, so the exit cascade finds nothing.
-        for child in list(self._attached_children):
-            if child is new_view:
-                continue
-            new_view.attach_child(child)
-
-        # Migrate the tracked-child slot from this instance to the refreshed
-        # one. Without this transfer, a parent that called attach_child(self)
-        # would still hold a reference to the (about-to-exit) old view, and
-        # its _cleanup_attached_children pass would silently skip the new view as
-        # "untracked" -- leaving an orphan ephemeral after the parent ends.
-        parent = self._attached_to
-        if parent is not None and not parent.is_finished():
-            parent.attach_child(new_view)
-            try:
-                parent._attached_children.remove(self)
-            except ValueError:
-                pass
-        self._attached_to = None
+        self._carry_attachments_to(new_view)
 
         # Best-effort cleanup of the old message. Inside the original token
         # window this succeeds; past 15:00 it fails silently and the stale
@@ -573,7 +503,7 @@ class _InteractionMixin:
                 await self._bounded(self._message.delete())
             except (discord.NotFound, discord.HTTPException, asyncio.TimeoutError):
                 try:
-                    await self._bounded(self._message.edit(view=self))
+                    await self._bounded(self._message.edit(**self._freeze_edit_kwargs()))
                 except (discord.NotFound, discord.HTTPException, asyncio.TimeoutError):
                     pass
 

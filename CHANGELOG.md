@@ -23,6 +23,270 @@ preserved below for historical reference but are not the supported baseline.
 
 ---
 
+## [3.8.0] - 2026-07-27
+
+### Breaking
+
+- **`MenuLayoutView._build_header()` / `_build_footer()` removed.** The
+  underscore names were deprecated in v3.4.1 and delegated to the public
+  `build_header()` / `build_footer()` since. Rename any remaining overrides;
+  the public hooks take the same arguments and return the same shapes.
+- **`refresh()` rejects edit kwargs that only some of its endpoints accept.**
+  `refresh()` picks between the interaction, webhook, and channel endpoints at
+  runtime, and `suppress`, `suppress_embeds`, and `delete_after` are each
+  accepted by only one or two of them, so a call carrying one worked only
+  while the ack race kept landing on a compatible path. All now raise a
+  `TypeError` naming the portable set (`content`, `embed`, `embeds`,
+  `attachments`, `allowed_mentions`). Edit `view.message` directly for a
+  one-off that needs a non-portable field. The same guard applies to the dict
+  a `rebuild=` callback returns.
+
+### Added
+
+- **`allowed_mentions` on views.** A class attribute governing mention
+  behavior for a view's own message, plus an `allowed_mentions=` parameter on
+  `send()` that overrides it per message. Applies to the initial send and to
+  every refresh and navigation edit, so a panel that re-renders cannot re-ping
+  the users it names. `None` (the default) defers to the bot's client-level
+  rules. Reach for it on rosters, leaderboards, and turn announcements; pass
+  the parameter when a one-off notice genuinely should notify.
+- **`custom_id` on the interactive V2 builders.** `button_row`,
+  `confirm_section`, `cycle_button`, `toggle_button`, and `tab_nav` accept a
+  base id, suffixed per button (`{custom_id}_0`, `{custom_id}_confirm`).
+  Without one, builder-produced buttons carry ids that change every restart,
+  which made all five unusable inside a `PersistentLayoutView`.
+- **`image_section()` accepts extra text lines.** `image_section(primary,
+  secondary, url=...)` renders a two-line entry beside its thumbnail, the
+  shape leaderboard rows previously hand-built a `Section` for. Discord's
+  three-children cap is enforced at construction.
+- **`link_section(disabled=...)`, `gallery(spoilers=...)`, and
+  `stats_card(spoiler=...)`**, matching the parameters their sibling builders
+  already took.
+- **`PaginatedRegion.show_page()`.** The async jump-and-re-render counterpart
+  to the view-side `set_page()`. The region's own `set_page()` stays
+  synchronous and render-free for the pre-attach restore path.
+- **`DynamicPersistentButton.open_modal()`.** The sibling of the button's
+  `respond()` for the one response type that cannot follow a defer. A
+  persistent button's click arms an ack backstop before `on_click` runs, so
+  opening a modal directly raced it; both now share the view side's guard.
+- **`StateStore.scope_key(scope, *, user_id=None, guild_id=None)`.** The single
+  writer of the scope-key format, returning `None` when the scope's required ids
+  are missing. The scoped-state readers, the instance-limit index, and the sync
+  availability pre-check all route through it, so the format is defined once. `0`
+  is a legitimate Discord id and is never treated as absent; a caller that wants
+  falsy ids treated as missing normalizes with `or None` first.
+- **`view.validate()`.** Raises if the view's tree is one Discord would
+  reject, running the same custom_id and placement checks the library runs
+  before every send, plus the auto-generated-id check on a persistent view
+  (the one that catches a panel coming back with dead buttons after a
+  restart). The point is testing a view with no Discord connection: compose
+  with `on_load()` (or `build_ui()`), count with `walk_children()`, and
+  validate, all offline. Previously the first and third steps had no public
+  entry, so a test asserting a panel still builds had to reach into private
+  methods.
+- **A warning when a navigation step changes `exit_policy`.** The policy is
+  declared per class but push and pop edit one message in place, so a stack
+  whose screens disagree tears the same message down differently depending on
+  how deep the user went. Each class is individually valid, so nothing at
+  definition time can see it. Declare the policy on a shared base when every
+  screen should agree; a destination that deliberately differs still works.
+
+### Changed
+
+- **`LeaderboardLayoutView` suppresses mentions by default.** Entries without
+  a `display_name` render as `<@id>`, so a stock leaderboard notified every
+  ranked player on send and again on every refresh. Rows still render as
+  mention links; they no longer ping. Override `allowed_mentions` on a board
+  that wants the notification.
+- **The lobby, battleship, and tic-tac-toe examples suppress their own
+  mentions.** Each renders player mentions in a body that rebuilds on every
+  interaction, so a full game re-notified both players once per move.
+- **Button labels and emoji are validated at class-definition time.** The
+  paginated, wizard, and form patterns already checked the `*_style` member of
+  each button triple; the `*_label` and `*_emoji` members are now checked too,
+  matching what `PaginatedRegion` enforced.
+- **`nav_rebuild` is validated at class-definition time.** A bare function or
+  lambda assigned in a class body binds as a method and receives `self` where
+  the destination view belongs, which previously surfaced as an arity
+  `TypeError` at navigation. It now raises at import naming the
+  `staticmethod(...)` fix. `functools.partial` is rejected on every supported
+  Python rather than only where it behaves as a descriptor.
+- **The navigation example adopts `nav_rebuild`.** It repeated an identical
+  rebuild callback at six push and pop call sites; the destinations now name
+  their own once, and one call site keeps an explicit `rebuild=` to show the
+  override winning.
+
+### Fixed
+
+- **`exit_policy` had no effect on the exit controls the library ships.**
+  `make_exit_button`, `add_exit_button`, and `make_nav_row` each passed
+  `delete_message=False` explicitly, which is the one value that stops `exit()`
+  from consulting the policy, so a view declaring `exit_policy = "delete"`
+  froze on close instead of deleting, with nothing to indicate why. All three
+  now default to `None` and defer to the policy; an explicit `True` or `False`
+  still wins. A view left at the `"disable"` default is unaffected.
+- **`StatefulLayoutView.add_exit_button()` silently swallowed unknown
+  keywords**, including typos and the V1-only `row=`. The signature is closed
+  now, so a wrong argument raises at the call site.
+- **`exit_policy` was documented as governing `on_timeout` and the exit-button
+  helpers.** It never governed the former and no longer fails to govern the
+  latter. A timed-out view freezes regardless of the policy, because an expiry
+  is not a close gesture; the guides say so, and `on_timeout` is the override
+  seam for deleting instead.
+- **Persistent views accepted components whose ids change on restart.**
+  `_stabilize_custom_ids` anchors rewritten ids on the view instance, and the
+  rewrite cleared both signals `_validate_custom_ids` used to recognize a
+  missing id, so a panel built from V2 builders passed validation, shipped,
+  and came back with dead buttons after the next restart. The rewrite is now
+  marked and rejected at validation.
+- **Custom-id stabilization stamped ids onto display components.** Every
+  `discord.ui.Item` sets the attribute the walk was gated on, so
+  `TextDisplay`, `Container`, `Separator`, `ActionRow`, and `Section` were all
+  being rewritten. The walk discriminates by type instead.
+- **A composed `custom_id` could exceed Discord's 100-character cap.** The
+  builders append a suffix to the caller's base, and the composites and the
+  id stabilizer compose their own, so a legal input could be pushed over the
+  limit by a string the caller never sees. The builders reject at
+  construction naming the length to trim to, the stabilizer folds the
+  overflow into a digest (it runs inside every `build_ui` and must not
+  raise), and the placement validator backstops every remaining path
+  including hand-built ids.
+- **An empty `TextDisplay` failed the entire message.** Discord requires
+  non-empty `content` and rejects the whole payload, so a formatter hook
+  returning `""` for one entry took down every component beside it. The
+  condition is data-triggered: a leaderboard renders for nine players and
+  fails when a tenth arrives whose optional fields all happen to be absent.
+  `image_section()` now skips empty lines (a Section with one text child and
+  an accessory is legal, so the entry still renders), the leaderboard's
+  no-avatar fallback skips an empty half instead of joining it into a
+  dangling newline, and the placement validator rejects empty content
+  pre-flight for hand-assembled trees. The validator previously enforced
+  TextDisplay's upper bound and every container's lower bound, so the empty
+  case was the one gap in an otherwise symmetric set.
+- **An empty `SelectOption` label or value failed the whole select**, the same
+  shape and the same data-triggered trigger. Both are rejected pre-flight now.
+- **`card`, `action_section`, and `toggle_section` accepted an empty string**
+  and shipped the same doomed `TextDisplay`. All three reject at construction
+  now, naming the builder and the parameter, which points at the formatter
+  that produced the blank rather than at the primitive that carried it.
+- **A `MenuLayoutView` category without a `description` could not be sent.**
+  The field is optional, but the empty string reached a `Section`, which
+  Discord rejects for having no text. The category label renders as the
+  section text when no description is given.
+- **`stats_card` with an empty title rendered a bare `##`.** It now renders no
+  heading at all, matching how the leaderboard's `build_title` treats one.
+- **Modal titles and input labels over Discord's 45-character cap, or empty,
+  failed at modal-open.** Both are stored unchecked by discord.py, so a label
+  built from a schema field or a record name failed only for the data that
+  happened to be long. Both are now construction-time `ValueError`s, and the
+  form's grouped edit label (which doubles as the modal title) falls back to
+  its generic form rather than composing a title the caller never typed.
+- **Refreshes on the channel endpoint ignored mention rules.** `Message.edit`
+  forwards the client-level `AllowedMentions` only when `content` is
+  supplied, which a V2 view never does, so the same view shipped a different
+  mention payload depending on which of the three endpoints the runtime
+  chose, and a bot that configured suppression globally got it on send and
+  lost it on any refresh that took the channel path. All three endpoints now
+  agree, falling back to the client's rules when neither the class attribute
+  nor an explicit argument is set.
+- **Teardown freezes ignored the view's own mention rules.** `on_timeout`,
+  `exit()`'s V2 branch, the empty-stack back clear, and the reopen fallback
+  each re-ship the same mention-bearing tree `refresh()` does, so the last
+  edit a view ever made was the one edit that dropped its
+  `allowed_mentions`.
+- **`validate_placement` could not be validated on five V2 pattern classes.**
+  Each pattern mixin extends the class-attribute tables by naming
+  `_StatefulMixin` directly, and the mixin precedes the concrete V2 class in
+  the MRO, so the entry `StatefulLayoutView` contributes was dropped, and
+  `validate_placement = 0` silently disabled the pre-flight validator with no
+  definition-time error. The tables are resolved across the whole MRO now.
+- **`PersistenceManager.flush_all()` and `close()` were permanent no-ops.**
+  The manager's middleware handle was never assigned, so the Inspector's
+  "Flush to Disk" button, `/cascadeui flush`, and `/cascadeui reset` each
+  reported a write that never reached the debounce buffers.
+- **`InMemoryBackend.row_upsert_many` committed rows from a failed batch.**
+  The SQL backends roll back; the reference implementation did not, and the
+  middleware's retry re-enqueues the whole batch on failure.
+- **`PersistenceSchemaError` was documented but never raised.** The
+  schema-ahead-of-library and missing-migrator conditions raised
+  `PersistenceInitError`, so the `except PersistenceSchemaError` handler the
+  guide shows could not fire. Both now raise the documented type; it shares
+  the `PersistenceError` base, so catching the family is unaffected.
+- **`user_id = 0` disabled `owner_only` on a restored persistent view** and
+  skipped its session re-derivation, the same falsy-versus-absent confusion
+  `scope_key` above resolves.
+- **A raising `on_instance_limit` override leaked the rejected view.** The
+  rollback ran after the hook rather than in a `finally`, so an override that
+  propagates (a documented shape, and what the default hook itself does when
+  there is no interaction to answer on) left the view subscribed and never
+  stopped, permanently under `timeout=None`.
+- **A raising `on_page_changed` or `on_toggle` took down the render.** The V2
+  composites awaited their post-event hooks bare, so a user override that
+  raised left the cursor advanced and the display stale, with the click
+  reported as failed. All five call sites across `PaginatedRegion` and
+  `Collapsible` route through the same fire-and-forget wrapper the view
+  patterns already used, logging the override's error and continuing.
+- **`respond(delete_after=...)` raised on the followup path.** Only
+  `send_message` takes the argument natively, so the same call failed whenever
+  the ack backstop had already consumed the response slot. It works on both
+  paths now.
+- **`respond()` and `open_modal()` raced the same ack backstop.** Both read
+  `interaction.response.is_done()` and then send, and the two are not atomic:
+  a backstop armed outside the interaction lock can take the slot in between,
+  so the check passing did not mean the send would. `open_modal()` then raised
+  `InteractionResponded` out of the callback against a docstring promising a
+  fallback instead. Both now catch it, and Discord's own report of the same
+  race (HTTP 40060), and deliver through the followup path.
+- **`reload()` rebuilt over an armed ephemeral refresh button.** Between the
+  arming edit and the token cliff, an out-of-band reload replaced the button,
+  and the armed flag then dropped every notification that could restore it.
+- **`_safe_defer` propagated `InteractionResponded` on Python 3.10 and 3.11.**
+  It is a sibling of `HTTPException`, not a subclass, so the handler could
+  not see it; on those versions `wait_for` widens the window enough for the
+  auto-defer timer to ack inside the call, turning a benign race into a
+  failed navigation. The docstring already promised a failed ack is never
+  propagated.
+- **`RateLimited` escaped three handlers.** Also a sibling rather than a
+  subclass: it could abort the post-send message re-fetch (leaving a
+  successful send reported as a failure with no `_message`), bypass the
+  `on_role_error` hook, and misroute a restore fetch into the never-retried
+  `failed` bucket.
+- **Twenty-two public names were unreachable from their own subpackage.**
+  `from cascadeui import setup_logging` worked while
+  `from cascadeui.utils import setup_logging` raised `ImportError`, for a name
+  no less public than the thirteen that package did re-export. The same gap
+  hid the grid, composite, and `choice_row` builders in `cascadeui.components`,
+  `@computed` in `cascadeui.state`, and the roles views and typed schemas in
+  `cascadeui.views`. Each subpackage now re-exports every public name defined
+  under it, in both directions.
+- **Corrected `with_error_boundary`, `RetryConfig`, and `safe_execute` in the
+  API reference.** All three documented signatures that raise `TypeError` as
+  written, and `with_error_boundary` was described as swallowing exceptions
+  when it logs and re-raises.
+- **The lobby example claimed a 10-per-Container cap** that does not exist.
+  The only limit is the 40 components per message the library already enforces
+  at `add_item`.
+- **`ChannelSelect` documented its input coercion but not its callback value.**
+  Where `RoleSelect` and `UserSelect` hand back full `Role` and `Member`
+  objects, `ChannelSelect` yields discord.py's `AppCommandChannel` partials,
+  which have no `permissions_for()`. Its `.permissions` attribute holds the
+  invoking user's permissions rather than the bot's, so the obvious repair
+  answers a different question and passes for the admin it should refuse. The
+  docstring now names the callback type and the `resolve()` / `fetch()` idiom.
+- **Ack diagnostics named the clock they measure against.** `elapsed_since`
+  subtracts an interaction's Discord-derived creation time from the local
+  clock, so the printed elapsed carries the host's skew. A host running
+  behind reported under three seconds beside a message about a missed
+  three-second deadline, sending the reader after the wrong cause. Discord
+  enforces the window on its own clock, so only the log line changes.
+- **The missed-ack warning omitted its likeliest cause.** It named event-loop
+  congestion and slow pre-callback work, both of which point at the caller's
+  own code. discord.py sleeps on an exhausted rate-limit bucket inside
+  `HTTPClient.request`, so an earlier HTTP call can hold the interaction with
+  nothing at the call site to show it. The message names that third cause now.
+
+---
+
 ## [3.7.0] - 2026-07-21
 
 ### Added

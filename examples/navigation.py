@@ -92,10 +92,13 @@ class MainMenuView(StatefulView):
         )
 
     async def go_settings(self, interaction):
+        # An explicit rebuild= overrides the destination's own nav_rebuild,
+        # which is how a caller renders one hop differently from the rest.
         await self.push(SettingsView, interaction, rebuild=lambda v: {"embed": v.build_embed()})
 
     async def go_about(self, interaction):
-        await self.push(AboutView, interaction, rebuild=lambda v: {"embed": v.build_embed()})
+        # No rebuild= needed: AboutView names its own via nav_rebuild.
+        await self.push(AboutView, interaction)
 
 
 class SettingsView(StatefulView):
@@ -116,6 +119,10 @@ class SettingsView(StatefulView):
 
     owner_only = True
     auto_defer = True
+    # Every navigation edit into this view renders the same way, so the
+    # view names its own rebuild once instead of each caller repeating
+    # it. push()/pop() fall back to this when given no rebuild= kwarg.
+    nav_rebuild = staticmethod(lambda v: {"embed": v.build_embed()})
     # No Redux state: this view uses session data, not scoped state.
     state_scope = None
     # Manual back button; auto_back_button doesn't call rebuild.
@@ -181,10 +188,10 @@ class SettingsView(StatefulView):
         await self.update_session(dark_mode=not dark)
 
     async def go_nested(self, interaction):
-        await self.push(NestedView, interaction, rebuild=lambda v: {"embed": v.build_embed()})
+        await self.push(NestedView, interaction)
 
     async def go_back(self, interaction):
-        await self.pop(interaction, rebuild=lambda v: {"embed": v.build_embed()})
+        await self.pop(interaction)
 
 
 class NestedView(StatefulView):
@@ -198,6 +205,7 @@ class NestedView(StatefulView):
 
     owner_only = True
     auto_defer = True
+    nav_rebuild = staticmethod(lambda v: {"embed": v.build_embed()})
     state_scope = None
     auto_back_button = False
     # Reads shared_data on push and displays it -- never rebuilds on an external
@@ -234,7 +242,7 @@ class NestedView(StatefulView):
         )
 
     async def go_back(self, interaction):
-        await self.pop(interaction, rebuild=lambda v: {"embed": v.build_embed()})
+        await self.pop(interaction)
 
 
 class AboutView(StatefulView):
@@ -242,6 +250,7 @@ class AboutView(StatefulView):
 
     owner_only = True
     auto_defer = True
+    nav_rebuild = staticmethod(lambda v: {"embed": v.build_embed()})
     state_scope = None
     auto_back_button = False
     # Static page -- no Redux state to react to, so subscribe to nothing.
@@ -272,7 +281,7 @@ class AboutView(StatefulView):
         )
 
     async def go_back(self, interaction):
-        await self.pop(interaction, rebuild=lambda v: {"embed": v.build_embed()})
+        await self.pop(interaction)
 
 
 # // ========================================( Cog )======================================== // #

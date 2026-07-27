@@ -505,9 +505,9 @@ Dispatch multiple actions atomically. Subscribers fire once after all actions
 complete:
 
 ```python
-async with self.batch() as b:
-    await b.dispatch("VOTE_CAST", {"user_id": user_id, "delta": 1})
-    await b.dispatch("VOTE_LOG", {"entry": "User voted +1"})
+async with self.batch():
+    await self.dispatch("VOTE_CAST", {"user_id": user_id, "delta": 1})
+    await self.dispatch("VOTE_LOG", {"entry": "User voted +1"})
 # Single notification cycle fires here
 ```
 
@@ -645,14 +645,18 @@ filter which state changes trigger its rebuild.
 
 ### Invalidation
 
-Force recomputation on next access:
+Invalidation is automatic and there is no manual seam. Each read compares the
+selector's current output against the last one; when they differ the compute
+function re-runs, and when they match the cached value is returned. A value
+therefore cannot go stale while its own inputs are unchanged.
 
 ```python
-store.computed["vote_totals"].invalidate()
+total = store.computed["vote_totals"]   # recomputes only if the slice moved
 ```
 
-This is rarely needed -- the selector-based check handles most cases
-automatically.
+`store.computed[name]` returns the computed **value**, not the cache object.
+`/cascadeui reset` clears every cache at once, which is the only blanket
+invalidation the library offers.
 
 ### Full Example
 
@@ -668,8 +672,7 @@ Enable undo/redo per view:
 ```python
 from cascadeui import UndoMiddleware, get_store
 
-store = get_store()
-store.add_middleware(UndoMiddleware(store))
+await setup_middleware(UndoMiddleware())
 
 class EditableView(StatefulLayoutView):
     enable_undo = True
@@ -695,7 +698,7 @@ stack (standard semantics).
 The store keeps a history of dispatched actions for debugging:
 
 ```python
-history = store.action_history  # List of recent actions
+history = store.history  # List of recent actions
 ```
 
 The [DevTools Inspector](devtools.md) visualizes this history on the History

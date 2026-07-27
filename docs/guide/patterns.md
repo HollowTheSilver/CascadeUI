@@ -106,7 +106,7 @@ parameter:
 | `label` | Yes | Button label |
 | `view` | Yes | View class to push to |
 | `emoji` | No | Button/section emoji |
-| `description` | No | V2 only -- text displayed in the `action_section` |
+| `description` | No | V2 only: text displayed in the `action_section`. Without one, the label renders as the section text |
 | `style` | No | Per-category `ButtonStyle` override (falls back to `menu_style`) |
 | `rebuild` | No | Per-category rebuild callable for `push(rebuild=...)` |
 
@@ -165,8 +165,9 @@ async def on_category_selected(self, category, index, interaction):
 
 **`build_header()` / `build_footer()`** (V2 only) -- return V2
 components for areas above and below the category list. The former
-underscore-prefixed names remain as deprecated aliases; existing
-overrides keep rendering.
+underscore-prefixed names (`_build_header()` / `_build_footer()`) were
+removed; rename any remaining override to the public name, which takes
+the same arguments and returns the same shape.
 
 ```python
 def build_header(self):
@@ -511,7 +512,11 @@ for custom formatting:
 
 ```python
 class MyWizard(WizardLayoutView):
-    step_indicator_label = lambda current, total: f"Phase {current} of {total}"
+    # staticmethod is required: a bare lambda in a class body binds as a
+    # method and would receive self as its first argument.
+    step_indicator_label = staticmethod(
+        lambda current, total: f"Phase {current} of {total}"
+    )
 ```
 
 ### Progress header (V2)
@@ -527,8 +532,10 @@ class SetupWizard(WizardLayoutView):
     show_progress_bar = True
 
     def _build_progress_header(self):
+        # step_indicator_label defaults to None, so a subclass that has not
+        # set it renders the label itself rather than calling through.
         return card(
-            f"## {self.step_indicator_label(self.current_step + 1, self.step_count)}",
+            f"## Step {self.current_step + 1} of {self.step_count}",
             progress_bar(self.current_step + 1, self.step_count),
         )
 ```
@@ -809,9 +816,9 @@ Each navigation button exposes a `{label, emoji, style}` triple:
 | `prev_button_label` | `"◀"` | Previous page button |
 | `prev_button_emoji` | `None` | |
 | `prev_button_style` | `secondary` | |
-| `indicator_button_label` | `None` (auto) | Page indicator / go-to button |
-| `indicator_button_emoji` | `None` | |
-| `indicator_button_style` | `primary` | |
+| `indicator_button_label` | `None` (auto) | Page indicator and go-to button |
+| `indicator_button_emoji` | `None` | Go-to button only |
+| `indicator_button_style` | `primary` | Go-to button only |
 | `next_button_label` | `"▶"` | Next page button |
 | `next_button_emoji` | `None` | |
 | `next_button_style` | `secondary` | |
@@ -823,6 +830,11 @@ Each navigation button exposes a `{label, emoji, style}` triple:
 When the page count reaches `jump_threshold` or above, three extra
 controls appear: first-page and last-page jump buttons, and a
 go-to-page modal triggered by clicking the page indicator.
+
+Below that threshold the indicator is a disabled button that always renders
+`secondary` with no emoji, since a disabled button in an accent colour reads
+as one that is broken. `indicator_button_label` still applies; the style and
+emoji reach the clickable go-to button only.
 
 ### `set_page(n)`
 
@@ -852,9 +864,14 @@ Hook for adding components below the navigation buttons. Called once
 during init. Items added here are preserved across page turns:
 
 ```python
+async def _on_refresh(self, interaction):
+    # reload() takes no positional, so it cannot be a callback directly;
+    # a button callback is always invoked as callback(interaction).
+    await self.reload()
+
 def _build_extra_items(self):
     self.add_item(ActionRow(
-        StatefulButton(label="Refresh", callback=self.reload),
+        StatefulButton(label="Refresh", callback=self._on_refresh),
     ))
 ```
 
@@ -963,7 +980,7 @@ the gists do not. Migration map for users coming from those gists:
 | `per_page` | same -- `from_data(items, per_page=N)` |
 | Pages wrapped in a Container with buttons inside | `nav_inside_container = True` |
 | Push paginator from a button click | `await self.push(await Paginator.from_data(...), interaction, ...)` -- `push` accepts the pre-constructed instance directly |
-| Timeout cleanup | `exit_policy = "delete"` / `"disable"` |
+| Timeout cleanup | automatic -- a timed-out view freezes its components; override `on_timeout` to delete instead |
 
 CascadeUI adds beyond the gists:
 

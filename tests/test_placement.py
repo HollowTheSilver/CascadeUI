@@ -27,6 +27,8 @@ from helpers import make_interaction
 
 from cascadeui import (
     StatefulButton,
+    StatefulLayoutView,
+    StatefulView,
     action_section,
     alert,
     button_row,
@@ -755,3 +757,183 @@ class TestCheckPlacementUniqueIdsWiring:
         with pytest.raises(ValueError, match="Duplicate component custom_id"):
             await view.send()
         assert view.id not in store.subscribers
+
+
+class TestEmptyTextDisplay:
+    """An empty TextDisplay fails the whole message, so it is caught pre-flight.
+
+    Discord's text display requires non-empty ``content``. discord.py stores
+    it unchecked, so a formatter hook returning ``""`` for one entry sends a
+    tree that Discord rejects entirely, every component beside it included.
+    """
+
+    def test_empty_content_rejected(self):
+        v = _view_with(Container(TextDisplay("")))
+        with pytest.raises(ValueError, match="TextDisplay content is empty"):
+            validate_placement(v)
+
+    def test_whitespace_content_allowed(self):
+        """Only truly empty content is rejected; Discord accepts whitespace."""
+        validate_placement(_view_with(Container(TextDisplay(" "))))
+
+    def test_error_names_the_path(self):
+        v = _view_with(Container(TextDisplay("fine"), TextDisplay("")))
+        with pytest.raises(ValueError, match="Path:"):
+            validate_placement(v)
+
+
+class TestEmptySelectOptionText:
+    """SelectOption label and value are required and displayed.
+
+    Same shape as the empty-TextDisplay case: an option built from a
+    record whose name field happens to be blank fails the whole select.
+    """
+
+    def test_empty_label_rejected(self):
+        v = _view_with(
+            ActionRow(Select(custom_id="s", options=[SelectOption(label="", value="x")]))
+        )
+        with pytest.raises(ValueError, match="SelectOption label is empty"):
+            validate_placement(v)
+
+    def test_empty_value_rejected(self):
+        v = _view_with(
+            ActionRow(Select(custom_id="s", options=[SelectOption(label="L", value="")]))
+        )
+        with pytest.raises(ValueError, match="SelectOption value is empty"):
+            validate_placement(v)
+
+    def test_populated_option_passes(self):
+        validate_placement(
+            _view_with(
+                ActionRow(Select(custom_id="s", options=[SelectOption(label="L", value="v")]))
+            )
+        )
+
+
+class TestValidationTableMroUnion:
+    """Class-attribute tables resolve across the whole MRO.
+
+    Each pattern mixin extends a table by naming ``_StatefulMixin``
+    directly, and the mixin precedes the concrete V2 class in the MRO, so
+    a plain attribute read returns the mixin's copy and silently drops
+    whatever the concrete class added. ``validate_placement`` is declared
+    on ``StatefulLayoutView``, which is exactly the position that loses.
+
+    Asserting against ``StatefulLayoutView`` alone cannot see this: that
+    class declares the entry itself, so it passes either way. These tests
+    target the classes where the bug actually lived.
+    """
+
+    @pytest.mark.parametrize(
+        "cls_name",
+        [
+            "LeaderboardLayoutView",
+            "MenuLayoutView",
+            "PaginatedLayoutView",
+            "WizardLayoutView",
+            "TabLayoutView",
+        ],
+    )
+    def test_validate_placement_rejected_on_every_pattern_class(self, cls_name):
+        import cascadeui
+
+        cls = getattr(cascadeui, cls_name)
+        with pytest.raises(ValueError, match="validate_placement must be a bool"):
+            type("_Bad", (cls,), {"validate_placement": "yes"})
+
+    def test_falsy_value_cannot_silently_disable_the_validator(self):
+        """``validate_placement = 0`` is the shape that shipped: a bool-ish
+        value that turns the pre-flight validator off with no error.
+        """
+        from cascadeui import LeaderboardLayoutView
+
+        with pytest.raises(ValueError, match="validate_placement must be a bool"):
+            type("_Off", (LeaderboardLayoutView,), {"validate_placement": 0})
+
+    def test_effective_table_unions_tuple_declarations(self):
+        from cascadeui import PaginatedLayoutView
+
+        table = PaginatedLayoutView._effective_table("_BOOL_ATTRS")
+        # Contributed by StatefulLayoutView, which the mixin's splat omits.
+        assert "validate_placement" in table
+        # Contributed by _StatefulMixin, reached through the mixin's splat.
+        assert "owner_only" in table
+
+    def test_effective_table_merges_dict_declarations(self):
+        """``_ENUM_ATTRS`` maps name -> allowed values, so the merge has to
+        carry the values through, not just the keys; otherwise membership
+        succeeds and the lookup raises KeyError.
+        """
+        from cascadeui import LeaderboardLayoutView
+
+        table = LeaderboardLayoutView._effective_table("_ENUM_ATTRS")
+        assert table["instance_policy"] == {"reject", "replace"}
+        assert "entry_layout" in table
+
+    def test_non_splatting_mixin_still_gets_the_directed_error(self):
+        """A mixin that declares its own table without splatting the base is
+        the shape that turned a typo into a KeyError.
+        """
+        from cascadeui import StatefulLayoutView
+
+        class _Mixin:
+            _ENUM_ATTRS = {"conc_policy": {"a", "b"}}
+
+        class _View(_Mixin, StatefulLayoutView):
+            pass
+
+        with pytest.raises(ValueError, match="instance_policy must be one of"):
+            type("_Bad", (_View,), {"instance_policy": "rejct"})
+
+
+# // ========================================( Class )======================================== // #
+
+
+class TestPublicValidate:
+    """``view.validate()`` is the public entry to the pre-flight checks.
+
+    A consumer testing a view offline needs to build the tree, count it, and
+    validate it without a Discord connection. Composing and counting were
+    already public (``on_load`` / ``build_ui`` and ``walk_children``);
+    validation was not, so a test had to reach ``_check_placement``.
+    """
+
+    @staticmethod
+    def _cascade_view(*items):
+        """A CascadeUI view: ``validate()`` lives on the mixin, not LayoutView."""
+        v = StatefulLayoutView(user_id=1, guild_id=2)
+        for item in items:
+            v.add_item(item)
+        return v
+
+    async def test_validate_passes_a_composed_view(self):
+        view = self._cascade_view(Container(TextDisplay("Ready")))
+        view.validate()
+
+    async def test_validate_rejects_an_empty_text_display(self):
+        # Discriminating rather than inert: the same tree with one blank node.
+        view = self._cascade_view(Container(TextDisplay("")))
+        with pytest.raises(ValueError, match="content is empty"):
+            view.validate()
+
+    async def test_validate_covers_v1_uniqueness(self):
+        # V1 views never run the structural walk, so this proves validate()
+        # is not merely a validate_placement alias.
+        async def _cb(interaction):
+            pass
+
+        view = StatefulView(user_id=1, guild_id=2)
+        view.add_item(StatefulButton(label="A", custom_id="dup", callback=_cb))
+        view.add_item(StatefulButton(label="B", custom_id="dup", callback=_cb))
+        with pytest.raises(ValueError, match="Duplicate component custom_id"):
+            view.validate()
+
+    async def test_validate_delegates_to_check_placement(self):
+        # The public entry must stay a thin wrapper; a divergent second
+        # implementation is how the two would drift apart.
+        calls = []
+        view = self._cascade_view(Container(TextDisplay("Ready")))
+        view._check_placement = lambda: calls.append(1)
+        view.validate()
+        assert calls == [1]

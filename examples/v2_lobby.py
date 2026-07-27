@@ -124,6 +124,10 @@ class LobbyView(StatefulLayoutView):
     participant_limit_message = "This lobby is full."
     timeout = LOBBY_TIMEOUT
     exit_policy = "delete"
+    # The roster rebuilds on every Join and Leave, so without this each
+    # click re-notifies everyone already listed. The full-lobby and
+    # replacement notices are separate sends and still ping.
+    allowed_mentions = discord.AllowedMentions.none()
     # One lobby per host. Opening a new lobby replaces the old one.
     instance_limit = 1
     instance_scope = "user"  # one lobby per host across all guilds
@@ -215,8 +219,7 @@ class LobbyView(StatefulLayoutView):
         # Filled slots are numbered mention lines; open slots render as
         # subtext so the remaining capacity is visible at a glance. The
         # heading shares the roster TextDisplay instead of adding its own,
-        # keeping the card under Discord's 10-per-Container cap with room
-        # to grow.
+        # so a growing roster stays clear of the 40-component message cap.
         roster_lines = [f"### Players", f"1. {host_mention} *(host)*"]
         for idx, uid in enumerate(sorted(self.participants), start=2):
             roster_lines.append(f"{idx}. <@{uid}>")

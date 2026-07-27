@@ -36,12 +36,13 @@ Dispatched by `_register_state()` during `send()`. Creates the view's entry in
 | `view_type` | `str` | Class name (e.g. `"SettingsView"`) |
 | `user_id` | `int \| None` | Owner's Discord user ID |
 | `session_id` | `str \| None` | Session this view belongs to |
+| `guild_id` | `int \| None` | Guild the view was created in |
 | `props` | `dict` | Extra properties passed at creation |
-| `message_id` | `str \| None` | Discord message ID after send |
-| `channel_id` | `str \| None` | Discord channel ID |
 
 **State change:** Writes to `state["views"][view_id]` and appends `view_id` to
-`state["sessions"][session_id]["views"]`.
+`state["sessions"][session_id]["members"]`. The view record carries `message_id`
+and `channel_id` fields, but they arrive later via `VIEW_UPDATED` once the
+message exists; they are not part of this payload.
 
 ---
 
@@ -100,11 +101,12 @@ session entry if one does not already exist.
 |-----|------|-------------|
 | `session_id` | `str` | Session identifier. Default shape is `<module.QualName>:user_<id>:<8hex>` (the 8-hex suffix isolates repeat opens); views that set `session_continuity = True` drop the suffix and produce `<module.QualName>:user_<id>` |
 | `user_id` | `int \| None` | Session owner |
-| `data` | `dict` | Initial session data |
+| `guild_id` | `int \| None` | Guild the session belongs to |
+| `shared_data` | `dict` | Initial session data |
 
-**State change:** Writes to `state["sessions"][session_id]` with empty `views`,
-`history`, and `data` fields. Skips if the session already exists (idempotent
-for push/pop chains that share a session).
+**State change:** Writes to `state["sessions"][session_id]` with empty `members`,
+`history`, and `shared_data` fields. Skips if the session already exists
+(idempotent for push/pop chains that share a session).
 
 ---
 
@@ -132,11 +134,11 @@ ephemeral and not persisted across restarts.
 | Key | Type | Description |
 |-----|------|-------------|
 | `session_id` | `str` | Target session |
-| `data` | `dict` | Fields to shallow-merge into the session's `data` dict |
+| `shared_data` | `dict` | Fields to shallow-merge into the session's `shared_data` dict |
 
-**State change:** Shallow-merges `payload["data"]` into
-`state["sessions"][session_id]["data"]` and sets `updated_at`. No-op if the
-session does not exist.
+**State change:** Shallow-merges `payload["shared_data"]` into
+`state["sessions"][session_id]["shared_data"]` and sets `updated_at`. No-op if
+the session does not exist.
 
 ---
 

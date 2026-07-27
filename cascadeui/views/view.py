@@ -23,6 +23,7 @@ class StatefulView(_StatefulMixin, View):
         embeds: Optional[Sequence[Embed]] = None,
         file: Optional[discord.File] = None,
         files: Optional[Sequence[discord.File]] = None,
+        allowed_mentions: Optional[discord.AllowedMentions] = None,
         ephemeral: bool = False,
     ):
         """Send this view as a message using the stored context or interaction.
@@ -40,6 +41,9 @@ class StatefulView(_StatefulMixin, View):
             files: Sequence of attachments uploaded with the message.
                 Mutually exclusive with ``file``. discord.py raises
                 ``TypeError`` when both are supplied.
+            allowed_mentions: Mention rules for this message. Overrides
+                the ``allowed_mentions`` class attribute; when both are
+                ``None`` the bot's client-level rules apply.
             ephemeral: Whether the message should be ephemeral
                 (interaction-context only).
 
@@ -62,5 +66,8 @@ class StatefulView(_StatefulMixin, View):
             send_kwargs["file"] = file
         if files is not None:
             send_kwargs["files"] = files
+        mentions = self._resolve_allowed_mentions(allowed_mentions)
+        if mentions is not None:
+            send_kwargs["allowed_mentions"] = mentions
 
         return await self._send_pipeline(send_kwargs, ephemeral=ephemeral)

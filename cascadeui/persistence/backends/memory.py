@@ -115,8 +115,19 @@ class InMemoryBackend:
         # No round-trip to batch for the in-memory store -- per-row upsert
         # is O(1) amortized, and delegating keeps copy-on-store and conflict
         # semantics identical to row_upsert.
-        for row in rows:
-            await self.row_upsert(namespace, row, key_columns)
+        #
+        # The snapshot is what makes the batch all-or-nothing, matching the
+        # SQL backends' rollback. The middleware's retry re-enqueues the
+        # whole batch, so a partial commit here would be re-applied on top
+        # of itself. This backend is also the reference implementation, so
+        # a new backend author reading it should see the contract honored.
+        snapshot = [dict(existing) for existing in self._rows.get(namespace, [])]
+        try:
+            for row in rows:
+                await self.row_upsert(namespace, row, key_columns)
+        except Exception:
+            self._rows[namespace] = snapshot
+            raise
 
     async def row_select(
         self,

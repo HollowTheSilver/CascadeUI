@@ -128,7 +128,6 @@ class RegistryPersistence:
 
     backend: Optional[PersistenceBackend]
 
-    _logical_name: ClassVar[str] = NAMESPACE_REGISTRY
     _required_capabilities: ClassVar[Capability] = Capability.RELATIONAL | Capability.SCHEMA_META
 
     def __post_init__(self) -> None:
@@ -170,8 +169,6 @@ class ApplicationPersistence:
     backend: Optional[PersistenceBackend]
     slots: dict[str, SlotPolicy] = field(default_factory=dict)
 
-    _logical_name: ClassVar[str] = NAMESPACE_APPLICATION
-
     def __post_init__(self) -> None:
         # Validate slots mapping shape first so error messages point at
         # the user-authored config, not a downstream capability mismatch.
@@ -199,4 +196,4 @@ class ApplicationPersistence:
 
         _validate_capabilities(type(self).__name__, required, self.backend)
         # Record the effective required set for introspection + tests.
-        object.__setattr__(self, "_required_capabilities", required)
+        self._required_capabilities = required

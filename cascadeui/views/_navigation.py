@@ -11,6 +11,11 @@ from ..state.actions import ActionCreators
 
 logger = logging.getLogger(__name__)
 
+# Deduped per (source class, destination class) pair: the mismatch is a
+# property of the stack shape, so one warning per edge is enough however
+# many times a user walks it.
+_exit_policy_mismatch_warned: set = set()
+
 
 # // ========================================( Mixin )======================================== // #
 
@@ -173,6 +178,12 @@ class _NavigationMixin:
                     new_view.interaction = current_interaction
 
             new_view._ephemeral = self._ephemeral
+            # Push and pop reuse one message, so a policy disagreement decides
+            # the same message's teardown by depth. replace() sends a new
+            # message and tears the source down under replace_policy, so a
+            # differing policy there is coherent and not worth a warning.
+            if action_type != "NAVIGATION_REPLACE":
+                self._warn_on_exit_policy_mismatch(new_view)
 
             # Rebind the batch source so BATCH_COMPLETE carries the new
             # view's id -- ``_notify_subscribers`` awards the inline
@@ -244,10 +255,7 @@ class _NavigationMixin:
             # The membership-check guard makes the propagation idempotent for
             # pre-constructed instances that already hold participants.
             if action_type != "NAVIGATION_REPLACE" and self._participants:
-                for pid in self._participants:
-                    if pid not in new_view._participants:
-                        new_view._participants.add(pid)
-                        self.state_store._register_participant(new_view, pid)
+                self._carry_participants_to(new_view)
 
             # Register the new view in state BEFORE destroying the old one.
             # This keeps session["members"] non-empty during the transition
@@ -270,17 +278,7 @@ class _NavigationMixin:
             # every other state mutation, rather than writing into the live
             # state["views"] row in place.
             if action_type in ("NAVIGATION_PUSH", "NAVIGATION_POP"):
-                old_view_state = self.state_store.state.get("views", {}).get(self.id, {})
-                stack_updates = {}
-                if old_view_state.get("undo_stack"):
-                    stack_updates["undo_stack"] = list(old_view_state["undo_stack"])
-                if old_view_state.get("redo_stack"):
-                    stack_updates["redo_stack"] = list(old_view_state["redo_stack"])
-                if stack_updates:
-                    await new_view.dispatch(
-                        "VIEW_UPDATED",
-                        ActionCreators.view_updated(new_view.id, **stack_updates),
-                    )
+                await self._carry_undo_stacks_to(new_view)
 
             # Remove the old view from state. _destroy_view drops its
             # active-registry entry once the state removal confirms, completing
@@ -421,7 +419,9 @@ class _NavigationMixin:
         views need post-construction setup (V2 views that build empty
         and need ``v.build_ui()``, V1 views that need to return an
         ``embed``/``content`` dict). When ``rebuild`` returns a dict,
-        its contents flow into the edit as extra kwargs.
+        its contents flow into the edit as extra kwargs, limited to the
+        ones every edit endpoint accepts (``content``, ``embed``,
+        ``embeds``, ``attachments``, ``allowed_mentions``).
 
         The destination tree is built BEFORE the interaction is acked so
         the fast path can edit + ack in one round-trip via
@@ -460,6 +460,10 @@ class _NavigationMixin:
                 result = await result
             if isinstance(result, dict):
                 edit_kwargs = result
+                # This dict reaches whichever of the three edit endpoints
+                # the runtime picks, so it is held to the same portable set
+                # refresh() enforces.
+                new_view._reject_non_portable_edit_kwargs(edit_kwargs)
 
         # Pre-flight check on the new view's assembled tree. Catches the
         # same class of HTTP 400 the validator catches in send/refresh:
@@ -515,6 +519,15 @@ class _NavigationMixin:
                 )
                 return False
 
+        # The destination's mention rules ride the two direct edits below.
+        # They stay out of edit_kwargs deliberately: the refresh() paths above
+        # and below inject their own, and a non-empty kwargs dict there would
+        # defeat refresh()'s digest short-circuit on every navigation.
+        nav_mentions = new_view._resolve_allowed_mentions(None)
+        direct_kwargs = dict(edit_kwargs)
+        if nav_mentions is not None:
+            direct_kwargs["allowed_mentions"] = nav_mentions
+
         # Fast path: a component/modal interaction whose response slot is still
         # open edits + acks in one request -- no separate defer round-trip, which
         # was the source of the navigation pause. Bounded at the ack deadline via
@@ -529,7 +542,7 @@ class _NavigationMixin:
         if fast_eligible and not current_interaction.response.is_done():
             try:
                 await self._ack_bounded(
-                    current_interaction.response.edit_message(view=new_view, **edit_kwargs)
+                    current_interaction.response.edit_message(view=new_view, **direct_kwargs)
                 )
                 return True
             except asyncio.TimeoutError:
@@ -566,7 +579,7 @@ class _NavigationMixin:
         await self._safe_defer(current_interaction)
         try:
             msg = await self._bounded(
-                current_interaction.edit_original_response(view=new_view, **edit_kwargs)
+                current_interaction.edit_original_response(view=new_view, **direct_kwargs)
             )
             # Preserve the parent's plain Message ref. The edit response
             # is an InteractionMessage / WebhookMessage bound to the
@@ -634,20 +647,7 @@ class _NavigationMixin:
             #
             # Snapshot: attach_child prunes the source's list as it
             # re-parents each child onto the destination.
-            for child in list(self._attached_children):
-                if child is new_view:
-                    # The destination taking over the message supersedes its
-                    # old child link; attach_child rejects self-attachment.
-                    continue
-                new_view.attach_child(child)
-            parent = self._attached_to
-            if parent is not None and not parent.is_finished():
-                parent.attach_child(new_view)
-                try:
-                    parent._attached_children.remove(self)
-                except ValueError:
-                    pass
-            self._attached_to = None
+            self._carry_attachments_to(new_view)
 
             await self._commit_source_teardown()
             # The source's arm timer was cancelled in _navigate_to and the
@@ -752,6 +752,39 @@ class _NavigationMixin:
         # after recomposing their own component tree.
         self._auto_back_item = button
         self.add_item(button)
+
+    def _warn_on_exit_policy_mismatch(self, new_view) -> None:
+        """Warn once when a navigation step changes ``exit_policy``.
+
+        ``exit_policy`` is declared per class, but push and pop edit ONE
+        message in place, so a stack whose screens disagree tears the same
+        message down differently depending on how deep the user happened to
+        go. Each class is individually valid, so nothing at class-definition
+        time can see the disagreement; the stack is the only place it exists.
+
+        A warning rather than a carried-forward value: a destination that
+        deliberately differs (a confirmation screen that should delete while
+        the hub freezes) is a legitimate shape, and silently overriding it
+        would break that. Declaring the policy on a shared base is the fix
+        when every depth should agree.
+        """
+        try:
+            if self.exit_policy == new_view.exit_policy:
+                return
+            edge = (type(self).__name__, type(new_view).__name__)
+            if edge in _exit_policy_mismatch_warned:
+                return
+            _exit_policy_mismatch_warned.add(edge)
+            logger.warning(
+                f"{edge[0]}.exit_policy={self.exit_policy!r} but "
+                f"{edge[1]}.exit_policy={new_view.exit_policy!r}. Navigation "
+                f"edits one message in place, so Exit behaves differently "
+                f"depending on the depth the user reached. Declare the policy "
+                f"on a shared base class when every screen should agree."
+            )
+        except AttributeError:
+            # A view type without the attribute has nothing to disagree about.
+            return
 
     def _restore_navigation_artifacts(self) -> None:
         """Re-add auto-added navigation items stripped by ``clear_items()``.

@@ -487,3 +487,35 @@ class TestSQLiteBatchAtomicity:
         v = await b.get_schema_version(TABLE_PERSISTENT_VIEWS)
         await b.close()
         assert v == 2
+
+
+class TestInMemoryBatchAtomicity:
+    """The reference backend honors the all-or-nothing batch contract.
+
+    The middleware's retry re-enqueues the whole batch, so a partial
+    commit would be re-applied on top of itself. This backend is also
+    what a new backend author reads to learn the contract.
+    """
+
+    async def test_failed_batch_commits_nothing(self):
+        from cascadeui.persistence.backends.memory import InMemoryBackend
+
+        backend = InMemoryBackend()
+        await backend.initialize()
+        await backend.row_upsert("ns", {"k": "pre", "v": 0}, ["k"])
+
+        with pytest.raises(Exception):
+            await backend.row_upsert_many(
+                "ns", [{"k": "a", "v": 1}, {"k": "b", "v": 2}, "malformed"], ["k"]
+            )
+
+        assert [r["k"] for r in await backend.row_select("ns")] == ["pre"]
+
+    async def test_successful_batch_still_commits(self):
+        from cascadeui.persistence.backends.memory import InMemoryBackend
+
+        backend = InMemoryBackend()
+        await backend.initialize()
+        await backend.row_upsert_many("ns", [{"k": "a"}, {"k": "b"}], ["k"])
+
+        assert sorted(r["k"] for r in await backend.row_select("ns")) == ["a", "b"]

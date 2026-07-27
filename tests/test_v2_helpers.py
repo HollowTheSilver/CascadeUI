@@ -250,9 +250,12 @@ class TestKeyValue:
         result = key_value({"Members": 42, "Roles": 5})
         assert result.content == "**Members:** 42\n**Roles:** 5"
 
-    def test_empty_dict(self):
-        result = key_value({})
-        assert result.content == ""
+    def test_empty_dict_rejected(self):
+        # An empty dict produced a TextDisplay with no content, which Discord
+        # rejects along with every component beside it. The old assertion here
+        # (content == "") documented the shape that fails at send.
+        with pytest.raises(ValueError, match="key_value"):
+            key_value({})
 
     def test_non_string_values(self):
         result = key_value({"Count": 42, "Active": True})
