@@ -44,7 +44,9 @@ These methods are available on all view classes (V1 and V2):
 
 #### `send(...)`
 
-Sends the view as a message. V1 accepts `content`, `embed`, `embeds`, `file`, `files`, `ephemeral`. V2 accepts `file`, `files`, `ephemeral` (V2 sends the view as its own content, so no content/embed params). The `file` / `files` pair mirrors discord.py's `Messageable.send` signature and pairs with the V2 media builders (`gallery`, `image_section`, `file_attachment`) for `attachment://` references. See [Local file attachments](../guide/components.md#local-file-attachments).
+Sends the view as a message. V1 accepts `content`, `embed`, `embeds`, `file`, `files`, `allowed_mentions`, `ephemeral`. V2 accepts `file`, `files`, `allowed_mentions`, `ephemeral` (V2 sends the view as its own content, so no content/embed params). The `file` / `files` pair mirrors discord.py's `Messageable.send` signature and pairs with the V2 media builders (`gallery`, `image_section`, `file_attachment`) for `attachment://` references. See [Local file attachments](../guide/components.md#local-file-attachments).
+
+`allowed_mentions` overrides the [`allowed_mentions` class attribute](#allowed_mentions) for one send. When both are `None`, the bot's client-level rules apply.
 
 The V1 patterns (`PaginatedView`, `TabView`, `WizardView`, `FormView`, `MenuView`) supply their own content when the caller passes neither `embed` nor `content`, so `await view.send()` renders the first page, tab, step, or hub card. An explicit `embed=` or `content=` wins. See [View Patterns](../guide/patterns.md).
 
@@ -60,9 +62,26 @@ In each case, the view is fully cleaned up -- no message was sent, no state rema
 
 Dispatches an action through the store with `source=self.id`. Subscriber failures are caught and logged internally -- `dispatch()` does not raise from subscriber errors.
 
+#### `validate()`
+
+Raises `ValueError` if the view's component tree is one Discord would reject: `custom_id` uniqueness and length on every interactive node, and, for V2 views, the structural placement walk.
+
+```python
+view = MyLeaderboard(user_id=1, guild_id=2)
+await view.on_load()          # composes the tree
+view.validate()               # raises if Discord would reject it
+
+nodes = sum(1 for _ in view.walk_children())
+assert nodes <= 40            # the per-message component cap
+```
+
+These are the same checks the library runs itself at three seams: the initial send, every `refresh()`, and every push/pop edit. `validate()` adds no check of its own and enforces nothing at runtime that was not already enforced; it exists so a test can reach them without a Discord connection.
+
 #### `refresh(**kwargs)`
 
 Edits the view's message with `view=self` plus any extra kwargs forwarded to `message.edit()`. Does NOT rebuild components -- call your rebuild method (e.g. `build_ui()`) first. Handles `discord.NotFound` silently if the message has been deleted. V2 callers pass no args; V1 callers pass `embed=` or `content=`.
+
+Only kwargs every edit endpoint accepts are allowed: `content`, `embed`, `embeds`, `attachments`, `allowed_mentions`. `refresh()` picks between the interaction, webhook, and channel endpoints at runtime, so a kwarg only one of them takes (`suppress`, `suppress_embeds`, `delete_after`) raises `TypeError` rather than working intermittently. Edit `view.message` directly for a one-off that needs a non-portable field.
 
 #### `respond(interaction, content=None, *, ephemeral=False, **kwargs)`
 
@@ -211,17 +230,19 @@ view = LobbyView(context=ctx)
 view.set_class_attribute("participant_limit", player_count)
 ```
 
-#### `make_exit_button(label="Exit", style=ButtonStyle.secondary, emoji="❌", delete_message=False, custom_id=None)`
+#### `make_exit_button(label="Exit", style=ButtonStyle.secondary, emoji="❌", delete_message=None, custom_id=None, row=None)`
 
-Returns a pre-configured `StatefulButton` without adding it to the view. Use in V2 views that need to place exit buttons inside specific `ActionRow` or `Container` subtrees rather than at the top level. `add_exit_button()` continues to work for top-level placement.
+Returns a pre-configured `StatefulButton` without adding it to the view. Use in V2 views that need to place exit buttons inside specific `ActionRow` or `Container` subtrees rather than at the top level. `add_exit_button()` continues to work for top-level placement. `delete_message=None` (the default) defers to the `exit_policy` class attribute.
 
 #### `make_back_button(label="Back", style=ButtonStyle.secondary, emoji="◀", custom_id=None, row=None)`
 
 Returns an unattached `StatefulButton` whose callback pops the navigation stack. The matched pair to `make_exit_button()` -- pack it into a caller-owned `ActionRow` or `Container` subtree. For the top-level auto-injected case, set `auto_back_button = True` instead.
 
-#### `add_exit_button(label="Exit", style=ButtonStyle.secondary, row=None, emoji="❌", delete_message=False, custom_id=None)`
+#### `add_exit_button(label="Exit", style=ButtonStyle.secondary, row=None, emoji="❌", delete_message=None, custom_id=None)`
 
-Adds an exit button that calls `self.exit()`. In V2 views, the button is wrapped in an `ActionRow`. Set `delete_message=True` to delete the message instead of disabling components. Pass `custom_id` for persistent views.
+Adds an exit button that calls `self.exit()`. In V2 views, the button is wrapped in an `ActionRow`. `delete_message=None` (the default) defers to the `exit_policy` class attribute; pass `True` or `False` to override it for this button. Pass `custom_id` for persistent views.
+
+`row` is V1-only. V2 lays out by tree position rather than row index, so the V2 override does not accept it and raises `TypeError` if it is passed.
 
 #### `await exit(delete_message=None)`
 
@@ -383,7 +404,7 @@ Called before every component callback. Returns `True` to allow, `False` to bloc
 - `allowed_users` (frozenset[int]): When non-empty, only these user IDs can interact. Overrides `owner_only` completely. Empty (default) defers to `owner_only`. Stored as a `frozenset` and exposed via a property pair: assignment coerces both `int` and snowflake-shaped objects (`Member`, `User`, `Object`) at the setter, so `view.allowed_users = {member, 12345}` works. Direct mutation is unsupported -- to add a user after construction, use `await view.register_participant(user_id)` (which writes to `_participants`, not `allowed_users`) or rebind the attribute: `view.allowed_users = view.allowed_users | {new_id}`.
 - `participant_limit` (int | None): Maximum total view occupants (owner + participants). `None` (default) means unlimited. Owner counts toward the cap, so `participant_limit = 8` admits one host plus seven joiners. Enforced inside `register_participant`.
 - `participant_limit_message` (str): Ephemeral message sent when `register_participant` rejects a joiner due to view-capacity overflow (default: `"This session is full."`). Used by the default `on_participant_limit` hook.
-- `auto_register_participants` (bool): When `True`, `send()` iterates `allowed_users` and calls `register_participant` for each non-owner before the Discord send. All-or-nothing rollback: any rejection unregisters every previously-claimed slot AND `state_store.unregister_view(self.id)`, then `send()` returns `None`. A rejection therefore leaves zero side effects -- no message, no registry entry, no half-claimed participants. Default: `False`.
+- `auto_register_participants` (bool): When `True`, `send()` iterates `allowed_users` and calls `register_participant` for each non-owner before the Discord send. All-or-nothing rollback: any rejection unregisters every previously-claimed slot and tears the view back out of the registry, then `send()` returns `None`. A rejection therefore leaves zero side effects: no message, no registry entry, no half-claimed participants. Default: `False`.
 - `protect_attached` (bool): When `True` (default), views with active participants or attached children from other users are excluded from replacement candidates during instance enforcement. If no replaceable views remain, falls back to reject behavior (`on_instance_limit` fires). Same-user attachments do not trigger protection. Has no effect on views without attachments or when `instance_policy = "reject"`. Set to `False` for views where silent replacement is expected (e.g. spectator panels).
 - `replaced_message` (str | None): Static message sent to the channel when this view is replaced and has active participants. `None` (default) means silent replacement. Used by the default `on_replaced` hook.
 - `replace_policy` (str): What `instance_policy="replace"` does to the old view's message. `"delete"` (default) removes it; `"disable"` freezes its components in place. Only governs the instance-replace transition.
@@ -395,6 +416,29 @@ Called before every component callback. Returns `True` to allow, `False` to bloc
 - `serialize_interactions` (bool): Serialize rapid button clicks with an `asyncio.Lock` (default: `True`). Set to `False` for views that handle parallel callbacks.
 - `edit_timeout` (float | None): Maximum seconds any single Discord edit may stall before it is cancelled. Bounds the edits the library issues after the initial send -- state-driven refresh, exit/teardown, and navigation edits. discord.py issues edits with no total HTTP timeout, so without this a stalled connection would pin the view until the socket drops. Default `60.0` (clears realistic attachment uploads while capping a true hang). Set to `None` to disable the bound (unbounded, matching discord.py's own default). The acting-view fast path keeps its own tighter bound, which protects the 3-second ack deadline rather than guarding against a hang.
 - `session_continuity` (bool): Governs `session_id` auto-derivation polarity. Default `False` gives every invocation a per-instance UUID suffix, so repeat opens of the same view class are independent sessions with their own nav stack, undo timeline, and `shared_data`. Set to `True` on views that want repeat-open state coalescing (undo history surviving close-and-reopen, `shared_data` continuity across gestures); the opt-in collapses derivation back to the class-coalesced shape. Push/pop chains stay on one session regardless because `_navigate_to` forwards `session_id` explicitly.
+
+#### `allowed_mentions`
+
+`discord.AllowedMentions | None`, default `None`. Mention rules applied to this view's own message, on the initial send and on every subsequent refresh. `None` defers to the bot's client-level `AllowedMentions`, which discord.py already threads into each send path.
+
+Reach for it when the rendered body carries user or role mentions that should not notify. A roster or leaderboard re-renders on every state change, and without a rule each render is a fresh chance to ping everyone named. `LeaderboardLayoutView` therefore ships `AllowedMentions.none()` as its own default, since its `format_name` renders entries without a `display_name` as `<@id>`.
+
+```python
+class RosterPanel(StatefulLayoutView):
+    allowed_mentions = discord.AllowedMentions.none()   # names render, nobody pings
+```
+
+Pass `allowed_mentions=` to `send()` to override the attribute for one message, a winner announcement that genuinely should notify the person it names:
+
+```python
+await Notice(context=ctx).send(
+    allowed_mentions=discord.AllowedMentions(everyone=False, users=True, roles=False),
+)
+```
+
+Name every field you care about. `discord.AllowedMentions(users=True)` leaves the other fields at a sentinel meaning "inherit", so with no client-level default configured it permits `@everyone` and role pings as well.
+
+This governs Discord payload formatting only. It is unrelated to `allowed_users`, which is access control.
 
 ---
 
@@ -416,9 +460,9 @@ V2 views ARE the message content -- `send()` takes no `content` or `embed` param
 
 #### V2-Specific Methods
 
-##### `make_nav_row(*, back=True, exit=True, back_label="Back", exit_label="Exit", back_style=secondary, back_emoji="◀", exit_style=secondary, exit_emoji="❌", delete_message=False, back_custom_id=None, exit_custom_id=None)`
+##### `make_nav_row(*, back=True, exit=True, back_label="Back", exit_label="Exit", back_style=secondary, back_emoji="◀", exit_style=secondary, exit_emoji="❌", delete_message=None, back_custom_id=None, exit_custom_id=None)`
 
-Returns one `ActionRow` containing a Back button and/or an Exit button -- the V2 navigation footer helper. Raises `ValueError` if both `back` and `exit` are `False`. Back pops the navigation stack; Exit calls `self.exit()` (`delete_message` controls whether the message is deleted or frozen). When the popped view defines `on_load()`, that hook runs on the restored view before the edit ships, re-fetching its source on render. The `back_*` / `exit_*` label, style, and emoji kwargs forward to `make_back_button` / `make_exit_button`, so a relabeled Back (`make_nav_row(back_label="Leagues", back_emoji="🏠")`) needs no manual composition.
+Returns one `ActionRow` containing a Back button and/or an Exit button: the V2 navigation footer helper. Raises `ValueError` if both `back` and `exit` are `False`. Back pops the navigation stack; Exit calls `self.exit()` (`delete_message=None` defers to `exit_policy`; `True` or `False` overrides it). When the popped view defines `on_load()`, that hook runs on the restored view before the edit ships, re-fetching its source on render. The `back_*` / `exit_*` label, style, and emoji kwargs forward to `make_back_button` / `make_exit_button`, so a relabeled Back (`make_nav_row(back_label="Leagues", back_emoji="🏠")`) needs no manual composition.
 
 ```python
 def build_ui(self):
@@ -703,7 +747,7 @@ MenuLayoutView(
 )
 ```
 
-Each category generates an `action_section()` item that pushes to the specified view class when clicked. The `description`, `emoji`, `style`, and `rebuild` keys are optional.
+Each category generates an `action_section()` item that pushes to the specified view class when clicked. The `description`, `emoji`, `style`, and `rebuild` keys are optional. A category with no `description` renders its label as the section text.
 
 A category whose `"view"` is the other component version raises `TypeError` at construction rather than on the click (see [V1 and V2 Views Cannot Push/Pop Between Each Other](../guide/known-limitations.md#v1-and-v2-views-cannot-pushpop-between-each-other)).
 
@@ -718,11 +762,11 @@ A category whose `"view"` is the other component version raises `TypeError` at c
 
 ##### `build_header()` *(override)*
 
-Returns V2 components (list or single) for the area above category items. Default returns `[]`. The former `_build_header()` remains as a deprecated alias; existing overrides keep rendering.
+Returns V2 components (list or single) for the area above category items. Default returns `[]`.
 
 ##### `build_footer()` *(override)*
 
-Returns V2 components (list or single) for the area below category items. Default returns `[]`. The former `_build_footer()` remains as a deprecated alias; existing overrides keep rendering.
+Returns V2 components (list or single) for the area below category items. Default returns `[]`.
 
 ##### `_build_category_item(category, index)` *(override)*
 
@@ -757,6 +801,54 @@ class MyRoles(PersistentRolesLayoutView):
 view = MyRoles(context=ctx, persistence_key=f"roles:{ctx.guild.id}")
 await view.send()
 ```
+
+#### `FormField` (typed schema)
+
+```python
+FormField(
+    id: str,
+    label: str,
+    type: str = "text",
+    required: bool = False,
+    default: Any = None,
+    placeholder: Optional[str] = None,
+    min_length: Optional[int] = None,
+    max_length: Optional[int] = None,
+    min_value: Optional[float] = None,
+    max_value: Optional[float] = None,
+    options: Optional[list[Any]] = None,        # select/radio choices
+    max_values: Optional[int] = None,           # multi-select cap
+    validators: Optional[list[Callable]] = None,
+    style: Optional[TextStyle] = None,          # short vs paragraph
+    group: Optional[str] = None,                # co-edit in one modal
+    secret: bool = False,
+)
+```
+
+The typed alternative to the field dicts in the
+[patterns guide](../guide/patterns.md#typed-schemas-formfield-formschema). Both
+forms are accepted by `FormView` and `FormLayoutView`.
+
+#### `FormSchema` (typed schema)
+
+Base class for declarative form definitions. Override `get_fields()` to return
+the `FormField` list; pass an instance as the pattern's `schema=`.
+
+#### `WizardStep` (typed schema)
+
+```python
+WizardStep(
+    name: str,
+    builder: Callable,                    # builds the step's content
+    validator: Optional[Callable] = None, # gates advancing past this step
+    condition: Optional[Callable] = None, # skip the step when it returns False
+)
+```
+
+#### `WizardSchema` (typed schema)
+
+Base class for declarative wizard definitions. Override `get_steps()` to return
+the `WizardStep` list; pass an instance as the pattern's `schema=`.
 
 #### `RoleCategory` (typed schema)
 
@@ -980,8 +1072,7 @@ Write-through middleware that owns the full persistence pipeline. Install via `s
 - `restore_concurrency`: positive int bounding how many persistent-view channel and message fetches run concurrently during startup reattach (default `8`).
 
 ```python
-from cascadeui import setup_middleware
-from cascadeui.state.middleware import PersistenceMiddleware
+from cascadeui import PersistenceMiddleware, setup_middleware
 from cascadeui.persistence import SQLiteBackend
 
 await setup_middleware(
@@ -1023,7 +1114,7 @@ Optional decorators for wrapping callbacks in error boundaries, retry logic, or 
 
 ### `@with_error_boundary(name=None)`
 
-Wraps an async callable so exceptions are logged with context instead of raised. Returns `None` when the wrapped callable raises. Use on background or fire-and-forget paths where a raised exception would otherwise be swallowed by the asyncio event loop.
+Wraps an async callable so exceptions are logged with context (message at ERROR, traceback at DEBUG) and then **re-raised** for the caller to handle. Use where a raised exception would otherwise reach the asyncio event loop without any indication of which call site produced it. Reach for `safe_execute` instead when the exception should be absorbed rather than propagated.
 
 ```python
 from cascadeui import with_error_boundary
@@ -1035,24 +1126,24 @@ async def sync_scores(user_id):
 
 ### `@with_retry(config=None)`
 
-Retries an async callable on failure with exponential backoff. Accepts an optional `RetryConfig(max_attempts, base_delay, max_delay, exceptions)`; defaults to three attempts with a 1-second base delay.
+Retries an async callable on failure with exponential backoff. Accepts an optional `RetryConfig(max_retries=3, backoff_factor=1.0, exceptions_to_retry=(Exception,), max_backoff=30.0)`.
 
 ```python
 from cascadeui import RetryConfig, with_retry
 
-@with_retry(RetryConfig(max_attempts=5, base_delay=2.0))
+@with_retry(RetryConfig(max_retries=5, backoff_factor=2.0))
 async def fetch_profile(user_id):
     ...
 ```
 
-### `safe_execute(coro, default=None, name=None)`
+### `safe_execute(coro, fallback=None, log_error=True)`
 
-One-shot wrapper that awaits a coroutine and returns `default` on exception (with a logged traceback). Pair with the decorators when the call site is not the right place to attach an error boundary.
+One-shot wrapper that awaits a coroutine and returns `fallback` on exception (with a logged traceback). Pair with the decorators when the call site is not the right place to attach an error boundary.
 
 ```python
 from cascadeui import safe_execute
 
-result = await safe_execute(fetch_profile(user_id), default={})
+result = await safe_execute(fetch_profile(user_id), fallback={})
 ```
 
 ---
@@ -1072,4 +1163,132 @@ tm.create_task("my_worker", poll_loop())
 await tm.cancel_tasks("my_worker")
 ```
 
-See `cascadeui/utils/tasks.py` for the full TaskManager API.
+The manager exposes four methods: `create_task(owner_id, coro)`,
+`cancel_tasks(owner_id)`, `wait_tasks(owner_id)`, and `get_task_count(owner_id=None)`.
+
+---
+
+## Snowflake Coercion
+
+The library accepts either an `int` or any object carrying an `.id` wherever a
+Discord ID is expected, and coerces at the boundary. These helpers are that
+coercion, exposed for user code doing the same normalization.
+
+### `is_snowflake(value) -> bool`
+
+Whether `value` is plausibly a Discord snowflake, by magnitude. Test fixtures
+using small integers read as `False`.
+
+### `coerce_snowflake_id(value) -> int`
+
+Returns `value` if it is an `int`, or `value.id` if it carries one. Raises
+`TypeError` for anything else, so a string or dict fails where it is passed
+rather than corrupting a state key later.
+
+### `coerce_snowflake_id_set(values) -> set[int]`
+
+The same coercion across an iterable. This is what the `allowed_users` setter
+applies, which is why `{ctx.author, opponent}` works alongside
+`{ctx.author.id, opponent.id}`.
+
+### `coerce_snowflake_match(match_dict, snowflake_keys) -> dict`
+
+Converts named regex capture groups to `int` for known snowflake keys, leaving
+other keys unchanged. For `DynamicItem` subclasses, whose `match.groupdict()`
+yields strings (or `None` for optional groups):
+
+```python
+from cascadeui import coerce_snowflake_match
+
+data = coerce_snowflake_match(match.groupdict(), frozenset({"user_id", "guild_id"}))
+```
+
+---
+
+## Logging
+
+CascadeUI is silent until `setup_logging()` is called: the package root carries a
+`NullHandler`, and every module logs through `logging.getLogger(__name__)`.
+
+### `setup_logging(*, level=logging.INFO, actions=True, file=True, stream=True, trace=False, path="logs", max_files=10, prefix="cascadeui", mode="a", encoding="utf-8", colors=None, color=None, template=None, stream_formatter=None, file_formatter=None, handler=None)`
+
+Attaches a colored console sink and a date-stamped file sink to the `cascadeui`
+logger. Call it once, at startup, with no arguments:
+
+```python
+from cascadeui import setup_logging
+
+setup_logging()
+```
+
+That gives a colored console sink, a rotating file in `./logs`, and the action
+log, all at `INFO`. Everything below is optional tuning.
+
+Both sinks run behind a `QueueHandler` / `QueueListener`, so log I/O happens on a
+background thread rather than the calling one, and the queue drains at
+interpreter exit. Calling it again reconfigures from scratch, removing the
+handlers a previous call attached, so repeat calls never double-log.
+
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| `level` | `logging.INFO` | Level for the `cascadeui` logger |
+| `actions` | `True` | Install `LoggingMiddleware` so every dispatched action is logged. `False` drops the action log; a level string (`"DEBUG"`) places it lower so it stays out of INFO logs |
+| `file` | `True` | Write the date-stamped file sink |
+| `stream` | `True` | Write the console sink |
+| `trace` | `False` | Install ViewStore dispatch tracing |
+| `path` | `"logs"` | Directory for file sinks |
+| `max_files` | `10` | Rotation ceiling; older files are dropped past this count |
+| `prefix` | `"cascadeui"` | Filename prefix for file sinks |
+| `mode` | `"a"` | File open mode |
+| `encoding` | `"utf-8"` | File encoding |
+| `colors` | `None` | A `ColorScheme`, or a preset name: `"default"`, `"ocean"`, `"forest"`, `"none"` |
+| `color` | `None` | Force color on or off; `None` auto-detects |
+| `template` | `None` | A `FormatTemplate`, or a preset name: `"default"`, `"minimal"`, `"detailed"`, `"compact"` |
+| `stream_formatter` | `None` | Replace the console formatter outright |
+| `file_formatter` | `None` | Replace the file formatter outright |
+| `handler` | `None` | Attach an additional handler alongside the built-in sinks |
+
+```python
+from cascadeui import setup_logging
+
+setup_logging(level="DEBUG", colors="ocean", template="minimal", max_files=30)
+```
+
+Standard Python control still works afterwards, so a single noisy module can be
+raised or lowered on its own:
+
+```python
+logging.getLogger("cascadeui.state.store").setLevel(logging.DEBUG)
+```
+
+The listener thread does not survive `os.fork()`; a forked child calls
+`setup_logging()` again.
+
+### `ColorScheme(debug=..., info=..., warning=..., error=..., critical=..., timestamp=..., function=..., name=..., reset=...)`
+
+Raw ANSI escape strings, one per level plus the three field slots the console
+template highlights. Set any to `""` to drop coloring for that element. Pass an
+instance to `setup_logging(colors=...)`, or name a preset.
+
+```python
+from cascadeui import ColorScheme, setup_logging
+
+setup_logging(colors=ColorScheme(info="\x1b[36m"))
+```
+
+### `FormatTemplate(stream_fmt=..., file_fmt=..., datefmt="%Y-%m-%d %H:%M:%S", capitalize_module=True)`
+
+The layout of a log line. Both strings use `{`-style placeholders (`{asctime}`,
+`{levelname}`, `{funcName}`, `{name}`, `{message}`). `stream_fmt` also accepts
+the color tokens `$ts$`, `$lvl$`, `$fn$`, `$name$`, and `$r$`, replaced
+at build time from the active `ColorScheme`; `file_fmt` is plain.
+
+### `JSONFormatter(fields=None, indent=None)`
+
+One JSON object per record, for a log aggregator. `fields` selects which record
+attributes are included (a standard set by default); `indent` pretty-prints.
+
+Under the queue that `setup_logging` installs, the `QueueHandler` pre-formats
+each record and clears `exc_info`, so a traceback lands inside `message` rather
+than a separate `exception` key. Attach a synchronous handler carrying this
+formatter through `setup_logging(handler=...)` to get the structured key.

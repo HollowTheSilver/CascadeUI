@@ -9,8 +9,7 @@ Persistence in CascadeUI spans two isolated namespaces (registry, application), 
 Write-through middleware that owns the persistence pipeline. Construct once in `setup_hook`, after every cog that defines a `PersistentView` subclass has loaded, and pass it through `setup_middleware` to install it into the dispatch chain.
 
 ```python
-from cascadeui import setup_middleware
-from cascadeui.state.middleware import PersistenceMiddleware
+from cascadeui import PersistenceMiddleware, setup_middleware
 from cascadeui.persistence import SQLiteBackend
 
 # Shorthand: one backend fills every unconfigured namespace
@@ -146,9 +145,9 @@ from cascadeui.persistence import InMemoryBackend
 backend = InMemoryBackend()
 ```
 
-### `SQLiteBackend(path, *, busy_timeout_ms=5000, synchronous="NORMAL")`
+### `SQLiteBackend(db_path="cascadeui.db")`
 
-Requires `pip install pycascadeui[sqlite]`. Declares all five capabilities (including `RAW_SQL`). Uses WAL mode and prepared statements.
+Requires `pip install pycascadeui[sqlite]`. Declares all five capabilities (including `RAW_SQL`). Uses WAL mode and prepared statements, with `synchronous=NORMAL` and a 5-second busy timeout applied as connection PRAGMAs.
 
 ```python
 from cascadeui.persistence import SQLiteBackend
@@ -203,12 +202,16 @@ or handle specific phases individually.
 |-------|--------|------------|
 | `PersistenceError` | `RuntimeError` | Base class for every persistence failure. Catch this to handle any persistence error. |
 | `PersistenceInitError` | `PersistenceError` | Raised from `backend.initialize()` on connection failures, table-creation errors, or permission problems. Prevents the bot from starting against an unhealthy persistence layer. |
-| `PersistenceSchemaError` | `PersistenceError` | Raised when the on-disk schema version is higher than the library supports, or when a registered migrator fails mid-run and leaves the schema partially upgraded. |
+| `PersistenceSchemaError` | `PersistenceError` | Raised when the on-disk schema version is higher than the library supports, or when no migrator is registered for the next schema step. |
 | `PersistenceRehydrateError` | `PersistenceError` | Raised during `PersistenceMiddleware.initialize` when a persisted JSON blob is corrupted, a required row is malformed, or the backend returns unexpected shape. Per-view re-attachment failures do NOT raise this -- they are logged and skipped. |
 
 ```python
-from cascadeui import PersistenceError, PersistenceSchemaError, setup_middleware
-from cascadeui.state.middleware import PersistenceMiddleware
+from cascadeui import (
+    PersistenceError,
+    PersistenceMiddleware,
+    PersistenceSchemaError,
+    setup_middleware,
+)
 
 try:
     await setup_middleware(PersistenceMiddleware(backend=backend))

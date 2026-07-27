@@ -329,6 +329,10 @@ class TicTacToeView(StatefulLayoutView):
     # fits where Battleship needs a phase-aware exit() override. Stale games
     # are still removed by replace_policy when a new one evicts them.
     exit_policy = "disable"
+    # The turn indicator and legend both name the players, and the board
+    # rebuilds on every move, so without this a full game notifies both
+    # players once per move. The mentions still render as links.
+    allowed_mentions = discord.AllowedMentions.none()
 
     def __init__(self, *args, opponent_id: int, size: int = 3, win_length: int = 3, **kwargs):
         super().__init__(*args, **kwargs)
@@ -429,12 +433,11 @@ class TicTacToeView(StatefulLayoutView):
                         emoji="\N{ANTICLOCKWISE DOWNWARDS AND UPWARDS OPEN CIRCLE ARROWS}",
                         callback=self._rematch,
                     ),
-                    StatefulButton(
-                        label="Close",
-                        style=discord.ButtonStyle.secondary,
-                        emoji="\N{CROSS MARK}",
-                        callback=self._close,
-                    ),
+                    # make_exit_button's own defaults are this button:
+                    # secondary style, cross-mark emoji, and a
+                    # delete_message that defers to exit_policy ("disable"
+                    # here), so the finished board freezes as a record.
+                    self.make_exit_button(label="Close"),
                 )
             )
         else:
@@ -607,12 +610,6 @@ class TicTacToeView(StatefulLayoutView):
 
         self.build_ui()
         await self.refresh()
-
-    async def _close(self, interaction: discord.Interaction):
-        """Close the finished game. ``exit_policy = "disable"`` freezes the
-        final board in place rather than deleting it, so the completed card
-        stays as a record (matching Battleship)."""
-        await self.exit()
 
 
 # // ========================================( Cog )======================================== // #

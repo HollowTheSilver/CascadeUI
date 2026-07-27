@@ -57,7 +57,7 @@ and class attributes - the same mechanisms every existing pattern uses.
 
 **Avoid pattern variants.** One `TabLayoutView` covers tabs. If someone needs
 tabs with a dropdown selector instead of buttons, that's a subclass in their
-code, not a second `DropdownTabLayoutView` in ours.
+code, not a second `DropdownTabLayoutView` in the library.
 
 ### API Grammar
 
@@ -156,9 +156,10 @@ DevBot().run("YOUR_BOT_TOKEN")
 `/cascadeui inspect` subcommand opens the visual state Inspector, which
 surfaces the active view registry, session members, dispatch history, and
 live aggregates (total views, state size, application keys) computed via
-`@computed`. The other subcommands (`views`, `exit`, `exitall`, `sessions`,
-`clear`, `flush`, `purge`, `reset`) are text-level inspection and cleanup
-utilities for the same data.
+`@computed`. The other subcommands cover text-level inspection, registry
+introspection, and diagnostics over the same data; the group's help output
+lists them all, and derives that listing from the registered commands rather
+than a hand-kept copy.
 
 Swap `InMemoryBackend` for `SQLiteBackend("cascadeui.db")` when you need
 persistence to survive restarts.

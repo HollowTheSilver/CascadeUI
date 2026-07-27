@@ -153,8 +153,7 @@ Navigation stack with push/pop between multi-level views and session data sharin
 3. Load the example cogs in your bot:
 
 ```python
-from cascadeui import setup_middleware
-from cascadeui.state.middleware import PersistenceMiddleware, UndoMiddleware
+from cascadeui import PersistenceMiddleware, UndoMiddleware, setup_middleware
 from cascadeui.persistence import SQLiteBackend
 
 class MyBot(commands.Bot):

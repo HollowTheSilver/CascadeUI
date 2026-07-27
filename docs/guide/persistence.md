@@ -22,8 +22,7 @@ Construct `PersistenceMiddleware` once in your bot's `setup_hook`,
 **after loading your cogs**:
 
 ```python
-from cascadeui import setup_middleware
-from cascadeui.state.middleware import PersistenceMiddleware
+from cascadeui import PersistenceMiddleware, setup_middleware
 from cascadeui.persistence import SQLiteBackend
 
 class MyBot(commands.Bot):
@@ -70,8 +69,7 @@ config. Passing a namespace config overrides the shorthand for that
 namespace:
 
 ```python
-from cascadeui import setup_middleware
-from cascadeui.state.middleware import PersistenceMiddleware
+from cascadeui import PersistenceMiddleware, setup_middleware
 from cascadeui.persistence import (
     InMemoryBackend,
     SQLiteBackend,
@@ -235,8 +233,7 @@ pip install pycascadeui[sqlite]
 ```
 
 ```python
-from cascadeui import setup_middleware
-from cascadeui.state.middleware import PersistenceMiddleware
+from cascadeui import PersistenceMiddleware, setup_middleware
 from cascadeui.persistence import SQLiteBackend
 
 await setup_middleware(
@@ -258,8 +255,7 @@ Configure with a connection string:
 ```python
 import os
 
-from cascadeui import setup_middleware
-from cascadeui.state.middleware import PersistenceMiddleware
+from cascadeui import PersistenceMiddleware, setup_middleware
 from cascadeui.persistence import PostgresBackend
 
 backend = PostgresBackend(dsn=os.environ["CASCADEUI_DATABASE_URL"])

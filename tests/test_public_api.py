@@ -61,6 +61,26 @@ class TestPublicExportSurface:
             f"from cascadeui.__all__: {unreachable}"
         )
 
+    @pytest.mark.parametrize("module_name", SUBPACKAGES)
+    def test_root_public_names_reach_their_own_subpackage(self, module_name):
+        # The converse of the test above, and the direction that shipped a gap:
+        # a public name DEFINED under a subpackage must also be exported BY it.
+        # Without this, `from cascadeui.utils import slugify` works while
+        # `from cascadeui.utils import setup_logging` raises ImportError, for
+        # two names that are equally public and live in the same package.
+        module = importlib.import_module(module_name)
+        missing = sorted(
+            name
+            for name in cascadeui.__all__
+            if getattr(getattr(cascadeui, name, None), "__module__", "").startswith(
+                f"{module_name}."
+            )
+            and name not in module.__all__
+        )
+        assert missing == [], (
+            f"public names defined under {module_name} but absent from its " f"__all__: {missing}"
+        )
+
     def test_root_all_is_free_of_duplicates(self):
         seen = sorted({n for n in cascadeui.__all__ if cascadeui.__all__.count(n) > 1})
         assert seen == [], f"duplicated in __all__: {seen}"
@@ -130,6 +150,13 @@ _INTERNAL_NAMES = frozenset(
         "state_size_bytes",
         "total_sessions",
         "total_views",
+        # Ack and hook plumbing the library drives itself (respond_safe IS
+        # exported; these are not)
+        "ack_backstop",
+        "open_modal_safe",
+        "call_hook_safe",
+        "elapsed_since",
+        "trailing_ack",
         # Persistence internals (register_* helpers ARE exported; these are not)
         "NAMESPACE_APPLICATION",
         "NAMESPACE_REGISTRY",

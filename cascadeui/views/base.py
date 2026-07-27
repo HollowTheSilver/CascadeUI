@@ -3,6 +3,7 @@
 
 import asyncio
 import functools
+import hashlib
 import inspect
 import logging
 import time
@@ -12,9 +13,10 @@ from typing import Any, Callable, ClassVar, Dict, Optional, Set
 
 import discord
 from discord import Interaction
-from discord.ui import Container
+from discord.ui import Button, Container
 from discord.ui import File as UIFile
 from discord.ui import Item, MediaGallery, TextDisplay, Thumbnail
+from discord.ui.select import BaseSelect
 
 from ..components.base import StatefulButton
 from ..components.types import EmojiInput
@@ -23,11 +25,16 @@ from ..state.actions import ActionCreators
 from ..state.singleton import get_store
 from ..state.store import _CURRENT_INTERACTION
 from ..utils.coercion import coerce_snowflake_id, coerce_snowflake_id_set, is_snowflake
+from ..utils.hooks import call_hook_safe
+from ..utils.responses import ack_backstop
 from ..utils.tasks import get_task_manager
 from ._interaction import _InteractionMixin
 from ._navigation import _NavigationMixin
 
 logger = logging.getLogger(__name__)
+
+# Discord's custom_id ceiling. discord.py stores the value unchecked.
+_CUSTOM_ID_MAX_CHARS = 100
 
 
 # // ========================================( View Registry )======================================== // #
@@ -302,7 +309,8 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
     # the channel as a static record. The "disable" mode is useful for
     # audit trails or shared-context views where other users may have
     # been looking at the old view. Scoped to the replace transition
-    # only -- bare exit() calls and on_timeout are governed by exit_policy.
+    # only: exit() calls are governed by exit_policy, and on_timeout
+    # always freezes regardless of either policy.
     replace_policy: str = "delete"
     # Static message sent to the channel when this view is replaced and
     # has active participants. ``None`` (default) means silent replacement.
@@ -310,14 +318,28 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
     # ``on_replaced`` method instead.
     replaced_message: Optional[str] = None
 
-    # Default for bare exit() calls that pass no explicit delete_message
+    # Default for exit() calls that pass no explicit delete_message
     # argument. "disable" (default) freezes the components in place,
     # matching the historical safe-by-default behavior; "delete" removes
     # the message. Explicit delete_message arguments to exit() always
-    # override this policy. This governs on_timeout paths, manual close
-    # buttons wired to self.exit(), and any other site that calls exit()
-    # without specifying delete_message.
+    # override this policy. This governs the close buttons built by
+    # make_exit_button / add_exit_button / make_nav_row, which forward
+    # delete_message=None by default, plus any other site that calls
+    # exit() without specifying delete_message. on_timeout is NOT
+    # governed by this policy: an expiry is not a close gesture, so a
+    # timed-out view always freezes rather than deleting content the
+    # user never asked to dismiss.
     exit_policy: str = "disable"
+
+    # Mention parsing for this view's own message. None (default) defers
+    # to the bot's client-level AllowedMentions, which discord.py already
+    # threads into every send path. Set it when the rendered body carries
+    # user or role mentions that should not notify (a leaderboard, a
+    # roster, a turn announcement), since the declaration then applies to
+    # the initial send and to every refresh, on every endpoint. Not to be
+    # confused with allowed_users, which is access control (Pillar 1);
+    # this governs Discord payload formatting only.
+    allowed_mentions: Optional[discord.AllowedMentions] = None
 
     # Persistent view marker -- overridden to True by PersistentView / PersistentLayoutView
     _persistent: bool = False
@@ -361,6 +383,11 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
     # the mixin; pattern subclasses (Wizard/Tab/Paginated) declare their own
     # button-style attributes here so the validator path is shared.
     _BUTTON_STYLE_ATTRS: ClassVar[tuple] = ("refresh_button_style",)
+    # Button label / emoji triples. Patterns extend these the same way they
+    # extend _BUTTON_STYLE_ATTRS, so all three members of a button's triple
+    # are checked at class-definition time rather than only the style.
+    _STR_OR_NONE_ATTRS: ClassVar[tuple] = ("refresh_button_label",)
+    _EMOJI_ATTRS: ClassVar[tuple] = ("refresh_button_emoji",)
     # Snowflake-domain instance data -- coerced via the init pipeline,
     # never settable through set_class_attribute (those have their own
     # mutation paths and live as instance state, not class-level policy).
@@ -379,15 +406,16 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         in any table silently no-op -- free-form attributes like
         ``*_message`` strings have no rule to enforce.
         """
-        if name in cls._ENUM_ATTRS:
-            allowed = cls._ENUM_ATTRS[name]
+        enum_attrs = cls._effective_table("_ENUM_ATTRS")
+        if name in enum_attrs:
+            allowed = enum_attrs[name]
             if value not in allowed:
                 raise ValueError(
                     f"{cls.__name__}.{name} must be one of "
                     f"{sorted(a for a in allowed if a is not None)!r}, got {value!r}"
                 )
             return
-        if name in cls._POSITIVE_INT_ATTRS:
+        if name in cls._effective_table("_POSITIVE_INT_ATTRS"):
             if value is None:
                 return
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
@@ -395,11 +423,11 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     f"{cls.__name__}.{name} must be a positive int or None, got {value!r}"
                 )
             return
-        if name in cls._POSITIVE_NUMBER_ATTRS:
+        if name in cls._effective_table("_POSITIVE_NUMBER_ATTRS"):
             if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"{cls.__name__}.{name} must be a positive number, got {value!r}")
             return
-        if name in cls._OPTIONAL_POSITIVE_NUMBER_ATTRS:
+        if name in cls._effective_table("_OPTIONAL_POSITIVE_NUMBER_ATTRS"):
             if value is None:
                 return
             if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
@@ -407,13 +435,13 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     f"{cls.__name__}.{name} must be a positive number or None, got {value!r}"
                 )
             return
-        if name in cls._BOOL_ATTRS:
+        if name in cls._effective_table("_BOOL_ATTRS"):
             if not isinstance(value, bool):
                 raise ValueError(
                     f"{cls.__name__}.{name} must be a bool, got {type(value).__name__}"
                 )
             return
-        if name in cls._OPTIONAL_BOOL_ATTRS:
+        if name in cls._effective_table("_OPTIONAL_BOOL_ATTRS"):
             if value is None:
                 return
             if not isinstance(value, bool):
@@ -421,7 +449,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     f"{cls.__name__}.{name} must be a bool or None, " f"got {type(value).__name__}"
                 )
             return
-        if name in cls._BUTTON_STYLE_ATTRS:
+        if name in cls._effective_table("_BUTTON_STYLE_ATTRS"):
             if not isinstance(value, discord.ButtonStyle):
                 raise ValueError(
                     f"{cls.__name__}.{name} must be a discord.ButtonStyle, "
@@ -447,6 +475,53 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             if not isinstance(value, Theme):
                 raise TypeError(
                     f"{cls.__name__}.theme must be a Theme instance or None, "
+                    f"got {type(value).__name__}"
+                )
+            return
+        if name in cls._effective_table("_STR_OR_NONE_ATTRS"):
+            cls._validate_str_or_none(name, value)
+            return
+        if name in cls._effective_table("_EMOJI_ATTRS"):
+            cls._validate_emoji(name, value)
+            return
+        if name == "nav_rebuild":
+            if value is None:
+                return
+            # The mistake worth catching is a value that binds as a method
+            # in a class body, so it receives self instead of the
+            # destination view. Descriptor-ness decides that, not
+            # callability: a staticmethod object is callable too, so
+            # callable() cannot see the difference. staticmethod is the one
+            # descriptor that is correct here, since binding through it
+            # returns the wrapped callable untouched.
+            #
+            # functools.partial is named separately because it became a
+            # descriptor in 3.14 and is not one on 3.10-3.13. Rejecting it
+            # only where it binds would let the same class definition pass
+            # on one supported Python and fail on another; rejecting it
+            # everywhere means staticmethod is the answer on all of them.
+            binds = hasattr(type(value), "__get__") or isinstance(value, functools.partial)
+            if binds and not isinstance(value, staticmethod):
+                raise TypeError(
+                    f"{cls.__name__}.nav_rebuild is a "
+                    f"{type(value).__name__}, which binds as a method in a "
+                    f"class body: it would be called with self as its first "
+                    f"argument instead of the destination view.\n"
+                    f"  Fix: nav_rebuild = staticmethod(...)"
+                )
+            if not callable(value):
+                raise TypeError(
+                    f"{cls.__name__}.nav_rebuild must be callable or None, "
+                    f"got {type(value).__name__}."
+                )
+            return
+        if name == "allowed_mentions":
+            if value is None:
+                return
+            if not isinstance(value, discord.AllowedMentions):
+                raise TypeError(
+                    f"{cls.__name__}.allowed_mentions must be a "
+                    f"discord.AllowedMentions instance or None, "
                     f"got {type(value).__name__}"
                 )
             return
@@ -486,37 +561,81 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         defaults pay zero cost.
         """
         own = cls.__dict__
-        for attr in cls._ENUM_ATTRS:
-            if attr in own:
-                cls._validate_attribute_value(attr, own[attr])
-        for attr in cls._POSITIVE_INT_ATTRS:
-            if attr in own:
-                cls._validate_attribute_value(attr, own[attr])
-        for attr in cls._POSITIVE_NUMBER_ATTRS:
-            if attr in own:
-                cls._validate_attribute_value(attr, own[attr])
-        for attr in cls._OPTIONAL_POSITIVE_NUMBER_ATTRS:
-            if attr in own:
-                cls._validate_attribute_value(attr, own[attr])
-        for attr in cls._BOOL_ATTRS:
-            if attr in own:
-                cls._validate_attribute_value(attr, own[attr])
-        for attr in cls._OPTIONAL_BOOL_ATTRS:
-            if attr in own:
-                cls._validate_attribute_value(attr, own[attr])
-        for attr in cls._BUTTON_STYLE_ATTRS:
-            if attr in own:
-                cls._validate_attribute_value(attr, own[attr])
+        for table, check in (
+            ("_ENUM_ATTRS", cls._validate_attribute_value),
+            ("_POSITIVE_INT_ATTRS", cls._validate_attribute_value),
+            ("_POSITIVE_NUMBER_ATTRS", cls._validate_attribute_value),
+            ("_OPTIONAL_POSITIVE_NUMBER_ATTRS", cls._validate_attribute_value),
+            ("_BOOL_ATTRS", cls._validate_attribute_value),
+            ("_OPTIONAL_BOOL_ATTRS", cls._validate_attribute_value),
+            ("_BUTTON_STYLE_ATTRS", cls._validate_attribute_value),
+            ("_STR_OR_NONE_ATTRS", cls._validate_str_or_none),
+            ("_EMOJI_ATTRS", cls._validate_emoji),
+        ):
+            for attr in cls._effective_table(table):
+                if attr in own:
+                    check(attr, own[attr])
         if "subscribed_actions" in own:
             cls._validate_attribute_value("subscribed_actions", own["subscribed_actions"])
         if "theme" in own:
             cls._validate_attribute_value("theme", own["theme"])
+        if "allowed_mentions" in own:
+            cls._validate_attribute_value("allowed_mentions", own["allowed_mentions"])
+        if "nav_rebuild" in own:
+            cls._validate_attribute_value("nav_rebuild", own["nav_rebuild"])
         if "scoped_slot" in own:
             cls._validate_attribute_value("scoped_slot", own["scoped_slot"])
         if "persistent_slots" in own:
             cls._validate_attribute_value("persistent_slots", own["persistent_slots"])
         if "scoped_slot" in own or "persistent_slots" in own:
             cls._validate_slot_coherence()
+
+    @classmethod
+    def _effective_table(cls, name: str) -> tuple:
+        """Union every declaration of a validation table across the MRO.
+
+        A pattern mixin extends a table by splatting the base it knows
+        about (``*_StatefulMixin._BOOL_ATTRS``), and that mixin precedes
+        the concrete V1/V2 class in the MRO, so reading the table as a
+        plain attribute returns the mixin's copy and silently drops
+        whatever the concrete class added. ``validate_placement`` is
+        declared on ``StatefulLayoutView``, which is exactly the position
+        that loses. Unioning the whole MRO makes the extension idiom safe
+        regardless of which base each mixin happened to name.
+        """
+        merged: dict = {}
+        # Reversed so a nearer class's entry wins on collision, matching
+        # normal attribute resolution. Tables are declared as tuples of
+        # names or as name -> allowed-values dicts; a dict carries its
+        # values through so the caller can look them up from the same
+        # merged view it tested membership against.
+        for klass in reversed(cls.__mro__):
+            declared = klass.__dict__.get(name)
+            if declared is None:
+                continue
+            if isinstance(declared, dict):
+                merged.update(declared)
+            else:
+                for attr in declared:
+                    merged.setdefault(attr, None)
+        return merged
+
+    @classmethod
+    def _validate_str_or_none(cls, name: str, value) -> None:
+        """Reject a button label that is neither a string nor ``None``."""
+        if value is not None and not isinstance(value, str):
+            raise TypeError(
+                f"{cls.__name__}.{name} must be a str or None, got {type(value).__name__}"
+            )
+
+    @classmethod
+    def _validate_emoji(cls, name: str, value) -> None:
+        """Reject a button emoji outside the union discord.py accepts."""
+        if value is not None and not isinstance(value, (str, discord.Emoji, discord.PartialEmoji)):
+            raise TypeError(
+                f"{cls.__name__}.{name} must be a str, discord.Emoji, "
+                f"discord.PartialEmoji, or None, got {type(value).__name__}"
+            )
 
     @classmethod
     def _validate_slot_coherence(cls) -> None:
@@ -1122,14 +1241,98 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         flag so a followup after this ack renders in the right visibility.
         Cancelled before the send when the pre-send work finishes in time.
         """
-        try:
-            await asyncio.sleep(self.auto_defer_delay)
-            if self.interaction is not None and not self.interaction.response.is_done():
-                await self.interaction.response.defer(ephemeral=ephemeral)
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.debug(f"Send-scoped auto-defer failed in {type(self).__name__}")
+        if self.interaction is None:
+            return
+        await ack_backstop(
+            self.interaction,
+            self.auto_defer_delay,
+            owner=type(self).__name__,
+            log=logger,
+            ephemeral=ephemeral,
+        )
+
+    async def _carry_undo_stacks_to(self, new_view) -> None:
+        """Move this view's undo/redo timeline onto a successor.
+
+        Call between the successor's registration and this view's
+        teardown, while both state rows exist. Routed through a
+        ``VIEW_UPDATED`` dispatch so the transfer runs through the reducer
+        rather than writing into the live ``state["views"]`` row in place.
+        """
+        old_view_state = self.state_store.state.get("views", {}).get(self.id, {})
+        stack_updates = {}
+        if old_view_state.get("undo_stack"):
+            stack_updates["undo_stack"] = list(old_view_state["undo_stack"])
+        if old_view_state.get("redo_stack"):
+            stack_updates["redo_stack"] = list(old_view_state["redo_stack"])
+        if stack_updates:
+            await new_view.dispatch(
+                "VIEW_UPDATED",
+                ActionCreators.view_updated(new_view.id, **stack_updates),
+            )
+
+    def _carry_participants_to(self, new_view) -> None:
+        """Move this view's participants onto a successor.
+
+        Call after the successor is registered. The membership guard keeps
+        it idempotent against participants the successor already claimed
+        for itself.
+        """
+        for pid in self._participants:
+            if pid not in new_view._participants:
+                new_view._participants.add(pid)
+                self.state_store._register_participant(new_view, pid)
+
+    def _carry_attachments_to(self, new_view) -> None:
+        """Move this view's parent and child links onto a successor.
+
+        Without the hand-off, this view's ``exit()`` cascades into
+        ``_cleanup_attached_children`` and deletes children that should
+        outlive the swap, and a parent still tracking this view skips the
+        successor as untracked, leaving an orphan panel behind.
+
+        Destructive on this view's own tracking, so callers run it only
+        once the swap is confirmed: a rolled-back navigation must find the
+        source still holding its children and its parent link. The child
+        list is snapshotted because ``attach_child`` prunes it while
+        re-parenting.
+        """
+        for child in list(self._attached_children):
+            if child is new_view:
+                # The successor taking over the message supersedes its old
+                # child link; attach_child rejects self-attachment.
+                continue
+            new_view.attach_child(child)
+        parent = self._attached_to
+        if parent is not None and not parent.is_finished():
+            parent.attach_child(new_view)
+            try:
+                parent._attached_children.remove(self)
+            except ValueError:
+                pass
+        self._attached_to = None
+
+    async def _rollback_send(self, *, registered: bool) -> None:
+        """Undo everything a failed ``send()`` had built so far.
+
+        ``__init__`` creates the store subscriber and the undo-tracking
+        entry before ``send()`` ever runs, so every abort path owes their
+        removal. ``registered`` names the depth reached: ``False`` for a
+        failure before the view entered the registries (the pre-send veto,
+        an instance-limit rejection), ``True`` once ``_register_state`` has
+        dispatched, which also owes the task cancellation and the
+        ``VIEW_DESTROYED`` teardown.
+        """
+        self.stop()
+        # Unconditional: on_load runs at Stage 0a, before the instance-limit
+        # gate, so a view whose preload spawned a task owns one even on the
+        # paths that never reached the registries. Cancelling for an owner
+        # with no tasks costs nothing.
+        self.task_manager.cancel_tasks(self.id)
+        self.state_store._unsubscribe(self.id)
+        self.state_store._undo_enabled_views.pop(self.id, None)
+        if registered:
+            await self.state_store._destroy_view(self.id, source_id=self.id)
 
     async def _send_pipeline(self, send_kwargs, *, ephemeral=False):
         """Shared send pipeline for V1 and V2 views.
@@ -1143,8 +1346,10 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
 
         Args:
             send_kwargs: Dict of keyword arguments for the Discord send
-                call. Must include ``view=self``. V1 adds ``content``,
-                ``embed``, ``embeds``; V2 passes only ``{"view": self}``.
+                call. Must include ``view=self``. Both versions may add
+                ``file`` / ``files`` / ``allowed_mentions``; V1 also adds
+                ``content`` / ``embed`` / ``embeds``, which V2 has no
+                parameters for.
             ephemeral: Whether the message should be ephemeral.
 
         Returns:
@@ -1172,9 +1377,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         # try/finally guarantees the single cancel site covers all of them.
         try:
             if not await self.on_pre_send(self.interaction):
-                self.stop()
-                self.state_store._unsubscribe(self.id)
-                self.state_store._undo_enabled_views.pop(self.id, None)
+                await self._rollback_send(registered=False)
                 return None
 
             # N3: arm a send-scoped ack backstop AFTER the veto. The genuinely
@@ -1207,10 +1410,15 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             try:
                 await self._enforce_instance_limit()
             except InstanceLimitError as e:
-                await self.on_instance_limit(e)
-                self.stop()
-                self.state_store._unsubscribe(self.id)
-                self.state_store._undo_enabled_views.pop(self.id, None)
+                # The rollback runs in a finally because raising from the
+                # override is a documented shape: the default hook itself
+                # re-raises when there is no interaction to answer on. Without
+                # it, a re-raise leaves the rejected view subscribed and never
+                # stopped, which is permanent for timeout=None.
+                try:
+                    await self.on_instance_limit(e)
+                finally:
+                    await self._rollback_send(registered=False)
                 return None
 
             # -- Stage 2+3: state registration and participant claiming --
@@ -1233,11 +1441,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
 
                 if type(self).auto_register_participants:
                     if not await self._auto_register_participants():
-                        self.stop()
-                        self.task_manager.cancel_tasks(self.id)
-                        self.state_store._unsubscribe(self.id)
-                        self.state_store._undo_enabled_views.pop(self.id, None)
-                        await self.state_store._destroy_view(self.id, source_id=self.id)
+                        await self._rollback_send(registered=True)
                         return None
 
             # -- Stage 4: ephemeral refresh-handoff derivation --
@@ -1327,11 +1531,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     f.close()
                 except Exception:
                     pass
-            self.stop()
-            self.task_manager.cancel_tasks(self.id)
-            self.state_store._unsubscribe(self.id)
-            self.state_store._undo_enabled_views.pop(self.id, None)
-            await self.state_store._destroy_view(self.id, source_id=self.id)
+            await self._rollback_send(registered=True)
             raise
 
         # -- Stage 6: message re-fetch for token-free editing --
@@ -1341,7 +1541,11 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             self._webhook_message = message
             try:
                 self._message = await message.channel.fetch_message(message.id)
-            except discord.HTTPException:
+            except (discord.HTTPException, discord.RateLimited):
+                # RateLimited is a sibling of HTTPException, not a subclass.
+                # Uncaught it would escape a send that already succeeded,
+                # leaving the view with no _message: no cleanup listener, no
+                # parent attach, and a failure reported for a live message.
                 self._message = message
         else:
             self._message = message
@@ -1451,10 +1655,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         ``on_step_entered`` / ``on_step_exited``, ``on_field_changed``,
         ``on_replaced``).
         """
-        try:
-            await hook(*args)
-        except Exception as exc:
-            logger.warning(f"{hook.__name__} raised in {type(self).__name__}: {exc}")
+        await call_hook_safe(hook, *args, owner=type(self).__name__, log=logger)
 
     async def on_instance_limit(self, error: "InstanceLimitError") -> None:
         """Called when ``send()`` is blocked by the session limit.
@@ -1638,6 +1839,23 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 logger.debug(f"[viewstore-trace] clear_items trace failed: {e}")
         return result
 
+    @staticmethod
+    def _fit_custom_id(anchor: str) -> str:
+        """Bring a generated anchor under Discord's 100-character cap.
+
+        A qualname from a factory closure plus an 80-character label can
+        overrun the cap on its own. Raising is not an option here (this
+        runs inside every ``build_ui`` and a rebuild must not fail on a
+        label the user is allowed to set), so the overflow is folded into
+        a digest of the full anchor instead. Deterministic within a
+        process, which is all the dispatch table needs; these ids are
+        per-instance and never expected to survive a restart.
+        """
+        if len(anchor) <= _CUSTOM_ID_MAX_CHARS:
+            return anchor
+        digest = hashlib.blake2s(anchor.encode(), digest_size=6).hexdigest()
+        return f"{anchor[: _CUSTOM_ID_MAX_CHARS - len(digest) - 1]}~{digest}"
+
     def _stabilize_custom_ids(self):
         """Rewrite auto-generated ``custom_id`` values on interactive items.
 
@@ -1686,7 +1904,13 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             else:
                 inner = [top]
             for pos, item in enumerate(inner):
-                if not hasattr(item, "_provided_custom_id"):
+                # Only Buttons and Selects carry a real custom_id. Every
+                # discord.ui.Item sets _provided_custom_id in its own
+                # __init__, so a hasattr gate here would also rewrite
+                # TextDisplay, Container, Separator, ActionRow, and
+                # Section: inert on the wire, but the stray attribute
+                # then reads as an unstable id to any later tree walk.
+                if not isinstance(item, (Button, BaseSelect)):
                     continue
                 if item._provided_custom_id:
                     continue
@@ -1719,9 +1943,17 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         assigned: list[str] = []
         for item, ck, c_idx, p_idx in entries:
             if key_counts[ck] == 1:
-                item.custom_id = f"{prefix}:{ck}"
+                item.custom_id = self._fit_custom_id(f"{prefix}:{ck}")
             else:
-                item.custom_id = f"{prefix}:{ck}@{c_idx}.{p_idx}"
+                item.custom_id = self._fit_custom_id(f"{prefix}:{ck}@{c_idx}.{p_idx}")
+            # Assigning custom_id flips discord.py's own _provided_custom_id
+            # to True, and the new id no longer matches the auto-generated
+            # hex pattern, so both signals a persistent view uses to detect
+            # a missing custom_id are gone by the time it validates. Mark the
+            # rewrite so _validate_custom_ids can still tell the difference.
+            # These ids anchor on ``self.id``, which is per-instance, so they
+            # are stable across rebuilds but NOT across a restart.
+            item._cascadeui_stabilized = True
             if trace_on:
                 assigned.append(f"{type(item).__name__}({id(item):x})={item.custom_id}")
         if assigned:
@@ -1834,7 +2066,12 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         return frozen
 
     async def on_timeout(self) -> None:
-        """Called when the view times out. Disables all components and cleans up state."""
+        """Called when the view times out. Disables all components and cleans up state.
+
+        Freezing is unconditional here: ``exit_policy`` governs close
+        gestures, and an expiry is not one. Override this method to
+        delete the message on timeout instead.
+        """
         # Exit tracked child views first
         await self._cleanup_attached_children()
 
@@ -1853,7 +2090,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         # no-op PATCH that re-sends an identical tree on every timeout.
         if self._message and self._freeze_components():
             try:
-                await self._bounded(self._message.edit(view=self))
+                await self._bounded(self._message.edit(**self._freeze_edit_kwargs()))
             except discord.NotFound:
                 pass  # Message was already deleted
             except asyncio.TimeoutError:
@@ -2268,6 +2505,15 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         # on_load fetch, not just the edit, so waiving it for interaction-
         # driven reloads would turn a manual refresh button into an
         # unbounded query against the caller's data source.
+        if self._refresh_armed:
+            # Same reason the deferred path and the notification dispatcher
+            # refuse to rebuild here: the tree is the refresh button now, and
+            # re-running on_load would replace it. The armed flag then drops
+            # every notification that could put it back, leaving a stale panel
+            # with no recovery once the webhook token expires.
+            await self.refresh()
+            return
+
         now = time.monotonic()
         wait = self._throttle_until() - now
         if wait > 0:
@@ -2309,6 +2555,12 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             **kwargs: Additional keyword arguments forwarded to
                 ``message.edit()`` (e.g. ``embed=``, ``content=``).
         """
+        # Ahead of the no-message return, so a bad kwarg raises the same way
+        # whether or not the view has been sent yet. Leaving it below would
+        # reintroduce, in miniature, the send-state-dependent behavior this
+        # guard exists to remove.
+        self._reject_non_portable_edit_kwargs(kwargs)
+
         if not self._message:
             return
 
@@ -2379,6 +2631,18 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             # rebuilds) that would otherwise surface as HTTP 400 from
             # Discord rather than a clear ``ValueError`` at the seam.
             self._check_placement()
+
+            # Mention rules ride every edit path explicitly. discord.py
+            # applies the client-level default on the interaction and
+            # webhook endpoints, but ``Message.edit`` only forwards it
+            # when ``content`` is supplied, and a V2 view never supplies
+            # content, since the component tree is the content. Resolving
+            # here keeps all three paths shipping the same payload no
+            # matter which one the runtime picks. Injected after the digest
+            # short-circuit above, which is gated on an empty kwargs dict.
+            mentions = self._resolve_allowed_mentions(kwargs.pop("allowed_mentions", None))
+            if mentions is not None:
+                kwargs["allowed_mentions"] = mentions
 
             # Acting-view fast path. When the currently-handled interaction
             # targets this view's message and its response slot is still open,
@@ -2677,6 +2941,90 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         """
         return await asyncio.wait_for(coro, timeout=max(0.5, self.auto_defer_delay - 1.0))
 
+    # Edit kwargs every endpoint refresh() can route to will accept.
+    # ``view`` is library-owned and never comes from a caller.
+    _PORTABLE_EDIT_KWARGS = frozenset(
+        {"allowed_mentions", "attachments", "content", "embed", "embeds"}
+    )
+
+    @classmethod
+    def _reject_non_portable_edit_kwargs(cls, kwargs: dict) -> None:
+        """Reject an edit kwarg only some of the three endpoints accept.
+
+        ``refresh()`` picks its endpoint at runtime from conditions the
+        caller cannot see: whether an interaction is bound, whether its
+        response slot is open, whether the view is ephemeral. A kwarg the
+        chosen endpoint does not take raises a ``TypeError`` from inside
+        discord.py, so the same call site works for months and then fails
+        when the ack race flips. Rejecting here makes the answer the same
+        every time.
+
+        Known asymmetries in discord.py 2.7: ``suppress_embeds`` is
+        accepted only by ``InteractionResponse.edit_message``, and
+        ``suppress`` only by ``Message.edit``.
+        """
+        stray = sorted(set(kwargs) - cls._PORTABLE_EDIT_KWARGS)
+        if not stray:
+            return
+        raise TypeError(
+            f"{cls.__name__}.refresh() cannot forward {', '.join(stray)}: "
+            f"the three edit endpoints refresh() chooses between at runtime "
+            f"do not all accept it, so whether the call works would depend on "
+            f"which one ran. Portable kwargs: "
+            f"{', '.join(sorted(cls._PORTABLE_EDIT_KWARGS))}.\n"
+            f"  Fix: edit self.message directly when the view is not being "
+            f"re-rendered, or drop the argument."
+        )
+
+    def _freeze_edit_kwargs(self) -> Dict[str, Any]:
+        """Edit kwargs for a teardown edit that ships the frozen tree.
+
+        The freeze paths (``on_timeout``, ``exit()``'s V2 branch, the
+        empty-stack back clear, the reopen fallback) hand Discord the same
+        mention-bearing tree ``refresh()`` does, so they owe the same
+        mention rules. Without them the last edit a view ever makes is the
+        one edit that ignores the view's own ``allowed_mentions``.
+        """
+        kwargs: Dict[str, Any] = {"view": self}
+        mentions = self._resolve_allowed_mentions(None)
+        if mentions is not None:
+            kwargs["allowed_mentions"] = mentions
+        return kwargs
+
+    def _resolve_allowed_mentions(
+        self, explicit: Optional[discord.AllowedMentions] = None
+    ) -> Optional[discord.AllowedMentions]:
+        """Pick the mention rules for one send or edit.
+
+        An explicit argument wins, then the ``allowed_mentions`` class
+        attribute, then the bot's own client-level rules.
+
+        That last tier is not redundant. discord.py threads
+        ``Client.allowed_mentions`` into every send and into two of the
+        three edit endpoints on its own, but ``Message.edit`` forwards it
+        only when ``content`` is supplied, and a V2 view never supplies
+        content, because the tree is the content. Without this fallback a
+        bot that configured suppression globally would still get it on
+        send and lose it on any refresh that took the channel endpoint.
+        """
+        if explicit is not None:
+            return explicit
+        if self.allowed_mentions is not None:
+            return self.allowed_mentions
+        # ``_bot`` covers the restored persistent view, which has neither an
+        # interaction nor a context and would otherwise lose the client's
+        # rules on every post-restart refresh.
+        client = (
+            getattr(self.interaction, "client", None)
+            or getattr(self.context, "bot", None)
+            or getattr(self, "_bot", None)
+        )
+        rules = getattr(client, "allowed_mentions", None)
+        # Type-checked rather than truthiness-checked: the attribute is
+        # read off whatever object the caller handed in as a client, and
+        # only a real AllowedMentions is safe to put on the wire.
+        return rules if isinstance(rules, discord.AllowedMentions) else None
+
     def _apply_theme_defaults(self) -> None:
         """Resolve theme-managed accents against the view's live theme.
 
@@ -2698,6 +3046,35 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         for child in self.children:
             if isinstance(child, Container) and getattr(child, "_cascadeui_theme_accent", False):
                 child.accent_color = accent
+
+    def validate(self) -> None:
+        """Raise if this view's tree is one Discord would reject.
+
+        Runs the same two checks the library runs before every send,
+        refresh, and navigation edit: custom_id uniqueness and length on
+        every interactive node, and, for V2 views, the structural
+        placement walk. Passing means the tree ships.
+
+        The point of a public entry is testing a view without a Discord
+        connection. Compose the tree first, since a view built by a
+        pattern is empty until its data loads::
+
+            view = MyLeaderboard(user_id=1, guild_id=2)
+            await view.on_load()          # composes the tree
+            view.validate()               # raises if Discord would reject it
+
+            nodes = sum(1 for _ in view.walk_children())
+            assert nodes <= 40            # the per-message component cap
+
+        ``on_load()`` is the render seam the library itself drives, so a
+        tree built this way is the tree that would be sent. Views that
+        build in ``build_ui()`` call that instead.
+
+        Raises:
+            ValueError: The first violation found, naming the component,
+                the path through the tree, and the fix.
+        """
+        self._check_placement()
 
     def _check_placement(self) -> None:
         """Validate the component tree before shipping it to Discord.
@@ -2880,38 +3257,16 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
     # // ========================================( Scoped State )======================================== // #
 
     def _resolve_scope_target(self) -> Dict[str, Any]:
-        """Return the identifiers kwargs for this view's ``state_scope``.
+        """Return the identifier kwargs for this view's own ``state_scope``.
 
-        Handles all four legal scope values (``"user"``, ``"guild"``,
-        ``"user_guild"``, ``"global"``). Raises ``ValueError`` if
-        ``state_scope`` is unset or a required identifier is missing.
-        Single source of truth for ``scoped_state`` and ``dispatch_scoped``.
+        The no-overrides case of :meth:`_resolve_scoped_identifiers`,
+        which is where the four scope values are actually handled.
+        Raises ``ValueError`` when ``state_scope`` is unset or a required
+        identifier is missing.
         """
-        scope = self.state_scope
-        if scope is None:
+        if self.state_scope is None:
             raise ValueError("Cannot resolve scope target: view has no state_scope set")
-        if scope == "user":
-            if self.user_id is None:
-                raise ValueError("Cannot resolve 'user' scope: view has no user_id")
-            return {"user_id": self.user_id}
-        if scope == "guild":
-            if self.guild_id is None:
-                raise ValueError("Cannot resolve 'guild' scope: view has no guild_id")
-            return {"guild_id": self.guild_id}
-        if scope == "user_guild":
-            missing = []
-            if self.user_id is None:
-                missing.append("user_id")
-            if self.guild_id is None:
-                missing.append("guild_id")
-            if missing:
-                raise ValueError(
-                    f"Cannot resolve 'user_guild' scope: view has no {' and '.join(missing)}"
-                )
-            return {"user_id": self.user_id, "guild_id": self.guild_id}
-        if scope == "global":
-            return {}
-        raise ValueError(f"Unknown state_scope: {scope!r}")
+        return self._resolve_scoped_identifiers(self.state_scope, {})
 
     @property
     def _effective_scoped_slot(self) -> str:
@@ -3069,15 +3424,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 for whichever keys the scope needs. Pass an explicit
                 ``user_id=`` to write into another player's scope.
         """
-        effective_scope = scope if scope is not None else self.state_scope
-        effective_ids = self._resolve_scoped_identifiers(effective_scope, identifiers)
-        payload = {
-            "scope": effective_scope,
-            "identifiers": effective_ids,
-            "data": data,
-            "slot_name": self._effective_scoped_slot,
-        }
-        return await self.dispatch("SCOPED_UPDATE", payload)
+        return await self.dispatch_scoped_as("SCOPED_UPDATE", data, scope=scope, **identifiers)
 
     async def dispatch_scoped_as(
         self,
@@ -3106,12 +3453,14 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         """
         effective_scope = scope if scope is not None else self.state_scope
         effective_ids = self._resolve_scoped_identifiers(effective_scope, identifiers)
-        payload = {
-            "scope": effective_scope,
-            "identifiers": effective_ids,
-            "data": data,
-            "slot_name": self._effective_scoped_slot,
-        }
+        # Built through the creator rather than inline, so the one payload
+        # shape every scoped reducer decodes has a single author.
+        payload = ActionCreators.scoped_update(
+            effective_scope,
+            effective_ids,
+            data,
+            slot_name=self._effective_scoped_slot,
+        )
         return await self.dispatch(action_type, payload)
 
     # // ========================================( Session Limiting )======================================== // #
@@ -3226,18 +3575,11 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
 
         store = state_store or get_store()
 
-        scope = cls.instance_scope
-        if scope == "user":
-            scope_key = f"user:{user_id}" if user_id else None
-        elif scope == "guild":
-            scope_key = f"guild:{guild_id}" if guild_id else None
-        elif scope == "user_guild":
-            scope_key = f"user_guild:{user_id}:{guild_id}" if user_id and guild_id else None
-        elif scope == "global":
-            scope_key = "global"
-        else:
-            scope_key = None
-
+        # Falsy ids are treated as absent here, matching how the instance
+        # index itself keys views (see StateStore._build_instance_scope_key).
+        scope_key = store.scope_key(
+            cls.instance_scope, user_id=user_id or None, guild_id=guild_id or None
+        )
         if scope_key is None:
             return True
 
@@ -3420,7 +3762,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     # display view only re-sends an identical tree, so exit
                     # tears down state and leaves the message untouched.
                     if self._freeze_components():
-                        await self._bounded(self._message.edit(view=self))
+                        await self._bounded(self._message.edit(**self._freeze_edit_kwargs()))
                 else:
                     await self._bounded(self._message.edit(view=None))
             except discord.NotFound:
@@ -3459,7 +3801,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         label="Exit",
         style=discord.ButtonStyle.secondary,
         emoji="\u274c",
-        delete_message=False,
+        delete_message=None,
         custom_id=None,
         row=None,
     ):
@@ -3471,6 +3813,11 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         directly. ``add_exit_button`` is the attach-to-self convenience
         wrapper; reach for this helper whenever the layout needs to own
         the button's placement.
+
+        ``delete_message`` defaults to ``None``, which forwards the
+        decision to the view's ``exit_policy``: ``"disable"`` freezes the
+        components, ``"delete"`` removes the message. Pass an explicit
+        ``True`` or ``False`` to override the policy for this button.
 
         For ``PersistentView``/``PersistentLayoutView`` subclasses, pass
         ``custom_id`` so the button survives a restart.
@@ -3494,14 +3841,15 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         style=discord.ButtonStyle.secondary,
         row=None,
         emoji="\u274c",
-        delete_message=False,
+        delete_message=None,
         custom_id=None,
     ):
         """Add a button that exits this view when clicked.
 
         Thin wrapper over :meth:`make_exit_button` that attaches the
-        result to ``self``. For PersistentView subclasses, pass a
-        custom_id (e.g. ``custom_id="exit"``).
+        result to ``self``. ``delete_message=None`` (the default) defers
+        to the view's ``exit_policy``. For PersistentView subclasses,
+        pass a custom_id (e.g. ``custom_id="exit"``).
         """
         button = self.make_exit_button(
             label=label,

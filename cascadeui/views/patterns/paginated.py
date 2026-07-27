@@ -72,6 +72,22 @@ class _BasePaginatedMixin:
         "next_button_style",
         "last_button_style",
     )
+    _STR_OR_NONE_ATTRS: ClassVar[tuple] = (
+        *_StatefulMixin._STR_OR_NONE_ATTRS,
+        "first_button_label",
+        "prev_button_label",
+        "indicator_button_label",
+        "next_button_label",
+        "last_button_label",
+    )
+    _EMOJI_ATTRS: ClassVar[tuple] = (
+        *_StatefulMixin._EMOJI_ATTRS,
+        "first_button_emoji",
+        "prev_button_emoji",
+        "indicator_button_emoji",
+        "next_button_emoji",
+        "last_button_emoji",
+    )
 
     _BOOL_ATTRS: ClassVar[tuple] = (
         *_StatefulMixin._BOOL_ATTRS,
@@ -203,6 +219,10 @@ class _BasePaginatedMixin:
         subclass that needs a programmatic "jump to page N" control (a search
         hit, a "find me" button). Setting ``current_page`` directly does not
         re-render; this is the supported way to move the cursor.
+
+        Not to be confused with ``PaginatedRegion.set_page``, which is
+        synchronous and moves the cursor without rendering; the region's
+        rendering equivalent is ``PaginatedRegion.show_page``.
         """
         if not self.pages:
             return
@@ -265,7 +285,7 @@ class _BasePaginatedMixin:
                 page_num = max(1, min(page_num, total))
                 parent.current_page = page_num - 1
                 await parent._safe_defer(modal_interaction)
-                await parent.on_page_changed(parent.current_page)
+                await parent._call_hook_safe(parent.on_page_changed, parent.current_page)
                 await parent._update_page()
 
         await self.open_modal(interaction, _GotoModal())
@@ -720,10 +740,7 @@ class PaginatedView(_BasePaginatedMixin, StatefulView):
         content=None,
         *,
         embed=None,
-        embeds=None,
-        file=None,
-        files=None,
-        ephemeral=False,
+        **kwargs,
     ):
         """Send the view, using the first page as initial content if not specified."""
         # Cursor mode: page 0 is not yet loaded at construction; fetch it before
@@ -739,10 +756,7 @@ class PaginatedView(_BasePaginatedMixin, StatefulView):
         return await super().send(
             content=content,
             embed=embed,
-            embeds=embeds,
-            file=file,
-            files=files,
-            ephemeral=ephemeral,
+            **kwargs,
         )
 
     nav_rebuild = staticmethod(lambda v: v._nav_edit_kwargs())

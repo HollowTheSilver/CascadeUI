@@ -67,7 +67,7 @@ one must yield.
 
 | Method Hook | When it fires |
 |-------------|---------------|
-| `on_instance_limit(user_id, interaction)` | Dynamic override when limit blocks creation |
+| `on_instance_limit(error)` | Dynamic override when limit blocks creation |
 
 ### Replacement behavior
 
@@ -163,6 +163,7 @@ dies with its last member.
 | `ack_first` | `False` | Ack before the checks/callback (advanced escape hatch) |
 | `serialize_interactions` | `True` | Process clicks sequentially via asyncio.Lock |
 | `edit_timeout` | `60.0` | Max seconds a Discord edit may stall before cancellation; `None` disables |
+| `allowed_mentions` | `None` | Mention rules applied to this view's send and every re-render; `None` defers to the client's rules |
 
 ### Undo/redo
 
@@ -387,6 +388,7 @@ Every class attribute, grouped by pillar, with its default value:
     ack_first = False  # advanced -- ack before the checks/callback
     serialize_interactions = True
     edit_timeout = 60.0  # per-edit Discord HTTP ceiling; None = unbounded
+    allowed_mentions = None  # None = defer to the client's rules
     refresh_cooldown_ms = None  # paces background re-renders; clicks are exempt
     auto_refresh_ephemeral = None  # derives from timeout; pin with True/False
     reopen_failure_message = "Could not refresh this view..."

@@ -610,20 +610,6 @@ class StateStore:
                 computed_value._compute_fn,
             )
 
-    def _unregister_computed(self, name: str) -> None:
-        """Unregister a computed value by name. Internal plumbing.
-
-        Dual-clears both the local ``_computed`` cache and the global
-        ``_COMPUTED_REGISTRY`` recipe so neither the current store nor
-        any future fresh-init store will resurrect the computed. Silent
-        no-op when ``name`` is not registered, matching
-        ``dict.pop(name, None)`` semantics.
-        """
-        from .computed import _COMPUTED_REGISTRY
-
-        self._computed.pop(name, None)
-        _COMPUTED_REGISTRY.pop(name, None)
-
     @property
     def computed(self) -> "_ComputedAccessor":
         """Access computed values by name: store.computed["total_votes"]."""
@@ -835,25 +821,52 @@ class StateStore:
             user_guild  -> "user_guild:{user_id}:{guild_id}"
             global      -> "global"
         """
+        uid = identifiers.get("user_id")
+        gid = identifiers.get("guild_id")
+        key = StateStore.scope_key(scope, user_id=uid, guild_id=gid)
+        if key is not None:
+            return key
         if scope == "user":
-            uid = identifiers.get("user_id")
-            if uid is None:
-                raise ValueError("user_id is required for 'user' scope")
-            return f"user:{uid}"
+            raise ValueError("user_id is required for 'user' scope")
         if scope == "guild":
-            gid = identifiers.get("guild_id")
-            if gid is None:
-                raise ValueError("guild_id is required for 'guild' scope")
-            return f"guild:{gid}"
+            raise ValueError("guild_id is required for 'guild' scope")
         if scope == "user_guild":
-            uid = identifiers.get("user_id")
-            gid = identifiers.get("guild_id")
-            if uid is None or gid is None:
-                raise ValueError("user_id and guild_id are both required for 'user_guild' scope")
-            return f"user_guild:{uid}:{gid}"
+            raise ValueError("user_id and guild_id are both required for 'user_guild' scope")
+        raise ValueError(f"Unknown scope: {scope!r}")
+
+    @staticmethod
+    def scope_key(scope: str, *, user_id=None, guild_id=None) -> Optional[str]:
+        """Build a scope key, or ``None`` when the scope's ids are missing.
+
+        The single writer of the scope-key format. Every other site that
+        needs one (the strict :meth:`_build_scope_key`, the instance
+        index, the sync availability pre-check) routes through here, so
+        the format is defined once and a change cannot desync one caller
+        from the rest.
+
+        Missing means ``None``, not falsy. ``0`` is a value a caller can
+        legitimately hold (a sentinel account, a DM standing in for a
+        guild), and treating it as absent would drop the write rather than
+        reject it. Callers that want falsy ids treated as absent normalize
+        with ``or None`` before calling.
+
+        Key formats:
+            user        -> "user:{user_id}"
+            guild       -> "guild:{guild_id}"
+            user_guild  -> "user_guild:{user_id}:{guild_id}"
+            global      -> "global"
+        """
+        if scope == "user":
+            return None if user_id is None else f"user:{user_id}"
+        if scope == "guild":
+            return None if guild_id is None else f"guild:{guild_id}"
+        if scope == "user_guild":
+            if user_id is None or guild_id is None:
+                return None
+            return f"user_guild:{user_id}:{guild_id}"
         if scope == "global":
             return "global"
-        raise ValueError(f"Unknown scope: {scope!r}")
+        return None
 
     # // ========================================( View Registry )======================================== // #
 
@@ -973,8 +986,8 @@ class StateStore:
         Callers outside the store (devtools, diagnostics, test harnesses)
         read through this accessor instead of reaching for ``_active_views``
         directly. The returned mapping reflects registrations live but
-        rejects mutation -- all bookkeeping goes through ``register_view``
-        and ``unregister_view``.
+        rejects mutation: all bookkeeping goes through the store's own
+        ``_register_view`` / ``_destroy_view`` seams.
         """
         return MappingProxyType(self._active_views)
 
@@ -1013,19 +1026,17 @@ class StateStore:
                 scope keys for participants (non-owner users tracked in the
                 session index). Only affects "user" and "user_guild" scopes.
         """
-        scope = view.instance_scope
+        # The instance index treats a falsy id as no id: an unindexed view
+        # is simply exempt from the limit, where a "user:0" bucket would
+        # silently pool every such view together. The scoped-state writer
+        # keeps the stricter is-None rule, since dropping a write is worse
+        # than skipping an index entry.
         uid = user_id if user_id is not None else view.user_id
-        if scope == "user":
-            return f"user:{uid}" if uid else None
-        elif scope == "guild":
-            return f"guild:{view.guild_id}" if view.guild_id else None
-        elif scope == "user_guild":
-            if uid and view.guild_id:
-                return f"user_guild:{uid}:{view.guild_id}"
-            return None
-        elif scope == "global":
-            return "global"
-        return None
+        return StateStore.scope_key(
+            view.instance_scope,
+            user_id=uid or None,
+            guild_id=view.guild_id or None,
+        )
 
     # // ========================================( Message Cleanup )======================================== // #
 
@@ -1392,8 +1403,8 @@ class StateStore:
         subscriber task that outlives ``dispatch()``. The counter is
         task-inherited via ``_CURRENT_EDIT_COUNTER`` (set at dispatch
         time, captured by ``asyncio.create_task``), with a fallback to
-        the legacy ``_perf_edit_stack`` frame for sync test paths that
-        push manually.
+        the ``_perf_edit_stack`` frame the store itself pushes for edits
+        that land outside a task-inherited context.
 
         No-op when profiling is off or when called outside a dispatch.
         """

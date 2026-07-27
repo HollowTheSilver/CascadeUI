@@ -36,14 +36,19 @@ if TYPE_CHECKING:
 # Data-level migrations (rewriting rows through row_select + row_upsert)
 # are supported today on every backend that implements Capability.RELATIONAL.
 #
-# DDL-level migrations (ALTER TABLE, ADD COLUMN, DROP INDEX) are NOT
-# supported through this Protocol yet -- the backend surface is
-# deliberately backend-agnostic and does not expose raw SQL. The first
-# library migration that needs DDL will introduce a Capability.RAW_SQL
-# flag plus an optional execute(sql) method; backends can opt in without
-# breaking KV-only implementations. Until then, schema evolution happens
-# by shipping new DDL in schema.py for fresh installs and moving data
-# via the row API for existing installs.
+# DDL-level migrations (ALTER TABLE, ADD COLUMN, DROP INDEX) go through
+# the backend's raw-SQL surface, which the SQL backends declare via
+# Capability.RAW_SQL. Gate on the flag first, since a KV-only backend
+# (InMemoryBackend) raises rather than pretending to run the statement:
+#
+#     if Capability.RAW_SQL in backend.capabilities:
+#         async with backend.transaction():
+#             await backend.execute("ALTER TABLE ...")
+#
+# Group the statements inside one transaction() block: apply_migrations
+# records the new version in a separate call after the migrator returns,
+# so a migrator that fails partway leaves the old version recorded and
+# will be re-run against a half-migrated schema otherwise.
 Migrator = Callable[["PersistenceBackend"], Awaitable[None]]
 
 

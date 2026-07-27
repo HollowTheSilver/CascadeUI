@@ -15,13 +15,13 @@ store = get_store()
 
 ### Methods
 
-#### `dispatch(action_type, payload=None, source=None)`
+#### `dispatch(action_type, payload=None, source_id=None)`
 
 Dispatches an action through the middleware pipeline and into the matching reducer.
 
 - `action_type` (str): The action type (e.g., `"COUNTER_UPDATED"`)
 - `payload` (dict, optional): Data for the action
-- `source` (str, optional): ID of the dispatching view
+- `source_id` (str, optional): ID of the dispatching view. The action dict's own field is named `source`
 
 Subscriber failures are caught and logged internally -- `dispatch()` does not raise from subscriber errors.
 
@@ -46,7 +46,7 @@ Public attribute holding the current state dict. Read-only by convention; mutate
 Returns `True` when an instance of the given middleware class is installed. Used by `setup_middleware` to gate duplicate installs; available to callers that need to branch on middleware presence.
 
 ```python
-from cascadeui.state.middleware import UndoMiddleware
+from cascadeui import UndoMiddleware
 
 if store.has_middleware(UndoMiddleware):
     # undo/redo buttons will work
@@ -96,6 +96,10 @@ Registers an event hook. `event_name` is a snake_case name (e.g., `"view_created
 
 Removes an event hook.
 
+#### `scope_key(scope, *, user_id=None, guild_id=None) -> Optional[str]` (staticmethod)
+
+Builds a scope key string (`"user:123"`, `"guild:456"`, `"user_guild:123:456"`, `"global"`), or `None` when the scope's required ids are missing. The single writer of the scope-key format: the scoped-state readers, the instance-limit index, and the sync availability pre-check all route through it, so the format is defined once. `0` is a legitimate id and is never treated as missing; a caller that wants falsy ids treated as absent normalizes with `or None` first.
+
 #### `get_scoped(scope, *, user_id=None, guild_id=None)`
 
 Returns scoped state for the given scope type and ID. Reads from the live `self.state`.
@@ -116,9 +120,8 @@ Sets scoped state for the given scope type and ID.
 
 Returns a read-only `MappingProxyType` over the internal active-view
 registry (`view_id -> view instance`). The returned mapping is **live,
-not a snapshot** (subsequent `register_view` / `unregister_view` calls
-on the store show through), but mutation raises `TypeError`, so the
-privacy boundary stays intact.
+not a snapshot** (later registrations and teardowns show through), but
+mutation raises `TypeError`, so the privacy boundary stays intact.
 
 ```python
 from cascadeui import get_store
@@ -142,7 +145,7 @@ Reducer-side writer that merges `data` into the scope bucket and returns `state`
 ### Properties
 
 - `state` (dict): The current state tree
-- `action_history` (list): Recent dispatched actions
+- `history` (list): Recent dispatched actions, capped by `history_limit` (default 100)
 - `computed` (dict-like): Access computed values by name (e.g., `store.computed["total_votes"]`)
 
 ---
@@ -202,13 +205,13 @@ selector output changed.
 Top-level async helper that installs middleware into the store's dispatch chain. Each middleware is installed once (guarded by `store.has_middleware(type(mw))`), then its `async initialize(store)` method is awaited if one is defined.
 
 ```python
-from cascadeui import setup_middleware
-from cascadeui.persistence import SQLiteBackend
-from cascadeui.state.middleware import (
+from cascadeui import (
     LoggingMiddleware,
     PersistenceMiddleware,
     UndoMiddleware,
+    setup_middleware,
 )
+from cascadeui.persistence import SQLiteBackend
 
 class MyBot(commands.Bot):
     async def setup_hook(self):

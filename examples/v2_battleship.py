@@ -507,6 +507,11 @@ class BattleshipView(StatefulLayoutView):
     # trigger redundant rebuilds every time a child fleet panel exits
     # during _cleanup_attached_children.
     subscribed_actions = {"BATTLESHIP_REROLL"}
+    # The setup card, turn indicator, and shot results all name the
+    # players, and the tree rebuilds on every Ready toggle, re-roll, and
+    # shot, so without this a match re-notifies both players once per
+    # move. The turn-nudge followups are separate sends and still ping.
+    allowed_mentions = discord.AllowedMentions.none()
 
     # Ship placements live in ``state["application"]["battleship"]["fleets"]``
     # via the BATTLESHIP_REROLL reducer. These properties are the canonical
@@ -848,12 +853,10 @@ class BattleshipView(StatefulLayoutView):
                     emoji="\N{SHIP}",
                     callback=self._show_my_ships,
                 ),
-                StatefulButton(
-                    label="Close",
-                    style=discord.ButtonStyle.secondary,
-                    emoji="\N{CROSS MARK}",
-                    callback=self._close,
-                ),
+                # delete_message defaults to None, which reaches the
+                # phase-aware exit() override below: delete during setup,
+                # freeze once the game has started.
+                self.make_exit_button(label="Close"),
             )
         )
 
@@ -1064,10 +1067,6 @@ class BattleshipView(StatefulLayoutView):
         self.build_ui()
         await self.refresh()
 
-    async def _close(self, interaction: discord.Interaction):
-        """Close the game. Phase-aware behavior lives in ``exit()`` below."""
-        await self.exit()
-
     async def exit(self, delete_message: bool | None = None):
         # Phase-aware default: setup-phase exits delete the message (nothing
         # worth preserving); active or game-over exits freeze it so the
@@ -1241,8 +1240,8 @@ class MyShipsView(StatefulLayoutView):
     # Fleet ephemerals should never linger frozen. ``instance_policy``
     # evicts the previous fleet view when "View Fleet" is clicked again;
     # ``replace_policy`` then deletes that view's message; ``exit_policy``
-    # handles every bare ``exit()`` path -- close button, timeout, and
-    # ``_cleanup_attached_children`` on game end.
+    # covers the close button and every other ``exit()`` path that names
+    # no ``delete_message``.
     instance_policy = "replace"
     replace_policy = "delete"
     exit_policy = "delete"
@@ -1348,14 +1347,7 @@ class MyShipsView(StatefulLayoutView):
                 message="Re-rolling too fast. Try again in {remaining}s.",
             )
             buttons.append(regenerate)
-        buttons.append(
-            StatefulButton(
-                label="Close",
-                style=discord.ButtonStyle.secondary,
-                emoji="\N{CROSS MARK}",
-                callback=self._close,
-            )
-        )
+        buttons.append(self.make_exit_button(label="Close"))
         self.add_item(ActionRow(*buttons))
 
     async def _reroll(self, interaction: discord.Interaction):
@@ -1386,9 +1378,6 @@ class MyShipsView(StatefulLayoutView):
             "BATTLESHIP_REROLL",
             {"player_id": self.user_id, "ships": new_ships},
         )
-
-    async def _close(self, interaction: discord.Interaction):
-        await self.exit()
 
 
 # // ========================================( Cog )======================================== // #

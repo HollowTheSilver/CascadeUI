@@ -75,9 +75,9 @@ logger = logging.getLogger(__name__)
 
 RACES = ["Human", "Elf", "Dwarf", "Halfling"]
 
-# Class availability is gated by race. The gating is deliberately sparse
-# so the cascade is visible at a glance: Halflings cannot be Paladins,
-# Dwarves cannot be Wizards, and so on.
+# Class availability is gated by race: Halflings cannot be Paladins,
+# Dwarves cannot be Wizards, and so on. Picking a race narrows the class
+# options on the next step.
 CLASSES_BY_RACE = {
     "Human": ["Fighter", "Wizard", "Rogue", "Cleric"],
     "Elf": ["Wizard", "Ranger", "Rogue"],

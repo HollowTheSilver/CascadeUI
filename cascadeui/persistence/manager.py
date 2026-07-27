@@ -48,7 +48,11 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
-from ..exceptions import PersistenceInitError, PersistenceRehydrateError
+from ..exceptions import (
+    PersistenceInitError,
+    PersistenceRehydrateError,
+    PersistenceSchemaError,
+)
 from ..state.actions import ActionCreators
 from .config import (
     NAMESPACE_APPLICATION,
@@ -150,9 +154,10 @@ class PersistenceManager:
         # users register via register_hook().
         self._hooks: dict[str, list[Callable[..., Any]]] = {}
 
-        # Middleware handle. Left None under the canonical setup_middleware
-        # install, which owns the middleware's own flush/close lifecycle; the
-        # flush_all() / close() guards below skip when it is None.
+        # Middleware handle, set by PersistenceMiddleware.initialize once it
+        # has resolved this manager. Stays None only for a manager built
+        # directly in a test or a custom harness, where flush_all() and
+        # close() then have no buffers to drain.
         self._middleware: Any = None
 
     # // ========================================( Introspection )======================================== // #
@@ -260,7 +265,7 @@ class PersistenceManager:
             while on_disk < current:
                 migrator = get_schema_migrator(table, on_disk)
                 if migrator is None:
-                    raise PersistenceInitError(
+                    raise PersistenceSchemaError(
                         f"No migrator registered for {table} "
                         f"v{on_disk} -> v{on_disk + 1}; cannot upgrade"
                     )
@@ -272,7 +277,7 @@ class PersistenceManager:
             if on_disk > current:
                 # DB was written by a newer CascadeUI release. Refuse
                 # to run rather than silently downgrade data.
-                raise PersistenceInitError(
+                raise PersistenceSchemaError(
                     f"{table} on-disk schema v{on_disk} is newer than "
                     f"library version v{current}; upgrade CascadeUI."
                 )
@@ -638,7 +643,15 @@ class PersistenceManager:
             logger.warning(f"Channel {channel_id} for {persistence_key!r} is gone; pruning entry.")
             removed_keys.append(persistence_key)
             return None
-        except (discord.Forbidden, discord.HTTPException) as exc:
+        except (
+            discord.Forbidden,
+            discord.HTTPException,
+            discord.RateLimited,
+            discord.InvalidData,
+        ) as exc:
+            # RateLimited and InvalidData are siblings of HTTPException, not
+            # subclasses; uncaught they would land the row in "failed" (never
+            # retried) instead of "unreachable" (retried next restart).
             logger.warning(
                 f"Could not reach channel {channel_id} for {persistence_key!r} "
                 f"({type(exc).__name__}); leaving the entry for the next restart."
@@ -660,7 +673,7 @@ class PersistenceManager:
             logger.warning(f"Message {message_id} for {persistence_key!r} is gone; pruning entry.")
             removed_keys.append(persistence_key)
             return None
-        except (discord.Forbidden, discord.HTTPException) as exc:
+        except (discord.Forbidden, discord.HTTPException, discord.RateLimited) as exc:
             logger.warning(
                 f"Could not reach message {message_id} for {persistence_key!r} "
                 f"({type(exc).__name__}); leaving the entry for the next restart."
@@ -736,7 +749,7 @@ class PersistenceManager:
                 persisted = row.get("session_id")
                 if persisted:
                     view.session_id = persisted
-                elif view.user_id:
+                elif view.user_id is not None:
                     view.session_id = f"{type(view)._class_session_key()}:user_{view.user_id}"
 
             self._bot.add_view(view, message_id=message.id)
@@ -758,6 +771,11 @@ class PersistenceManager:
                 await view._register_state()
                 state_registered = True
                 await view._update_message_state(message)
+                # Stamped before the hook so the view can reach the client
+                # even when the override does not store it. A restored view
+                # has no interaction and no context, so this is the only
+                # route to the bot's own allowed_mentions on later refreshes.
+                view._bot = self._bot
                 # on_bind runs here so runtime deps are available before the
                 # deferred on_restore render. Supports sync or async overrides.
                 bind_result = view.on_bind(self._bot)
@@ -1021,8 +1039,8 @@ class PersistenceManager:
 
         Thin passthrough to :meth:`PersistenceMiddleware.flush_all`. Call
         from devtools or operator-facing commands that want an immediate
-        disk write without tearing the manager down. No-op when no
-        middleware is installed (every namespace opted out of persistence).
+        disk write without tearing the manager down. No-op for a manager
+        built outside the middleware, which owns the buffers this drains.
         """
         if self._middleware is not None:
             await self._middleware.flush_all()

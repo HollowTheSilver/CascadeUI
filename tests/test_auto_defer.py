@@ -658,3 +658,69 @@ class TestOpenModal:
         await view.open_modal(interaction, modal, fallback_message="Try later.")
 
         interaction.followup.send.assert_called_once_with("Try later.", ephemeral=True)
+
+
+class TestRespondDeleteAfter:
+    """``delete_after`` works on both respond paths.
+
+    ``Webhook.send`` does not take it, and which path runs depends on
+    whether the ack backstop fired first, outside the caller's control.
+    """
+
+    async def test_send_message_path_forwards_natively(self):
+        from cascadeui.utils.responses import respond_safe
+
+        interaction = _make_interaction(is_done=False)
+        await respond_safe(interaction, "hi", delete_after=5)
+
+        assert interaction.response.send_message.await_args.kwargs["delete_after"] == 5
+
+    async def test_followup_path_deletes_on_a_timer(self):
+        from cascadeui.utils.responses import respond_safe
+
+        interaction = _make_interaction(is_done=True)
+        message = MagicMock()
+        message.delete = AsyncMock()
+        interaction.followup.send = AsyncMock(return_value=message)
+
+        await respond_safe(interaction, "hi", delete_after=0.02)
+
+        # delete_after is consumed here, not handed to a method without it.
+        assert "delete_after" not in interaction.followup.send.await_args.kwargs
+        assert interaction.followup.send.await_args.kwargs["wait"] is True
+        await asyncio.sleep(0.08)
+        assert message.delete.await_count == 1
+
+    async def test_followup_path_without_delete_after_is_unchanged(self):
+        from cascadeui.utils.responses import respond_safe
+
+        interaction = _make_interaction(is_done=True)
+        interaction.followup.send = AsyncMock()
+
+        await respond_safe(interaction, "hi", ephemeral=True)
+
+        assert "wait" not in interaction.followup.send.await_args.kwargs
+
+
+class TestSafeDeferSwallowsInteractionResponded:
+    """``InteractionResponded`` is a sibling of ``HTTPException``.
+
+    The auto-defer timer can ack inside this call's own await window, and
+    on 3.10/3.11 ``wait_for`` widens that window enough to lose the race.
+    The slot ends up acked either way, which is all ``_safe_defer`` wanted,
+    so its docstring promise that a failed ack is never propagated has to
+    hold for this type too.
+    """
+
+    async def test_interaction_responded_is_absorbed(self):
+        view = StatefulView(interaction=_make_interaction())
+        interaction = _make_interaction(is_done=False)
+        interaction.response.defer = AsyncMock(
+            side_effect=discord.InteractionResponded(MagicMock())
+        )
+
+        await view._safe_defer(interaction)
+
+    def test_interaction_responded_is_not_an_http_exception(self):
+        """The reason the explicit clause is needed rather than inherited."""
+        assert not issubclass(discord.InteractionResponded, discord.HTTPException)

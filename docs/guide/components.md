@@ -571,7 +571,7 @@ self.add_item(action_section(
 ))
 ```
 
-### `toggle_section(text, *, active, callback, labels=("Enabled", "Disabled"), emoji=None)`
+### `toggle_section(text, *, active, callback, labels=("Enabled", "Disabled"), ...)`
 
 A `Section` with a green/red toggle button. `labels` sets the (active, inactive)
 button text -- pass `("On", "Off")` to relabel -- and `emoji` adds a button emoji.
@@ -586,7 +586,7 @@ self.add_item(toggle_section(
 ))
 ```
 
-### `image_section(text, *, url, description=None, spoiler=False)`
+### `image_section(text, *more_text, url, description=None, spoiler=False)`
 
 A `Section` with a `Thumbnail` image. `url` accepts a remote URL string,
 the `attachment://name.ext` form, or a `discord.File` instance whose
@@ -594,7 +594,7 @@ the `attachment://name.ext` form, or a `discord.File` instance whose
 256 chars); `spoiler=True` hides it behind a spoiler. See
 [Local file attachments](#local-file-attachments).
 
-### `link_section(text, *, label, url, emoji=None)`
+### `link_section(text, *, label, url, emoji=None, disabled=False)`
 
 A `Section` with a link-style button accessory. Completes the `*_section`
 family for the three Section accessory shapes: action (StatefulButton), image
@@ -647,12 +647,14 @@ A colored status container:
 | `"error"` | Red |
 | `"info"` | Blue |
 
-### `stats_card(title, stats, *, color=None, footer=None)`
+### `stats_card(title, stats, *, color=None, footer=None, spoiler=False)`
 
 Thin composition of `card(title, key_value(stats), ...)`. The title is
 rendered as a second-level heading automatically (pre-format with `##` for
 finer control), a small separator sits between the heading and the stats,
-and an optional `footer` line renders in Discord's subtext style:
+and an optional `footer` line renders in Discord's subtext style. An empty
+title renders no heading and no separator, so a computed title that comes
+back blank degrades to a bare stats card:
 
 ```python
 from cascadeui import stats_card
@@ -689,7 +691,7 @@ Override `filled` / `empty` for alternative glyphs, or set
 `divider()` creates a thin line separator. `gap()` creates spacing without a
 visible line.
 
-### `gallery(*media, descriptions=None)`
+### `gallery(*media, descriptions=None, spoilers=None)`
 
 A `MediaGallery` from one or more image references. Each reference is
 either a URL string, the `attachment://name.ext` form, or a `discord.File`
@@ -713,7 +715,7 @@ card(
 
 Use `file_attachment` for downloadable files; use `gallery` for inline image previews.
 
-### `button_row(buttons, *, style=..., emoji=None)`
+### `button_row(buttons, *, style=..., emoji=None, custom_id=None)`
 
 Builds an `ActionRow` from a `{label: callback}` mapping. Dict insertion
 order determines button order, so every button in the row shares one style
@@ -1112,6 +1114,9 @@ when you call `send()`.
 | `ActionRow` must hold at least 1 child (empty) | accepts | rejects |
 | `MediaGallery` must hold 1-10 items | accepts | rejects |
 | `TextDisplay` content over 4000 characters | accepts | rejects |
+| `TextDisplay` content is empty | accepts | rejects |
+| `SelectOption` label or value is empty | accepts | rejects |
+| `custom_id` over 100 characters | accepts | rejects |
 | `Button` label over 80 characters | accepts | rejects |
 | `Select` placeholder over 150 characters | accepts | rejects |
 | `SelectOption` label / value / description over 100 characters | accepts | rejects |

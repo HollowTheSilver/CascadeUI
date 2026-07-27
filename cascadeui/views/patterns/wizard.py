@@ -63,6 +63,18 @@ class _BaseWizardMixin:
         "next_button_style",
         "finish_button_style",
     )
+    _STR_OR_NONE_ATTRS: ClassVar[tuple] = (
+        *_StatefulMixin._STR_OR_NONE_ATTRS,
+        "back_button_label",
+        "next_button_label",
+        "finish_button_label",
+    )
+    _EMOJI_ATTRS: ClassVar[tuple] = (
+        *_StatefulMixin._EMOJI_ATTRS,
+        "back_button_emoji",
+        "next_button_emoji",
+        "finish_button_emoji",
+    )
     _BOOL_ATTRS: ClassVar[tuple] = (
         *_StatefulMixin._BOOL_ATTRS,
         "show_progress_bar",
@@ -420,10 +432,7 @@ class WizardView(_BaseWizardMixin, StatefulView):
         content: Optional[str] = None,
         *,
         embed: Optional[discord.Embed] = None,
-        embeds: Optional[List[discord.Embed]] = None,
-        file: Optional[discord.File] = None,
-        files: Optional[List[discord.File]] = None,
-        ephemeral: bool = False,
+        **kwargs,
     ):
         """Send the view, using the current step's content when none is given.
 
@@ -438,10 +447,7 @@ class WizardView(_BaseWizardMixin, StatefulView):
         return await super().send(
             content=content,
             embed=embed,
-            embeds=embeds,
-            file=file,
-            files=files,
-            ephemeral=ephemeral,
+            **kwargs,
         )
 
     nav_rebuild = staticmethod(lambda v: v._nav_edit_kwargs())

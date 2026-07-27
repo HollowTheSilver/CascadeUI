@@ -1,7 +1,7 @@
 # // ========================================( Modules )======================================== // #
 
 
-from typing import List, Tuple, Type
+from typing import Any, List, Tuple, Type
 
 from discord.ui import (
     ActionRow,
@@ -62,6 +62,12 @@ _SELECT_PLACEHOLDER_MAX = 150
 # discord.py stores all three as plain strings with no length check, so
 # oversized option text constructs cleanly and only fails at HTTP send.
 _SELECT_OPTION_TEXT_MAX = 100
+
+# custom_id cap. Discord limits every interactive component's ``custom_id``
+# to 100 characters and discord.py stores it unchecked. The builders that
+# compose ids raise at construction, but a hand-built id, a long composite
+# ``key=``, or a caller's own string only meets a check here.
+_CUSTOM_ID_MAX = 100
 
 # Section's documented child-count minimum. Discord's API docs at
 # ``developers/components/reference.mdx`` describe the Section
@@ -375,17 +381,33 @@ def _validate_action_row(row: ActionRow, path: List[str]) -> None:
 
 
 def _check_textdisplay_size(item: TextDisplay, path: List[str]) -> None:
-    """Reject a ``TextDisplay`` whose content exceeds Discord's 4000-char cap.
+    """Reject a ``TextDisplay`` whose content is empty or over the 4000-char cap.
 
     discord.py stores ``content`` as a plain string with no length check, so
-    an oversized body constructs cleanly and fails only at HTTP send, far from
-    where it was built. The validator catches it here at the same seams it
-    catches the MediaGallery cap.
+    both an oversized body and an empty one construct cleanly and fail only at
+    HTTP send, far from where they were built. The validator catches them here
+    at the same seams it catches the MediaGallery cap.
+
+    The empty case is the more damaging of the two because it is
+    data-triggered: a formatter hook that returns ``""`` for one entry whose
+    optional fields all happened to be absent fails the entire message, not
+    just its own row. Checking both bounds also makes TextDisplay symmetric
+    with the container types, whose minimum child counts are already enforced.
     """
     content = getattr(item, "content", None)
     if content is None:
         return
     length = len(content)
+    if length == 0:
+        raise ValueError(
+            f"Invalid V2 placement: TextDisplay content is empty.\n"
+            f"  Path: {' -> '.join(path)}\n"
+            f"  Discord requires a non-empty content on a text display and "
+            f"rejects the whole message with HTTP 400, so one blank line takes "
+            f"down every component beside it.\n"
+            f"  Fix: Skip the TextDisplay when its text is empty, rather than "
+            f"adding it with an empty string."
+        )
     if length > _TEXTDISPLAY_MAX_CHARS:
         raise ValueError(
             f"Invalid V2 placement: TextDisplay content is {length} characters, "
@@ -396,6 +418,28 @@ def _check_textdisplay_size(item: TextDisplay, path: List[str]) -> None:
         )
 
 
+def _check_custom_id(item: Any, path: List[str]) -> None:
+    """Reject an interactive component whose ``custom_id`` is over the cap.
+
+    The last line of defense for the id that actually ships. The builders
+    that compose ids check their own arithmetic, but a hand-built id, a
+    composite's long ``key=``, or a caller's own string reaches Discord
+    unchecked otherwise, and an oversized id fails as an HTTP 400 that
+    names no component.
+    """
+    custom_id = getattr(item, "custom_id", None)
+    if custom_id is None or len(custom_id) <= _CUSTOM_ID_MAX:
+        return
+    raise ValueError(
+        f"Invalid V2 placement: {type(item).__name__} custom_id is "
+        f"{len(custom_id)} characters, over Discord's "
+        f"{_CUSTOM_ID_MAX}-character cap.\n"
+        f"  Path: {' -> '.join(path)}\n"
+        f"  Discord rejects this composition with HTTP 400.\n"
+        f"  Fix: Shorten the custom_id to {_CUSTOM_ID_MAX} characters or fewer."
+    )
+
+
 def _check_button_label(button: Button, path: List[str]) -> None:
     """Reject a ``Button`` whose label exceeds Discord's 80-char cap.
 
@@ -404,6 +448,7 @@ def _check_button_label(button: Button, path: List[str]) -> None:
     where it was built. The validator catches it here at every seam a Button is
     visited: ActionRow children and Section accessories.
     """
+    _check_custom_id(button, path)
     label = getattr(button, "label", None)
     if label is None:
         return
@@ -428,6 +473,7 @@ def _check_select_text(select: BaseSelect, path: List[str]) -> None:
     Auto-populated selects (User / Role / Channel / Mentionable) and unknown
     select types expose no ``options``, so that read defaults to an empty list.
     """
+    _check_custom_id(select, path)
     placeholder = getattr(select, "placeholder", None)
     if placeholder is not None and len(placeholder) > _SELECT_PLACEHOLDER_MAX:
         raise ValueError(
@@ -440,6 +486,20 @@ def _check_select_text(select: BaseSelect, path: List[str]) -> None:
     for index, option in enumerate(getattr(select, "options", [])):
         option_path = path + [f"options[{index}]"]
         label = getattr(option, "label", None)
+        # ``label`` and ``value`` are required and displayed, the same shape
+        # TextDisplay.content has, and the same data-triggered failure: an
+        # option built from a record whose name field happens to be blank
+        # fails the whole select, not just its own row.
+        for field, text in (("label", label), ("value", getattr(option, "value", None))):
+            if text is not None and len(text) == 0:
+                raise ValueError(
+                    f"Invalid V2 placement: SelectOption {field} is empty.\n"
+                    f"  Path: {' -> '.join(option_path)}\n"
+                    f"  Discord requires a non-empty {field} on every select "
+                    f"option and rejects the whole message with HTTP 400.\n"
+                    f"  Fix: Skip the option when its {field} is empty, or "
+                    f"supply a placeholder string."
+                )
         if label is not None and len(label) > _SELECT_OPTION_TEXT_MAX:
             raise ValueError(
                 f"Invalid V2 placement: SelectOption label is {len(label)} characters, "
@@ -619,6 +679,19 @@ def validate_unique_custom_ids(view) -> None:
         custom_id = getattr(item, "custom_id", None)
         if custom_id is None:
             continue
+        # The length check rides this walk rather than the V2 structural one:
+        # this is the only walk that runs for V1 views and the only one that
+        # visits DynamicItem, which is not a Button subclass and so is invisible
+        # to the per-node checks. An id composed from user data (a role name, a
+        # record title) overflows here or nowhere.
+        if len(custom_id) > _CUSTOM_ID_MAX:
+            raise ValueError(
+                f"custom_id is {len(custom_id)} characters, over Discord's "
+                f"{_CUSTOM_ID_MAX}-character cap: {custom_id!r}\n"
+                f"  Component: {type(item).__name__} in {type(view).__name__}\n"
+                f"  Discord rejects this message with HTTP 400.\n"
+                f"  Fix: Shorten the id, or the data it is composed from."
+            )
         if custom_id in seen:
             raise ValueError(
                 f"Duplicate component custom_id: {custom_id!r} appears more than once "

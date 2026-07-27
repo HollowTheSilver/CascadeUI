@@ -3,7 +3,9 @@
 
 from .layout import DisplayLayoutView, StatefulLayoutView
 from .patterns import (
+    FormField,
     FormLayoutView,
+    FormSchema,
     FormView,
     LeaderboardLayoutView,
     MenuLayoutView,
@@ -11,9 +13,14 @@ from .patterns import (
     PaginatedLayoutView,
     PaginatedView,
     PersistentLeaderboardLayoutView,
+    PersistentRolesLayoutView,
+    RoleCategory,
+    RolesLayoutView,
     TabLayoutView,
     TabView,
     WizardLayoutView,
+    WizardSchema,
+    WizardStep,
     WizardView,
 )
 from .persistent import PersistentLayoutView, PersistentView
@@ -40,6 +47,14 @@ __all__ = [
     "MenuLayoutView",
     "PaginatedLayoutView",
     "PersistentLeaderboardLayoutView",
+    "RolesLayoutView",
+    "PersistentRolesLayoutView",
     "TabLayoutView",
     "WizardLayoutView",
+    # Typed schemas
+    "FormField",
+    "FormSchema",
+    "WizardStep",
+    "WizardSchema",
+    "RoleCategory",
 ]

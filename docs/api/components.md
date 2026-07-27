@@ -26,6 +26,34 @@ Discord's hard cap on the number of options in a single select menu.
 
 ---
 
+## `StatefulComponent`
+
+The base mixin every stateful component extends, including `StatefulButton`,
+`StatefulSelect`, the five modal input wrappers, and `Modal` itself. It supplies
+one method:
+
+#### `create_stateful_callback(component, original_callback=None)`
+
+Wraps a callback so the component dispatches a `COMPONENT_INTERACTION` action
+around it, binds the live interaction so the acting view's refresh can take the
+one-request fast path, and passes the component's `values` as a second argument
+when the callback declares one. Subclass `StatefulComponent` alongside a
+`discord.ui` primitive to give a custom component the same behavior:
+
+```python
+class TimeSelect(StatefulComponent, discord.ui.Select):
+    def __init__(self, *, callback=None, **kwargs):
+        super().__init__(**kwargs)
+        self.original_callback = callback
+        if callback:
+            self.callback = self.create_stateful_callback(self, callback)
+```
+
+The bundled components cover the common cases; reach for this only when wrapping
+a `discord.ui` primitive the library does not already ship.
+
+---
+
 ## `StatefulButton`
 
 Extends `discord.ui.Button` with automatic state dispatching.
@@ -158,7 +186,8 @@ auto-defer, so each button carries its own timer.
 
 Override hook for click handling. Default: no-op. Captured values
 from the `custom_id` template are available as instance attributes
-set by the subclass `__init__`. Use `self.respond(...)` for replies (see below).
+set by the subclass `__init__`. Use `self.respond(...)` for replies and
+`self.open_modal(...)` for modals (see below).
 
 ### `await respond(interaction, content=None, *, ephemeral=False, **kwargs)`
 
@@ -167,6 +196,15 @@ when the response slot is already acked. The ack backstop armed around
 `on_click` can consume the slot mid-click, so a bare
 `interaction.response.send_message` raises `InteractionResponded` under load;
 `respond()` routes around that. Mirrors the view-level `respond()`.
+
+### `await open_modal(interaction, modal, *, fallback_message=None) -> bool`
+
+Opens a modal, falling back to an ephemeral reply when the response slot is
+already gone. `send_modal()` cannot follow a defer, so the same ack backstop
+that makes `respond()` necessary makes a bare
+`interaction.response.send_modal` fail under load. Returns `True` when the
+modal opened, `False` when the fallback fired. Raises `ValueError` if the
+modal has no components. Mirrors the view-level `open_modal()`.
 
 ### `from_custom_id(cls, interaction, item, match) -> cls` (classmethod)
 
@@ -395,7 +433,7 @@ A `Separator` with `SeparatorSpacing.small` (default) or `SeparatorSpacing.large
 
 A `Separator` without a visible line. `SeparatorSpacing.small` (default) or `SeparatorSpacing.large`.
 
-### `image_section(text, *, url, description=None, spoiler=False)`
+### `image_section(text, *more_text, url, description=None, spoiler=False)`
 
 A `Section` with a `Thumbnail` image accessory. `description` sets the thumbnail's alt text (up to 256 chars); `spoiler=True` hides the thumbnail behind a spoiler. `url` accepts a URL string or a `discord.File` (`MediaInput`).
 
@@ -403,7 +441,7 @@ A `Section` with a `Thumbnail` image accessory. `description` sets the thumbnail
 image_section("User avatar", url="https://example.com/avatar.png")
 ```
 
-### `link_section(text, *, label, url, emoji=None)`
+### `link_section(text, *, label, url, emoji=None, disabled=False)`
 
 A `Section` with a link-style `Button` accessory that opens a URL. Completes the `*_section` family (action / image / link); link buttons carry no callback because the platform handles navigation directly.
 
@@ -415,7 +453,7 @@ link_section(
 )
 ```
 
-### `confirm_section(text, *, on_confirm, on_cancel, confirm_label="Confirm", cancel_label="Cancel", confirm_emoji="✅", cancel_emoji="❌")`
+### `confirm_section(text, *, on_confirm, on_cancel, confirm_label="Confirm", cancel_label="Cancel", confirm_emoji="✅", cancel_emoji="❌", custom_id=None)`
 
 A confirm/cancel prompt. Returns a `[TextDisplay, ActionRow]` list rather than a single component: the prompt text plus a paired success/danger button row. Splat it into `card(...)` or add it directly to a view.
 
@@ -430,7 +468,7 @@ card(
 )
 ```
 
-### `gallery(*media, descriptions=None)`
+### `gallery(*media, descriptions=None, spoilers=None)`
 
 A `MediaGallery` from one or more images passed as positional arguments (not a list). Each item is a URL string or a `discord.File` (`MediaInput`); `descriptions` is an optional parallel sequence of alt-text strings.
 
@@ -488,7 +526,7 @@ Choice(label="Goals", value=Event.GOAL, emoji="⚽", description="Match goals")
 
 `label` and `value` are required; `emoji` and `description` default to `None`. `description` renders on the dropdown form and is ignored when the control renders as buttons.
 
-### `toggle_button(*, active, on_toggle, labels=("Enabled", "Disabled"), emoji=None)`
+### `toggle_button(*, active, on_toggle, labels=("Enabled", "Disabled"), emoji=None, custom_id=None)`
 
 A standalone boolean toggle button -- the `ActionRow` form of `toggle_section` (no accompanying text). Renders green when `active`, relabels between the two `labels` on each click, and calls `on_toggle` with the new state.
 
@@ -496,7 +534,15 @@ A standalone boolean toggle button -- the `ActionRow` form of `toggle_section` (
 ActionRow(toggle_button(active=self.notify, on_toggle=self._set_notify))
 ```
 
-### `cycle_button(*, values, on_change, labels=None, style=secondary, emoji=None, start=0)`
+### `button_row(buttons, *, style=secondary, emoji=None, custom_id=None)`
+
+An `ActionRow` built from a `{label: callback}` mapping: one `StatefulButton` per entry, sharing `style` and `emoji`. Raises `ValueError` on an empty mapping or more than Discord's five buttons per row. `custom_id` is a base suffixed per button (`{custom_id}_0`, `{custom_id}_1`, ...); pass it inside a `PersistentLayoutView`, where auto-generated ids do not survive a restart.
+
+```python
+button_row({"Save": self._save, "Reset": self._reset}, style=discord.ButtonStyle.primary)
+```
+
+### `cycle_button(*, values, on_change, labels=None, style=secondary, emoji=None, start=0, custom_id=None)`
 
 A button that cycles through a fixed list of `values` on each click, advancing (and wrapping) the index before calling `on_change` with the new value. Use it when a setting has three or more options but a full select is overkill -- a single "Preset" button cycling `["Low", "Medium", "High"]` instead of three toggles. `labels` defaults to `str(value)` per entry; `start` is the initial index.
 
@@ -507,7 +553,7 @@ cycle_button(
 )
 ```
 
-### `tab_nav(tabs, *, active=None, active_style=primary, inactive_style=secondary)`
+### `tab_nav(tabs, *, active=None, active_style=primary, inactive_style=secondary, custom_id=None)`
 
 An `ActionRow` of tab buttons for inner-view navigation -- a lighter alternative to `TabLayoutView`. `tabs` maps each label to a callback; the `active` tab renders in `active_style`, the rest in `inactive_style`.
 
@@ -518,7 +564,7 @@ tab_nav(
 )
 ```
 
-### `stats_card(title, stats, *, color=None, footer=None)`
+### `stats_card(title, stats, *, color=None, footer=None, spoiler=False)`
 
 A titled `Container` rendering a `{label: value}` dict as key-value lines, with an optional `footer`. Reads the active theme's `accent_colour` when `color=None`, the same as `card`.
 
@@ -600,9 +646,13 @@ def build_ui(self):
 
 Override hook. Called after the page index updates, before the refresh. Default is a no-op. Use for analytics, async prefetch, or per-page validation.
 
+#### `await show_page(index)`
+
+Jumps to a zero-based page index, fires `on_page_changed`, and re-renders the host: the async counterpart to a nav-button click, for a programmatic jump (a search hit, a "find me" button, landing on the page holding a row the user just created). Requires the region to be attached already, since `controls(view)` is what gives it a host to re-render.
+
 #### `set_page(index)`, `page`, `page_count`
 
-`set_page(index)` jumps to a zero-based page index, clamped to the valid range -- the programmatic counterpart to the nav buttons, for resetting to page 1 after a filter change or jumping from outside the region's own controls. `page` reads the current zero-based index; `page_count` reads the total page count (minimum 1). Use them when the host renders a "page X of Y" line or gates a control on the current position.
+`set_page(index)` moves the cursor to a zero-based page index without re-rendering: use it before the region is attached, such as restoring a carried-over page in `restore_nav_state`. Reach for `show_page()` when the jump should also update the message. `page` reads the current zero-based index; `page_count` reads the total page count (minimum 1). Use them when the host renders a "page X of Y" line or gates a control on the current position.
 
 ### `Collapsible(*, label, reveal, summary=None, expanded_label=None, style=secondary, expanded_style=secondary, emoji=None, expanded_emoji=None, expanded=False, trigger_first=True, key="collapsible")`
 

@@ -83,6 +83,8 @@ class _GalleryView(StatefulLayoutView):
     """MediaGallery layout: ``gallery(*media)`` with attached files."""
 
     owner_only = True
+    # Throwaway demo panel: Exit removes the message instead of leaving a
+    # frozen card in the channel. The exit helper below reads this.
     exit_policy = "delete"
     timeout = 180.0
     state_scope = None
@@ -106,6 +108,16 @@ class _GalleryView(StatefulLayoutView):
         self.add_exit_button()
 
 
+def _section_labels(invoker_name: str, bot_name: str) -> list[tuple[str, str]]:
+    """Build the (name, role) pairs ``_SectionView`` renders.
+
+    Each pair becomes two text children of one Section, so the name and the
+    role render as separate lines. A single string with a newline in it is a
+    different shape and the view rejects it.
+    """
+    return [(f"**{invoker_name}**", "Invoker"), (f"**{bot_name}**", "Bot")]
+
+
 class _SectionView(StatefulLayoutView):
     """Section + Thumbnail layout: one row per attached file."""
 
@@ -126,7 +138,11 @@ class _SectionView(StatefulLayoutView):
                     "with a Thumbnail accessory."
                 ),
                 divider(),
-                *(image_section(label, url=f) for label, f in zip(labels, files)),
+                *(
+                    # A Section takes up to three text children.
+                    image_section(name, role, url=f)
+                    for (name, role), f in zip(labels, files)
+                ),
             )
         )
         self.add_exit_button()
@@ -298,10 +314,7 @@ class V2AttachmentsExample(commands.Cog, name="v2_attachments_example"):
                 "avatar_b.png",
                 session=session,
             )
-        labels = [
-            f"**{ctx.author.display_name}**\nInvoker",
-            f"**{bot_user.name if bot_user else 'Bot'}**\nBot",
-        ]
+        labels = _section_labels(ctx.author.display_name, bot_user.name if bot_user else "Bot")
         view = _SectionView(context=ctx, files=[avatar_a, avatar_b], labels=labels)
         await view.send(files=[avatar_a, avatar_b])
 

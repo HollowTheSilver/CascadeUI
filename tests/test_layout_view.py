@@ -3116,3 +3116,509 @@ class TestReactiveRenderDurationWarning:
             await view._run_state_changed({})
 
         assert not any("on_state_changed() took" in r.getMessage() for r in caplog.records)
+
+
+# // ========================================( allowed_mentions Seam )======================================== // #
+
+
+class TestAllowedMentions:
+    """The mention-rules seam on send() and refresh().
+
+    Three tiers: class attribute, explicit argument, and neither (which
+    defers to the client-level rules discord.py already applies).
+    """
+
+    @staticmethod
+    def _context():
+        ctx = MagicMock()
+        ctx.author.id = 100
+        ctx.guild.id = 200
+        sent = MagicMock()
+        sent.id = 999
+        ctx.send = AsyncMock(return_value=sent)
+        ctx.channel.fetch_message = AsyncMock(return_value=sent)
+        return ctx
+
+    async def test_explicit_argument_reaches_the_send_call(self):
+        ctx = self._context()
+        view = RenderableLayoutView(context=ctx, user_id=100, guild_id=200)
+        rules = discord.AllowedMentions(everyone=False, users=True, roles=False)
+
+        await view.send(allowed_mentions=rules)
+
+        assert ctx.send.await_args.kwargs["allowed_mentions"] is rules
+
+    async def test_class_attribute_is_the_standing_default(self):
+        class _Quiet(RenderableLayoutView):
+            allowed_mentions = discord.AllowedMentions.none()
+
+        ctx = self._context()
+        view = _Quiet(context=ctx, user_id=100, guild_id=200)
+
+        await view.send()
+
+        assert ctx.send.await_args.kwargs["allowed_mentions"].to_dict() == {"parse": []}
+
+    async def test_explicit_argument_overrides_the_class_attribute(self):
+        class _Quiet(RenderableLayoutView):
+            allowed_mentions = discord.AllowedMentions.none()
+
+        ctx = self._context()
+        view = _Quiet(context=ctx, user_id=100, guild_id=200)
+        rules = discord.AllowedMentions(everyone=False, users=True, roles=False)
+
+        await view.send(allowed_mentions=rules)
+
+        assert ctx.send.await_args.kwargs["allowed_mentions"] is rules
+
+    async def test_omitted_on_both_tiers_sends_no_key(self):
+        """Absent means "defer to the client", not "allow everything"."""
+        ctx = self._context()
+        view = RenderableLayoutView(context=ctx, user_id=100, guild_id=200)
+
+        await view.send()
+
+        assert "allowed_mentions" not in ctx.send.await_args.kwargs
+
+    async def test_refresh_channel_path_carries_the_rules(self):
+        """``Message.edit`` only forwards the client default when ``content``
+        is supplied, and a V2 view never supplies content, so the rules
+        must be injected explicitly or this path ships without them.
+        """
+
+        class _Quiet(RenderableLayoutView):
+            allowed_mentions = discord.AllowedMentions.none()
+
+        view = _Quiet(interaction=_make_interaction())
+        view._message = MagicMock()
+        view._message.id = 999
+        view._message.edit = AsyncMock()
+        view._webhook_message = None
+        view._last_tree_digest = None
+
+        await view.refresh()
+
+        assert view._message.edit.await_args.kwargs["allowed_mentions"].to_dict() == {"parse": []}
+
+    async def test_leaderboard_suppresses_its_own_mentions_by_default(self):
+        """format_name renders ``<@id>`` for entries without a display_name,
+        so the pattern owns a suppression default its siblings do not need.
+        """
+        from cascadeui.views.patterns.leaderboard import LeaderboardLayoutView
+
+        assert LeaderboardLayoutView.allowed_mentions.to_dict() == {"parse": []}
+        assert StatefulLayoutView.allowed_mentions is None
+
+    def test_non_allowed_mentions_value_rejected_at_class_definition(self):
+        with pytest.raises(TypeError, match="allowed_mentions must be"):
+
+            class _Bad(StatefulLayoutView):
+                allowed_mentions = "users"
+
+    @pytest.mark.parametrize("slot_open", [True, False])
+    async def test_navigation_edit_carries_the_destination_rules(self, slot_open):
+        """push()/pop() edit through their own endpoints rather than refresh(),
+        so the destination's rules must ride those calls too. A menu pushing a
+        leaderboard would otherwise ping every ranked player on the edit.
+        """
+
+        class _Quiet(RenderableLayoutView):
+            allowed_mentions = discord.AllowedMentions.none()
+
+        source = RenderableLayoutView(interaction=_make_interaction())
+        message = MagicMock()
+        message.id = 999
+        message.edit = AsyncMock()
+        source._message = message
+
+        interaction = _make_interaction()
+        interaction.message = message
+        interaction.response.edit_message = AsyncMock()
+        interaction.edit_original_response = AsyncMock()
+        if not slot_open:
+            interaction.response.is_done = MagicMock(return_value=True)
+
+        await source.push(_Quiet(interaction=_make_interaction()), interaction)
+
+        edited = (
+            interaction.response.edit_message if slot_open else interaction.edit_original_response
+        )
+        assert edited.await_args.kwargs["allowed_mentions"].to_dict() == {"parse": []}
+
+    async def test_navigation_leaves_the_digest_short_circuit_intact(self):
+        """The rules go onto a copy, not onto ``edit_kwargs``: a non-empty
+        kwargs dict would disable refresh()'s render-hash skip on the two
+        navigation paths that route through refresh().
+        """
+
+        class _Quiet(RenderableLayoutView):
+            allowed_mentions = discord.AllowedMentions.none()
+
+        source = RenderableLayoutView(interaction=_make_interaction())
+        message = MagicMock()
+        message.id = 999
+        message.edit = AsyncMock()
+        source._message = message
+
+        destination = _Quiet(interaction=_make_interaction())
+        # Foreign interaction: message ids differ, so _apply_navigation_edit
+        # takes the refresh() branch rather than either direct edit.
+        interaction = _make_interaction()
+        interaction.message = MagicMock()
+        interaction.message.id = 111
+
+        destination.refresh = AsyncMock()
+        await source.push(destination, interaction)
+
+        assert destination.refresh.await_args.kwargs == {}
+
+
+# // ========================================( Portable Edit Kwargs )======================================== // #
+
+
+class TestPortableEditKwargs:
+    """refresh() rejects kwargs only some of its three endpoints accept.
+
+    Which endpoint runs depends on runtime conditions the caller cannot
+    see, so a non-portable kwarg would work until the ack race flipped.
+    """
+
+    async def test_portable_kwargs_pass_through(self):
+        view = RenderableLayoutView(interaction=_make_interaction())
+        view._message = MagicMock()
+        view._message.id = 999
+        view._message.edit = AsyncMock()
+        view._webhook_message = None
+        view._last_tree_digest = None
+
+        await view.refresh(content="ok")
+
+        assert view._message.edit.await_args.kwargs["content"] == "ok"
+
+    @pytest.mark.parametrize("stray", ["suppress", "suppress_embeds", "delete_after"])
+    async def test_non_portable_kwarg_rejected(self, stray):
+        view = RenderableLayoutView(interaction=_make_interaction())
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+
+        with pytest.raises(TypeError, match="cannot forward"):
+            await view.refresh(**{stray: True})
+
+        assert view._message.edit.await_count == 0
+
+    def test_portable_set_matches_the_three_endpoints(self):
+        """Canary: the allowlist is derived from discord.py's own signatures,
+        so an upstream signature change surfaces here rather than as a
+        runtime TypeError on one endpoint.
+        """
+        import inspect
+
+        from discord.webhook import async_ as webhook_module
+
+        def names(fn):
+            return set(inspect.signature(fn).parameters) - {"self"}
+
+        common = (
+            names(discord.InteractionResponse.edit_message)
+            & names(webhook_module.WebhookMessage.edit)
+            & names(discord.Message.edit)
+        )
+        # ``view`` is library-owned and never accepted from a caller.
+        assert _StatefulMixin._PORTABLE_EDIT_KWARGS == common - {"view"}
+
+
+class TestNavRebuildValidation:
+    """``nav_rebuild`` must not be a value that binds as a method.
+
+    A bare function or a ``functools.partial`` in a class body receives
+    ``self`` as its first argument instead of the destination view.
+    ``callable()`` cannot tell those apart from a ``staticmethod``, since
+    all three are callable; descriptor-ness is what decides it.
+    """
+
+    def test_bare_lambda_rejected(self):
+        with pytest.raises(TypeError, match="binds as a method"):
+
+            class _Bad(StatefulLayoutView):
+                nav_rebuild = lambda v: {"content": "x"}  # noqa: E731
+
+    def test_partial_rejected_on_every_supported_python(self):
+        """``functools.partial`` became a descriptor in 3.14, so it binds on
+        3.14 and not on 3.10-3.13. Rejecting it only where it binds would let
+        the same class pass on one supported Python and fail on another, so
+        it is rejected everywhere and ``staticmethod`` is the portable answer.
+        """
+        import functools
+
+        with pytest.raises(TypeError, match="binds as a method"):
+
+            class _Bad(StatefulLayoutView):
+                nav_rebuild = functools.partial(lambda v: {"content": "x"})
+
+    def test_staticmethod_accepted(self):
+        class _Good(StatefulLayoutView):
+            nav_rebuild = staticmethod(lambda v: {"content": "x"})
+
+        assert _Good.nav_rebuild is not None
+
+    def test_plain_callable_object_accepted(self):
+        """An object with ``__call__`` but no ``__get__`` does not bind."""
+
+        class _Rebuilder:
+            def __call__(self, view):
+                return {"content": "x"}
+
+        class _Good(StatefulLayoutView):
+            nav_rebuild = _Rebuilder()
+
+        assert _Good.nav_rebuild is not None
+
+    def test_non_callable_rejected(self):
+        with pytest.raises(TypeError, match="must be callable or None"):
+
+            class _Bad(StatefulLayoutView):
+                nav_rebuild = "oops"
+
+
+class TestStabilizedCustomIdFitsTheCap:
+    """The id stabilizer folds an over-cap anchor instead of raising.
+
+    It runs inside every ``build_ui``, so a rebuild must not fail on a
+    label the user is allowed to set, unlike the builders, which reject
+    at construction where the caller can act on it.
+    """
+
+    def test_short_anchor_passes_through(self):
+        anchor = "a" * 50
+        assert _StatefulMixin._fit_custom_id(anchor) == anchor
+
+    def test_long_anchor_is_folded_to_the_cap(self):
+        folded = _StatefulMixin._fit_custom_id("x" * 250)
+        assert len(folded) == 100
+        assert "~" in folded
+
+    def test_fold_is_deterministic(self):
+        anchor = "y" * 250
+        assert _StatefulMixin._fit_custom_id(anchor) == _StatefulMixin._fit_custom_id(anchor)
+
+    def test_distinct_anchors_fold_distinctly(self):
+        a = _StatefulMixin._fit_custom_id("z" * 250)
+        b = _StatefulMixin._fit_custom_id("z" * 250 + "q")
+        assert a != b
+
+    async def test_a_long_label_does_not_break_build_ui(self):
+        """End to end: an 80-character label (Discord's own cap) on a
+        deeply-qualified callback must still produce a shippable id.
+        """
+
+        async def a_callback_with_a_long_qualified_name(interaction):
+            pass
+
+        class _Long(RenderableLayoutView):
+            def build_ui(self):
+                self.clear_items()
+                self.add_item(
+                    ActionRow(
+                        StatefulButton(
+                            label="L" * 80,
+                            callback=a_callback_with_a_long_qualified_name,
+                        )
+                    )
+                )
+
+        view = _Long(interaction=_make_interaction())
+        view.build_ui()
+
+        ids = [c.custom_id for c in view.walk_children() if getattr(c, "custom_id", None)]
+        assert ids and all(len(i) <= 100 for i in ids)
+
+
+class TestClientAllowedMentionsFallback:
+    """The third resolution tier: the bot's own client-level rules.
+
+    ``Message.edit`` forwards the client default only when ``content`` is
+    supplied, and a V2 view never supplies content, so without this tier
+    a bot that configured suppression globally would get it on send and
+    lose it on any refresh that took the channel endpoint.
+    """
+
+    @staticmethod
+    def _client(rules):
+        client = MagicMock(spec=discord.Client)
+        client.allowed_mentions = rules
+        return client
+
+    async def test_client_rules_reach_the_channel_edit(self):
+        interaction = _make_interaction()
+        interaction.client = self._client(discord.AllowedMentions.none())
+        view = RenderableLayoutView(interaction=interaction)
+        view._message = MagicMock()
+        view._message.id = 999
+        view._message.edit = AsyncMock()
+        view._webhook_message = None
+        view._last_tree_digest = None
+
+        await view.refresh()
+
+        assert view._message.edit.await_args.kwargs["allowed_mentions"].to_dict() == {"parse": []}
+
+    async def test_no_client_rules_sends_no_key(self):
+        interaction = _make_interaction()
+        interaction.client = self._client(None)
+        view = RenderableLayoutView(interaction=interaction)
+        view._message = MagicMock()
+        view._message.id = 999
+        view._message.edit = AsyncMock()
+        view._webhook_message = None
+        view._last_tree_digest = None
+
+        await view.refresh()
+
+        assert "allowed_mentions" not in view._message.edit.await_args.kwargs
+
+    def test_a_mock_client_attribute_is_not_put_on_the_wire(self):
+        """A bare Mock auto-creates any attribute, so the resolution is
+        type-checked rather than truthiness-checked.
+        """
+        view = RenderableLayoutView(interaction=_make_interaction())
+        view.interaction.client = MagicMock()
+
+        assert view._resolve_allowed_mentions(None) is None
+
+    def test_class_attribute_wins_over_client_rules(self):
+        class _Quiet(RenderableLayoutView):
+            allowed_mentions = discord.AllowedMentions(everyone=False, users=True, roles=False)
+
+        interaction = _make_interaction()
+        interaction.client = self._client(discord.AllowedMentions.none())
+        view = _Quiet(interaction=interaction)
+
+        assert view._resolve_allowed_mentions(None) is _Quiet.allowed_mentions
+
+
+class TestReloadRespectsArmedRefresh:
+    """An armed ephemeral view must not rebuild over its refresh button.
+
+    Between the arming edit and the token cliff, re-running ``on_load``
+    would replace the button, and the armed flag then drops every
+    notification that could put it back.
+    """
+
+    async def test_reload_skips_on_load_while_armed(self):
+        calls = []
+
+        class _Loader(RenderableLayoutView):
+            async def on_load(self):
+                calls.append("on_load")
+
+        view = _Loader(interaction=_make_interaction())
+        view._message = MagicMock()
+        view._message.id = 999
+        view._message.edit = AsyncMock()
+        view._webhook_message = None
+        view._refresh_armed = True
+
+        await view.reload()
+
+        assert calls == []
+        assert view._message.edit.await_count == 1
+
+    async def test_reload_runs_on_load_when_not_armed(self):
+        calls = []
+
+        class _Loader(RenderableLayoutView):
+            async def on_load(self):
+                calls.append("on_load")
+
+        view = _Loader(interaction=_make_interaction())
+        view._message = MagicMock()
+        view._message.id = 999
+        view._message.edit = AsyncMock()
+        view._webhook_message = None
+
+        await view.reload()
+
+        assert calls == ["on_load"]
+
+
+class TestRateLimitedSiblingOnSendRefetch:
+    """``RateLimited`` is a sibling of ``HTTPException``, not a subclass.
+
+    Uncaught on the post-send re-fetch it would escape a send that already
+    succeeded, leaving the view with no ``_message``: no cleanup listener,
+    no parent attach, and a failure reported for a live message.
+    """
+
+    def test_rate_limited_is_not_an_http_exception(self):
+        assert not issubclass(discord.RateLimited, discord.HTTPException)
+
+    async def test_rate_limited_refetch_keeps_the_sent_message(self):
+        ctx = MagicMock()
+        ctx.author.id = 100
+        ctx.guild.id = 200
+        sent = MagicMock()
+        sent.id = 999
+        ctx.send = AsyncMock(return_value=sent)
+        ctx.channel.fetch_message = AsyncMock(side_effect=discord.RateLimited(5.0))
+
+        view = RenderableLayoutView(context=ctx, user_id=100, guild_id=200)
+        result = await view.send()
+
+        assert result is sent
+        assert view._message is sent
+
+
+class TestFreezeEditsCarryMentionRules:
+    """A teardown freeze re-ships the same mention-bearing tree.
+
+    ``on_timeout``, ``exit()``'s V2 branch, the empty-stack back clear,
+    and the reopen fallback all hand Discord the tree ``refresh()`` hands
+    it, so they owe the same rules. Otherwise the last edit a view ever
+    makes is the one edit that ignores its own ``allowed_mentions``.
+    """
+
+    @staticmethod
+    def _quiet_view():
+        class _Quiet(RenderableLayoutView):
+            allowed_mentions = discord.AllowedMentions.none()
+
+            def build_ui(self):
+                self.clear_items()
+                self.add_item(
+                    ActionRow(StatefulButton(label="Go", callback=AsyncMock(), custom_id="g"))
+                )
+
+        view = _Quiet(interaction=_make_interaction())
+        view.build_ui()
+        message = MagicMock()
+        message.edit = AsyncMock()
+        message.delete = AsyncMock()
+        view._message = message
+        return view, message
+
+    async def test_on_timeout_freeze_carries_the_rules(self):
+        view, message = self._quiet_view()
+
+        await view.on_timeout()
+
+        assert message.edit.await_args.kwargs["allowed_mentions"].to_dict() == {"parse": []}
+
+    async def test_exit_freeze_carries_the_rules(self):
+        view, message = self._quiet_view()
+
+        await view.exit(delete_message=False)
+
+        assert message.edit.await_args.kwargs["allowed_mentions"].to_dict() == {"parse": []}
+
+    async def test_a_view_with_no_rules_ships_no_key(self):
+        view = RenderableLayoutView(interaction=_make_interaction())
+        view.interaction.client = MagicMock(spec=discord.Client)
+        view.interaction.client.allowed_mentions = None
+        view.add_item(ActionRow(StatefulButton(label="Go", callback=AsyncMock(), custom_id="g")))
+        message = MagicMock()
+        message.edit = AsyncMock()
+        view._message = message
+
+        await view.on_timeout()
+
+        assert "allowed_mentions" not in message.edit.await_args.kwargs

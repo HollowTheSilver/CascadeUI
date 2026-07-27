@@ -212,22 +212,26 @@ class PersistenceMiddleware:
                     f"(discord.Client subclass) or None, got {type(bot).__name__!r}."
                 )
 
-        # Two construction paths. The legacy path (``manager=``) is
-        # kept so internal call sites that hand-build a manager before
-        # install keep working. The direct path stashes the raw config
-        # and defers manager construction to :meth:`initialize`, where
-        # the store reference is finally available.
+        # Two supported construction paths. The pre-built path
+        # (``manager=``) is for call sites that customize manager
+        # internals before install. The direct path stashes the raw
+        # config and defers manager construction to :meth:`initialize`,
+        # where the store reference is finally available.
         self._pending_config: Optional[dict[str, Any]]
         if manager is not None:
             self._manager = manager
             self._store = manager._store
             self._pending_config = None
-            # Legacy path presumes the caller already ran the pipeline
+            # This path presumes the caller already ran the pipeline
             # (initialize_backends + migrations + rehydrate) before
             # constructing the middleware. Flag init as done so
             # :meth:`initialize` short-circuits and does not re-run
             # rehydrate on top of a hot store.
             self._initialized: bool = True
+            # initialize() short-circuits on this path, so the back-reference
+            # it normally sets has to be wired here or flush_all() and close()
+            # stay permanent no-ops for a pre-built manager.
+            manager._middleware = self
             self._build_namespaces(manager)
         else:
             self._manager = None  # type: ignore[assignment]
@@ -305,6 +309,11 @@ class PersistenceMiddleware:
         manager = self._resolve_manager(store, cfg)
         self._manager = manager
         self._store = store
+        # The back-reference is what makes manager.flush_all() and
+        # manager.close() reach the debounce buffers. Without it both are
+        # permanent no-ops, and the operator-facing flush surfaces that
+        # call them report a write that never happened.
+        manager._middleware = self
         self._build_namespaces(manager)
 
         # Register any caller-supplied migrators into the module registries

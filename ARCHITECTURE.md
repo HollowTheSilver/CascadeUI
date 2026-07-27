@@ -96,6 +96,9 @@ component interface remains discord.py.
 
 **Added by CascadeUI:**
 
+- `Modal` and the five input wrappers, which collect their own validators and
+  carry an ack backstop, plus the `is_done()`-aware responder helpers
+  (`respond`, `respond_safe`, `open_modal`)
 - Centralized `StateStore` with pub/sub subscriptions and a middleware
   pipeline
 - Per-view state integration (`session_id`, `nav_stack`, `shared_data`,
@@ -479,7 +482,7 @@ Each layer is replaceable:
   opt-in slots, schema migrators
 - **[Performance](docs/guide/performance.md)** -- render-hash, fast
   path, refresh throttling, profiling
-- **[CHANGELOG](CHANGELOG.md)** -- v3.0.0 feature catalog and
-  subsequent diffs
+- **[CHANGELOG](CHANGELOG.md)** -- per-release diffs, with the 3.0.0
+  stable cut carrying a full feature catalog
 - **[CONTRIBUTING](CONTRIBUTING.md)** -- design philosophy, API grammar
   rules, inclusion bar for new patterns

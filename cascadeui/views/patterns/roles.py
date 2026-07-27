@@ -10,6 +10,7 @@ from discord.ui import ActionRow, Container, TextDisplay
 from ...components.base import DynamicPersistentButton
 from ...components.patterns.v2 import card, divider
 from ...components.types import EmojiInput
+from ...utils.responses import respond_safe
 from ...utils.strings import slugify
 from ..layout import StatefulLayoutView
 from ..persistent import _PersistentMixin
@@ -38,29 +39,6 @@ def _category_slug(name: str) -> str:
 
 
 # // ========================================( Role Toggle Button )======================================== // #
-
-
-async def respond_safe(
-    interaction: discord.Interaction,
-    content: Optional[str] = None,
-    *,
-    ephemeral: bool = False,
-    **kwargs,
-) -> None:
-    """Send an interaction response, falling back to followup if already acked.
-
-    The public safe-responder for the ``_BaseRolesMixin`` event hooks
-    (``on_role_assigned`` and its siblings), which are classmethods with no
-    button or view instance to reach a ``respond`` method on. Role clicks run
-    inside the dynamic button's auto-defer window, so a bare
-    ``interaction.response.send_message`` in a hook override raises
-    ``InteractionResponded`` once the timer has acked; this routes to
-    ``interaction.followup.send`` when the slot is already consumed.
-    """
-    if not interaction.response.is_done():
-        await interaction.response.send_message(content, ephemeral=ephemeral, **kwargs)
-    else:
-        await interaction.followup.send(content, ephemeral=ephemeral, **kwargs)
 
 
 class _RoleToggleButton(
@@ -368,7 +346,9 @@ class _BaseRolesMixin:
                 f"Missing permission to toggle role {role.name!r} for " f"{member}: {exc}"
             )
             await cls.on_role_error(interaction, exc)
-        except discord.HTTPException as exc:
+        except (discord.HTTPException, discord.RateLimited) as exc:
+            # RateLimited is a sibling of HTTPException, so it needs naming or
+            # it bypasses the on_role_error hook entirely.
             logger.warning(f"HTTP error toggling role {role.name!r}: {exc}")
             await cls.on_role_error(interaction, exc)
 

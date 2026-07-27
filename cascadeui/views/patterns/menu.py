@@ -1,7 +1,6 @@
 # // ========================================( Modules )======================================== // #
 
 
-import warnings
 from typing import Any, ClassVar, Dict, List, Optional
 
 import discord
@@ -156,10 +155,7 @@ class MenuView(_BaseMenuMixin, StatefulView):
         content: Optional[str] = None,
         *,
         embed: Optional[discord.Embed] = None,
-        embeds: Optional[List[discord.Embed]] = None,
-        file: Optional[discord.File] = None,
-        files: Optional[List[discord.File]] = None,
-        ephemeral: bool = False,
+        **kwargs,
     ):
         """Send the view, using ``build_embed()`` when no content is given.
 
@@ -172,10 +168,7 @@ class MenuView(_BaseMenuMixin, StatefulView):
         return await super().send(
             content=content,
             embed=embed,
-            embeds=embeds,
-            file=file,
-            files=files,
-            ephemeral=ephemeral,
+            **kwargs,
         )
 
     def __init__(
@@ -265,8 +258,8 @@ class MenuLayoutView(_BaseMenuMixin, StatefulLayoutView):
         label (str): Button label. Required.
         view (type): View class to push to. Required.
         emoji (str): Button emoji. Optional.
-        description (str): Text displayed in the ``action_section``.
-            Optional, defaults to empty string.
+        description (str): Text displayed in the ``action_section``. Without
+            one, the label renders as the section text. Optional.
         style (ButtonStyle): Per-category override. Falls back to
             ``menu_style``. Optional.
         rebuild (callable): Per-category rebuild callable passed to
@@ -291,20 +284,6 @@ class MenuLayoutView(_BaseMenuMixin, StatefulLayoutView):
     _category_render_hook: ClassVar[str] = "build_ui"
     nav_rebuild = staticmethod(lambda v: v.build_ui())
 
-    def __init_subclass__(cls, **kwargs):
-        super().__init_subclass__(**kwargs)
-        # Definition-time deprecation signal for the underscore hook pair.
-        # The overrides still render (the public hooks delegate), so this
-        # warns without breaking.
-        for old, new in (("_build_header", "build_header"), ("_build_footer", "build_footer")):
-            if old in cls.__dict__:
-                warnings.warn(
-                    f"{cls.__name__}.{old}() is deprecated; override {new}() "
-                    f"instead. The existing override still renders.",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
-
     def __init__(
         self,
         *args,
@@ -321,37 +300,17 @@ class MenuLayoutView(_BaseMenuMixin, StatefulLayoutView):
         """Return V2 components for the area above category items.
 
         Override to add a title card, summary, or status display.
-        Returns a list of V2 components or a single component.
-        Default delegates to the deprecated ``_build_header`` so
-        existing overrides of the old name keep rendering; with
-        neither overridden, the result is an empty list (no header).
+        Returns a list of V2 components or a single component; the
+        default renders no header.
         """
-        return self._build_header()
+        return []
 
     def build_footer(self):
         """Return V2 components for the area below category items.
 
         Override to add notes, status text, or extra action buttons.
-        Returns a list of V2 components or a single component.
-        Default delegates to the deprecated ``_build_footer`` so
-        existing overrides of the old name keep rendering; with
-        neither overridden, the result is an empty list (no footer).
-        """
-        return self._build_footer()
-
-    def _build_header(self):
-        """Deprecated alias of :meth:`build_header`.
-
-        Overrides of this name still render because the public hook's
-        default delegates here. New code overrides ``build_header``.
-        """
-        return []
-
-    def _build_footer(self):
-        """Deprecated alias of :meth:`build_footer`.
-
-        Overrides of this name still render because the public hook's
-        default delegates here. New code overrides ``build_footer``.
+        Returns a list of V2 components or a single component; the
+        default renders no footer.
         """
         return []
 
@@ -361,8 +320,11 @@ class MenuLayoutView(_BaseMenuMixin, StatefulLayoutView):
         Override to customize how individual categories are rendered.
         Must return a V2 component (typically an ``action_section()``).
         """
+        # ``description`` is optional, but a Section needs non-empty text or
+        # Discord rejects the whole message. Falling back to the label gives
+        # the row a title line; the button beside it carries the same word.
         return action_section(
-            category.get("description", ""),
+            category.get("description") or f"**{category['label']}**",
             label=category["label"],
             emoji=category.get("emoji"),
             callback=self._make_push_callback(category, index),

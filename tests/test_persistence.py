@@ -21,7 +21,11 @@ import pytest
 from helpers import make_interaction
 
 from cascadeui import setup_middleware
-from cascadeui.exceptions import PersistenceConfigError, PersistenceInitError
+from cascadeui.exceptions import (
+    PersistenceConfigError,
+    PersistenceInitError,
+    PersistenceSchemaError,
+)
 from cascadeui.persistence import (
     ApplicationPersistence,
     Capability,
@@ -284,7 +288,10 @@ class TestManagerApplyMigrations:
             registry=RegistryPersistence(backend=be),
         )
         await mgr.initialize_backends()
-        with pytest.raises(PersistenceInitError, match="newer than"):
+        # PersistenceSchemaError, the type docs/api/persistence.md has always
+        # named for this condition: it subclasses PersistenceError, so a
+        # caller catching the family is unaffected.
+        with pytest.raises(PersistenceSchemaError, match="newer than"):
             await mgr.apply_migrations()
 
     async def test_missing_migrator_raises(self):
@@ -1921,3 +1928,66 @@ class TestMigratorRegistries:
             @register_kwargs_migrator("MyView", 1)
             async def second(kwargs):
                 return kwargs
+
+
+class TestManagerMiddlewareWiring:
+    """``manager.flush_all()`` must reach the middleware's debounce buffers.
+
+    Without the back-reference the manager holds nothing to drain, so the
+    three operator-facing flush surfaces (the Inspector button,
+    ``/cascadeui flush``, ``/cascadeui reset``) report a write that never
+    happened.
+    """
+
+    async def test_initialize_wires_the_back_reference(self):
+        from cascadeui.persistence.backends.memory import InMemoryBackend
+        from cascadeui.state.middleware.persistence import PersistenceMiddleware
+        from cascadeui.state.singleton import get_store
+
+        store = get_store()
+        middleware = PersistenceMiddleware(backend=InMemoryBackend())
+        await middleware.initialize(store)
+
+        assert store.persistence_manager._middleware is middleware
+
+    async def test_manager_flush_all_reaches_the_middleware(self):
+        from unittest.mock import AsyncMock
+
+        from cascadeui.persistence.backends.memory import InMemoryBackend
+        from cascadeui.state.middleware.persistence import PersistenceMiddleware
+        from cascadeui.state.singleton import get_store
+
+        store = get_store()
+        middleware = PersistenceMiddleware(backend=InMemoryBackend())
+        await middleware.initialize(store)
+        middleware.flush_all = AsyncMock()
+
+        await store.persistence_manager.flush_all()
+
+        assert middleware.flush_all.await_count == 1
+
+
+class TestFalsyUserIdOnRestore:
+    """``user_id = 0`` is a value, not an absent id.
+
+    Stored as ``None`` it disables ``owner_only`` on the restored view and
+    skips the session re-derivation: the same falsy-versus-absent
+    confusion the scope keys had.
+    """
+
+    def test_zero_user_id_is_stored_not_dropped(self):
+        import inspect
+
+        from cascadeui.views.persistent import _PersistentMixin
+
+        src = inspect.getsource(_PersistentMixin._register_persistent)
+        assert "self.user_id is not None" in src
+        assert "if self.user_id else None" not in src
+
+    def test_session_rederivation_gate_uses_is_not_none(self):
+        import inspect
+
+        from cascadeui.persistence.manager import PersistenceManager
+
+        src = inspect.getsource(PersistenceManager._reattach_one)
+        assert "elif view.user_id is not None:" in src

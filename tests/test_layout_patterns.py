@@ -276,3 +276,59 @@ class TestWizardLayoutViewNavigation:
         nav_interaction.response.send_message.assert_called_once_with(
             "Validation failed", ephemeral=True
         )
+
+
+class TestCompositeHostSeams:
+    """The V2 composites probe host render seams by name, not by type.
+
+    The component layer cannot import views without a cycle, so
+    ``_rerender_host`` duck-types each seam. That makes the seam names a
+    cross-package contract: renaming one silently stops composites from
+    re-rendering inside that host.
+    """
+
+    def test_probed_host_seams_still_exist(self):
+        """A rename check only. The behavior these seams drive is covered
+        end to end by ``test_collapsible_toggle_rebuilds_tab`` in
+        ``tests/test_tab_patterns.py``; this catches the cheaper failure of
+        one of the three names disappearing, which that test would report
+        as a confusing render failure rather than a missing attribute.
+        """
+        from cascadeui.views.layout import StatefulLayoutView
+        from cascadeui.views.patterns.tabs import TabLayoutView
+
+        assert hasattr(TabLayoutView, "_refresh_tabs")
+        assert hasattr(StatefulLayoutView, "reload")
+        assert hasattr(StatefulLayoutView, "refresh")
+
+    def test_probe_order_prefers_build_ui_then_tabs_then_reload(self):
+        """The seam order is load-bearing: a TabLayoutView has no build_ui
+        and its bare reload() would refresh a stale tree, so _refresh_tabs
+        has to be probed before reload.
+        """
+        import inspect
+
+        from cascadeui.components.patterns import v2
+
+        src = inspect.getsource(v2._rerender_host)
+        positions = [src.index(name) for name in ("build_ui", "_refresh_tabs", "reload")]
+        assert positions == sorted(positions)
+
+
+class TestGotoModalHookIsGuarded:
+    """The goto-modal fires ``on_page_changed`` after moving the cursor.
+
+    ``_safe_defer`` has already acked by that point, so a raising override
+    would leave the user looking at a page that silently never turned: the
+    cursor advances and ``_update_page`` never runs. The three sibling
+    call sites in the same file were already guarded.
+    """
+
+    def test_goto_modal_routes_the_hook_through_the_guard(self):
+        import inspect
+
+        from cascadeui.views.patterns.paginated import _BasePaginatedMixin
+
+        src = inspect.getsource(_BasePaginatedMixin._open_goto_modal)
+        assert "_call_hook_safe(parent.on_page_changed" in src
+        assert "await parent.on_page_changed(" not in src

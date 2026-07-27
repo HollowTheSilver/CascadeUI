@@ -1,7 +1,12 @@
 # // ========================================( Modules )======================================== // #
 
 
-from .base import StatefulButton, StatefulComponent, StatefulSelect
+from .base import (
+    DynamicPersistentButton,
+    StatefulButton,
+    StatefulComponent,
+    StatefulSelect,
+)
 from .buttons import (
     DangerButton,
     LinkButton,
@@ -12,17 +17,24 @@ from .buttons import (
 )
 from .inputs import Checkbox, CheckboxGroup, FileUpload, Modal, RadioGroup, TextInput
 from .patterns import (
+    Choice,
+    Collapsible,
     ConfirmationButtons,
+    EmojiGrid,
+    PaginatedRegion,
     PaginationControls,
     ProgressBar,
     ToggleGroup,
     action_section,
     alert,
+    button_grid,
     button_row,
     card,
+    choice_row,
     confirm_section,
     cycle_button,
     divider,
+    emoji_grid,
     file_attachment,
     gallery,
     gap,
@@ -48,6 +60,7 @@ __all__ = [
     "StatefulComponent",
     "StatefulButton",
     "StatefulSelect",
+    "DynamicPersistentButton",
     # Button components
     "PrimaryButton",
     "SecondaryButton",
@@ -91,6 +104,15 @@ __all__ = [
     "button_row",
     "cycle_button",
     "toggle_button",
+    "choice_row",
+    "Choice",
+    # V2 grids
+    "emoji_grid",
+    "EmojiGrid",
+    "button_grid",
+    # V2 stateful composites
+    "PaginatedRegion",
+    "Collapsible",
     # V2 content
     "key_value",
     "alert",

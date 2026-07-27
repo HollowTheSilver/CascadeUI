@@ -226,6 +226,8 @@ complete list with defaults.
 | `refresh_button_label` | `"Continue Session"` | Label on the ephemeral refresh button |
 | `refresh_button_style` | `ButtonStyle.primary` | Style of the ephemeral refresh button |
 | `auto_back_button` | `False` | Add a back button when pushed onto a nav stack |
+| `nav_rebuild` | `None` | Edit kwargs the destination supplies for itself on push/pop; an explicit `rebuild=` wins |
+| `allowed_mentions` | `None` | Mention rules for this view's own message, on send and on every re-render. `None` defers to the bot's client-level rules |
 | `enable_undo` | `False` | Track undo/redo history for this view |
 | `undo_limit` | `20` | Max undo snapshots |
 | `refresh_cooldown_ms` | `None` | Proactive cooldown in milliseconds on **background** re-renders; those arriving during the window schedule one deferred edit and re-read store state at fire time. Edits answering a click on the view's own message are exempt -- for per-user spam control on one control, use `with_cooldown` |
@@ -243,8 +245,13 @@ Every policy attribute follows the same precedence:
 class MyView(StatefulLayoutView):
     exit_policy = "disable"             # 1. Class default: freeze on exit
 
-    async def on_timeout(self):
-        await self.exit(delete_message=True)  # 3. Explicit arg overrides policy
+    async def exit(self, delete_message=None):
+        if self.has_unsaved_draft:
+            delete_message = False      # 2. Method override: keep drafts visible
+        await super().exit(delete_message=delete_message)
+
+
+await view.exit(delete_message=True)    # 3. Explicit arg wins over both
 ```
 
 ---

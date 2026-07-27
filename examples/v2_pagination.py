@@ -102,7 +102,7 @@ RARITY_ORDER = ["Common", "Uncommon", "Rare", "Legendary"]
 class InventoryView(PaginatedLayoutView):
     """Paginated inventory with an exit button below navigation.
 
-    Overrides ``_build_extra_items()`` to add a Close button after
+    Overrides ``_build_extra_items()`` to add an Exit button after
     the pagination controls. This hook is called during init and
     on every page turn.
     """
@@ -112,6 +112,8 @@ class InventoryView(PaginatedLayoutView):
     instance_scope = "user_guild"
     instance_policy = "reject"
     instance_limit_message = "You already have a browser open. Close it before opening another."
+    # A disposable browse session, so Exit removes the message rather than
+    # leaving a frozen card behind. The exit helpers below read this.
     exit_policy = "delete"
     state_scope = None
 

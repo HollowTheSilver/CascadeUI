@@ -81,6 +81,18 @@ class _PersistentMixin:
         """
         return self.children
 
+    def validate(self) -> None:
+        """Raise if this view's tree is one Discord or a restart would reject.
+
+        Extends the base check with the id validation a persistent
+        ``send()`` runs. Without it the public entry would pass a panel
+        whose auto-generated ids do not survive a restart, which is the
+        failure this class exists to prevent and the one an offline test
+        most needs to reach.
+        """
+        super().validate()
+        self._validate_custom_ids()
+
     def _validate_custom_ids(self):
         """Ensure every interactive component has an explicit custom_id.
 
@@ -95,7 +107,9 @@ class _PersistentMixin:
                 # V1 treats None as an error; V2 treats None as non-interactive.
                 # The V1 override handles the stricter check before calling super.
                 continue
-            if self._AUTO_ID_PATTERN.match(custom_id):
+            if getattr(item, "_cascadeui_stabilized", False) or self._AUTO_ID_PATTERN.match(
+                custom_id
+            ):
                 raise ValueError(
                     f"Component {item!r} in {self.__class__.__name__} is missing a custom_id. "
                     "All interactive components in a persistent view must have an explicit "
@@ -179,7 +193,9 @@ class _PersistentMixin:
             message_id=str(message.id),
             channel_id=str(message.channel.id),
             guild_id=guild_id,
-            user_id=str(self.user_id) if self.user_id else None,
+            # is not None, not truthiness: id 0 is a value, and storing it as
+            # None would drop owner_only on the restored view.
+            user_id=str(self.user_id) if self.user_id is not None else None,
         )
         await self.dispatch("PERSISTENT_VIEW_REGISTERED", payload)
 
@@ -344,7 +360,11 @@ class PersistentView(_PersistentMixin, StatefulView):
             if getattr(item, "url", None) is not None or getattr(item, "sku_id", None) is not None:
                 continue
             custom_id = getattr(item, "custom_id", None)
-            if custom_id is None or self._AUTO_ID_PATTERN.match(custom_id):
+            if (
+                custom_id is None
+                or getattr(item, "_cascadeui_stabilized", False)
+                or self._AUTO_ID_PATTERN.match(custom_id)
+            ):
                 raise ValueError(
                     f"Component {item!r} in {self.__class__.__name__} is missing a custom_id. "
                     "All components in a PersistentView must have an explicit custom_id "

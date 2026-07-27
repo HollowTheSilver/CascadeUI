@@ -2,6 +2,7 @@
 
 
 from .actions import ActionCreators
+from .computed import ComputedValue, computed
 from .middleware import LoggingMiddleware, PersistenceMiddleware, UndoMiddleware
 from .singleton import get_store
 from .slots import access_slot, read_slot, slot_property
@@ -23,4 +24,6 @@ __all__ = [
     "access_slot",
     "read_slot",
     "slot_property",
+    "computed",
+    "ComputedValue",
 ]
