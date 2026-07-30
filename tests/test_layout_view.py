@@ -2222,8 +2222,14 @@ class TestRefreshThrottling:
 
         before = time.monotonic()
         await view.refresh()  # must not raise
+        after = time.monotonic()
 
-        assert before + 0.7 <= view._ratelimit_not_before <= before + 0.8
+        # Bracketed by the two readings around the call rather than by a
+        # tolerance: the stamp is monotonic() + retry_after taken inside the
+        # handler, so this holds however long the refresh takes. The second
+        # assertion carries the discrimination the docstring describes.
+        assert before + 0.75 <= view._ratelimit_not_before <= after + 0.75
+        assert view._ratelimit_not_before < before + 1.0
         # A 429 is Discord's window, not the library's opt-in pacing.
         assert view._cooldown_not_before == 0.0
 
@@ -2260,8 +2266,11 @@ class TestRefreshThrottling:
 
         before = time.monotonic()
         await view.refresh()  # must not raise
+        after = time.monotonic()
 
-        assert before + 1.9 <= view._ratelimit_not_before <= before + 2.1
+        # Exact bracket, not a tolerance. 2.0 also excludes both fallbacks
+        # (one second header-less, thirty for a ban) by construction.
+        assert before + 2.0 <= view._ratelimit_not_before <= after + 2.0
 
     async def test_reactive_429_defers_next_refresh(self):
         view = self._make_view(self._build_simple)
@@ -2637,8 +2646,12 @@ class TestActingViewFastPath:
             await view.refresh()
         finally:
             _CURRENT_INTERACTION.reset(token)
+        after = time.monotonic()
 
-        assert before + 0.7 <= view._ratelimit_not_before <= before + 0.8
+        # Exact bracket; the second assertion excludes the ban fallback the
+        # docstring warns a lower bound alone would stay green through.
+        assert before + 0.75 <= view._ratelimit_not_before <= after + 0.75
+        assert view._ratelimit_not_before < before + 1.0
         view._message.edit.assert_not_called()
         if view._deferred_refresh_task is not None:
             view._deferred_refresh_task.cancel()
