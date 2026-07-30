@@ -7,6 +7,8 @@ import logging
 import traceback
 from typing import Any, Callable, Coroutine, Optional, Tuple, Type, TypeVar, Union, cast
 
+from .hooks import await_maybe
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
@@ -40,7 +42,7 @@ def with_error_boundary(name: str = None):
         @functools.wraps(func)
         async def wrapper(*args, **kwargs) -> T:
             try:
-                return await func(*args, **kwargs)
+                return await await_maybe(func(*args, **kwargs))
             except Exception as e:
                 logger.error(f"Error in {func_name}: {str(e)}", exc_info=True)
 
@@ -67,7 +69,7 @@ def with_retry(config: Optional[RetryConfig] = None):
 
             for attempt in range(retry_config.max_retries):
                 try:
-                    return await func(*args, **kwargs)
+                    return await await_maybe(func(*args, **kwargs))
                 except retry_config.exceptions_to_retry as e:
                     last_exception = e
 

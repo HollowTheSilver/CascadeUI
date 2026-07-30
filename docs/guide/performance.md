@@ -358,7 +358,8 @@ and `StatefulLayoutView`:
 | Attribute | Default | What it governs | Raise or change it when |
 |-----------|---------|-----------------|-------------------------|
 | `auto_defer` | `True` | The ack safety net. A background timer acknowledges the interaction if the callback has not responded in time. | Keep it on. Turning it off removes the only thing standing between a slow callback and Discord's 3-second ack wall. |
-| `auto_defer_delay` | `2.5` | How long the safety net waits before acking (seconds). | A view's callback can run long; lowering it acks sooner. The default leaves headroom under the 3s wall. |
+| `auto_defer_delay` | `2.5` | How long the safety net waits before acking (seconds). | Rarely. Two edit budgets derive from it by `-1.0` (the acting-view fast path and the ack-coupled navigation edits), so lowering it to ack sooner also shrinks the in-place edit window. The default leaves headroom under the 3s wall. |
+| `ack_first` | `False` | Acks before the access checks and the callback run, so the ack lands even if the callback then starves the event loop. | A callback does synchronous work heavy enough to delay the safety-net timer. It costs the one-call refresh fast path on every render, and `open_modal()` degrades to an ephemeral message because the slot is already spent. |
 | `serialize_interactions` | `True` | Serializes callbacks behind a lock so rapid clicks cannot fire racing `message.edit()` calls. | Keep it on for views that edit one shared message. It serializes the edits, not the data loads. |
 | `refresh_cooldown_ms` | `None` | A proactive throttle on **background** re-renders: state-driven edits inside the window coalesce into one deferred render, and a `reload()` in the window defers its `on_load()` fetch too, not just the edit. Edits answering a click on the view's own message are exempt. | A view re-renders rapidly on its own and you want fewer REST round-trips. Not a spam guard (see below). The reactive 429 backoff is always on regardless. |
 | `edit_timeout` | `60.0` | The ceiling on every edit the library issues after the initial send. A stalled edit is cancelled at this bound. | Uploads or large payloads need longer than 60s per edit. Set `None` to await with no ceiling. |
@@ -370,12 +371,16 @@ persistent views reattach concurrently on startup. Raise it when a bot
 restores many panels and the serial fetch cost dominates `setup_hook`.
 
 `auto_defer` is the one to understand. The safety-net timer runs
-independently of the serialization lock, so it acks the interaction at
-`auto_defer_delay` seconds **regardless of what the callback is doing**.
-A slow callback therefore produces a slow response, not a failed one --
-the ack is still delivered. The 3-second wall only becomes a risk when
-the safety net is weakened (`auto_defer = False`, or `auto_defer_delay`
-raised toward 3s) *and* the render is slow.
+independently of the serialization lock, so a callback that *awaits* for a
+long time still gets acked at `auto_defer_delay` seconds: it produces a
+slow response, not a failed one. The timer is an ordinary task on the
+event loop, though, so a callback that *blocks* the loop (a long CPU-bound
+render, a synchronous file or database call) starves the timer along with
+everything else and the ack never lands. `ack_first = True` covers that
+case by acking before the callback runs at all. Otherwise the 3-second
+wall becomes a risk only when the safety net is weakened
+(`auto_defer = False`, or `auto_defer_delay` raised toward 3s) *and* the
+render is slow.
 
 ### Pacing a Panel vs. Guarding a Button
 

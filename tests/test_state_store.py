@@ -394,7 +394,7 @@ class TestSelectors:
         assert received == [1, 2, 3]
 
     async def test_selector_with_action_filter(self):
-        """Selector and action filter work together — both must pass."""
+        """Selector and action filter work together: both must pass."""
         store = get_store()
         received = []
 
@@ -461,6 +461,62 @@ class TestSelectors:
         store._unsubscribe("memo-sub")
 
         assert "memo-sub" not in store._last_selected
+
+
+class TestSelectorMustBeSynchronous:
+    """``subscribe`` refuses a selector it cannot call.
+
+    The change check runs inline in dispatch and cannot await, so an async
+    selector returned a fresh coroutine every time. A coroutine never
+    equals the last one, so the subscriber was notified on every action --
+    the opposite of what passing a selector asks for -- and each unawaited
+    coroutine warned from the user's own console.
+    """
+
+    async def _async_selector(self, state):
+        return state.get("views")
+
+    def test_coroutine_function_rejected(self):
+        store = get_store()
+
+        with pytest.raises(TypeError, match="must be synchronous"):
+            store.subscribe("s", lambda state, action: None, selector=self._async_selector)
+
+    def test_async_dunder_call_rejected(self):
+        """The shape ``inspect.iscoroutinefunction`` answers False for."""
+        store = get_store()
+
+        class AsyncCallable:
+            async def __call__(self, state):
+                return state
+
+        with pytest.raises(TypeError, match="must be synchronous"):
+            store.subscribe("s", lambda state, action: None, selector=AsyncCallable())
+
+    def test_partial_around_a_coroutine_function_rejected(self):
+        import functools
+
+        store = get_store()
+
+        with pytest.raises(TypeError, match="must be synchronous"):
+            store.subscribe(
+                "s",
+                lambda state, action: None,
+                selector=functools.partial(self._async_selector),
+            )
+
+    def test_non_callable_rejected(self):
+        store = get_store()
+
+        with pytest.raises(TypeError, match="must be a callable"):
+            store.subscribe("s", lambda state, action: None, selector="views")
+
+    def test_synchronous_selector_accepted(self):
+        store = get_store()
+
+        store.subscribe("s", lambda state, action: None, selector=lambda state: state.get("views"))
+
+        assert "s" in store.subscribers
 
 
 class TestReducers:
@@ -594,6 +650,7 @@ class TestCascadeReducerCollision:
         assert dispatch_only == {
             "APPLICATION_SLOTS_PRUNED",
             "REGISTRY_PRUNED",
+            "BATCH_COMPLETE",
         }
 
     def test_register_reducer_direct_api_still_allows_override(self):
@@ -609,6 +666,45 @@ class TestCascadeReducerCollision:
         store._register_reducer("VIEW_UPDATED", _override)
         assert store.reducers["VIEW_UPDATED"] is _override
         store._unregister_reducer("VIEW_UPDATED")
+
+
+class TestCascadeReducerAcceptsSyncFunctions:
+    """A reducer written with a plain ``def`` runs.
+
+    The wrapper awaited its return unconditionally, so a synchronous
+    reducer passed decoration, passed dispatch, and then failed on
+    awaiting a dict -- which the store caught and logged, leaving the
+    state untouched. Nothing raised at the call site and nothing rejected
+    it at decoration, so the only signal was an error line.
+    """
+
+    async def test_sync_reducer_applies_its_change(self):
+        from cascadeui.utils import cascade_reducer
+
+        store = get_store()
+
+        @cascade_reducer("SYNC_REDUCER_TEST")
+        def _sync(action, state):
+            state.setdefault("application", {})["sync_marker"] = action["payload"]["value"]
+            return state
+
+        await store.dispatch("SYNC_REDUCER_TEST", {"value": 42})
+
+        assert store.state["application"]["sync_marker"] == 42
+
+    async def test_async_reducer_still_applies_its_change(self):
+        from cascadeui.utils import cascade_reducer
+
+        store = get_store()
+
+        @cascade_reducer("ASYNC_REDUCER_TEST")
+        async def _async(action, state):
+            state.setdefault("application", {})["async_marker"] = action["payload"]["value"]
+            return state
+
+        await store.dispatch("ASYNC_REDUCER_TEST", {"value": 7})
+
+        assert store.state["application"]["async_marker"] == 7
 
 
 class TestInspectorPurgedStaleReducer:
@@ -645,7 +741,7 @@ class TestInspectorPurgedStaleReducer:
 
         assert set(result["modals"].keys()) == {"inspector-1"}
 
-    async def test_drops_components_key_when_no_inspector_entries(self):
+    async def test_empties_components_key_when_no_inspector_entries(self):
         from cascadeui.state.reducers import reduce_inspector_purged_stale
 
         state = {
@@ -657,7 +753,8 @@ class TestInspectorPurgedStaleReducer:
 
         result = await reduce_inspector_purged_stale(action, state)
 
-        assert "components" not in result
+        # Emptied, not removed: ``components`` is canonical state shape.
+        assert result["components"] == {}
 
     async def test_missing_inspector_id_returns_state_unchanged(self):
         from cascadeui.state.reducers import reduce_inspector_purged_stale

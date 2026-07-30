@@ -270,7 +270,7 @@ automatic `COMPONENT_INTERACTION` dispatching:
 |----------------|-------|-------------|
 | `StatefulButton` | `discord.ui.Button` | Click → callback → `COMPONENT_INTERACTION` |
 | `StatefulSelect` | `discord.ui.Select` | Selection → callback → `COMPONENT_INTERACTION` |
-| `Dropdown` | alias for `StatefulSelect` | Same |
+| `Dropdown` | `StatefulSelect` + option-dict shorthand | Same |
 | `RoleSelect` | `discord.ui.RoleSelect` | Role selection → callback |
 | `ChannelSelect` | `discord.ui.ChannelSelect` | Channel selection → callback |
 | `UserSelect` | `discord.ui.UserSelect` | User selection → callback |
@@ -312,6 +312,57 @@ CascadeUI provides builder functions (`card()`, `key_value()`, `alert()`,
 boilerplate. See [Components -- V2 Builders](components.md#v2-builder-functions).
 
 ---
+
+## Sync or Async, Your Choice
+
+Every seam that runs code you wrote accepts either shape. Write `async def`
+when the body awaits something; write a plain `def` when it does not:
+
+```python
+class Standings(StatefulLayoutView):
+    async def on_load(self):              # awaits, so async
+        self.rows = await db.fetch_top(10)
+
+    def build_ui(self):                   # pure composition, so not
+        self.clear_items()
+        self.add_item(card(*self.rows))
+```
+
+This holds for every `on_*` override on a view, store subscribers and
+`store.on()` hooks, custom reducers, component callbacks, the pattern
+builders and validators, and the fetch function behind
+`PaginatedView.from_cursor`. The library checks what your function
+returned rather than inspecting the function, so a callable object with an
+async `__call__` and a `functools.partial` around one both work.
+
+Three places want a synchronous function specifically, because the answer
+is needed inside a check that cannot pause: a wizard step's `condition`, a
+subscriber's `selector`, and `Collapsible`'s `reveal` and `summary`. Each
+rejects a coroutine function where you declare it.
+
+`build_ui` carries one more constraint. The patterns that compose their tree
+in `__init__` (`MenuLayoutView`, `RolesLayoutView`, and `DisplayLayoutView`)
+need it synchronous, since a constructor cannot await. An `async def build_ui`
+on one of those raises `TypeError` at construction, naming the class and
+pointing at `on_load()` for the work that needs to await. Every other
+`build_ui` runs from an async render seam and takes either shape.
+
+## Mappings and Pairs
+
+Wherever the library documents a `{key: value}` mapping, it also takes a
+sequence of `(key, value)` pairs, and any object that behaves like a
+mapping -- an `OrderedDict`, a `UserDict`, a `defaultdict`:
+
+```python
+key_value({"Wins": 12, "Losses": 3})            # the documented shape
+key_value([("Wins", 12), ("Losses", 3)])        # equally fine
+```
+
+This covers `key_value(data=)`, `button_row(buttons=)`, `tab_nav(tabs=)`,
+`choice_row(options=)`, `Theme(styles=)`, and the `tabs=` kwarg on
+`TabView` / `TabLayoutView`. Pairs are converted where they arrive, so
+ordering and every other behavior is identical. Anything that is neither
+raises `TypeError` at the call, naming the builder and the argument.
 
 ## Extension Strategies
 
@@ -565,6 +616,17 @@ Here is the full sequence:
 Interaction arrives from Discord
         │
         ▼
+ack_first = True?
+└── Yes → defer() right here, before the checks and the callback
+        │
+        ▼
+auto_defer = True?
+└── Background timer starts (auto_defer_delay seconds).
+    Armed BEFORE the access checks, so a slow interaction_check
+    still has an ack backstop. If the callback hasn't responded
+    by the deadline, defer() fires.
+        │
+        ▼
 interaction_check(interaction)
 ├── allowed_users set?  → only users in the set pass
 ├── owner_only = True?  → only the view creator passes
@@ -572,10 +634,6 @@ interaction_check(interaction)
         │
         ▼ (passed)
 Timeout refreshed (resets the inactivity clock)
-        │
-        ├── auto_defer = True?
-        │   └── Background timer starts (auto_defer_delay seconds)
-        │       If the callback hasn't responded by then, defer() fires
         │
         ▼
 serialize_interactions = True?
@@ -600,6 +658,11 @@ Exception? → on_error(interaction, error, item)
 
 The auto-defer timer and post-callback defer both check `is_done()` before
 acting, so they never conflict with a response your callback already sent.
+
+Arming the timer ahead of the access checks matters when you override
+`interaction_check` with something that awaits. A role lookup that misses the
+cache spends its round-trip on the same 3-second clock the click is racing, and
+the backstop is already running by the time it starts.
 
 ### What CascadeUI Handles for You
 

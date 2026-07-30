@@ -46,6 +46,8 @@ async def block_spam(action, state, next_fn):
 The canonical install path is `setup_middleware`, which routes every middleware through a uniform install + `async initialize(store)` pipeline. Call it once from the bot author's `setup_hook`:
 
 ```python
+from discord.ext import commands
+
 from cascadeui import (
     LoggingMiddleware,
     PersistenceMiddleware,
@@ -84,7 +86,7 @@ The `level` (default `INFO`) is the action stream's *emission* level, not a thre
 
 ### Persistence
 
-Fans writes across two namespaces (registry, application) with independent debounce windows per namespace. Flushes immediately on lifecycle actions (`VIEW_DESTROYED`, `PERSISTENT_VIEW_REGISTERED`, `PERSISTENT_VIEW_UNREGISTERED`) and routes each action to the namespaces it touches via identity-diff. Scoped state rides under the application namespace; a scoped slot persists when its slot name is opted in (either via `persistent_slots = ("scoped",)` on the view class or via `SlotPolicy(persistent=True)` in `ApplicationPersistence.slots`).
+Fans writes across two namespaces (registry, application) with independent debounce windows per namespace. Flushes immediately on the registry lifecycle actions (`PERSISTENT_VIEW_REGISTERED`, `PERSISTENT_VIEW_UNREGISTERED`), which reach a namespace configured with a zero debounce, and routes each action to the namespaces it touches via identity-diff. Scoped state rides under the application namespace; a scoped slot persists when its slot name is opted in (either via `persistent_slots = ("scoped",)` on the view class or via `SlotPolicy(persistent=True)` in `ApplicationPersistence.slots`).
 
 Construct `PersistenceMiddleware` directly with the backends and bot reference it needs; `setup_middleware` installs it and its `initialize(store)` method runs the full pipeline (manager build, backend init, migrations, blocking rehydrate, message-cleanup listener, reattach). See [Persistence](persistence.md) for the full setup flow.
 

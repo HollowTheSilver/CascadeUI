@@ -16,7 +16,7 @@ The smallest working CascadeUI view: a per-user counter using `state_scope = "us
 
 ### v2_dashboard.py
 
-Full V2 builder showcase using `TabLayoutView`. A Controls tab demonstrates `tab_nav` inner navigation, `button_row`, `toggle_button`, `cycle_button`, and `choice_row`; the Modules tab shows a `Collapsible` reset confirm; the About tab uses `link_section` links. Also covers `action_section`, `toggle_section`, `key_value`, `alert`, and session limiting.
+Full V2 builder showcase using `TabLayoutView`. A Controls tab demonstrates `tab_nav` inner navigation, `button_row`, `toggle_button`, `cycle_button`, and `choice_row`; the Modules tab shows a `Collapsible` reset confirm; the About tab uses `link_section` links. Also covers `action_section`, `toggle_section`, `key_value`, `alert`, and instance limiting.
 
 **Command:** `/v2dashboard`
 
@@ -37,7 +37,7 @@ Full settings menu showcasing most CascadeUI features with V2 components:
 
 ### v2_form.py
 
-Registration form using `FormLayoutView` with native `text` fields, a dropdown select, and the full set of built-in validators (`min_length`, `max_length`, `regex`, `min_value`, `max_value`, `choices`) alongside an async "username already taken" check. Text fields are grouped behind a single "Edit Text Fields" button that opens a `Modal`.
+Registration form using `FormLayoutView` with native `text` fields, a dropdown select, four built-in validators (`min_length`, `max_length`, `regex`, `choices`), a typed `integer` field carrying numeric `min_value` / `max_value` constraints, and an async "username already taken" check. Text fields are grouped behind a single "Edit Text Fields" button that opens a `Modal`.
 
 **Command:** `/v2form`
 
@@ -69,7 +69,7 @@ current repo data.
 
 Quick poll demonstrating `@computed` for global memoized values that multiple views share without recalculating. Two `@computed` values derive vote totals and the current leader; the poll view reads both in `build_ui()` and displays them alongside the raw vote buttons. Contrast with `state_selector` (per-view change detection): computed values are global and shared across all views.
 
-**Command:** `/v2poll`
+**Command:** `/poll`
 
 ### v2_wizard.py
 
@@ -79,13 +79,13 @@ D&D character creator using `WizardLayoutView`. Six steps (Identity, Class, Abil
 
 ### v2_persistence.py
 
-A `PersistentLayoutView`-based role selector panel that survives bot restarts. Categories are rendered as accent-colored containers, with exclusive-mode support (selecting one role in a category auto-removes the others). Running `/v2roles` again automatically cleans up the previous panel.
+A `PersistentRolesLayoutView`-based role selector panel that survives bot restarts. Categories are rendered as accent-colored containers, with exclusive-mode support (selecting one role in a category auto-removes the others). Running `/v2roles` again automatically cleans up the previous panel.
 
 **Command:** `/v2roles`
 
 ### v2_tictactoe.py
 
-Two-player TicTacToe demonstrating multi-user interaction patterns. Features a challenge acceptance flow (opponent must accept before the game starts), dynamic board size (3x3 to 5x5), configurable win length (e.g. 3-in-a-row on a 5x5 board), Discord mentions, mutual rematch agreement (both players must confirm), forfeit tracking, and participant-aware session limiting via `register_participant()`. Uses `allowed_users` to restrict interaction to the two players; per-player lifetime stats are written to scoped state via `SCOPED_UPDATE` and grouped into a server ranking by a `@computed` selector (no custom reducer). The finished board freezes on Close (`exit_policy = "disable"`), matching Battleship. `/tictactoe leaderboard` renders the ranking on a Section-mode `LeaderboardLayoutView` with avatar thumbnails and an Overview stats card.
+Two-player TicTacToe demonstrating multi-user interaction patterns. Features a challenge acceptance flow (opponent must accept before the game starts), dynamic board size (3x3 to 5x5), configurable win length (e.g. 3-in-a-row on a 5x5 board), Discord mentions, mutual rematch agreement (both players must confirm), forfeit tracking, and participant-aware instance limiting via `register_participant()`. Uses `allowed_users` to restrict interaction to the two players; per-player lifetime stats are written to scoped state via `SCOPED_UPDATE` and grouped into a server ranking by a `@computed` selector (no custom reducer). The finished board freezes on Close (`exit_policy = "disable"`), matching Battleship. `/tictactoe leaderboard` renders the ranking on a Section-mode `LeaderboardLayoutView` with avatar thumbnails and an Overview stats card.
 
 **Commands:** `/tictactoe play @user [size] [win]`, `/tictactoe stats [user]`, `/tictactoe leaderboard`
 
@@ -127,7 +127,7 @@ These use the V1 component system (`StatefulView`, embeds, row-based layout).
 
 ### settings_menu.py
 
-Advanced settings menu retained as the legacy V1 demonstration. Showcases session limiting, scoped state, push/pop navigation, theming, undo/redo, state selectors, batched dispatch, and a custom reducer. The V1 counterpart to `v2_settings.py` -- both share the same state keys for cross-view reactivity.
+Advanced settings menu retained as the legacy V1 demonstration. Showcases instance limiting, scoped state, push/pop navigation, theming, undo/redo, state selectors, batched dispatch, and a custom reducer. The V1 counterpart to `v2_settings.py` -- both share the same state keys for cross-view reactivity.
 
 **Command:** `/settings`
 
@@ -172,6 +172,7 @@ class MyBot(commands.Bot):
         await self.load_extension("examples.v2_tictactoe")
         await self.load_extension("examples.v2_battleship")
         await self.load_extension("examples.v2_leaderboard")
+        await self.load_extension("examples.v2_attachments")
         await self.load_extension("examples.v2_lobby")
         await self.load_extension("examples.v2_grids")
 

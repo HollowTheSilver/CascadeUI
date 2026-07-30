@@ -673,13 +673,13 @@ class TestCardMasthead:
         assert children[0].items[0].media.url == self.BANNER_URL
 
     def test_banner_invalid_kwarg_raises_at_construction(self):
-        with pytest.raises(TypeError, match="banner must be"):
+        with pytest.raises(TypeError, match=r"banner= must be"):
             LeaderboardLayoutView(
                 interaction=_make_interaction(), entries=SAMPLE_ENTRIES, banner=123
             )
 
     def test_banner_invalid_class_value_raises_at_definition(self):
-        with pytest.raises(TypeError, match="banner must be"):
+        with pytest.raises(TypeError, match=r"banner= must be"):
 
             class BadBanner(LeaderboardLayoutView):
                 banner = 123
@@ -690,7 +690,7 @@ class TestCardMasthead:
         inside a later async rebuild.
         """
         view = LeaderboardLayoutView(interaction=_make_interaction(), entries=SAMPLE_ENTRIES)
-        with pytest.raises(TypeError, match="banner must be"):
+        with pytest.raises(TypeError, match=r"banner= must be"):
             view.set_class_attribute("banner", 123)
         view.set_class_attribute("banner", self.BANNER_URL)
         assert view.banner == self.BANNER_URL

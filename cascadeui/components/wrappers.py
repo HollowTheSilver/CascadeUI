@@ -8,6 +8,8 @@ from typing import Any, Callable, Dict, Optional
 import discord
 from discord import ButtonStyle, Interaction
 
+from ..utils.hooks import await_maybe
+from ..utils.responses import DISCORD_CALL_ERRORS, describe_discord_error
 from .types import EmojiInput
 
 logger = logging.getLogger(__name__)
@@ -81,8 +83,10 @@ class _ConfirmationView(discord.ui.View):
         if self.message is not None:
             try:
                 await self.message.edit(view=self)
-            except discord.HTTPException as e:
-                logger.debug(f"with_confirmation prompt timeout edit failed: {e}")
+            except DISCORD_CALL_ERRORS as e:
+                logger.debug(
+                    f"with_confirmation prompt timeout edit failed: " f"{describe_discord_error(e)}"
+                )
 
 
 # // ========================================( Functions )======================================== // #
@@ -151,11 +155,17 @@ def with_loading_state(
         elif not interaction.response.is_done():
             try:
                 await interaction.response.edit_message(view=view)
-            except discord.InteractionResponded:
-                pass
+            except (*DISCORD_CALL_ERRORS, discord.InteractionResponded) as e:
+                # Matches the stateful branch above: showing the loading
+                # state is cosmetic, and failing to show it must not
+                # cancel the action the click asked for.
+                logger.debug(
+                    f"with_loading_state pre-edit failed on "
+                    f"{type(view).__name__}: {describe_discord_error(e)}"
+                )
 
         try:
-            await original_callback(interaction)
+            await await_maybe(original_callback(interaction))
         except discord.InteractionResponded:
             raise RuntimeError(
                 f"The callback wrapped by with_loading_state tried to use "
@@ -245,14 +255,15 @@ def with_confirmation(
                     await confirm_interaction.response.edit_message(
                         content=confirmed_message, embed=None, view=None
                     )
-                except discord.HTTPException:
+                except (*DISCORD_CALL_ERRORS, discord.InteractionResponded):
                     # A failed prompt edit (deleted message, dead ack, transient
-                    # 5xx) must not cancel the confirmed action -- the contract is
+                    # 5xx, a rate limit, a slot something else already took)
+                    # must not cancel the confirmed action -- the contract is
                     # "on confirm, run the callback". Swallow the cosmetic edit
                     # failure and proceed; the callback acks the slot if it is
                     # still open.
                     pass
-                await original_callback(confirm_interaction)
+                await await_maybe(original_callback(confirm_interaction))
             finally:
                 confirmation_view.stop()
 
@@ -262,12 +273,12 @@ def with_confirmation(
                     await cancel_interaction.response.edit_message(
                         content=cancelled_message, embed=None, view=None
                     )
-                except discord.HTTPException:
+                except (*DISCORD_CALL_ERRORS, discord.InteractionResponded):
                     # Same containment as _on_confirm: a failed prompt edit must
                     # not skip the on_cancel hook.
                     pass
                 if on_cancel is not None:
-                    await on_cancel(cancel_interaction)
+                    await await_maybe(on_cancel(cancel_interaction))
             finally:
                 confirmation_view.stop()
 
@@ -308,8 +319,11 @@ def with_confirmation(
         if prompt_message is None:
             try:
                 prompt_message = await interaction.original_response()
-            except discord.HTTPException as e:
-                logger.debug(f"with_confirmation could not capture prompt message: {e}")
+            except DISCORD_CALL_ERRORS as e:
+                logger.debug(
+                    f"with_confirmation could not capture prompt message: "
+                    f"{describe_discord_error(e)}"
+                )
         confirmation_view.message = prompt_message
 
     component.callback = confirmation_callback
@@ -514,7 +528,7 @@ def with_cooldown(
             return
 
         cooldowns[key] = now + seconds
-        await original_callback(interaction)
+        await await_maybe(original_callback(interaction))
 
     component.callback = cooldown_callback
     return component

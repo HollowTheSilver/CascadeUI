@@ -1,6 +1,7 @@
 # // ========================================( Modules )======================================== // #
 
 
+import inspect
 import logging
 from typing import Any, Callable, ClassVar, Dict, List, Optional
 
@@ -11,12 +12,33 @@ from discord.ui import ActionRow, Button
 from ...components.base import StatefulButton
 from ...components.patterns.v2 import card, progress_bar
 from ...components.types import EmojiInput
+from ...utils.hooks import await_maybe
 from ..base import _StatefulMixin
 from ..layout import StatefulLayoutView
 from ..view import StatefulView
 from .types import WizardSchema, _normalize_steps
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_validation(result, owner: str, index: int):
+    """Resolve what a step validator returned into ``(valid, error)``.
+
+    A bare bool is the common near miss and means what it looks like, so
+    it is read as ``(result, None)``. Anything else that is not a pair is
+    refused rather than unpacked: a two-character string and a two-key
+    dict both unpack without complaint and hand back a truthy first
+    element, which advances the wizard past the step the validator was
+    rejecting.
+    """
+    if isinstance(result, bool):
+        return result, None
+    if isinstance(result, (tuple, list)) and len(result) == 2:
+        return result[0], result[1]
+    raise TypeError(
+        f"{owner} step {index} validator must return (valid, error) or a bool; "
+        f"got {type(result).__name__}: {result!r}"
+    )
 
 
 # // ========================================( Shared Mixin )======================================== // #
@@ -163,7 +185,34 @@ class _BaseWizardMixin:
         if condition is None:
             return True
         try:
-            return bool(condition(self))
+            answer = condition(self)
+            # An awaitable answer is not an answer. ``WizardStep`` rejects a
+            # coroutine function at construction, but a step declared as a raw
+            # dict never passes through it, and neither path catches an object
+            # whose ``__call__`` is async. Every coroutine is truthy, so
+            # without this the step renders regardless of what the predicate
+            # would have decided, and nothing anywhere reports it.
+            # An async generator is the third shape and the quietest: it is
+            # not awaitable, so the check below misses it, and it is truthy,
+            # so the step shows. A stray ``yield`` in an ``async def``
+            # predicate is all it takes. It cannot be closed from here
+            # (``aclose`` is itself a coroutine), so it is only reported.
+            if inspect.isasyncgen(answer):
+                logger.warning(
+                    f"Step condition in {type(self).__name__} is an async "
+                    f"generator, not a predicate; treating step as visible. "
+                    f"Remove the yield, or move the async work to on_load()."
+                )
+                return True
+            if inspect.isawaitable(answer):
+                answer.close()
+                logger.warning(
+                    f"Step condition in {type(self).__name__} is async and cannot "
+                    f"be awaited here; treating step as visible. Load async data "
+                    f"in on_load() and have the predicate read the result."
+                )
+                return True
+            return bool(answer)
         except Exception as exc:
             logger.warning(
                 f"Step condition in {type(self).__name__} raised; "
@@ -276,7 +325,11 @@ class _BaseWizardMixin:
     async def _go_next(self, interaction: Interaction):
         step = self._steps[self._current_step] if self._steps else None
         if step and "validator" in step:
-            valid, error = await step["validator"]()
+            valid, error = _normalize_validation(
+                await await_maybe(step["validator"]()),
+                type(self).__name__,
+                self._current_step,
+            )
             if not valid:
                 await self._call_hook_safe(
                     self.on_validation_failed,
@@ -288,7 +341,7 @@ class _BaseWizardMixin:
 
         next_visible = self._next_visible_index(self._current_step)
         if next_visible is None:
-            await self.on_finish(interaction)
+            await await_maybe(self.on_finish(interaction))
             return
 
         old_index = self._current_step
@@ -466,7 +519,7 @@ class WizardView(_BaseWizardMixin, StatefulView):
         builder = self._steps[self._current_step].get("builder")
         if not builder:
             return {}
-        return {"embed": await builder()}
+        return {"embed": await await_maybe(builder())}
 
 
 # // ========================================( V2: WizardLayoutView )======================================== // #
@@ -609,7 +662,7 @@ class WizardLayoutView(_BaseWizardMixin, StatefulLayoutView):
                 step = self._steps[self._current_step]
                 builder = step.get("builder")
                 if builder:
-                    content = await builder()
+                    content = await await_maybe(builder())
                     if isinstance(content, list):
                         for item in content:
                             self.add_item(item)

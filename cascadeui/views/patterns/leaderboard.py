@@ -7,7 +7,14 @@ from typing import ClassVar, Dict, List, Optional, Tuple, Union
 import discord
 from discord.ui import Container, Item, TextDisplay
 
-from ...components.patterns.v2 import card, divider, gallery, gap, image_section
+from ...components.patterns.v2 import (
+    _coerce_media_ref,
+    card,
+    divider,
+    gallery,
+    gap,
+    image_section,
+)
 from ...components.types import MediaInput
 from ..base import _StatefulMixin
 from ..persistent import _PersistentMixin
@@ -32,23 +39,80 @@ def _as_frame_items(value) -> list:
     return [TextDisplay(item) if isinstance(item, str) else item for item in items]
 
 
-def _coerce_banner(value):
+def _normalize_entries(entries, owner: str, source: str):
+    """Resolve leaderboard entries to the ``(user_id, stats)`` pairs the board reads.
+
+    Every consumer unpacks two items and then reads the second as a mapping,
+    so a wrong shape surfaces deep inside a hashing helper or a page builder
+    as an attribute error naming ``items`` or an unpack error naming an int.
+    Neither says what the board wanted.
+
+    A mapping of id to stats and a one-shot iterable are the same data in a
+    different container, so both are converted. Anything else raises here,
+    where the parameter and the source are still known.
+
+    Args:
+        entries: The caller's value.
+        owner: Class name for the message.
+        source: Where the value came from, so the message points at the
+            constructor kwarg or the overridden hook rather than at neither.
+    """
+    if entries is None:
+        raise TypeError(
+            f"{owner}: {source} returned None. Return a sequence of "
+            f"(user_id, stats_dict) pairs, or an empty list for no entries."
+        )
+    if hasattr(entries, "items"):
+        entries = list(entries.items())
+    elif not hasattr(entries, "__len__") or not hasattr(entries, "__getitem__"):
+        try:
+            entries = list(entries)
+        except TypeError:
+            raise TypeError(
+                f"{owner}: {source} must be a sequence of (user_id, stats_dict) "
+                f"pairs, got {type(entries).__name__}"
+            ) from None
+    for index, entry in enumerate(entries):
+        # A mapping is excluded before the length and item reads below: it
+        # satisfies both and then indexes by key, so ``entry[1]`` on a
+        # two-key dict raises KeyError from inside this check rather than
+        # reporting the shape. Strings and sets fail the same reads for
+        # their own reasons, so all three are named here.
+        if (
+            isinstance(entry, (str, bytes))
+            or hasattr(entry, "items")
+            or not hasattr(entry, "__len__")
+            or not hasattr(entry, "__getitem__")
+        ):
+            raise TypeError(
+                f"{owner}: {source}[{index}] must be a (user_id, stats_dict) pair, "
+                f"got {type(entry).__name__}: {entry!r}"
+            )
+        if len(entry) != 2:
+            raise ValueError(
+                f"{owner}: {source}[{index}] must have exactly two items "
+                f"(user_id, stats_dict), got {len(entry)}: {entry!r}"
+            )
+        if not hasattr(entry[1], "items"):
+            raise TypeError(
+                f"{owner}: {source}[{index}] stats must be a mapping, got "
+                f"{type(entry[1]).__name__}: {entry[1]!r}\n"
+                f"  Fix: pair each id with a dict, e.g. (user_id, {{'score': 50}})."
+            )
+    return entries
+
+
+def _coerce_banner(value, owner: str):
     """Coerce a ``banner`` value to the media reference ``gallery`` accepts.
 
-    ``None``, URL strings, and ``discord.File`` pass through. Objects
-    carrying a string ``url`` attribute (``discord.Asset``, so
-    ``guild.icon`` and ``member.display_avatar`` work directly) coerce
-    to that URL. Anything else raises ``TypeError`` at the call site.
+    ``None`` passes through, since a banner is optional where a builder's
+    media argument is required. Everything else resolves through the same
+    coercion the V2 media builders use, so an Asset, a File, and a URL
+    string mean here exactly what they mean there.
     """
-    if value is None or isinstance(value, (str, discord.File)):
-        return value
-    url = getattr(value, "url", None)
-    if isinstance(url, str):
-        return url
-    raise TypeError(
-        f"banner must be a URL string, discord.File, or an object with a "
-        f"string .url attribute (e.g. discord.Asset); got {type(value).__name__}"
-    )
+    if value is None:
+        return None
+    return _coerce_media_ref(value, owner=owner, param="banner=")
 
 
 _DEFAULT_AVATAR_CDN = "https://cdn.discordapp.com/embed/avatars/{index}.png"
@@ -184,7 +248,7 @@ class _BaseLeaderboardMixin:
         """
         if name == "banner":
             if value is not None:
-                _coerce_banner(value)
+                _coerce_banner(value, cls.__name__)
             return
         super()._validate_attribute_value(name, value)
 
@@ -465,7 +529,7 @@ class _BaseLeaderboardMixin:
         if hook_value is not None:
             return _as_frame_items(hook_value)
         items: list = []
-        media = _coerce_banner(self.banner)
+        media = _coerce_banner(self.banner, type(self).__name__)
         if media:
             items.append(gallery(media))
         if self.title:
@@ -565,7 +629,10 @@ class _BaseLeaderboardMixin:
             return await self._build_leaderboard_pages_inner()
 
     async def _build_leaderboard_pages_inner(self) -> list:
-        entries = self.get_entries()
+        # Normalized here as well as in ``rebuild_pages``: page building is
+        # reachable without it, and a hook is re-consulted on every call, so
+        # an override returning a different shape later gets the same answer.
+        entries = _normalize_entries(self.get_entries(), type(self).__name__, "get_entries()")
 
         if not entries:
             return [self.on_leaderboard_empty()]
@@ -777,8 +844,10 @@ class LeaderboardLayoutView(_BaseLeaderboardMixin, PaginatedLayoutView):
         if subtitle is not _UNSET:
             self.subtitle = subtitle
         if banner is not _UNSET:
-            self.banner = _coerce_banner(banner)
-        self._entries = entries or []
+            self.banner = _coerce_banner(banner, type(self).__name__)
+        self._entries = (
+            _normalize_entries(entries, type(self).__name__, "entries=") if entries else []
+        )
         # Pages build lives in ``on_load()`` so the async ``get_avatar_url``
         # hook can resolve thumbnails before the first render. ``__init__``
         # hands the paginated base an empty list until then.
@@ -845,7 +914,7 @@ class LeaderboardLayoutView(_BaseLeaderboardMixin, PaginatedLayoutView):
         rendered pages (a filter, or a select's highlighted option read
         by ``build_header``).
         """
-        entries = self.get_entries()
+        entries = _normalize_entries(self.get_entries(), type(self).__name__, "get_entries()")
         signature = self._entries_signature_for(entries)
         if not force and signature == getattr(self, "_entries_signature", None) and self.pages:
             return

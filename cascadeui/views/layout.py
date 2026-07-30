@@ -159,45 +159,6 @@ class StatefulLayoutView(_StatefulMixin, LayoutView):
 
     # // ==================( V2 Layout Helpers )================== // #
 
-    async def _clear_on_empty_back(self, interaction) -> None:
-        """V2 override: freeze components instead of editing to ``view=None``.
-
-        A V2 message IS its components, so ``view=None`` would produce an
-        empty message (error 50006). Freeze the dead components and edit
-        with the frozen view, preserving the visible content. The response
-        slot is still open, so edit + ack ship in one call.
-        """
-        try:
-            self._freeze_components()
-            if not interaction.response.is_done():
-                await self._ack_bounded(
-                    interaction.response.edit_message(**self._freeze_edit_kwargs())
-                )
-            else:
-                await self._bounded(
-                    interaction.edit_original_response(**self._freeze_edit_kwargs())
-                )
-        except asyncio.TimeoutError:
-            logger.debug(
-                f"Back-navigation freeze stalled past {self.edit_timeout}s "
-                f"in {type(self).__name__}."
-            )
-        except discord.InteractionResponded:
-            # The auto-defer timer raced the is_done() guard and acked the
-            # interaction before edit_message's own guard. The ack landed but
-            # the frozen view did not ship -- send it through the deferred endpoint.
-            try:
-                await self._bounded(
-                    interaction.edit_original_response(**self._freeze_edit_kwargs())
-                )
-            except (asyncio.TimeoutError, discord.HTTPException):
-                pass
-        except discord.HTTPException as e:
-            logger.debug(
-                f"Back-navigation freeze failed in {type(self).__name__}: "
-                f"status={e.status} code={e.code}"
-            )
-
     def _add_back_button(self):
         """Add a back button wrapped in an ActionRow for V2 layout views."""
         action_row = ActionRow(self.make_back_button(custom_id=f"nav_back_{self.id[:8]}"))
@@ -329,7 +290,7 @@ class DisplayLayoutView(StatefulLayoutView):
     def __init__(self, *args, container: Item, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._container = container
-        self.build_ui()
+        self._build_ui_sync()
 
     def build_ui(self) -> None:
         self.clear_items()

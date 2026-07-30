@@ -8,6 +8,7 @@ import discord
 
 from ..components.base import StatefulButton
 from ..state.actions import ActionCreators
+from ..utils.responses import DISCORD_CALL_ERRORS, describe_discord_error
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,28 @@ class _NavigationMixin:
     """
 
     # // ==================( Navigation Stack )================== // #
+
+    @property
+    def nav_depth(self) -> int:
+        """Number of views beneath this one on the navigation stack.
+
+        Zero on a view opened directly, one on the first push, and so on.
+        Read it to decide whether a Back button belongs on the screen at
+        all: the library disables one that has nowhere to go, but a screen
+        reachable both by a push and by its own command usually wants it
+        absent on the root entry rather than present and greyed::
+
+            self.add_item(self.make_nav_row(back=bool(self.nav_depth)))
+
+        A view that builds its nav row in more than one branch reads this
+        in each of them, rather than tracking a separate root flag its
+        constructor has to be told about.
+
+        Safe to read inside ``on_load``: ``_navigate_to`` assigns the stack
+        before it runs the destination's load hook, so the count is already
+        correct by the time the tree is composed.
+        """
+        return len(self._nav_stack)
 
     async def _navigate_to(
         self,
@@ -227,7 +250,7 @@ class _NavigationMixin:
                 new_view._nav_stack = list(self._nav_stack[:-1])
 
             # Propagate session origin so the entire navigation chain is tracked
-            # under the root view's class name in the session index.
+            # under the root view's class name in the instance index.
             if action_type == "NAVIGATION_REPLACE":
                 # replace() is a one-way transition -- the destination view is independent
                 # and should be tracked under its own class name, not the source's.
@@ -244,7 +267,7 @@ class _NavigationMixin:
             # Register the new view in the active view registry immediately.
             # Sub-views from push/pop typically edit the existing message instead
             # of calling send(), so register_view() must happen here -- otherwise
-            # the sub-view is invisible to session limit enforcement.
+            # the sub-view is invisible to instance limit enforcement.
             # Pre-constructed instances also need this: __init__ wires the
             # subscriber and stores identity, but register_view fires only
             # from _send_pipeline or this navigation path.
@@ -472,6 +495,7 @@ class _NavigationMixin:
         # first so the destination renders themed regardless of where
         # its tree was built.
         new_view._apply_theme_defaults()
+        new_view._sync_back_buttons()
         new_view._check_placement()
 
         # Push/pop reuse the parent's Discord message, carried onto
@@ -508,10 +532,12 @@ class _NavigationMixin:
                 await new_view.refresh(**edit_kwargs)
                 return True
             except discord.HTTPException as e:
-                # refresh() already absorbs NotFound and 429; a remaining
-                # HTTP error means the view's own message could not be
-                # edited. Report failure so the navigation rolls back to the
-                # live source instead of stranding a dead view.
+                # refresh() already absorbs the three conditions that leave
+                # nothing to recover: NotFound, 429, and an expired
+                # ephemeral's 401. A remaining HTTP error means the view's
+                # own message could not be edited but the message is still
+                # reachable, so report failure and let the navigation roll
+                # back to the live source instead of stranding a dead view.
                 logger.warning(
                     f"Navigation edit to the view's own message failed in "
                     f"{type(self).__name__}: status={getattr(e, 'status', '?')} "
@@ -564,7 +590,7 @@ class _NavigationMixin:
                     f"Navigation fast path raced an ack in {type(self).__name__}; "
                     f"using the deferred edit."
                 )
-            except (discord.HTTPException, discord.RateLimited) as e:
+            except DISCORD_CALL_ERRORS as e:
                 # 429: stamp the backoff and report failure so the navigation
                 # rolls back to the live source rather than hammering the rate
                 # limit; the user re-clicks to retry. Other transient failures
@@ -594,8 +620,9 @@ class _NavigationMixin:
                 f"{type(self).__name__}; rolling back to source."
             )
             return False
-        except discord.HTTPException:
-            # Interaction token expired (15-min lifetime). Route the
+        except DISCORD_CALL_ERRORS:
+            # Interaction token expired (15-min lifetime), or the ack was
+            # rate limited. Route the
             # channel-endpoint fallback through refresh() so cooldown
             # throttling, 429 backoff, and the render-hash short-circuit
             # all participate in the edit.
@@ -604,8 +631,9 @@ class _NavigationMixin:
                     await new_view.refresh(**edit_kwargs)
                     return True
                 except discord.HTTPException as e:
-                    # refresh() already absorbs NotFound and 429; remaining
-                    # HTTP errors mean the channel endpoint also failed.
+                    # refresh() already absorbs NotFound, 429, and an expired
+                    # ephemeral's 401; remaining HTTP errors mean the channel
+                    # endpoint also failed on a message still worth retrying.
                     logger.warning(
                         f"Navigation channel-endpoint fallback failed in "
                         f"{type(self).__name__}: status={getattr(e, 'status', '?')} "
@@ -710,38 +738,38 @@ class _NavigationMixin:
             self.create_task(self._schedule_ephemeral_refresh())
 
     async def _clear_on_empty_back(self, interaction) -> None:
-        """Clear the view when Back is pressed at the root of the stack.
+        """Acknowledge a Back press that has nowhere to go.
 
-        Called by the back-button callback when :meth:`pop` returns
-        ``None`` (empty stack), with the interaction still unacked. The V1
-        default edits to ``view=None`` -- strips the buttons, keeps any
-        embed. The response slot is still open, so edit + ack ship in one
-        call; the original-response endpoint is the fallback. V2 overrides
-        this to freeze components instead, since a V2 message IS its
-        components and ``view=None`` would empty it.
+        Called by the back-button callback when :meth:`pop` returns ``None``
+        (empty stack), with the interaction still unacked. The panel is left
+        as it is: the render seams disable a Back button whose stack is
+        empty, so reaching this means the button was clicked before that
+        state shipped, most plausibly on a persistent view restored after a
+        restart with a Back button its rebuilt stack no longer justifies.
+        Tearing the panel down there would destroy a working message on a
+        press that asked for nothing.
+
+        The interaction still has to be answered or the click reports as
+        failed, so the response slot is consumed with a no-op deferred
+        update. Override to close the panel on a Back press instead, though
+        ``exit`` and the Exit button are the surfaces built for that.
         """
         try:
             if not interaction.response.is_done():
-                await self._ack_bounded(interaction.response.edit_message(view=None))
-            else:
-                await self._bounded(interaction.edit_original_response(view=None))
+                await self._ack_bounded(interaction.response.defer())
         except asyncio.TimeoutError:
             logger.debug(
-                f"Back-navigation clear stalled past {self.edit_timeout}s "
+                f"Back-navigation ack stalled past {self.auto_defer_delay}s "
                 f"in {type(self).__name__}."
             )
         except discord.InteractionResponded:
-            # The auto-defer timer raced the is_done() guard and acked the
-            # interaction before edit_message's own guard. The ack landed but
-            # the clear did not ship -- send it through the deferred endpoint.
-            try:
-                await self._bounded(interaction.edit_original_response(view=None))
-            except (asyncio.TimeoutError, discord.HTTPException):
-                pass
-        except discord.HTTPException as e:
+            # The auto-defer timer took the slot between the guard above and
+            # the call. Already acked, which is the whole job here.
+            pass
+        except DISCORD_CALL_ERRORS as e:
             logger.debug(
-                f"Back-navigation clear failed in {type(self).__name__}: "
-                f"status={e.status} code={e.code}"
+                f"Back-navigation ack failed in {type(self).__name__}: "
+                f"{describe_discord_error(e)}"
             )
 
     def _add_back_button(self):
@@ -960,6 +988,13 @@ class _NavigationMixin:
                 child._attached_to = None
                 try:
                     await child.exit(delete_message=True)
-                except Exception:
-                    pass
+                except Exception as e:
+                    # The list is cleared below either way, so a child that
+                    # cannot tear itself down leaves nothing else to find
+                    # it by. Every comparable teardown seam logs; this one
+                    # was the exception.
+                    logger.debug(
+                        f"Attached child {type(child).__name__} failed to exit "
+                        f"under {type(self).__name__}: {type(e).__name__}: {e}"
+                    )
         self._attached_children.clear()

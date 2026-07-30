@@ -41,7 +41,9 @@ self.add_item(ActionRow(
 ```
 
 Convenience subclasses: `PrimaryButton`, `SecondaryButton`, `SuccessButton`,
-`DangerButton`, `LinkButton`, `ToggleButton`.
+`DangerButton`, `ToggleButton`. `LinkButton` sits beside them but wraps
+`discord.ui.Button` directly, since Discord opens the URL client-side and no
+interaction is dispatched: it takes no `callback` and no `owner_only`.
 
 #### `owner_only=True` per-button host gate
 
@@ -92,8 +94,8 @@ select = StatefulSelect(
 )
 ```
 
-Specialized variants: `Dropdown` (alias), `RoleSelect`, `ChannelSelect`,
-`UserSelect`, `MentionableSelect`.
+Specialized variants: `Dropdown` (adds option-dict shorthand), `RoleSelect`,
+`ChannelSelect`, `UserSelect`, `MentionableSelect`.
 
 #### `set_selected(value)` / `get_selected()`
 
@@ -189,9 +191,9 @@ for i in range(9):
 
 ## Modal Inputs
 
-These live inside `Modal` dialogs. They have `custom_id` attributes but
-`is_dispatchable = False` -- values are collected by the Modal on submit.
-All five share the same contract:
+These live inside `Modal` dialogs. They carry a `custom_id` but never fire
+`COMPONENT_INTERACTION` of their own; values are collected by the Modal on
+submit. All five share the same contract:
 
 - `custom_id` derived from label via `TextInput._slug()`
 - Optional `validators` list auto-collected by `Modal`
@@ -588,9 +590,7 @@ self.add_item(toggle_section(
 
 ### `image_section(text, *more_text, url, description=None, spoiler=False)`
 
-A `Section` with a `Thumbnail` image. `url` accepts a remote URL string,
-the `attachment://name.ext` form, or a `discord.File` instance whose
-`.uri` is read internally. `description` sets the thumbnail's alt text (up to
+A `Section` with a `Thumbnail` image. `url` accepts a [`MediaInput`](../api/components.md#mediainput). `description` sets the thumbnail's alt text (up to
 256 chars); `spoiler=True` hides it behind a spoiler. See
 [Local file attachments](#local-file-attachments).
 
@@ -627,14 +627,18 @@ self.add_item(card(
         on_confirm=self._do_delete,
         on_cancel=self._do_cancel,
         confirm_label="Delete",
+        confirm_style=discord.ButtonStyle.danger,
+        cancel_style=discord.ButtonStyle.secondary,
     ),
     color=discord.Color.red(),
 ))
 ```
 
-Defaults: confirm button is green with a check emoji, cancel is red with a
-cross emoji. Override any of `confirm_label`, `cancel_label`,
-`confirm_emoji`, `cancel_emoji` to customize.
+Defaults: confirm is green with a check emoji, cancel is red with a cross
+emoji, which suits a constructive prompt. A destructive one wants the
+opposite, as above, or the button that deletes renders green beside a red
+one that does nothing. Override any of `confirm_label`, `cancel_label`,
+`confirm_emoji`, `cancel_emoji`, `confirm_style`, `cancel_style`.
 
 ### `alert(message, *, level="info")`
 
@@ -694,14 +698,15 @@ visible line.
 ### `gallery(*media, descriptions=None, spoilers=None)`
 
 A `MediaGallery` from one or more image references. Each reference is
-either a URL string, the `attachment://name.ext` form, or a `discord.File`
-instance whose `.uri` is read internally. See
+a [`MediaInput`](../api/components.md#mediainput). See
 [Local file attachments](#local-file-attachments) for the send-time pairing.
 
 ### `file_attachment(url, *, spoiler=False)`
 
-A `File` component for inline attachment display. Accepts either a remote
-URL, the `attachment://name.ext` form, or a `discord.File` instance:
+A `File` component for inline attachment display. Takes the same
+`MediaInput` as the builders above -- a remote URL, the
+`attachment://name.ext` form, a `discord.File`, or any object with a
+string `.url`:
 
 ```python
 from cascadeui import card, file_attachment
@@ -766,10 +771,12 @@ raises. Discord requires select option values to be strings; the builder maps
 to and from that form, so `on_select` always receives the real Python value,
 never a stringified index.
 
-Set `multi=True` to let several options be active at once. `selected`
-becomes a set, the buttons become toggles (no disabled state, since an
-active option must be clickable to turn it off), and `on_select` receives
-the full list of selected values. Two `choice_row` controls in one view need
+Set `multi=True` to let several options be active at once. `selected` is
+then read as a collection of active values rather than one, the buttons
+become toggles (no disabled state, since an active option must be
+clickable to turn it off), and `on_select` receives the full list of
+selected values. A `Choice.value` may be any Python object, including an
+unhashable one like a list or a dict. Two `choice_row` controls in one view need
 distinct `custom_id=` values so their components do not collide.
 
 Single-select disables the active option because re-picking it is normally a
@@ -871,13 +878,21 @@ limit -- use `TabLayoutView` for views that need more tabs.
 ## Local file attachments
 
 V2 builders that take a media reference (`gallery`, `image_section`,
-`file_attachment`) accept three input shapes:
+`file_attachment`, and `LeaderboardLayoutView`'s `banner=`) accept four
+input shapes, together typed as
+[`MediaInput`](../api/components.md#mediainput):
 
 - A remote URL (`"https://cdn.example.com/img.png"`)
 - The `attachment://<filename>` reference scheme, when the file travels
   with the message as a `discord.File`
 - A `discord.File` instance directly -- the builder reads its `.uri`
   property and emits the same `attachment://<filename>` reference
+- Any object carrying a string `.url`, which covers every `discord.Asset`
+  -- so `member.display_avatar` works where `member.display_avatar.url`
+  was meant
+
+Anything else raises `TypeError` where the builder is called, naming the
+builder and the argument that carried it.
 
 The reference and the bytes are independent: the builder emits the
 reference into the component tree; the `discord.File` carries the bytes
@@ -979,6 +994,28 @@ single edit. `attachments=` replaces the message's complete attachment
 list -- previously-attached files not present in the new list are
 removed. Use an empty list (`attachments=[]`) to clear all attachments
 without uploading new ones.
+
+The example above passes one file because the tree holds one reference.
+That is the bound: the list belongs to the
+message, so it needs a file for every `attachment://` reference the tree
+currently holds, not only the one that changed. A view showing four
+images passes four; pass one and the other three render as permanent
+loading placeholders, with no exception raised anywhere.
+
+Paged or tabbed content is where this bites, because the reference that
+breaks is the one you are navigating *to*. Under Discord's ten-attachment
+ceiling the simpler shape is to upload everything once:
+
+```python
+files = [await fetch_as_file(url, f"page_{i}.png") for i, url in enumerate(urls)]
+await view.send(files=files)     # every page's bytes, once
+...
+await view.refresh()             # page turns: omit attachments entirely
+```
+
+An edit that does not mention `attachments=` keeps whatever is already
+attached, so each page's reference resolves for as long as the message
+lives. Past ten attachments, use remote URLs in `gallery()` instead.
 
 ### Persistent views
 
@@ -1241,8 +1278,13 @@ string. Ideal for persistent grids where the board evolves incrementally:
 ```python
 # Battleship pattern: mutate cells, grid auto-renders
 grid[(row, col)] = hit_emoji
-self.build_ui()  # grid.content is already updated
+await self.refresh()  # the grid rewrote its own content; ship the message
 ```
+
+The grid rewriting itself is what makes `build_ui()` unnecessary here, not
+what makes the edit unnecessary. Nothing reaches Discord until something
+sends it, so a callback that mutates and stops leaves the message showing
+the previous board.
 
 **Immediate mode** -- rebuild from external state each render. The grid is
 reconstructed from scratch on every `build_ui()` call, using external state
@@ -1274,10 +1316,11 @@ emoji, max 10). Custom `Sequence[str]` also accepted.
 
 | Operation | Example |
 |-----------|---------|
-| Single cell | `grid[(r, c)] = "🔥"` |
+| Single cell, by coordinate | `grid[(r, c)] = "🔥"` |
+| Single cell, by flat index | `grid[0] = "🟥"` (row-major, `row * cols + col`) |
 | Multiple cells | `grid[[(0,0), (1,1)]] = "⭐"` |
 | Rectangle fill | `grid.fill_rect((0,0), (2,2), "⬜")` |
-| Row by index | `grid[0] = "🟥"` |
+| Whole row | `grid.fill_rect((r, 0), (r, cols - 1), "🟥")` |
 | Clear all | `grid.clear()` |
 
 ### `button_grid(rows, cols, cell_factory)`

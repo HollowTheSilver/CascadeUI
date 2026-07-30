@@ -22,6 +22,8 @@ Construct `PersistenceMiddleware` once in your bot's `setup_hook`,
 **after loading your cogs**:
 
 ```python
+from discord.ext import commands
+
 from cascadeui import PersistenceMiddleware, setup_middleware
 from cascadeui.persistence import SQLiteBackend
 
@@ -734,8 +736,10 @@ across bot restarts:
 === "V2"
 
     ```python
-    from cascadeui import PersistentLayoutView, StatefulButton, card
+    import discord
     from discord.ui import ActionRow
+
+    from cascadeui import PersistentLayoutView, StatefulButton, card
 
     class RoleSelectorPanel(PersistentLayoutView):
         instance_limit = 1
@@ -801,8 +805,8 @@ drives the reattach pipeline during startup:
 3. Walks the kwargs migrator chain from the stored `kwargs_schema_version`
    to the class's current version.
 4. Fetches the target channel and message (skips non-messageable channels).
-5. Constructs the view, sets `_message`, restores `user_id` / `guild_id`,
-   re-derives `session_id`, and calls `bot.add_view(view, message_id=...)`.
+5. Constructs the view, sets `_message`, restores `user_id` / `guild_id` /
+   `session_id` from the row, and calls `bot.add_view(view, message_id=...)`.
 6. Registers the view in state, installs the message-deletion listener
    (eagerly, since restored views skip `send()`), and calls `on_bind(bot)` so
    runtime dependencies are injected. Interaction routing is live from this
@@ -827,19 +831,19 @@ decided by the context it is constructed with:
   a leaderboard, a role panel, a status display.
 
 Both round-trip through restore intact: the registry row stores `user_id` when there
-is one, and reattach restores it and re-derives `session_id` from it (step 5 above).
+is one, and reattach restores it alongside the `session_id` the row carries (step 5 above).
 A channel-posted panel restores ownerless by design -- nothing to attach, nothing to
 key a session on.
 
-!!! note "Restored session IDs use the coalesced form"
-    Normal `__init__` derivation appends a per-instance UUID suffix (e.g.
-    `MyPanel:user_123:a1b2c3d4`). Reattach re-derives without the suffix
-    (`MyPanel:user_123`), because the original session ended when the bot
-    stopped. The restored view starts a new session under the coalesced shape.
-    This matters if any code compares a stored `session_id` against the
-    restored view's `session_id` -- they will not match. Read session identity
-    from the live `view.session_id` property, not from a value captured before
-    a restart.
+!!! note "Restored session IDs come back verbatim"
+    The registry row stores the `session_id` the view was registered under, and
+    reattach restores that value as-is, UUID suffix and all. A view that was
+    `MyPanel:user_123:a1b2c3d4` before the restart is `MyPanel:user_123:a1b2c3d4`
+    after it, so a stored id still matches the restored view's.
+
+    Only a row written before the `session_id` column existed comes back with
+    `NULL` there. Reattach falls back to deriving `MyPanel:user_123` from the
+    restored `user_id` for those, which is the coalesced shape without a suffix.
 
 `owner_only` and `user_id` are independent axes: `owner_only` governs *who may
 interact* (a public board sets `owner_only = False`), while `user_id` governs
@@ -1037,7 +1041,7 @@ async def _migrate_persistent_views_1_to_2(backend):
 
 Library-owned migrators run automatically during `apply_migrations` in the
 setup pipeline. A missing migrator for a required version step raises
-`PersistenceInitError`. Fresh installs skip this path entirely because
+`PersistenceSchemaError`. Fresh installs skip this path entirely because
 the DDL creates tables at the current version.
 
 ### Registering migrators as data

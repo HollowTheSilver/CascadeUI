@@ -51,21 +51,23 @@ persistence across restarts.
 ### When to enable tracing
 
 `setup_logging()` accepts a `trace=True` flag that installs a wrapper
-around discord.py's `ViewStore` and logs every interaction-dispatch
-attempt: which `custom_id` the gateway received, which view matched,
-whether the handler ran, and why it was skipped if it didn't. This is
-useful when a specific symptom appears:
+around discord.py's `ViewStore`. It dumps the full dispatch table
+whenever a click resolves to a component whose view reference is already
+gone, the path discord.py otherwise discards silently, and adds
+per-rebuild lines for custom_id stabilization and item restoration.
+Successful routing produces no output. This is useful when a specific
+symptom appears:
 
 - A button click produces no response and no error in the normal logs.
 - A `PersistentView` fails to re-attach on restart and you want to see
   which `custom_id`s the dispatcher is looking for.
 - A modal submission seems to be routed to the wrong view.
 
-The tracer emits a line per dispatch attempt across every active view,
-so the volume is high enough to bury a typical debug session. Leave
-`trace=False` during general development and flip it on only when
-chasing a routing question. Turn it back off once the symptom is
-resolved.
+The tracer is quiet while routing succeeds and loud on rebuilds and
+misses, so a view that rebuilds on every state change still produces
+enough volume to bury a typical debug session. Leave `trace=False`
+during general development and flip it on only when chasing a routing
+question. Turn it back off once the symptom is resolved.
 
 ### Customizing log output
 
@@ -199,7 +201,7 @@ Lists every view currently registered with the store:
 - User ID, channel ID, message ID
 
 Up to 8 views per page. A registry stats card shows active instance
-count, session index entries, and subscriber count.
+count, instance index entries, and subscriber count.
 
 **Interactive controls:**
 
@@ -297,11 +299,15 @@ entry to the Views or Sessions tabs:
 
 ## Live Auto-Refresh
 
-The inspector subscribes to `VIEW_CREATED` and `VIEW_DESTROYED` actions.
-When another view is created or destroyed, the inspector automatically
-refreshes its active tab. The `state_selector` tracks filtered view and
-session counts, so the refresh only fires when external state actually
-changes.
+The inspector subscribes to the view, navigation, and session lifecycle
+actions. When another view is created, updated, navigated, or destroyed,
+the inspector automatically refreshes its active tab.
+
+Its `state_selector` returns the identity set of the filtered views and
+sessions, not their counts. A push or a pop births one view and destroys
+another inside a single batch, so the count is unchanged across an action
+that changed everything on screen. Copy the identity approach, not a
+count, for any dashboard that watches a set it does not own.
 
 ---
 

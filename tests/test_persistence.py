@@ -45,8 +45,23 @@ from cascadeui.persistence.schema import (
     TABLE_APPLICATION_SLOTS,
     TABLE_PERSISTENT_VIEWS,
 )
+from cascadeui.state import slots as _slots_module
 from cascadeui.state.middleware.persistence import PersistenceMiddleware
 from cascadeui.state.singleton import get_store
+
+
+@pytest.fixture(autouse=True)
+def _reset_persistent_slots():
+    # _PERSISTENT_SLOTS is a sticky module-level set: once a slot name
+    # is marked persistent, future writes to the same name inherit the
+    # contract. A persistent SlotPolicy registers into it, so every test
+    # here that declares one would otherwise leak the name into the rest
+    # of the session. Snapshot-and-restore around each test.
+    snapshot = set(_slots_module._PERSISTENT_SLOTS)
+    yield
+    _slots_module._PERSISTENT_SLOTS.clear()
+    _slots_module._PERSISTENT_SLOTS.update(snapshot)
+
 
 # // ========================================( Fake / limited backends )======================================== // #
 
@@ -562,6 +577,39 @@ class TestManagerSlotPolicy:
             ),
         )
         assert mgr.get_slot_policy("prefs") is policy
+
+    def test_config_slot_policy_opts_the_slot_in(self):
+        """A persistent policy registers the slot, not just its TTL.
+
+        Registering the policy without registering the slot left the
+        middleware's opt-in scan blind to it, so a setup that followed the
+        persistence guide wrote nothing to disk and said nothing about it.
+        """
+        mgr = PersistenceManager(
+            store=get_store(),
+            application=ApplicationPersistence(
+                backend=InMemoryBackend(),
+                slots={
+                    "cfg_slot": SlotPolicy(persistent=True),
+                    "eph_slot": SlotPolicy(),
+                },
+            ),
+        )
+        assert mgr.get_slot_policy("cfg_slot").persistent is True
+        assert _slots_module.is_persistent_slot("cfg_slot")
+        assert not _slots_module.is_persistent_slot("eph_slot")
+
+    def test_register_slot_policy_opts_the_slot_in(self):
+        """The runtime route registers the slot the same way the config does."""
+        mgr = PersistenceManager(
+            store=get_store(),
+            application=ApplicationPersistence(backend=InMemoryBackend()),
+        )
+        mgr.register_slot_policy("runtime_slot", SlotPolicy(persistent=True))
+        mgr.register_slot_policy("runtime_eph", SlotPolicy())
+
+        assert _slots_module.is_persistent_slot("runtime_slot")
+        assert not _slots_module.is_persistent_slot("runtime_eph")
 
     def test_register_slot_policy_runtime(self):
         mgr = PersistenceManager(store=get_store())
@@ -1635,7 +1683,7 @@ class TestReattachConcurrency:
         assert sorted(summary["restored"]) == ["panel:0", "panel:1"]
         assert summary["failed"] == ["panel:bad"]
 
-    async def test_unknown_class_skips_and_warns(self, caplog):
+    async def test_unknown_class_skips_and_reports_at_debug(self, caplog):
         be = InMemoryBackend()
         await be.initialize()
         await be.row_upsert(
@@ -1665,11 +1713,14 @@ class TestReattachConcurrency:
         )
         await mgr.rehydrate()
 
-        with caplog.at_level(logging.WARNING, logger="cascadeui.persistence.manager"):
+        with caplog.at_level(logging.DEBUG, logger="cascadeui.persistence.manager"):
             summary = await mgr.reattach_persistent_views()
 
         assert summary["skipped"] == ["panel:unknown"]
-        assert any("not found" in r.getMessage() for r in caplog.records)
+        # Reported, but at debug: a class not imported on the first pass is
+        # what reattach() exists to pick up, so it is not a fault yet.
+        assert any("not imported yet" in r.getMessage() for r in caplog.records)
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
 
 
 class TestRestoreConcurrencyValidation:
@@ -1801,8 +1852,14 @@ class TestPersistenceMiddlewareSetup:
         from cascadeui.persistence import backends as backends_module
 
         monkeypatch.delattr(backends_module, "SQLiteBackend", raising=False)
-        with pytest.raises(PersistenceInitError, match="aiosqlite"):
+        with pytest.raises(PersistenceInitError, match="aiosqlite") as excinfo:
             await setup_middleware(PersistenceMiddleware())
+
+        # Asserted positively: the wrong name this once carried
+        # ("cascadeui[sqlite]") is a substring of the right one, so a
+        # "not in" check would pass on the broken message and fail on the
+        # fixed one.
+        assert "pip install 'pycascadeui[sqlite]'" in str(excinfo.value)
 
     async def test_shorthand_fills_all_namespaces(self):
         be = InMemoryBackend()
@@ -1991,3 +2048,84 @@ class TestFalsyUserIdOnRestore:
 
         src = inspect.getsource(PersistenceManager._reattach_one)
         assert "elif view.user_id is not None:" in src
+
+
+class TestReattachLogLevels:
+    """A class not imported yet is what the first pass absorbs, not a fault.
+
+    The two-pass design exists so a cog loading after ``setup_middleware``
+    still gets its panels back: those rows land in ``skipped`` and
+    ``reattach()`` collects them. Reporting each one at warning level put a
+    fault on the sanctioned path, and at one line per row it taught an
+    operator to skim the level: a warning that is wrong a dozen times per
+    boot is worse than no warning. The count is what an operator acts on,
+    so the aggregate carries it and the per-row detail sits at debug,
+    matching what the summary's own comment already promised.
+    """
+
+    def _manager(self, rows):
+        from unittest.mock import MagicMock
+
+        from cascadeui.persistence.manager import PersistenceManager
+        from cascadeui.state.singleton import get_store
+
+        mgr = PersistenceManager(store=get_store())
+        mgr._bot = MagicMock()
+        mgr._registry_rows = rows
+        return mgr
+
+    def _rows(self, n):
+        return [
+            {
+                "persistence_key": f"panel:{i}",
+                "view_class": "cogs.later.LatePanel",
+                "channel_id": 1,
+                "message_id": 2,
+                "init_kwargs": "{}",
+            }
+            for i in range(n)
+        ]
+
+    async def test_first_pass_does_not_warn_per_row(self, caplog):
+        mgr = self._manager(self._rows(12))
+
+        with caplog.at_level("DEBUG", logger="cascadeui.persistence.manager"):
+            summary = await mgr.reattach_persistent_views()
+
+        assert len(summary["skipped"]) == 12
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+    async def test_first_pass_keeps_the_detail_at_debug(self, caplog):
+        mgr = self._manager(self._rows(3))
+
+        with caplog.at_level("DEBUG", logger="cascadeui.persistence.manager"):
+            await mgr.reattach_persistent_views()
+
+        debug = [
+            r for r in caplog.records if r.levelname == "DEBUG" and "not imported yet" in r.message
+        ]
+        assert len(debug) == 3
+
+    async def test_a_later_pass_warns_once_for_the_whole_set(self, caplog):
+        """By the second pass the caller has had its chance to import, so a
+        class still missing is a real problem -- reported once, not per row."""
+        mgr = self._manager(self._rows(12))
+        await mgr.reattach_persistent_views()
+
+        with caplog.at_level("DEBUG", logger="cascadeui.persistence.manager"):
+            await mgr.reattach()
+
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert "12 persistent view(s)" in warnings[0].message
+        assert "reattach()" in warnings[0].message
+
+    async def test_the_advice_no_longer_names_a_pre_import(self, caplog):
+        """The old message told an operator to import before initialize(),
+        which is the one thing the sanctioned pattern does not do."""
+        mgr = self._manager(self._rows(2))
+
+        with caplog.at_level("DEBUG", logger="cascadeui.persistence.manager"):
+            await mgr.reattach_persistent_views()
+
+        assert "before PersistenceMiddleware.initialize()" not in caplog.text

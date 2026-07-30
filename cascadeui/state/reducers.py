@@ -41,6 +41,11 @@ _BUILTIN_REDUCER_ACTIONS = frozenset(
         "APPLICATION_SLOTS_PRUNED",
         "REGISTRY_PRUNED",
         "INSPECTOR_PURGED_STALE",
+        # Synthetic: the batch commit fires it straight at subscribers and
+        # hooks, bypassing dispatch, so a reducer registered for it would
+        # never run. Reserved so the decorator rejects it rather than
+        # accepting a registration that does nothing.
+        "BATCH_COMPLETE",
     }
 )
 
@@ -138,10 +143,10 @@ async def reduce_view_destroyed(action: Action, state: StateData) -> StateData:
     components = state.get("components")
     if components:
         filtered = {cid: c for cid, c in components.items() if c.get("view_id") != view_id}
-        if filtered:
-            new_state["components"] = filtered
-        else:
-            new_state.pop("components", None)
+        # Empty, not absent: ``components`` is one of the four keys
+        # _build_initial_state establishes, and dropping it leaves the
+        # state shape depending on whether a view happened to be destroyed.
+        new_state["components"] = filtered
 
     # Remove modal submission entries owned by this view
     modals = state.get("modals")
@@ -382,10 +387,7 @@ async def reduce_inspector_purged_stale(action: Action, state: StateData) -> Sta
     components = state.get("components")
     if components:
         kept = {cid: c for cid, c in components.items() if c.get("view_id") == inspector_id}
-        if kept:
-            new_state["components"] = kept
-        else:
-            new_state.pop("components", None)
+        new_state["components"] = kept
 
     modals = state.get("modals")
     if modals:

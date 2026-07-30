@@ -165,7 +165,7 @@ class TestViewReducers:
         assert "v1" not in result.get("modals", {})
         assert "v2" in result["modals"]
 
-    async def test_view_destroyed_removes_empty_components_key(self):
+    async def test_view_destroyed_empties_but_keeps_components_key(self):
         """When all component entries belong to the destroyed view,
         the ``components`` key itself is removed from state."""
         state = base_state()
@@ -175,7 +175,10 @@ class TestViewReducers:
         }
         action = make_action("VIEW_DESTROYED", {"view_id": "v1"})
         result = await reduce_view_destroyed(action, state)
-        assert "components" not in result
+        # Emptied, not removed. ``components`` is one of the four keys
+        # _build_initial_state establishes, so a subscriber indexing it
+        # must not start raising the first time a view is destroyed.
+        assert result["components"] == {}
 
 
 class TestSessionReducers:
@@ -368,7 +371,7 @@ class TestModalSubmittedReducer:
         assert "form_abc" in result["modals"]
         submission = result["modals"]["form_abc"]["submissions"][-1]
         assert submission["values"] == {"username": "alice"}
-        # Source propagation is a pipeline contract — confirm the action
+        # Source propagation is a pipeline contract: confirm the action
         # dict still carries it untouched for downstream devtools/hooks.
         assert action["source"] == "form_abc"
 

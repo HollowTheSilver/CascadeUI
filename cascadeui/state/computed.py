@@ -1,8 +1,10 @@
 # // ========================================( Modules )======================================== // #
 
 
+import copy
 from typing import Any, Callable, Dict, Optional, Tuple
 
+from ..utils.hooks import is_async_callable
 from .singleton import get_store
 from .types import SelectorFn, StateData
 
@@ -40,7 +42,23 @@ class ComputedValue:
         current_input = self._selector(state)
         if self._last_input is not _SENTINEL and current_input == self._last_input:
             return self._cached
-        self._last_input = current_input
+        # Keep an independent copy of the input, not a reference to it. A
+        # selector returns a slice of live state, and a slice mutated in
+        # place carries the stored reference with it, so the comparison
+        # above becomes the slice against itself and the stale result is
+        # returned forever -- including after a later, correct replacement,
+        # because the aliased reference already matches the new value while
+        # the cached result predates it. ``access_slot`` mutates in place by
+        # design, and ``seed_initial_state`` hands it live state, so the
+        # aliasing is reachable through a sanctioned path. Copying costs
+        # only on a miss, where the recompute is happening anyway.
+        try:
+            self._last_input = copy.deepcopy(current_input)
+        except Exception:
+            # Something in the slice will not copy (a live client object, an
+            # open handle). Recompute every time rather than trust a
+            # reference this cannot verify.
+            self._last_input = _SENTINEL
         self._cached = self._compute_fn(current_input)
         return self._cached
 
@@ -63,6 +81,24 @@ def computed(selector: SelectorFn):
         # Access:
         result = store.computed["total_votes"]
     """
+
+    if not callable(selector):
+        raise TypeError(
+            f"@computed selector= must be a callable taking the state and returning "
+            f"the slice to watch, e.g. lambda s: s['application']['votes']; got "
+            f"{type(selector).__name__}: {selector!r}"
+        )
+    # The selector runs inside the memo comparison, which is synchronous and
+    # cannot await. An async one hands back a coroutine that the compute
+    # function then tries to use as data, failing somewhere downstream with
+    # a message naming neither this decorator nor the argument.
+    if is_async_callable(selector):
+        raise TypeError(
+            "@computed selector= must be synchronous; it runs inside the cache "
+            "comparison, which cannot await it."
+            "\n  Fix: read the slice from the state argument and return it directly. "
+            "A computed value derives from state already in memory."
+        )
 
     def decorator(fn: Callable[[Any], Any]):
         _COMPUTED_REGISTRY[fn.__name__] = (selector, fn)

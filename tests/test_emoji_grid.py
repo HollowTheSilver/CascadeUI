@@ -1,4 +1,4 @@
-"""Tests for emoji_grid() / EmojiGrid — axis matrix, cell API, validation."""
+"""Tests for emoji_grid() / EmojiGrid: axis matrix, cell API, validation."""
 
 import discord
 import pytest

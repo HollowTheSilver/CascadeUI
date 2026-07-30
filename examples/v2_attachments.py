@@ -15,6 +15,16 @@ matching ``discord.File`` carries the bytes alongside the message via
 ``view.refresh(attachments=[...])`` (in-place edit). Both halves must
 travel together, or Discord renders an unresolved placeholder.
 
+The attachment list belongs to the message, not to one reference. An
+edit replaces it whole, so it must carry a file for every
+``attachment://`` reference the tree currently holds, not only the one
+that changed. A view showing one image at a time passes one file; a
+view showing four passes four, or the three it omitted go unresolved.
+Under Discord's ten-attachment ceiling the simpler shape is to upload
+everything once through ``send(files=[...])`` and then omit
+``attachments=`` entirely, since an edit that does not mention it keeps
+what is already there.
+
 Commands:
     /attach_gallery   gallery(*media: MediaInput) with two avatars
     /attach_section   Stacked image_section() rows with Thumbnail accessories
@@ -66,10 +76,11 @@ def _bot_report_file() -> discord.File:
     runs without external assets.
     """
     payload = (
-        "CascadeUI v3.3.0 attachment surface report\n"
+        "CascadeUI attachment surface report\n"
         "------------------------------------------\n"
         "Builders: gallery(), image_section(), file_attachment()\n"
         "Type alias: MediaInput = Union[str, discord.File]\n"
+        "Also accepted: discord.Asset, discord.UnfurledMediaItem\n"
         "Send kwargs: view.send(file=) and view.send(files=[...])\n"
         "Refresh: view.refresh(attachments=[...])  -- replacement list\n"
     )
@@ -188,6 +199,13 @@ class _SwapView(StatefulLayoutView):
     ``swap_2.png``, ...) so the ``attachment://`` reference in the
     component tree pairs with the freshly-uploaded file on each swap
     without colliding with any cached upload from a prior swap.
+
+    Passing a one-item list is correct here because the tree holds exactly
+    one reference at a time: the rebuild above replaces the gallery rather
+    than adding to it, so the file being dropped is one nothing points at
+    any more. A view that keeps several images on screen, or that can
+    navigate back to an image it showed earlier, passes every file those
+    references need. The list is per message, not per swap.
     """
 
     owner_only = True

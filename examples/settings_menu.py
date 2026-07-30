@@ -619,7 +619,7 @@ class SettingsMenuExample(commands.Cog, name="settings_menu_example"):
         # Flipping it to "reject" routes rejection through on_instance_limit,
         # which sends an ephemeral default message without a try/except.
         view = SettingsHubView(context=context)
-        # send() returns None when blocked by session limiting. No-op here
+        # send() returns None when blocked by instance limiting. No-op here
         # under replace policy, but the guard is the canonical pattern.
         if await view.send() is None:
             return

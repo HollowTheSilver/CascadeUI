@@ -227,7 +227,7 @@ class TicTacToeChallengeView(StatefulLayoutView):
     async def _accept(self, interaction: discord.Interaction):
         await self.exit()
 
-        # Create the game view (challenger's context owns it for session limiting)
+        # Create the game view (challenger's context owns it for instance limiting)
         view = TicTacToeView(
             interaction=interaction,
             user_id=self.challenger_id,
@@ -283,7 +283,7 @@ class TicTacToeView(StatefulLayoutView):
     Both players interact with the same message. ``allowed_users``
     restricts interaction to the two players, and turn enforcement
     in ``_make_move`` handles ordering. The opponent is registered
-    as a participant so session limiting applies to both players.
+    as a participant so instance limiting applies to both players.
     """
 
     unauthorized_message = "You're not part of this game."

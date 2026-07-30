@@ -1,13 +1,7 @@
 # // ========================================( Modules )======================================== // #
 
 
-from typing import Any, Callable, Dict, List, Optional, Type, Union
-
-import discord
-from discord import Interaction
-
-from ..state.actions import ActionCreators
-from .base import StatefulButton, StatefulComponent
+from typing import Any, List, Optional, Type
 
 # Component registry for pre-built components
 _component_registry = {}
@@ -50,7 +44,9 @@ class CompositeComponent:
         return result
 
     def add_to_view(self, view, row=None) -> Any:
-        """Add all components to a view."""
+        """Add all components to a view, optionally onto a specific row."""
         for component in self.create_discord_components():
+            if row is not None and hasattr(component, "row"):
+                component.row = row
             view.add_item(component)
         return view

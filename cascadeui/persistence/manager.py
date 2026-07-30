@@ -54,6 +54,7 @@ from ..exceptions import (
     PersistenceSchemaError,
 )
 from ..state.actions import ActionCreators
+from ..utils.hooks import await_maybe
 from .config import (
     NAMESPACE_APPLICATION,
     NAMESPACE_REGISTRY,
@@ -129,6 +130,10 @@ class PersistenceManager:
         # reattach and skips these so an already-live panel is never re-fetched
         # or double-registered on a second pass.
         self._restored_keys: set[str] = set()
+        # Which reattach pass is running. The first is the library's own,
+        # during initialize(); later ones come from reattach(). A class
+        # missing on the first is expected and on a later one is not.
+        self._reattach_passes: int = 0
         # Summary from the most recent reattach_persistent_views() (restored /
         # skipped / failed / removed key lists). Stashed so a consumer can read
         # which persistence_keys were pruned for gone messages after
@@ -140,6 +145,16 @@ class PersistenceManager:
         # Slot policy registry, seeded from ApplicationPersistence.slots
         # and extended at runtime by register_slot_policy.
         self._slot_policies: dict[str, SlotPolicy] = dict(self.application.slots)
+
+        # A policy declaring persistent=True is an opt-in, so it registers
+        # the slot the same way persistent_slots and access_slot do. Seeding
+        # here rather than in PersistenceMiddleware.initialize() covers both
+        # construction paths: a caller passing a pre-built manager marks the
+        # middleware initialized, so initialize() short-circuits and never
+        # runs. Lazy import matches the other two seeding sites.
+        for slot_name, policy in self._slot_policies.items():
+            if policy.persistent:
+                self._register_persistent_slot(slot_name)
 
         # TTL sweeper task. Started during PersistenceMiddleware.initialize()
         # only when at least one slot declares ttl_days > 0. Cancelled by close().
@@ -198,9 +213,18 @@ class PersistenceManager:
         if name in self._slot_policies:
             raise ValueError(f"Slot policy already registered for {name!r}")
         self._slot_policies[name] = policy
+        if policy.persistent:
+            self._register_persistent_slot(name)
 
         if policy.persistent and policy.ttl_days is not None:
             self._start_ttl_sweeper()
+
+    @staticmethod
+    def _register_persistent_slot(name: str) -> None:
+        """Add ``name`` to the sticky opt-in set the middleware scans."""
+        from ..state.slots import _PERSISTENT_SLOTS
+
+        _PERSISTENT_SLOTS.add(name)
 
     def get_slot_policy(self, name: str) -> SlotPolicy:
         """Return the policy for ``name`` or the :class:`SlotPolicy`
@@ -441,6 +465,7 @@ class PersistenceManager:
         # serially on the setup_hook critical path. The per-row helpers
         # already isolate failures (skipped / removed / failed land in the
         # summary), so a bad row never aborts the fan-out.
+        self._reattach_passes += 1
         sem = asyncio.Semaphore(self.restore_concurrency)
 
         async def _prepare(row: dict[str, Any]) -> Optional[tuple]:
@@ -454,10 +479,16 @@ class PersistenceManager:
                 class_name = row["view_class"]
                 view_cls = _persistent_view_classes.get(class_name)
                 if view_cls is None:
-                    logger.warning(
-                        f"Persistent view class {class_name!r} not found for "
-                        f"persistence_key {persistence_key!r}. Ensure the module is imported "
-                        "before PersistenceMiddleware.initialize()."
+                    # Not yet imported is the state the two-pass design exists
+                    # to absorb: a cog loading after setup_middleware lands its
+                    # panels here, and reattach() picks them up. Reporting each
+                    # one at warning level put a fault on the sanctioned path
+                    # and, at one line per row, taught an operator to skim the
+                    # level. The aggregate below carries the signal, and says
+                    # what to do about it.
+                    logger.debug(
+                        f"Persistent view class {class_name!r} not imported yet for "
+                        f"persistence_key {persistence_key!r}; leaving it for reattach()."
                     )
                     summary["skipped"].append(persistence_key)
                     return None
@@ -531,6 +562,22 @@ class PersistenceManager:
             f"{len(summary['skipped'])} skipped, {len(summary['failed'])} failed, "
             f"{len(summary['removed'])} removed, {len(summary['unreachable'])} unreachable"
         )
+        # Skipped rows are only news once the caller has had its chance to
+        # import them. reattach() is that chance, so the first pass says
+        # nothing louder than the count above and a later pass, finding the
+        # class still absent, reports it as the real problem it is by then.
+        if summary["skipped"] and self._reattach_passes > 1:
+            logger.warning(
+                f"{len(summary['skipped'])} persistent view(s) still have no imported "
+                f"class after a reattach() pass; their messages stay dead until the "
+                f"class is importable. Keys at DEBUG on this logger."
+            )
+        if summary["unreachable"]:
+            logger.warning(
+                f"{len(summary['unreachable'])} persistent view(s) could not be reached "
+                f"(missing permissions, or a channel that is gone); the rows are kept and "
+                f"retried next restart. Keys at DEBUG on this logger."
+            )
         return summary
 
     async def reattach(self) -> dict[str, list[str]]:
@@ -652,7 +699,7 @@ class PersistenceManager:
             # RateLimited and InvalidData are siblings of HTTPException, not
             # subclasses; uncaught they would land the row in "failed" (never
             # retried) instead of "unreachable" (retried next restart).
-            logger.warning(
+            logger.debug(
                 f"Could not reach channel {channel_id} for {persistence_key!r} "
                 f"({type(exc).__name__}); leaving the entry for the next restart."
             )
@@ -877,7 +924,15 @@ class PersistenceManager:
         """
         try:
             await self._bot.wait_until_ready()
-        except Exception:
+        except Exception as e:
+            # Every restored view stays registered and interactive; only the
+            # warm re-render is skipped. Silence here made that look like a
+            # restore that had simply found nothing to render.
+            logger.warning(
+                f"Post-ready restore skipped: waiting for the gateway raised "
+                f"{type(e).__name__}: {e}. {len(views)} restored view(s) keep "
+                f"their cold render until something re-renders them."
+            )
             return
         start = time.monotonic()
         rendered = 0
@@ -887,7 +942,7 @@ class PersistenceManager:
             persistence_key = getattr(view, "_persistence_key", "?")
             try:
                 async with self._store.batch(source_id=view.id):
-                    await view.on_restore(self._bot)
+                    await await_maybe(view.on_restore(self._bot))
                 rendered += 1
             except Exception as exc:
                 logger.error(

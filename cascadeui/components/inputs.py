@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 import discord
 from discord import CheckboxGroupOption, Interaction, RadioGroupOption, TextStyle
 
+from ..utils.hooks import await_maybe
 from ..utils.responses import ack_backstop, respond_safe, trailing_ack
 from ..utils.strings import slugify
 from ..validation import validate_fields
@@ -26,6 +27,15 @@ def _validate_range(owner: str, name: str, value: Optional[int], lo: int, hi: in
     open otherwise; raising here surfaces the mistake where the value is set.
     ``None`` (Discord's server default) is always allowed.
     """
+    # The type check precedes the range check because the comparison below is
+    # what fails otherwise, and it fails as a bare operand TypeError naming
+    # neither the field nor the bound. A bool passes ``isinstance(int)`` and
+    # serializes as true/false, and a float serializes with a decimal point;
+    # Discord rejects both, so neither reaches the range test.
+    if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+        raise TypeError(
+            f"{owner} {name} must be an int or None, got {type(value).__name__}: {value!r}"
+        )
     if value is not None and not lo <= value <= hi:
         raise ValueError(f"{owner} {name}={value} is out of range; Discord accepts {lo}-{hi}.")
 
@@ -38,6 +48,13 @@ _MODAL_TEXT_MAX = 45
 
 def _validate_text(owner: str, name: str, value: str) -> None:
     """Reject a modal title or label Discord will not accept."""
+    # Checked before the emptiness and length tests, which are the operations
+    # that would otherwise fail: a value with no ``__len__`` raises a bare
+    # TypeError from inside the guard, and one that has a length (a list, a
+    # bytestring) passes both tests and reaches Discord as a label it cannot
+    # render.
+    if not isinstance(value, str):
+        raise TypeError(f"{owner} {name} must be a str, got {type(value).__name__}: {value!r}")
     if not value:
         raise ValueError(f"{owner} {name} must not be empty; Discord rejects a blank {name}.")
     if len(value) > _MODAL_TEXT_MAX:
@@ -244,9 +261,25 @@ class CheckboxGroup(StatefulComponent):
 
     @staticmethod
     def _process_options(raw, option_cls):
-        """Convert dicts to option instances, pass through existing ones."""
+        """Convert dicts to option instances, rejecting anything else.
+
+        The pass-through branch used to accept whatever it was handed, so a
+        list of plain strings became a list of plain strings and reached
+        Discord as options with no label and no value. A single option dict
+        passed without its list is worse: iterating a mapping yields its
+        keys, so ``{"label": "A", "value": "a"}`` produced two options named
+        ``"label"`` and ``"value"``, which the count check then counted and
+        approved. Both failed at modal-open with an attribute error from
+        inside discord.py, and the user saw "This interaction failed".
+        """
+        if hasattr(raw, "items"):
+            raise TypeError(
+                f"{option_cls.__name__} options must be a list of option dicts, "
+                f"not a single mapping. Iterating a mapping yields its keys.\n"
+                f"  Fix: wrap it in a list, e.g. options=[{{'label': ..., 'value': ...}}]."
+            )
         processed = []
-        for opt in raw:
+        for index, opt in enumerate(raw):
             if isinstance(opt, dict):
                 processed.append(
                     option_cls(
@@ -256,8 +289,14 @@ class CheckboxGroup(StatefulComponent):
                         default=opt.get("default", False),
                     )
                 )
-            else:
+            elif isinstance(opt, option_cls):
                 processed.append(opt)
+            else:
+                raise TypeError(
+                    f"{option_cls.__name__} options[{index}] must be a dict or a "
+                    f"{option_cls.__name__}, got {type(opt).__name__}: {opt!r}\n"
+                    f"  Fix: pass {{'label': ..., 'value': ...}} per option."
+                )
         return processed
 
     def create_discord_component(self):
@@ -501,6 +540,15 @@ class Modal(discord.ui.Modal, StatefulComponent):
         # Preferred over the slug-keyed ``values`` dict passed to callbacks.
         self.values_by_input: Dict[Any, Any] = {}
 
+        # A single wrapper passed without its list is not iterable, so the
+        # loop below fails on the argument rather than naming it.
+        if isinstance(inputs, _WRAPPED_INPUT_TYPES):
+            raise TypeError(
+                f"Modal inputs must be a list, got a single "
+                f"{type(inputs).__name__}.\n"
+                f"  Fix: wrap it in a list, e.g. "
+                f"inputs=[{type(inputs).__name__}(...)]."
+            )
         for input_item in inputs:
             if isinstance(input_item, _WRAPPED_INPUT_TYPES):
                 label_wrapper = input_item.create_discord_component()
@@ -662,7 +710,7 @@ class Modal(discord.ui.Modal, StatefulComponent):
 
             # Call user callback if provided
             if self.user_callback:
-                await self.user_callback(interaction, values)
+                await await_maybe(self.user_callback(interaction, values))
 
             # Ack the submission if nothing above responded. The validation-error
             # path already responded via respond() and returned; a fast callback

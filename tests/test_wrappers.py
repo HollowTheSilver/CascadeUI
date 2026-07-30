@@ -904,3 +904,162 @@ class TestCooldownSurvivesRebuild:
         await view.children[0].children[1].callback(other)
 
         assert ran == [1, 1]  # distinct keys -> independent cooldowns
+
+
+class TestRateLimitedIsASibling:
+    """``RateLimited`` does not inherit from ``HTTPException``.
+
+    ``except discord.HTTPException`` misses it entirely, and it reaches
+    user code whenever the client was built with ``max_ratelimit_timeout``
+    -- a supported upstream option. Each escape below cost more than a log
+    line, so each is driven with a real ``RateLimited`` rather than
+    asserted from the shape of the catch clause.
+    """
+
+    @staticmethod
+    def _prompt_buttons(interaction):
+        """The confirm/cancel pair, off the view the prompt was sent with."""
+        return interaction.response.send_message.call_args[1]["view"].children
+
+    def test_ratelimited_is_not_an_httpexception(self):
+        """The premise every catch below depends on. If upstream ever makes
+        it a subclass, those catches become redundant rather than wrong, and
+        this test is what says so first."""
+        assert not issubclass(discord.RateLimited, discord.HTTPException)
+
+    async def test_confirmed_action_survives_a_rate_limited_prompt_edit(self):
+        """``with_confirmation``'s own comment promises the confirmed action
+        runs even when the cosmetic prompt edit fails."""
+        ran = []
+
+        async def action(interaction):
+            ran.append(True)
+
+        component = _make_button(callback=action)
+        with_confirmation(component)
+        opening = make_interaction()
+        await component.callback(opening)
+
+        confirm, _cancel = self._prompt_buttons(opening)
+        prompt = make_interaction()
+        prompt.response.edit_message = AsyncMock(side_effect=discord.RateLimited(5.0))
+        await confirm.callback(prompt)
+
+        assert ran == [True]
+
+    async def test_cancel_hook_survives_a_rate_limited_prompt_edit(self):
+        cancelled = []
+
+        async def on_cancel(interaction):
+            cancelled.append(True)
+
+        component = _make_button(callback=AsyncMock())
+        with_confirmation(component, on_cancel=on_cancel)
+        opening = make_interaction()
+        await component.callback(opening)
+
+        _confirm, cancel = self._prompt_buttons(opening)
+        prompt = make_interaction()
+        prompt.response.edit_message = AsyncMock(side_effect=discord.RateLimited(5.0))
+        await cancel.callback(prompt)
+
+        assert cancelled == [True]
+
+    async def test_loading_state_runs_the_action_after_a_rate_limited_pre_edit(self):
+        """The loading state is cosmetic; failing to show it must not cancel
+        the click that asked for the action."""
+        ran = []
+
+        async def action(interaction):
+            ran.append(True)
+
+        component = _make_button(callback=action)
+        with_loading_state(component)
+
+        interaction = make_interaction(is_done=False)
+        interaction.response.edit_message = AsyncMock(side_effect=discord.RateLimited(5.0))
+        await component.callback(interaction)
+
+        assert ran == [True]
+
+
+class TestDecoratorsAcceptEitherShape:
+    """``with_error_boundary``, ``with_retry`` and ``cascade_component``
+    take a plain ``def`` as well as an ``async def``.
+
+    All three are public, root-exported, and awaited whatever they were
+    given, so a synchronous function ran, returned, and then failed on the
+    library awaiting its return value. None had a functional test of any
+    kind before this.
+    """
+
+    async def test_error_boundary_runs_a_sync_function(self):
+        from cascadeui import with_error_boundary
+
+        @with_error_boundary("sync_work")
+        def work(n):
+            return n * 2
+
+        assert await work(21) == 42
+
+    async def test_error_boundary_still_reraises_from_a_sync_function(self):
+        from cascadeui import with_error_boundary
+
+        @with_error_boundary("sync_boom")
+        def work():
+            raise ValueError("boom")
+
+        with pytest.raises(ValueError, match="boom"):
+            await work()
+
+    async def test_error_boundary_runs_an_async_function(self):
+        from cascadeui import with_error_boundary
+
+        @with_error_boundary("async_work")
+        async def work(n):
+            return n * 2
+
+        assert await work(21) == 42
+
+    async def test_retry_runs_a_sync_function(self):
+        from cascadeui import RetryConfig, with_retry
+
+        @with_retry(RetryConfig(max_retries=2, backoff_factor=0.0))
+        def work():
+            return "done"
+
+        assert await work() == "done"
+
+    async def test_retry_retries_a_failing_sync_function(self):
+        from cascadeui import RetryConfig, with_retry
+
+        attempts = []
+
+        @with_retry(RetryConfig(max_retries=3, backoff_factor=0.0))
+        def work():
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise RuntimeError("not yet")
+            return "done"
+
+        assert await work() == "done"
+        assert len(attempts) == 3
+
+    async def test_cascade_component_runs_a_sync_handler(self):
+        from cascadeui.utils.decorators import cascade_component
+
+        seen = []
+
+        class Host:
+            id = "view-1"
+
+            @cascade_component("btn")
+            def handler(self, interaction):
+                seen.append(interaction.user.id)
+
+            async def dispatch(self, action_type, payload):
+                return None
+
+        await Host().handler(make_interaction(user_id=7))
+
+        assert seen == [7]

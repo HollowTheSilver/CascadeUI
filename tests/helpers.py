@@ -51,7 +51,7 @@ def make_interaction(user_id=100, guild_id=200, is_done=False, message=None):
     # the acting-view and navigation fast paths, which gate on interaction type,
     # engage by default.
     interaction.type = discord.InteractionType.component
-    # InteractionResponse.is_done() is sync in discord.py — use MagicMock
+    # InteractionResponse.is_done() is sync in discord.py: use MagicMock
     # so the return value is a plain bool, not a coroutine.
     interaction.response = MagicMock()
     interaction.response.is_done.return_value = is_done

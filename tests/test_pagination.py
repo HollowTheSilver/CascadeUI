@@ -59,7 +59,7 @@ class TestBasicPages:
         assert result["content"] == "Text content"
 
     async def test_extract_page_embed(self):
-        """_extract_page handles plain Embeds — only includes 'embed' key."""
+        """_extract_page handles plain Embeds: only includes 'embed' key."""
         embed = discord.Embed(title="Test")
         view = PaginatedView(pages=[embed], interaction=_make_interaction())
 
@@ -68,7 +68,7 @@ class TestBasicPages:
         assert "content" not in result
 
     async def test_extract_page_string(self):
-        """_extract_page handles strings — only includes 'content' key."""
+        """_extract_page handles strings: only includes 'content' key."""
         view = PaginatedView(pages=["text"], interaction=_make_interaction())
 
         result = view._extract_page("text")
@@ -394,7 +394,7 @@ class TestUpdatePage:
     """_update_page edits the message with the correct page content type."""
 
     async def test_update_page_with_embed(self):
-        """_update_page edits with embed for Embed pages — no content key sent."""
+        """_update_page edits with embed for Embed pages: no content key sent."""
         pages = _make_embeds(3)
         view = PaginatedView(pages=pages, interaction=_make_interaction())
         view._message = MagicMock()
@@ -408,7 +408,7 @@ class TestUpdatePage:
         assert "content" not in call_kwargs
 
     async def test_update_page_with_string(self):
-        """_update_page edits with content for string pages — no embed key sent."""
+        """_update_page edits with content for string pages: no embed key sent."""
         pages = ["Hello", "World"]
         view = PaginatedView(pages=pages, interaction=_make_interaction())
         view._message = MagicMock()

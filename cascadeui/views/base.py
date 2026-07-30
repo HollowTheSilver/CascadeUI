@@ -25,8 +25,8 @@ from ..state.actions import ActionCreators
 from ..state.singleton import get_store
 from ..state.store import _CURRENT_INTERACTION
 from ..utils.coercion import coerce_snowflake_id, coerce_snowflake_id_set, is_snowflake
-from ..utils.hooks import call_hook_safe
-from ..utils.responses import ack_backstop
+from ..utils.hooks import await_maybe, call_hook_safe, is_async_callable
+from ..utils.responses import DISCORD_CALL_ERRORS, ack_backstop, describe_discord_error
 from ..utils.tasks import get_task_manager
 from ._interaction import _InteractionMixin
 from ._navigation import _NavigationMixin
@@ -142,12 +142,12 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
     # Subclass config: auto-add a back button when pushed onto nav stack
     auto_back_button: bool = False
 
-    # Subclass config: session limiting
+    # Subclass config: instance limiting
     instance_limit: Optional[int] = None  # None = unlimited
     instance_scope: str = "user_guild"  # "user", "guild", "user_guild", "global"
     instance_policy: str = "replace"  # "replace" or "reject"
     # Optional override for the default ephemeral message sent when a user
-    # hits the session limit.  Falsy values fall back to
+    # hits the instance limit.  Falsy values fall back to
     # ``InstanceLimitError.default_message`` (singular/plural aware).  For
     # fully custom UX, override the ``on_instance_limit`` method instead.
     instance_limit_message: Optional[str] = None
@@ -554,7 +554,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
 
         Runs in ``__init_subclass__``, so a typo like
         ``instance_policy = "rejct"`` raises ``ValueError`` at *class
-        definition time* -- i.e. at module import -- instead of failing
+        definition time* (at module import) instead of failing
         silently or surfacing as a confusing runtime error deep inside
         the dispatch loop. Only attributes the subclass actually
         overrode (present in ``cls.__dict__``) are checked, so inherited
@@ -644,7 +644,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         A view with ``scoped_slot = "my_stats"`` writes scoped data to the
         ``my_stats`` bucket. Declaring ``persistent_slots = ("scoped",)``
         alongside that custom slot means the view persists the default
-        bucket -- which nothing writes to -- while ``my_stats`` remains
+        bucket, which nothing writes to, while ``my_stats`` remains
         transient. Data vanishes on restart with no warning. Raising at
         class-definition time makes the mismatch impossible to ship.
 
@@ -716,6 +716,25 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         _register_view_class(cls)
         cls._validate_class_attributes()
 
+        # A selector runs inline inside dispatch, where nothing can await it.
+        # An async override is therefore never resolved: the store compares
+        # one fresh coroutine against the last, they never match, and the
+        # notification is skipped every time -- so the view goes silently
+        # deaf to state while looking correctly wired. ``subscribe`` refuses
+        # an async selector where it is handed one, but it is handed the
+        # lambda ``_build_selector`` wraps this method in, and a lambda is
+        # never a coroutine function whatever it closes over, so the
+        # override is checked at the class that declares it.
+        own_selector = cls.__dict__.get("state_selector")
+        if own_selector is not None and is_async_callable(own_selector):
+            raise TypeError(
+                f"{cls.__name__}.state_selector must be synchronous; it is compared "
+                f"inline during dispatch, which cannot await it, so an async one is "
+                f"never resolved and the view stops receiving state updates."
+                f"\n  Fix: read the slice from the state argument and return it "
+                f"directly. Do async work in on_state_changed."
+            )
+
         # Register declared persistent slot names with the module-level
         # set the middleware checks. Sticky by design -- once any class
         # declares a slot name persistent, every ``access_slot`` write to
@@ -770,6 +789,16 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         if "build_ui" in cls.__dict__:
             original_build = cls.build_ui
 
+            # Two wrappers because the sync one must stay sync: three classes
+            # call ``self.build_ui()`` from ``__init__``, which cannot await.
+            # ``iscoroutinefunction`` picks between them, and it answers False
+            # for shapes that still return a coroutine -- a callable instance
+            # whose ``__call__`` is async, a ``functools.partial`` around one,
+            # a plain function that returns one. Those take the sync branch,
+            # so it checks the result rather than trusting the dispatch: with
+            # a coroutine in hand the body has not run yet, and stabilizing
+            # ids or dropping the ambient theme at that point would be doing
+            # the wrapper's work against a tree that does not exist.
             if inspect.iscoroutinefunction(original_build):
 
                 @functools.wraps(original_build)
@@ -789,8 +818,24 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
 
                     with theme_context(self.get_theme()):
                         result = original_build(self, *args, **kw)
-                        self._stabilize_custom_ids()
-                        return result
+                        if not inspect.isawaitable(result):
+                            self._stabilize_custom_ids()
+                            return result
+
+                    # Hand back a coroutine that re-enters the theme for the
+                    # body and stabilizes once it has actually built. The
+                    # context is entered again rather than held open across
+                    # the yield: it is a contextvar, so the second entry costs
+                    # a set and a reset, and holding one open across an await
+                    # would leak the theme into whatever else the awaiting
+                    # task runs.
+                    async def _finish_themed_build():
+                        with theme_context(self.get_theme()):
+                            value = await result
+                            self._stabilize_custom_ids()
+                            return value
+
+                    return _finish_themed_build()
 
             cls.build_ui = _themed_build_ui
 
@@ -806,7 +851,11 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 from ..theming.context import theme_context
 
                 with theme_context(self.get_theme()):
-                    return await original_load(self, *args, **kw)
+                    # The wrapper is always a coroutine function because the
+                    # library awaits ``on_load`` at three render seams, but the
+                    # override it wraps need not be: a preload with no I/O
+                    # reads naturally as a plain ``def``.
+                    return await await_maybe(original_load(self, *args, **kw))
 
             cls.on_load = _themed_on_load
 
@@ -817,7 +866,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         Returns the fully-qualified class path (``module.QualName``) by
         default, which the Python import system guarantees unique across
         a running process. Used as the internal discriminator for session
-        IDs, the session index, the nav-stack class registry, and session
+        IDs, the instance index, the nav-stack class registry, and session
         origin tracking.
 
         Subclasses may set a ``session_class_key`` class attribute to
@@ -905,7 +954,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
 
         # Session origin: when a view is pushed via navigation, this is set to
         # the root view's class name so the entire nav chain is tracked under
-        # one session index key.  None means this view IS the root.
+        # one instance index key.  None means this view IS the root.
         self._instance_root_class: Optional[str] = None
 
         # View-local navigation stack.  On push, the new view receives
@@ -914,9 +963,9 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         # breadcrumb trail independently.
         self._nav_stack: list = []
 
-        # Participants: non-owner users registered in the session index.
+        # Participants: non-owner users registered in the instance index.
         # Used by multi-user views (games, collaborative tools) so that
-        # session limiting applies to all participants, not just the owner.
+        # instance limiting applies to all participants, not just the owner.
         self._participants: Set[int] = set()
 
         # Attached children: tracked for automatic cleanup on exit/timeout.
@@ -1376,7 +1425,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         # timer fires a phantom defer after send() already returned None. The
         # try/finally guarantees the single cancel site covers all of them.
         try:
-            if not await self.on_pre_send(self.interaction):
+            if not await await_maybe(self.on_pre_send(self.interaction)):
                 await self._rollback_send(registered=False)
                 return None
 
@@ -1416,7 +1465,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 # it, a re-raise leaves the rejected view subscribed and never
                 # stopped, which is permanent for timeout=None.
                 try:
-                    await self.on_instance_limit(e)
+                    await await_maybe(self.on_instance_limit(e))
                 finally:
                     await self._rollback_send(registered=False)
                 return None
@@ -1437,7 +1486,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 # state, but inside the batch so any seeding dispatches join
                 # the same BATCH_COMPLETE notification. Subscribers see the
                 # seeded slot from frame one. Default is a no-op.
-                await self.seed_initial_state(self.state_store.state)
+                await await_maybe(self.seed_initial_state(self.state_store.state))
 
                 if type(self).auto_register_participants:
                     if not await self._auto_register_participants():
@@ -1492,6 +1541,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             # registration via the teardown below, since state registration has
             # already happened by this stage.
             self._apply_theme_defaults()
+            self._sync_back_buttons()
             self._check_placement()
 
             if self.context and hasattr(self.context, "send"):
@@ -1623,7 +1673,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             return True
 
         if not allowed:
-            await self.on_unauthorized(interaction)
+            await await_maybe(self.on_unauthorized(interaction))
             return False
         return True
 
@@ -1643,8 +1693,10 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         """
         try:
             await self.respond(interaction, self.unauthorized_message, ephemeral=True)
-        except discord.HTTPException as e:
-            logger.debug(f"Could not send unauthorized response in {self.__class__.__name__}: {e}")
+        except DISCORD_CALL_ERRORS as e:
+            logger.debug(
+                f"Could not send unauthorized response in {self.__class__.__name__}: {describe_discord_error(e)}"
+            )
 
     async def _call_hook_safe(self, hook, *args) -> None:
         """Run a fire-and-forget user hook, logging any exception.
@@ -1658,7 +1710,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         await call_hook_safe(hook, *args, owner=type(self).__name__, log=logger)
 
     async def on_instance_limit(self, error: "InstanceLimitError") -> None:
-        """Called when ``send()`` is blocked by the session limit.
+        """Called when ``send()`` is blocked by the instance limit.
 
         Default implementation sends an ephemeral response using
         ``instance_limit_message`` (or ``error.default_message`` if unset)
@@ -1675,18 +1727,18 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         if self.interaction is not None:
             try:
                 await self.respond(self.interaction, message, ephemeral=True)
-            except discord.HTTPException as e:
+            except DISCORD_CALL_ERRORS as e:
                 logger.debug(
-                    f"Could not send instance limit response in {self.__class__.__name__}: {e}"
+                    f"Could not send instance limit response in {self.__class__.__name__}: {describe_discord_error(e)}"
                 )
             return
 
         if self.context is not None and hasattr(self.context, "send"):
             try:
                 await self.context.send(message, ephemeral=True)
-            except discord.HTTPException as e:
+            except DISCORD_CALL_ERRORS as e:
                 logger.debug(
-                    f"Could not send instance limit response in {self.__class__.__name__}: {e}"
+                    f"Could not send instance limit response in {self.__class__.__name__}: {describe_discord_error(e)}"
                 )
             return
 
@@ -1715,9 +1767,9 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             return
         try:
             await self.respond(interaction, self.participant_limit_message, ephemeral=True)
-        except discord.HTTPException as e:
+        except DISCORD_CALL_ERRORS as e:
             logger.debug(
-                f"Could not send participant limit response in {self.__class__.__name__}: {e}"
+                f"Could not send participant limit response in {self.__class__.__name__}: {describe_discord_error(e)}"
             )
 
     async def on_replaced(self) -> None:
@@ -1737,9 +1789,9 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         if self.replaced_message and self._participants and self._message:
             try:
                 await self._message.channel.send(self.replaced_message)
-            except discord.HTTPException as e:
+            except DISCORD_CALL_ERRORS as e:
                 logger.debug(
-                    f"Could not send replaced notification in {self.__class__.__name__}: {e}"
+                    f"Could not send replaced notification in {self.__class__.__name__}: {describe_discord_error(e)}"
                 )
 
     async def on_error(self, interaction: Interaction, error: Exception, item: Item) -> None:
@@ -1759,8 +1811,10 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
 
         try:
             await self.respond(interaction, embed=embed, ephemeral=True)
-        except discord.HTTPException as e:
-            logger.debug(f"Could not send error response in {self.__class__.__name__}: {e}")
+        except DISCORD_CALL_ERRORS as e:
+            logger.debug(
+                f"Could not send error response in {self.__class__.__name__}: {describe_discord_error(e)}"
+            )
 
     async def on_reopen_failure(
         self, interaction: Interaction, error: Exception | None = None
@@ -1788,9 +1842,9 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             msg = "This session has ended."
         try:
             await self.respond(interaction, msg, ephemeral=True)
-        except discord.HTTPException as e:
+        except DISCORD_CALL_ERRORS as e:
             logger.debug(
-                f"Could not send reopen failure response in {self.__class__.__name__}: {e}"
+                f"Could not send reopen failure response in {self.__class__.__name__}: {describe_discord_error(e)}"
             )
         if error is None:
             await self.exit()
@@ -1855,6 +1909,46 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             return anchor
         digest = hashlib.blake2s(anchor.encode(), digest_size=6).hexdigest()
         return f"{anchor[: _CUSTOM_ID_MAX_CHARS - len(digest) - 1]}~{digest}"
+
+    def _build_ui_sync(self) -> None:
+        """Run ``build_ui`` from a caller that cannot await it.
+
+        Three patterns compose their tree in ``__init__`` -- a synchronous
+        frame with no way to resolve a coroutine. An async ``build_ui``
+        there ran nothing: the class constructed, the tree stayed empty,
+        and the only signal was a "never awaited" warning that most bots
+        never surface. The mistake then arrived as a placement error at
+        send naming "no top-level components", which describes the symptom
+        and points nowhere near the cause.
+
+        Checks the result rather than the function, so an object with an
+        async ``__call__`` and a ``partial`` around one are caught too.
+        """
+        result = self.build_ui()
+        if not inspect.isawaitable(result):
+            return
+        # Close before reporting, or a "never awaited" warning follows the
+        # error and reads as a second, separate fault. Two coroutines can
+        # be in hand: the theme wrapper's, and the one it is holding for a
+        # build_ui that returns rather than is one. The nested one is
+        # collected by shape from the outer's frame rather than by the
+        # name it happens to be bound to, so renaming a local in the
+        # wrapper cannot quietly stop closing it.
+        pending = [result]
+        frame = getattr(result, "cr_frame", None)
+        if frame is not None:
+            pending.extend(v for v in frame.f_locals.values() if inspect.isawaitable(v))
+        for item in pending:
+            close = getattr(item, "close", None)
+            if callable(close):
+                close()
+        raise TypeError(
+            f"{type(self).__name__} composes its component tree in __init__, which "
+            f"cannot await, so build_ui must be synchronous here; it returned "
+            f"{type(result).__name__}."
+            f"\n  Fix: keep build_ui a plain def and move the async work into "
+            f"on_load(), which the library awaits before every render."
+        )
 
     def _stabilize_custom_ids(self):
         """Rewrite auto-generated ``custom_id`` values on interactive items.
@@ -1989,6 +2083,13 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         """
         parts: list = []
         for item in self.walk_children():
+            # ``id`` is wire-visible on every component type, so it rides the
+            # walk rather than each per-type branch. Without it a rebuild that
+            # renumbers nodes and changes nothing else hashes identically and
+            # refresh() skips the edit, leaving Discord holding the old ids.
+            component_id = getattr(item, "id", None)
+            if component_id is not None:
+                parts.append(("i", component_id))
             # TextDisplay carries raw markdown and is checked first because
             # discord.py injects a ``custom_id`` attribute on every item
             # once it is attached to a parent view (for ViewStore tracking),
@@ -2374,7 +2475,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         if type(self).on_load is _StatefulMixin.on_load:
             return  # Default no-op -- skip the timing wrapper.
         start = time.monotonic()
-        await self.on_load()
+        await await_maybe(self.on_load())
         elapsed = time.monotonic() - start
         if elapsed > self.auto_defer_delay:
             cls_name = type(self).__name__
@@ -2408,10 +2509,10 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             type(self).on_state_changed is _StatefulMixin.on_state_changed
             or _CURRENT_INTERACTION.get() is None
         ):
-            await self.on_state_changed(state)
+            await await_maybe(self.on_state_changed(state))
             return
         start = time.monotonic()
-        await self.on_state_changed(state)
+        await await_maybe(self.on_state_changed(state))
         elapsed = time.monotonic() - start
         if elapsed > self.auto_defer_delay:
             cls_name = type(self).__name__
@@ -2610,6 +2711,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             # before the digest, so a runtime theme change alters the
             # digest and ships as a re-render instead of being skipped.
             self._apply_theme_defaults()
+            self._sync_back_buttons()
 
             # Render-hash short-circuit. Only valid when the caller is not
             # supplying fresh embed/content kwargs -- those affect bytes
@@ -2780,7 +2882,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 # rely on it absorbing NotFound.
                 self._message = None
                 try:
-                    await self.on_message_gone()
+                    await await_maybe(self.on_message_gone())
                 except Exception as exc:
                     logger.error(
                         f"on_message_gone failed for {type(self).__name__}: {exc}",
@@ -2793,7 +2895,18 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 )
                 self._last_tree_digest = None
             except (discord.HTTPException, discord.RateLimited) as e:
-                if not self._handle_rate_limit(e):
+                if self._ephemeral and getattr(e, "status", None) == 401:
+                    # The lifecycle exit() and on_timeout() already classify:
+                    # an ephemeral past the 15-minute webhook cliff has no
+                    # token left, so no edit can land. Raising instead puts an
+                    # ERROR and a traceback through the subscriber wrapper on
+                    # every dispatch, for a condition the library treats as
+                    # normal at every other edit seam.
+                    logger.debug(
+                        f"Refresh skipped: ephemeral webhook token expired "
+                        f"for {type(self).__name__}."
+                    )
+                elif not self._handle_rate_limit(e):
                     raise
         finally:
             if perf_on:
@@ -3025,6 +3138,24 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         # only a real AllowedMentions is safe to put on the wire.
         return rules if isinstance(rules, discord.AllowedMentions) else None
 
+    def _sync_back_buttons(self) -> None:
+        """Disable every Back button this view carries when the stack is empty.
+
+        A Back button is only meaningful with somewhere to go back to, and
+        the paginated and wizard controls beside it already derive their
+        disabled state from their own cursor. This is the same rule applied
+        to the navigation stack.
+
+        Runs at the render seams rather than at construction because the
+        stack is not known when the button is built: ``_navigate_to``
+        constructs the destination view and assigns ``_nav_stack``
+        afterwards, so a pushed view that composes its tree in ``__init__``
+        would read an empty stack and disable a button that works.
+        """
+        for item in self.walk_children():
+            if getattr(item, "_cascadeui_back_button", False):
+                item.disabled = not self._nav_stack
+
     def _apply_theme_defaults(self) -> None:
         """Resolve theme-managed accents against the view's live theme.
 
@@ -3090,9 +3221,12 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         to keep ``base.py``'s import graph thin. The checks fire often
         (one walk per edit) but load their module once.
         """
-        from ._placement import validate_unique_custom_ids
+        from ._placement import validate_unique_custom_ids, validate_unique_ids
 
         validate_unique_custom_ids(self)
+        # Ungated like the custom_id walk: ``id`` is legal on every component
+        # in either tree, so a V1 view can carry a duplicate just as a V2 one can.
+        validate_unique_ids(self)
         if getattr(self, "validate_placement", False):
             from ._placement import validate_placement
 
@@ -3466,7 +3600,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
     # // ========================================( Session Limiting )======================================== // #
 
     async def _enforce_instance_limit(self):
-        """Enforce session limiting before sending.
+        """Enforce instance limiting before sending.
 
         Called by concrete ``send()`` implementations. Exits overflow views
         under replace policy, or raises ``InstanceLimitError`` under reject policy.
@@ -3594,7 +3728,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
     ) -> bool:
         """Register a non-owner user as a participant in this view's session.
 
-        Participants are tracked in the session index so that session limiting
+        Participants are tracked in the instance index so that instance limiting
         applies to them. For example, in a two-player game, the opponent should
         not be able to join a second game while already in one.
 
@@ -3653,7 +3787,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     if interaction is not None:
                         self.interaction = interaction
                     try:
-                        await self.on_instance_limit(error)
+                        await await_maybe(self.on_instance_limit(error))
                     finally:
                         self.interaction = saved_interaction
                     return False
@@ -3662,7 +3796,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         if self.participant_limit is not None:
             current = len(self._participants) + (1 if self.user_id is not None else 0)
             if current >= self.participant_limit:
-                await self.on_participant_limit(user_id, interaction=interaction)
+                await await_maybe(self.on_participant_limit(user_id, interaction=interaction))
                 return False
 
         self._participants.add(user_id)
@@ -3873,12 +4007,20 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         """Return a back button without attaching it to the view.
 
         Mirrors :meth:`make_exit_button`. The callback pops the navigation
-        stack via :meth:`pop`; when the stack is empty (this is the root
-        view), it clears the dead components in place via
-        ``_clear_on_empty_back`` rather than navigating. Pack the returned
-        button into a caller-owned container -- an ``ActionRow`` or a tab
-        builder's return list (V2 views can also use ``make_nav_row`` to
-        build the Back+Exit footer in one call).
+        stack via :meth:`pop`. Pack the returned button into a caller-owned
+        container -- an ``ActionRow`` or a tab builder's return list (V2
+        views can also use ``make_nav_row`` to build the Back+Exit footer in
+        one call).
+
+        The button renders disabled while the stack is empty, resolved at
+        each render seam rather than here: a pushed view is constructed
+        before ``_navigate_to`` assigns its stack, so reading it at build
+        time would disable a button that works. A press that still reaches
+        an empty stack (a persistent view restored after a restart, whose
+        message shows the pre-restart render) is acknowledged without
+        modifying the message. Override ``_clear_on_empty_back`` to close
+        the panel on Back instead, though :meth:`exit` and the Exit button
+        are the surfaces built for that.
 
         When the destination view defines :meth:`on_load`, the restored
         parent reloads its DATA automatically on pop, so the back button
@@ -3899,7 +4041,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             if prev_view is None:
                 await self._clear_on_empty_back(interaction)
 
-        return StatefulButton(
+        button = StatefulButton(
             label=label,
             style=style,
             row=row,
@@ -3907,6 +4049,11 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             custom_id=custom_id,
             callback=back_callback,
         )
+        # Marked so the render seams can disable it when the stack is empty.
+        # The stack is not readable here: a pushed view is constructed before
+        # ``_navigate_to`` assigns it.
+        button._cascadeui_back_button = True
+        return button
 
     def clear_row(self, row: int):
         """Remove all components on the given row number.

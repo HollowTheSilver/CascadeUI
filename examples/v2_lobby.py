@@ -17,7 +17,7 @@ pattern with V2 components:
     - Live participant card refresh on every join/leave via ``refresh()``
     - ``unregister_participant`` for the Leave path -- the library owns
       both the join and leave directions, so users never touch
-      ``_participants`` or the session index directly
+      ``_participants`` or the instance index directly
     - ``on_pre_send`` veto gate -- aborts the open in a DM before any
       work happens, with the response slot still open to explain why
     - ``protect_attached = False`` -- a lobby is a staging area, not

@@ -12,8 +12,11 @@ from discord.ui import Item
 
 from ..components.base import StatefulButton
 from ..state.actions import ActionCreators
+from ..utils.hooks import await_maybe
 from ..utils.responses import (
+    DISCORD_CALL_ERRORS,
     ack_backstop,
+    describe_discord_error,
     elapsed_since,
     open_modal_safe,
     respond_safe,
@@ -112,7 +115,7 @@ class _InteractionMixin:
                 if self.auto_defer:
                     await trailing_ack(interaction, owner=self.__class__.__name__, log=logger)
         except Exception as e:
-            return await self.on_error(interaction, e, item)
+            return await await_maybe(self.on_error(interaction, e, item))
 
     _elapsed_since = staticmethod(elapsed_since)
 
@@ -266,10 +269,9 @@ class _InteractionMixin:
                 # that window enough to lose the race. The slot is acked
                 # either way, which is all this method wanted.
                 logger.debug(f"Ack defer raced an existing ack in {type(self).__name__}.")
-            except discord.HTTPException as e:
+            except DISCORD_CALL_ERRORS as e:
                 logger.debug(
-                    f"Ack defer failed in {type(self).__name__}: "
-                    f"status={getattr(e, 'status', '?')} code={getattr(e, 'code', '?')}"
+                    f"Ack defer failed in {type(self).__name__}: " f"{describe_discord_error(e)}"
                 )
 
     # // ==================( Ephemeral Refresh )================== // #
@@ -389,8 +391,11 @@ class _InteractionMixin:
             if not interaction.response.is_done():
                 try:
                     await interaction.response.defer()
-                except discord.HTTPException:
-                    pass
+                except (*DISCORD_CALL_ERRORS, discord.InteractionResponded) as e:
+                    logger.debug(
+                        f"Reopen reentry ack failed in {type(self).__name__}: "
+                        f"{describe_discord_error(e)}"
+                    )
             return
         self._reopen_in_flight = True
 
@@ -415,13 +420,28 @@ class _InteractionMixin:
                 kwargs.setdefault("guild_id", self.guild_id)
                 new_view = cls(interaction=interaction, **kwargs)
         except Exception as e:
-            logger.error(f"Refresh factory failed for {type(self).__name__}: {e}")
+            # Name which of the two paths failed. Without a factory the
+            # failing code is the view's own ``__init__`` or its captured
+            # kwargs, and blaming a "refresh factory" sends the operator
+            # looking for something they never wrote.
+            source = (
+                "reopen factory"
+                if self._reopen_factory is not None
+                else "reconstruction from kwargs"
+            )
+            logger.error(f"Ephemeral reopen failed for {type(self).__name__} ({source}): {e}")
             self._reopen_in_flight = False
-            await self.on_reopen_failure(interaction, error=e)
+            await await_maybe(self.on_reopen_failure(interaction, error=e))
             return
 
         if new_view is None:
-            await self.on_reopen_failure(interaction, error=None)
+            # Cleared before the hook, matching the two sibling failure
+            # paths. The default ``on_reopen_failure`` exits, so the flag
+            # would not be read again; an override that keeps the view
+            # alive leaves every later click hitting the reentry
+            # early-return above with no reopen ever in flight.
+            self._reopen_in_flight = False
+            await await_maybe(self.on_reopen_failure(interaction, error=None))
             return
 
         # Carry navigation identity onto the replacement before send() runs
@@ -501,10 +521,10 @@ class _InteractionMixin:
         if self._message:
             try:
                 await self._bounded(self._message.delete())
-            except (discord.NotFound, discord.HTTPException, asyncio.TimeoutError):
+            except (discord.NotFound, *DISCORD_CALL_ERRORS, asyncio.TimeoutError):
                 try:
                     await self._bounded(self._message.edit(**self._freeze_edit_kwargs()))
-                except (discord.NotFound, discord.HTTPException, asyncio.TimeoutError):
+                except (discord.NotFound, *DISCORD_CALL_ERRORS, asyncio.TimeoutError):
                     pass
 
         await self.exit()

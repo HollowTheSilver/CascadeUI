@@ -4,6 +4,7 @@
 import asyncio
 import contextvars
 import copy
+import inspect
 import logging
 import time
 from datetime import datetime, timezone
@@ -11,6 +12,7 @@ from types import MappingProxyType
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Set, Tuple, Union
 
 from ..utils.errors import with_error_boundary
+from ..utils.hooks import await_maybe
 from ..utils.tasks import get_task_manager
 from .actions import ActionCreators
 from .slots import access_slot, read_slot
@@ -219,6 +221,11 @@ class StateStore:
 
         # Memoized selector results for change detection
         self._last_selected: Dict[str, Any] = {}
+        # Subscribers whose selector has already been reported as raising.
+        # A broken selector raises on every dispatch, and the failure is a
+        # property of the selector rather than of any one action, so one
+        # line says everything a flood would.
+        self._selector_failed: Set[str] = set()
         self._SENTINEL = object()  # Marker for "no previous value"
 
         # Core reducers
@@ -583,7 +590,7 @@ class StateStore:
         hooks = self._hooks.get(action["type"], [])
         for hook in hooks:
             try:
-                await hook(action, self.state)
+                await await_maybe(hook(action, self.state))
             except Exception as e:
                 logger.error(f"Error in hook for {action['type']}: {e}", exc_info=True)
 
@@ -871,12 +878,12 @@ class StateStore:
     # // ========================================( View Registry )======================================== // #
 
     def _add_to_instance_index(self, view_id: str, view_type: str, scope_key: str) -> None:
-        """Add a view ID to the session index under the given type+scope key."""
+        """Add a view ID to the instance index under the given type+scope key."""
         key = (view_type, scope_key)
         self._instance_index.setdefault(key, []).append(view_id)
 
     def _remove_from_instance_index(self, view_id: str, view_type: str, scope_key: str) -> None:
-        """Remove a view ID from the session index for the given type+scope key."""
+        """Remove a view ID from the instance index for the given type+scope key."""
         key = (view_type, scope_key)
         ids = self._instance_index.get(key, [])
         if view_id in ids:
@@ -992,7 +999,7 @@ class StateStore:
         return MappingProxyType(self._active_views)
 
     def _register_participant(self, view, user_id: int) -> None:
-        """Add a participant's scope key to the session index for a view.
+        """Add a participant's scope key to the instance index for a view.
 
         Skips registration if the participant's scope key is the same as the
         owner's (guild and global scopes don't include user_id, so participant
@@ -1007,7 +1014,7 @@ class StateStore:
             self._add_to_instance_index(view.id, view_type, scope_key)
 
     def _unregister_participant(self, view, user_id: int) -> None:
-        """Remove a participant's scope key from the session index for a view."""
+        """Remove a participant's scope key from the instance index for a view."""
         scope_key = self._build_instance_scope_key(view, user_id=user_id)
         owner_key = self._build_instance_scope_key(view)
         if scope_key is not None and scope_key != owner_key:
@@ -1024,7 +1031,7 @@ class StateStore:
             view: The view to build the scope key for.
             user_id: Optional override for the view's user_id. Used to build
                 scope keys for participants (non-owner users tracked in the
-                session index). Only affects "user" and "user_guild" scopes.
+                instance index). Only affects "user" and "user_guild" scopes.
         """
         # The instance index treats a falsy id as no id: an unindexed view
         # is simply exempt from the limit, where a "user:0" bucket would
@@ -1057,7 +1064,7 @@ class StateStore:
         async def _cascadeui_message_cleanup(payload):
             for view in list(store._active_views.values()):
                 if view._message and view._message.id == payload.message_id:
-                    await view.on_message_delete()
+                    await await_maybe(view.on_message_delete())
                     break
 
         @bot.listen("on_raw_bulk_message_delete")
@@ -1065,7 +1072,7 @@ class StateStore:
             deleted_ids = set(payload.message_ids)
             for view in list(store._active_views.values()):
                 if view._message and view._message.id in deleted_ids:
-                    await view.on_message_delete()
+                    await await_maybe(view.on_message_delete())
 
         logger.debug("Message deletion cleanup listener installed")
 
@@ -1083,6 +1090,34 @@ class StateStore:
         batch exit. This is what makes ``batch()`` work transitively for
         view-level helpers that route through ``store.dispatch()``.
         """
+        # The Redux idiom most callers arrive with is ``dispatch(action)``,
+        # and reducers here receive exactly that dict, so handing one to this
+        # is the natural mistake. It reached the reducer lookup below and
+        # failed on "cannot use 'dict' as a dict key", which names neither
+        # the parameter nor the shape. A non-string type is quieter still:
+        # nothing raises, and an action nothing can route sits in state and
+        # history under a type no reducer or subscriber will ever match.
+        if not isinstance(action_type, str):
+            got = type(action_type).__name__
+            hint = (
+                "\n  Fix: pass the type and payload separately, e.g. "
+                'dispatch(action["type"], action["payload"]).'
+                if isinstance(action_type, dict)
+                else "\n  Fix: pass the action's type as a non-empty string."
+            )
+            raise TypeError(
+                f"dispatch() expects an action type string, got {got}: {action_type!r}{hint}"
+            )
+        # A string carrying no name is the right type with a wrong value,
+        # which is where the two stdlib exceptions divide.
+        if not action_type:
+            raise ValueError(
+                "dispatch() received an empty action type. Nothing routes to the "
+                "empty string, so the action would sit in state and history under "
+                "a type no reducer or subscriber can match."
+                "\n  Fix: pass the action's type, e.g. dispatch('SCORE_CHANGED', ...)."
+            )
+
         # Create the action object
         action = {
             "type": action_type,
@@ -1233,8 +1268,20 @@ class StateStore:
                 if selector is not None:
                     try:
                         new_value = selector(self.state)
-                    except Exception:
-                        new_value = self._SENTINEL  # On error, always notify
+                    except Exception as e:
+                        # Degrade to notify-always, which is the safe answer
+                        # for "cannot tell whether this changed". Report it
+                        # once: silence here left a permanently broken
+                        # selector looking exactly like a subscriber that
+                        # legitimately wants every action.
+                        if subscriber_id not in self._selector_failed:
+                            self._selector_failed.add(subscriber_id)
+                            logger.warning(
+                                f"Selector for subscriber {subscriber_id} raised "
+                                f"{type(e).__name__}: {e}. Notifying on every action "
+                                f"until it stops raising."
+                            )
+                        new_value = self._SENTINEL
                     old_value = self._last_selected.get(subscriber_id, self._SENTINEL)
                     if (
                         new_value is not self._SENTINEL
@@ -1311,7 +1358,7 @@ class StateStore:
             t0 = time.perf_counter()
         try:
             logger.debug(f"Executing notification callback for subscriber {subscriber_id}")
-            await callback(state, action)
+            await await_maybe(callback(state, action))
         except Exception as e:
             logger.error(f"Error notifying subscriber {subscriber_id}: {e}", exc_info=True)
 
@@ -1346,13 +1393,34 @@ class StateStore:
 
         Args:
             subscriber_id: Unique ID for this subscriber.
-            callback: Async callable receiving (state, action).
+            callback: Callable receiving (state, action). Sync or async.
             action_filter: Optional set of action types to listen for.
                            If None, the subscriber receives all actions.
-            selector: Optional function that extracts a slice of state.
-                      When set, the subscriber is only notified when the
-                      selected value changes between dispatches.
+            selector: Optional synchronous function that extracts a slice
+                      of state. When set, the subscriber is only notified
+                      when the selected value changes between dispatches.
         """
+        if selector is not None:
+            if not callable(selector):
+                raise TypeError(
+                    f"subscribe({subscriber_id!r}) selector= must be a callable taking "
+                    f"the state and returning the slice to watch; got "
+                    f"{type(selector).__name__}: {selector!r}"
+                )
+            # The comparison that decides whether to notify runs inline in
+            # dispatch and cannot await. An async selector returns a fresh
+            # coroutine every time, which never equals the last one, so the
+            # subscriber is notified on every action, the exact opposite
+            # of what passing a selector asks for, and each unawaited
+            # coroutine warns from the user's console.
+            if inspect.iscoroutinefunction(selector) or inspect.iscoroutinefunction(
+                getattr(selector, "__call__", None)
+            ):
+                raise TypeError(
+                    f"subscribe({subscriber_id!r}) selector= must be synchronous; the "
+                    f"change check runs inline in dispatch and cannot await. Read the "
+                    f"slice from the state argument, and do async work in the callback."
+                )
         self.subscribers[subscriber_id] = (callback, action_filter, selector)
 
     def _unsubscribe(self, subscriber_id: str) -> None:
@@ -1365,6 +1433,7 @@ class StateStore:
         if subscriber_id in self.subscribers:
             del self.subscribers[subscriber_id]
         self._last_selected.pop(subscriber_id, None)
+        self._selector_failed.discard(subscriber_id)
 
     @property
     def perf_samples(self) -> List[Dict[str, Any]]:

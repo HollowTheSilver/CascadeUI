@@ -985,37 +985,81 @@ class TestNavigationFastPath:
         nav.edit_original_response.assert_awaited_once()
         assert sub is not None
 
-    async def test_clear_on_empty_back_handles_ack_race_v1(self):
-        """_clear_on_empty_back's fast-path edit hits the same auto-defer ack
-        race as the navigation fast path: edit_message can raise
-        InteractionResponded (a sibling of HTTPException, not a subclass). The
-        empty-stack clear must catch it and fall through to the deferred edit
-        rather than escape to on_error."""
+    async def test_clear_on_empty_back_leaves_the_panel_alone_v1(self):
+        """A Back press with nowhere to go acks and changes nothing.
+
+        The render seams disable a Back button whose stack is empty, so
+        reaching here means the click beat that state onto the wire. Tearing
+        the message down would destroy a working panel on a press that asked
+        for nothing."""
         view = StatefulView(interaction=_make_interaction(user_id=1, guild_id=100))
         await view.send()
 
         nav = _make_interaction(user_id=1, guild_id=100, is_done=False)
-        nav.response.edit_message = AsyncMock(side_effect=discord.InteractionResponded(MagicMock()))
         nav.edit_original_response = AsyncMock()
 
-        await view._clear_on_empty_back(nav)  # must not raise
+        await view._clear_on_empty_back(nav)
 
-        # V1 fallback edits to view=None (strips buttons, keeps embed).
-        nav.edit_original_response.assert_awaited_once_with(view=None)
+        nav.response.defer.assert_awaited_once()
+        nav.edit_original_response.assert_not_awaited()
 
-    async def test_clear_on_empty_back_handles_ack_race_v2(self):
-        """Same race on the V2 freeze path (edits view=self, not view=None)."""
-        view = RenderableLayoutView(interaction=_make_interaction(user_id=1, guild_id=100))
+    async def test_clear_on_empty_back_survives_the_ack_race_v1(self):
+        """The auto-defer timer can take the slot between the guard and the
+        call, so ``defer`` raises ``InteractionResponded`` -- a sibling of
+        ``HTTPException``, not a subclass. Already acked is the whole job, so
+        it is swallowed rather than escaping to on_error."""
+        view = StatefulView(interaction=_make_interaction(user_id=1, guild_id=100))
         await view.send()
 
         nav = _make_interaction(user_id=1, guild_id=100, is_done=False)
-        nav.response.edit_message = AsyncMock(side_effect=discord.InteractionResponded(MagicMock()))
+        nav.response.defer = AsyncMock(side_effect=discord.InteractionResponded(MagicMock()))
         nav.edit_original_response = AsyncMock()
 
         await view._clear_on_empty_back(nav)  # must not raise
 
-        # V2 fallback edits with the frozen view, not view=None (50006 guard).
-        nav.edit_original_response.assert_awaited_once_with(view=view)
+        nav.edit_original_response.assert_not_awaited()
+
+    async def test_clear_on_empty_back_does_not_freeze_v2(self):
+        """The V2 path used to freeze every component, which left the panel
+        rendered but dead. It now shares the base's ack-only behaviour.
+
+        The view needs a real interactive item before the freeze claim can
+        be tested at all: ``RenderableLayoutView`` renders one
+        ``TextDisplay``, nothing in that tree carries ``disabled``, and an
+        assertion over the empty list passes whether or not anything was
+        frozen.
+        """
+        view = RenderableLayoutView(interaction=_make_interaction(user_id=1, guild_id=100))
+        await view.send()
+        view._add_back_button()
+        interactive = [c for c in view.walk_children() if hasattr(c, "disabled")]
+        assert interactive, "fixture must carry something freezable for this to mean anything"
+
+        nav = _make_interaction(user_id=1, guild_id=100, is_done=False)
+        nav.edit_original_response = AsyncMock()
+
+        await view._clear_on_empty_back(nav)
+
+        nav.response.defer.assert_awaited_once()
+        nav.edit_original_response.assert_not_awaited()
+        assert not any(c.disabled for c in interactive)
+
+    async def test_back_button_disabled_when_stack_is_empty(self):
+        """A Back button is only meaningful with somewhere to go back to.
+
+        Synced at the render seams rather than at construction: a pushed view
+        is built before ``_navigate_to`` assigns its stack, so a build-time
+        check would disable a button that works."""
+        view = RenderableLayoutView(interaction=_make_interaction(user_id=1, guild_id=100))
+        back = view.make_back_button()
+        view.add_item(discord.ui.ActionRow(back))
+
+        view._sync_back_buttons()
+        assert back.disabled is True
+
+        view._nav_stack = [{"view_class": "Something"}]
+        view._sync_back_buttons()
+        assert back.disabled is False
 
 
 class TestNavigationForeignInteraction:
@@ -1747,8 +1791,8 @@ class TestPatternNavigationState:
 
         sub = await self._child()
         fields = [
-            {"id": "email", "label": "Email", "type": "string"},
-            {"id": "name", "label": "Name", "type": "string"},
+            {"id": "email", "label": "Email", "type": "text"},
+            {"id": "name", "label": "Name", "type": "text"},
         ]
         view = FormView(
             fields=fields, title="Signup", interaction=_make_interaction(user_id=1, guild_id=100)
@@ -1794,7 +1838,7 @@ class TestPatternNavigationState:
         from cascadeui import FormView
 
         sub = await self._child()
-        fields = [{"id": "email", "label": "Email", "type": "string"}]
+        fields = [{"id": "email", "label": "Email", "type": "text"}]
         view = FormView(
             fields=fields, title="Signup", interaction=_make_interaction(user_id=1, guild_id=100)
         )
@@ -1811,7 +1855,7 @@ class TestPatternNavigationState:
 
         sub = await self._child()
         view = FormView(
-            fields=[{"id": "email", "label": "Email", "type": "string"}],
+            fields=[{"id": "email", "label": "Email", "type": "text"}],
             title="Signup",
             interaction=_make_interaction(user_id=1, guild_id=100),
         )
@@ -2223,7 +2267,7 @@ class TestV1PatternPopCarriesTheEmbed:
         from cascadeui import FormView
 
         view = FormView(
-            fields=[{"id": "email", "label": "Email", "type": "string"}],
+            fields=[{"id": "email", "label": "Email", "type": "text"}],
             title="Signup",
             interaction=_make_interaction(user_id=1, guild_id=100),
         )
@@ -2266,3 +2310,63 @@ class TestV1PatternPopCarriesTheEmbed:
         shipped = await self._popped_edit_kwargs(view)
 
         assert "embed" not in shipped
+
+
+class TestNavDepth:
+    """``nav_depth`` reports how many views sit beneath this one.
+
+    A screen reachable both by a push and by its own command wants Back
+    absent on the root entry rather than present and greyed, and deciding
+    that needs the stack the library already holds. Without a public read
+    the caller carries its own root flag, which duplicates that state and
+    lives on whoever constructs the view -- so a class building its nav row
+    in two branches has to remember the flag in both.
+    """
+
+    async def test_zero_on_a_directly_opened_view(self):
+        view = RenderableLayoutView(interaction=_make_interaction(user_id=1))
+        await view.send()
+
+        assert view.nav_depth == 0
+
+    async def test_one_after_a_push(self):
+        from cascadeui.state.singleton import get_store
+
+        class _Child(RenderableLayoutView):
+            owner_only = False
+
+        root = RenderableLayoutView(interaction=_make_interaction(user_id=1))
+        await root.send()
+        await root.push(_Child, _make_interaction(user_id=1))
+
+        child = next(v for v in get_store().get_active_views().values() if isinstance(v, _Child))
+        assert child.nav_depth == 1
+
+    async def test_readable_inside_on_load(self):
+        """``_navigate_to`` assigns the stack before running the destination's
+        load hook, which is where a view composes its nav row."""
+        from cascadeui.state.singleton import get_store
+
+        seen = []
+
+        class _Child(RenderableLayoutView):
+            owner_only = False
+
+            async def on_load(self):
+                seen.append(self.nav_depth)
+
+        root = RenderableLayoutView(interaction=_make_interaction(user_id=1))
+        await root.send()
+        await root.push(_Child, _make_interaction(user_id=1))
+
+        assert seen == [1]
+
+    async def test_back_to_zero_after_a_pop(self):
+        class _Child(RenderableLayoutView):
+            owner_only = False
+
+        root = RenderableLayoutView(interaction=_make_interaction(user_id=1))
+        await root.send()
+        await root.push(_Child, _make_interaction(user_id=1))
+
+        assert root.nav_depth == 0

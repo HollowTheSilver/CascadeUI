@@ -110,8 +110,18 @@ class TestComputedValue:
         assert "reset_marker" in _COMPUTED_REGISTRY
 
         # Simulate a store reset: drop the singleton and read a fresh one.
+        # BOTH holders have to go, as conftest documents. StateStore keeps
+        # its own ``_instance`` on the class, so clearing only the module
+        # global hands back the same object with its ``_computed`` dict
+        # already populated -- the reseed loop this test names would never
+        # run and the assertion below would pass without it.
+        from cascadeui.state.store import StateStore
+
+        stale = get_store()
+        StateStore._instance = None
         singleton._store_instance = None
         fresh = get_store()
+        assert fresh is not stale
 
         assert "reset_marker" in fresh.computed
         fresh.state["application"]["reset_marker"] = 10
@@ -144,3 +154,114 @@ class TestComputedValue:
         cv.invalidate()
         assert store.computed["invalidatable"] == 42
         assert call_count == 2  # Recomputed
+
+
+class TestComputedMemoAgainstInPlaceMutation:
+    """The memo holds a copy of its input, not a reference to it.
+
+    A selector returns a slice of live state. Storing that slice by
+    reference made the change check compare the slice against itself, so
+    a slot mutated in place -- which ``access_slot`` does by design, on
+    the live state ``seed_initial_state`` hands it -- left the cached
+    result standing. A later correct replacement did not rescue it: the
+    aliased reference already equalled the new value while the cached
+    result predated it, so the stale answer was permanent.
+    """
+
+    def test_in_place_mutation_invalidates(self):
+        cv = ComputedValue(
+            name="votes",
+            selector=lambda s: s.get("application", {}).get("votes", {}),
+            compute_fn=lambda v: sum(v.values()),
+        )
+        state = {"application": {"votes": {"a": 1}}}
+
+        assert cv.get(state) == 1
+        state["application"]["votes"]["a"] = 100
+        assert cv.get(state) == 100
+
+    def test_replacement_after_in_place_mutation_invalidates(self):
+        """The half that made it permanent rather than merely stale."""
+        cv = ComputedValue(
+            name="votes",
+            selector=lambda s: s.get("application", {}).get("votes", {}),
+            compute_fn=lambda v: sum(v.values()),
+        )
+        state = {"application": {"votes": {"a": 1}}}
+
+        cv.get(state)
+        state["application"]["votes"]["a"] = 100
+        state["application"]["votes"] = {"a": 100}
+        assert cv.get(state) == 100
+
+    def test_unchanged_input_still_hits_the_cache(self):
+        calls = []
+
+        cv = ComputedValue(
+            name="counted",
+            selector=lambda s: s.get("application", {}).get("x", 0),
+            compute_fn=lambda v: calls.append(v) or v,
+        )
+        state = {"application": {"x": 7}}
+
+        assert [cv.get(state) for _ in range(4)] == [7, 7, 7, 7]
+        assert len(calls) == 1
+
+    def test_uncopyable_input_recomputes_rather_than_trusting_a_reference(self):
+        class Uncopyable:
+            def __deepcopy__(self, memo):
+                raise TypeError("cannot copy")
+
+            def __eq__(self, other):
+                return True
+
+        calls = []
+        payload = Uncopyable()
+        cv = ComputedValue(
+            name="uncopyable",
+            selector=lambda s: payload,
+            compute_fn=lambda v: calls.append(1) or "value",
+        )
+
+        assert cv.get({}) == "value"
+        assert cv.get({}) == "value"
+        assert len(calls) == 2, "an input it cannot copy is an input it cannot verify"
+
+
+class TestComputedSelectorValidation:
+    """``@computed`` refuses a selector it cannot call.
+
+    The selector runs inside the memo comparison, which is synchronous.
+    An async one handed back a coroutine that the compute function then
+    used as data, failing downstream with a message naming neither the
+    decorator nor the argument. A non-callable was not checked at all.
+    """
+
+    def test_async_selector_rejected(self):
+        async def selector(state):
+            return state
+
+        with pytest.raises(TypeError, match="must be synchronous"):
+            computed(selector=selector)(lambda value: value)
+
+    def test_async_dunder_call_selector_rejected(self):
+        class AsyncCallable:
+            async def __call__(self, state):
+                return state
+
+        with pytest.raises(TypeError, match="must be synchronous"):
+            computed(selector=AsyncCallable())(lambda value: value)
+
+    def test_non_callable_selector_rejected(self):
+        with pytest.raises(TypeError, match="must be a callable"):
+            computed(selector="application")(lambda value: value)
+
+    def test_synchronous_selector_accepted(self):
+        store = get_store()
+
+        @computed(selector=lambda s: s.get("application", {}).get("accepted", 0))
+        def accepted_total(value):
+            return value + 1
+
+        store.state["application"]["accepted"] = 4
+        assert store.computed["accepted_total"] == 5

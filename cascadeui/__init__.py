@@ -64,7 +64,7 @@ from .components.selects import (
     RoleSelect,
     UserSelect,
 )
-from .components.types import MAX_SELECT_OPTIONS, EmojiInput, MediaInput
+from .components.types import MAX_COMPONENT_ID, MAX_SELECT_OPTIONS, EmojiInput, MediaInput
 from .components.v1_composition import CompositeComponent, get_component, register_component
 from .components.wrappers import with_confirmation, with_cooldown, with_loading_state
 from .devtools import DevToolsCog, InspectorView
@@ -168,7 +168,7 @@ if "PostgresBackend" in _persistence_all:
 # // ========================================( Script )======================================== // #
 
 
-__version__ = "3.8.0"
+__version__ = "3.9.0"
 
 # Export public API
 __all__ = [
@@ -250,6 +250,7 @@ __all__ = [
     # Type aliases
     "EmojiInput",
     "MediaInput",
+    "MAX_COMPONENT_ID",
     "MAX_SELECT_OPTIONS",
     # V2 Cards & Sections
     "card",

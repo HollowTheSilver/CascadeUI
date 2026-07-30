@@ -83,12 +83,20 @@ class PersistenceBackend(Protocol):
 
     Implement this Protocol (no inheritance required) to add a custom
     backend. Declare supported capabilities as a class-level
-    :class:`Capability` flag; the manager checks required capabilities
-    when :class:`PersistenceMiddleware` initializes.
+    :class:`Capability` flag. Each namespace config
+    (:class:`RegistryPersistence`, :class:`ApplicationPersistence`) compares
+    that flag against what the namespace requires while the config object is
+    constructed, and raises :class:`PersistenceConfigError` naming the
+    missing capabilities. Method presence is not part of that check: a
+    backend that advertises a flag but omits one of its methods reaches the
+    setup pipeline and fails there with the method named.
 
-    The Protocol uses ``@runtime_checkable`` so ``isinstance(backend,
-    PersistenceBackend)`` validates method presence at setup. Users who
-    prefer abstract-base semantics can subclass the Protocol directly.
+    ``@runtime_checkable`` allows ``isinstance(backend,
+    PersistenceBackend)`` in caller code, but it tests the full Protocol
+    surface including the capability-gated raw-SQL methods, so a legitimate
+    capability-subset backend does not pass it. The library runs no such
+    check. Users who prefer abstract-base semantics can subclass the
+    Protocol directly.
     """
 
     capabilities: ClassVar[Capability]

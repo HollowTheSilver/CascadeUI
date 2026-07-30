@@ -8,7 +8,8 @@ A display-only showcase for the grid helpers plus the V2 media builders:
                         optional axis labels, and bulk assignment
     - button_grid()   -- (row, col) -> Button factory packed into ActionRows,
                         enforcing Discord's 5x5 component cap
-    - gallery()       -- MediaGallery from URL strings or discord.File objects
+    - gallery()       -- MediaGallery from any MediaInput: a URL string, a discord.File, a
+discord.Asset, or an UnfurledMediaItem
     - image_section() -- Section with a Thumbnail accessory
 
 This cog demonstrates that grids and media components are standalone

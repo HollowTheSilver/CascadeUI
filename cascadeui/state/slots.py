@@ -26,29 +26,41 @@ accessors that all do the same
 walk. For paths deeper than the canonical three levels, declare a
 plain ``@property`` and call ``read_slot`` inside it.
 
-CascadeUI state is ephemeral by default. Opt a slot in to persistence
-by passing ``persistent=True`` to :func:`access_slot`; everything else
-stays in memory and is skipped by :class:`PersistenceMiddleware`.
+CascadeUI state is ephemeral by default. A slot reaches the backend only
+once it is declared persistent; :func:`is_persistent_slot` names the
+routes that do so. Everything else stays in memory and is skipped by
+:class:`PersistenceMiddleware`.
 """
 
 # // ========================================( Modules )======================================== // #
 
 
+import logging
 from typing import Any, Callable, Optional, Set
+
+logger = logging.getLogger(__name__)
 
 # // ========================================( Persistent registry )======================================== // #
 
 
-# Slots marked ``persistent=True`` via ``access_slot`` are written
-# through to the backend by ``PersistenceMiddleware``. Everything else
-# is skipped. The registry is module-level so the marker is sticky
-# across calls: once a slot is declared persistent, every future write
-# to that slot name inherits the contract.
+# Slots declared persistent are written through to the backend by
+# ``PersistenceMiddleware``; everything else is skipped. The routes that
+# add a name here are listed on ``is_persistent_slot`` below, so the list
+# lives in one place rather than in every comment that mentions it. The
+# registry is module-level so the marker is sticky across calls: once a
+# slot is declared persistent, every future write to that slot name
+# inherits the contract.
 _PERSISTENT_SLOTS: Set[str] = set()
 
 
 def is_persistent_slot(name: str) -> bool:
-    """Return True when ``name`` was declared persistent via ``access_slot``."""
+    """Return True when ``name`` was declared persistent.
+
+    All three declaration paths land here: ``access_slot(..., persistent=True)``,
+    the ``persistent_slots`` class attribute on a view, and a
+    ``SlotPolicy(persistent=True)`` declared in ``ApplicationPersistence.slots``
+    or registered through ``PersistenceManager.register_slot_policy``.
+    """
     return name in _PERSISTENT_SLOTS
 
 
@@ -213,11 +225,26 @@ class slot_property:
         key: Callable[[Any], Any],
         default: Any = None,
     ):
+        if not callable(key):
+            raise TypeError(
+                f"slot_property({name!r}) key= must be a callable taking the "
+                f"instance and returning the lookup key, e.g. "
+                f"lambda self: self.user_id; got {type(key).__name__}: {key!r}"
+            )
         self._field = name
         self._slot = slot
         self._key = key
         self._default = default
         self._attr_name = name  # overridden by __set_name__ when used in a class body
+        # Owner classes whose key= has already been reported as raising. A
+        # descriptor is read on every attribute access, so reporting per
+        # read buries the one line that matters under thousands of copies
+        # and teaches an operator to filter the logger out. The failure
+        # belongs to the declaration, not to any one read. Keyed by owner
+        # rather than a bare flag because one descriptor is shared by every
+        # subclass that inherits it, and the attribute the key reaches for
+        # may exist on some of them.
+        self._key_failed: Set[str] = set()
 
     def __set_name__(self, owner, name):
         self._attr_name = name
@@ -225,16 +252,27 @@ class slot_property:
     def __get__(self, instance, owner):
         if instance is None:
             return self
-        try:
-            return read_slot(
-                instance.state_store.state,
-                self._slot,
-                self._key(instance),
-                self._field,
-                default=self._default,
-            )
-        except (KeyError, TypeError, AttributeError):
+        # Split the two reasons a read can come up empty. A store that is
+        # not wired yet is the ordinary case and stays silent. A key
+        # callable that raises is a mistake in the declaration, and folding
+        # it into the same swallow turned a typo into a default that looks
+        # correct in every test.
+        state = getattr(getattr(instance, "state_store", None), "state", None)
+        if not isinstance(state, dict):
             return self._default
+        try:
+            key = self._key(instance)
+        except Exception as e:
+            owner_name = type(instance).__name__
+            if owner_name not in self._key_failed:
+                self._key_failed.add(owner_name)
+                logger.warning(
+                    f"slot_property {owner_name}.{self._attr_name} key= "
+                    f"raised {type(e).__name__}: {e}. Reading {self._default!r} "
+                    f"until it stops raising."
+                )
+            return self._default
+        return read_slot(state, self._slot, key, self._field, default=self._default)
 
     def __repr__(self) -> str:
         return (

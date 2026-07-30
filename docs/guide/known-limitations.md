@@ -17,7 +17,11 @@ the message is sent.
 
 **V2 (`StatefulLayoutView`):** Maximum 40 total components in the tree.
 Containers, TextDisplays, ActionRows, Buttons, Selects, Separators - everything
-counts toward the budget. Discord rejects the message if the count exceeds 40.
+counts toward the budget, counted recursively. discord.py raises from
+`add_item()` the moment the tree would cross the cap, so the error arrives
+while `build_ui()` is still composing rather than from Discord at send time.
+CascadeUI re-raises it with the running count and a pointer to
+`control_buttons(compact=True)`.
 
 **Why:** Both limits are Discord API constraints, not CascadeUI limitations.
 
@@ -77,8 +81,15 @@ async def my_slow_callback(self, interaction):
     await interaction.followup.send(f"Done: {result}", ephemeral=True)
 ```
 
-All auto-defer mechanisms check `is_done()` before firing, so explicit defers
-and manual responses are safe to combine.
+Route an explicit acknowledgement through `self._safe_defer(interaction)`
+rather than a bare `interaction.response.defer()`. The auto-defer timer is
+armed outside the interaction lock, so it can take the slot between your
+`is_done()` check and your call. Under `serialize_interactions`, a click that
+waits on the lock longer than `auto_defer_delay` is acked by the timer, and the
+callback's own `defer()` then raises `InteractionResponded`, abandoning the
+rest of the callback with no rebuild and no refresh. The library's `is_done()`
+checks keep its own backstop from acking twice; they cannot protect a call made
+from your callback.
 
 ---
 
@@ -225,6 +236,12 @@ error.
   views where parallel rebuilds are safe (read-only displays, views
   that mutate independent state slices). Race-prone views (game
   boards, shared lists) should keep the lock.
+- `ack_first = True` -- acknowledges before the access checks and
+  the callback run, so a queued click is acked no matter how long it
+  waited on the lock. The cost is the acting-view fast path: every
+  refresh takes two calls instead of one, and `open_modal()` falls
+  back to an ephemeral message because the slot is already consumed
+  by the time the callback opens it.
 
 **Why no library-default fix:** dropping the lock reintroduces
 concurrent rebuild races, where rapid clicks can produce visual
@@ -285,6 +302,14 @@ click refreshes the tree.
   (`await self._safe_defer(interaction)` at the top of the
   callback). The click acks immediately and the refresh routes
   through the channel endpoint deliberately.
+- `ack_first = True` -- the view-wide form of the same trade. Every
+  callback acks before it runs, so no click can stall past the
+  deadline, and in exchange the view gives up the one-call fast path
+  permanently rather than losing it on the occasional slow edit.
+  Worth it on views whose callbacks routinely risk the ack budget;
+  on everything else it pays two calls per refresh to avoid a rare
+  one-frame delay. Callbacks on such a view cannot open modals
+  either, since `open_modal()` needs the un-acked slot.
 
 **A residual case CascadeUI cannot eliminate.** The auto-defer
 timer's own `defer()` call is itself a Discord HTTP request. Under
@@ -340,6 +365,7 @@ sent.
 | Total components per V2 LayoutView | 40 |
 | Components per ActionRow (V2) | 5 |
 | `custom_id` length | 100 characters |
+| Component `id` (V2) | 1 to 2147483647 |
 
 ### Text Limits
 

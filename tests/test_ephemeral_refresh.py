@@ -1381,3 +1381,54 @@ class TestEphemeralHandoffOnNavSuccess:
             assert source.task_manager.get_task_count(source.id) == 1
         finally:
             source.task_manager.cancel_tasks(source.id)
+
+
+# // ========================================( Expired Token )======================================== // #
+
+
+def _http_error(status: int) -> discord.HTTPException:
+    """An HTTPException carrying a specific status, as Discord would raise."""
+    return discord.HTTPException(MagicMock(status=status, reason="Error"), f"{status} Error")
+
+
+class TestRefreshAbsorbsExpiredEphemeralToken:
+    """An ephemeral past the 15-minute webhook cliff cannot be edited.
+
+    ``exit()`` and ``on_timeout()`` both treat that 401 as expected
+    lifecycle and log it at debug. ``refresh()`` re-raised it instead, so
+    every state dispatch reaching such a view surfaced an ERROR and a
+    traceback from the store's subscriber wrapper.
+    """
+
+    async def test_ephemeral_401_is_absorbed(self):
+        view = RenderableLayoutView()
+        view._ephemeral = True
+        view._message = AsyncMock()
+        view._message.edit.side_effect = _http_error(401)
+        view._last_tree_digest = None
+
+        await view.refresh()
+
+        view._message.edit.assert_awaited_once()
+
+    async def test_non_ephemeral_401_still_raises(self):
+        """The guard is scoped to ephemerals. A 401 elsewhere is a real error."""
+        view = RenderableLayoutView()
+        view._ephemeral = False
+        view._message = AsyncMock()
+        view._message.edit.side_effect = _http_error(401)
+        view._last_tree_digest = None
+
+        with pytest.raises(discord.HTTPException):
+            await view.refresh()
+
+    async def test_ephemeral_non_401_still_raises(self):
+        """Only token expiry is absorbed, not every failure on an ephemeral."""
+        view = RenderableLayoutView()
+        view._ephemeral = True
+        view._message = AsyncMock()
+        view._message.edit.side_effect = _http_error(500)
+        view._last_tree_digest = None
+
+        with pytest.raises(discord.HTTPException):
+            await view.refresh()

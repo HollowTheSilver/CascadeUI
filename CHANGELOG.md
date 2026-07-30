@@ -23,6 +23,522 @@ preserved below for historical reference but are not the supported baseline.
 
 ---
 
+## [3.9.0] - 2026-07-30
+
+### Security
+
+- **`ToggleButton` accepted `owner_only=True` and never enforced it.** The
+  gate lives in the callback wrapper that `StatefulButton` installs, and
+  `ToggleButton` replaced that wrapper with one of its own after
+  construction, so the flag was stored and never read. Any user could
+  operate a toggle meant for the host, and the view's `on_unauthorized`
+  never fired. Present since the per-component gate shipped in 3.2.0.
+  The toggle now runs inside the shared wrapper, which also restores the
+  three other guarantees it had been missing: no dispatch once the view
+  is finished, the acting interaction bound so the refresh takes the
+  one-request fast path, and a synchronous callback accepted. Routing a
+  self-mutating component through the shared wrapper also moved where its
+  value is read: `COMPONENT_INTERACTION` now records the state the toggle
+  landed on rather than the one it was clicked in. Selects and plain
+  buttons are unaffected, since neither changes its value during its own
+  callback. Anyone using `owner_only=` on a toggle should treat it as
+  having been open to everyone.
+
+### Added
+
+- **`confirm_style` and `cancel_style` on `confirm_section()`.** The builder
+  exposed labels, emoji, and `custom_id` but hardcoded `success` for confirm
+  and `danger` for cancel, so a destructive prompt rendered a green Delete
+  beside a red Keep, and its own docstring example paired
+  `confirm_label="Delete"` with a red card while teaching exactly that
+  inversion. Both default to the values they replaced, so nothing that
+  worked changes colour. Every builder that takes a style now also rejects
+  a value that is not a `discord.ButtonStyle`: a bare `"danger"` used to
+  construct cleanly and fail at send with an attribute error naming neither
+  the builder nor the parameter, which the class-attribute validator has
+  always caught on the equivalent class attributes.
+- **`id=` on the V2 builders.** Discord gives every component an optional
+  32-bit `id`, unique per message and auto-assigned sequentially when
+  omitted, and discord.py surfaces it on `Container`, `Section`,
+  `Thumbnail`, `MediaGallery`, and `TextDisplay`. None of the builders
+  forwarded it, so composing a view from them was the one path that could
+  not set an id at all: reaching a documented upstream field meant dropping
+  to raw `discord.ui` for that node. `id=` names the component a builder
+  returns, so the nineteen that return exactly one take it and the two that
+  return a list do not: `confirm_section` yields a text display and a row of
+  buttons, `button_grid` a row per grid row, and neither has a single node
+  for an id to mean. Assign `.id` on the returned components for those, or
+  set it per button inside `button_grid`'s `cell_factory`, which already
+  owns every other per-button attribute.
+- **Component ids are checked before the message is sent.** An id must be a
+  whole number from 1 to `MAX_COMPONENT_ID` (2147483647, exported from the
+  package root), and no two components in one message may share one --
+  Discord's rules, previously discoverable only as an HTTP 400 with a form
+  body that named a numeric path rather than a component. The builders
+  reject a bad value where it is written, naming the builder; the
+  uniqueness walk runs at the same three seams as the placement check
+  (initial send, refresh, navigation edit) and covers V1 and V2 alike,
+  since both carry ids. It can only refuse what Discord already refuses, so
+  a view that sends today still sends.
+- **`nav_depth` reads how many views sit beneath this one.** Zero on a
+  view opened directly, one on the first push. This release disables a
+  Back button with nowhere to go, but a screen reachable both by a push
+  and by its own command usually wants that button *absent* on the root
+  entry rather than present and greyed, and deciding that needs the stack
+  the library already holds: `make_nav_row(back=bool(self.nav_depth))`.
+  Without a read of it the caller carries its own root flag, which
+  duplicates the stack and lives on whoever constructs the view, so a
+  class that builds its nav row in two branches has to remember the flag
+  in both. Safe to read inside `on_load`, since the stack is assigned
+  before the load hook runs. Named for the `undo_depth` / `redo_depth`
+  pair it sits beside.
+
+### Changed
+
+- **`PaginatedRegion.set_page` takes a negative index.** `set_page(-1)` is
+  the last page, counting from the end the way Python indexing does. It is
+  the only way to name the last page without first knowing how many there
+  are, which is what made "add a row, then show it" cost two reads: asking
+  the region for its page count needs the data loaded, and the jump then
+  re-renders and loads it again. `await pager.show_page(-1)` does the whole
+  gesture in one read and one edit, since it seeks and re-renders together.
+  `set_page` moves the cursor only, for the seams with no tree to re-render
+  yet, and a seek stays invisible until something rebuilds.
+- **The `{label: callback}` builders accept a sequence of pairs.**
+  `button_row`, `tab_nav`, `key_value`, `choice_row`, and both tab views
+  read their argument with `.items()` or `.keys()`, so the same data
+  written as `[("Save", on_save), ("Cancel", on_cancel)]` failed on an
+  `AttributeError` naming a method rather than a parameter. The pair form
+  is the same information in the order it was written, so it is converted
+  rather than refused, and anything that is neither a mapping nor a pair
+  sequence now names the parameter it was passed to. Mappings other than
+  `dict` were already accepted by most of these and now are by all of them.
+- **Type hints that named less than the code accepts.** Several parameters
+  advertised a narrower type than they have ever taken, which matters more
+  than a documentation slip: the obvious guard to write against a
+  `list` annotation is `isinstance(items, list)`, and that would have
+  rejected the tuples, ranges, and strings `from_data` has always paged.
+  `items` is `Iterable[Any]`, which is what it reads. `MediaInput` names
+  `discord.UnfurledMediaItem`, which every media builder has always passed
+  through. The builders that now take a sequence of pairs say so rather
+  than naming `Dict`, and each says `Mapping`, since a `UserDict` has
+  always worked.
+
+### Fixed
+
+- **A non-string `label`, `value`, `content`, or `placeholder` crashed the
+  placement validator.** discord.py stores these fields unvalidated, so a
+  caller can pass an int and it reaches the payload unchanged. The character
+  and empty-string guards called `len()` on the raw value, so an int
+  `SelectOption` value raised `TypeError: object of type 'int' has no len()`
+  from inside a pre-flight check instead of the send it was meant to protect.
+  All six guarded fields now measure only strings. Present since 3.6.0, when
+  the length caps landed.
+- **`from_data()` validated none of what `from_cursor()` validates.** The
+  two constructors take the same page size and the same formatter, and the
+  cursor one rejects a non-callable and a non-positive `per_page` with
+  directed messages. Its sibling checked nothing, so `per_page=0` surfaced
+  as `range() arg 3 must not be zero` and a string page size as an indexing
+  `TypeError`, while `per_page=-1` raised nothing at all and built a view
+  with zero pages. Both now reject the same mistakes in the same words. A
+  generator of items is consumed rather than refused, and tuples, ranges,
+  and strings keep working as they always have despite the annotation
+  naming a list. One input changes meaning: `per_page=True` previously
+  paged by one, since a bool is an int, and is now rejected the way its
+  sibling has always rejected it.
+- **The paginated views ignored an async formatter unless it was a plain
+  coroutine function.** All three seams that format a page asked
+  `inspect.iscoroutinefunction` before deciding to await, which answers
+  `False` for an object whose `__call__` is async, so the formatter's
+  coroutine was stored as the page and rendered as a repr. It affected the
+  eager build, the cursor mode's page fetch, and `refresh_data` alike.
+  `validate_field` documents that same object as a supported shape. All
+  three now await the result rather than interrogating the callable, which
+  resolves every shape any of them accepts.
+- **A synchronous post-event hook logged as though it had failed.** The
+  wrapper that runs `on_page_changed`, `on_tab_switched`, `on_step_entered`
+  and their siblings awaited the hook unconditionally, so an override
+  written `def` rather than `async def` ran correctly, returned `None`, and
+  then failed on awaiting that `None` inside the wrapper. The failure was
+  caught and logged as a raising override, which named the user's hook for
+  a fault in the caller. Both shapes are accepted now.
+- **A `Collapsible` whose `reveal` or `summary` was async slipped its own
+  check.** The constructor rejects a coroutine function, but that predicate
+  recognises only the object itself, so an instance with an async `__call__`
+  passed it and returned a coroutine into a synchronous render. The two
+  halves then failed differently: a revealed coroutine reached `add_item`
+  and raised `expected Item not coroutine` on the caller's line, loud but
+  unnamed, while a summary coroutine was truthy, became a `TextDisplay`
+  body, cleared the placement validator, and surfaced only as a JSON
+  serialization error at send, naming neither the parameter nor the class.
+  Both are caught at the render call now with the message the constructor
+  would have given. Relatedly, a wizard step condition written as an async
+  generator, one stray `yield` away from a correct predicate, was neither
+  awaitable nor falsy, so its step rendered with nothing reported; it warns.
+- **`dispatch()` accepted an action where it wanted an action's type.** The
+  Redux idiom most callers arrive with is `dispatch(action)`, and reducers
+  here receive exactly that dict, so handing one to `dispatch` is the
+  natural mistake. It reached the reducer lookup and failed on
+  `cannot use 'dict' as a dict key`, which names neither the parameter nor
+  the shape. A non-string type was quieter: nothing raised, and an action
+  no reducer or subscriber could ever match was recorded against a type
+  like `None` or `5`. Both are rejected at the entry point now, and the
+  dict case says how to split it. `dispatch_scoped_as` and the view-level
+  `dispatch` route through the same seam.
+- **`dispatch("")` raised `TypeError` for what is a value problem.** An
+  empty action type is the right type carrying a wrong value, which is
+  where the two stdlib exceptions divide. It raises `ValueError` now; a
+  non-string still raises `TypeError`.
+- **A wizard step or form field written as a dict escaped the checks its
+  typed form has always run.** `WizardStep` and `FormField` validate at
+  construction; the raw-dict alternative both patterns document was passed
+  through untouched, so the same mistake behaved differently depending on
+  which spelling was used. Mostly it stayed quiet: a step whose builder was
+  not callable crashed at render, but one whose condition was not callable
+  was swallowed by the visibility guard and rendered anyway, and a field
+  with an unrecognised `type` produced no control at all, so it simply went
+  missing from the form. The dict form stays the looser of the two, which
+  is its purpose. It reads only `builder`, `validator` and `condition`, and
+  a step with none of them is a supported shape that renders its navigation
+  alone. What it no longer accepts is a value under one of those keys that
+  cannot be called, or a field type nothing knows how to draw.
+- **A leaderboard's entries were read for their shape without being
+  checked for it.** Both the `entries=` kwarg and the `get_entries()` hook
+  feed a signature helper that unpacks each entry and reads the second item
+  as a mapping, so `[(user_id, score)]` and `{user_id: stats}`, the two
+  most natural guesses, failed with `'int' object has no attribute 'items'`
+  and `cannot unpack non-iterable int object` from inside a generator
+  expression that named neither the parameter nor the shape. The failure
+  fires during `send()`, so nothing surfaced until the board was displayed.
+  Entries are checked where they enter now, naming the source and the
+  offending index. A mapping of id to stats and a one-shot iterable are the
+  same data in another container and are converted; lists of lists and
+  tuples of tuples keep working as they always have.
+- **Toggle labels were read by index without being checked.** Both toggles
+  take an on/off pair and read `labels[0]` and `labels[1]`, so a one-item
+  sequence raised `IndexError` from inside the builder. A bare string was
+  worse: it indexes without complaint, so `labels="Enabled"` rendered a
+  button captioned `E` in one state and `n` in the other, with nothing
+  raised anywhere. `cycle_button` had rejected a mismatched label list all
+  along; the toggles now check their pair the same way.
+- **A cell factory was type-checked on its first cell only.** `button_grid`
+  validated the first button it received and appended the rest untouched,
+  so a factory returning `None` for one position, the natural way to leave
+  a gap, failed inside `ActionRow` on an attribute the caller never wrote.
+  Every cell is checked now, and the error names the row and column.
+- **`choice_row` rejected the values its own docstring promised.**
+  `Choice.value` is documented as any Python object, but active values were
+  held in a set, so a list or a dict raised `cannot use 'list' as a set
+  element` on the containment test, even with nothing selected. Active
+  values are a list now and compare by equality. Options cap at 25, so the
+  scan costs nothing and unhashable values work as documented.
+- **Numbers, separators and single-item arguments reached operations that
+  assumed their type.** `progress_bar` compared and divided its arguments
+  before checking them, so a string bound failed on the operator rather
+  than the parameter. `EmojiGrid` checked `rows`, `cols` and `fill` but not
+  `cell_sep` or `corner`, which reach `str.join` during construction.
+  `Theme(styles=...)` read its argument by key, so a sequence of pairs
+  failed on `list indices must be integers`, and now converts the way the
+  builders do. A `Modal` given a single input rather than a list failed on
+  `not iterable`; it now says which it wanted.
+- **The media builders disagreed with each other and with `banner=`.**
+  `gallery`, `image_section`, and `file_attachment` share one `MediaInput`
+  union, and passing a `discord.Asset` to it behaved three ways: `gallery`
+  refused it at construction through discord.py's own check, while the
+  other two accepted it and crashed at send inside the payload build with
+  an attribute error. `LeaderboardLayoutView`'s `banner=` had always
+  coerced the same objects, so `member.display_avatar` worked there and
+  nowhere else, despite being one attribute away from the `.url` form every
+  docstring example shows. All four now resolve an Asset, and all four
+  reject an unusable value at construction naming the builder and the
+  argument that carried it, down to which `gallery` item was wrong. A
+  `discord.File`, a URL string, and an `UnfurledMediaItem` are unchanged.
+- **Option lists accepted entries that were not options.** `CheckboxGroup`,
+  `RadioGroup`, and `Dropdown` converted dicts and appended everything else
+  untouched, so a list of plain strings became a list of plain strings and
+  reached Discord as options carrying neither a label nor a value. Passing
+  a single option dict without its list was worse: iterating a mapping
+  yields its keys, so `options={"label": "A", "value": "a"}` built two
+  options named `label` and `value`, which the one-to-ten count check then
+  counted and approved. Both surfaced only when Discord rendered the
+  component, as an attribute error from inside discord.py and "This
+  interaction failed" on screen. Entries are now checked where they are
+  read, naming the index, and a mapping passed in place of a list says so.
+  `StatefulSelect` is checked too. `Dropdown` is the seam that accepts dict
+  shorthand, and its base class took the same shapes without converting
+  them, so the three failures above reached Discord unaltered through it.
+  It now names the offending index and points at the sibling that does the
+  conversion.
+- **Three guards failed on the inputs they existed to screen.** A modal
+  title or label that was not a string either crashed inside the length
+  check with `object of type 'int' has no len()` or, when it happened to
+  have a length of its own, passed both tests and reached Discord as a list
+  or a bytestring. A numeric bound that was not an int either crashed on
+  the comparison or slipped through as a float or a bool, which Discord
+  rejects at modal-open. And a menu category that was not a mapping died
+  inside the category validator on `'tuple' object has no attribute 'get'`,
+  while one missing `label` or `view` surfaced later as a bare `KeyError`
+  from whichever builder read it first. All three now name the parameter,
+  the type they got, and the shape they wanted. Twelve call sites share
+  the two input helpers, and the category check runs once per entry with
+  the index in the message. Mappings other than `dict` keep working.
+- **A V1 form's dropdown showed the wrong selection on the edit that
+  recorded the right one.** The option marks are stamped when the controls
+  are built, and V1 answers a pick by shipping an embed edit rather than
+  rebuilding its controls, so Discord re-rendered the select from a payload
+  still carrying the seeded marks. The user chose B, the summary read B, and
+  the dropdown beside it snapped back to A. A multi-select was worse: every
+  tick cleared on the very edit that confirmed it. The same stamps went
+  stale on a pop, where restored entries rendered over controls built before
+  the values arrived. Both paths re-derive from the form's values now, using
+  the `set_selected` helper the library already shipped for exactly this and
+  had never called. V2 was unaffected, since it rebuilds its controls on
+  every update, which is the parity gap that hid this.
+- **A Back button with nowhere to go destroyed the panel it sat on.**
+  `make_nav_row()` defaults to `back=True`, so a view that is sent rather
+  than pushed rendered Back against an empty stack, and pressing it took
+  the empty-stack path, which froze every component on a V2 view and
+  stripped them on a V1 one. The only recovery was running the command
+  again. Two things change. Back is disabled while the stack is empty, the
+  way the paginated and wizard controls beside it already derive their
+  state from a cursor, and the empty-stack path acknowledges the press
+  without touching the message. The disabled state is resolved at the
+  render seams rather than when the button is built, because a pushed view
+  is constructed before its stack is assigned: reading it at build time
+  would disable a working button on any view that composes its tree in
+  `__init__`. Both paths share one implementation now; the V2 freeze
+  override is gone. A view that wants Back to close the panel overrides
+  `_clear_on_empty_back`, though `exit()` and the Exit button are the
+  surfaces built for that.
+- **Anything you write for the library had to be `async def`, or the
+  library failed on your behalf.** Every seam that runs your code awaited
+  its result unconditionally, so a synchronous function ran, returned a
+  value, and then failed on awaiting that value. Fifty-nine seams were
+  affected, and between them they covered most of the surface you write
+  against: every `on_*` override on a view (`on_load`, `on_submit`,
+  `on_state_changed`, `on_error`, `on_finish`, `on_pre_send`,
+  `on_unauthorized`, `on_restore`, `on_message_delete` and the rest),
+  the `seed_initial_state` preload hook,
+  plus store subscribers and `store.on()` hooks, custom reducers,
+  component callbacks, the `with_loading_state` / `with_confirmation` /
+  `with_cooldown` wrappers, `with_retry` and `with_error_boundary`, wizard
+  and tab builders and validators, `choice_row` and `cycle_button` and
+  `toggle_button` handlers, and the paginated cursor's fetch function.
+  What surfaced varied by seam and none of it named the cause: a wizard
+  builder gave `'list' object can't be awaited` at render, a subscriber
+  logged an error against the user's own callback, and a view whose
+  `on_load` was missing its `async` failed to send at all. A custom
+  reducer was the quietest of them: the store caught the failure and
+  logged it, so the action completed and the state never changed. These now
+  test the result with `inspect.isawaitable`, which is what the rest of
+  the library already did, and take either shape. A
+  wizard step's `condition` is the inverse
+  case: it was never awaited, and a coroutine is always truthy, so an async
+  predicate rendered its step regardless of the answer, with nothing raised
+  and nothing logged. `WizardStep` now rejects a coroutine function at
+  construction, matching how `Collapsible` treats `reveal`, and the
+  visibility check recognises an awaitable answer, warns, and shows the
+  step. Both are needed: a step declared as a raw dict never passes through
+  `WizardStep`, and neither construction check sees an object whose
+  `__call__` is async.
+- **A `build_ui` that returned a coroutine had the library's own work done
+  against a tree it had not built.** `__init_subclass__` wraps `build_ui`
+  to set the ambient theme and stabilize `custom_id`s, choosing a sync or
+  async wrapper by inspecting the function. Several shapes answer "not a
+  coroutine function" and still return a coroutine (a callable instance
+  with an async `__call__`, a `partial` around one, a plain function
+  returning one), so they took the sync wrapper, which stabilized ids and
+  tore the theme down before the body ran. The ids therefore kept the
+  random hex discord.py assigns, which changes on every rebuild and churns
+  the dispatch table that stabilization exists to keep still, and a `card()`
+  built with no explicit colour missed the view's theme. The sync wrapper
+  now checks what it got back and, holding a coroutine, returns one that
+  re-enters the theme and stabilizes once the body has resolved. It stays
+  synchronous otherwise, because three classes call `build_ui()` from
+  `__init__`.
+- **An async `build_ui` on a pattern that builds in `__init__` did
+  nothing, quietly.** `DisplayLayoutView`, `MenuLayoutView` and
+  `RolesLayoutView` compose their tree in the constructor, which cannot
+  await. An `async def build_ui` there was called and discarded: the view
+  constructed, its tree stayed empty, and the only signal was a "never
+  awaited" warning most bots never surface. The mistake then arrived at
+  `send()` as a placement error naming "no top-level components" -- the
+  symptom, nowhere near the cause. All three now refuse it where it
+  happens, naming the class and pointing at `on_load()`, the hook the
+  library awaits before every render. The refusal covers the shapes an
+  `iscoroutinefunction` check misses, since it reads what `build_ui`
+  returned rather than what it looks like.
+- **A wizard step validator's answer was unpacked without being read.** The
+  documented return is `(valid, error)`, and the code took it apart on the
+  spot. A bare `True`, the obvious near miss, raised `cannot unpack
+  non-iterable bool object` and reached the user as "Something went wrong."
+  Worse was the shape that did not raise: any two-element iterable unpacks,
+  so a two-character string or a two-key dict handed back a truthy first
+  element and the wizard advanced past the step the validator was
+  rejecting. A bare bool is now read as the answer it plainly is, a pair is
+  read as documented, and anything else is refused with a message naming
+  the step and the shape it owes.
+- **A component interaction recorded its value nested inside itself.**
+  `ActionCreators.component_interaction` collected `value=` into a keyword
+  bag and then stored the bag under `value`, so every click wrote
+  `{"value": {"value": True}}` into `state["components"]`. `value` is now a
+  named parameter and records what it was given; any other keyword lands
+  beside it under its own name. Nothing in the library read the nested
+  shape, but a subscriber that dug through the extra layer needs to stop.
+- **A computed value could cache the wrong answer permanently.** The memo
+  compared the selector's output against the previous output, but held
+  that previous output by reference. A slice mutated in place carried the
+  stored reference with it, so the check compared the slice against
+  itself and kept returning the stale result. A later correct replacement
+  did not recover it either: the aliased reference already matched the new
+  value while the cached result predated it. `access_slot` mutates in
+  place by design and `seed_initial_state` hands it live state, so a
+  computed read before another view seeded its slot stayed wrong for the
+  life of the store. The memo now keeps its own copy, and recomputes every
+  time rather than trust an input it cannot copy.
+- **Constructing a `Theme` edited the dict you constructed it from.** The
+  six style defaults were seeded into the caller's own mapping, so passing
+  a dict to `Theme` silently added keys to it, and two Themes built from
+  one base dict shared a single live mapping where restyling either
+  restyled both. The styles are copied before the defaults are applied.
+- **A failed cosmetic edit could cancel the action it was decorating.**
+  `with_loading_state` shows its loading state before running the wrapped
+  callback. On a plain `discord.ui.View` that pre-edit caught only the
+  already-answered case, so a deleted message or a transient 5xx
+  propagated and the click did nothing -- while the branch three lines
+  above, for stateful views, had always swallowed the same failure. The
+  two branches agree now.
+- **Three exception types Discord raises are siblings, and half the
+  library caught only one of them.** `RateLimited` and
+  `InteractionResponded` do not inherit from `HTTPException`, so
+  `except discord.HTTPException` misses both. `RateLimited` reaches user
+  code whenever the bot passes `max_ratelimit_timeout` to its client, and
+  the escapes were not cosmetic: the ephemeral-reopen cleanup skipped its
+  `exit()` and left the replaced view registered holding its instance-limit
+  slot, a participant-limit rejection skipped the send rollback and leaked
+  a registered view, `with_confirmation` skipped the confirmed action its
+  own comment promised to run, and a rate-limited acknowledgement during
+  navigation became a full rollback and an error embed. Every seam in the
+  view base, navigation, the interaction helpers and the component
+  wrappers now catches what it meant to, and says which of the three
+  happened rather than printing two question marks where a `RateLimited`'s
+  `retry_after` belongs.
+- **A refresh past the ephemeral cliff reported an error nobody could act
+  on.** `exit()` and `on_timeout()` both read the 401 an expired 15-minute
+  webhook token returns as ordinary lifecycle and log it at debug.
+  `refresh()` re-raised it instead, so every state dispatch reaching such a
+  view surfaced an ERROR and a full traceback from the store's subscriber
+  wrapper, for a condition the library treats as normal at every other edit
+  seam. It is absorbed at the same level as its siblings now. Navigation
+  inherits the change: an edit onto a message no token can reach is no
+  longer a reason to roll a push or pop back to its source.
+- **A `slot_property` declared wrong returned its default forever.** The
+  `key=` callable was never checked at construction, and errors raised by
+  the callable itself were swallowed by the same handler that absorbs a
+  store that is not wired yet, so `key="user_id"` (a string, not a
+  callable) and `key=lambda self: self.usr_id` (a typo) both read as a
+  permanent default that looks correct in every test. A non-callable
+  `key=` is now refused where it is declared, and one that raises is
+  reported instead of being folded into the ordinary empty read -- once
+  per class, since a descriptor is read on every attribute access and a
+  line per read buries the one that matters.
+- **`ToggleGroup` built colliding `custom_id`s.** Ids came from the option
+  label alone, so two groups in one view that shared a label sent Discord
+  a duplicate id and the message was rejected. A `key=` prefix
+  disambiguates them, matching `choice_row`'s `custom_id=`. The id is
+  otherwise built exactly as before, so a persistent panel already on
+  screen keeps the ids its buttons are registered under.
+- **`CompositeComponent.add_to_view` took a `row` and ignored it.** The
+  parameter has always been in the signature and never read, so components
+  landed wherever discord.py placed them. It now sets the row it was
+  given.
+- **`state["components"]` disappeared once a view was destroyed.** Two
+  reducers removed the key entirely when the last entry was filtered out,
+  even though it is one of the four keys the initial state establishes. A
+  subscriber that indexed it directly worked until the first teardown and
+  then raised. It is emptied now, not removed.
+- **A reducer registered for `BATCH_COMPLETE` silently never ran.** The
+  batch commit fires that action straight at subscribers and hooks,
+  bypassing dispatch, so no reducer could ever see it -- and the collision
+  guard did not list it, so registering one looked like it worked. It is
+  reserved now, and `@cascade_reducer` says so at decoration time.
+- **An async subscriber selector was accepted and did the opposite of its
+  job.** The change check runs inline in dispatch and cannot await, so an
+  `async def` selector handed back a fresh coroutine on every call. A
+  coroutine never equals the previous one, so the subscriber was notified
+  on every single action (precisely what passing a selector asks the
+  store to avoid), and each unawaited coroutine printed a warning from
+  the bot's own console. `subscribe` now refuses one where it is passed,
+  including the two shapes a plain `iscoroutinefunction` check misses: an
+  object with an async `__call__`, and a `functools.partial` around a
+  coroutine function.
+- **The selector guard reached one of the three places a selector is
+  supplied.** `subscribe` refuses an async selector, but it only ever sees
+  what it is handed, and a view's `state_selector` override arrives wrapped
+  in a lambda that is never a coroutine function whatever it closes over.
+  An `async def state_selector` therefore sailed past the check and the
+  view went silently deaf: the store compared one fresh coroutine against
+  the last, they never matched, and the notification was skipped on every
+  dispatch. `@computed`'s selector was not checked at all, not even for
+  being callable. Both are refused now, where they are declared, and both
+  catch the shapes a plain `iscoroutinefunction` misses.
+- **Restoring persistent views warned about the pattern it documents.**
+  A view class not yet imported when `initialize()` runs is the state the
+  two-pass design exists to absorb: the row lands in `skipped` and
+  `reattach()` collects it once the cog has loaded, which is what makes
+  import order stop mattering. Each such row was reported at warning level
+  anyway, with advice to import the module before `initialize()` -- the one
+  thing the sanctioned pattern deliberately does not do. A bot with a dozen
+  panels logged a dozen wrong warnings on every boot, which teaches an
+  operator to skim the level. That detail now sits at debug, where the summary's own
+  comment already said per-view detail belonged, and the warning is saved for
+  a class still missing after a `reattach()` pass, when it is a real problem.
+  Unreachable channels got the same treatment: one warning naming the count
+  rather than one per row, since the count is what an operator acts on.
+- **A broken selector was silent forever.** A subscriber selector that
+  raised was swallowed with no log at all, on every dispatch, degrading to
+  notify-on-everything -- which is the safe answer, and indistinguishable
+  from a subscriber that legitimately wants every action. It reports once
+  per subscriber now. Three other silences got the same treatment: an
+  attached child that failed to exit left no trace before the list was
+  cleared, a gateway wait that failed skipped the post-ready re-render
+  without saying so, and a failed ephemeral reopen blamed a "refresh
+  factory" on the path where the caller never supplied one.
+- **`SlotPolicy(persistent=True)` never persisted anything.** Declaring a
+  slot persistent in `ApplicationPersistence.slots`, or through
+  `register_slot_policy`, registered its retention policy and not the slot
+  itself. The middleware scans an opt-in set that neither route wrote to, so
+  it skipped the slot entirely and a setup copied from the persistence guide
+  put nothing on disk and said nothing about it. Both routes now register
+  the slot the way `persistent_slots` and `access_slot(persistent=True)` do.
+  Slots declared this way begin persisting, and rehydrating on restart, as
+  soon as you upgrade, which is what declaring them always claimed.
+- **The missing-aiosqlite error named a package that does not exist.** The
+  zero-config path told you to run `pip install 'cascadeui[sqlite]'`; the
+  distribution is `pycascadeui`, which the two backend modules had right
+  all along. The name is written by hand at each hint, so a test now walks
+  the source and fails on any that stops matching the distribution.
+- **A shutdown could discard the writes it was shutting down to save.**
+  The flush drains its dirty rows into a local batch before handing them
+  to the backend, and the retry that puts a failed batch back caught
+  `Exception`, which `CancelledError` is not. So a cancel arriving while
+  the write was in flight lost the batch outright: buffers empty, nothing
+  committed, nothing retried. `flush_all` opened exactly that window on
+  every shutdown, cancelling in-flight flushes before its own final
+  drain, which is the one path `close` exists to guarantee. A cancelled
+  batch is now returned to the buffers under the same both-sides guard
+  the retry uses, so the drain that follows finds it.
+- **The attachment example taught a one-image technique without its bound.**
+  `refresh(attachments=[...])` replaces the message's whole attachment list,
+  which is correct for the single-image swap the example demonstrates and
+  wrong the moment a tree references two. Adapting it to paged content
+  ships each page's reference with only that page's bytes attached,
+  and every other page renders as a permanent loading placeholder. The
+  example now states that the list must carry every file the tree
+  references, and shows the multi-image shape.
+
+---
+
 ## [3.8.0] - 2026-07-27
 
 ### Breaking
@@ -277,7 +793,7 @@ preserved below for historical reference but are not the supported baseline.
   subtracts an interaction's Discord-derived creation time from the local
   clock, so the printed elapsed carries the host's skew. A host running
   behind reported under three seconds beside a message about a missed
-  three-second deadline, sending the reader after the wrong cause. Discord
+  three-second deadline, sending the operator after the wrong cause. Discord
   enforces the window on its own clock, so only the log line changes.
 - **The missed-ack warning omitted its likeliest cause.** It named event-loop
   congestion and slow pre-callback work, both of which point at the caller's

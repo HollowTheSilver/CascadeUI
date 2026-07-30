@@ -12,7 +12,7 @@ Every action is a dict with four top-level keys:
     "type": "VIEW_CREATED",       # Action type constant
     "payload": { ... },           # Action-specific data
     "source": "abc123",           # View ID of the dispatcher (or None)
-    "timestamp": 1712764800.0,    # time.time() at dispatch
+    "timestamp": "2026-01-01T12:00:00.000000+00:00",  # ISO 8601 UTC at dispatch
 }
 ```
 
@@ -73,7 +73,6 @@ from the state tree and cleans up associated data.
 | Key | Type | Description |
 |-----|------|-------------|
 | `view_id` | `str` | View being destroyed |
-| `clear_nav_stack` | `bool` | If `True`, wipes the session's nav stack before checking emptiness |
 
 **State change:**
 
@@ -81,12 +80,11 @@ from the state tree and cleans up associated data.
 - Removes component interaction entries owned by this view
 - Removes modal submission entries owned by this view
 - Removes `view_id` from its session's view list
-- Deletes the session entirely if no views remain and no nav stack exists
+- Deletes the session entirely once its member list is empty
 
-The `clear_nav_stack` flag is set by `exit()` and `on_timeout()` so the session
-is cleaned up even when a pushed sub-view exits directly. Push/pop transitions
-leave it `False` to keep the session alive between the old view's destruction
-and the new view's registration.
+Push and pop keep the session alive by ordering rather than by a flag:
+`_navigate_to` registers the destination view in state before dispatching the
+source view's `VIEW_DESTROYED`, so the member list is never empty mid-transition.
 
 ---
 
@@ -104,8 +102,9 @@ session entry if one does not already exist.
 | `guild_id` | `int \| None` | Guild the session belongs to |
 | `shared_data` | `dict` | Initial session data |
 
-**State change:** Writes to `state["sessions"][session_id]` with empty `members`,
-`history`, and `shared_data` fields. Skips if the session already exists
+**State change:** Writes to `state["sessions"][session_id]` with empty `members`
+and `history` lists, and `shared_data` seeded from the payload (empty when none
+was supplied). Skips if the session already exists
 (idempotent for push/pop chains that share a session).
 
 ---
@@ -159,8 +158,10 @@ Dispatched by `push()`. Records the current view on the session's nav stack so
 | `kwargs` | `dict` | Constructor kwargs snapshot (captured by `__init_subclass__`) |
 | `state_snapshot` | `any` | Optional state to restore on pop |
 
-**State change:** Appends an entry to
-`state["sessions"][session_id]["nav_stack"]`.
+**State change:** None. The reducer returns state untouched. The navigation
+stack is view-local, transferred between view objects by `_navigate_to`, so
+sessions carry no `nav_stack` key. The action still fires so middleware,
+subscribers, and hooks observe the transition.
 
 ---
 
@@ -174,16 +175,16 @@ Dispatched by `pop()`. Removes the top entry from the nav stack.
 |-----|------|-------------|
 | `session_id` | `str` | Session owning the nav stack |
 
-**State change:** Pops the last entry from
-`state["sessions"][session_id]["nav_stack"]`.
+**State change:** None, for the same reason as `NAVIGATION_PUSH` above. The
+pop happens on the view's own `_nav_stack`.
 
 ---
 
 ### `NAVIGATION_REPLACE`
 
 Dispatched by `replace()`. Records the transition in session history. Does not
-modify the nav stack (replace clears it via `VIEW_DESTROYED` with
-`clear_nav_stack=True` on the source view).
+modify the nav stack: `replace()` is a one-way transition, so the destination
+starts with its own empty view-local stack rather than inheriting the source's.
 
 **Payload:**
 
@@ -233,7 +234,7 @@ invocation. Records the interaction for devtools history.
 | `component_id` | `str` | The component's `custom_id` |
 | `view_id` | `str` | Parent view ID |
 | `user_id` | `int \| None` | User who clicked |
-| `value` | `dict` | Interaction-specific values |
+| `value` | `Any` | The component's value at the end of the callback: a select's chosen options, a toggle's new state, `True` for a plain button. Any other keyword passed to the creator lands beside it under its own name. |
 
 **State change:** Appends to
 `state["components"][component_id]["interactions"]`, capped at 50 entries.
@@ -344,18 +345,17 @@ to observe prunes.
 
 ### `INSPECTOR_PURGED_STALE`
 
-Dispatched by `DevToolsCog`'s `/cascadeui purge` subcommand and the Inspector's Purge Stale button when stale view rows are removed from `state["views"]`. A view row is considered stale when its `view_id` is no longer in the live `_active_views` registry (e.g. the view was destroyed externally or its message was deleted while the bot was offline).
+Dispatched by `DevToolsCog`'s `/cascadeui purge` subcommand and the Inspector's Purge Stale button to drop orphaned component-interaction and modal-submission rows.
 
 **Payload:**
 
 ```python
 {
-    "purged_view_ids": list[str],   # IDs of stale rows removed
-    "purged_count": int,            # convenience count
+    "inspector_id": str | None,   # Live inspector whose own rows survive
 }
 ```
 
-**State change:** Removes the listed entries from `state["views"]`.
+**State change:** Drops entries from `state["components"]` and `state["modals"]` that are not owned by the given inspector. `state["views"]` is left alone. Passing `None` purges every row; omitting the key entirely is a no-op.
 
 ---
 
@@ -375,13 +375,15 @@ previous application state snapshot.
 
 **State change:**
 
-- Pushes current `state["application"]` and `session["shared_data"]` onto the view's `redo_stack`
-- Pops the top entry from the view's `undo_stack` and restores both
+- Builds the inverse per-slot diff of the slots the undo entry names, and pushes it onto the view's `redo_stack` alongside the current `shared_data`
+- Pops the top entry from the view's `undo_stack` and applies its per-slot diff, plus the `shared_data` it carries
 
-The restored snapshot covers the full `application` subtree (including
-the nested `scoped` namespace), so `dispatch_scoped()` changes round-trip
-correctly. Session data from `update_session()` is also
-restored.
+The snapshot is a **per-slot diff**, not a copy of the whole `application`
+subtree: only the slots the undone action actually touched are restored, so a
+sibling view's concurrent writes to other slots survive an undo here. Scoped
+data lives under `application` as a top-level slot, so `dispatch_scoped()`
+changes round-trip the same way. Session data from `update_session()` is
+restored too.
 
 ---
 
@@ -399,8 +401,8 @@ previously undone snapshot.
 
 **State change:**
 
-- Pushes current `state["application"]` and `session["shared_data"]` onto the view's `undo_stack`
-- Pops the top entry from the view's `redo_stack` and restores both `state["application"]` and `session["shared_data"]`
+- Builds the inverse per-slot diff of the slots the redo entry names, and pushes it onto the view's `undo_stack` alongside the current `shared_data`
+- Pops the top entry from the view's `redo_stack` and applies its per-slot diff, plus the `shared_data` it carries
 
 ---
 
@@ -423,21 +425,28 @@ Three middleware components interact with these actions:
   rides under the application namespace; a scoped slot persists when its slot
   name is opted in via `persistent_slots` on the view class or via
   `SlotPolicy(persistent=True)` at setup time.
-  Flushes immediately on `VIEW_DESTROYED`, `PERSISTENT_VIEW_REGISTERED`, and
-  `PERSISTENT_VIEW_UNREGISTERED`. Skips bookkeeping actions
+  The registry namespace carries a zero debounce, so
+  `PERSISTENT_VIEW_REGISTERED` and `PERSISTENT_VIEW_UNREGISTERED` write
+  immediately; the application namespace debounces. Skips bookkeeping actions
   (`SESSION_CREATED`, `SESSION_UPDATED`, `VIEW_CREATED`, `VIEW_UPDATED`,
-  `COMPONENT_INTERACTION`, `NAVIGATION_PUSH`, `NAVIGATION_POP`,
-  `NAVIGATION_REPLACE`, `UNDO`, `REDO`, `BATCH_COMPLETE`) that don't carry
+  `VIEW_DESTROYED`, `COMPONENT_INTERACTION`, `MODAL_SUBMITTED`,
+  `NAVIGATION_PUSH`, `NAVIGATION_POP`,
+  `NAVIGATION_REPLACE`, `UNDO`, `REDO`, `BATCH_COMPLETE`,
+  `INSPECTOR_PURGED_STALE`, `APPLICATION_SLOTS_PRUNED`,
+  `REGISTRY_PRUNED`) that don't carry
   application state changes. Also skips any dispatch-only action (no registered
   reducer) where the state reference is unchanged. Slots default to in-memory;
   the middleware only writes slots opted in through `_PERSISTENT_SLOTS`.
 
-- **`UndoMiddleware`** snapshots `state["application"]` and `session["shared_data"]` into the source view's `undo_stack`
-  before the reducer runs. Skips bookkeeping actions (`VIEW_CREATED`,
+- **`UndoMiddleware`** captures a per-slot diff of `state["application"]` across
+  the reducer (holding the pre-state, computing the diff once the reducer
+  returns) plus a copy of the session's `shared_data`, and pushes both onto the
+  source view's `undo_stack`. Skips bookkeeping actions (`VIEW_CREATED`,
   `VIEW_UPDATED`, `VIEW_DESTROYED`, `SESSION_CREATED`, `NAVIGATION_PUSH`,
   `NAVIGATION_POP`, `NAVIGATION_REPLACE`, `COMPONENT_INTERACTION`,
   `MODAL_SUBMITTED`, `UNDO`, `REDO`, `BATCH_COMPLETE`,
-  `PERSISTENT_VIEW_REGISTERED`, `PERSISTENT_VIEW_UNREGISTERED`). Only
+  `PERSISTENT_VIEW_REGISTERED`, `PERSISTENT_VIEW_UNREGISTERED`,
+  `INSPECTOR_PURGED_STALE`, `APPLICATION_SLOTS_PRUNED`, `REGISTRY_PRUNED`). Only
   snapshots when the dispatching view has `enable_undo = True`.
   `SESSION_UPDATED` is **not** skipped - `update_session()` changes are
   captured and restored by undo/redo.

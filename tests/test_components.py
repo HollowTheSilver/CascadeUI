@@ -71,6 +71,42 @@ class TestStatefulSelectEmptyOptions:
         assert sel.disabled is False
 
 
+class TestStatefulSelectOptionShape:
+    """Entries are checked at construction, not by discord.py at send.
+
+    ``Dropdown`` is the seam that accepts dict shorthand. Its base class
+    accepted the same shapes without converting them, so a dict, a bare
+    mapping, or a plain string reached Discord as an option carrying
+    neither a label nor a value.
+    """
+
+    def test_bare_mapping_rejected(self):
+        # len() of a mapping is its key count, so a bare mapping cleared
+        # both the empty check and the 25-option cap before this guard.
+        with pytest.raises(TypeError, match="not a single mapping"):
+            StatefulSelect(options={"label": "A", "value": "a"})
+
+    def test_dict_entry_rejected_naming_the_index(self):
+        with pytest.raises(TypeError, match=r"options\[0\] must be a SelectOption"):
+            StatefulSelect(options=[{"label": "A", "value": "a"}])
+
+    def test_string_entry_rejected_naming_the_index(self):
+        with pytest.raises(TypeError, match=r"options\[1\] must be a SelectOption"):
+            StatefulSelect(options=[discord.SelectOption(label="A", value="a"), "b"])
+
+    def test_rejection_points_at_the_sibling_that_accepts_dicts(self):
+        with pytest.raises(TypeError, match="Dropdown"):
+            StatefulSelect(options=[{"label": "A", "value": "a"}])
+
+    def test_dropdown_still_converts_dict_shorthand(self):
+        # The guard must not collapse the distinction it points users at.
+        from cascadeui.components.selects import Dropdown
+
+        drop = Dropdown(options=[{"label": "A", "value": "a"}])
+        assert isinstance(drop.options[0], discord.SelectOption)
+        assert drop.options[0].value == "a"
+
+
 class TestStatefulSelectSetSelected:
     """``set_selected`` / ``get_selected`` reflect state into option defaults.
 
@@ -345,6 +381,103 @@ class TestButtonOwnerOnly:
 
         assert btn_default._button_owner_only is False
         assert btn_owner._button_owner_only is True
+
+
+class TestToggleButton:
+    """``ToggleButton`` flips inside the shared stateful callback.
+
+    The class used to build its own callback and assign it over
+    ``self.callback``, which replaced the wrapper every guard rides:
+    ``owner_only`` was accepted and never read, the finished-view skip
+    never ran, the dispatch preceded the user callback, and the acting
+    interaction was never bound. These drive the real class rather than
+    a mock component, so a future callback assignment that bypasses
+    the wrapper fails here.
+    """
+
+    def _make_button(self, **kwargs):
+        from cascadeui.components.buttons import ToggleButton
+
+        view = MagicMock()
+        view.user_id = 1
+        view.id = "view-under-test"
+        view.is_finished = MagicMock(return_value=False)
+        view.dispatch = AsyncMock()
+        view.on_unauthorized = AsyncMock()
+
+        button = ToggleButton(label="Mode", **kwargs)
+        button._view = view
+        return button, view
+
+    def _interaction(self, user_id):
+        from helpers import make_interaction
+
+        interaction = make_interaction()
+        interaction.user.id = user_id
+        return interaction
+
+    async def test_non_owner_cannot_toggle(self):
+        calls = []
+
+        async def user_cb(interaction):
+            calls.append(True)
+
+        button, view = self._make_button(callback=user_cb, owner_only=True)
+
+        await button.callback(self._interaction(user_id=999))
+
+        assert calls == []
+        assert button.is_toggled is False
+        view.on_unauthorized.assert_awaited_once()
+        view.dispatch.assert_not_awaited()
+
+    async def test_owner_toggles_and_relabels(self):
+        button, view = self._make_button(toggled_label="Mode on", owner_only=True)
+
+        await button.callback(self._interaction(user_id=1))
+
+        assert button.is_toggled is True
+        assert button.label == "Mode on"
+        assert button.style is discord.ButtonStyle.success
+
+        await button.callback(self._interaction(user_id=1))
+
+        assert button.is_toggled is False
+        assert button.label == "Mode"
+        assert button.style is discord.ButtonStyle.secondary
+
+    async def test_dispatched_value_is_the_state_it_ended_on(self):
+        button, view = self._make_button()
+
+        await button.callback(self._interaction(user_id=1))
+
+        payload = view.dispatch.await_args.args[1]
+        assert payload["value"] is True
+
+    async def test_sync_callback_is_accepted(self):
+        calls = []
+        button, _ = self._make_button(callback=lambda interaction: calls.append(True))
+
+        await button.callback(self._interaction(user_id=1))
+
+        assert calls == [True]
+        assert button.is_toggled is True
+
+    async def test_finished_view_skips_dispatch(self):
+        button, view = self._make_button()
+        view.is_finished = MagicMock(return_value=True)
+
+        await button.callback(self._interaction(user_id=1))
+
+        view.dispatch.assert_not_awaited()
+
+    async def test_callback_is_the_shared_wrapper(self):
+        """The toggle rides ``create_stateful_callback``; the raw
+        ``_toggle`` coroutine is never installed as the callback."""
+        button, _ = self._make_button()
+
+        assert button.callback.__name__ == "stateful_callback"
+        assert button.original_callback == button._toggle
 
 
 class TestBuilderCustomIdAndDisabled:

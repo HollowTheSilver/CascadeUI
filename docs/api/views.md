@@ -183,7 +183,7 @@ Pops the top entry from the navigation stack, reconstructs that view with its or
 
 #### `batch()`
 
-Returns an async context manager for batched dispatch. Convenience for `self.state_store.batch()`.
+Returns an async context manager for batched dispatch. Calls `self.state_store.batch(source_id=self.id)`, so the batch's single `BATCH_COMPLETE` notification reaches this view on the inline acting-view path. Calling `store.batch()` directly instead loses that and the view's own refresh joins the background fan-out.
 
 #### `undo()`
 
@@ -237,6 +237,23 @@ Returns a pre-configured `StatefulButton` without adding it to the view. Use in 
 #### `make_back_button(label="Back", style=ButtonStyle.secondary, emoji="◀", custom_id=None, row=None)`
 
 Returns an unattached `StatefulButton` whose callback pops the navigation stack. The matched pair to `make_exit_button()` -- pack it into a caller-owned `ActionRow` or `Container` subtree. For the top-level auto-injected case, set `auto_back_button = True` instead.
+
+The button renders disabled while the navigation stack is empty, which is the state a root view sits in. That is resolved at each render seam rather than at construction, because a pushed view is built before `_navigate_to` hands it its stack. Should a press still reach an empty stack, it acknowledges the interaction and leaves the message alone -- tearing the panel down there would destroy a working message on a press that asked for nothing. Override `_clear_on_empty_back` to close the panel instead, though `exit()` and the Exit button are the surfaces built for that.
+
+#### `nav_depth`
+
+Read-only `int`: how many views sit beneath this one on the navigation stack. Zero on a view opened directly, one on the first push. Sits alongside `undo_depth` and `redo_depth`.
+
+Disabled and absent are different answers. The library disables a Back button with nowhere to go, but a screen reachable both by a push and by its own slash command usually wants that button gone on the root entry rather than greyed:
+
+```python
+async def on_load(self):
+    self.clear_items()
+    self.add_item(card(*self.rows()))
+    self.add_item(self.make_nav_row(back=bool(self.nav_depth)))
+```
+
+Safe to read inside `on_load`, which is where a view composes its tree: `_navigate_to` assigns the stack before it runs the destination's load hook, so the count is already correct.
 
 #### `add_exit_button(label="Exit", style=ButtonStyle.secondary, row=None, emoji="❌", delete_message=None, custom_id=None)`
 
@@ -355,7 +372,7 @@ Select the state your view *displays*. A theme resolved through `get_theme()` is
 
 #### `await register_participant(user_id, *, interaction=None) -> bool`
 
-Registers a non-owner user in the instance index so that `instance_limit` and `participant_limit` apply to them. Returns `True` on success (including the owner short-circuit), `False` on rejection. Never raises.
+Registers a non-owner user in the instance index so that `instance_limit` and `participant_limit` apply to them. Returns `True` on success (including the owner short-circuit), `False` on rejection. Rejections have no exception path; check the bool. It does raise `TypeError` for a `user_id` that cannot be coerced to a snowflake, and the default `on_instance_limit` re-raises `InstanceLimitError` when the view has neither an interaction nor a context to answer on.
 
 `user_id` accepts either an `int` or any object with an `int .id` attribute (`discord.Member`, `discord.User`, `discord.Object`) -- coercion happens silently at the entry point.
 
@@ -368,7 +385,7 @@ Pass the `interaction` keyword when the registration is driven by a button or se
 
 #### `unregister_participant(user_id)`
 
-Removes a participant from the session index. Use when a participant leaves a multi-user view (e.g., a player disconnects mid-game).
+Removes a participant from the instance index. Use when a participant leaves a multi-user view (e.g., a player disconnects mid-game).
 
 #### `interaction_check(interaction)` *(override)*
 
@@ -401,7 +418,7 @@ Called before every component callback. Returns `True` to allow, `False` to bloc
 - `unauthorized_message` (str): Ephemeral message sent to non-owners (default: `"You cannot interact with this."`).
 - `error_message` (str): Description used in the default `on_error` red embed (default: `"An unexpected error occurred while processing your interaction."`).
 - `reopen_failure_message` (str): Ephemeral message sent when the ephemeral refresh button fails to reconstruct the view (default: `"Could not refresh this view. Please reopen from the original command."`). Used by the default `on_reopen_failure` hook. Only relevant for ephemeral views where the auto-refresh handoff is engaged (either `auto_refresh_ephemeral = True` or derived from a timeout greater than `900`).
-- `allowed_users` (frozenset[int]): When non-empty, only these user IDs can interact. Overrides `owner_only` completely. Empty (default) defers to `owner_only`. Stored as a `frozenset` and exposed via a property pair: assignment coerces both `int` and snowflake-shaped objects (`Member`, `User`, `Object`) at the setter, so `view.allowed_users = {member, 12345}` works. Direct mutation is unsupported -- to add a user after construction, use `await view.register_participant(user_id)` (which writes to `_participants`, not `allowed_users`) or rebind the attribute: `view.allowed_users = view.allowed_users | {new_id}`.
+- `allowed_users` (frozenset[int] | None): `None` (default) defers to `owner_only`. Once set to anything else, only those user IDs can interact and `owner_only` is ignored entirely. The gate tests `is not None`, so an explicitly assigned empty set admits nobody rather than falling back: clear the list by assigning `None`, not `set()`. Because the default is `None`, guard membership checks (`if view.allowed_users and uid in view.allowed_users`) rather than testing `in` directly. Stored as a `frozenset` and exposed via a property pair: assignment coerces both `int` and snowflake-shaped objects (`Member`, `User`, `Object`) at the setter, so `view.allowed_users = {member, 12345}` works. Direct mutation is unsupported -- to add a user after construction, use `await view.register_participant(user_id)` (which writes to `_participants`, not `allowed_users`) or rebind the attribute: `view.allowed_users = view.allowed_users | {new_id}`.
 - `participant_limit` (int | None): Maximum total view occupants (owner + participants). `None` (default) means unlimited. Owner counts toward the cap, so `participant_limit = 8` admits one host plus seven joiners. Enforced inside `register_participant`.
 - `participant_limit_message` (str): Ephemeral message sent when `register_participant` rejects a joiner due to view-capacity overflow (default: `"This session is full."`). Used by the default `on_participant_limit` hook.
 - `auto_register_participants` (bool): When `True`, `send()` iterates `allowed_users` and calls `register_participant` for each non-owner before the Discord send. All-or-nothing rollback: any rejection unregisters every previously-claimed slot and tears the view back out of the registry, then `send()` returns `None`. A rejection therefore leaves zero side effects: no message, no registry entry, no half-claimed participants. Default: `False`.
@@ -462,7 +479,7 @@ V2 views ARE the message content -- `send()` takes no `content` or `embed` param
 
 ##### `make_nav_row(*, back=True, exit=True, back_label="Back", exit_label="Exit", back_style=secondary, back_emoji="◀", exit_style=secondary, exit_emoji="❌", delete_message=None, back_custom_id=None, exit_custom_id=None)`
 
-Returns one `ActionRow` containing a Back button and/or an Exit button: the V2 navigation footer helper. Raises `ValueError` if both `back` and `exit` are `False`. Back pops the navigation stack; Exit calls `self.exit()` (`delete_message=None` defers to `exit_policy`; `True` or `False` overrides it). When the popped view defines `on_load()`, that hook runs on the restored view before the edit ships, re-fetching its source on render. The `back_*` / `exit_*` label, style, and emoji kwargs forward to `make_back_button` / `make_exit_button`, so a relabeled Back (`make_nav_row(back_label="Leagues", back_emoji="🏠")`) needs no manual composition.
+Returns one `ActionRow` containing a Back button and/or an Exit button: the V2 navigation footer helper. Raises `ValueError` if both `back` and `exit` are `False`. Back pops the navigation stack and renders disabled while that stack is empty (see `make_back_button` above); Exit calls `self.exit()` (`delete_message=None` defers to `exit_policy`; `True` or `False` overrides it). When the popped view defines `on_load()`, that hook runs on the restored view before the edit ships, re-fetching its source on render. The `back_*` / `exit_*` label, style, and emoji kwargs forward to `make_back_button` / `make_exit_button`, so a relabeled Back (`make_nav_row(back_label="Leagues", back_emoji="🏠")`) needs no manual composition.
 
 ```python
 def build_ui(self):
@@ -504,7 +521,7 @@ TabLayoutView(
 )
 ```
 
-Each tab builder is an async function that returns a list of V2 components. The first tab is displayed on send.
+Each tab builder returns a list of V2 components; it may be `async def` or a plain `def`. `tabs=` takes a `{name: builder}` mapping or a sequence of `(name, builder)` pairs. The first tab is displayed on send.
 
 #### Class Attributes
 
@@ -541,8 +558,18 @@ WizardLayoutView(
 )
 ```
 
-- `builder(self)` -- async, returns a list of V2 components for the step
-- `validator(self, interaction)` -- async, returns `True` to proceed or `False` to block
+- `builder()` -- takes no arguments, returns a list of V2 components for the
+  step. Sync or async; the result is awaited only if it is awaitable.
+- `validator()` -- takes no arguments, returns `(valid: bool, error: str)`.
+  Sync or async. A bare `bool` is read as the answer it plainly is, with no
+  message. Anything else that is not a pair is refused, naming the step and
+  the shape it owes: a two-character string and a two-key dict both unpack
+  without complaint and hand back a truthy first element, which would
+  advance the wizard past the step the validator was rejecting.
+- `condition(view)` -- must be synchronous. An async predicate returns a
+  coroutine, which is always truthy, so the step would render regardless of
+  the answer; `WizardStep` rejects one at construction and a step written as
+  a dict warns at the visibility check.
 
 #### Methods
 
@@ -560,13 +587,13 @@ Back, Next, and Finish buttons are added automatically. Back is disabled on the 
 
 | Attribute | Default | Purpose |
 |---|---|---|
-| `back_button_label` | `"Back"` | Back button label |
+| `back_button_label` | `None` | Back button label. `None` renders "Back" |
 | `back_button_emoji` | `None` | Back button emoji |
 | `back_button_style` | `ButtonStyle.secondary` | Back button style |
-| `next_button_label` | `"Next"` | Next button label |
+| `next_button_label` | `None` | Next button label. `None` renders "Next" |
 | `next_button_emoji` | `None` | Next button emoji |
 | `next_button_style` | `ButtonStyle.primary` | Next button style |
-| `finish_button_label` | `"Finish"` | Finish button label |
+| `finish_button_label` | `None` | Finish button label. `None` renders "Finish" |
 | `finish_button_emoji` | `None` | Finish button emoji |
 | `finish_button_style` | `ButtonStyle.success` | Finish button style |
 | `step_indicator_label` | `None` | Callable `(current, total) -> str`. Default: `"Step {current}/{total}"` |
@@ -697,6 +724,15 @@ await view.send()
 | `card_color` | `None` | Optional `discord.Color` for the rankings card accent. `None` falls through to the active theme. |
 | `show_title_divider` | `True` | Toggle the divider rendered below the title. |
 | `avatar_backfill` | `False` | Section mode only. Renders default avatars immediately, resolves the real ones off the render path via `resolve_avatar_urls`, then reloads. Avoids a blocking first render and per-row fetches on large guilds. |
+
+**What `entries=` accepts.** A sequence of `(user_id, stats_dict)` pairs is
+the documented shape, and `get_entries()` returns the same. Three other
+shapes are converted rather than refused, because each carries exactly that
+data in a different container: a `{user_id: stats_dict}` mapping, a
+generator or other one-pass iterable, and a sequence of two-element lists.
+Anything else raises `TypeError` where it was supplied, naming the class,
+the argument, and the index of the entry that was wrong -- rather than
+failing later inside the page build.
 
 **Constructor.** Besides `entries=` / `title=` / `subtitle=` / `banner=`, `LeaderboardLayoutView` accepts an optional `bot=` kwarg. Passing it lets the default `get_avatar_url` resolve avatars from the bot's user cache in Section mode. The persistent variant receives the bot through `on_bind` instead (it is stripped from the persistence round-trip).
 
@@ -946,7 +982,7 @@ StatefulView(context=None, **kwargs)
 
 #### V1-Specific Methods
 
-##### `send(content=None, *, embed=None, embeds=None, ephemeral=False)`
+##### `send(content=None, *, embed=None, embeds=None, file=None, files=None, allowed_mentions=None, ephemeral=False)`
 
 Sends the view with optional content and embeds.
 
@@ -1114,7 +1150,7 @@ Optional decorators for wrapping callbacks in error boundaries, retry logic, or 
 
 ### `@with_error_boundary(name=None)`
 
-Wraps an async callable so exceptions are logged with context (message at ERROR, traceback at DEBUG) and then **re-raised** for the caller to handle. Use where a raised exception would otherwise reach the asyncio event loop without any indication of which call site produced it. Reach for `safe_execute` instead when the exception should be absorbed rather than propagated.
+Wraps a callable (`async def` or a plain `def`) so exceptions are logged with context (message at ERROR, traceback at DEBUG) and then **re-raised** for the caller to handle. Use where a raised exception would otherwise reach the asyncio event loop without any indication of which call site produced it. Reach for `safe_execute` instead when the exception should be absorbed rather than propagated.
 
 ```python
 from cascadeui import with_error_boundary
@@ -1126,7 +1162,7 @@ async def sync_scores(user_id):
 
 ### `@with_retry(config=None)`
 
-Retries an async callable on failure with exponential backoff. Accepts an optional `RetryConfig(max_retries=3, backoff_factor=1.0, exceptions_to_retry=(Exception,), max_backoff=30.0)`.
+Retries a callable (`async def` or a plain `def`) on failure with exponential backoff. The decorated result is always awaitable, since the retry loop is. Accepts an optional `RetryConfig(max_retries=3, backoff_factor=1.0, exceptions_to_retry=(Exception,), max_backoff=30.0)`.
 
 ```python
 from cascadeui import RetryConfig, with_retry
@@ -1176,7 +1212,10 @@ coercion, exposed for user code doing the same normalization.
 
 ### `is_snowflake(value) -> bool`
 
-Whether `value` is plausibly a Discord snowflake, by magnitude. Test fixtures
+Whether `value` is plausibly a Discord snowflake. Decodes the creation
+timestamp packed into the id's high bits and checks it lands between
+Discord's epoch and now, so an oversized integer fails on the date it
+decodes to rather than on its size. Test fixtures
 using small integers read as `False`.
 
 ### `coerce_snowflake_id(value) -> int`

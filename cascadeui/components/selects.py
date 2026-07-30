@@ -100,9 +100,19 @@ class Dropdown(StatefulSelect):
         callback: Optional[Callable] = None,
         **kwargs,
     ):
-        # Process options if they're dictionaries
+        # Dicts are converted; SelectOptions pass through. Anything else is
+        # rejected here rather than appended untouched: a plain string became
+        # an option with no label and no value, and a single option dict
+        # passed without its list iterated as its own keys, both surfacing
+        # only when Discord tried to render the select.
+        if hasattr(options, "items"):
+            raise TypeError(
+                "Dropdown options must be a list of option dicts, not a single "
+                "mapping. Iterating a mapping yields its keys.\n"
+                "  Fix: wrap it in a list, e.g. options=[{'label': ..., 'value': ...}]."
+            )
         processed_options = []
-        for opt in options:
+        for index, opt in enumerate(options):
             if isinstance(opt, dict):
                 processed_options.append(
                     SelectOption(
@@ -113,8 +123,14 @@ class Dropdown(StatefulSelect):
                         default=opt.get("default", False),
                     )
                 )
-            else:
+            elif isinstance(opt, SelectOption):
                 processed_options.append(opt)
+            else:
+                raise TypeError(
+                    f"Dropdown options[{index}] must be a dict or a SelectOption, "
+                    f"got {type(opt).__name__}: {opt!r}\n"
+                    f"  Fix: pass {{'label': ..., 'value': ...}} per option."
+                )
 
         super().__init__(
             options=processed_options, placeholder=placeholder, callback=callback, **kwargs

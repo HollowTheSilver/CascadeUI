@@ -1,13 +1,17 @@
 # // ========================================( Modules )======================================== // #
 
 
+import logging
 from typing import Any, Callable, Optional
 
 import discord
 from discord import ButtonStyle, Interaction
 
-from ..state.actions import ActionCreators
+from ..utils.hooks import await_maybe
+from ..utils.responses import trailing_ack
 from .base import StatefulButton
+
+logger = logging.getLogger(__name__)
 
 # // ========================================( Classes )======================================== // #
 
@@ -53,7 +57,14 @@ class LinkButton(discord.ui.Button):
 
 
 class ToggleButton(StatefulButton):
-    """A button that toggles between two states."""
+    """A button that toggles between two states.
+
+    The flip runs inside the same stateful callback every other
+    component uses, so ``owner_only=``, the acting-view fast path, and
+    the finished-view dispatch skip all apply here as they do to a
+    plain ``StatefulButton``. ``value`` reports the state the button
+    ended on, which is what ``COMPONENT_INTERACTION`` records.
+    """
 
     def __init__(
         self,
@@ -66,6 +77,7 @@ class ToggleButton(StatefulButton):
         self.original_label = label
         self.toggled_label = toggled_label or f"{label} ✓"
         self.is_toggled = toggled
+        self.user_callback = callback
 
         # Set initial style
         if toggled:
@@ -75,40 +87,22 @@ class ToggleButton(StatefulButton):
             kwargs.setdefault("style", ButtonStyle.secondary)
             current_label = self.original_label
 
-        # Create the button
-        super().__init__(label=current_label, **kwargs)
+        # Passing the toggle through ``callback=`` is what routes it into
+        # ``create_stateful_callback``. Assigning ``self.callback`` after
+        # construction instead would replace that wrapper and drop every
+        # guard it carries.
+        super().__init__(label=current_label, callback=self._toggle, **kwargs)
 
-        # Store original callback and create toggle wrapper
-        self.user_callback = callback
-        self.callback = self._create_toggle_callback()
+    @property
+    def value(self) -> bool:
+        return self.is_toggled
 
-    def _create_toggle_callback(self):
-        """Create a callback that handles toggling."""
+    async def _toggle(self, interaction: Interaction) -> None:
+        self.is_toggled = not self.is_toggled
+        self.label = self.toggled_label if self.is_toggled else self.original_label
+        self.style = ButtonStyle.success if self.is_toggled else ButtonStyle.secondary
 
-        async def toggle_callback(interaction: Interaction):
-            # Toggle state
-            self.is_toggled = not self.is_toggled
-
-            # Update button appearance
-            self.label = self.toggled_label if self.is_toggled else self.original_label
-            self.style = ButtonStyle.success if self.is_toggled else ButtonStyle.secondary
-
-            # Dispatch state update using public .view property from discord.ui.Item
-            view = self.view
-            if view and hasattr(view, "dispatch"):
-                component_id = getattr(self, "custom_id", None) or str(id(self))
-                payload = ActionCreators.component_interaction(
-                    component_id=component_id,
-                    view_id=view.id,
-                    user_id=interaction.user.id,
-                    value=self.is_toggled,
-                )
-                await view.dispatch("COMPONENT_INTERACTION", payload)
-
-            # Call user callback if provided
-            if self.user_callback:
-                await self.user_callback(interaction)
-            elif not interaction.response.is_done():
-                await interaction.response.defer()
-
-        return toggle_callback
+        if self.user_callback:
+            await await_maybe(self.user_callback(interaction))
+        else:
+            await trailing_ack(interaction, owner="ToggleButton", log=logger)

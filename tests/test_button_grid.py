@@ -1,4 +1,4 @@
-"""Tests for button_grid() — ActionRow packing and Discord 5x5 limit."""
+"""Tests for button_grid(): ActionRow packing and Discord 5x5 limit."""
 
 import discord
 import pytest

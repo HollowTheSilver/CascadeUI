@@ -9,7 +9,31 @@ import discord
 
 logger = logging.getLogger(__name__)
 
+# Every way a Discord call reports that it did not land. ``RateLimited``
+# is a sibling of ``HTTPException`` rather than a subclass, so catching
+# the latter alone misses it -- and it is raised whenever the client was
+# built with ``max_ratelimit_timeout`` and a bucket exceeds it, which is
+# a supported upstream option, not an exotic one. Catch this tuple at
+# any seam that must survive a failed call; catch ``InteractionResponded``
+# separately, since at an ack it means the work is already done and at an
+# edit it means to try another endpoint.
+DISCORD_CALL_ERRORS = (discord.HTTPException, discord.RateLimited)
+
 # // ========================================( Functions )======================================== // #
+
+
+def describe_discord_error(exc: BaseException) -> str:
+    """Name the cause of a failed Discord call in one clause.
+
+    ``RateLimited`` carries ``retry_after`` and neither ``status`` nor
+    ``code``, so a log line written for ``HTTPException`` prints two
+    question marks and hides the one number that explains the failure.
+    """
+    if isinstance(exc, discord.RateLimited):
+        return f"rate limited, retry_after={exc.retry_after:.1f}s"
+    if isinstance(exc, discord.InteractionResponded):
+        return "interaction already acknowledged"
+    return f"status={getattr(exc, 'status', '?')} code={getattr(exc, 'code', '?')}"
 
 
 def elapsed_since(interaction: discord.Interaction) -> str:
@@ -23,7 +47,7 @@ def elapsed_since(interaction: discord.Interaction) -> str:
     only what the log says. Labelling the number keeps it from
     contradicting the sentence it annotates: a host running behind
     prints an elapsed time under 3s beside a message reporting a missed
-    3s deadline, which sends the reader after the wrong cause.
+    3s deadline, which sends the operator after the wrong cause.
 
     Degrades to a placeholder rather than raising: a diagnostic must
     never crash the ack path it is reporting on.
@@ -89,8 +113,8 @@ async def ack_backstop(
                 # here: discord.py sleeps on an exhausted bucket inside
                 # HTTPClient.request, so the call simply takes longer and
                 # nothing distinguishes it from a busy loop. The other two
-                # causes both point at the caller's own code, which sends a
-                # reader looking there first.
+                # causes both point at the caller's own code, which sends an
+                # operator looking there first.
                 f"Auto-defer ack missed the 3s deadline in {owner}: "
                 f"{elapsed_since(interaction)} (event-loop congestion, slow "
                 f"pre-callback work, or a rate-limit wait inside an earlier "
@@ -129,14 +153,17 @@ async def trailing_ack(
         await interaction.response.defer()
     except discord.NotFound:
         log.debug(f"Post-callback defer hit a dead interaction in {owner} (10062)")
-    except discord.HTTPException as e:
+    except DISCORD_CALL_ERRORS as e:
         if getattr(e, "code", None) == 40060:
             log.debug(f"Post-callback defer raced an existing ack in {owner} (40060)")
         else:
+            # RateLimited lands here rather than in the generic branch below,
+            # which called it an expired interaction -- the wrong cause, and
+            # the one case where the fix is to slow down rather than to look
+            # for a dead token.
             log.warning(
                 f"Post-callback defer failed in {owner}: "
-                f"status={getattr(e, 'status', '?')} code={getattr(e, 'code', '?')} "
-                f"({elapsed_since(interaction)})"
+                f"{describe_discord_error(e)} ({elapsed_since(interaction)})"
             )
     except Exception:
         log.debug(f"Post-callback defer failed in {owner} (interaction may have expired)")

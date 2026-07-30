@@ -157,6 +157,50 @@ class TestMiddlewareRoutesApplication:
         assert len(rows) == 1
         assert rows[0]["slot_name"] == "prefs"
 
+    async def test_config_declared_policy_slot_queues_upsert(self):
+        """A persistent SlotPolicy is enough on its own to reach the backend.
+
+        Deliberately omits the ``_PERSISTENT_SLOTS.add`` its sibling tests
+        perform: proving that manual step is unnecessary is the point. The
+        policy registered the TTL and nothing else, so the opt-in scan
+        skipped the slot and this write went nowhere.
+        """
+        backend = InMemoryBackend()
+        await backend.initialize()
+        store = get_store()
+        mgr = PersistenceManager(
+            store=store,
+            registry=RegistryPersistence(backend=backend),
+            application=ApplicationPersistence(
+                backend=backend,
+                slots={"user_preferences": SlotPolicy(persistent=True)},
+            ),
+        )
+        middleware = PersistenceMiddleware(mgr)
+        middleware._ns_application.interval = 0.01
+        middleware._ns_application.max_age = 0.02
+
+        state_before = store.state
+
+        async def mutate_app(action, state):
+            new = dict(state)
+            new["application"] = {
+                **state.get("application", {}),
+                "user_preferences": {"theme": "dark"},
+            }
+            store.state = new
+            return new
+
+        await middleware({"type": "SET_PREFS", "payload": {}}, state_before, mutate_app)
+
+        assert "user_preferences" in middleware._ns_application.dirty_rows
+
+        await asyncio.sleep(0.05)
+        await _drain(middleware)
+
+        rows = await backend.row_select(TABLE_APPLICATION_SLOTS)
+        assert [r["slot_name"] for r in rows] == ["user_preferences"]
+
     async def test_slot_set_to_none_queues_delete(self):
         middleware, mgr, backend = await _make_middleware()
         middleware._ns_application.interval = 0.01
@@ -682,6 +726,85 @@ class TestMiddlewareRetryBackoff:
 
 
 # // ========================================( Observability hooks )======================================== // #
+
+
+class TestMiddlewareFlushCancellation:
+    """A cancel landing mid-write returns the batch to the buffers.
+
+    ``_flush`` drains ``dirty_rows``/``deleted_keys`` into a local
+    snapshot before awaiting the backend. ``CancelledError`` is a
+    ``BaseException``, so the retry path's ``except Exception`` never
+    saw it and the snapshot went nowhere. ``flush_all`` opens exactly
+    that window at shutdown: it cancels in-flight flush tasks and then
+    drains, so the rows lost were the ones ``close`` exists to persist.
+    """
+
+    def _dirty_row(self, slot="pref"):
+        return {
+            "slot_name": slot,
+            "payload": '{"k": 1}',
+            "schema_version": 1,
+            "updated_at": 1,
+            "expires_at": None,
+        }
+
+    async def test_cancel_mid_write_returns_the_batch(self):
+        middleware, _mgr, backend = await _make_middleware()
+        ns = middleware._ns_application
+
+        started = asyncio.Event()
+        original = backend.row_upsert_many
+
+        async def hangs(table, rows, key_columns):
+            started.set()
+            await asyncio.sleep(3600)
+
+        backend.row_upsert_many = hangs  # type: ignore[method-assign]
+        ns.dirty_rows["pref"] = self._dirty_row()
+
+        task = asyncio.create_task(middleware._flush(ns))
+        await started.wait()
+        assert ns.dirty_rows == {}, "drained into the snapshot, as designed"
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert "pref" in ns.dirty_rows
+
+        # close() drains, so the hanging stand-in has to go first or the
+        # requeued row parks the shutdown on it.
+        backend.row_upsert_many = original  # type: ignore[method-assign]
+        await middleware.close()
+
+    async def test_shutdown_persists_a_batch_whose_flush_was_cancelled(self):
+        """The end-to-end shape: ``close`` cancels the in-flight flush,
+        then drains, and the row reaches the backend."""
+        middleware, _mgr, backend = await _make_middleware()
+        ns = middleware._ns_application
+
+        started = asyncio.Event()
+        hang = True
+        written = []
+        original = backend.row_upsert_many
+
+        async def maybe_hangs(table, rows, key_columns):
+            if hang:
+                started.set()
+                await asyncio.sleep(3600)
+            written.extend(rows)
+            return await original(table, rows, key_columns)
+
+        backend.row_upsert_many = maybe_hangs  # type: ignore[method-assign]
+        ns.dirty_rows["pref"] = self._dirty_row()
+        ns.task = asyncio.ensure_future(middleware._flush(ns))
+        middleware._tasks.add(ns.task)
+        await started.wait()
+
+        hang = False
+        await middleware.close()
+
+        assert [r["slot_name"] for r in written] == ["pref"]
 
 
 class TestMiddlewareBatchedFlush:
