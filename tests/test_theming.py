@@ -462,3 +462,37 @@ class TestSelectorCarriesTheme:
                 raise RuntimeError("boom")
 
         assert _Broken()._theme_key() is None
+
+
+class TestThemeDoesNotAdoptTheCallersMapping:
+    """``Theme`` copies the styles it is given before seeding defaults.
+
+    ``normalize_mapping`` returns a mapping untouched by contract, which
+    suits its read-only callers and not the one caller that writes into
+    the result. Holding the caller's own dict made construction add six
+    keys to it as a side effect, and made two Themes built from one base
+    share a single live mapping.
+    """
+
+    def test_construction_leaves_the_caller_dict_alone(self):
+        base = {"primary_color": discord.Color.blue()}
+
+        Theme("custom", base)
+
+        assert list(base) == ["primary_color"]
+
+    def test_two_themes_from_one_base_do_not_share_styles(self):
+        base = {"primary_color": discord.Color.blue()}
+
+        first = Theme("first", base)
+        second = Theme("second", base)
+        first.styles["accent_colour"] = discord.Color.red()
+
+        assert first.styles is not second.styles
+        assert second.styles["accent_colour"] != discord.Color.red()
+
+    def test_pair_sequence_still_converts(self):
+        theme = Theme("pairs", [("primary_color", discord.Color.gold())])
+
+        assert theme.get_style("primary_color") == discord.Color.gold()
+        assert theme.get_style("separator_spacing") == "small"

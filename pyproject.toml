@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pycascadeui"
-version = "3.8.0"
+version = "3.9.0"
 description = "Redux-inspired UI framework for discord.py"
 readme = "README.md"
 license = "MIT"

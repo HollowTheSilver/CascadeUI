@@ -254,9 +254,10 @@ fields = [
 
 ### Typed schemas (`FormField` / `FormSchema`)
 
-The dict API stays valid. The typed alternative gives IDE auto-complete
-and class-definition-time validation: a typo in `type="interger"` raises
-`ValueError` at construction rather than silently at first click.
+The dict API stays valid, and both forms reject a typo in
+`type="interger"` at construction. What the typed alternative adds is IDE
+auto-complete and failure at schema-definition time rather than when the
+view is built.
 
 ```python
 from cascadeui import FormField, FormSchema
@@ -324,15 +325,17 @@ the message shown, and the next submit re-runs the check.
 A field change clears only that field's own error; the others stay until
 they change or the next submit re-checks them.
 
-### `on_field_changed(field_id, value)`
+### `on_field_changed(field_name, old, new)`
 
 Fires after a field value changes (select choice, toggle flip, modal
-submit write-back). The hook is fire-and-forget and does not block the
-state rebuild:
+submit write-back), and only when the value actually moved: `old != new`
+is checked before the hook runs. `old` is `None` for a field that had no
+value yet. The hook is fire-and-forget and does not block the state
+rebuild:
 
 ```python
-async def on_field_changed(self, field_id, value):
-    if field_id == "class" and value == "mage":
+async def on_field_changed(self, field_name, old, new):
+    if field_name == "class" and new == "mage":
         self.values["weapon"] = "staff"
 ```
 
@@ -437,9 +440,9 @@ class SetupWizard(WizardLayoutView):
 | Step Key | Required | Description |
 |----------|----------|-------------|
 | `name` | Yes | Step display name (used in indicator) |
-| `builder` | Yes | Async callable returning content (embed for V1, component list for V2) |
-| `validator` | No | Async callable returning `(valid: bool, error: str)` -- gates the Next button |
-| `condition` | No | Callable `(view) -> bool` -- step is skipped when it returns `False` |
+| `builder` | No | Callable returning content (embed for V1, component list for V2). Sync or async. A step with no builder renders its navigation alone |
+| `validator` | No | Callable returning `(valid: bool, error: str)` -- gates the Next button. Sync or async |
+| `condition` | No | Callable `(view) -> bool` -- step is skipped when it returns `False`. Must be synchronous |
 
 When a validator returns `(False, "error message")`, the error is shown
 as an ephemeral message and the wizard stays on the current step.
@@ -465,8 +468,12 @@ Condition callables are evaluated on every navigation, so toggling
 
 ### Typed schemas (`WizardStep` / `WizardSchema`)
 
-Same pattern as the form side. Dict API stays valid; the typed variant
-catches a missing `builder` or a non-callable `validator` at construction.
+Same pattern as the form side. Both forms reject a non-callable `builder`,
+`validator` or `condition` at construction, and both reject an async
+`condition`. What the typed variant adds is IDE auto-complete, a required
+`builder` (the dict form treats it as optional, since a step with none
+renders its navigation alone), and failure at schema-definition time rather
+than when the view is built.
 
 ```python
 from cascadeui import WizardStep, WizardSchema
@@ -495,17 +502,17 @@ Per-step values live on the view as they always have.
 
 | Attribute | Default | Controls |
 |-----------|---------|----------|
-| `back_button_label` | `"Back"` | Label for the Back button |
+| `back_button_label` | `None` | Label for the Back button. `None` renders "Back" |
 | `back_button_emoji` | `None` | Emoji on the Back button |
 | `back_button_style` | `secondary` | Style of the Back button |
-| `next_button_label` | `"Next"` | Label for the Next button |
+| `next_button_label` | `None` | Label for the Next button. `None` renders "Next" |
 | `next_button_emoji` | `None` | Emoji on the Next button |
 | `next_button_style` | `primary` | Style of the Next button |
-| `finish_button_label` | `"Finish"` | Label on the last step's button |
+| `finish_button_label` | `None` | Label on the last step's button. `None` renders "Finish" |
 | `finish_button_emoji` | `None` | Emoji on the Finish button |
 | `finish_button_style` | `success` | Style of the Finish button |
 | `step_indicator_label` | `None` | `Callable(current, total) -> str` for custom indicator |
-| `show_progress_bar` | `False` | V2 only -- when `True`, renders a progress header above the step content |
+| `show_progress_bar` | `True` | V2 only -- renders a progress header above the step content whenever more than one step is visible |
 
 The step indicator defaults to `"Step {n}/{total}"`. Pass a callable
 for custom formatting:
@@ -521,22 +528,24 @@ class MyWizard(WizardLayoutView):
 
 ### Progress header (V2)
 
-With `show_progress_bar = True`, `WizardLayoutView` renders a progress
-header inside a `card()` above the step content. The default header
-uses the step indicator label plus a proportional progress bar.
+`WizardLayoutView` renders a progress header inside a `card()` above the
+step content by default, whenever more than one step is visible. The
+default header is a proportional progress bar. Set
+`show_progress_bar = False` to suppress it.
 
-Override `_build_progress_header()` to customize the header component:
+Override `_build_progress_header(visible_indices)` to customize the header
+component. Returning `None` suppresses it for that render:
 
 ```python
 class SetupWizard(WizardLayoutView):
-    show_progress_bar = True
-
-    def _build_progress_header(self):
-        # step_indicator_label defaults to None, so a subclass that has not
-        # set it renders the label itself rather than calling through.
+    def _build_progress_header(self, visible_indices):
+        # visible_indices holds the steps whose condition currently passes,
+        # so the count tracks what the user will actually walk through.
+        # step_count would include steps this run has skipped.
+        position = visible_indices.index(self.current_step) + 1
         return card(
-            f"## Step {self.current_step + 1} of {self.step_count}",
-            progress_bar(self.current_step + 1, self.step_count),
+            f"## Step {position} of {len(visible_indices)}",
+            progress_bar(position, len(visible_indices)),
         )
 ```
 
@@ -547,17 +556,22 @@ reacting to step transitions and validation outcomes:
 
 | Hook | Fires |
 |------|-------|
-| `on_step_entered(step_index)` | After a step becomes active (initial send, next, back) |
+| `on_step_entered(step_index)` | After a step becomes active via Next or Back. Does not fire for the first step on the initial render |
 | `on_step_exited(step_index)` | Before leaving a step (next or back) |
-| `on_validation_failed(step_index, error)` | When the current step's validator returns `(False, error)` |
+| `on_validation_failed(step_index, error, interaction=None)` | When the current step's validator returns `(False, error)` |
 
 ```python
 async def on_step_entered(self, step_index):
     await self.analytics.log("wizard_step_entered", step=step_index)
 
-async def on_validation_failed(self, step_index, error):
+async def on_validation_failed(self, step_index, error, interaction=None):
     self.failed_attempts += 1
 ```
+
+Overriding `on_validation_failed` replaces the default, which is what shows
+the validator's message to the user. Keep the `interaction` parameter and
+either call `super()` or send the feedback yourself, or a failed step
+rejects the user silently.
 
 Hooks are fire-and-forget -- exceptions raised inside them are logged
 but do not block navigation.
@@ -628,7 +642,7 @@ Tabbed interface with button-based tab switching.
 
 ### Tab Definitions
 
-Tabs are passed as a dict mapping names to async builder functions:
+Tabs are passed as a dict mapping names to builder functions, or as a sequence of `(name, builder)` pairs. A builder may be `async def` or a plain `def`:
 
 ```python
 class DashboardView(TabLayoutView):
@@ -1066,6 +1080,12 @@ change (multi-line, different separator).
 | `on_leaderboard_empty()` | Returns the V2 component list shown when `entries` is empty. Default wraps `leaderboard_empty_message` in a single card. |
 | `on_state_changed(state)` | Runs `rebuild_pages()` before the paginated refresh -- lets live-data subclasses re-fetch on every subscribed action. The rebuild short-circuits when the entries signature (user ids + stats) is unchanged, so identical re-fetches cost one comparison instead of a full page rebuild. |
 
+**What `entries=` accepts.** A sequence of `(user_id, stats_dict)` pairs is
+the documented shape. Three other containers carrying the same data convert
+rather than being refused, and anything else raises `TypeError` naming the
+class, the argument, and the offending index. See
+[the API reference](../api/views.md#leaderboardlayoutview-persistentleaderboardlayoutview) for the full list.
+
 ```python
 from cascadeui import LeaderboardLayoutView, progress_bar
 
@@ -1444,7 +1464,7 @@ Paginated views support dynamic data via `refresh_data()` for views
 created with `from_data()`:
 
 ```python
-async def reload(self, interaction):
+async def _on_refresh(self, interaction):
     fresh_items = await fetch_items_from_db()
     await self.refresh_data(fresh_items)
 ```
@@ -1453,15 +1473,22 @@ For cursor-mode views (`from_cursor()`), call `refresh_pages()` or
 `refresh_pages(new_total=N)` instead:
 
 ```python
-async def reload(self, interaction):
+async def _on_refresh(self, interaction):
     # Contents changed, row count did not
     await self.refresh_pages()
 
-async def reload_after_insert(self, interaction):
+async def _on_insert(self, interaction):
     # Rows added; resize the pages list
     new_total = await db.fetchval("SELECT count(*) FROM users")
     await self.refresh_pages(new_total=new_total)
 ```
+
+Do not name these `reload`. `reload()` is the library's own seam
+(`on_load()` then `refresh()`), it takes no positional argument, and it is
+called internally by the deferred-refresh replay, by persistent
+`on_restore`, and by the composite re-render probe. An override taking
+`interaction` shadows it, and every one of those internal calls raises
+`TypeError` on the missing argument.
 
 ### Combining Patterns with Navigation
 

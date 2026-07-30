@@ -12,6 +12,7 @@ from discord.ui import Item
 from ..state.actions import ActionCreators
 from ..state.store import _CURRENT_INTERACTION
 from ..utils.coercion import coerce_snowflake_match
+from ..utils.hooks import await_maybe
 from ..utils.responses import ack_backstop, open_modal_safe, respond_safe, trailing_ack
 from .types import MAX_SELECT_OPTIONS
 
@@ -60,7 +61,7 @@ class StatefulComponent:
 
                 # Call original callback if provided
                 if original_callback:
-                    return await original_callback(interaction)
+                    return await await_maybe(original_callback(interaction))
                 return
 
             # Per-component owner-only gate. Routes through the view's
@@ -87,17 +88,8 @@ class StatefulComponent:
                 and getattr(view, "user_id", None) is not None
                 and interaction.user.id != view.user_id
             ):
-                await view.on_unauthorized(interaction)
+                await await_maybe(view.on_unauthorized(interaction))
                 return
-
-            # Get component value
-            value = None
-            if hasattr(component, "value"):
-                value = component.value
-            elif hasattr(component, "values"):
-                value = component.values
-            elif isinstance(component, discord.ui.Button):
-                value = True
 
             # Bind the live interaction for the acting-view fast path in
             # ``_StatefulMixin.refresh()``. Scope-narrow: set for the original
@@ -110,13 +102,25 @@ class StatefulComponent:
                 # before state dispatch triggers on_state_changed notifications
                 if original_callback:
                     if _pass_values and component.values is not None:
-                        await original_callback(interaction, component.values)
+                        await await_maybe(original_callback(interaction, component.values))
                     else:
-                        await original_callback(interaction)
+                        await await_maybe(original_callback(interaction))
 
                 # Skip dispatch if the callback destroyed the view (exit, push, etc.)
                 if view.is_finished():
                     return
+
+                # Read the component's value after the callback so a component
+                # that mutates itself in its own callback (ToggleButton flipping
+                # ``is_toggled``) records the state it ended on, not the one it
+                # was clicked in.
+                value = None
+                if hasattr(component, "value"):
+                    value = component.value
+                elif hasattr(component, "values"):
+                    value = component.values
+                elif isinstance(component, discord.ui.Button):
+                    value = True
 
                 # Then dispatch state update (may trigger on_state_changed on views)
                 payload = ActionCreators.component_interaction(
@@ -184,17 +188,39 @@ class StatefulSelect(discord.ui.Select, StatefulComponent):
         # a single disabled placeholder so the select still renders and
         # the surrounding layout stays stable across state changes.
         options = kwargs.get("options")
-        if options is not None and len(options) == 0:
-            kwargs["options"] = [_EMPTY_SELECT_OPTION]
-            kwargs["disabled"] = True
-        elif options is not None and len(options) > MAX_SELECT_OPTIONS:
-            # Discord 400s a select with more than 25 options at send. Raise
-            # here so the mistake surfaces at construction, matching the cap
-            # choice_row already enforces for the same limit.
-            raise ValueError(
-                f"StatefulSelect has {len(options)} options; Discord accepts at most "
-                f"{MAX_SELECT_OPTIONS}. Trim the list or split the choices across selects."
-            )
+        if options is not None:
+            # A mapping has to be excluded before len() reads it, because it
+            # answers with a different meaning: len({"label": .., "value": ..})
+            # is 2, which clears both the empty check and the cap below, and
+            # discord.py then iterates the keys into two options named after
+            # them. Entries are checked here rather than at send, where the
+            # only symptom is an AttributeError raised inside discord.py.
+            if hasattr(options, "items"):
+                raise TypeError(
+                    "StatefulSelect options must be a list of SelectOption, not a "
+                    "single mapping. Iterating a mapping yields its keys.\n"
+                    "  Fix: wrap it in a list, or use Dropdown for dict shorthand."
+                )
+            for index, opt in enumerate(options):
+                if not isinstance(opt, discord.SelectOption):
+                    raise TypeError(
+                        f"StatefulSelect options[{index}] must be a SelectOption, got "
+                        f"{type(opt).__name__}: {opt!r}\n"
+                        f"  Fix: pass discord.SelectOption(label=..., value=...), or use "
+                        f"Dropdown for {{'label': ..., 'value': ...}} shorthand."
+                    )
+
+            if len(options) == 0:
+                kwargs["options"] = [_EMPTY_SELECT_OPTION]
+                kwargs["disabled"] = True
+            elif len(options) > MAX_SELECT_OPTIONS:
+                # Discord 400s a select with more than 25 options at send. Raise
+                # here so the mistake surfaces at construction, matching the cap
+                # choice_row already enforces for the same limit.
+                raise ValueError(
+                    f"StatefulSelect has {len(options)} options; Discord accepts at most "
+                    f"{MAX_SELECT_OPTIONS}. Trim the list or split the choices across selects."
+                )
 
         super().__init__(*args, **kwargs)
 
@@ -441,7 +467,7 @@ class DynamicPersistentButton(
         token = _CURRENT_INTERACTION.set(interaction)
         defer_task = asyncio.create_task(self._auto_defer_timer(interaction))
         try:
-            await self.on_click(interaction)
+            await await_maybe(self.on_click(interaction))
         finally:
             _CURRENT_INTERACTION.reset(token)
             if not defer_task.done():

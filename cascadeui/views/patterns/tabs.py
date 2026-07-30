@@ -2,13 +2,15 @@
 
 
 import logging
-from typing import Callable, ClassVar, Dict, List, Optional, Tuple, Union
+from typing import Callable, ClassVar, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import discord
 from discord import Interaction
 from discord.ui import ActionRow
 
 from ...components.base import StatefulButton
+from ...utils.guards import normalize_mapping
+from ...utils.hooks import await_maybe
 from ..base import _StatefulMixin
 from ..layout import StatefulLayoutView
 from ..view import StatefulView
@@ -328,10 +330,17 @@ class TabView(_BaseTabMixin, StatefulView):
         to reimplement the tab-button wiring.
     """
 
-    def __init__(self, *args, tabs: Optional[Dict[str, Callable]] = None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        tabs: Optional[Union[Mapping[str, Callable], Sequence[Tuple[str, Callable]]]] = None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
 
-        self._tabs: Dict[str, Callable] = tabs or {}
+        self._tabs: Dict[str, Callable] = (
+            normalize_mapping(tabs, owner=type(self).__name__, param="tabs") if tabs else {}
+        )
         self._tab_names: List[str] = list(self._tabs.keys())
         self._active_tab: int = 0
         self._tab_buttons: List[StatefulButton] = []
@@ -408,7 +417,7 @@ class TabView(_BaseTabMixin, StatefulView):
         if not self._tab_names:
             return {}
         builder = self._tabs[self._tab_names[self._active_tab]]
-        return {"embed": await builder()}
+        return {"embed": await await_maybe(builder())}
 
     async def _reload_render(self) -> None:
         await self._refresh_tabs()
@@ -419,7 +428,7 @@ class TabView(_BaseTabMixin, StatefulView):
 
         tab_name = self._tab_names[self._active_tab]
         builder = self._tabs[tab_name]
-        embed = await builder()
+        embed = await await_maybe(builder())
 
         await self.refresh(embed=embed)
 
@@ -436,10 +445,17 @@ class TabLayoutView(_BaseTabMixin, StatefulLayoutView):
     Customization + override hook mirror ``TabView``.
     """
 
-    def __init__(self, *args, tabs: Optional[Dict[str, Callable]] = None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        tabs: Optional[Union[Mapping[str, Callable], Sequence[Tuple[str, Callable]]]] = None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
 
-        self._tabs: Dict[str, Callable] = tabs or {}
+        self._tabs: Dict[str, Callable] = (
+            normalize_mapping(tabs, owner=type(self).__name__, param="tabs") if tabs else {}
+        )
         self._tab_names: List[str] = list(self._tabs.keys())
         self._active_tab: int = 0
         self._tab_buttons: List[StatefulButton] = []
@@ -512,7 +528,7 @@ class TabLayoutView(_BaseTabMixin, StatefulLayoutView):
         from ...theming.context import theme_context
 
         with theme_context(self.get_theme()):
-            content = await builder()
+            content = await await_maybe(builder())
 
         if isinstance(content, list):
             for item in content:

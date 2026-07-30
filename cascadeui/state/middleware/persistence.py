@@ -14,11 +14,11 @@ Design contracts:
   immediately; application writes debounce at 2s with a 10s ceiling.
   Steady traffic that never hits the idle window still flushes when
   ``max_age`` expires.
-- **Opt-in filter at the dispatch seam.** Only slots registered
-  persistent via :func:`~cascadeui.state.slots.access_slot` with
-  ``persistent=True`` reach the backend. Everything else is skipped at
-  routing time and the middleware never schedules a task for it. This
-  mirrors the opt-in model used by ``PersistentView``.
+- **Opt-in filter at the dispatch seam.** Only slots declared persistent
+  reach the backend, by whichever route
+  :func:`~cascadeui.state.slots.is_persistent_slot` documents. Everything
+  else is skipped at routing time and the middleware never schedules a
+  task for it. This mirrors the opt-in model used by ``PersistentView``.
 - **Direct task ownership.** Flush tasks are created via
   ``asyncio.create_task`` and tracked on the middleware itself. Cancel
   unwinds through asyncio's own coroutine driver so shutdown leaves no
@@ -48,6 +48,7 @@ from ...persistence.schema import (
     TABLE_APPLICATION_SLOTS,
     TABLE_PERSISTENT_VIEWS,
 )
+from ...utils.hooks import await_maybe
 from ..types import Action, StateData
 
 if TYPE_CHECKING:
@@ -405,7 +406,7 @@ class PersistenceMiddleware:
                     "PersistenceMiddleware with no backend configured "
                     "defaults to SQLiteBackend('cascadeui.db'), which "
                     "requires the optional 'aiosqlite' dependency. "
-                    "Install it with: pip install 'cascadeui[sqlite]' "
+                    "Install it with: pip install 'pycascadeui[sqlite]' "
                     "or pass an explicit backend= argument."
                 ) from exc
             backend = SQLiteBackend("cascadeui.db")
@@ -655,6 +656,27 @@ class PersistenceMiddleware:
 
         table, key_columns, delete_column = self._namespace_tables(ns.name)
 
+        def requeue() -> None:
+            """Return the snapshot to the buffers it was drained from.
+
+            Restores the single-buffer-per-key invariant the routing
+            helpers maintain (a key lives in ``dirty_rows`` OR
+            ``deleted_keys``, never both). A re-register or unregister
+            that arrived while the write was in flight may have claimed a
+            key for the opposite buffer, so each side skips a key the
+            other side now owns: the snapshot never resurrects a key in
+            the buffer it left, and the newer write survives the next
+            flush. That guard is what keeps a re-registered persistent
+            view reattaching after restart.
+            """
+            for row in rows:
+                key = row[key_columns[0]]
+                if key not in ns.deleted_keys:
+                    ns.dirty_rows.setdefault(key, row)
+            for key in deletes:
+                if key not in ns.dirty_rows:
+                    ns.deleted_keys.add(key)
+
         try:
             if rows:
                 # Prefer the batched path (one round-trip) when the backend
@@ -668,6 +690,18 @@ class PersistenceMiddleware:
                         await ns.backend.row_upsert(table, row, key_columns)
             for key in deletes:
                 await ns.backend.row_delete(table, {delete_column: key})
+        except asyncio.CancelledError:
+            # CancelledError is a BaseException, so the retry path below
+            # never saw it and the snapshot drained above was lost. That
+            # window is not hypothetical: ``flush_all`` cancels in-flight
+            # flush tasks before its own final drain, which is exactly a
+            # cancel landing mid-write at shutdown, and the rows it
+            # dropped were the ones ``close`` exists to persist. From
+            # here a cancel mid-write is indistinguishable from one
+            # before it, so the batch goes back for whoever flushes next
+            # rather than on the floor.
+            requeue()
+            raise
         except Exception as exc:
             ns.retry_count += 1
             logger.error(
@@ -676,22 +710,8 @@ class PersistenceMiddleware:
             )
             await self._fire_hook("on_error", ns.name, exc)
 
-            # Re-enqueue so the next scheduled flush retries, restoring the
-            # single-buffer-per-key invariant the routing helpers maintain (a
-            # key lives in dirty_rows OR deleted_keys, never both). A
-            # re-register/unregister that arrived during the failed flush may
-            # have claimed a key for the opposite buffer, so each side skips a
-            # key the other side now owns: the re-enqueued snapshot never
-            # resurrects a key in the buffer it left, and the newer write
-            # survives the next flush. That guard is what keeps a re-registered
-            # persistent view reattaching after restart.
-            for row in rows:
-                key = row[key_columns[0]]
-                if key not in ns.deleted_keys:
-                    ns.dirty_rows.setdefault(key, row)
-            for key in deletes:
-                if key not in ns.dirty_rows:
-                    ns.deleted_keys.add(key)
+            # Re-enqueue so the next scheduled flush retries.
+            requeue()
 
             if ns.retry_count >= self.MAX_RETRIES:
                 logger.critical(
@@ -816,9 +836,10 @@ class PersistenceMiddleware:
             return
         for callback in hooks.get(hook_name, ()):
             try:
-                result = callback(*args)
-                if asyncio.iscoroutine(result):
-                    await result
+                # isawaitable, not iscoroutine: a hook returning a Future
+                # or any awaitable object is still work to wait on, and the
+                # narrow check silently dropped it on the floor.
+                await await_maybe(callback(*args))
             except Exception as exc:
                 logger.error(f"Persistence hook {hook_name!r} raised: {exc}")
 

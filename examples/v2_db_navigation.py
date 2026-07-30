@@ -21,11 +21,12 @@ The pattern (the reason this example exists):
 Reload-on-render payoff:
     The detail view deletes a task and ``pop()``s. The root view's
     ``on_load`` runs on the way back, re-reads the repo, and shows the
-    list without the deleted task -- with no manual refresh of the root
-    and no ``rebuild=`` callback on the navigation call. Compare
-    ``examples/navigation.py`` (V1), which threads
-    ``rebuild=lambda v: {"embed": v.build_embed()}`` through every push
-    and pop; ``on_load`` removes that boilerplate.
+    list without the deleted task, with no manual refresh of the root and
+    nothing declared on the navigation call. Compare ``navigation.py``
+    (V1), where each destination names a ``nav_rebuild`` so the push has
+    something to rebuild it with: a V1 view carries an embed the edit has
+    to be handed. A V2 view is its own content, and ``on_load`` runs on
+    the way back, so neither the call nor the class declares anything.
 
 Also shown: a ``PaginatedRegion`` pages the row list inside the root view.
 ``on_load`` feeds it the current rows and renders one page's slice, so a
@@ -213,14 +214,15 @@ class TaskListView(StatefulLayoutView):
                 await self.respond(modal_interaction, "Title cannot be blank.", ephemeral=True)
                 return
             await self.db.add_task(title)
-            # reload() = on_load() + refresh(): re-read the repo and re-render
-            # this view so the new task appears immediately.
-            await self.reload()
-            # The new row lands last, which is off-screen for anyone not
-            # already on the final page: reload() re-reads the data but
-            # never moves the cursor. show_page() is the region's
-            # jump-and-rerender, so the user sees what they just created.
-            await self.tasks_pager.show_page(self.tasks_pager.page_count - 1)
+            # The new row lands last, off-screen for anyone not already on
+            # the final page, so the cursor has to move as well as the data.
+            # show_page seeks and then re-renders the host, so the rows the
+            # user sees come from the page the cursor just moved to. Seeking
+            # with set_page and calling refresh instead would ship the tree
+            # composed before the seek: the cursor advances and the rows do
+            # not. Negative index means the last page, resolved after the
+            # re-render loads, so this costs one read and one edit.
+            await self.tasks_pager.show_page(-1)
 
         await self.open_modal(
             interaction,

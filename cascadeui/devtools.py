@@ -1311,7 +1311,7 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
     # Marks this cog's commands as owner-gated. A consumer that routes owner-only
     # tooling differently (e.g. to a control guild so it never reaches a member's
     # slash picker) reads getattr(cog, "is_owner_tool", False) instead of matching
-    # the class name. Any owner-gated cog -- library or consumer -- can carry the
+    # the class name. Any owner-gated cog (library or consumer) can carry the
     # same marker, so the check generalizes.
     is_owner_tool = True
 

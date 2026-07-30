@@ -6,6 +6,7 @@ from typing import Callable, List, Optional
 import discord
 from discord import ButtonStyle, Interaction
 
+from ...utils.hooks import await_maybe
 from ..base import StatefulButton, StatefulComponent
 from ..v1_composition import CompositeComponent, register_component
 
@@ -90,7 +91,7 @@ class PaginationControls(CompositeComponent):
             self._update_buttons()
 
             if self.on_page_change:
-                await self.on_page_change(interaction, self.current_page)
+                await await_maybe(self.on_page_change(interaction, self.current_page))
             elif not interaction.response.is_done():
                 await interaction.response.defer()
         elif not interaction.response.is_done():
@@ -103,7 +104,7 @@ class PaginationControls(CompositeComponent):
             self._update_buttons()
 
             if self.on_page_change:
-                await self.on_page_change(interaction, self.current_page)
+                await await_maybe(self.on_page_change(interaction, self.current_page))
             elif not interaction.response.is_done():
                 await interaction.response.defer()
         elif not interaction.response.is_done():
@@ -142,8 +143,10 @@ class ToggleGroup(CompositeComponent):
         on_select: Optional[Callable] = None,
         default: Optional[str] = None,
         row: Optional[int] = None,
+        key: str = "toggle",
     ):
         super().__init__()
+        self.key = key
         self.options = options
         self.on_select = on_select
         self.selected = default or options[0] if options else None
@@ -168,7 +171,7 @@ class ToggleGroup(CompositeComponent):
                         await self._view.refresh()
 
                     if self.on_select:
-                        await self.on_select(interaction, opt)
+                        await await_maybe(self.on_select(interaction, opt))
                     elif not interaction.response.is_done():
                         await interaction.response.defer()
 
@@ -177,7 +180,7 @@ class ToggleGroup(CompositeComponent):
             button = StatefulButton(
                 label=option,
                 style=style,
-                custom_id=f"toggle_{option.lower().replace(' ', '_')}",
+                custom_id=f"{key}_{option.lower().replace(' ', '_')}",
                 row=row,
                 callback=make_callback(option),
             )

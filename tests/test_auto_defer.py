@@ -358,7 +358,7 @@ class TestAutoDeferSkipped:
         interaction = _make_interaction(is_done=False)
 
         async def fast_callback(inter):
-            # Simulate responding immediately — flip is_done so timer skips
+            # Simulate responding immediately: flip is_done so timer skips
             await inter.response.defer()
             inter.response.is_done.return_value = True
 

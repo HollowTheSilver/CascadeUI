@@ -323,7 +323,7 @@ class TestBuildTextModal:
             ],
         )
         modal = _build_form_modal(view, "Edit")
-        # Modal.validators should be empty — validation lives in the callback.
+        # Modal.validators should be empty: validation lives in the callback.
         assert modal.validators == {}
 
     async def test_on_modal_submit_writes_values_back(self):
@@ -333,7 +333,7 @@ class TestBuildTextModal:
         )
         modal = _build_form_modal(view, "Edit")
 
-        # Stub the refresh path — unit test, no real discord message.
+        # Stub the refresh path: unit test, no real discord message.
         async def _noop():
             pass
 
@@ -2103,3 +2103,63 @@ class TestStatefulCallbackWiring:
         await select.callback(_make_interaction())
 
         assert view.values["color"] == "red"
+
+
+class TestV1SelectReflectsValues:
+    """V1 ships an embed edit rather than rebuilding its controls, and Discord
+    re-renders a select from whatever the edit payload carries. Without a sync
+    the option marks stay at whatever construction seeded them."""
+
+    FIELDS = [
+        {
+            "id": "color",
+            "label": "Colour",
+            "type": "select",
+            "options": [{"label": "A", "value": "a"}, {"label": "B", "value": "b"}],
+        }
+    ]
+
+    @staticmethod
+    def _marks(view):
+        for child in view.walk_children():
+            if isinstance(child, discord.ui.Select):
+                return {opt.value: opt.default for opt in child.options}
+        return {}
+
+    async def test_select_marks_follow_a_pick(self):
+        view = FormView(fields=self.FIELDS, interaction=_make_interaction())
+        view.values["color"] = "b"
+        await view._update_form_display()
+        assert self._marks(view) == {"a": False, "b": True}
+
+    async def test_select_marks_follow_a_switch(self):
+        view = FormView(fields=self.FIELDS, interaction=_make_interaction())
+        view.values["color"] = "b"
+        await view._update_form_display()
+        view.values["color"] = "a"
+        await view._update_form_display()
+        assert self._marks(view) == {"a": True, "b": False}
+
+    async def test_select_marks_follow_a_pop_restore(self):
+        """The controls are built before the restored values arrive."""
+        view = FormView(fields=self.FIELDS, interaction=_make_interaction())
+        view.restore_nav_state({"values": {"color": "b"}})
+        assert self._marks(view) == {"a": False, "b": True}
+
+    async def test_multi_select_marks_follow_the_list(self):
+        fields = [
+            {
+                "id": "tags",
+                "label": "Tags",
+                "type": "multi_select",
+                "options": [{"label": "X", "value": "x"}, {"label": "Y", "value": "y"}],
+            }
+        ]
+        view = FormView(fields=fields, interaction=_make_interaction())
+        view.values["tags"] = ["x", "y"]
+        await view._update_form_display()
+        assert self._marks(view) == {"x": True, "y": True}
+
+        view.values["tags"] = []
+        await view._update_form_display()
+        assert self._marks(view) == {"x": False, "y": False}

@@ -30,9 +30,9 @@ Subscriber failures are caught and logged internally -- `dispatch()` does not ra
 Registers a subscriber for state change notifications. Views auto-subscribe during `__init__` and tear down through their own lifecycle hooks; direct calls from user code are rare.
 
 - `subscriber_id` (str): Unique ID for the subscriber
-- `callback` (callable): Async function called on matching state changes
+- `callback` (callable): Called on matching state changes. Either `async def` or a plain `def`.
 - `action_filter` (set[str], optional): Only notify for these action types
-- `selector` (callable, optional): Function `(state) -> value` that extracts a slice. Subscriber is only notified when the selected value changes.
+- `selector` (callable, optional): Synchronous function `(state) -> value` that extracts a slice. Subscriber is only notified when the selected value changes. A selector that raises degrades to notifying on every action, and is reported once.
 
 #### `state`
 
@@ -100,21 +100,21 @@ Removes an event hook.
 
 Builds a scope key string (`"user:123"`, `"guild:456"`, `"user_guild:123:456"`, `"global"`), or `None` when the scope's required ids are missing. The single writer of the scope-key format: the scoped-state readers, the instance-limit index, and the sync availability pre-check all route through it, so the format is defined once. `0` is a legitimate id and is never treated as missing; a caller that wants falsy ids treated as absent normalizes with `or None` first.
 
-#### `get_scoped(scope, *, user_id=None, guild_id=None)`
+#### `get_scoped(scope, *, slot_name="scoped", **identifiers)`
 
-Returns scoped state for the given scope type and ID. Reads from the live `self.state`.
+Returns scoped state for the given scope type and ids. Reads from the live `self.state`. `slot_name` selects the named bucket under `state["application"]`; views that set `scoped_slot` pass their own.
 
-#### `get_scoped_from(state, scope, **identifiers)` (staticmethod)
+#### `get_scoped_from(state, scope, *, slot_name="scoped", **identifiers)` (staticmethod)
 
 Reads a scoped slice from an explicit `state` dict rather than the live store. Intended for `@computed` selectors (which receive `state` as input) and custom reducers (which mutate deep-copied state). Using `store.get_scoped()` inside a reducer would bypass the deep-copied state -- `get_scoped_from(state, ...)` keeps the read aligned with what the reducer is mutating.
 
-#### `iter_scoped(scope, slot_name="scoped")`
+#### `iter_scoped(state, scope, *, slot_name="scoped", **filter_ids)` (staticmethod)
 
-Iterates over every entry in the named scoped slot, yielding `(identifier_key, data)` pairs. Used by hub views that aggregate across many users or guilds (leaderboards, dashboards) without reaching into `state["application"]["scoped"]` directly.
+Iterates the named scoped slot in an explicit `state` dict, yielding `(identifiers, data)` pairs where `identifiers` is the parsed id mapping, e.g. `({"user_id": 123}, data)`. Unsupplied identifiers act as wildcards and malformed keys are skipped. Pass `store.state` for a live read or a reducer's `state` for a consistent one. Used by hub views that aggregate across many users or guilds (leaderboards, dashboards) without reaching into `state["application"]["scoped"]` directly.
 
-#### `set_scoped(scope, data, *, user_id=None, guild_id=None)`
+#### `set_scoped(scope, data, *, slot_name="scoped", **identifiers)`
 
-Sets scoped state for the given scope type and ID.
+Sets scoped state for the given scope type and ids.
 
 #### `get_active_views() -> Mapping[str, Any]`
 

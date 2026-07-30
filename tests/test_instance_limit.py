@@ -185,7 +185,7 @@ class TestScopeIsolation:
         view_a = _GuildView(interaction=_make_interaction(user_id=1, guild_id=100))
         await view_a.send()
 
-        # Same guild, different user — should be rejected
+        # Same guild, different user: should be rejected
         view_b = _GuildView(interaction=_make_interaction(user_id=2, guild_id=100))
         with pytest.raises(InstanceLimitError):
             await view_b.send()
@@ -201,7 +201,7 @@ class TestScopeIsolation:
         view_a = _GlobalView(interaction=_make_interaction(user_id=1, guild_id=100))
         await view_a.send()
 
-        # Completely different user and guild — should still be rejected
+        # Completely different user and guild: should still be rejected
         view_b = _GlobalView(interaction=_make_interaction(user_id=2, guild_id=200))
         with pytest.raises(InstanceLimitError):
             await view_b.send()
@@ -340,7 +340,7 @@ class TestMissingIdentity:
         interaction2.guild_id = None
 
         view2 = _DmView(interaction=interaction2)
-        await view2.send()  # No error — enforcement skipped
+        await view2.send()  # No error: enforcement skipped
 
 
 # // ========================================( Navigation Chain Tracking )======================================== // #
@@ -368,7 +368,7 @@ class TestNavigationChainTracking:
             len(store._get_active_views(_HubView._class_session_key(), "user_guild:100:200")) == 1
         )
 
-        # Push to sub-view — _navigate_to registers it, no send() needed
+        # Push to sub-view: _navigate_to registers it, no send() needed
         sub = await hub.push(_SubView)
 
         # Sub-view should be tracked under _HubView, not _SubView
@@ -476,11 +476,11 @@ class TestNavigationChainTracking:
         assert (
             len(store._get_active_views(_PopRoot._class_session_key(), "user_guild:100:200")) == 1
         )
-        # The restored view IS a _PopRoot — origin is cleared back to None
+        # The restored view IS a _PopRoot: origin is cleared back to None
         assert restored._instance_root_class is None
 
     async def test_replace_does_not_set_origin(self):
-        """replace() is a one-way transition — should NOT propagate session origin."""
+        """replace() is a one-way transition: should NOT propagate session origin."""
 
         class _SourceView(StatefulView):
             instance_limit = 1
@@ -501,7 +501,7 @@ class TestNavigationChainTracking:
         dest._message = MagicMock()
         await dest.send()
 
-        # replace() is one-way — dest view should be independent, tracked under
+        # replace() is one-way: dest view should be independent, tracked under
         # its own class name with origin cleared.
         assert dest._instance_root_class is None
         assert (

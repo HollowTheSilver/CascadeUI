@@ -113,3 +113,61 @@ class TestEventHooks:
 
         await store.dispatch("MULTI_HOOK", {})
         assert received == ["a", "b"]
+
+
+class TestAwaitMaybe:
+    """The shared helper the whole sync-or-async contract rests on.
+
+    Fifty-eight call sites resolve a caller's return value through it. Each
+    proves it indirectly at best, so a regression here would surface as
+    fifty-eight unrelated symptoms rather than one named failure.
+    """
+
+    async def test_plain_value_passes_through(self):
+        from cascadeui.utils.hooks import await_maybe
+
+        assert await await_maybe(42) == 42
+
+    async def test_none_passes_through(self):
+        from cascadeui.utils.hooks import await_maybe
+
+        assert await await_maybe(None) is None
+
+    async def test_coroutine_is_awaited(self):
+        from cascadeui.utils.hooks import await_maybe
+
+        async def work():
+            return "resolved"
+
+        assert await await_maybe(work()) == "resolved"
+
+    async def test_result_of_an_async_dunder_call_is_awaited(self):
+        """The shape ``inspect.iscoroutinefunction`` answers False for."""
+        from cascadeui.utils.hooks import await_maybe
+
+        class AsyncCallable:
+            async def __call__(self):
+                return "resolved"
+
+        assert await await_maybe(AsyncCallable()()) == "resolved"
+
+    async def test_result_of_a_partial_around_a_coroutine_function_is_awaited(self):
+        import functools
+
+        from cascadeui.utils.hooks import await_maybe
+
+        async def work():
+            return "resolved"
+
+        assert await await_maybe(functools.partial(work)()) == "resolved"
+
+    async def test_a_falsy_awaitable_result_is_still_returned(self):
+        """Resolution keys on awaitability, not truthiness -- a hook that
+        legitimately returns False or 0 must not be mistaken for one that
+        returned nothing."""
+        from cascadeui.utils.hooks import await_maybe
+
+        async def work():
+            return False
+
+        assert await await_maybe(work()) is False

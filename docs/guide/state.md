@@ -156,18 +156,21 @@ fields still repaints when the theme changes elsewhere. See
 
 Views unsubscribe automatically on exit or timeout.
 
-!!! warning "Read the `state` argument, not `self.state`"
-    Every selector receives the candidate next state as its `state` argument.
-    Reading `self.state` (or `self.state_store.state`) instead returns the
-    *current* store state, which during a dispatch is whatever existed
-    *before* the pending action was applied. That breaks subscription
-    change-detection silently -- the selector returns the same value on
-    every call, and the view's `on_state_changed` never fires.
+!!! warning "Read the `state` argument, not the store"
+    A selector must be a pure function of its `state` argument. A view
+    carries no `.state` attribute, so `self.state` raises `AttributeError`;
+    the store reports that once per subscriber and then degrades to
+    notifying on every action, which is safe but discards the filtering the
+    selector existed to do.
 
     **Correct:** `return state.get("scores", {})`
-    **Bug:** `return self.state.get("scores", {})`
+    **Bug:** `return self.state_store.state.get("scores", {})`
 
-    The same rule applies to `@computed` selector functions and to
+    Reaching through `self.state_store.state` is the sharper trap inside a
+    **reducer**: the reducer mutates a deep copy while the store still holds
+    the pre-action values, so a read through the store sees data the reducer
+    has already moved past. The same rule applies to `@computed` selector
+    functions and to
     `StateStore.get_scoped_from(state, ...)` calls made from reducers.
     `get_scoped_from` is the staticmethod specifically designed to read
     from the deep-copied state handed to a reducer, without reaching
@@ -355,10 +358,11 @@ consistently from views, reducers, and selectors:
 | `self.user_guild_scoped_state(user_id=None, guild_id=None)` | Read the `"user_guild"` composite scope slice. |
 | `self.global_scoped_state()` | Read the `"global"` scope slice. |
 | `self.dispatch_scoped(data)` | Write-through from a view -- merges into the scope slot. |
-| `self.dispatch_scoped_as(scope, data, **ids)` | Write-through from a view with an explicit scope + identifiers. |
+| `self.dispatch_scoped_as(action_type, data, *, scope=None, **ids)` | Dispatch a **named** action carrying the scoped payload, for a custom reducer that decodes it with `merge_scoped`. `scope=` overrides the view's `state_scope`. |
 | `store.get_scoped(scope, **ids)` | Read from a live store (subscribers, devtools). |
 | `StateStore.get_scoped_from(state, scope, **ids)` | Staticmethod -- read from the `state` arg handed to a reducer or `@computed` selector. |
-| `store.iter_scoped(scope, slot_name="scoped")` | Iterate every scope bucket under a slot. |
+| `StateStore.iter_scoped(state, scope, *, slot_name="scoped", **filter_ids)` | Staticmethod -- iterate every scope bucket under a slot, yielding `(identifiers, data)`. |
+| `StateStore.scope_key(scope, *, user_id=None, guild_id=None)` | Staticmethod -- build the scope-key string, or `None` when a required id is missing. |
 | `StateStore.merge_scoped(state, scope, data, *, slot_name="scoped", subkey=None, **ids)` | Reducer-side writer -- mutates the deep-copied state in place. |
 
 ### Cross-View Reactivity
@@ -513,7 +517,7 @@ async with self.batch():
 
 Inside the block, each dispatch runs through middleware and the reducer
 immediately -- state is current at every line, so later dispatches can read
-what earlier ones wrote. Only subscriber notifications are deferred until the
+what earlier ones wrote. Subscriber notifications and event hooks are deferred until the
 block exits, where one synthetic `BATCH_COMPLETE` action fires the fan-out.
 
 ### When to batch
@@ -670,7 +674,7 @@ for a complete poll example with computed totals and leader detection.
 Enable undo/redo per view:
 
 ```python
-from cascadeui import UndoMiddleware, get_store
+from cascadeui import UndoMiddleware, setup_middleware
 
 await setup_middleware(UndoMiddleware())
 

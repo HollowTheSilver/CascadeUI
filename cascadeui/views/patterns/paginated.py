@@ -4,7 +4,7 @@
 import inspect
 import logging
 from collections import OrderedDict
-from typing import Callable, ClassVar, List, Optional
+from typing import Any, Callable, ClassVar, Iterable, List, Optional
 
 import discord
 from discord import Interaction
@@ -12,6 +12,7 @@ from discord.ui import ActionRow, Button, Container, TextDisplay
 
 from ...components.base import StatefulButton
 from ...components.types import EmojiInput
+from ...utils.hooks import await_maybe
 from ..base import _StatefulMixin
 from ..layout import StatefulLayoutView
 from ..view import StatefulView
@@ -295,7 +296,7 @@ class _BasePaginatedMixin:
     @classmethod
     async def from_data(
         cls,
-        items: list,
+        items: Iterable[Any],
         per_page: int,
         formatter: Callable,
         **kwargs,
@@ -311,13 +312,29 @@ class _BasePaginatedMixin:
             view = await PaginatedView.from_data(items, 10, fmt)   # awaited
             view = PaginatedView.from_cursor(fetch, total=n, ...)  # not
         """
+        if not callable(formatter):
+            raise TypeError(f"formatter must be callable, got {type(formatter).__name__}")
+        if not isinstance(per_page, int) or isinstance(per_page, bool) or per_page < 1:
+            raise ValueError(f"per_page must be a positive int, got {per_page!r}")
+        # Anything sliceable with a length is paged as it arrives: the annotation
+        # says list, but tuples, ranges and strings have always worked and stay
+        # working. A one-shot iterable is consumed instead, since chunking reads
+        # it repeatedly and a generator would silently yield nothing the second
+        # time. Neither shape is ambiguous, so both are absorbed rather than
+        # refused, and only a value that is not a sequence at all raises.
+        if not hasattr(items, "__len__") or not hasattr(items, "__getitem__"):
+            try:
+                items = list(items)
+            except TypeError:
+                raise TypeError(
+                    f"items must be a sequence or an iterable of them, got "
+                    f"{type(items).__name__}"
+                ) from None
+
         chunks = [items[i : i + per_page] for i in range(0, len(items), per_page)]
         pages = []
         for chunk in chunks:
-            if inspect.iscoroutinefunction(formatter):
-                pages.append(await formatter(chunk))
-            else:
-                pages.append(formatter(chunk))
+            pages.append(await await_maybe(formatter(chunk)))
         return cls(pages=pages, _per_page=per_page, _formatter=formatter, **kwargs)
 
     @classmethod
@@ -449,11 +466,8 @@ class _BasePaginatedMixin:
             return
 
         offset = page_idx * self._per_page
-        chunk = await self._fetch_fn(offset, self._per_page)
-        if inspect.iscoroutinefunction(self._formatter):
-            content = await self._formatter(chunk)
-        else:
-            content = self._formatter(chunk)
+        chunk = await await_maybe(self._fetch_fn(offset, self._per_page))
+        content = await await_maybe(self._formatter(chunk))
 
         self.pages[page_idx] = content
         self._touch_cache(page_idx)
@@ -484,7 +498,7 @@ class _BasePaginatedMixin:
             self._page_cache_order.pop(evicted)
             self.pages[evicted] = None
 
-    async def refresh_data(self, items: list):
+    async def refresh_data(self, items: Iterable[Any]):
         """Re-paginate with new data using the original per_page and formatter.
 
         Eager mode only (views created via ``from_data``). Cursor-mode
@@ -503,10 +517,7 @@ class _BasePaginatedMixin:
         chunks = [items[i : i + self._per_page] for i in range(0, len(items), self._per_page)]
         pages = []
         for chunk in chunks:
-            if inspect.iscoroutinefunction(self._formatter):
-                pages.append(await self._formatter(chunk))
-            else:
-                pages.append(self._formatter(chunk))
+            pages.append(await await_maybe(self._formatter(chunk)))
 
         self.pages = pages or []
         if self.current_page >= len(self.pages):

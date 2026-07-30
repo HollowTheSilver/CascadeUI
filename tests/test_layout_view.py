@@ -1,6 +1,7 @@
 """Tests for StatefulLayoutView (V2 base class)."""
 
 import asyncio
+import inspect
 import logging
 import time
 from unittest.mock import AsyncMock, MagicMock
@@ -1266,6 +1267,114 @@ class TestStableCustomIds:
             if i == 4:
                 continue
             assert turn1[i] == turn2[i], f"cell {i} id shifted: {turn1[i]} -> {turn2[i]}"
+
+
+class TestBuildUiThatReturnsACoroutine:
+    """The wrapper checks what ``build_ui`` returned, not what it looks like.
+
+    ``__init_subclass__`` picks a sync or async wrapper with
+    ``inspect.iscoroutinefunction``, which answers False for several
+    shapes that still hand back a coroutine: a callable instance whose
+    ``__call__`` is async, a ``functools.partial`` around one, a plain
+    function that returns one. Those take the sync wrapper, so it has to
+    look at the result. Trusting the dispatch instead meant the wrapper
+    did its work against a tree the body had not built yet -- ids were
+    stabilized before any component existed, leaving the random hex
+    discord.py assigns, which is the exact dispatch-table churn
+    stabilization exists to prevent, and the ambient theme was already
+    torn down by the time the body ran.
+    """
+
+    @staticmethod
+    def _body(view):
+        async def _cb(interaction):
+            return None
+
+        view.clear_items()
+        view.add_item(ActionRow(StatefulButton(label="Go", callback=_cb)))
+
+    def _view_for(self, build_fn):
+        cls = type("_V", (StatefulLayoutView,), {"owner_only": False, "build_ui": build_fn})
+        return cls(interaction=_make_interaction())
+
+    async def _resolve(self, result):
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    async def test_async_dunder_call_builds_and_stabilizes(self):
+        body = self._body
+
+        class AsyncCallable:
+            async def __call__(self, view):
+                body(view)
+
+        view = self._view_for(AsyncCallable())
+        await self._resolve(view.build_ui())
+
+        ids = [i.custom_id for i in view.walk_children() if isinstance(i, StatefulButton)]
+        assert ids and ids[0].endswith(":Go"), f"not stabilized: {ids}"
+
+    async def test_partial_around_a_coroutine_function_builds_and_stabilizes(self):
+        import functools
+
+        body = self._body
+
+        class AsyncCallable:
+            async def __call__(self, view):
+                body(view)
+
+        view = self._view_for(functools.partial(AsyncCallable()))
+        await self._resolve(view.build_ui())
+
+        ids = [i.custom_id for i in view.walk_children() if isinstance(i, StatefulButton)]
+        assert ids and ids[0].endswith(":Go"), f"not stabilized: {ids}"
+
+    async def test_sync_function_returning_a_coroutine_builds_and_stabilizes(self):
+        body = self._body
+
+        def returns_a_coroutine(view):
+            async def inner():
+                body(view)
+
+            return inner()
+
+        view = self._view_for(returns_a_coroutine)
+        await self._resolve(view.build_ui())
+
+        ids = [i.custom_id for i in view.walk_children() if isinstance(i, StatefulButton)]
+        assert ids and ids[0].endswith(":Go"), f"not stabilized: {ids}"
+
+    async def test_theme_is_ambient_while_the_deferred_body_runs(self):
+        from cascadeui.theming.context import get_current_theme
+        from cascadeui.theming.core import Theme
+
+        theme = Theme("probe", {"accent_colour": discord.Color.gold()})
+        seen = []
+
+        class AsyncCallable:
+            async def __call__(self, view):
+                seen.append(get_current_theme())
+                view.clear_items()
+                view.add_item(TextDisplay("built"))
+
+        cls = type(
+            "_V",
+            (StatefulLayoutView,),
+            {"owner_only": False, "theme": theme, "build_ui": AsyncCallable()},
+        )
+        view = cls(interaction=_make_interaction())
+        await self._resolve(view.build_ui())
+
+        assert seen and seen[0] is theme
+
+    async def test_plain_sync_build_is_untouched(self):
+        view = self._view_for(lambda self: self._body_marker())
+        view._body_marker = lambda: self._body(view)
+
+        result = view.build_ui()
+
+        assert not inspect.isawaitable(result), "a sync build must stay sync"
 
 
 class TestStableCustomIdsAtRefresh:
@@ -3622,3 +3731,188 @@ class TestFreezeEditsCarryMentionRules:
         await view.on_timeout()
 
         assert "allowed_mentions" not in message.edit.await_args.kwargs
+
+
+class TestBuildUiInSyncInit:
+    """Patterns that compose in ``__init__`` refuse an async ``build_ui``.
+
+    ``DisplayLayoutView``, ``MenuLayoutView`` and ``RolesLayoutView`` build
+    their tree in ``__init__``, a synchronous frame that cannot resolve a
+    coroutine. An async override there ran nothing: construction
+    succeeded, the tree stayed empty, and the only signal was a "never
+    awaited" warning most bots never surface. The mistake surfaced later
+    as a placement error naming "no top-level components", which is the
+    symptom and points nowhere near the cause.
+    """
+
+    def _menu(self, build_fn):
+        from cascadeui.views.patterns.menu import MenuLayoutView
+
+        cls = type("_M", (MenuLayoutView,), {"build_ui": build_fn})
+        return lambda: cls(interaction=_make_interaction(), user_id=1, categories=[])
+
+    async def test_async_def_is_refused_at_construction(self):
+        async def build(self):
+            self.add_item(TextDisplay("x"))
+
+        with pytest.raises(TypeError, match="cannot await"):
+            self._menu(build)()
+
+    async def test_async_dunder_call_is_refused(self):
+        """The shape ``iscoroutinefunction`` answers False for."""
+
+        class AsyncCallable:
+            async def __call__(self, view):
+                view.add_item(TextDisplay("x"))
+
+        with pytest.raises(TypeError, match="cannot await"):
+            self._menu(AsyncCallable())()
+
+    async def test_partial_around_a_coroutine_function_is_refused(self):
+        import functools
+
+        class AsyncCallable:
+            async def __call__(self, view):
+                view.add_item(TextDisplay("x"))
+
+        with pytest.raises(TypeError, match="cannot await"):
+            self._menu(functools.partial(AsyncCallable()))()
+
+    async def test_message_names_the_replacement_hook(self):
+        async def build(self):
+            self.add_item(TextDisplay("x"))
+
+        with pytest.raises(TypeError, match=r"on_load\(\)"):
+            self._menu(build)()
+
+    async def test_refusal_leaves_no_never_awaited_warning(self):
+        """The error is the whole report; a trailing warning naming the
+        same function reads as a second, separate fault."""
+        import gc
+        import warnings
+
+        class AsyncCallable:
+            async def __call__(self, view):
+                view.add_item(TextDisplay("x"))
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with pytest.raises(TypeError):
+                self._menu(AsyncCallable())()
+            gc.collect()
+
+        assert not [w for w in caught if "never awaited" in str(w.message)]
+
+    async def test_synchronous_build_still_constructs(self):
+        from cascadeui.views.patterns.menu import MenuLayoutView
+
+        view = MenuLayoutView(interaction=_make_interaction(), user_id=1, categories=[])
+
+        assert view.children
+
+
+class TestViewHooksAcceptPlainDef:
+    """Every ``on_*`` override runs whether or not it is ``async def``.
+
+    Each of these was a bare ``await self.on_x(...)``, so a synchronous
+    override ran, returned, and then failed on the library awaiting its
+    return value -- surfacing as an error against the user's own callback,
+    or, for ``on_load``, as a view that would not send at all. Nothing in
+    the suite declared a plain-``def`` override before this.
+    """
+
+    async def test_a_view_whose_every_hook_is_sync_sends(self):
+        calls = []
+
+        class SyncHooks(StatefulLayoutView):
+            owner_only = False
+
+            def on_pre_send(self, interaction):
+                calls.append("on_pre_send")
+                return True
+
+            def on_load(self):
+                calls.append("on_load")
+                self.build_ui()
+
+            def on_state_changed(self, state):
+                calls.append("on_state_changed")
+
+            def build_ui(self):
+                self.clear_items()
+                self.add_item(TextDisplay("built"))
+
+        view = SyncHooks(interaction=_make_interaction(user_id=1), user_id=1)
+
+        assert await view.send() is not None
+        assert view.children, "a sync on_load must still have composed the tree"
+        assert {"on_pre_send", "on_load"} <= set(calls)
+
+    async def test_sync_seed_initial_state_runs(self):
+        """The seed hook was the one member this family's sweep missed.
+
+        Its siblings route through ``await_maybe``; this one was a bare
+        ``await``, so a plain-``def`` override raised ``'NoneType' object
+        can't be awaited`` from inside ``send()`` rather than running.
+        """
+        seeded = []
+
+        class SyncSeed(StatefulLayoutView):
+            owner_only = False
+
+            def seed_initial_state(self, state):
+                seeded.append(state is not None)
+
+            def build_ui(self):
+                self.clear_items()
+                self.add_item(TextDisplay("seeded"))
+
+        view = SyncSeed(interaction=_make_interaction(user_id=1), user_id=1)
+        view.build_ui()
+
+        assert await view.send() is not None
+        assert seeded == [True]
+
+    async def test_sync_on_state_changed_runs_on_notification(self):
+        calls = []
+
+        class SyncNotify(StatefulLayoutView):
+            owner_only = False
+
+            def on_load(self):
+                self.build_ui()
+
+            def on_state_changed(self, state):
+                calls.append(state)
+
+            def build_ui(self):
+                self.clear_items()
+                self.add_item(TextDisplay("built"))
+
+        view = SyncNotify(interaction=_make_interaction(user_id=1), user_id=1)
+        await view.send()
+
+        await view._handle_state_notification(view.state_store.state, {"type": "X", "payload": {}})
+
+        assert calls, "a sync on_state_changed must be awaited through await_maybe"
+
+    async def test_sync_on_unauthorized_runs(self):
+        calls = []
+
+        class SyncGate(StatefulLayoutView):
+            owner_only = True
+
+            def on_unauthorized(self, interaction):
+                calls.append(interaction.user.id)
+
+            def build_ui(self):
+                self.clear_items()
+                self.add_item(TextDisplay("built"))
+
+        view = SyncGate(interaction=_make_interaction(user_id=1), user_id=1)
+        view.build_ui()
+
+        allowed = await view.interaction_check(_make_interaction(user_id=999))
+
+        assert allowed is False
+        assert calls == [999]

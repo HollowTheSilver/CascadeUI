@@ -22,6 +22,8 @@ from discord.ui import (
 )
 from discord.ui.select import BaseSelect
 
+from ..components.types import MAX_COMPONENT_ID
+
 # Item types that belong inside a ``Modal``, never inside a ``LayoutView``
 # tree. discord.py accepts them at any tree position because every check
 # is ``isinstance(item, Item)``; Discord's API server rejects them at send
@@ -395,7 +397,12 @@ def _check_textdisplay_size(item: TextDisplay, path: List[str]) -> None:
     with the container types, whose minimum child counts are already enforced.
     """
     content = getattr(item, "content", None)
-    if content is None:
+    # discord.py stores every text field below unvalidated, so a caller can
+    # hand one a non-string and it reaches the payload as-is (an int
+    # SelectOption value is the common case). A character cap only means
+    # anything for a string, and raising TypeError from inside a pre-flight
+    # check is a worse failure than the HTTP 400 the check exists to prevent.
+    if not isinstance(content, str):
         return
     length = len(content)
     if length == 0:
@@ -450,7 +457,7 @@ def _check_button_label(button: Button, path: List[str]) -> None:
     """
     _check_custom_id(button, path)
     label = getattr(button, "label", None)
-    if label is None:
+    if not isinstance(label, str):
         return
     length = len(label)
     if length > _BUTTON_LABEL_MAX:
@@ -475,7 +482,7 @@ def _check_select_text(select: BaseSelect, path: List[str]) -> None:
     """
     _check_custom_id(select, path)
     placeholder = getattr(select, "placeholder", None)
-    if placeholder is not None and len(placeholder) > _SELECT_PLACEHOLDER_MAX:
+    if isinstance(placeholder, str) and len(placeholder) > _SELECT_PLACEHOLDER_MAX:
         raise ValueError(
             f"Invalid V2 placement: Select placeholder is {len(placeholder)} characters, "
             f"over Discord's {_SELECT_PLACEHOLDER_MAX}-character cap.\n"
@@ -491,7 +498,7 @@ def _check_select_text(select: BaseSelect, path: List[str]) -> None:
         # option built from a record whose name field happens to be blank
         # fails the whole select, not just its own row.
         for field, text in (("label", label), ("value", getattr(option, "value", None))):
-            if text is not None and len(text) == 0:
+            if isinstance(text, str) and len(text) == 0:
                 raise ValueError(
                     f"Invalid V2 placement: SelectOption {field} is empty.\n"
                     f"  Path: {' -> '.join(option_path)}\n"
@@ -500,7 +507,7 @@ def _check_select_text(select: BaseSelect, path: List[str]) -> None:
                     f"  Fix: Skip the option when its {field} is empty, or "
                     f"supply a placeholder string."
                 )
-        if label is not None and len(label) > _SELECT_OPTION_TEXT_MAX:
+        if isinstance(label, str) and len(label) > _SELECT_OPTION_TEXT_MAX:
             raise ValueError(
                 f"Invalid V2 placement: SelectOption label is {len(label)} characters, "
                 f"over Discord's {_SELECT_OPTION_TEXT_MAX}-character cap.\n"
@@ -509,7 +516,7 @@ def _check_select_text(select: BaseSelect, path: List[str]) -> None:
                 f"  Fix: Shorten the SelectOption label to {_SELECT_OPTION_TEXT_MAX} characters or fewer."
             )
         value = getattr(option, "value", None)
-        if value is not None and len(value) > _SELECT_OPTION_TEXT_MAX:
+        if isinstance(value, str) and len(value) > _SELECT_OPTION_TEXT_MAX:
             raise ValueError(
                 f"Invalid V2 placement: SelectOption value is {len(value)} characters, "
                 f"over Discord's {_SELECT_OPTION_TEXT_MAX}-character cap.\n"
@@ -518,7 +525,7 @@ def _check_select_text(select: BaseSelect, path: List[str]) -> None:
                 f"  Fix: Shorten the SelectOption value to {_SELECT_OPTION_TEXT_MAX} characters or fewer."
             )
         description = getattr(option, "description", None)
-        if description is not None and len(description) > _SELECT_OPTION_TEXT_MAX:
+        if isinstance(description, str) and len(description) > _SELECT_OPTION_TEXT_MAX:
             raise ValueError(
                 f"Invalid V2 placement: SelectOption description is {len(description)} "
                 f"characters, over Discord's {_SELECT_OPTION_TEXT_MAX}-character cap.\n"
@@ -703,3 +710,60 @@ def validate_unique_custom_ids(view) -> None:
                 f"custom_id=/key= per call."
             )
         seen.add(custom_id)
+
+
+def validate_unique_ids(view) -> None:
+    """Raise ``ValueError`` on a duplicate or malformed component ``id``.
+
+    Discord's ``id`` is a per-component integer, distinct from ``custom_id``:
+    every component carries one, not just the interactive leaves, and Discord
+    assigns them sequentially from 1 for any component that omits it. A
+    duplicate fails the whole message, so the walk is untyped -- a Container
+    and a Thumbnail collide with each other as readily as two buttons.
+
+    The value check rides this walk for the same reason the custom_id length
+    check does: the builders reject at construction, but a tree assembled from
+    raw ``discord.ui`` primitives never passes through them, and discord.py
+    stores whatever it is handed. A string or a float reaches Discord as-is
+    and returns an opaque HTTP 400.
+
+    Args:
+        view: Any ``View`` / ``LayoutView`` about to ship its tree.
+
+    Raises:
+        ValueError: The first malformed or repeated id, naming it and the fix.
+    """
+    seen = set()
+    for item in view.walk_children():
+        component_id = getattr(item, "id", None)
+        if component_id is None:
+            continue
+        # bool is an int subclass, so it passes an isinstance check while
+        # serializing as true/false.
+        if isinstance(component_id, bool) or not isinstance(component_id, int):
+            raise ValueError(
+                f"Component id must be an int, got "
+                f"{type(component_id).__name__}: {component_id!r}\n"
+                f"  Component: {type(item).__name__} in {type(view).__name__}\n"
+                f"  Discord rejects this message with HTTP 400.\n"
+                f"  Fix: Pass an int between 1 and {MAX_COMPONENT_ID}, or omit "
+                f"id= and let Discord assign one."
+            )
+        if not 1 <= component_id <= MAX_COMPONENT_ID:
+            raise ValueError(
+                f"Component id {component_id} is outside Discord's range "
+                f"(1 to {MAX_COMPONENT_ID}).\n"
+                f"  Component: {type(item).__name__} in {type(view).__name__}\n"
+                f"  Discord treats 0 as absent and rejects the rest with HTTP 400.\n"
+                f"  Fix: Pass an id in range, or omit id= to have Discord assign one."
+            )
+        if component_id in seen:
+            raise ValueError(
+                f"Duplicate component id: {component_id} appears more than once "
+                f"in {type(view).__name__}.\n"
+                f"  Discord requires every id in a message to be unique and "
+                f"rejects this message with HTTP 400.\n"
+                f"  Fix: Give each component a distinct id, or omit id= on the "
+                f"ones that do not need a stable identity."
+            )
+        seen.add(component_id)

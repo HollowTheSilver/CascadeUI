@@ -193,6 +193,10 @@ class MyFleetView(StatefulLayoutView):
     state_scope = "user"
     subscribed_actions = {"FLEET_REROLLED"}
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.build_ui()  # First render: send() needs components to ship
+
     def build_ui(self):
         self.clear_items()
         grid = emoji_grid(10, 10, fill="\U0001f7e6", row_labels="alpha", col_labels="numeric")

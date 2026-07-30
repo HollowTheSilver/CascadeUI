@@ -14,6 +14,7 @@ from ...components.inputs import Modal as CascadeModal
 from ...components.inputs import TextInput as CascadeTextInput
 from ...components.patterns.v2 import alert, card
 from ...components.types import EmojiInput
+from ...utils.hooks import await_maybe
 from ..base import _StatefulMixin
 from ..layout import StatefulLayoutView
 from ..view import StatefulView
@@ -404,6 +405,30 @@ class _BaseFormMixin:
         """
         return {"values": dict(self.values), "raw_drafts": dict(self._raw_drafts)}
 
+    def _sync_select_defaults(self) -> None:
+        """Point every select's marked option at the value the form holds.
+
+        V1 ships an embed edit rather than rebuilding its controls, and
+        Discord re-renders a select from whatever the edit payload carries.
+        The options were marked once at construction, so without this the
+        control reverts to its seeded selection on the very edit that
+        confirms the new one in the embed: the user picks B, the summary
+        reads B, and the dropdown beside it still shows A. A multi-select
+        cleared its ticks entirely.
+
+        Keyed off the ``form_{field_id}`` custom_id the controls are built
+        with, so nothing extra is stored. V2 needs no equivalent because
+        ``_rebuild_display`` reconstructs the controls from ``values`` on
+        every update.
+        """
+        for item in self.children:
+            if not isinstance(item, StatefulSelect):
+                continue
+            custom_id = getattr(item, "custom_id", "") or ""
+            if not custom_id.startswith("form_"):
+                continue
+            item.set_selected(self.values.get(custom_id[len("form_") :]))
+
     def restore_nav_state(self, state: dict) -> None:
         """Restore entered values and pending drafts for fields the form
         still declares.
@@ -421,6 +446,10 @@ class _BaseFormMixin:
         drafts = state.get("raw_drafts")
         if drafts:
             self._raw_drafts.update({k: v for k, v in drafts.items() if k in known})
+        # The controls were built before the values arrived, so a form popped
+        # back to renders its restored entries in the body over selects still
+        # marked with whatever they were seeded with.
+        self._sync_select_defaults()
 
     # // ----( Group + error helpers )---- // #
 
@@ -866,7 +895,7 @@ class FormView(_BaseFormMixin, StatefulView):
                 # present after on_submit is one on_submit set itself.
                 self._field_errors = {}
                 self._form_error = None
-                await self.on_submit(interaction, self.values)
+                await await_maybe(self.on_submit(interaction, self.values))
                 # on_submit may reject a cross-field rule via set_form_error /
                 # set_field_error; if it did, keep the form open (the setter
                 # already re-rendered) rather than exiting. Otherwise an
@@ -944,6 +973,7 @@ class FormView(_BaseFormMixin, StatefulView):
 
     async def _update_form_display(self):
         """Rebuild the form embed and ship it."""
+        self._sync_select_defaults()
         await self.refresh(**await self._nav_edit_kwargs())
 
     async def send(
@@ -1153,7 +1183,7 @@ class FormLayoutView(_BaseFormMixin, StatefulLayoutView):
                 # present after on_submit is one on_submit set itself.
                 self._field_errors = {}
                 self._form_error = None
-                await self.on_submit(interaction, self.values)
+                await await_maybe(self.on_submit(interaction, self.values))
                 # on_submit may reject a cross-field rule via set_form_error /
                 # set_field_error; if it did, keep the form open (the setter
                 # already re-rendered) rather than exiting. Otherwise an

@@ -155,8 +155,13 @@ _INTERNAL_NAMES = frozenset(
         "ack_backstop",
         "open_modal_safe",
         "call_hook_safe",
+        "await_maybe",
+        "is_async_callable",
+        "normalize_mapping",
         "elapsed_since",
         "trailing_ack",
+        "DISCORD_CALL_ERRORS",
+        "describe_discord_error",
         # Persistence internals (register_* helpers ARE exported; these are not)
         "NAMESPACE_APPLICATION",
         "NAMESPACE_REGISTRY",
@@ -246,4 +251,49 @@ class TestNoAccidentalInternalPublic:
             "Public names that reach neither cascadeui.__all__ nor _INTERNAL_NAMES "
             "-- export each from the package root or add it to _INTERNAL_NAMES: "
             f"{offenders}"
+        )
+
+
+class TestInstallHintsNameTheDistribution:
+    """Every ``pip install`` hint in the source names the real distribution.
+
+    Three modules carry one and each writes the name by hand. One said
+    ``cascadeui`` while the distribution is ``pycascadeui``, so the
+    missing-aiosqlite error handed the user a command for a package that
+    does not exist. Nothing but this test stops the next copy from drifting.
+    """
+
+    def test_every_pip_install_hint_uses_the_real_name(self):
+        package_dir = os.path.dirname(os.path.abspath(cascadeui.__file__))
+        root = os.path.dirname(package_dir)
+
+        distribution = None
+        with open(os.path.join(root, "pyproject.toml"), encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("name"):
+                    distribution = line.split("=", 1)[1].strip().strip("\"'")
+                    break
+        assert distribution, "could not read the distribution name from pyproject.toml"
+
+        offenders = {}
+        for dirpath, _, filenames in os.walk(package_dir):
+            for filename in sorted(filenames):
+                if not filename.endswith(".py"):
+                    continue
+                path = os.path.join(dirpath, filename)
+                with open(path, encoding="utf-8") as fh:
+                    for lineno, line in enumerate(fh, 1):
+                        if "pip install" not in line:
+                            continue
+                        # Strip the quoting that guards bracket-globbing shells
+                        # before comparing, so 'pycascadeui[x]' and bare
+                        # pycascadeui[x] both read the same.
+                        hint = line.split("pip install", 1)[1].lstrip(" \"'")
+                        if not hint.startswith(distribution):
+                            offenders[f"{os.path.relpath(path, root)}:{lineno}"] = line.strip()
+
+        assert not offenders, (
+            f"pip install hints naming something other than the {distribution!r} "
+            f"distribution -- a user copying one of these installs the wrong "
+            f"package or nothing at all: {offenders}"
         )

@@ -7,6 +7,8 @@ import logging
 from functools import wraps
 from typing import Any, Callable, Dict
 
+from .hooks import await_maybe
+
 logger = logging.getLogger(__name__)
 
 
@@ -39,7 +41,14 @@ def cascade_reducer(action_type: str):
     def decorator(func: Callable):
         @wraps(func)
         async def wrapper(action: Dict[str, Any], state: Dict[str, Any]):
-            return await func(action, copy.deepcopy(state))
+            # A reducer is a pure transformation and has no reason to be
+            # async, so plenty are written with a plain ``def``. Awaiting
+            # unconditionally turned those into a swallowed no-op: the
+            # decoration succeeded, the dispatch succeeded, the returned
+            # dict failed on being awaited, and the store logged the
+            # TypeError and kept the old state. Same polarity as every
+            # other seam that runs a caller's function.
+            return await await_maybe(func(action, copy.deepcopy(state)))
 
         # Import lazily to avoid circular imports
         from ..state.singleton import get_store
@@ -74,7 +83,7 @@ def cascade_component(component_id: str = None):
             )
 
             # Call original function
-            return await func(self, interaction)
+            return await await_maybe(func(self, interaction))
 
         return wrapper
 

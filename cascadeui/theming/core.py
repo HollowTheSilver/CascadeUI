@@ -1,10 +1,12 @@
 # // ========================================( Modules )======================================== // #
 
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
 
 import discord
 from discord import Color
+
+from ..utils.guards import normalize_mapping
 
 # // ========================================( Classes )======================================== // #
 
@@ -12,9 +14,27 @@ from discord import Color
 class Theme:
     """Defines styling for UI components."""
 
-    def __init__(self, name: str, styles: Dict[str, Any] = None) -> None:
+    def __init__(
+        self,
+        name: str,
+        styles: Optional[Union[Mapping[str, Any], Sequence[Tuple[str, Any]]]] = None,
+    ) -> None:
         self.name = name
-        self.styles = styles or {}
+        # Every read below is by key, so a sequence of pairs (the plausible
+        # near miss) otherwise fails on the first lookup with "list indices
+        # must be integers", naming neither the parameter nor the shape. The
+        # pair form carries the same mapping, so it is converted rather than
+        # refused, matching how the V2 builders treat the same argument.
+        # Copied, not adopted: the defaults below are seeded into this dict,
+        # so holding the caller's own mapping would make constructing a
+        # Theme silently add six keys to it, and two Themes built from one
+        # base dict would share a single live styles mapping where editing
+        # either restyles both. ``normalize_mapping`` returns a mapping
+        # untouched by contract, which is right for its read-only callers
+        # and wrong for the one caller that writes.
+        self.styles = (
+            dict(normalize_mapping(styles, owner="Theme", param="styles")) if styles else {}
+        )
 
         # Set default styles if not provided
         if "primary_color" not in self.styles:

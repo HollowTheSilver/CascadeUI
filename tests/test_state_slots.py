@@ -431,3 +431,119 @@ class TestPersistentSlotsAttribute:
         slot["text"] = "hello"
         assert is_persistent_slot("notes")
         assert state["application"]["notes"][1]["text"] == "hello"
+
+
+class TestSlotPropertyMisuse:
+    """A misdeclared ``slot_property`` says so instead of reading a default.
+
+    Neither mistake used to surface. A non-callable ``key=`` and a ``key=``
+    that raises both landed in the same swallow as "the store is not wired
+    yet", so a typo became a default that looks correct in every test and
+    forever after.
+    """
+
+    def _host(self, **attrs):
+        cls = type("Host", (), {"state_store": get_store(), **attrs})
+        return cls()
+
+    def test_non_callable_key_is_refused_where_it_is_declared(self):
+        with pytest.raises(TypeError, match="must be a callable"):
+            slot_property("setup", slot="prefs", key="user_id")
+
+    def test_message_shows_the_shape_it_wanted(self):
+        with pytest.raises(TypeError, match=r"lambda self: self\.user_id"):
+            slot_property("setup", slot="prefs", key=42)
+
+    def test_raising_key_reads_the_default_and_reports(self, caplog):
+        host = self._host(
+            broken=slot_property(
+                "setup", slot="prefs", key=lambda self: self.usr_id, default="fallback"
+            )
+        )
+
+        with caplog.at_level("WARNING", logger="cascadeui.state.slots"):
+            assert host.broken == "fallback"
+
+        assert "AttributeError" in caplog.text
+        assert "Host.broken" in caplog.text
+
+    def test_raising_key_reports_once_not_once_per_read(self, caplog):
+        """A descriptor is read on every attribute access, so reporting per
+        read buries the one line that matters and trains an operator to
+        filter the logger out."""
+        host = self._host(broken=slot_property("setup", slot="prefs", key=lambda self: self.usr_id))
+
+        with caplog.at_level("WARNING", logger="cascadeui.state.slots"):
+            for _ in range(6):
+                host.broken
+
+        assert len([r for r in caplog.records if "slot_property" in r.message]) == 1
+
+    def test_each_owner_class_reports_for_itself(self):
+        """One descriptor is shared by every subclass that inherits it, and
+        the attribute the key reaches for may exist on some of them."""
+        prop = slot_property("setup", slot="prefs", key=lambda self: self.usr_id)
+        base = type("Base", (), {"state_store": get_store(), "broken": prop})
+        sub = type("Sub", (base,), {})
+
+        base().broken
+        sub().broken
+
+        assert prop._key_failed == {"Base", "Sub"}
+
+    def test_a_working_key_is_silent(self, caplog):
+        store = get_store()
+        store.state.setdefault("application", {})["prefs"] = {7: {"setup": "done"}}
+        host = self._host(usr_id=7, ok=slot_property("setup", slot="prefs", key=lambda s: s.usr_id))
+
+        with caplog.at_level("WARNING", logger="cascadeui.state.slots"):
+            assert host.ok == "done"
+
+        assert not [r for r in caplog.records if "slot_property" in r.message]
+
+
+class TestStateSelectorMustBeSynchronous:
+    """A view's ``state_selector`` override is refused if it is async.
+
+    The store's guard sees only what ``subscribe`` is handed, and
+    ``_build_selector`` hands it a lambda wrapping this method -- a lambda
+    is never a coroutine function whatever it closes over, so the override
+    slipped through and the view stopped receiving state updates while
+    looking correctly wired.
+    """
+
+    def test_async_override_rejected_at_class_definition(self):
+        from cascadeui.views.layout import StatefulLayoutView
+
+        with pytest.raises(TypeError, match="must be synchronous"):
+
+            class _Async(StatefulLayoutView):
+                async def state_selector(self, state):
+                    return state
+
+    def test_async_dunder_call_override_rejected(self):
+        from cascadeui.views.layout import StatefulLayoutView
+
+        class AsyncCallable:
+            async def __call__(self, view, state):
+                return state
+
+        with pytest.raises(TypeError, match="must be synchronous"):
+            type("_AsyncCall", (StatefulLayoutView,), {"state_selector": AsyncCallable()})
+
+    def test_synchronous_override_accepted(self):
+        from cascadeui.views.layout import StatefulLayoutView
+
+        class _Sync(StatefulLayoutView):
+            def state_selector(self, state):
+                return state.get("views")
+
+        assert _Sync.state_selector is not StatefulLayoutView.state_selector
+
+    def test_a_view_that_does_not_override_is_unaffected(self):
+        from cascadeui.views.layout import StatefulLayoutView
+
+        class _Plain(StatefulLayoutView):
+            pass
+
+        assert _Plain.state_selector is StatefulLayoutView.state_selector

@@ -619,7 +619,7 @@ class BattleshipView(StatefulLayoutView):
 
     async def send(self, *, ephemeral: bool = False):
         result = await super().send(ephemeral=ephemeral)
-        # send() returns None when session limiting blocks the view.
+        # send() returns None when instance limiting blocks the view.
         # Starting background tasks on a rejected view would leave
         # orphaned timers dispatching actions from a dead instance.
         if result is not None:
@@ -735,7 +735,6 @@ class BattleshipView(StatefulLayoutView):
             )
         )
 
-        # Last shot result
         if self._last_result:
             if "Sunk" in self._last_result:
                 level = "error"
@@ -784,7 +783,6 @@ class BattleshipView(StatefulLayoutView):
             )
         )
 
-        # Action buttons
         self.add_item(
             ActionRow(
                 StatefulButton(
@@ -822,7 +820,6 @@ class BattleshipView(StatefulLayoutView):
             )
         )
 
-        # Result alert
         if self._forfeited_by:
             self.add_item(
                 alert(
@@ -899,12 +896,10 @@ class BattleshipView(StatefulLayoutView):
         """
         current_id = self._current_player_id()
 
-        # Turn enforcement
         if interaction.user.id != current_id:
             await self.respond(interaction, f"It's <@{current_id}>'s turn!", ephemeral=True)
             return
 
-        # Validate selection
         if self._selected_row is None or self._selected_col is None:
             await self.respond(
                 interaction, "Select a **row** and **column** first!", ephemeral=True
@@ -970,7 +965,6 @@ class BattleshipView(StatefulLayoutView):
             defense[target] = WATER_MISS
             self._last_result = f"\N{MEDIUM WHITE CIRCLE} Missed <@{victim_id}> at **{coord}**."
 
-        # Switch turn
         self.turn = 2 if self.turn == 1 else 1
         self._selected_row = None
         self._selected_col = None

@@ -11,6 +11,7 @@ from typing import (
     Iterable,
     List,
     Literal,
+    Mapping,
     NamedTuple,
     Optional,
     Sequence,
@@ -32,9 +33,10 @@ from discord.ui import (
     Thumbnail,
 )
 
-from ...utils.hooks import call_hook_safe
+from ...utils.guards import normalize_mapping
+from ...utils.hooks import await_maybe, call_hook_safe
 from ..base import StatefulButton, StatefulSelect
-from ..types import MAX_SELECT_OPTIONS, EmojiInput, MediaInput
+from ..types import MAX_COMPONENT_ID, MAX_SELECT_OPTIONS, EmojiInput, MediaInput
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +102,112 @@ def _stamp_custom_id(base: Optional[str], suffix: str) -> Optional[str]:
     return composed
 
 
+def _require_sync_result(value, owner: str, param: str):
+    """Reject an awaitable returned where a rendered value was wanted.
+
+    The constructor rejects a coroutine function, but that predicate only
+    recognises the object as one: an instance whose ``__call__`` is async
+    passes it and returns a coroutine anyway. Rendering is synchronous, so
+    there is nothing to await it with, and the two consumers fail far apart.
+    A revealed coroutine reaches ``add_item`` and raises ``expected Item not
+    coroutine`` on the caller's own line, which is loud but unnamed. A
+    summary coroutine is truthy, so it becomes a ``TextDisplay`` body, clears
+    the placement validator (which skips non-string content deliberately),
+    and surfaces as a JSON serialization error at HTTP send, naming neither
+    the parameter nor the class.
+
+    The coroutine is closed before raising so it does not also emit a
+    "never awaited" warning from the collector.
+    """
+    if inspect.isawaitable(value):
+        value.close()
+        raise TypeError(
+            f"{owner}: {param} must be synchronous; it returned "
+            f"{type(value).__name__}.\n"
+            f"  Fix: load async data in the host's on_load() and have {param} "
+            f"read the result."
+        )
+    return value
+
+
+def _check_button_styles(builder: str, **styles) -> None:
+    """Reject a button style that is not a ``discord.ButtonStyle``.
+
+    discord.py stores whatever it is handed and reads ``.value`` only when
+    the payload is built, so a bare string like ``"danger"`` constructs
+    cleanly and fails at send with an attribute error naming neither the
+    builder nor the parameter. The class-attribute validator has always
+    checked the same type on ``*_button_style`` attributes; this is that
+    check for the values passed straight to a builder.
+    """
+    for name, value in styles.items():
+        if not isinstance(value, discord.ButtonStyle):
+            raise TypeError(
+                f"{builder}: {name} must be a discord.ButtonStyle, got "
+                f"{type(value).__name__}: {value!r}\n"
+                f"  Fix: pass a member, e.g. discord.ButtonStyle.danger."
+            )
+
+
+def _check_label_pair(labels, builder: str) -> None:
+    """Reject a toggle's ``labels`` that is not an on/off pair of strings.
+
+    Both labels are read by index, so a one-item sequence raises
+    ``IndexError`` from inside the builder. A bare string is worse: it
+    indexes without complaint and the button renders single characters,
+    which no exception ever reports. ``cycle_button`` already rejects a
+    label list that does not match its values; this is the same check for
+    the fixed pair the toggles take.
+    """
+    if isinstance(labels, str) or not isinstance(labels, (tuple, list)) or len(labels) != 2:
+        raise ValueError(
+            f"{builder}: labels must be a two-item sequence of "
+            f"(active, inactive) strings, got {labels!r}"
+        )
+    if not all(isinstance(label, str) for label in labels):
+        raise TypeError(
+            f"{builder}: both labels must be strings, got "
+            f"({', '.join(type(label).__name__ for label in labels)})"
+        )
+
+
+def _with_id(component, component_id: Optional[int], builder: str):
+    """Stamp a caller-supplied ``id`` onto the component a builder returns.
+
+    ``id`` is Discord's per-component integer, unique within a message and
+    assigned sequentially from 1 for anything that omits it. It is unrelated
+    to ``custom_id``: every component carries one, including the display-only
+    types that have no ``custom_id`` at all.
+
+    ``id`` is a plain attribute on every component type the builders
+    return, so it is assigned after construction rather than threaded
+    through each constructor.
+
+    Validation lives here because discord.py performs none: a string, a
+    float, or a negative reaches the payload untouched and returns an opaque
+    HTTP 400. Zero is rejected rather than passed through, since Discord
+    reads it as absent and assigns a number the caller did not choose.
+    """
+    if component_id is None:
+        return component
+    if isinstance(component_id, bool) or not isinstance(component_id, int):
+        raise TypeError(
+            f"{builder}(id=...) must be an int, got "
+            f"{type(component_id).__name__}: {component_id!r}\n"
+            f"  Fix: Pass an int between 1 and {MAX_COMPONENT_ID}, or omit id= "
+            f"and let Discord assign one."
+        )
+    if not 1 <= component_id <= MAX_COMPONENT_ID:
+        raise ValueError(
+            f"{builder}(id={component_id}) is outside Discord's range "
+            f"(1 to {MAX_COMPONENT_ID}).\n"
+            f"  Discord reads 0 as absent and rejects the rest with HTTP 400.\n"
+            f"  Fix: Pass an id in range, or omit id= to have Discord assign one."
+        )
+    component.id = component_id
+    return component
+
+
 def _require_text(value: str, builder: str, param: str) -> str:
     """Reject a caller-formatted string that would ship an empty TextDisplay.
 
@@ -120,7 +228,7 @@ def _require_text(value: str, builder: str, param: str) -> str:
     return value
 
 
-def _coerce_media_ref(value: MediaInput) -> str:
+def _coerce_media_ref(value: MediaInput, *, owner: str, param: str) -> str:
     """Resolve a ``MediaInput`` to the URL string Discord's API consumes.
 
     Strings pass through unchanged. A :class:`discord.File` resolves to
@@ -138,7 +246,23 @@ def _coerce_media_ref(value: MediaInput) -> str:
     """
     if isinstance(value, discord.File):
         return value.uri
-    return value
+    if isinstance(value, (str, discord.UnfurledMediaItem)):
+        return value
+    # An Asset is one attribute away from correct (``member.display_avatar``
+    # instead of ``member.display_avatar.url``), and every docstring example
+    # here shows the ``.url`` form, so the near miss is the likely one. It is
+    # coerced rather than refused, matching how the leaderboard's ``banner=``
+    # has always treated the same objects. Checked after UnfurledMediaItem,
+    # which carries a ``.url`` of its own but is a media reference already and
+    # would lose its other fields on the way through.
+    url = getattr(value, "url", None)
+    if isinstance(url, str):
+        return url
+    raise TypeError(
+        f"{owner} {param} must be a URL string, a discord.File, or an object "
+        f"with a string .url attribute (e.g. discord.Asset); got "
+        f"{type(value).__name__}: {value!r}"
+    )
 
 
 # Regional indicator emoji for alpha axis preset (🇦 through 🇿, 26 glyphs).
@@ -160,6 +284,7 @@ def card(
     *children,
     color: Optional[Union[discord.Colour, int]] = None,
     spoiler: bool = False,
+    id: Optional[int] = None,
 ) -> Container:
     """Build a themed Container from children.
 
@@ -211,7 +336,11 @@ def card(
     # themed no matter where it was built and follows runtime theme
     # changes. An explicit color is never marked and never touched.
     container._cascadeui_theme_accent = theme_managed
-    return container
+    return _with_id(
+        container,
+        id,
+        "card",
+    )
 
 
 # // ========================================( Sections )======================================== // #
@@ -226,11 +355,12 @@ def action_section(
     emoji: EmojiInput = None,
     custom_id: Optional[str] = None,
     disabled: bool = False,
+    id: Optional[int] = None,
 ) -> Section:
     """Build a Section with a StatefulButton accessory.
 
-    V2's signature pattern -- text and an action button on the same line --
-    as a one-liner instead of 5+ lines.
+    Renders V2's signature pattern, text and an action button on the same
+    line, as a one-liner instead of 5+ lines.
 
     Args:
         text: Display text for the section (supports markdown).
@@ -255,6 +385,7 @@ def action_section(
             style=discord.ButtonStyle.primary,
         )
     """
+    _check_button_styles("action_section", style=style)
     button_kwargs = {
         "label": label,
         "style": style,
@@ -265,9 +396,13 @@ def action_section(
     _check_custom_id_length(custom_id, "action_section")
     if custom_id is not None:
         button_kwargs["custom_id"] = custom_id
-    return Section(
-        TextDisplay(_require_text(text, "action_section", "text")),
-        accessory=StatefulButton(**button_kwargs),
+    return _with_id(
+        Section(
+            TextDisplay(_require_text(text, "action_section", "text")),
+            accessory=StatefulButton(**button_kwargs),
+        ),
+        id,
+        "action_section",
     )
 
 
@@ -280,6 +415,7 @@ def toggle_section(
     emoji: EmojiInput = None,
     custom_id: Optional[str] = None,
     disabled: bool = False,
+    id: Optional[int] = None,
 ) -> Section:
     """Build a Section with a green/red toggle button accessory.
 
@@ -309,6 +445,7 @@ def toggle_section(
             callback=self._toggle_moderation,
         )
     """
+    _check_label_pair(labels, "toggle_section")
     button_kwargs = {
         "label": labels[0] if active else labels[1],
         "style": discord.ButtonStyle.success if active else discord.ButtonStyle.danger,
@@ -319,9 +456,13 @@ def toggle_section(
     _check_custom_id_length(custom_id, "toggle_section")
     if custom_id is not None:
         button_kwargs["custom_id"] = custom_id
-    return Section(
-        TextDisplay(_require_text(text, "toggle_section", "text")),
-        accessory=StatefulButton(**button_kwargs),
+    return _with_id(
+        Section(
+            TextDisplay(_require_text(text, "toggle_section", "text")),
+            accessory=StatefulButton(**button_kwargs),
+        ),
+        id,
+        "toggle_section",
     )
 
 
@@ -331,6 +472,7 @@ def image_section(
     url: MediaInput,
     description: Optional[str] = None,
     spoiler: bool = False,
+    id: Optional[int] = None,
 ) -> Section:
     """Build a Section with a Thumbnail accessory.
 
@@ -384,12 +526,19 @@ def image_section(
             f"3-children-per-Section limit. Merge lines with a newline, or "
             f"move the overflow into its own component."
         )
-    kwargs = {"media": _coerce_media_ref(url), "spoiler": spoiler}
+    kwargs = {
+        "media": _coerce_media_ref(url, owner="image_section", param="url"),
+        "spoiler": spoiler,
+    }
     if description is not None:
         kwargs["description"] = description
-    return Section(
-        *(TextDisplay(line) for line in lines),
-        accessory=Thumbnail(**kwargs),
+    return _with_id(
+        Section(
+            *(TextDisplay(line) for line in lines),
+            accessory=Thumbnail(**kwargs),
+        ),
+        id,
+        "image_section",
     )
 
 
@@ -400,6 +549,7 @@ def link_section(
     url: str,
     emoji: EmojiInput = None,
     disabled: bool = False,
+    id: Optional[int] = None,
 ) -> Section:
     """Build a Section with a link button accessory.
 
@@ -429,15 +579,19 @@ def link_section(
             url="https://hollowthesilver.github.io/CascadeUI/",
         )
     """
-    return Section(
-        TextDisplay(_require_text(text, "link_section", "text")),
-        accessory=discord.ui.Button(
-            label=label,
-            style=discord.ButtonStyle.link,
-            url=url,
-            emoji=emoji,
-            disabled=disabled,
+    return _with_id(
+        Section(
+            TextDisplay(_require_text(text, "link_section", "text")),
+            accessory=discord.ui.Button(
+                label=label,
+                style=discord.ButtonStyle.link,
+                url=url,
+                emoji=emoji,
+                disabled=disabled,
+            ),
         ),
+        id,
+        "link_section",
     )
 
 
@@ -450,6 +604,8 @@ def confirm_section(
     cancel_label: str = "Cancel",
     confirm_emoji: EmojiInput = "\u2705",
     cancel_emoji: EmojiInput = "\u274c",
+    confirm_style: discord.ButtonStyle = discord.ButtonStyle.success,
+    cancel_style: discord.ButtonStyle = discord.ButtonStyle.danger,
     custom_id: Optional[str] = None,
 ) -> List:
     """Build a confirm/cancel prompt as a list of V2 children.
@@ -457,17 +613,26 @@ def confirm_section(
     Returns a ``[TextDisplay, ActionRow]`` pair rather than a single
     component so the caller can splat it into ``card(...)`` or add
     it directly to a view alongside other content. The TextDisplay holds
-    the prompt text; the ActionRow holds the paired success/danger
-    buttons.
+    the prompt text; the ActionRow holds the confirm and cancel buttons,
+    green and red by default and restyled through the two style
+    parameters below.
 
     Args:
         text: Prompt text shown above the buttons (supports markdown).
-        on_confirm: Async callback ``(interaction) -> None`` for the
-            confirm button.
-        on_cancel: Async callback ``(interaction) -> None`` for the
-            cancel button.
+        on_confirm: Callback ``(interaction) -> None`` for the confirm
+            button. Sync or async.
+        on_cancel: Callback ``(interaction) -> None`` for the cancel
+            button. Sync or async.
         confirm_label: Confirm button label. Defaults to ``"Confirm"``.
         cancel_label: Cancel button label. Defaults to ``"Cancel"``.
+        confirm_style: Confirm button style. Defaults to
+            ``ButtonStyle.success``, which reads confirm-is-good. Pass
+            ``ButtonStyle.danger`` when confirming is the destructive
+            choice, or the button that deletes renders green.
+        cancel_style: Cancel button style. Defaults to
+            ``ButtonStyle.danger``. Pair it with ``ButtonStyle.secondary``
+            when the styles above are swapped, so the safe option does not
+            render as the alarming one.
         confirm_emoji: Confirm button emoji. Defaults to a green check.
         cancel_emoji: Cancel button emoji. Defaults to a red cross.
         custom_id: Base id for the two buttons, which become
@@ -487,23 +652,26 @@ def confirm_section(
                 on_confirm=self._do_delete,
                 on_cancel=self._do_cancel,
                 confirm_label="Delete",
+                confirm_style=discord.ButtonStyle.danger,
+                cancel_style=discord.ButtonStyle.secondary,
             ),
             color=discord.Color.red(),
         )
     """
+    _check_button_styles("confirm_section", confirm_style=confirm_style, cancel_style=cancel_style)
     return [
         TextDisplay(_require_text(text, "confirm_section", "text")),
         ActionRow(
             StatefulButton(
                 label=confirm_label,
-                style=discord.ButtonStyle.success,
+                style=confirm_style,
                 emoji=confirm_emoji,
                 custom_id=_stamp_custom_id(custom_id, "confirm"),
                 callback=on_confirm,
             ),
             StatefulButton(
                 label=cancel_label,
-                style=discord.ButtonStyle.danger,
+                style=cancel_style,
                 emoji=cancel_emoji,
                 custom_id=_stamp_custom_id(custom_id, "cancel"),
                 callback=on_cancel,
@@ -516,11 +684,12 @@ def confirm_section(
 
 
 def button_row(
-    buttons: Dict[str, Callable],
+    buttons: Union[Mapping[str, Callable], Sequence[Tuple[str, Callable]]],
     *,
     style: discord.ButtonStyle = discord.ButtonStyle.secondary,
     emoji: EmojiInput = None,
     custom_id: Optional[str] = None,
+    id: Optional[int] = None,
 ) -> ActionRow:
     """Build an ActionRow from a ``{label: callback}`` mapping.
 
@@ -559,6 +728,8 @@ def button_row(
             style=discord.ButtonStyle.primary,
         )
     """
+    _check_button_styles("button_row", style=style)
+    buttons = normalize_mapping(buttons, owner="button_row", param="buttons")
     if not buttons:
         raise ValueError("button_row: buttons mapping must not be empty.")
     if len(buttons) > 5:
@@ -566,17 +737,21 @@ def button_row(
             f"button_row: {len(buttons)} buttons exceeds Discord's "
             f"5-per-ActionRow limit. Split into multiple rows."
         )
-    return ActionRow(
-        *(
-            StatefulButton(
-                label=label,
-                style=style,
-                emoji=emoji,
-                custom_id=_stamp_custom_id(custom_id, str(i)),
-                callback=callback,
+    return _with_id(
+        ActionRow(
+            *(
+                StatefulButton(
+                    label=label,
+                    style=style,
+                    emoji=emoji,
+                    custom_id=_stamp_custom_id(custom_id, str(i)),
+                    callback=callback,
+                )
+                for i, (label, callback) in enumerate(buttons.items())
             )
-            for i, (label, callback) in enumerate(buttons.items())
-        )
+        ),
+        id,
+        "button_row",
     )
 
 
@@ -589,6 +764,7 @@ def cycle_button(
     emoji: EmojiInput = None,
     start: int = 0,
     custom_id: Optional[str] = None,
+    id: Optional[int] = None,
 ) -> StatefulButton:
     """Build a button that cycles through a fixed list of values.
 
@@ -631,6 +807,7 @@ def cycle_button(
             emoji="\u2699\ufe0f",
         )
     """
+    _check_button_styles("cycle_button", style=style)
     if not values:
         raise ValueError("cycle_button: values must not be empty.")
     _check_custom_id_length(custom_id, "cycle_button")
@@ -648,7 +825,7 @@ def cycle_button(
     async def _cycle_callback(interaction):
         button._cycle_index = (button._cycle_index + 1) % len(button._cycle_values)
         button.label = button._cycle_labels[button._cycle_index]
-        await on_change(interaction, button._cycle_values[button._cycle_index])
+        await await_maybe(on_change(interaction, button._cycle_values[button._cycle_index]))
 
     button = StatefulButton(
         label=resolved_labels[start],
@@ -660,7 +837,11 @@ def cycle_button(
     button._cycle_index = start
     button._cycle_values = list(values)
     button._cycle_labels = resolved_labels
-    return button
+    return _with_id(
+        button,
+        id,
+        "cycle_button",
+    )
 
 
 def toggle_button(
@@ -670,6 +851,7 @@ def toggle_button(
     labels: Tuple[str, str] = ("Enabled", "Disabled"),
     emoji: EmojiInput = None,
     custom_id: Optional[str] = None,
+    id: Optional[int] = None,
 ) -> StatefulButton:
     """Build a standalone boolean toggle button.
 
@@ -707,6 +889,7 @@ def toggle_button(
     """
 
     _check_custom_id_length(custom_id, "toggle_button")
+    _check_label_pair(labels, "toggle_button")
 
     async def _toggle_callback(interaction):
         button._toggle_active = not button._toggle_active
@@ -714,7 +897,7 @@ def toggle_button(
         button.style = (
             discord.ButtonStyle.success if button._toggle_active else discord.ButtonStyle.danger
         )
-        await on_toggle(interaction, button._toggle_active)
+        await await_maybe(on_toggle(interaction, button._toggle_active))
 
     button = StatefulButton(
         label=labels[0] if active else labels[1],
@@ -724,7 +907,11 @@ def toggle_button(
         callback=_toggle_callback,
     )
     button._toggle_active = active
-    return button
+    return _with_id(
+        button,
+        id,
+        "toggle_button",
+    )
 
 
 # // ========================================( Choices )======================================== // #
@@ -755,47 +942,72 @@ class Choice(NamedTuple):
     description: Optional[str] = None
 
 
-def _normalize_choices(options: Union[Dict[str, Any], Sequence[Choice]]) -> List[Choice]:
+def _normalize_choices(
+    options: Union[Mapping[str, Any], Sequence[Tuple[str, Any]], Sequence[Choice]],
+) -> List[Choice]:
     """Resolve dict or Choice-sequence input into a list of ``Choice``."""
-    if isinstance(options, dict):
+    if hasattr(options, "items"):
         return [Choice(label=str(label), value=value) for label, value in options.items()]
+    # An int or any other non-iterable dies on the ``for`` below with its own
+    # message, which names neither the builder nor the parameter. Strings and
+    # bytes iterate, but into characters, so they arrive as a row of
+    # one-letter options rather than as the mistake they are.
+    if isinstance(options, (str, bytes)) or not hasattr(options, "__iter__"):
+        raise TypeError(
+            f"choice_row: options must be a mapping of {{label: value}}, a sequence "
+            f"of Choice, or a sequence of (label, value) pairs; got "
+            f"{type(options).__name__}: {options!r}"
+        )
     resolved: List[Choice] = []
     for opt in options:
-        if not isinstance(opt, Choice):
-            raise TypeError(
-                f"choice_row options must be a dict or a sequence of Choice; "
-                f"got {type(opt).__name__}"
-            )
-        resolved.append(opt)
+        if isinstance(opt, Choice):
+            resolved.append(opt)
+            continue
+        # A two-item sequence is the same data a mapping carries, in the order
+        # the caller wrote it, so it converts rather than being refused. A
+        # Choice is itself a tuple, which is why it is matched first.
+        if isinstance(opt, (tuple, list)) and len(opt) == 2:
+            resolved.append(Choice(label=str(opt[0]), value=opt[1]))
+            continue
+        raise TypeError(
+            f"choice_row options must be a mapping, a sequence of Choice, or a "
+            f"sequence of (label, value) pairs; got {type(opt).__name__}"
+        )
     return resolved
 
 
-def _selected_set(selected: Any, multi: bool) -> set:
-    """Normalize ``selected`` into a set of active values.
+def _selected_values(selected: Any, multi: bool) -> list:
+    """Normalize ``selected`` into a list of active values.
 
     Single-select treats ``selected`` as one value; multi-select treats
     it as a collection. ``str``/``bytes`` are never iterated apart (a
     string value is one choice, not a set of characters).
+
+    A list rather than a set because ``Choice.value`` is documented as any
+    Python object, and membership against a set requires every value to be
+    hashable: a list or dict value failed on the containment test even when
+    nothing was selected. Options cap at 25, so the linear scan costs
+    nothing measurable and equality is the comparison the caller expects.
     """
     if selected is None:
-        return set()
+        return []
     if not multi:
         if isinstance(selected, (list, tuple, set, frozenset)):
             raise TypeError(
                 "choice_row: with multi=False, selected must be a single value "
                 f"(not a {type(selected).__name__}). Pass multi=True to select several."
             )
-        return {selected}
+        return [selected]
     if isinstance(selected, (str, bytes)) or not hasattr(selected, "__iter__"):
         raise TypeError(
             "choice_row: with multi=True, selected must be a collection of "
             f"values (set/list/tuple), got {type(selected).__name__}"
         )
-    return set(selected)
+    return list(selected)
 
 
 def choice_row(
-    options: Union[Dict[str, Any], Sequence[Choice]],
+    options: Union[Mapping[str, Any], Sequence[Tuple[str, Any]], Sequence[Choice]],
     *,
     on_select: Callable,
     selected: Any = None,
@@ -807,12 +1019,13 @@ def choice_row(
     inactive_style: discord.ButtonStyle = discord.ButtonStyle.secondary,
     placeholder: Optional[str] = None,
     custom_id: str = "choice",
+    id: Optional[int] = None,
 ) -> ActionRow:
     """Build a "choose one" (or "choose any") control from a set of options.
 
-    Collapses the hand-rolled segmented control -- a row of buttons where
+    Collapses the hand-rolled segmented control (a row of buttons where
     the active option is styled differently and disabled, each wired to set
-    its value -- into one call, and switches to a dropdown automatically
+    its value) into one call, and switches to a dropdown automatically
     when the option count outgrows a button row.
 
     The active option(s) render highlighted. In single-select the active
@@ -826,7 +1039,7 @@ def choice_row(
     select option values to be strings; the builder maps to and from that
     string form, so ``on_select`` always sees the real Python value.
 
-    The builder is stateless -- it reads ``selected`` at build time and
+    The builder is stateless: it reads ``selected`` at build time and
     renders the active option(s) from it. The host view owns the selection:
     the ``on_select`` callback stores the new value and rebuilds the row
     (``build_ui()`` then ``refresh()``, or a state dispatch) so the next
@@ -843,10 +1056,10 @@ def choice_row(
         selected: The active value (single-select) or a collection of
             active values (multi-select). ``None`` means nothing selected.
         multi: When ``True``, multiple options can be active at once.
-        disabled: When ``True``, the whole control renders greyed out and
-            non-interactive (every button, or the dropdown). Use it for a
-            read-only state -- a locked or closed choice -- where the
-            selection still shows but cannot change.
+        disabled: When ``True``, every button or the dropdown renders
+            greyed out and non-interactive. Use it for a read-only,
+            locked, or closed state where the selection still shows but
+            cannot change.
         allow_reselect: Single-select only. When ``True``, the active option
             stays clickable and a re-pick fires ``on_select`` with the active
             value again. Default ``False`` keeps the active option inert (a
@@ -884,6 +1097,7 @@ def choice_row(
             on_select=self._set_difficulty,
         )
     """
+    _check_button_styles("choice_row", active_style=active_style, inactive_style=inactive_style)
     choices = _normalize_choices(options)
     if not choices:
         raise ValueError("choice_row: options must not be empty.")
@@ -904,39 +1118,59 @@ def choice_row(
     if not callable(on_select):
         raise TypeError(f"choice_row: on_select must be callable, got {type(on_select).__name__}")
 
-    active = _selected_set(selected, multi)
+    active = _selected_values(selected, multi)
     if len(choices) <= button_threshold:
-        return _choice_button_row(
-            choices,
-            active,
-            on_select,
-            multi,
-            active_style,
-            inactive_style,
-            custom_id,
-            disabled,
-            allow_reselect,
+        return _with_id(
+            _choice_button_row(
+                choices,
+                active,
+                on_select,
+                multi,
+                active_style,
+                inactive_style,
+                custom_id,
+                disabled,
+                allow_reselect,
+            ),
+            id,
+            "choice_row",
         )
-    return _choice_select_row(
-        choices, active, on_select, multi, placeholder, custom_id, disabled, allow_reselect
+    return _with_id(
+        _choice_select_row(
+            choices, active, on_select, multi, placeholder, custom_id, disabled, allow_reselect
+        ),
+        id,
+        "choice_row",
     )
 
 
 def _make_single_choice_callback(value: Any, on_select: Callable):
     async def callback(interaction: discord.Interaction):
-        await on_select(interaction, value)
+        await await_maybe(on_select(interaction, value))
 
     return callback
 
 
-def _make_multi_choice_callback(value: Any, active: set, on_select: Callable):
+def _make_multi_choice_callback(value: Any, active: list, on_select: Callable):
     # active is the build-time snapshot; clicking toggles this value in or
-    # out and hands the host the full new set. The host stores it and
-    # rebuilds, so the next render's buttons capture the updated set.
+    # out and hands the host the full new list. The host stores it and
+    # rebuilds, so the next render's buttons capture the updated selection.
+    #
+    # A list, not a set: a Choice.value is any Python object, and the
+    # construction path was widened to accept unhashable ones. Building a
+    # set here put the same restriction back one click later, which is
+    # strictly worse -- it moved the failure from where the options are
+    # written to where a user pressed a button. Options cap at 25, so the
+    # linear scan costs nothing.
     async def callback(interaction: discord.Interaction):
-        new = set(active)
-        new.discard(value) if value in new else new.add(value)
-        await on_select(interaction, list(new))
+        # ``in`` is what the render path uses to decide which options draw
+        # active, so toggling reads membership the same way and the two
+        # cannot disagree about what is selected.
+        if value in active:
+            new = [v for v in active if v != value]
+        else:
+            new = [*active, value]
+        await await_maybe(on_select(interaction, new))
 
     return callback
 
@@ -1006,7 +1240,7 @@ def _choice_select_row(
         # each back to its Python value before handing it to on_select.
         resolved = [idx_to_value[int(v)] for v in values]
         if multi:
-            await on_select(interaction, resolved)
+            await await_maybe(on_select(interaction, resolved))
         else:
             picked = resolved[0] if resolved else None
             # Match the button form: a single-select re-pick of the active
@@ -1016,7 +1250,7 @@ def _choice_select_row(
             # button_threshold. The host's post-callback defer acks the click.
             if not allow_reselect and picked in active:
                 return
-            await on_select(interaction, picked)
+            await await_maybe(on_select(interaction, picked))
 
     select = StatefulSelect(
         options=options,
@@ -1033,7 +1267,9 @@ def _choice_select_row(
 # // ========================================( Content )======================================== // #
 
 
-def key_value(data: Dict[str, Any]) -> TextDisplay:
+def key_value(
+    data: Union[Mapping[str, Any], Sequence[Tuple[str, Any]]], id: Optional[int] = None
+) -> TextDisplay:
     """Build a TextDisplay from a dict of key-value pairs.
 
     Each key is rendered in bold, followed by its value. Pairs are
@@ -1054,8 +1290,13 @@ def key_value(data: Dict[str, Any]) -> TextDisplay:
         # **Roles:** 5
         # **Channels:** 12
     """
+    data = normalize_mapping(data, owner="key_value", param="data")
     lines = [f"**{key}:** {value}" for key, value in data.items()]
-    return TextDisplay(_require_text("\n".join(lines), "key_value", "data"))
+    return _with_id(
+        TextDisplay(_require_text("\n".join(lines), "key_value", "data")),
+        id,
+        "key_value",
+    )
 
 
 _ALERT_STYLES = {
@@ -1066,7 +1307,7 @@ _ALERT_STYLES = {
 }
 
 
-def alert(message: str, level: str = "info") -> Container:
+def alert(message: str, level: str = "info", id: Optional[int] = None) -> Container:
     """Build a colored Container for status messages.
 
     Four levels with matching emoji and accent colour:
@@ -1091,9 +1332,13 @@ def alert(message: str, level: str = "info") -> Container:
         raise ValueError(f"Unknown alert level '{level}'. Expected: {list(_ALERT_STYLES)}")
 
     emoji, color_factory = _ALERT_STYLES[level]
-    return Container(
-        TextDisplay(f"{emoji} {message}"),
-        accent_colour=color_factory(),
+    return _with_id(
+        Container(
+            TextDisplay(f"{emoji} {message}"),
+            accent_colour=color_factory(),
+        ),
+        id,
+        "alert",
     )
 
 
@@ -1104,6 +1349,7 @@ def stats_card(
     color: Optional[Union[discord.Colour, int]] = None,
     footer: Optional[str] = None,
     spoiler: bool = False,
+    id: Optional[int] = None,
 ) -> Container:
     """Build a titled Container showing a dict of stats as key-value lines.
 
@@ -1157,7 +1403,11 @@ def stats_card(
     container = Container(*children, accent_colour=color, spoiler=spoiler)
     # Same theme-managed contract as ``card()``: see the note there.
     container._cascadeui_theme_accent = theme_managed
-    return container
+    return _with_id(
+        container,
+        id,
+        "stats_card",
+    )
 
 
 def progress_bar(
@@ -1168,6 +1418,7 @@ def progress_bar(
     filled: str = "\u2588",
     empty: str = "\u2591",
     show_percent: bool = True,
+    id: Optional[int] = None,
 ) -> TextDisplay:
     """Build a text-based progress bar as a TextDisplay.
 
@@ -1196,6 +1447,15 @@ def progress_bar(
 
         progress_bar(7, 10, width=10)  # [███████░░░] 70%
     """
+    for name, number in (("value", value), ("max_value", max_value), ("width", width)):
+        # Checked before the comparisons below, which are what fail otherwise:
+        # a string operand raises a bare "'<=' not supported" naming neither
+        # parameter, and the division further down does the same.
+        if isinstance(number, bool) or not isinstance(number, (int, float)):
+            raise TypeError(
+                f"progress_bar: {name} must be a number, got "
+                f"{type(number).__name__}: {number!r}"
+            )
     if max_value <= 0:
         raise ValueError(f"progress_bar: max_value must be positive, got {max_value}.")
     if width <= 0:
@@ -1207,7 +1467,11 @@ def progress_bar(
     text = f"[{bar}]"
     if show_percent:
         text = f"{text} {int(round(ratio * 100))}%"
-    return TextDisplay(text)
+    return _with_id(
+        TextDisplay(text),
+        id,
+        "progress_bar",
+    )
 
 
 # // ========================================( Separators )======================================== // #
@@ -1228,7 +1492,7 @@ def _resolve_separator_large(large: Optional[bool]) -> bool:
     return bool(theme) and theme.get_style("separator_spacing") == "large"
 
 
-def divider(large: Optional[bool] = None) -> Separator:
+def divider(large: Optional[bool] = None, id: Optional[int] = None) -> Separator:
     """A visible separator line between content blocks.
 
     Args:
@@ -1237,10 +1501,14 @@ def divider(large: Optional[bool] = None) -> Separator:
             outside a theme context it falls back to small spacing.
     """
     size = SeparatorSpacing.large if _resolve_separator_large(large) else SeparatorSpacing.small
-    return Separator(visible=True, spacing=size)
+    return _with_id(
+        Separator(visible=True, spacing=size),
+        id,
+        "divider",
+    )
 
 
-def gap(large: Optional[bool] = None) -> Separator:
+def gap(large: Optional[bool] = None, id: Optional[int] = None) -> Separator:
     """Invisible spacing between content blocks (no visible line).
 
     Args:
@@ -1249,19 +1517,24 @@ def gap(large: Optional[bool] = None) -> Separator:
             it falls back to small spacing.
     """
     size = SeparatorSpacing.large if _resolve_separator_large(large) else SeparatorSpacing.small
-    return Separator(visible=False, spacing=size)
+    return _with_id(
+        Separator(visible=False, spacing=size),
+        id,
+        "gap",
+    )
 
 
 # // ========================================( Navigation )======================================== // #
 
 
 def tab_nav(
-    tabs: Dict[str, Callable],
+    tabs: Union[Mapping[str, Callable], Sequence[Tuple[str, Callable]]],
     *,
     active: Optional[str] = None,
     active_style: discord.ButtonStyle = discord.ButtonStyle.primary,
     inactive_style: discord.ButtonStyle = discord.ButtonStyle.secondary,
     custom_id: Optional[str] = None,
+    id: Optional[int] = None,
 ) -> ActionRow:
     """Build an ActionRow of tab-styled buttons for manual-control views.
 
@@ -1305,6 +1578,15 @@ def tab_nav(
             active="Stats",
         )
     """
+    _check_button_styles("tab_nav", active_style=active_style, inactive_style=inactive_style)
+    # Normalized first, before anything measures or indexes it. The size
+    # guards below call len(), which a non-mapping answers with its own
+    # error naming neither the builder nor the parameter, and which a
+    # generator of pairs, accepted by every sibling that takes a mapping,
+    # cannot answer at all. Normalizing here also resolves ``active``
+    # against real keys: reading the raw argument bound it to a
+    # ``(label, callback)`` tuple, so no tab rendered active.
+    tabs = normalize_mapping(tabs, owner="tab_nav", param="tabs")
     if not tabs:
         raise ValueError("tab_nav: tabs mapping must not be empty.")
     if len(tabs) > 5:
@@ -1319,16 +1601,20 @@ def tab_nav(
             f"tab_nav: active={active!r} is not a key in tabs " f"(keys: {list(tabs)})."
         )
 
-    return ActionRow(
-        *(
-            StatefulButton(
-                label=label,
-                style=active_style if label == active else inactive_style,
-                custom_id=_stamp_custom_id(custom_id, str(i)),
-                callback=callback,
+    return _with_id(
+        ActionRow(
+            *(
+                StatefulButton(
+                    label=label,
+                    style=active_style if label == active else inactive_style,
+                    custom_id=_stamp_custom_id(custom_id, str(i)),
+                    callback=callback,
+                )
+                for i, (label, callback) in enumerate(tabs.items())
             )
-            for i, (label, callback) in enumerate(tabs.items())
-        )
+        ),
+        id,
+        "tab_nav",
     )
 
 
@@ -1381,7 +1667,7 @@ class PaginatedRegion:
     :class:`~cascadeui.PaginatedLayoutView` owns the whole message and
     paginates it end to end, a ``PaginatedRegion`` paginates a single slice
     of items *inside* a host view's ``build_ui()`` and leaves the rest of
-    the tree -- headers, other cards, even a second region -- to the host.
+    the tree (headers, other cards, even a second region) to the host.
     Each instance holds its own page index, so two regions can live in one
     view without sharing a cursor.
 
@@ -1610,10 +1896,38 @@ class PaginatedRegion:
         zero, losing the page the user was on.
 
         Nothing out of range can render regardless: the ``items`` setter
-        re-clamps on assignment, and both read paths -- ``page_items`` for
-        the content and the nav builder for the button state -- clamp before
+        re-clamps on assignment, and both read paths (``page_items`` for
+        the content and the nav builder for the button state) clamp before
         they read.
+
+        A negative index counts from the end, so ``set_page(-1)`` is the
+        last page. That is the only way to name the last page without
+        first knowing how many there are, which matters after the item
+        list changes: reading ``page_count`` to compute the index forces a
+        fetch, and the jump would then load it again.
+
+        **A seek is invisible until something rebuilds.** This method moves
+        the cursor and nothing else, so the tree on screen still shows the
+        page it was composed with. Reach for :meth:`show_page` to move and
+        re-render together::
+
+            await self.pager.show_page(-1)   # one fetch, one edit
+
+        Pairing this with ``refresh()`` does not substitute: ``refresh``
+        ships the existing tree without composing a new one, so the cursor
+        advances and the rows do not. The mismatch is visible rather than
+        silent when anything in the tree counts rows, since the changed
+        total defeats the render-hash skip and an edit goes out carrying
+        the new count above the old rows.
+
+        Use this one where there is no tree to re-render yet: before the
+        region is attached, or from ``restore_nav_state`` on a popped host.
+
+        With no items there is one page and page zero is already the last,
+        so a negative index resolves to zero rather than waiting.
         """
+        if index < 0:
+            index += self.page_count
         self._page = max(0, index)
         if self._items:
             self._clamp()
@@ -1635,8 +1949,8 @@ class PaginatedRegion:
         ``view`` must be the host ``StatefulLayoutView``; the region calls
         its ``build_ui`` / ``refresh`` / ``open_modal`` on navigation.
 
-        ``compact=True`` builds a three-button row -- prev, go-to-page,
-        next -- dropping first/last and the standalone indicator. It trims
+        ``compact=True`` builds a three-button row (prev, go-to-page,
+        next), dropping first/last and the standalone indicator. It trims
         the pager's own row to three nodes; to fuse the pager buttons into
         a host-owned row with Back/Exit, see :meth:`control_buttons`.
         """
@@ -1866,8 +2180,8 @@ class Collapsible:
     """A trigger button that toggles an inline region of revealed content.
 
     The V2 collapsible (disclosure / expander) primitive. A button shows
-    one label while collapsed; clicking it reveals a region of content -- a
-    ``choice_row``, a select, a card, more buttons -- and swaps the trigger
+    one label while collapsed; clicking it reveals a region of content (a
+    ``choice_row``, a select, a card, more buttons) and swaps the trigger
     to its expanded label. Clicking again collapses. Each instance holds
     its own collapsed/expanded state, so two collapsibles in one view are
     independent.
@@ -2064,7 +2378,7 @@ class Collapsible:
         if not self._expanded:
             return [trigger]
 
-        revealed = self._reveal()
+        revealed = _require_sync_result(self._reveal(), "Collapsible", "reveal")
         revealed = revealed if isinstance(revealed, list) else [revealed]
         return [trigger, *revealed] if self._trigger_first else [*revealed, trigger]
 
@@ -2085,7 +2399,7 @@ class Collapsible:
         # set or the callable yields nothing (e.g. data not loaded yet) -- an
         # empty Section has no text to render.
         if self._summary is not None:
-            text = self._summary()
+            text = _require_sync_result(self._summary(), "Collapsible", "summary")
             if text:
                 return action_section(
                     text,
@@ -2118,6 +2432,7 @@ def gallery(
     *media: MediaInput,
     descriptions: Optional[Sequence[Optional[str]]] = None,
     spoilers: Optional[Sequence[bool]] = None,
+    id: Optional[int] = None,
 ) -> MediaGallery:
     """Build a MediaGallery from image references.
 
@@ -2160,6 +2475,12 @@ def gallery(
             f"caps MediaGallery at 10 items. Split into multiple gallery() "
             f"calls."
         )
+    if isinstance(descriptions, str):
+        raise TypeError(
+            f"gallery: descriptions must be a sequence with one entry per media "
+            f"reference, not a single string; got {descriptions!r}. A string has "
+            f"a length of its own, so it would be counted as that many descriptions."
+        )
     if descriptions is not None and len(descriptions) != len(media):
         raise ValueError(
             f"gallery: descriptions length ({len(descriptions)}) must match "
@@ -2176,19 +2497,24 @@ def gallery(
     items = []
     for i, ref in enumerate(media):
         desc = descriptions[i] if descriptions is not None else None
-        kwargs = {"media": _coerce_media_ref(ref)}
+        kwargs = {"media": _coerce_media_ref(ref, owner="gallery", param=f"media[{i}]")}
         if desc is not None:
             kwargs["description"] = desc
         if spoilers is not None and spoilers[i]:
             kwargs["spoiler"] = True
         items.append(MediaGalleryItem(**kwargs))
-    return MediaGallery(*items)
+    return _with_id(
+        MediaGallery(*items),
+        id,
+        "gallery",
+    )
 
 
 def file_attachment(
     url: MediaInput,
     *,
     spoiler: bool = False,
+    id: Optional[int] = None,
 ) -> File:
     """Build a File component for attachment display.
 
@@ -2216,7 +2542,14 @@ def file_attachment(
             "Released April 15.",
         )
     """
-    return File(media=_coerce_media_ref(url), spoiler=spoiler)
+    return _with_id(
+        File(
+            media=_coerce_media_ref(url, owner="file_attachment", param="url"),
+            spoiler=spoiler,
+        ),
+        id,
+        "file_attachment",
+    )
 
 
 # // ========================================( Grids )======================================== // #
@@ -2327,6 +2660,13 @@ class EmojiGrid(TextDisplay):
             raise ValueError(f"rows and cols must be >= 1, got rows={rows} cols={cols}")
         if not isinstance(fill, str):
             raise TypeError(f"fill must be str, got {type(fill).__name__}")
+        # cell_sep joins every row and corner renders into the header, so a
+        # non-string reaches str.join during __init__ and fails there rather
+        # than here, where fill is already checked.
+        if not isinstance(cell_sep, str):
+            raise TypeError(f"cell_sep must be str, got {type(cell_sep).__name__}")
+        if corner is not None and not isinstance(corner, str):
+            raise TypeError(f"corner must be str or None, got {type(corner).__name__}")
 
         self._rows = rows
         self._cols = cols
@@ -2483,6 +2823,7 @@ def emoji_grid(
     col_labels: AxisLabels = None,
     corner: Optional[str] = None,
     cell_sep: str = " ",
+    id: Optional[int] = None,
 ) -> EmojiGrid:
     """Build a string-rendered emoji grid as a live ``TextDisplay``.
 
@@ -2498,14 +2839,18 @@ def emoji_grid(
 
     See :class:`EmojiGrid` for the full parameter reference.
     """
-    return EmojiGrid(
-        rows,
-        cols,
-        fill=fill,
-        row_labels=row_labels,
-        col_labels=col_labels,
-        corner=corner,
-        cell_sep=cell_sep,
+    return _with_id(
+        EmojiGrid(
+            rows,
+            cols,
+            fill=fill,
+            row_labels=row_labels,
+            col_labels=col_labels,
+            corner=corner,
+            cell_sep=cell_sep,
+        ),
+        id,
+        "emoji_grid",
     )
 
 
@@ -2550,17 +2895,20 @@ def button_grid(
         )
 
     action_rows: List[ActionRow] = []
-    first = True
     for r in range(rows):
         buttons = []
         for c in range(cols):
             btn = cell_factory(r, c)
-            if first:
-                if not isinstance(btn, discord.ui.Button):
-                    raise TypeError(
-                        f"cell_factory must return discord.ui.Button, got " f"{type(btn).__name__}"
-                    )
-                first = False
+            # Every cell is checked, not only the first. A factory that
+            # returns something else for one position -- ``None`` to leave a
+            # gap is the plausible one -- otherwise reached ActionRow and
+            # failed there on an attribute the caller never mentioned,
+            # naming no cell.
+            if not isinstance(btn, discord.ui.Button):
+                raise TypeError(
+                    f"cell_factory must return discord.ui.Button, got "
+                    f"{type(btn).__name__} at (row={r}, col={c})"
+                )
             buttons.append(btn)
         action_rows.append(ActionRow(*buttons))
     return action_rows

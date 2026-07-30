@@ -412,6 +412,7 @@ Every class attribute, grouped by pillar, with its default value:
     ```python
     auto_back_button = False
     nav_rebuild = None  # edit kwargs a pop supplies for itself (V1 embeds)
+    # nav_depth -- read-only: views beneath this one, 0 when sent directly
     # push(view, rebuild=) -- method
     # pop(rebuild=) -- method
     # replace(view) -- method

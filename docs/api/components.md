@@ -14,6 +14,30 @@ attributes, the refresh handoff). Mirrors the union accepted by
 `discord.ui.Button`. See [Custom Emoji](../guide/components.md#custom-emoji)
 for the three string forms and application emoji setup.
 
+### `MediaInput`
+
+```python
+MediaInput = Union[str, discord.File, discord.UnfurledMediaItem]
+```
+
+Defined in `cascadeui.components.types`, exported from the package root.
+Used by every media parameter in the V2 builders: `gallery(*media)`,
+`image_section(url=...)`, `file_attachment(url)`, and
+`LeaderboardLayoutView(banner=...)`.
+
+The annotation names the three shapes the builders resolve by type, and one
+more reaches them besides. A string is used as-is, whether it is a remote
+URL or the `attachment://name.ext` form. A `discord.File` resolves to its
+`.uri`. A `discord.UnfurledMediaItem` passes through unchanged. Anything
+else carrying a string `.url` is read from that attribute, which is what
+makes `member.display_avatar` work where `member.display_avatar.url` was
+meant. Anything else raises `TypeError` at construction, naming the
+builder and the argument.
+
+A `discord.File` supplies only the reference. The bytes travel separately
+through `view.send(files=[...])` or `view.refresh(attachments=[...])` --
+see [Local file attachments](../guide/components.md#local-file-attachments).
+
 ### `MAX_SELECT_OPTIONS`
 
 ```python
@@ -23,6 +47,40 @@ MAX_SELECT_OPTIONS = 25
 Defined in `cascadeui.components.types`, exported from the package root.
 Discord's hard cap on the number of options in a single select menu.
 `choice_row` enforces it, raising `ValueError` past the cap.
+
+### `MAX_COMPONENT_ID`
+
+```python
+MAX_COMPONENT_ID = 2**31 - 1
+```
+
+Defined in `cascadeui.components.types`, exported from the package root.
+Discord's upper bound on a component `id`. See
+[Naming a component](#naming-a-component) below.
+
+---
+
+## Naming a component
+
+Every V2 builder that returns exactly one component takes an optional
+`id=`, an integer that names that component within its message:
+
+```python
+card("Standings", id=10)
+image_section("Avatar", url=member.display_avatar, id=11)
+```
+
+Discord assigns ids sequentially from 1 when you supply none, so passing
+your own is only worth doing when something outside the builder needs to
+refer to a specific node. Ids must be positive and no larger than
+`MAX_COMPONENT_ID`, and no two components in one message may share one --
+all three are checked before the message is sent, naming the builder and
+the offending value.
+
+The two builders that return a list take no `id=`: `confirm_section`
+yields a text display plus a row of buttons, and `button_grid` yields one
+row per grid row, so there is no single node for an id to mean. Set ids on
+the pieces you build yourself if you need them.
 
 ---
 
@@ -63,7 +121,7 @@ StatefulButton(
     label=None,
     style=ButtonStyle.secondary,
     custom_id=None,        # Required for PersistentView
-    callback=async_fn,     # async def callback(interaction)
+    callback=fn,           # def callback(interaction) or async def
     owner_only=False,      # When True, only view.user_id can click; non-owner clicks route to view.on_unauthorized
     emoji=None,
     disabled=False,
@@ -71,12 +129,20 @@ StatefulButton(
 )
 ```
 
+!!! note "Callbacks and hooks take either shape"
+    Every `callback=`, `on_*` hook, and builder function on this page accepts
+    a plain `def` as readily as an `async def`. The library resolves what your
+    function returned rather than inspecting the function, so a callable
+    object with an async `__call__` and a `functools.partial` around one work
+    too. The `async def` spellings below are examples, not requirements. See
+    [Sync or Async, Your Choice](../guide/concepts.md#sync-or-async-your-choice)
+    for the few seams that genuinely require a synchronous function.
+
 Every click dispatches a `COMPONENT_INTERACTION` action. Skips dispatch when the parent view is finished.
 
 ---
 
 ## `StatefulSelect`
-
 
 Extends `discord.ui.Select` with state integration.
 
@@ -84,8 +150,9 @@ Extends `discord.ui.Select` with state integration.
 StatefulSelect(
     placeholder=None,
     options=[SelectOption(...)],
-    callback=async_fn,
+    callback=fn,           # sync or async
     custom_id=None,        # Required for PersistentView; recommended in _build_extra_items
+    owner_only=False,      # Same per-component host gate StatefulButton takes
     min_values=1,
     max_values=1,
     row=None,
@@ -93,6 +160,10 @@ StatefulSelect(
 ```
 
 More than 25 options raises a `ValueError` at construction (`MAX_SELECT_OPTIONS`), turning a Discord HTTP 400 into a construction-time error. `Dropdown` inherits the same cap.
+
+`options` takes `SelectOption` instances. Anything else raises a `TypeError` naming the offending index; pass option dicts to `Dropdown` instead, which converts them.
+
+`owner_only` is available on `StatefulSelect` and `Dropdown`. The four specialized selects (`RoleSelect`, `ChannelSelect`, `UserSelect`, `MentionableSelect`) wrap their discord.py classes directly and reject the keyword; gate those through the view's `interaction_check` or `allowed_users`.
 
 ### `set_selected(value)`
 
@@ -122,7 +193,10 @@ Detection happens at creation time via `inspect.signature`. Old single-parameter
 
 ### Select Variants
 
-- `Dropdown` -- alias for `StatefulSelect`
+- `Dropdown` -- `StatefulSelect` subclass that also accepts option dicts
+  (`{"label": ..., "value": ...}`) and converts them. `StatefulSelect`
+  itself takes `SelectOption` instances only and rejects anything else at
+  construction
 - `RoleSelect` -- extends `discord.ui.RoleSelect`
 - `ChannelSelect` -- extends `discord.ui.ChannelSelect`
 - `UserSelect` -- extends `discord.ui.UserSelect`
@@ -394,7 +468,7 @@ key_value({"Status": "Online", "Users": "42"})
 
 ### `action_section(text, *, label, callback, emoji=None, style=secondary, custom_id=None, disabled=False)`
 
-Creates a `Section` with text and a `StatefulButton` accessory. Pass `disabled=True` to render the button greyed out and non-interactive.
+Creates a `Section` with text and a `StatefulButton` accessory. Pass `disabled=True` to render the button greyed out and non-interactive. Pass `custom_id=` inside a `PersistentLayoutView`, where auto-generated ids do not survive a restart.
 
 ```python
 action_section(
@@ -407,7 +481,7 @@ action_section(
 
 ### `toggle_section(text, *, active, callback, labels=("Enabled", "Disabled"), emoji=None, custom_id=None, disabled=False)`
 
-Creates a `Section` with a green/red toggle button. `labels` sets the (active, inactive) button text -- pass `("On", "Off")` to relabel. `emoji` adds a button emoji. Pass `disabled=True` to render the button greyed out and non-interactive.
+Creates a `Section` with a green/red toggle button. `labels` sets the (active, inactive) button text -- pass `("On", "Off")` to relabel. `emoji` adds a button emoji. Pass `disabled=True` to render the button greyed out and non-interactive. Pass `custom_id=` inside a `PersistentLayoutView`, where auto-generated ids do not survive a restart.
 
 ```python
 toggle_section(
@@ -435,7 +509,7 @@ A `Separator` without a visible line. `SeparatorSpacing.small` (default) or `Sep
 
 ### `image_section(text, *more_text, url, description=None, spoiler=False)`
 
-A `Section` with a `Thumbnail` image accessory. `description` sets the thumbnail's alt text (up to 256 chars); `spoiler=True` hides the thumbnail behind a spoiler. `url` accepts a URL string or a `discord.File` (`MediaInput`).
+A `Section` with a `Thumbnail` image accessory. `description` sets the thumbnail's alt text (up to 256 chars); `spoiler=True` hides the thumbnail behind a spoiler. `url` accepts a [`MediaInput`](#mediainput): a URL string, a `discord.File`, or any object with a string `.url` such as `member.display_avatar`.
 
 ```python
 image_section("User avatar", url="https://example.com/avatar.png")
@@ -453,9 +527,13 @@ link_section(
 )
 ```
 
-### `confirm_section(text, *, on_confirm, on_cancel, confirm_label="Confirm", cancel_label="Cancel", confirm_emoji="✅", cancel_emoji="❌", custom_id=None)`
+### `confirm_section(text, *, on_confirm, on_cancel, confirm_label="Confirm", cancel_label="Cancel", confirm_emoji="✅", cancel_emoji="❌", confirm_style=ButtonStyle.success, cancel_style=ButtonStyle.danger, custom_id=None)`
 
-A confirm/cancel prompt. Returns a `[TextDisplay, ActionRow]` list rather than a single component: the prompt text plus a paired success/danger button row. Splat it into `card(...)` or add it directly to a view.
+A confirm/cancel prompt. Returns a `[TextDisplay, ActionRow]` list rather than a single component: the prompt text plus the paired button row. Splat it into `card(...)` or add it directly to a view. Pass `custom_id=` inside a `PersistentLayoutView`, where auto-generated ids do not survive a restart.
+
+The style defaults suit a constructive prompt. A destructive one wants them swapped (`confirm_style=ButtonStyle.danger, cancel_style=ButtonStyle.secondary`), or the button that deletes renders green beside a red one that does nothing.
+
+Returning a list is also why this builder takes no `id=`: there is no single component for one to name. Assign `.id` on the returned components if you need them addressable.
 
 ```python
 card(
@@ -470,7 +548,7 @@ card(
 
 ### `gallery(*media, descriptions=None, spoilers=None)`
 
-A `MediaGallery` from one or more images passed as positional arguments (not a list). Each item is a URL string or a `discord.File` (`MediaInput`); `descriptions` is an optional parallel sequence of alt-text strings.
+A `MediaGallery` from one or more images passed as positional arguments (not a list). Each item is a [`MediaInput`](#mediainput) -- a URL string, a `discord.File`, or any object with a string `.url`; `descriptions` is an optional parallel sequence of alt-text strings.
 
 ```python
 gallery(
@@ -514,7 +592,7 @@ choice_row(
 )
 ```
 
-`options` is a `{label: value}` dict or a sequence of `Choice`. `multi=True` makes `selected` a set, turns the buttons into toggles, and delivers a list to `on_select`. `active_style` / `inactive_style` set the button colors (button form only; dropdowns have no per-option style), and `placeholder` sets the dropdown's placeholder text. Two controls in one view need distinct `custom_id=` values. Raises `ValueError` for an empty `options`, more than 25 options, or a `button_threshold` outside 0-5; raises `TypeError` if `on_select` is not callable.
+`options` is a `{label: value}` dict or a sequence of `Choice`. `multi=True` reads `selected` as a collection of active values rather than one, turns the buttons into toggles, and delivers a list to `on_select`. Values need not be hashable -- a `Choice.value` may be any Python object, including a list or a dict. `active_style` / `inactive_style` set the button colors (button form only; dropdowns have no per-option style), and `placeholder` sets the dropdown's placeholder text. Two controls in one view need distinct `custom_id=` values. Raises `ValueError` for an empty `options`, more than 25 options, or a `button_threshold` outside 0-5; raises `TypeError` if `on_select` is not callable.
 
 ### `Choice`
 
@@ -528,7 +606,7 @@ Choice(label="Goals", value=Event.GOAL, emoji="⚽", description="Match goals")
 
 ### `toggle_button(*, active, on_toggle, labels=("Enabled", "Disabled"), emoji=None, custom_id=None)`
 
-A standalone boolean toggle button -- the `ActionRow` form of `toggle_section` (no accompanying text). Renders green when `active`, relabels between the two `labels` on each click, and calls `on_toggle` with the new state.
+A standalone boolean toggle button -- the `ActionRow` form of `toggle_section` (no accompanying text). Renders green when `active`, relabels between the two `labels` on each click, and calls `on_toggle` with the new state. Pass `custom_id=` inside a `PersistentLayoutView`, where auto-generated ids do not survive a restart.
 
 ```python
 ActionRow(toggle_button(active=self.notify, on_toggle=self._set_notify))
@@ -544,7 +622,7 @@ button_row({"Save": self._save, "Reset": self._reset}, style=discord.ButtonStyle
 
 ### `cycle_button(*, values, on_change, labels=None, style=secondary, emoji=None, start=0, custom_id=None)`
 
-A button that cycles through a fixed list of `values` on each click, advancing (and wrapping) the index before calling `on_change` with the new value. Use it when a setting has three or more options but a full select is overkill -- a single "Preset" button cycling `["Low", "Medium", "High"]` instead of three toggles. `labels` defaults to `str(value)` per entry; `start` is the initial index.
+A button that cycles through a fixed list of `values` on each click, advancing (and wrapping) the index before calling `on_change` with the new value. Use it when a setting has three or more options but a full select is overkill -- a single "Preset" button cycling `["Low", "Medium", "High"]` instead of three toggles. `labels` defaults to `str(value)` per entry; `start` is the initial index. Pass `custom_id=` inside a `PersistentLayoutView`, where auto-generated ids do not survive a restart.
 
 ```python
 cycle_button(
@@ -555,7 +633,7 @@ cycle_button(
 
 ### `tab_nav(tabs, *, active=None, active_style=primary, inactive_style=secondary, custom_id=None)`
 
-An `ActionRow` of tab buttons for inner-view navigation -- a lighter alternative to `TabLayoutView`. `tabs` maps each label to a callback; the `active` tab renders in `active_style`, the rest in `inactive_style`.
+An `ActionRow` of tab buttons for inner-view navigation -- a lighter alternative to `TabLayoutView`. `tabs` maps each label to a callback; the `active` tab renders in `active_style`, the rest in `inactive_style`. Pass `custom_id=` inside a `PersistentLayoutView`, where auto-generated ids do not survive a restart.
 
 ```python
 tab_nav(
@@ -584,13 +662,15 @@ progress_bar(7, 10)   # [██████████████░░░░�
 
 ## Convenience Buttons
 
-Subclasses of `StatefulButton` with preset styles:
+Preset-style buttons. All but `LinkButton` extend `StatefulButton`:
 
 - `PrimaryButton` -- `ButtonStyle.primary`
 - `SecondaryButton` -- `ButtonStyle.secondary`
 - `SuccessButton` -- `ButtonStyle.success`
 - `DangerButton` -- `ButtonStyle.danger`
-- `LinkButton` -- `ButtonStyle.link`
+- `LinkButton` -- `ButtonStyle.link`. Wraps `discord.ui.Button` directly,
+  since Discord opens the URL client-side and no interaction is ever
+  dispatched. It takes no `callback` and no `owner_only`
 - `ToggleButton` -- Toggles between two states on click
 
 ---
@@ -727,7 +807,7 @@ group.add_to_view(view)
 ### `ProgressBar`
 
 ```python
-bar = ProgressBar(total=100, width=20, fill="█", empty="░")
+bar = ProgressBar(total=100, width=20, fill_char="█", empty_char="░")
 bar.render(current)  # Returns string like "████████░░░░░░░░░░░░ 40%"
 ```
 
@@ -809,10 +889,13 @@ class BoardView(StatefulLayoutView):
     @cascade_component("reroll")
     async def reroll(self, interaction):
         self._board = new_board()
-        await self.refresh()
+        self.build_ui()      # compose the new board
+        await self.refresh()  # then ship it
 ```
 
 The decorated function is a method: it takes `self` and dispatches through the view it belongs to. When `component_id` is omitted, the function's `__name__` is used.
+
+The `build_ui()` line is load-bearing. `refresh()` sends the tree the view already holds and composes nothing, so mutating state and calling only `refresh()` ships the pre-mutation render. Worse, an unchanged tree hashes the same, so the render-hash skip suppresses the edit and the click produces no visible result at all. The dispatch also happens *before* the body runs, so a view driving its render from `on_state_changed` rebuilds from the old state; compose in the body as above rather than relying on the dispatch.
 
 ### `register_component(name, component_class)` / `get_component(name)`
 

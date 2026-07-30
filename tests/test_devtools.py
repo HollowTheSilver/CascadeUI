@@ -645,7 +645,9 @@ class TestPurgeStaleReducerNullPath:
         store.state["modals"] = {"m1": {"data": "x"}}
 
         await store.dispatch("INSPECTOR_PURGED_STALE", {"inspector_id": None})
-        assert "components" not in store.state
+        # ``components`` is canonical state shape and is emptied rather than
+        # removed; ``modals`` is on-demand, so it is dropped outright.
+        assert store.state["components"] == {}
         assert "modals" not in store.state
 
     async def test_missing_inspector_id_key_is_noop(self):

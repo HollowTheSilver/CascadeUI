@@ -20,6 +20,7 @@ Public exports (also re-exported from ``cascadeui``):
     - ``RoleCategory`` -- typed dataclass for a role-assign category
 """
 
+import inspect
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
 from typing import Any, Callable, Dict, FrozenSet, List, Optional
@@ -32,6 +33,28 @@ import discord
 _FIELD_TYPES: FrozenSet[str] = frozenset(
     {"text", "integer", "float", "date", "boolean", "select", "multi_select"}
 )
+
+
+def _validate_field_values(label: str, field_id, field_label, field_type) -> None:
+    """Check one form field's identity and type, whatever declared it.
+
+    Shared by :class:`FormField` and the raw-dict path. An unrecognised
+    type rendered no control and a missing id surfaced wherever the value
+    was first keyed, so the dict form failed later and more quietly than
+    the typed one for the same mistake.
+    """
+    if not isinstance(field_id, str) or not field_id:
+        raise ValueError(f"{label}.id must be a non-empty string (got {field_id!r})")
+    if not isinstance(field_label, str) or not field_label:
+        raise ValueError(
+            f"{label}.label must be a non-empty string "
+            f"(field id={field_id!r}, got {field_label!r})"
+        )
+    if field_type not in _FIELD_TYPES:
+        raise ValueError(
+            f"{label}.type={field_type!r} is not a valid type. "
+            f"Valid types: {sorted(_FIELD_TYPES)}. (field id={field_id!r})"
+        )
 
 
 @dataclass
@@ -86,18 +109,7 @@ class FormField:
     secret: bool = False
 
     def __post_init__(self) -> None:
-        if not isinstance(self.id, str) or not self.id:
-            raise ValueError(f"FormField.id must be a non-empty string (got {self.id!r})")
-        if not isinstance(self.label, str) or not self.label:
-            raise ValueError(
-                f"FormField.label must be a non-empty string "
-                f"(field id={self.id!r}, got {self.label!r})"
-            )
-        if self.type not in _FIELD_TYPES:
-            raise ValueError(
-                f"FormField.type={self.type!r} is not a valid type. "
-                f"Valid types: {sorted(_FIELD_TYPES)}. (field id={self.id!r})"
-            )
+        _validate_field_values("FormField", self.id, self.label, self.type)
 
     def to_dict(self) -> Dict[str, Any]:
         """Return the dict shape the form pattern consumes internally.
@@ -116,6 +128,67 @@ class FormField:
 
 
 # // ========================================( WizardStep )======================================== // #
+
+
+def _validate_step_callables(label: str, step: Dict[str, Any]) -> None:
+    """Check the callables a raw step dict declares, if it declares them.
+
+    Narrower than :class:`WizardStep`'s own checks on purpose. The dict form
+    reads only ``builder``, ``validator`` and ``condition``, never ``name``,
+    and a step with no builder is a supported shape that renders nav alone.
+    What is not supported is a value under one of those keys that cannot be
+    called: the builder crashed at render, the validator crashed on Next,
+    and the condition was swallowed by the visibility guard and its step
+    shown regardless.
+    """
+    for key in ("builder", "validator", "condition"):
+        value = step.get(key)
+        if value is None:
+            continue
+        if not callable(value):
+            raise ValueError(
+                f"{label}.{key} must be callable or absent, got {type(value).__name__}"
+            )
+    condition = step.get("condition")
+    if condition is not None and inspect.iscoroutinefunction(condition):
+        raise TypeError(
+            f"{label}.condition must be synchronous; load async data in the "
+            f"view's on_load() and have the predicate read the result."
+        )
+
+
+def _validate_step_values(label: str, name, builder, validator, condition) -> None:
+    """Check one wizard step's callables and name, whatever declared it.
+
+    Shared by :class:`WizardStep` and the raw-dict path so both answer the
+    same way. The dict form is a documented alternative, not a lesser one,
+    and left unchecked it failed later and mostly in silence: a step with
+    no builder rendered as an empty page, a non-callable condition was
+    swallowed by the visibility guard and shown anyway, and only a
+    non-callable builder raised at all.
+    """
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"{label}.name must be a non-empty string (got {name!r})")
+    if not callable(builder):
+        raise ValueError(
+            f"{label}.builder must be callable (step name={name!r}, "
+            f"got {type(builder).__name__})"
+        )
+    for field_name, value in (("validator", validator), ("condition", condition)):
+        if value is not None and not callable(value):
+            raise ValueError(
+                f"{label}.{field_name} must be callable or None "
+                f"(step name={name!r}, got {type(value).__name__})"
+            )
+    # The visibility check reads the predicate's answer synchronously, so an
+    # async one returns a coroutine, and a coroutine is truthy: the step
+    # renders whatever the predicate would have said.
+    if condition is not None and inspect.iscoroutinefunction(condition):
+        raise TypeError(
+            f"{label}.condition must be synchronous (step name={name!r}); "
+            f"load async data in the view's on_load() and have the predicate "
+            f"read the result."
+        )
 
 
 @dataclass
@@ -142,23 +215,7 @@ class WizardStep:
     condition: Optional[Callable] = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.name, str) or not self.name:
-            raise ValueError(f"WizardStep.name must be a non-empty string (got {self.name!r})")
-        if not callable(self.builder):
-            raise ValueError(
-                f"WizardStep.builder must be callable "
-                f"(step name={self.name!r}, got {type(self.builder).__name__})"
-            )
-        if self.validator is not None and not callable(self.validator):
-            raise ValueError(
-                f"WizardStep.validator must be callable or None "
-                f"(step name={self.name!r}, got {type(self.validator).__name__})"
-            )
-        if self.condition is not None and not callable(self.condition):
-            raise ValueError(
-                f"WizardStep.condition must be callable or None "
-                f"(step name={self.name!r}, got {type(self.condition).__name__})"
-            )
+        _validate_step_values("WizardStep", self.name, self.builder, self.validator, self.condition)
 
     def to_dict(self) -> Dict[str, Any]:
         """Return the dict shape the wizard pattern consumes internally."""
@@ -346,7 +403,16 @@ def _normalize_fields(
             # A dict with no "type" renders no control at all; FormField
             # defaults type="text", so fill it to match rather than mutate
             # the caller's dict.
-            out.append(item if "type" in item else {**item, "type": "text"})
+            resolved = item if "type" in item else {**item, "type": "text"}
+            # An unrecognised type renders no control at all, so the field
+            # vanishes from the form with nothing raised and nothing logged.
+            # ``FormField`` has always rejected it; the dict form now does too.
+            if resolved.get("type") not in _FIELD_TYPES:
+                raise ValueError(
+                    f"{cls_name} fields[{len(out)}].type={resolved.get('type')!r} "
+                    f"is not a valid type. Valid types: {sorted(_FIELD_TYPES)}."
+                )
+            out.append(resolved)
         else:
             raise TypeError(
                 f"{cls_name} field entries must be FormField or dict "
@@ -365,8 +431,8 @@ def _normalize_steps(
     Raises ``ValueError`` when both ``steps`` and ``schema`` are supplied.
     Returns an empty list when both are ``None`` -- a zero-step wizard is a
     valid zero-config state, not an error. Typed ``WizardStep`` items lower
-    to dicts via ``to_dict()``; raw dicts pass through unchanged so
-    hand-written steps stay valid.
+    to dicts via ``to_dict()``; raw dicts keep their own keys but face the
+    same checks, so neither declaration form is the lenient one.
     """
     if schema is not None and steps is not None:
         raise ValueError(f"{cls_name} accepts either 'steps=' or 'schema=', not both.")
@@ -384,6 +450,7 @@ def _normalize_steps(
         if isinstance(item, WizardStep):
             out.append(item.to_dict())
         elif isinstance(item, dict):
+            _validate_step_callables(f"{cls_name} steps[{len(out)}]", item)
             out.append(item)
         else:
             raise TypeError(

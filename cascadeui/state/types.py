@@ -39,7 +39,9 @@ MiddlewareFn = Callable[[Action, StateData, Callable], Awaitable[StateData]]
 SelectorFn = Callable[[StateData], Any]
 
 # Hook: async callable receiving (action, state) -> None.
-# Hooks are read-only observers that fire after reducers and subscribers.
+# Hooks are read-only observers. They fire after reducers, inline in
+# dispatch; ordering against the background cross-view subscriber tasks
+# is not guaranteed either way.
 HookFn = Callable[[Action, StateData], Awaitable[None]]
 
 # Type variable for generic functions

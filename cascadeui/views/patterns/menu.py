@@ -9,6 +9,7 @@ from discord.ui import ActionRow
 
 from ...components.base import StatefulButton
 from ...components.patterns.v2 import action_section, card
+from ...utils.hooks import await_maybe
 from ..base import _StatefulMixin
 from ..layout import StatefulLayoutView
 from ..view import StatefulView
@@ -67,7 +68,28 @@ class _BaseMenuMixin:
         from discord.ui import LayoutView as _LayoutView
 
         self_is_v2 = isinstance(self, _LayoutView)
-        for category in categories:
+        for index, category in enumerate(categories):
+            # Shape first: every read below and in the item builders assumes a
+            # mapping with both keys, so a tuple entry otherwise fails inside
+            # this check with an AttributeError naming neither the entry nor
+            # the expected shape, and a missing key surfaces later as a bare
+            # KeyError from the builder. Duck-typed rather than isinstance so
+            # any mapping keeps working, not only dict.
+            if not hasattr(category, "get") or not hasattr(category, "__getitem__"):
+                raise TypeError(
+                    f"{type(self).__name__} categories[{index}] must be a mapping "
+                    f"with 'label' and 'view', got {type(category).__name__}: "
+                    f"{category!r}\n"
+                    f"  Fix: pass {{'label': ..., 'view': ...}} per category."
+                )
+            for key in ("label", "view"):
+                if key not in category:
+                    raise ValueError(
+                        f"{type(self).__name__} categories[{index}] is missing "
+                        f"required key {key!r}.\n"
+                        f"  Fix: every category needs both 'label' and 'view'; "
+                        f"'emoji', 'description', 'style' and 'rebuild' are optional."
+                    )
             view_cls = category.get("view")
             if not isinstance(view_cls, type):
                 continue
@@ -98,7 +120,7 @@ class _BaseMenuMixin:
             rebuild = type(self).nav_rebuild
 
         async def callback(interaction: Interaction):
-            await self.on_category_selected(category, index, interaction)
+            await await_maybe(self.on_category_selected(category, index, interaction))
             await self.push(view_cls, interaction, rebuild=rebuild)
 
         return callback
@@ -294,7 +316,7 @@ class MenuLayoutView(_BaseMenuMixin, StatefulLayoutView):
 
         self._categories: List[Dict[str, Any]] = categories or []
         self._validate_categories(self._categories)
-        self.build_ui()
+        self._build_ui_sync()
 
     def build_header(self):
         """Return V2 components for the area above category items.

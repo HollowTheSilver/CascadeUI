@@ -251,7 +251,6 @@ class DashboardView(TabLayoutView):
         visits = read_slot(self.state_store.state, "dashboard", "visits", default={})
         total_visits = self.state_store.computed["dashboard_total_visits"]
 
-        # Server stats card -- green accent
         stats = card(
             f"## {name}",
             action_section(
@@ -278,7 +277,6 @@ class DashboardView(TabLayoutView):
             color=discord.Color.green(),
         )
 
-        # Quick actions card -- blurple accent
         actions = card(
             "## Quick Actions",
             action_section(
@@ -350,6 +348,11 @@ class DashboardView(TabLayoutView):
             on_cancel=self._on_cancel_reset,
             confirm_label="Reset",
             cancel_label="Keep",
+            # The defaults read confirm-is-good, cancel-is-bad, which is
+            # backwards when confirming is the destructive choice: Reset
+            # would render green beside a red Keep.
+            confirm_style=discord.ButtonStyle.danger,
+            cancel_style=discord.ButtonStyle.secondary,
         )
 
     async def _on_reset_modules(self, interaction):

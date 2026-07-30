@@ -127,6 +127,7 @@ Key points:
 Register the view as a slash command:
 
 ```python
+import discord
 from discord.ext import commands
 
 bot = commands.Bot(command_prefix="!", intents=discord.Intents.default())

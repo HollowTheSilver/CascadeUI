@@ -71,14 +71,25 @@ class ActionCreators:
 
     @staticmethod
     def component_interaction(
-        component_id: ComponentId, view_id: ViewId, user_id: Optional[UserId] = None, **values
+        component_id: ComponentId,
+        view_id: ViewId,
+        user_id: Optional[UserId] = None,
+        value: Any = None,
+        **extra,
     ) -> ActionPayload:
-        """Create a COMPONENT_INTERACTION action payload."""
+        """Create a COMPONENT_INTERACTION action payload.
+
+        ``value`` is the component's value at the end of the callback: a
+        select's chosen options, a toggle's new state, ``True`` for a
+        plain button. Any other keyword lands beside it under its own
+        name.
+        """
         return {
             "component_id": component_id,
             "view_id": view_id,
             "user_id": user_id,
-            "value": values,
+            "value": value,
+            **extra,
         }
 
     @staticmethod

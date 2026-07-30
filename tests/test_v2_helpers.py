@@ -370,7 +370,7 @@ class TestGallery:
         assert result.items[1].description is None
 
     def test_length_mismatch_raises(self):
-        """Descriptions length must match URLs exactly — fail loud like emoji_grid."""
+        """Descriptions length must match URLs exactly: fail loud like emoji_grid."""
         with pytest.raises(ValueError, match="descriptions length"):
             gallery(
                 "https://example.com/a.png",
@@ -453,7 +453,7 @@ class TestFileAttachment:
         assert result.media.url == "attachment://report.pdf"
 
 
-# // ========================================( 7.8b — additive helpers )======================================== // #
+# // ========================================( Additive helpers )======================================== // #
 
 
 async def _noop(interaction):
@@ -465,7 +465,7 @@ async def _noop_with_value(interaction, value):
 
 
 class TestToggleSectionEmoji:
-    """L4 — toggle_section gains emoji kwarg for parity with action_section."""
+    """toggle_section gains emoji kwarg for parity with action_section."""
 
     def test_emoji_kwarg_passthrough(self):
         result = toggle_section("Lights", active=True, callback=_noop, emoji="\U0001f4a1")
@@ -476,7 +476,7 @@ class TestToggleSectionEmoji:
 
 
 class TestLinkSection:
-    """C1 — Section with link-style Button accessory."""
+    """Section with link-style Button accessory."""
 
     def test_returns_section(self):
         result = link_section("Docs", label="Open", url="https://example.com")
@@ -493,7 +493,7 @@ class TestLinkSection:
 
 
 class TestConfirmSection:
-    """C3 — returns [TextDisplay, ActionRow] for splat-into-card composition."""
+    """returns [TextDisplay, ActionRow] for splat-into-card composition."""
 
     def test_returns_list_of_two(self):
         result = confirm_section("Sure?", on_confirm=_noop, on_cancel=_noop)
@@ -522,7 +522,7 @@ class TestConfirmSection:
 
 
 class TestButtonRow:
-    """C2 — dict shorthand for an ActionRow of same-style buttons."""
+    """dict shorthand for an ActionRow of same-style buttons."""
 
     def test_returns_action_row(self):
         result = button_row({"Save": _noop, "Cancel": _noop})
@@ -549,7 +549,7 @@ class TestButtonRow:
 
 
 class TestCycleButton:
-    """C4 — first stateful v2 helper; index tracked on instance."""
+    """first stateful v2 helper; index tracked on instance."""
 
     def test_returns_stateful_button(self):
         btn = cycle_button(values=["Low", "Med", "High"], on_change=_noop_with_value)
@@ -582,7 +582,7 @@ class TestCycleButton:
 
 
 class TestToggleButton:
-    """C5 — standalone boolean toggle, distinct from toggle_section."""
+    """standalone boolean toggle, distinct from toggle_section."""
 
     def test_active_initial_state(self):
         btn = toggle_button(active=True, on_toggle=_noop_with_value)
@@ -602,7 +602,7 @@ class TestToggleButton:
 
 
 class TestStatsCard:
-    """C6 — Container composition of heading + divider + key_value."""
+    """Container composition of heading + divider + key_value."""
 
     def test_returns_container(self):
         result = stats_card("Stats", {"Members": 5})
@@ -634,7 +634,7 @@ class TestStatsCard:
 
 
 class TestProgressBar:
-    """C7 — text-based progress bar as TextDisplay."""
+    """text-based progress bar as TextDisplay."""
 
     def test_returns_text_display(self):
         result = progress_bar(5, 10)
@@ -666,7 +666,7 @@ class TestProgressBar:
 
 
 class TestTabNav:
-    """C8 — ActionRow of tab-styled buttons for manual-control views."""
+    """ActionRow of tab-styled buttons for manual-control views."""
 
     def test_returns_action_row(self):
         result = tab_nav({"A": _noop, "B": _noop})
@@ -1307,8 +1307,14 @@ class TestChoiceRowConstruction:
             choice_row({"a": 1}, on_select=None)
 
     def test_non_choice_option_raises(self):
-        with pytest.raises(TypeError, match="dict or a sequence of Choice"):
-            choice_row([("a", 1)], on_select=_noop_select)
+        """A two-item pair is now converted, so the rejection needs an entry
+        that carries no label and value at all."""
+        with pytest.raises(TypeError, match="mapping, a sequence of Choice"):
+            choice_row(["a"], on_select=_noop_select)
+
+    def test_three_item_sequence_entry_raises(self):
+        with pytest.raises(TypeError, match="mapping, a sequence of Choice"):
+            choice_row([("a", 1, "extra")], on_select=_noop_select)
 
     def test_multi_selected_non_collection_raises(self):
         with pytest.raises(TypeError, match="must be a collection"):
@@ -1943,3 +1949,61 @@ class TestCollapsibleToggle:
         await c._toggle(make_interaction())
         await c._toggle(make_interaction())
         assert seen == [True, False]
+
+
+class TestPairSequenceAcceptance:
+    """The {key: value} builders take the same data written as ordered pairs.
+
+    tab_nav resolved ``active`` against the raw argument before normalizing,
+    so a pair sequence bound it to a (label, callback) tuple: no tab matched,
+    none rendered active, and an explicit active= was rejected for not being
+    a key. choice_row advertised the pair form in its annotation and refused
+    it in its body.
+    """
+
+    @staticmethod
+    async def _cb(interaction):
+        pass
+
+    @staticmethod
+    async def _cb2(interaction, value):
+        pass
+
+    def test_tab_nav_pairs_mark_the_first_tab_active(self):
+        row = tab_nav([("Overview", self._cb), ("Stats", self._cb)])
+        assert [b.style for b in row.children] == [
+            discord.ButtonStyle.primary,
+            discord.ButtonStyle.secondary,
+        ]
+
+    def test_tab_nav_pairs_honour_an_explicit_active(self):
+        row = tab_nav([("Overview", self._cb), ("Stats", self._cb)], active="Stats")
+        assert [b.style for b in row.children] == [
+            discord.ButtonStyle.secondary,
+            discord.ButtonStyle.primary,
+        ]
+
+    def test_tab_nav_mapping_form_is_unchanged(self):
+        row = tab_nav({"Overview": self._cb, "Stats": self._cb}, active="Stats")
+        assert [b.style for b in row.children] == [
+            discord.ButtonStyle.secondary,
+            discord.ButtonStyle.primary,
+        ]
+
+    def test_choice_row_accepts_pairs(self):
+        row = choice_row([("Easy", 1), ("Hard", 2)], on_select=self._cb2)
+        assert [b.label for b in row.children] == ["Easy", "Hard"]
+
+    def test_choice_row_still_accepts_choice_and_mapping(self):
+        assert [
+            b.label for b in choice_row([Choice(label="A", value=1)], on_select=self._cb2).children
+        ] == ["A"]
+        assert [b.label for b in choice_row({"X": 1}, on_select=self._cb2).children] == ["X"]
+
+    def test_choice_row_rejects_a_non_pair_entry(self):
+        with pytest.raises(TypeError, match="mapping, a sequence of Choice"):
+            choice_row(["Easy"], on_select=self._cb2)
+
+    def test_button_row_and_key_value_accept_pairs(self):
+        assert [b.label for b in button_row([("Save", self._cb)]).children] == ["Save"]
+        assert key_value([("k", "v")]).content == "**k:** v"

@@ -59,9 +59,10 @@ class PersistenceConfigError(PersistenceError):
     """Raised when persistence configuration is invalid at setup time.
 
     Fires when a namespace config requires a capability the chosen
-    backend does not declare (e.g. ``ScopedPersistence(ttl_days=30)``
-    with a backend missing ``Capability.TTL_INDEX``) or when
-    incompatible options are combined.
+    backend does not declare (e.g. an ``ApplicationPersistence`` slot
+    policy carrying a TTL against a backend missing
+    ``Capability.TTL_INDEX``) or when incompatible options are
+    combined.
     """
 
 

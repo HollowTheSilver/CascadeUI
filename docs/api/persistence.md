@@ -38,7 +38,7 @@ Runs the async startup pipeline: build the manager from the stashed config, init
 
 Invoked automatically by `setup_middleware`. Direct invocation is supported for test fixtures that bypass the install helper.
 
-**Raises** -- `ValueError` when constructed with no backend configured for any namespace. `PersistenceInitError` when the optional `aiosqlite` dependency is required but missing.
+**Raises** -- `ValueError` for a `restore_concurrency` below 1 or an unrecognized key in `migrators`; `TypeError` for a `bot` that is not a `discord.Client` or a `migrators` value of the wrong shape; `PersistenceInitError` when the optional `aiosqlite` dependency is required but missing. Opting every namespace out with `backend=None` is supported and does not raise.
 
 ---
 
@@ -56,13 +56,13 @@ Governs the `state["application"]` namespace. `slots` maps slot name to a `SlotP
 
 Per-slot policy declared inside `ApplicationPersistence.slots={"slot_name": SlotPolicy(...)}`. `persistent=True` writes the slot through to the backend; `persistent=False` (the default) keeps it in-memory. `ttl_days=N` prunes rows older than the cutoff on auto-prune cycles; `ttl_days=None` disables TTL. `persistent=False` paired with `ttl_days=N` raises `ValueError` -- in-memory slots never reach storage, so a TTL has nothing to prune.
 
-Slot opt-in is additive with the class-level `persistent_slots` tuple on `_StatefulMixin` subclasses. Either path registers the slot in the library's sticky `_PERSISTENT_SLOTS` set; both combine cleanly when used together (class declares "CAN persist"; policy layers on TTL).
+Slot opt-in is additive with the class-level `persistent_slots` tuple on `_StatefulMixin` subclasses and with `access_slot(..., persistent=True)`. All three register the slot in the library's sticky `_PERSISTENT_SLOTS` set and combine cleanly when used together; `SlotPolicy` is the only one of them that also carries a TTL.
 
 ---
 
 ## `PersistenceBackend` (Protocol)
 
-A backend is any class declaring `capabilities: Capability` and the methods required by the flags it advertises. `PersistenceManager` validates declared capabilities against method presence when `PersistenceMiddleware` initializes.
+A backend is any class declaring `capabilities: Capability` and the methods required by the flags it advertises. The namespace configs check that flag against what each namespace needs, at config construction, and raise `PersistenceConfigError` when one is missing. A flag advertised without its methods is not caught there; it surfaces during setup with the missing method named.
 
 ```python
 from typing import Any, AsyncIterator, ClassVar
@@ -129,7 +129,7 @@ Flag enum advertising which method sets a backend implements. Any combination vi
 - `Capability.TTL_INDEX` -- declares the backend has an indexed TTL column. Required when any `SlotPolicy` declares `ttl_days`.
 - `Capability.RAW_SQL` -- `execute`, `fetch`, `fetch_one`, `executemany`, and the `transaction()` context manager (which yields a `Transaction`, the typed protocol importable from the package root that a custom backend's `transaction()` returns). Declared by the SQL backends; `InMemoryBackend` omits it.
 
-`PersistenceMiddleware.initialize` raises `PersistenceConfigError` at config time when a declared capability's method is missing.
+The namespace configs check the backend's *declared* capability flags against what the namespace requires, raising `PersistenceConfigError` when a flag is absent. That check runs while the config object is constructed, before any backend method is called. Declaring a flag whose methods are not implemented is not caught here; it surfaces as an `AttributeError` at the first call.
 
 ---
 
@@ -193,14 +193,15 @@ await mgr.prune_registry(persistence_keys=["roles:main", "tickets:panel"])
 
 ## Exceptions
 
-All four exception types are importable from the package root
+All five exception types are importable from the package root
 (`from cascadeui import PersistenceError, ...`). They form a simple
 hierarchy so callers can catch the whole family with `PersistenceError`
 or handle specific phases individually.
 
 | Class | Parent | Fires when |
 |-------|--------|------------|
-| `PersistenceError` | `RuntimeError` | Base class for every persistence failure. Catch this to handle any persistence error. |
+| `PersistenceError` | `Exception` | Base class for every persistence failure. Catch this to handle any persistence error. |
+| `PersistenceConfigError` | `PersistenceError` | Raised when a namespace config is built against a backend whose declared capabilities do not cover what that namespace requires. Fires at config construction, before any backend method runs. |
 | `PersistenceInitError` | `PersistenceError` | Raised from `backend.initialize()` on connection failures, table-creation errors, or permission problems. Prevents the bot from starting against an unhealthy persistence layer. |
 | `PersistenceSchemaError` | `PersistenceError` | Raised when the on-disk schema version is higher than the library supports, or when no migrator is registered for the next schema step. |
 | `PersistenceRehydrateError` | `PersistenceError` | Raised during `PersistenceMiddleware.initialize` when a persisted JSON blob is corrupted, a required row is malformed, or the backend returns unexpected shape. Per-view re-attachment failures do NOT raise this -- they are logged and skipped. |

@@ -463,7 +463,7 @@ class RolesLayoutView(_BaseRolesMixin, StatefulLayoutView):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.build_ui()
+        self._build_ui_sync()
 
     def build_ui(self) -> None:
         self.clear_items()
@@ -531,5 +531,5 @@ class PersistentRolesLayoutView(_PersistentMixin, RolesLayoutView):
         reach the displayed message at a cost of one ``PATCH`` per persistent
         role panel per restart.
         """
-        self.build_ui()
+        self._build_ui_sync()
         await self.refresh()

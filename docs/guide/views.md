@@ -608,6 +608,33 @@ controls keeps both reachable across every state-driven rebuild.
     `StatefulLayoutView` *is* its component tree, so swapping `view=` is
     the whole render.
 
+### Knowing Whether Back Belongs
+
+`nav_depth` reports how many views sit beneath this one on the navigation
+stack. It is `0` on a view that was sent rather than pushed, so it answers
+"is there anywhere to go back to?" directly:
+
+```python
+def build_ui(self):
+    self.clear_items()
+    self.add_item(card("Settings"))
+    self.add_item(self.make_nav_row(back=bool(self.nav_depth)))
+```
+
+It sits beside `undo_depth` and `redo_depth`, which report the same thing
+for the undo and redo timelines.
+
+A Back button on an empty stack renders disabled, and pressing a disabled one
+acknowledges the click without touching the message. `make_nav_row()` defaults
+to `back=True`, so a view that is sent directly would otherwise show a Back
+button whose only effect is to clear the panel it sits on.
+
+The disabled state resolves at the render seams rather than inside
+`make_nav_row()`, so a button inspected right after it is built still reads
+`disabled=False`. A pushed view is constructed before its stack is assigned,
+and reading the stack at build time would disable a working button on any view
+that composes its tree in `__init__`.
+
 ### Push vs. Replace
 
 | | `push()` | `replace()` |
@@ -909,7 +936,7 @@ class AdminView(StatefulLayoutView):
 ## Participants and Multi-User Views
 
 For multi-user views (games, polls, lobbies), `register_participant` adds
-non-owner users to the session index:
+non-owner users to the instance index:
 
 ```python
 joined = await view.register_participant(opponent.id, interaction=interaction)
@@ -1051,9 +1078,13 @@ await self.open_modal(interaction, modal)
 
 See [Opening Modals from Callbacks](#opening-modals-from-callbacks) for details.
 
-All three mechanisms check `interaction.response.is_done()` before acting, so
-manual `defer()`, `with_loading_state`, `with_confirmation`, and `with_cooldown`
-are all safe to combine with auto-defer.
+`with_loading_state`, `with_confirmation`, and `with_cooldown` are safe to
+combine with auto-defer. Each one either catches `discord.InteractionResponded`
+itself or routes its reply through `respond()`, which falls back to a followup
+when the slot is already spent. A manual `interaction.response.defer()` has
+neither fallback: the timer is armed outside the interaction lock, so it can
+take the slot between an `is_done()` check and the call that follows it, and
+the resulting `InteractionResponded` propagates. See the warning above.
 
 ### Sending Ephemeral Feedback from Callbacks
 
@@ -1238,7 +1269,7 @@ players acting simultaneously), notifications are coalesced automatically. See
 Enable undo/redo on any view:
 
 ```python
-from cascadeui import UndoMiddleware, get_store
+from cascadeui import UndoMiddleware, setup_middleware
 
 await setup_middleware(UndoMiddleware())
 

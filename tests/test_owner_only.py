@@ -140,7 +140,7 @@ class TestNoneUserId:
 
     async def test_none_user_id_skips_check(self):
         """Views with no user_id (e.g. restored) should skip ownership check."""
-        view = StatefulView()  # No context or interaction — user_id is None
+        view = StatefulView()  # No context or interaction: user_id is None
         assert view.user_id is None
 
         other_interaction = _make_interaction(user_id=999)
@@ -198,7 +198,7 @@ class TestAllowedUsers:
         view = _RestrictedView(interaction=_make_interaction(user_id=100))
         view.allowed_users = {100, 200}
 
-        # User 200 is not the owner, but IS in allowed_users — should pass
+        # User 200 is not the owner, but IS in allowed_users: should pass
         result = await view.interaction_check(_make_interaction(user_id=200))
         assert result is True
 
