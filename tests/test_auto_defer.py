@@ -5,11 +5,14 @@ import logging
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import discord
 import pytest
 from helpers import make_interaction as _make_interaction
 
+from cascadeui.components.inputs import Modal, TextInput
 from cascadeui.state.singleton import get_store
+from cascadeui.utils.responses import open_modal_safe, respond_safe
 from cascadeui.views.view import StatefulView
 
 
@@ -724,3 +727,46 @@ class TestSafeDeferSwallowsInteractionResponded:
     def test_interaction_responded_is_not_an_http_exception(self):
         """The reason the explicit clause is needed rather than inherited."""
         assert not issubclass(discord.InteractionResponded, discord.HTTPException)
+
+
+class TestRespondersDegradeOnTransportFailure:
+    """A reply that never left the host must not become an error card.
+
+    These run inside component callbacks, where an escaping exception
+    reaches ``on_error``. A dropped notice is the cheaper failure.
+    """
+
+    async def test_respond_safe_swallows_and_does_not_retry_on_followup(self, caplog):
+        interaction = _make_interaction()
+        interaction.response.send_message.side_effect = aiohttp.ClientOSError(104, "reset")
+
+        with caplog.at_level(logging.WARNING):
+            await respond_safe(interaction, "hello")
+
+        # Not retried: whether the first send landed is unknowable here, and a
+        # duplicate reply is worse than a missing transient notice.
+        interaction.followup.send.assert_not_called()
+        assert "did not reach Discord" in caplog.text
+
+    async def test_respond_safe_swallows_a_failing_followup(self, caplog):
+        interaction = _make_interaction()
+        interaction.response.is_done.return_value = True
+        interaction.followup.send.side_effect = aiohttp.ClientOSError(104, "reset")
+
+        with caplog.at_level(logging.WARNING):
+            await respond_safe(interaction, "hello")
+
+        assert "did not reach Discord" in caplog.text
+
+    async def test_open_modal_safe_reports_non_delivery(self, caplog):
+        interaction = _make_interaction()
+        interaction.response.send_modal.side_effect = aiohttp.ClientOSError(104, "reset")
+        modal = Modal(title="T", inputs=[TextInput(label="x")])
+
+        with caplog.at_level(logging.WARNING):
+            opened = await open_modal_safe(interaction, modal)
+
+        assert opened is False
+        # The fallback notice would travel the same broken connection.
+        interaction.followup.send.assert_not_called()
+        assert "did not reach Discord" in caplog.text

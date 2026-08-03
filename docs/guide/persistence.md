@@ -147,7 +147,8 @@ summary = await store.persistence_manager.reattach_persistent_views()
   while the bot was offline. Row removed via `prune_registry` (which dispatches
   `REGISTRY_PRUNED`).
 - `unreachable`: channel or message could not be fetched for a transient reason
-  (`Forbidden`, `HTTPException`, or a non-messageable channel). The row is left on
+  (`Forbidden`, `RateLimited`, `HTTPException`, a transport failure, or a
+  non-messageable channel). The row is left on
   disk so a clean restart retries; nothing is pruned. Do not reconcile external
   records from this bucket: the panel may still exist.
 
@@ -925,7 +926,7 @@ on disk for later recovery.
 | Scenario | Outcome |
 |----------|---------|
 | Message or channel returns a definitive 404 (`discord.NotFound`) | Row removed, reattach summary logs as `removed` |
-| Message or channel transiently unreachable (`Forbidden`, `HTTPException`, or non-messageable) | Row kept, reattach summary logs as `unreachable` |
+| Message or channel transiently unreachable (`Forbidden`, `RateLimited`, `HTTPException`, a transport failure, or non-messageable) | Row kept, reattach summary logs as `unreachable` |
 | View class not imported | Row kept, reattach summary logs as `skipped` |
 | Kwargs migrator raises or returns non-dict | Row kept, reattach summary logs as `failed` |
 | Construction raises during reattach | Row kept, reattach summary logs as `failed` |

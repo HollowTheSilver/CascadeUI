@@ -1,8 +1,10 @@
 """Tests for navigation reducers, view-local nav stack, and forward-transfer."""
 
+import asyncio
 import copy
 from unittest.mock import AsyncMock, MagicMock
 
+import aiohttp
 import discord
 import pytest
 from discord.ui import ActionRow
@@ -2370,3 +2372,91 @@ class TestNavDepth:
         await root.push(_Child, _make_interaction(user_id=1))
 
         assert root.nav_depth == 0
+
+
+class TestAbortedNavigationNeverPaintsTheDestination:
+    """The rollback has to land before the batch announces its prefix.
+
+    An aborted batch announces what it committed, and the flush awards the
+    inline notification slot to ``source_id`` -- rebound to the destination.
+    A rollback placed outside the ``async with`` therefore lets the
+    destination render itself onto the live message and only then be
+    unsubscribed and destroyed, leaving the user clicking a view that no
+    longer exists.
+    """
+
+    async def test_a_raise_inside_the_batch_leaves_the_message_untouched(self):
+        class BrokenDestination(RenderableLayoutView):
+            # Raises AFTER _register_state has run, so the destination is a
+            # live subscriber holding the source's message when the batch
+            # unwinds -- the window this ordering exists to close.
+            async def _update_message_state(self, *args, **kwargs):
+                raise RuntimeError("destination blew up after registration")
+
+        source = RenderableLayoutView(
+            interaction=_make_interaction(user_id=7), user_id=7, guild_id=8
+        )
+        await source.send()
+        store = source.state_store
+        source._message.edit = AsyncMock()
+
+        with pytest.raises(RuntimeError):
+            await source.push(BrokenDestination, _make_interaction(user_id=7))
+        await store._flush_notifications()
+
+        source._message.edit.assert_not_called()
+        assert source.id in store.subscribers
+        assert source.id in store.state["views"]
+        assert not source.is_finished()
+
+
+class TestNavigationConnectTimeoutTakesTheTransportPath:
+    """A connect timeout is a transport failure that also answers as a timeout.
+
+    aiohttp's connect and socket timeouts inherit from both ``ClientError``
+    and ``asyncio.TimeoutError``, and discord.py builds its session with no
+    total timeout, so aiohttp's 30s ``sock_connect`` fires below the 60s
+    ``edit_timeout``. Ordering the timeout clause first would route a request
+    that never left the host past the branch that re-routes it to the channel
+    endpoint.
+    """
+
+    async def test_a_connect_timeout_reaches_the_channel_endpoint_fallback(self):
+        class _Dest(RenderableLayoutView):
+            pass
+
+        source = RenderableLayoutView(
+            interaction=_make_interaction(user_id=5), user_id=5, guild_id=6
+        )
+        await source.send()
+
+        # is_done() True forces the deferred path, where the two clauses sit.
+        nav = _make_interaction(user_id=5, guild_id=6, is_done=True)
+        nav.edit_original_response = AsyncMock(
+            side_effect=aiohttp.ConnectionTimeoutError("connect timed out")
+        )
+        source._message.edit = AsyncMock()
+
+        dest = await source.push(_Dest, interaction=nav)
+
+        source._message.edit.assert_awaited()
+        assert dest is not None
+        assert not dest.is_finished(), "the channel fallback landed, so no rollback is owed"
+
+    async def test_a_true_stall_still_rolls_back(self):
+        class _Dest(RenderableLayoutView):
+            pass
+
+        source = RenderableLayoutView(
+            interaction=_make_interaction(user_id=5), user_id=5, guild_id=6
+        )
+        await source.send()
+
+        nav = _make_interaction(user_id=5, guild_id=6, is_done=True)
+        nav.edit_original_response = AsyncMock(side_effect=asyncio.TimeoutError())
+        source._message.edit = AsyncMock()
+
+        await source.push(_Dest, interaction=nav)
+
+        source._message.edit.assert_not_called()
+        assert not source.is_finished(), "a stall rolls back to a live source"

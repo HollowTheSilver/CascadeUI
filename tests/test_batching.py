@@ -1,5 +1,6 @@
 """Tests for action batching and atomic dispatch transactions."""
 
+import asyncio
 import copy
 
 import pytest
@@ -252,16 +253,20 @@ class TestTransitiveBatching:
         assert received == ["BATCH_COMPLETE"]
         assert payloads == [["OUTER_1", "INNER_1", "INNER_2", "OUTER_2"]]
 
-    async def test_exception_inside_batch_drops_queued_actions(self):
-        """If an exception propagates out of a batch block, its queued
-        actions are dropped (no BATCH_COMPLETE, no stale queue leaking
-        into the next batch).
+    async def test_exception_inside_batch_announces_what_committed(self):
+        """An abort announces its committed prefix and starts the next batch clean.
+
+        Reducers run inline, so an entry is queued only once its state change
+        has landed. Discarding the queue reported nothing while state had
+        moved, which reads to every subscriber as the change never happening.
         """
         store = get_store()
         received = []
+        payloads = []
 
         async def handler(state, action):
             received.append(action["type"])
+            payloads.append([queued["type"] for queued in action["payload"]["actions"]])
 
         store.subscribe("error-sub", handler)
 
@@ -271,15 +276,17 @@ class TestTransitiveBatching:
                 raise RuntimeError("boom")
         await store._flush_notifications()
 
-        assert received == []
+        assert received == ["BATCH_COMPLETE"]
+        assert payloads == [["QUEUED_A"]]
+
         # Next batch must start clean -- the aborted batch's actions
         # must not leak forward.
         async with store.batch():
             await store.dispatch("CLEAN_A", {})
         await store._flush_notifications()
 
-        assert received == ["BATCH_COMPLETE"]
-        assert store._batched_actions == []
+        assert received == ["BATCH_COMPLETE", "BATCH_COMPLETE"]
+        assert payloads == [["QUEUED_A"], ["CLEAN_A"]]
 
     async def test_batched_dispatch_skips_per_action_profiling(self):
         """Per-action samples are suppressed inside a batch; the whole batch
@@ -295,7 +302,7 @@ class TestTransitiveBatching:
                 await store.dispatch("BATCHED_B", {})
             await store._flush_notifications()
             # No BATCHED_A / BATCHED_B samples -- per-action profiling is
-            # skipped when _batch_depth > 0. Exactly one BATCH_COMPLETE
+            # skipped while a batch is open. Exactly one BATCH_COMPLETE
             # sample accounts for the whole batch.
             assert len(store._perf_samples) == 1
             sample = store._perf_samples[0]
@@ -374,3 +381,189 @@ class TestLibraryInternalBatching:
         for leaked in ("NAVIGATION_PUSH", "SESSION_CREATED", "VIEW_CREATED"):
             assert leaked not in received, f"{leaked} leaked outside the batch"
         assert "VIEW_DESTROYED" in received
+
+
+class TestConcurrentBatchesAreIndependent:
+    """Batch membership follows the task, not the store.
+
+    On one shared depth counter two concurrent batches read as a single
+    nested batch: the second never flushed its own, and whichever exited
+    last flushed both under one source_id.
+    """
+
+    async def _watch(self, store):
+        seen = []
+
+        async def handler(state, action):
+            if action["type"] == "BATCH_COMPLETE":
+                seen.append(
+                    (
+                        action.get("source"),
+                        tuple(queued["payload"]["n"] for queued in action["payload"]["actions"]),
+                    )
+                )
+            else:
+                seen.append((action["type"], action["payload"].get("n")))
+
+        store.subscribe("watcher", handler)
+        return seen
+
+    async def _batched(self, store, name):
+        async with store.batch(source_id=name):
+            # Yield first so both batches are open before either dispatches.
+            # Dispatching on entry lets the tasks interleave into a legal
+            # order by luck, and the assertion then holds without proving
+            # anything about isolation.
+            await asyncio.sleep(0.01)
+            await store.dispatch("X", {"n": name}, source_id=name)
+
+    async def test_each_task_flushes_its_own_batch(self):
+        store = get_store()
+        seen = await self._watch(store)
+
+        await asyncio.gather(self._batched(store, "A"), self._batched(store, "B"))
+        await store._flush_notifications()
+
+        assert sorted(seen) == [("A", ("A",)), ("B", ("B",))]
+
+    async def test_nesting_in_one_task_still_absorbs(self):
+        store = get_store()
+        seen = await self._watch(store)
+
+        async with store.batch(source_id="outer"):
+            await store.dispatch("X", {"n": "o"}, source_id="outer")
+            async with store.batch():
+                await store.dispatch("X", {"n": "i"}, source_id="outer")
+        await store._flush_notifications()
+
+        assert seen == [("outer", ("o", "i"))]
+
+    async def test_a_foreign_batch_does_not_absorb_a_background_dispatch(self):
+        store = get_store()
+        seen = await self._watch(store)
+
+        async def background():
+            await asyncio.sleep(0.005)
+            await store.dispatch("UNRELATED", {"n": "bg"})
+
+        async def holder():
+            async with store.batch(source_id="H"):
+                await store.dispatch("X", {"n": "h"}, source_id="H")
+                await asyncio.sleep(0.02)
+
+        await asyncio.gather(holder(), background())
+        await store._flush_notifications()
+
+        # Notified under its own type, not folded into the holder's payload.
+        assert ("UNRELATED", "bg") in seen
+        assert ("H", ("h",)) in seen
+
+    async def test_a_foreign_abort_does_not_discard_a_background_dispatch(self):
+        store = get_store()
+        seen = await self._watch(store)
+
+        async def background():
+            await asyncio.sleep(0.005)
+            await store.dispatch("UNRELATED", {"n": "bg"})
+
+        async def holder():
+            with pytest.raises(RuntimeError):
+                async with store.batch(source_id="H"):
+                    await store.dispatch("X", {"n": "h"}, source_id="H")
+                    await asyncio.sleep(0.02)
+                    raise RuntimeError("boom")
+
+        await asyncio.gather(holder(), background())
+        await store._flush_notifications()
+
+        # The reducer ran, so dropping the notification would desync every
+        # subscriber from state that had already changed -- for the holder's
+        # own committed prefix as much as for the foreign dispatch.
+        assert ("UNRELATED", "bg") in seen
+        assert ("H", ("h",)) in seen
+
+    async def test_a_spawned_task_joins_the_nearest_open_ancestor(self):
+        store = get_store()
+        seen = await self._watch(store)
+        spawned = None
+
+        async def child():
+            # Dispatches once the inner batch has closed and the outer has not.
+            await asyncio.sleep(0.03)
+            await store.dispatch("X", {"n": "child"}, source_id="outer")
+
+        async with store.batch(source_id="outer"):
+            await store.dispatch("X", {"n": "o"}, source_id="outer")
+            async with store.batch():
+                spawned = asyncio.create_task(child())
+                await store.dispatch("X", {"n": "i"}, source_id="outer")
+            await asyncio.sleep(0.05)
+        await spawned
+        await store._flush_notifications()
+
+        # Not unbatched: the innermost entry is closed but an ancestor is open.
+        assert seen == [("outer", ("o", "i", "child"))]
+
+    async def test_a_batch_closed_under_another_context_does_not_raise(self):
+        store = get_store()
+
+        async def generator():
+            async with store.batch():
+                await store.dispatch("X", {"n": "g"})
+                yield 1
+
+        agen = generator()
+        await agen.__anext__()
+        # The event loop's own async-generator shutdown finalizes from a
+        # different task, where the entry token does not belong.
+        await asyncio.create_task(agen.aclose())
+
+        async with store.batch():
+            await store.dispatch("X", {"n": "after"})
+
+    async def test_a_batch_context_cannot_be_re_entered(self):
+        store = get_store()
+        batch = store.batch()
+
+        async with batch:
+            pass
+
+        with pytest.raises(RuntimeError, match="cannot be re-entered"):
+            async with batch:
+                pass
+
+    async def test_a_dispatch_outliving_its_batch_still_notifies(self):
+        """An entry is queued after the chain runs, so a suspending chain can
+        outlive the batch it started in.
+
+        Appending to a drained buffer would leave a committed state change
+        with no subscriber ever told -- the shape this whole redesign exists
+        to remove, reached by a different route.
+        """
+        store = get_store()
+        seen = await self._watch(store)
+
+        async def slow_middleware(action, state, next_fn):
+            if action["type"] == "LATE":
+                await asyncio.sleep(0.02)
+            return await next_fn(action, state)
+
+        store._add_middleware(slow_middleware)
+
+        async def late_dispatcher():
+            await asyncio.sleep(0.005)
+            await store.dispatch("LATE", {"n": "late"})
+
+        try:
+            async with store.batch(source_id="B"):
+                await store.dispatch("X", {"n": "early"}, source_id="B")
+                spawned = asyncio.create_task(late_dispatcher())
+                # The batch closes while LATE is still inside the chain.
+                await asyncio.sleep(0.01)
+            await spawned
+            await store._flush_notifications()
+        finally:
+            store._remove_middleware(slow_middleware)
+
+        assert ("B", ("early",)) in seen
+        assert ("LATE", "late") in seen

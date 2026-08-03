@@ -58,6 +58,8 @@ The V1 patterns (`PaginatedView`, `TabView`, `WizardView`, `FormView`, `MenuView
 
 In each case, the view is fully cleaned up -- no message was sent, no state remains. See [send() and Rollback](../guide/views.md#send-and-rollback) for usage patterns.
 
+All three are decided before the Discord call, which is what makes `None` mean "nothing happened". Once the message is live the rollback path is behind it, so a failure in the bookkeeping that follows the send degrades and logs what is inactive on the message rather than reporting the send as failed. `send()` still returns the message. Retrying on the return value therefore never posts a second copy.
+
 #### `dispatch(action_type, payload=None)`
 
 Dispatches an action through the store with `source=self.id`. Subscriber failures are caught and logged internally -- `dispatch()` does not raise from subscriber errors.
@@ -80,6 +82,51 @@ These are the same checks the library runs itself at three seams: the initial se
 #### `refresh(**kwargs)`
 
 Edits the view's message with `view=self` plus any extra kwargs forwarded to `message.edit()`. Does NOT rebuild components -- call your rebuild method (e.g. `build_ui()`) first. Handles `discord.NotFound` silently if the message has been deleted. V2 callers pass no args; V1 callers pass `embed=` or `content=`.
+
+A transport failure (a request that never reached Discord, which raises from aiohttp and carries no HTTP status) is swallowed rather than raised: the edit is dropped, the render baseline is cleared so the next state change re-ships, and `refresh_degraded` reports it. Raising would surface a network blip as `on_error`'s failure card over a repaint that merely needs repeating. See [Transport Failures Degrade Quietly](../guide/known-limitations.md#transport-failures-degrade-quietly).
+
+#### `restore_on_dropped_render(*attributes)`
+
+Context manager. Snapshots each named view attribute on entry and rebinds it if the render inside the block was dropped by a transport failure, so a view-local write and the screen cannot disagree.
+
+Pass `rebuild=` to recompose the tree from the restored values. A V2 tree *is* the content, so rebinding the attribute is only half the rollback: without a rebuild the tree keeps what the dropped render composed, and the next `refresh()` that does not rebuild first ships a screen the restored attribute no longer names. `rebuild` runs only on a drop, after the attributes are back, and is not re-rendered -- the render being undone is the one that failed, and the next one carries the corrected tree. It must be synchronous, since the restore happens at a synchronous context-manager exit; an async callable is rejected at the call with a message naming the alternative.
+
+```python
+with self.restore_on_dropped_render("_confirming", rebuild=self.build_ui):
+    self._confirming = True
+    self.build_ui()
+    await self.refresh()
+```
+
+A V1 view carrying its body on an `embed` or `content` kwarg needs no rebuild -- the tree is not the content there.
+
+The snapshot holds each attribute's value. A name rebound inside the block comes back; a list or dict edited in place does not, because the snapshot and the attribute are the same object. Flags and cursors are what this is for. Rebuild a collection from the restored cursor rather than editing it under the manager.
+
+When two views are involved, the manager reads the flag of the view it is called on. A caller deciding on one view while a sibling's render is the one that matters opens the block on whichever view performs the refresh.
+
+The shape it exists for is a control armed on one press and executed on the next. If the arming render never reaches Discord, the button on screen still looks unarmed, so the obvious response is to press it again -- and that press executes, because the flag is already set. A dropped packet turns a two-press confirmation into one, on exactly the controls that ask for confirmation because they are destructive.
+
+```python
+with self.restore_on_dropped_render("_confirming"):
+    self._confirming = True
+    self.build_ui()
+    await self.refresh()
+```
+
+Nothing is restored when the render lands, nor when the block raises: an exception is its own signal and the caller owns the recovery. Entry clears [`refresh_degraded`](#refresh_degraded), so a block whose refresh sits behind a conditional that did not run keeps its write instead of answering for an earlier drop. The flag stays available directly for anything the snapshot shape does not fit.
+
+#### `refresh_degraded`
+
+Read-only `bool`. `True` when the most recent `refresh()` was dropped by a transport failure, `False` otherwise. Reset at the top of every `refresh()`, so it always describes the latest call.
+
+Read it when the caller changed something *before* the render that should not stand if the render never landed. A paginated view is the worked example: the page cursor advances first, so a dropped edit otherwise leaves the reader on the previous page with the cursor already moved.
+
+```python
+before = self.current_page
+await self.refresh()
+if self.refresh_degraded:
+    self.current_page = before
+```
 
 Only kwargs every edit endpoint accepts are allowed: `content`, `embed`, `embeds`, `attachments`, `allowed_mentions`. `refresh()` picks between the interaction, webhook, and channel endpoints at runtime, so a kwarg only one of them takes (`suppress`, `suppress_embeds`, `delete_after`) raises `TypeError` rather than working intermittently. Edit `view.message` directly for a one-off that needs a non-portable field.
 
@@ -1105,7 +1152,7 @@ Write-through middleware that owns the full persistence pipeline. Install via `s
 - `backend`: a `PersistenceBackend` instance (e.g. `SQLiteBackend`, `InMemoryBackend`) used as the shorthand for any namespace not configured explicitly
 - `registry`, `application`: per-namespace configs (`RegistryPersistence`, `ApplicationPersistence`) that override the shorthand. Scoped state rides under the application namespace -- opt a scoped slot in via `persistent_slots = ("scoped",)` on the view class.
 - `migrators`: optional dict with `"schema"` and/or `"kwargs"` keys, each mapping a `(name, from_version)` tuple to an async migrator callable. When omitted, no migrators are registered through this kwarg; the `@register_migrator` / `@register_kwargs_migrator` decorators are the canonical registration path, and this dict is the programmatic bulk alternative.
-- `restore_concurrency`: positive int bounding how many persistent-view channel and message fetches run concurrently during startup reattach (default `8`).
+- `restore_concurrency`: positive int bounding concurrency in both restore phases: the channel and message fetches during startup reattach, and the post-ready `on_restore` repaint that follows (default `8`).
 
 ```python
 from cascadeui import PersistenceMiddleware, setup_middleware

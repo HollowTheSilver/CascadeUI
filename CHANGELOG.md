@@ -20,6 +20,217 @@ preserved below for historical reference but are not the supported baseline.
   Pillow-backed; core install stays lean because the extra is opt-in.
 - **Redis persistence backend.** Capability-flag conformant `RedisBackend`
   with multi-process coordination and pub/sub for scoped invalidation.
+- **An age on an unreachable registry row, and a prune that reads it.** A row
+  whose channel or message answers `Forbidden` is kept rather than pruned, so
+  a permission change during startup never deletes a live panel. The cost is
+  that a channel the bot will never see again is indistinguishable from one it
+  cannot see this minute, and each costs a message fetch at every boot for the
+  life of the deployment. A `first_unreachable_at` stamp on the row, reported
+  alongside the existing count, gives an operator the one fact that separates
+  the two; `prune_unreachable(older_than=...)` then acts on it. The library
+  keeps out of the delete decision: a count of consecutive failures cannot
+  make it safely, since a restart loop spends a boot-based threshold in
+  minutes, which is exactly when the rows are least safe to drop.
+
+---
+
+## [3.9.1] - 2026-08-03
+
+### Added
+
+- **`refresh_degraded` reports a dropped render.** Read-only `bool` on every
+  view, `True` when the last `refresh()` was dropped by a transport failure.
+  Read it when the caller changed something before the render that should
+  not stand if the render never landed.
+- **`restore_on_dropped_render(*attributes)` rolls back a dropped render.**
+  Context manager that snapshots view attributes and rebinds them when the
+  render inside it was dropped. A control armed on one press and executed on
+  the next used to collapse into a single press when the arming render
+  failed: the button on screen still looked unarmed, so pressing it again
+  executed rather than armed. That has been true of the in-place
+  arm-then-confirm shape for as long as it has existed; the library now
+  offers the rollback rather than leaving each caller to remember it. The
+  snapshot holds each attribute's value, so flags and cursors come back and a
+  collection edited in place does not. Pass `rebuild=` to recompose the tree
+  from the restored values: a V2 tree is the content, so rebinding the
+  attribute alone leaves the screen describing a value that was rolled back,
+  and the next refresh that does not rebuild first ships it.
+
+### Changed
+
+- **An aborted batch announces what it committed instead of discarding it.**
+  Reducers run inline, so the dispatches before a raise have already changed
+  state; dropping the queue reported nothing while state had moved, and left
+  that change with no undo entry able to revert it. The committed prefix now
+  fires one `BATCH_COMPLETE` and lands on the undo stack, and the exception
+  still propagates. `batch()` remains a notification gate rather than a
+  transaction: a block that must not leave anything behind rolls back itself,
+  which the library's own pipelines now do.
+- **A `BatchContext` cannot be entered twice.** Re-entering one after it
+  closed collected onto a buffer that had already flushed, where the entries
+  were never announced. `store.batch()` returns a fresh context per use;
+  reusing a stored one now raises `RuntimeError`.
+- **Restored persistent panels repaint concurrently.** The post-ready
+  `on_restore` pass ran one panel at a time because batch state was shared,
+  giving a repaint tail linear in panel count on views that were already
+  interactive. It now runs under the existing `restore_concurrency` ceiling
+  (default 8), which bounds both restore phases.
+- **Dispatch cost no longer tracks how much data the store holds.** Two
+  comparisons walked structures they could have skipped by identity. The
+  built-in reducers shallow-spread, so a slot an action did not write is the
+  same object on both sides of the undo diff, yet dict equality has no identity
+  shortcut and compared it entry by entry: every undo-tracked action paid for
+  the whole application namespace, measured at 493 microseconds against one
+  untouched 20,000-entry slot and now 2.3. A subscriber whose selector
+  returns a whole bucket was compared the same way on every dispatch, 20.8
+  milliseconds at 200 subscribers over 5,000 scoped keys and now 0.15. Views
+  never paid the second one, since their selector is wrapped in a tuple and
+  tuple comparison does shortcut identical elements; it fell on direct
+  `store.subscribe` callers. A batch commit also rebuilt its set of batched
+  action types once per subscriber instead of once. `InMemoryBackend`'s
+  batched upsert rescanned every stored row for each incoming one, so a
+  200-row flush against 2,000 stored rows cost 167 milliseconds where the
+  same batch into an empty namespace cost 8; it indexes the batch once and
+  now costs 1.3. That backend is the reference implementation, so the shape
+  it models is the one a new backend inherits.
+- **The copy a custom reducer is handed is about twice as cheap.** State is
+  dicts, lists and scalars, because it round-trips through `json.dumps` on the
+  persistence path, and `copy.deepcopy` cannot assume that: it consults
+  `__reduce_ex__` and the copy dispatch table at every node. Walking the two
+  container shapes directly and delegating anything else takes a dispatch
+  against 2,000 scope keys from 5.8ms to 2.9ms. A memo is still carried, so a
+  self-referential value terminates and a reference appearing twice in the
+  tree stays one object on the other side. The contract is unchanged: the
+  reducer receives its own copy and mutates it freely.
+- **A reducer that forgets to return names itself.** The store assigns whatever
+  comes back, so falling off the end of a reducer installed `None` as the
+  entire state and the failure surfaced at whichever unrelated read came next.
+  A non-dict return now raises where the mistake is, naming the reducer, the
+  action, and the missing `return state`; the store's own reducer guard logs it
+  and keeps the previous state, so one dispatch is lost instead of the session.
+- **The circular-attachment error names which views.** It reported the two
+  class names, and attaching two instances of one view class is the ordinary
+  case, so it named the same type twice and said nothing. It now carries each
+  view's id, the chain it walked, and what to do about it.
+
+### Fixed
+
+- **A dropped connection no longer surfaces as an error card.** A request
+  that never reached Discord raises from aiohttp and carries none of the HTTP
+  types, so it escaped every handler: a reset during a page turn unwound out
+  of `refresh()` into `on_error` and rendered a failure card over content that
+  was fine. `aiohttp.ClientError` joined the shared catch-tuple as a third
+  sibling. Each surface degrades and logs at `WARNING` rather than raising:
+  `refresh()` re-ships on the next state change, the post-send message
+  re-fetch keeps the message it just sent, and `respond()` / `open_modal()`
+  drop the undelivered notice instead of retrying it on the followup path,
+  where a duplicate reply would be worse. Navigation tries the channel
+  endpoint before giving up and otherwise rolls back, since a swap the user
+  never saw must not tear the source view down. Every paging
+  pattern rewinds its own cursor (page, wizard step, active tab, and both V2
+  composites), so a dropped turn no longer leaves the reader a position
+  behind and makes the next press skip past content. Role toggles route their
+  failures through `on_role_error` rather than escaping a dynamic button that
+  has no handler beneath it. aiohttp's connect and socket timeouts read as
+  transport rather than as a stalled edit: they inherit `asyncio.TimeoutError`
+  too, so the timeout clause saw them first, and with discord.py passing no
+  session timeout they are the likeliest transport failure of all. The full
+  per-surface table is in the known-limitations guide. (The umbrella is
+  `aiohttp.ClientError` rather than `OSError`: `ServerDisconnectedError` is
+  not an `OSError`, and `asyncio.TimeoutError` is one from 3.11 but not on
+  3.10.)
+- **An ephemeral view keeps trying to arm its refresh button.** The handoff
+  swaps the view's children for a Refresh button at T+810s and then drops
+  every state notification, so that one edit is the only thing that can put
+  the button on screen. A rate-limited attempt re-queues itself, but a
+  dropped one gave up after a single retry and left the panel frozen with no
+  button and most of the 90-second window unspent. It now retries for as long
+  as the token can still carry an edit.
+- **`card(color=...)` and `stats_card(color=...)` accept the int form their
+  signatures document.** discord.py coerces an int in `Embed.colour`'s setter
+  but stores one verbatim on `Container.accent_colour`, so a hex literal that
+  had always themed a V1 embed reached the render digest as a bare `int` and
+  raised after the message was already sent. Both builders and every colour
+  style on `Theme` coerce to `discord.Colour`, and the digest reads either
+  form, so a Container built without a builder works too. A theme declaring
+  `primary_color` as an int was the widest way in: `accent_colour` defaults
+  to it, and every themed card takes its accent from there. An out-of-range
+  int and `True` are rejected where they are written. One read-back
+  consequence: `Theme.get_style()` returns the `discord.Colour` for a style
+  written as an int, so code comparing that value against the literal it
+  passed needs `.value`.
+- **A failure after the message was sent no longer reports the send as
+  failed.** `send()`'s rollback path ends at the Discord call, so anything
+  raising past it left the view registered and the message live while telling
+  the caller neither happened; a caller retrying on that answer posted a
+  second copy, and the registration stayed behind permanently, holding an
+  `instance_limit` slot no live view occupied. Post-send bookkeeping now
+  degrades and logs what is inactive on the message, and the same contract
+  covers a persistent view whose registry write fails. A circular `parent=`
+  chain, the other way into that window, is rejected before the send where
+  the rollback still applies.
+- **A raising hook no longer strands the view it was building.** `send()`
+  registers state before running `seed_initial_state`, and `push()` quiesces
+  the source before constructing the destination; neither rolled back if that
+  caller code raised. A raising seed hook left a registered view with no
+  message, invisible but counted by the instance limit, which under
+  `instance_policy="reject"` locked the owner out of the view class until the
+  process restarted. A raising destination `__init__` left the source on
+  screen with buttons that no longer rendered, because it had already
+  unsubscribed. Both now run the rollback they already own and re-raise, and
+  a constructor that raises after `super().__init__()` no longer leaves its
+  store subscriber behind. `push()`'s rollback runs inside its batch, so an
+  aborted navigation no longer paints the destination onto the live message
+  before destroying it. Both seams catch `BaseException`, since a cancellation
+  strands exactly what a raise does.
+- **Undo history survives actions that change nothing.** Every dispatch from
+  an undo-enabled view pushed an entry, including ones that wrote no
+  application slot and left `shared_data` alone: a selection change, a
+  view-local toggle, a re-render. `undo_limit` bounds the stack, so those
+  entries evicted the ones a user was trying to reach, and four of them
+  cleared a stack of three. A snapshot that can put nothing back is no longer
+  pushed, on the per-dispatch path and at batch commit. The test is whether
+  `shared_data` *changed*, not whether it holds anything, because a session
+  gaining its first shared data records an empty pre-value that is precisely
+  what an undo has to restore.
+- **A batch belongs to the task that opened it.** `_batch_depth` and the
+  queued-action list were plain attributes on the store, so two tasks
+  batching at once were indistinguishable from one batch nested inside
+  another: the second never flushed its own, and whichever exited last fired
+  a single `BATCH_COMPLETE` for both under one `source_id`. Worse without any
+  concurrency of the caller's own making, a dispatch from a background task
+  landing while an unrelated view was sending or navigating was absorbed into
+  that view's batch, reaching subscribers late and under the wrong action
+  type; if that batch then aborted, the queued actions were dropped and the
+  background action's notification went with them, so state had changed and
+  no subscriber was ever told. Batch membership now follows the task, and
+  nesting inside one task absorbs exactly as before. Undo diffs are captured
+  per action and merged at commit rather than diffed against live state,
+  which had pulled an overlapping batch's slot writes into another view's
+  undo entry; a slot a batch writes and then restores leaves no entry at all,
+  and a batch holding undo records but no actions of its own finalizes them
+  rather than discarding a snapshot for a change that committed. Profiling
+  frames were shared the same way: with `perf` on, overlapping dispatches
+  took each other's edit frames and a batched
+  reducer's time landed on whichever unbatched dispatch was in flight.
+- **A closing card composed before teardown reaches the message.** The V2
+  teardown edit shipped only when the freeze disabled something, which is
+  right for a display view that has nothing to disable and wrong for a view
+  that clears its tree and composes a farewell card first: that view has
+  nothing left to freeze either, so `exit()` and `on_timeout()` dropped the
+  card and left the original controls on screen looking live. The next press
+  reached a stopped view and Discord reported it as failed. The edit now also
+  ships when the tree no longer matches the last render, and the no-op PATCH
+  the guard exists to prevent is still skipped. Both challenge prompts in the
+  examples expired this way, and both now print their deadline as a live
+  Discord countdown timestamp instead of a fixed second count that was wrong
+  the moment it was sent.
+- **Four examples now key shared state per guild.** `v2_battleship.py`,
+  `v2_computed.py`, and `v2_dashboard.py` each wrote every guild's data into
+  one slot, and the battleship one decides hit-or-miss from that state, so a
+  player in two matches at once had one overwrite the other's fleet.
+  `v2_pagination.py`'s two commands shared a view class and its
+  `instance_limit` slot. Worth re-reading if one was used as a starting point.
 
 ---
 

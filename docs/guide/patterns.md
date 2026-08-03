@@ -872,6 +872,13 @@ async def on_page_changed(self, page):
     await self.dispatch("PAGE_VIEWED", {"page": page})
 ```
 
+!!! warning "Fires before the repaint"
+    This reports the move the reader asked for. If that repaint's edit never
+    reaches Discord the cursor is rewound and the hook is *not* called again,
+    so an override that counts moves or writes state records one the reader
+    never saw. Read `refresh_degraded` after the move if that matters. See
+    [Transport Failures Degrade Quietly](known-limitations.md#transport-failures-degrade-quietly).
+
 ### `_build_extra_items()`
 
 Hook for adding components below the navigation buttons. Called once
@@ -1361,7 +1368,7 @@ to suppress the hint entirely. Per-category dynamic hints override
 | `on_role_removed(interaction, member, role, category)` | Called after a role is removed. Default: reads `removed_message`. |
 | `on_role_swap(interaction, member, role_added, roles_removed, category)` | Called after an exclusive-mode swap. Default: reads `swap_message` with `{removed}` formatted as a comma-joined list of removed role names. |
 | `on_role_required_block(interaction, member, role, category)` | Called when a required-category last-role removal is rejected. Default: reads `required_message`. |
-| `on_role_error(interaction, error)` | Called on role mutation failure (`discord.Forbidden`, `discord.HTTPException`, or role-not-found string). Default: reads `role_error_message`. |
+| `on_role_error(interaction, error)` | Called on role mutation failure (`discord.Forbidden`, `discord.RateLimited`, `discord.HTTPException`, a transport failure, or role-not-found string). Default: reads `role_error_message`. |
 
 ### Tier 1 customization (class attributes)
 

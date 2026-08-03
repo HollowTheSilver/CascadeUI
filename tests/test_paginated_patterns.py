@@ -2,6 +2,7 @@
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import discord
 import pytest
 from discord.ui import ActionRow, Button, Container, TextDisplay
@@ -762,3 +763,71 @@ class TestSetPage:
         await view.reload()
         embed = view.refresh.call_args.kwargs.get("embed")
         assert embed is not None  # was the empty-kwargs no-op before the fix
+
+
+class TestPageCursorRewindsWhenTheEditNeverLanded:
+    """The cursor moves before the repaint, so a dropped edit desyncs them.
+
+    Left alone the reader sees the old page while the view believes it
+    moved, and the next press advances from the new position -- skipping a
+    page the reader never saw.
+    """
+
+    @staticmethod
+    async def _view(cls, formatter):
+        view = await cls.from_data(list(range(30)), per_page=5, formatter=formatter)
+        view.interaction = _make_interaction()
+        view.user_id = 1
+        view.guild_id = 2
+        message = MagicMock()
+        message.id = 999
+        message.edit = AsyncMock()
+        view._message = message
+        await view.set_page(1)
+        return view, message
+
+    @pytest.mark.parametrize(
+        "cls,formatter",
+        [
+            (PaginatedLayoutView, lambda chunk: [TextDisplay(str(chunk))]),
+            (PaginatedView, lambda chunk: {"content": str(chunk)}),
+        ],
+        ids=["v2", "v1"],
+    )
+    async def test_a_dropped_page_turn_does_not_skip_a_page(self, cls, formatter):
+        view, message = await self._view(cls, formatter)
+
+        message.edit = AsyncMock(side_effect=aiohttp.ClientOSError(104, "reset"))
+        await view._make_step_callback(1)(_make_interaction())
+        assert view.current_page == 1, "cursor must stay where the screen still is"
+
+        message.edit = AsyncMock()
+        await view._make_step_callback(1)(_make_interaction())
+        assert view.current_page == 2, "the recovery press advances one page, not two"
+
+    @pytest.mark.parametrize(
+        "cls,formatter",
+        [
+            (PaginatedLayoutView, lambda chunk: [TextDisplay(str(chunk))]),
+            (PaginatedView, lambda chunk: {"content": str(chunk)}),
+        ],
+        ids=["v2", "v1"],
+    )
+    async def test_a_successful_page_turn_keeps_its_cursor(self, cls, formatter):
+        view, _message = await self._view(cls, formatter)
+
+        await view._make_step_callback(1)(_make_interaction())
+
+        assert view.current_page == 2
+        assert view.refresh_degraded is False
+
+    async def test_a_rebuild_caller_moves_no_cursor_to_rewind(self):
+        """``refresh_data`` passes no previous page, so nothing rewinds."""
+        view, message = await self._view(
+            PaginatedLayoutView, lambda chunk: [TextDisplay(str(chunk))]
+        )
+        message.edit = AsyncMock(side_effect=aiohttp.ClientOSError(104, "reset"))
+
+        await view.refresh_data(list(range(30)))
+
+        assert view.current_page == 1

@@ -60,6 +60,7 @@ Usage:
 import asyncio
 import logging
 import random
+from datetime import timedelta
 
 import discord
 from discord import SelectOption, app_commands
@@ -214,15 +215,23 @@ def _ship_status_line(ships: dict[str, list[int]], sunk_ships: set[str], emoji: 
 #
 # Battleship demonstrates a deliberate mixed-scope state design.
 #
-# Shared per-game state lives under ``state["application"]["battleship"]``
-# and is written by the four lifecycle reducers below. Both players read
+# Shared per-game state lives under ``state["application"]["battleship"]``,
+# keyed by ``match_id`` (``BattleshipView.id``, stable across a rematch),
+# and is written by the five lifecycle reducers below. Both players read
 # this slot (via ``MyShipsView.state_selector``), so it cannot live behind
-# a per-user scope key.
+# a per-user scope key -- but it also cannot live UNKEYED at the slot root:
+# a bot serving several guilds can have two unrelated matches in flight at
+# once, and a player who happens to be seated in both (a normal case for a
+# multi-guild bot, not an edge case) would have one match's fleet silently
+# overwrite the other's the moment either match seeds or rerolls.
 #
 #     state["application"]["battleship"] = {
-#         "fleets":      {player_id: {ship_name: [cell_indices]}},
-#         "phase":       "setup" | "active" | "finished",
-#         "shots_fired": int,   # per-match counter, reset on REMATCH
+#         match_id: {
+#             "fleets":      {player_id: {ship_name: [cell_indices]}},
+#             "phase":       "setup" | "active" | "finished",
+#             "shots_fired": int,   # per-match counter, reset on REMATCH
+#         },
+#         ...
 #     }
 #
 # Per-player lifetime totals (games, wins, forfeits) live under
@@ -231,15 +240,16 @@ def _ship_status_line(ships: dict[str, list[int]], sunk_ships: set[str], emoji: 
 # end. Lifetime stats belong to one player and persist across matches
 # against different opponents -- exactly what scoped state is for.
 #
-# ``access_slot(state, "battleship")`` keeps the slot key in one
+# ``access_slot(state, "battleship", match_id)`` keeps the slot key in one
 # string instead of repeating ``state.setdefault("application", {})
-# .setdefault("battleship", {})`` in every reducer.
+# .setdefault("battleship", {}).setdefault(match_id, {})`` in every reducer.
 
 
 @cascade_reducer("BATTLESHIP_REROLL")
 async def battleship_reroll_reducer(action, state):
     """Record the rerolled fleet so selectors can detect per-player changes."""
-    fleets = access_slot(state, "battleship", "fleets")
+    match = access_slot(state, "battleship", action["payload"]["match_id"])
+    fleets = match.setdefault("fleets", {})
     fleets[action["payload"]["player_id"]] = action["payload"]["ships"]
     return state
 
@@ -247,16 +257,16 @@ async def battleship_reroll_reducer(action, state):
 @cascade_reducer("BATTLESHIP_STARTED")
 async def battleship_started_reducer(action, state):
     """Transition phase to active so setup-only UI elements drop out."""
-    bs = access_slot(state, "battleship")
-    bs["phase"] = "active"
+    match = access_slot(state, "battleship", action["payload"]["match_id"])
+    match["phase"] = "active"
     return state
 
 
 @cascade_reducer("BATTLESHIP_SHOT")
 async def battleship_shot_reducer(action, state):
     """Increment the shot counter so every shot produces a selector delta."""
-    bs = access_slot(state, "battleship")
-    bs["shots_fired"] = bs.get("shots_fired", 0) + 1
+    match = access_slot(state, "battleship", action["payload"]["match_id"])
+    match["shots_fired"] = match.get("shots_fired", 0) + 1
     return state
 
 
@@ -268,11 +278,11 @@ async def battleship_rematch_reducer(action, state):
     rematch untouched. Player IDs ride the payload because the
     seat swap happens in the view before dispatch.
     """
-    bs = access_slot(state, "battleship")
-    bs["phase"] = "setup"
-    bs["shots_fired"] = 0
+    match = access_slot(state, "battleship", action["payload"]["match_id"])
+    match["phase"] = "setup"
+    match["shots_fired"] = 0
 
-    fleets = access_slot(state, "battleship", "fleets")
+    fleets = match.setdefault("fleets", {})
     fleets[action["payload"]["player_1"]] = _place_ships(BOARD_SIZE, SHIPS)
     fleets[action["payload"]["player_2"]] = _place_ships(BOARD_SIZE, SHIPS)
     return state
@@ -287,8 +297,8 @@ async def battleship_finished_reducer(action, state):
     scope -- see ``BattleshipView._record_player_stats`` for the
     rationale.
     """
-    bs = access_slot(state, "battleship")
-    bs["phase"] = "finished"
+    match = access_slot(state, "battleship", action["payload"]["match_id"])
+    match["phase"] = "finished"
     return state
 
 
@@ -342,6 +352,7 @@ class BattleshipChallengeView(StatefulLayoutView):
         self.challenger_id = challenger_id
         self.opponent = opponent
         self.allowed_users = {opponent.id}
+        self._expires_at = discord.utils.utcnow() + timedelta(seconds=self.timeout)
         self.build_ui()
 
     def build_ui(self):
@@ -377,7 +388,7 @@ class BattleshipChallengeView(StatefulLayoutView):
                     ),
                 ),
                 f"-# Only <@{self.opponent.id}> can respond \N{MIDDLE DOT} "
-                f"expires in {int(self.timeout)} seconds",
+                f"expires {discord.utils.format_dt(self._expires_at, 'R')}",
                 color=discord.Color.blurple(),
             )
         )
@@ -513,9 +524,10 @@ class BattleshipView(StatefulLayoutView):
     # move. The turn-nudge followups are separate sends and still ping.
     allowed_mentions = discord.AllowedMentions.none()
 
-    # Ship placements live in ``state["application"]["battleship"]["fleets"]``
-    # via the BATTLESHIP_REROLL reducer. These properties are the canonical
-    # read path; writes happen exclusively through dispatch() or the
+    # Ship placements live in
+    # ``state["application"]["battleship"][match_id]["fleets"]`` via the
+    # BATTLESHIP_REROLL reducer. These properties are the canonical read
+    # path; writes happen exclusively through dispatch() or the
     # _place_fresh_fleets helper below. Making them read-only @property enforces
     # that -- any stray ``self.ships_1 = ...`` raises AttributeError at the
     # call site instead of silently desynchronising state from local data.
@@ -527,8 +539,23 @@ class BattleshipView(StatefulLayoutView):
     def ships_2(self) -> dict[str, list[int]]:
         return self._fleets().get(self.player_2, {})
 
+    @property
+    def _match_key(self) -> str:
+        """Stable key partitioning this match inside the shared 'battleship' slot.
+
+        ``self.id`` is a UUID stamped once at construction and unchanged
+        across a rematch (same view instance, seats just swap), so it
+        isolates this match's fleets/phase/shots_fired from every other
+        concurrent match a multi-guild bot may be running at once --
+        including a match involving one of the same two players in a
+        different guild.
+        """
+        return self.id
+
     def _fleets(self) -> dict[int, dict[str, list[int]]]:
-        return read_slot(self.state_store.state, "battleship", "fleets", default={})
+        return read_slot(
+            self.state_store.state, "battleship", self._match_key, "fleets", default={}
+        )
 
     def _place_fresh_fleets(self, state) -> None:
         """Write a randomly-generated ship layout for each player into the slot.
@@ -539,7 +566,8 @@ class BattleshipView(StatefulLayoutView):
         same placement logic inside the BATTLESHIP_REMATCH reducer
         instead, which keeps the write on the standard reducer pipeline.
         """
-        fleets = access_slot(state, "battleship", "fleets")
+        match = access_slot(state, "battleship", self._match_key)
+        fleets = match.setdefault("fleets", {})
         fleets[self.player_1] = _place_ships(BOARD_SIZE, SHIPS)
         fleets[self.player_2] = _place_ships(BOARD_SIZE, SHIPS)
 
@@ -877,7 +905,7 @@ class BattleshipView(StatefulLayoutView):
 
         if started:
             # Notify open MyShipsView instances so their re-roll button hides.
-            await self.dispatch("BATTLESHIP_STARTED", {})
+            await self.dispatch("BATTLESHIP_STARTED", {"match_id": self._match_key})
 
     async def _on_row_select(self, interaction: discord.Interaction, values: list[str]):
         """Store the selected row. No UI rebuild needed."""
@@ -973,7 +1001,7 @@ class BattleshipView(StatefulLayoutView):
         await self.refresh()
 
         # Notify ephemeral MyShipsView subscribers
-        await self.dispatch("BATTLESHIP_SHOT", {"cell": target})
+        await self.dispatch("BATTLESHIP_SHOT", {"cell": target, "match_id": self._match_key})
 
     async def _show_my_ships(self, interaction: discord.Interaction):
         """Open an ephemeral live-updating fleet view for the clicking player.
@@ -1047,7 +1075,11 @@ class BattleshipView(StatefulLayoutView):
             # happened on the view.
             await self.dispatch(
                 "BATTLESHIP_REMATCH",
-                {"player_1": self.player_1, "player_2": self.player_2},
+                {
+                    "player_1": self.player_1,
+                    "player_2": self.player_2,
+                    "match_id": self._match_key,
+                },
             )
 
             # Now that state holds the fresh fleets, repaint defense
@@ -1103,7 +1135,7 @@ class BattleshipView(StatefulLayoutView):
             self.phase = "active"
             self.build_ui()
             await self.refresh()
-            await self.dispatch("BATTLESHIP_STARTED", {})
+            await self.dispatch("BATTLESHIP_STARTED", {"match_id": self._match_key})
 
     async def _finish_game(self, forfeit: bool):
         """Dispatch game result and close any private fleet panels.
@@ -1124,7 +1156,7 @@ class BattleshipView(StatefulLayoutView):
         async with self.batch():
             await self.dispatch(
                 "BATTLESHIP_FINISHED",
-                {"winner": self.winner, "forfeit": forfeit},
+                {"winner": self.winner, "forfeit": forfeit, "match_id": self._match_key},
             )
             await self._record_player_stats(winner_id, won=True, forfeit=False)
             await self._record_player_stats(loser_id, won=False, forfeit=forfeit)
@@ -1261,11 +1293,16 @@ class MyShipsView(StatefulLayoutView):
         * ``shots_fired`` -- monotonically increases on every SHOT, so
           incoming damage always produces a rebuild regardless of whose
           turn it was.
+
+        All three read through ``self.parent_view._match_key`` so a
+        concurrent, unrelated match never contributes a false-positive
+        (or false-negative) change to this tuple.
         """
+        match_key = self.parent_view._match_key
         return (
-            read_slot(state, "battleship", "fleets", self.user_id),
-            read_slot(state, "battleship", "phase"),
-            read_slot(state, "battleship", "shots_fired", default=0),
+            read_slot(state, "battleship", match_key, "fleets", self.user_id),
+            read_slot(state, "battleship", match_key, "phase"),
+            read_slot(state, "battleship", match_key, "shots_fired", default=0),
         )
 
     def __init__(self, *, parent_view: "BattleshipView", **kwargs):
@@ -1349,9 +1386,9 @@ class MyShipsView(StatefulLayoutView):
 
         The dispatch carries the new placement as payload; the REROLL
         reducer writes it into ``state["application"]["battleship"]
-        ["fleets"][player_id]``. The parent's ``ships_1`` / ``ships_2``
-        properties then read the new placement directly from state, and
-        the opponent's MyShipsView short-circuits via its
+        [match_id]["fleets"][player_id]``. The parent's ``ships_1`` /
+        ``ships_2`` properties then read the new placement directly from
+        state, and the opponent's MyShipsView short-circuits via its
         ``state_selector`` because its own fleet slice didn't change.
         """
         # Phase guard: re-roll is meaningless once the game has started or
@@ -1370,7 +1407,11 @@ class MyShipsView(StatefulLayoutView):
 
         await self.dispatch(
             "BATTLESHIP_REROLL",
-            {"player_id": self.user_id, "ships": new_ships},
+            {
+                "player_id": self.user_id,
+                "ships": new_ships,
+                "match_id": self.parent_view._match_key,
+            },
         )
 
 

@@ -104,6 +104,13 @@ class _BasePaginatedMixin:
         ``page`` is the zero-based index of the new current page. Default
         is a no-op. Override for analytics, async prefetch, or per-page
         validation that should fire on every page turn.
+
+        Fires before the repaint, so it reports the page the reader asked
+        for. When that repaint's edit never reaches Discord the cursor is
+        rewound and the reader stays where they were, and this hook is not
+        called again -- an override that counts turns or writes state will
+        have recorded one the reader never saw. Read ``refresh_degraded``
+        after the turn if that matters.
         """
         return None
 
@@ -124,6 +131,27 @@ class _BasePaginatedMixin:
         return f"{current}/{total}"
 
     # // ----( Nav state )---- // #
+
+    def _rewind_page_if_edit_never_landed(self, previous: Optional[int]) -> bool:
+        """Roll the cursor back when the page turn's edit did not reach Discord.
+
+        The cursor advances before the repaint, so a dropped edit would
+        otherwise leave the reader looking at the old page while the view
+        believes it moved: the next press advances from the new position and
+        silently skips a page. A transport failure is the one edit outcome
+        where nothing shipped and nothing is known to be wrong, so the honest
+        recovery is to put the cursor back where the screen still is.
+
+        ``on_page_changed`` is not re-fired. It reports the navigation the
+        user asked for, which did happen; only the render did not.
+
+        Returns ``True`` when the cursor moved back, so the caller can
+        recompose its tree for the restored page.
+        """
+        if not self._edit_never_landed(previous, self.current_page, cursor="Page"):
+            return False
+        self.current_page = previous
+        return True
 
     def _sync_nav_state(self) -> None:
         """Derive every nav button's disabled state and the indicator label
@@ -228,16 +256,18 @@ class _BasePaginatedMixin:
         if not self.pages:
             return
         target = max(0, min(len(self.pages) - 1, page))
+        previous = self.current_page
         self.current_page = target
         await self._call_hook_safe(self.on_page_changed, target)
-        await self._update_page()
+        await self._update_page(previous_page=previous)
 
     def _make_step_callback(self, delta: int):
         async def callback(interaction: Interaction):
             new_page = max(0, min(len(self.pages) - 1, self.current_page + delta))
+            previous = self.current_page
             self.current_page = new_page
             await self._call_hook_safe(self.on_page_changed, new_page)
-            await self._update_page()
+            await self._update_page(previous_page=previous)
 
         return callback
 
@@ -251,9 +281,10 @@ class _BasePaginatedMixin:
             else:
                 target = target_resolver
             target = max(0, min(len(self.pages) - 1, target))
+            previous = self.current_page
             self.current_page = target
             await self._call_hook_safe(self.on_page_changed, target)
-            await self._update_page()
+            await self._update_page(previous_page=previous)
 
         return callback
 
@@ -284,10 +315,11 @@ class _BasePaginatedMixin:
                     return
 
                 page_num = max(1, min(page_num, total))
+                previous = parent.current_page
                 parent.current_page = page_num - 1
                 await parent._safe_defer(modal_interaction)
                 await parent._call_hook_safe(parent.on_page_changed, parent.current_page)
-                await parent._update_page()
+                await parent._update_page(previous_page=previous)
 
         await self.open_modal(interaction, _GotoModal())
 
@@ -790,8 +822,14 @@ class PaginatedView(_BasePaginatedMixin, StatefulView):
     async def _reload_render(self) -> None:
         await self._update_page()
 
-    async def _update_page(self):
-        """Mutate nav buttons in place and refresh the page content."""
+    async def _update_page(self, *, previous_page: Optional[int] = None):
+        """Mutate nav buttons in place and refresh the page content.
+
+        ``previous_page`` is the cursor value the caller moved away from.
+        Navigation callbacks pass it so a page turn whose edit never reached
+        Discord can put the cursor back; rebuild callers (``refresh_data``,
+        ``rebuild_pages``) leave it ``None`` because they moved no cursor.
+        """
         if not self.pages:
             return
 
@@ -817,6 +855,11 @@ class PaginatedView(_BasePaginatedMixin, StatefulView):
         else:
             self._sync_nav_state()
         await self.refresh(**page_kwargs)
+        if self._rewind_page_if_edit_never_landed(previous_page):
+            # Nav state is the only tree-resident page artifact in V1 (the
+            # body rides the embed kwarg), so re-deriving it is the whole
+            # rollback. No second edit: the connection is still down.
+            self._sync_nav_state()
 
 
 # // ========================================( V2: PaginatedLayoutView )======================================== // #
@@ -1181,12 +1224,16 @@ class PaginatedLayoutView(_BasePaginatedMixin, StatefulLayoutView):
             self.add_item(extra)
         self._restore_navigation_artifacts()
 
-    async def _update_page(self):
+    async def _update_page(self, *, previous_page: Optional[int] = None):
         """Mutate nav in place, rebuild page content, preserve extra items.
 
         Removes only the current page-content children and re-adds new
         ones; the nav row and any ``_build_extra_items``-registered items
         keep their identity across page turns.
+
+        ``previous_page`` is the cursor value the caller moved away from, so
+        a page turn whose edit never reached Discord can put it back. Rebuild
+        callers leave it ``None``.
         """
         if not self.pages:
             return
@@ -1205,3 +1252,8 @@ class PaginatedLayoutView(_BasePaginatedMixin, StatefulLayoutView):
             self._sync_nav_state()
             self._recompose_page_tree()
         await self.refresh()
+        if self._rewind_page_if_edit_never_landed(previous_page):
+            # A V2 tree IS the content, so the rollback has to rebuild it or
+            # the next refresh would ship the page the cursor no longer names.
+            self._sync_nav_state()
+            self._recompose_page_tree()

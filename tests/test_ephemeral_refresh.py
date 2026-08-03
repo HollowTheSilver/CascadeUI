@@ -12,6 +12,7 @@ import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import discord
 import pytest
 from discord.ui import ActionRow, TextDisplay
@@ -1432,3 +1433,68 @@ class TestRefreshAbsorbsExpiredEphemeralToken:
 
         with pytest.raises(discord.HTTPException):
             await view.refresh()
+
+
+class TestArmingRetriesWhileTheTokenLives:
+    """A dropped arming edit keeps retrying, the way a rate-limited one does.
+
+    ``_handle_rate_limit`` queues a successor, so a 429 during arming heals
+    itself. A transport failure carries no retry-after and took a short fixed
+    window instead, and the deferred render that fired on that window did not
+    look at whether its own edit landed. Two consecutive drops inside the
+    90-second arming budget therefore ended the chain and left the panel
+    frozen with no refresh button on it.
+    """
+
+    async def test_a_second_dropped_arming_edit_queues_another_attempt(self):
+        class _View(RenderableLayoutView):
+            auto_refresh_ephemeral = True
+
+        view = _View(interaction=_make_interaction())
+        view._message = MagicMock()
+        view._message.edit = AsyncMock(side_effect=aiohttp.ClientOSError(104, "reset"))
+        view._refresh_armed = True
+
+        queued = []
+        view._queue_deferred_refresh = lambda wait: queued.append(wait)
+
+        await view._deferred_refresh(0)
+
+        assert queued == [5.0], "the armed branch must re-queue while the token can still edit"
+
+    async def test_a_landed_arming_edit_ends_the_chain(self):
+        class _View(RenderableLayoutView):
+            auto_refresh_ephemeral = True
+
+        view = _View(interaction=_make_interaction())
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+        view._refresh_armed = True
+
+        queued = []
+        view._queue_deferred_refresh = lambda wait: queued.append(wait)
+
+        await view._deferred_refresh(0)
+
+        assert queued == []
+
+    async def test_an_expired_token_ends_the_chain(self):
+        """Past the cliff the edit answers 401, which does not set the flag."""
+
+        class _View(RenderableLayoutView):
+            auto_refresh_ephemeral = True
+
+        view = _View(interaction=_make_interaction())
+        view._ephemeral = True
+        view._message = MagicMock()
+        view._message.edit = AsyncMock(
+            side_effect=discord.HTTPException(MagicMock(status=401), "expired")
+        )
+        view._refresh_armed = True
+
+        queued = []
+        view._queue_deferred_refresh = lambda wait: queued.append(wait)
+
+        await view._deferred_refresh(0)
+
+        assert queued == [], "a dead token must not spin a retry loop"

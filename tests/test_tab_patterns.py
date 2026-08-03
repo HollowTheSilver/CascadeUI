@@ -3,6 +3,7 @@
 import logging
 from unittest.mock import AsyncMock, MagicMock
 
+import aiohttp
 import discord
 import pytest
 from discord.ui import Container, TextDisplay
@@ -572,3 +573,52 @@ class TestRefreshContent:
         embed = view.refresh.call_args.kwargs.get("embed")
         assert embed is not None  # was the empty-kwargs no-op before the fix
         assert embed.title == "reloaded"
+
+
+class TestTabCursorRewindsWhenTheEditNeverLanded:
+    """The active tab moves before the repaint, so a dropped edit desyncs them."""
+
+    @staticmethod
+    def _wire(view):
+        view.interaction = _make_interaction()
+        view.user_id = 1
+        view.guild_id = 2
+        message = MagicMock()
+        message.id = 999
+        message.edit = AsyncMock()
+        view._message = message
+        return message
+
+    @pytest.mark.parametrize(
+        "cls,tabs",
+        [
+            (
+                TabLayoutView,
+                {
+                    "x": lambda: [TextDisplay("x")],
+                    "y": lambda: [TextDisplay("y")],
+                    "z": lambda: [TextDisplay("z")],
+                },
+            ),
+            (
+                TabView,
+                {
+                    "x": lambda: discord.Embed(title="x"),
+                    "y": lambda: discord.Embed(title="y"),
+                    "z": lambda: discord.Embed(title="z"),
+                },
+            ),
+        ],
+        ids=["v2", "v1"],
+    )
+    async def test_a_dropped_switch_leaves_the_cursor_on_the_visible_tab(self, cls, tabs):
+        view = cls(tabs=tabs)
+        message = self._wire(view)
+
+        message.edit = AsyncMock(side_effect=aiohttp.ClientOSError(104, "reset"))
+        await view._make_switch_callback(2)(_make_interaction())
+        assert view._active_tab == 0
+
+        message.edit = AsyncMock()
+        await view._make_switch_callback(2)(_make_interaction())
+        assert view._active_tab == 2

@@ -149,167 +149,188 @@ class _NavigationMixin:
         # (self has already unsubscribed above, so the OLD view won't
         # receive BATCH_COMPLETE -- the NEW view is the live subscriber
         # whose on_state_changed needs to ride the interaction ack cycle).
+        # The source was quiesced before the batch opened (unsubscribed,
+        # and for replace() stopped). An abort in here would leave it on
+        # screen with live buttons that no longer render, and the
+        # half-registered destination in both registries, so the recovery
+        # the failed-edit path already owns runs for a raise too.
         async with self.state_store.batch() as batch:
-            await self.state_store.dispatch(action_type, action_payload, source_id=self.id)
+            try:
+                await self.state_store.dispatch(action_type, action_payload, source_id=self.id)
 
-            if not is_instance:
-                # Pass through state store, session, and scoping context
-                if "state_store" not in kwargs:
-                    kwargs["state_store"] = self.state_store
-                if "session_id" not in kwargs:
-                    kwargs["session_id"] = self.session_id
-                if "user_id" not in kwargs:
-                    kwargs["user_id"] = self.user_id
-                if "guild_id" not in kwargs:
-                    kwargs["guild_id"] = self.guild_id
+                if not is_instance:
+                    # Pass through state store, session, and scoping context
+                    if "state_store" not in kwargs:
+                        kwargs["state_store"] = self.state_store
+                    if "session_id" not in kwargs:
+                        kwargs["session_id"] = self.session_id
+                    if "user_id" not in kwargs:
+                        kwargs["user_id"] = self.user_id
+                    if "guild_id" not in kwargs:
+                        kwargs["guild_id"] = self.guild_id
 
-                # Create new view
-                new_view = view_class(interaction=current_interaction, **kwargs)
-            else:
-                # Pre-constructed instance: __init__ wired the subscriber
-                # and populated session_id / user_id / guild_id /
-                # state_store from whatever interaction or kwargs the
-                # caller passed. _register_state has not run yet (only
-                # _send_pipeline and this method dispatch it), so
-                # rebinding these fields here is safe -- nothing in
-                # state references the instance's auto-derived values.
-                #
-                # session_id rebinds to the parent's session so
-                # shared_data and the session lifecycle behave
-                # identically to the class path. Skipping this would
-                # destroy the parent's session when the parent is
-                # cleaned up (last-member rule), losing parent
-                # shared_data across navigation. user_id, guild_id,
-                # and state_store typically already match because the
-                # instance was constructed from the same interaction
-                # as the parent; rebind defensively for the
-                # cross-interaction edge case.
-                if not new_view._init_kwargs.get("session_id"):
-                    new_view.session_id = self.session_id
-                if not new_view._init_kwargs.get("user_id"):
-                    new_view.user_id = self.user_id
-                if not new_view._init_kwargs.get("guild_id"):
-                    new_view.guild_id = self.guild_id
-                if not new_view._init_kwargs.get("state_store"):
-                    new_view.state_store = self.state_store
+                    # Create new view
+                    new_view = view_class(interaction=current_interaction, **kwargs)
+                else:
+                    # Pre-constructed instance: __init__ wired the subscriber
+                    # and populated session_id / user_id / guild_id /
+                    # state_store from whatever interaction or kwargs the
+                    # caller passed. _register_state has not run yet (only
+                    # _send_pipeline and this method dispatch it), so
+                    # rebinding these fields here is safe -- nothing in
+                    # state references the instance's auto-derived values.
+                    #
+                    # session_id rebinds to the parent's session so
+                    # shared_data and the session lifecycle behave
+                    # identically to the class path. Skipping this would
+                    # destroy the parent's session when the parent is
+                    # cleaned up (last-member rule), losing parent
+                    # shared_data across navigation. user_id, guild_id,
+                    # and state_store typically already match because the
+                    # instance was constructed from the same interaction
+                    # as the parent; rebind defensively for the
+                    # cross-interaction edge case.
+                    if not new_view._init_kwargs.get("session_id"):
+                        new_view.session_id = self.session_id
+                    if not new_view._init_kwargs.get("user_id"):
+                        new_view.user_id = self.user_id
+                    if not new_view._init_kwargs.get("guild_id"):
+                        new_view.guild_id = self.guild_id
+                    if not new_view._init_kwargs.get("state_store"):
+                        new_view.state_store = self.state_store
 
-                # The class path constructs with the acting interaction; the
-                # instance path binds it here, or a later navigation from
-                # this view (the interaction-or-self.interaction fallback)
-                # degrades to the no-edit programmatic path.
-                if current_interaction is not None:
-                    new_view.interaction = current_interaction
+                    # The class path constructs with the acting interaction; the
+                    # instance path binds it here, or a later navigation from
+                    # this view (the interaction-or-self.interaction fallback)
+                    # degrades to the no-edit programmatic path.
+                    if current_interaction is not None:
+                        new_view.interaction = current_interaction
 
-            new_view._ephemeral = self._ephemeral
-            # Push and pop reuse one message, so a policy disagreement decides
-            # the same message's teardown by depth. replace() sends a new
-            # message and tears the source down under replace_policy, so a
-            # differing policy there is coherent and not worth a warning.
-            if action_type != "NAVIGATION_REPLACE":
-                self._warn_on_exit_policy_mismatch(new_view)
+                new_view._ephemeral = self._ephemeral
+                # Push and pop reuse one message, so a policy disagreement decides
+                # the same message's teardown by depth. replace() sends a new
+                # message and tears the source down under replace_policy, so a
+                # differing policy there is coherent and not worth a warning.
+                if action_type != "NAVIGATION_REPLACE":
+                    self._warn_on_exit_policy_mismatch(new_view)
 
-            # Rebind the batch source so BATCH_COMPLETE carries the new
-            # view's id -- ``_notify_subscribers`` awards the inline
-            # notification slot to the subscriber that actually needs to
-            # refresh the reused message.
-            batch.source_id = new_view.id
+                # Rebind the batch source so BATCH_COMPLETE carries the new
+                # view's id -- ``_notify_subscribers`` awards the inline
+                # notification slot to the subscriber that actually needs to
+                # refresh the reused message.
+                batch.source_id = new_view.id
 
-            # Push/pop reuse the same Discord message, so carry both message
-            # references forward. Without this, on_state_changed() can't edit
-            # the message (self.message would be None on the new view).
-            if action_type in ("NAVIGATION_PUSH", "NAVIGATION_POP") and self._message:
-                new_view._message = self._message
-                new_view._webhook_message = self._webhook_message
-                # Carry the ephemeral arming deadline, never recompute it: the
-                # webhook token belongs to the original send, so a mid-chain
-                # hop's handoff timer must sleep only the remainder of the
-                # original 900s window. The timer itself is scheduled
-                # post-commit in _settle_navigation -- armed here, it would
-                # orphan on rollback (_rollback_navigation never cancels the
-                # destination's tasks) and clobber the recovered source.
-                new_view._ephemeral_arm_deadline = self._ephemeral_arm_deadline
+                # Push/pop reuse the same Discord message, so carry both message
+                # references forward. Without this, on_state_changed() can't edit
+                # the message (self.message would be None on the new view).
+                if action_type in ("NAVIGATION_PUSH", "NAVIGATION_POP") and self._message:
+                    new_view._message = self._message
+                    new_view._webhook_message = self._webhook_message
+                    # Carry the ephemeral arming deadline, never recompute it: the
+                    # webhook token belongs to the original send, so a mid-chain
+                    # hop's handoff timer must sleep only the remainder of the
+                    # original 900s window. The timer itself is scheduled
+                    # post-commit in _settle_navigation -- armed here, it would
+                    # orphan on rollback (_rollback_navigation never cancels the
+                    # destination's tasks) and clobber the recovered source.
+                    new_view._ephemeral_arm_deadline = self._ephemeral_arm_deadline
 
-            # Forward-transfer the navigation stack.  Push appends an entry
-            # for the current view; pop strips the last entry.  Replace
-            # starts fresh (one-way transition).
-            if action_type == "NAVIGATION_PUSH":
-                entry = {
-                    "class_name": type(self)._class_session_key(),
-                    "module": self.__class__.__module__,
-                    "kwargs": self._init_kwargs if self._init_kwargs else {},
-                    # Selection state the kwargs snapshot cannot carry: it was
-                    # chosen after construction. pop() hands this back to
-                    # restore_nav_state on the reconstruction. The entry is
-                    # view-local and never serialized, so live objects are fine
-                    # here. A raising override costs the restore, not the
-                    # navigation -- the user still reaches the child view.
-                    "view_state": self._capture_nav_state(),
-                }
-                new_view._nav_stack = list(self._nav_stack) + [entry]
-            elif action_type == "NAVIGATION_POP":
-                new_view._nav_stack = list(self._nav_stack[:-1])
+                # Forward-transfer the navigation stack.  Push appends an entry
+                # for the current view; pop strips the last entry.  Replace
+                # starts fresh (one-way transition).
+                if action_type == "NAVIGATION_PUSH":
+                    entry = {
+                        "class_name": type(self)._class_session_key(),
+                        "module": self.__class__.__module__,
+                        "kwargs": self._init_kwargs if self._init_kwargs else {},
+                        # Selection state the kwargs snapshot cannot carry: it was
+                        # chosen after construction. pop() hands this back to
+                        # restore_nav_state on the reconstruction. The entry is
+                        # view-local and never serialized, so live objects are fine
+                        # here. A raising override costs the restore, not the
+                        # navigation -- the user still reaches the child view.
+                        "view_state": self._capture_nav_state(),
+                    }
+                    new_view._nav_stack = list(self._nav_stack) + [entry]
+                elif action_type == "NAVIGATION_POP":
+                    new_view._nav_stack = list(self._nav_stack[:-1])
 
-            # Propagate session origin so the entire navigation chain is tracked
-            # under the root view's class name in the instance index.
-            if action_type == "NAVIGATION_REPLACE":
-                # replace() is a one-way transition -- the destination view is independent
-                # and should be tracked under its own class name, not the source's.
-                new_view._instance_root_class = None
-            else:
-                origin = self._instance_root_class or type(self)._class_session_key()
-                # If the destination IS the root class (e.g. pop() back to root),
-                # clear the origin so it knows it's the root again.
-                if view_class._class_session_key() == origin:
+                # Propagate session origin so the entire navigation chain is tracked
+                # under the root view's class name in the instance index.
+                if action_type == "NAVIGATION_REPLACE":
+                    # replace() is a one-way transition -- the destination view is independent
+                    # and should be tracked under its own class name, not the source's.
                     new_view._instance_root_class = None
                 else:
-                    new_view._instance_root_class = origin
+                    origin = self._instance_root_class or type(self)._class_session_key()
+                    # If the destination IS the root class (e.g. pop() back to root),
+                    # clear the origin so it knows it's the root again.
+                    if view_class._class_session_key() == origin:
+                        new_view._instance_root_class = None
+                    else:
+                        new_view._instance_root_class = origin
 
-            # Register the new view in the active view registry immediately.
-            # Sub-views from push/pop typically edit the existing message instead
-            # of calling send(), so register_view() must happen here -- otherwise
-            # the sub-view is invisible to instance limit enforcement.
-            # Pre-constructed instances also need this: __init__ wires the
-            # subscriber and stores identity, but register_view fires only
-            # from _send_pipeline or this navigation path.
-            self.state_store._register_view(new_view)
+                # Register the new view in the active view registry immediately.
+                # Sub-views from push/pop typically edit the existing message instead
+                # of calling send(), so register_view() must happen here -- otherwise
+                # the sub-view is invisible to instance limit enforcement.
+                # Pre-constructed instances also need this: __init__ wires the
+                # subscriber and stores identity, but register_view fires only
+                # from _send_pipeline or this navigation path.
+                self.state_store._register_view(new_view)
 
-            # Propagate participants for push/pop (same users, same message).
-            # replace() is a one-way transition -- participants don't carry over.
-            # The membership-check guard makes the propagation idempotent for
-            # pre-constructed instances that already hold participants.
-            if action_type != "NAVIGATION_REPLACE" and self._participants:
-                self._carry_participants_to(new_view)
+                # Propagate participants for push/pop (same users, same message).
+                # replace() is a one-way transition -- participants don't carry over.
+                # The membership-check guard makes the propagation idempotent for
+                # pre-constructed instances that already hold participants.
+                if action_type != "NAVIGATION_REPLACE" and self._participants:
+                    self._carry_participants_to(new_view)
 
-            # Register the new view in state BEFORE destroying the old one.
-            # This keeps session["members"] non-empty during the transition
-            # so the session is not prematurely deleted. Both class and
-            # instance paths reach this -- _register_state dispatches the
-            # SESSION_CREATED + VIEW_CREATED actions that populate the
-            # state row, and __init__ does not do this.
-            await new_view._register_state()
+                # Register the new view in state BEFORE destroying the old one.
+                # This keeps session["members"] non-empty during the transition
+                # so the session is not prematurely deleted. Both class and
+                # instance paths reach this -- _register_state dispatches the
+                # SESSION_CREATED + VIEW_CREATED actions that populate the
+                # state row, and __init__ does not do this.
+                await new_view._register_state()
 
-            # Push/pop targets inherit the parent's message without routing
-            # through _send_pipeline, so _update_message_state must fire
-            # here for the new view's state row to carry message_id and
-            # channel_id (otherwise the inspector shows None / None).
-            if action_type in ("NAVIGATION_PUSH", "NAVIGATION_POP") and new_view._message:
-                await new_view._update_message_state(new_view._message)
+                # Push/pop targets inherit the parent's message without routing
+                # through _send_pipeline, so _update_message_state must fire
+                # here for the new view's state row to carry message_id and
+                # channel_id (otherwise the inspector shows None / None).
+                if action_type in ("NAVIGATION_PUSH", "NAVIGATION_POP") and new_view._message:
+                    await new_view._update_message_state(new_view._message)
 
-            # Forward-transfer undo/redo stacks through push/pop chain so the
-            # undo timeline stays continuous across navigation. Routed through a
-            # VIEW_UPDATED dispatch so the transfer runs through the reducer like
-            # every other state mutation, rather than writing into the live
-            # state["views"] row in place.
-            if action_type in ("NAVIGATION_PUSH", "NAVIGATION_POP"):
-                await self._carry_undo_stacks_to(new_view)
+                # Forward-transfer undo/redo stacks through push/pop chain so the
+                # undo timeline stays continuous across navigation. Routed through a
+                # VIEW_UPDATED dispatch so the transfer runs through the reducer like
+                # every other state mutation, rather than writing into the live
+                # state["views"] row in place.
+                if action_type in ("NAVIGATION_PUSH", "NAVIGATION_POP"):
+                    await self._carry_undo_stacks_to(new_view)
 
-            # Remove the old view from state. _destroy_view drops its
-            # active-registry entry once the state removal confirms, completing
-            # the teardown deferred from the top of this method. push()/pop()
-            # hold this until the destination edit confirms (see defer_teardown
-            # above); _commit_source_teardown runs it on success.
-            if not defer_teardown:
-                await self.state_store._destroy_view(self.id, source_id=self.id)
+                # Remove the old view from state. _destroy_view drops its
+                # active-registry entry once the state removal confirms, completing
+                # the teardown deferred from the top of this method. push()/pop()
+                # hold this until the destination edit confirms (see defer_teardown
+                # above); _commit_source_teardown runs it on success.
+                if not defer_teardown:
+                    await self.state_store._destroy_view(self.id, source_id=self.id)
+            except BaseException:
+                # BaseException, not Exception: a cancellation mid-batch leaves
+                # the source unsubscribed and the destination half-registered
+                # exactly as a raise does.
+                # INSIDE the batch deliberately, mirroring _send_pipeline. The
+                # flush awards the inline notification slot to source_id
+                # (rebound to the destination above) and awaits that
+                # subscriber before any handler outside the block runs. A
+                # rollback placed outside would therefore let the destination
+                # paint itself onto the live message first, and only then be
+                # unsubscribed and destroyed, leaving the user clicking a view
+                # that no longer exists. Unsubscribing here lands before the
+                # flush, so the aborted batch announces a net-zero sequence.
+                await self._rollback_navigation(new_view)
+                raise
 
         return new_view
 
@@ -530,6 +551,17 @@ class _NavigationMixin:
                 new_view._message = target_message
             try:
                 await new_view.refresh(**edit_kwargs)
+                if new_view._refresh_degraded:
+                    # refresh() swallows a transport failure because a repaint
+                    # can wait for the next state change. Navigation cannot:
+                    # the source is torn down on the strength of this edit, so
+                    # an edit that never reached Discord has to read as failure
+                    # here or the swap completes with the old view on screen.
+                    logger.warning(
+                        f"Navigation edit did not reach Discord in "
+                        f"{type(self).__name__}; rolling back to the source view."
+                    )
+                    return False
                 return True
             except discord.HTTPException as e:
                 # refresh() already absorbs the three conditions that leave
@@ -614,21 +646,31 @@ class _NavigationMixin:
             if new_view._message is None:
                 new_view._message = msg
             return True
-        except asyncio.TimeoutError:
-            logger.warning(
-                f"Navigation edit stalled past {self.edit_timeout}s in "
-                f"{type(self).__name__}; rolling back to source."
-            )
-            return False
         except DISCORD_CALL_ERRORS:
-            # Interaction token expired (15-min lifetime), or the ack was
-            # rate limited. Route the
+            # Ordered above the timeout clause deliberately. aiohttp's connect
+            # and socket timeouts inherit from both ClientError and
+            # asyncio.TimeoutError, and discord.py builds its session with no
+            # total timeout, so aiohttp's 30s sock_connect fires below
+            # edit_timeout. Catching the timeout first would route a request
+            # that never left the host past the one branch that recovers it.
+            #
+            # Interaction token expired (15-min lifetime), the ack was rate
+            # limited, or the request never reached Discord. Route the
             # channel-endpoint fallback through refresh() so cooldown
             # throttling, 429 backoff, and the render-hash short-circuit
             # all participate in the edit.
             if new_view._message:
                 try:
                     await new_view.refresh(**edit_kwargs)
+                    if new_view._refresh_degraded:
+                        # Same reasoning as the interaction path above: a
+                        # swallowed transport failure is still a swap that
+                        # did not happen.
+                        logger.warning(
+                            f"Navigation channel-endpoint edit did not reach "
+                            f"Discord in {type(self).__name__}; rolling back."
+                        )
+                        return False
                     return True
                 except discord.HTTPException as e:
                     # refresh() already absorbs NotFound, 429, and an expired
@@ -639,6 +681,12 @@ class _NavigationMixin:
                         f"{type(self).__name__}: status={getattr(e, 'status', '?')} "
                         f"code={getattr(e, 'code', '?')}; rolling back to source."
                     )
+            return False
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Navigation edit stalled past {self.edit_timeout}s in "
+                f"{type(self).__name__}; rolling back to source."
+            )
             return False
 
     async def _settle_navigation(self, new_view, interaction, rebuild) -> None:
@@ -710,21 +758,37 @@ class _NavigationMixin:
         self.state_store._undo_enabled_views.pop(self.id, None)
         await self.state_store._destroy_view(self.id, source_id=self.id)
 
-    async def _rollback_navigation(self, new_view) -> None:
+    async def _rollback_navigation(self, new_view=None) -> None:
         """Recover the source view after a failed navigation edit.
 
         The destination never reached the message, so its state registration is
-        torn down and the source is re-subscribed. The source was never stopped
-        or destroyed (its teardown was deferred), so it stays live and
-        re-clickable on the message it still owns.
+        torn down and the source is re-subscribed. On the push/pop paths the
+        source's teardown was deferred, so it was never stopped and comes back
+        live and re-clickable on the message it still owns.
+
+        ``replace()`` is the exception: it stops the source before the batch
+        opens, which is its point of no return. A stopped view cannot be made
+        clickable again (``StatefulButton`` skips dispatch once the view is
+        finished), so re-subscribing one would only give it renders nobody can
+        trigger. The subscription is restored for a live source only.
+
+        ``new_view`` is ``None`` when the destination raised in its own
+        ``__init__``: there is no registration to undo, and the source still
+        needs its subscription back.
         """
-        await self.state_store._destroy_view(new_view.id, source_id=new_view.id)
-        self.state_store.subscribe(
-            self.id,
-            self._handle_state_notification,
-            self.subscribed_actions,
-            self._build_selector(),
-        )
+        if new_view is not None:
+            # _destroy_view clears the state row and the active registry but
+            # not the subscriber __init__ wired up, and the subscriber holds a
+            # strong reference to the view.
+            self.state_store._unsubscribe(new_view.id)
+            await self.state_store._destroy_view(new_view.id, source_id=new_view.id)
+        if not self.is_finished():
+            self.state_store.subscribe(
+                self.id,
+                self._handle_state_notification,
+                self.subscribed_actions,
+                self._build_selector(),
+            )
         # _navigate_to cancelled the source's tasks ahead of the (now-failed)
         # teardown. Re-arm the ephemeral refresh handoff so a recovered
         # long-lived ephemeral source still swaps in its refresh button before
@@ -913,6 +977,37 @@ class _NavigationMixin:
             if not c.is_finished()
         )
 
+    def _check_attachment(self, child_view) -> None:
+        """Raise if attaching ``child_view`` would corrupt the parent chain.
+
+        Split out of ``attach_child`` so the ``parent=`` kwarg can be
+        checked before the Discord send rather than after it. ``send()``
+        attaches once the message is live, and a rejection there would
+        report a failure for a message that had already arrived.
+        """
+        if child_view is self:
+            raise ValueError("A view cannot attach itself as its own child")
+
+        # Detect circular chains: walk up from self to see if child_view
+        # is already an ancestor. A->B->C->A would cause infinite
+        # recursion during cleanup. The chain is collected on the way up
+        # because two instances of one view class share a type name, and
+        # the type alone can't distinguish the ancestor from the new child.
+        ancestor = self._attached_to
+        chain = [self]
+        while ancestor is not None:
+            if ancestor is child_view:
+                chain.append(ancestor)
+                path = " -> ".join(f"{type(v).__name__}({v.id})" for v in reversed(chain))
+                raise ValueError(
+                    f"Circular attachment: {type(child_view).__name__}({child_view.id}) "
+                    f"is already an ancestor of {type(self).__name__}({self.id}). "
+                    f"Chain: {path} -> {type(child_view).__name__}({child_view.id}). "
+                    f"Fix: detach the existing link, or attach to a view outside this chain."
+                )
+            chain.append(ancestor)
+            ancestor = ancestor._attached_to
+
     def attach_child(self, child_view):
         """Register a child view for automatic cleanup on exit or timeout.
 
@@ -932,23 +1027,10 @@ class _NavigationMixin:
         Args:
             child_view: The child view to attach.
         """
-        if child_view is self:
-            raise ValueError("A view cannot attach itself as its own child")
+        self._check_attachment(child_view)
 
         if child_view in self._attached_children:
             return
-
-        # Detect circular chains: walk up from self to see if child_view
-        # is already an ancestor. A->B->C->A would cause infinite
-        # recursion during cleanup.
-        ancestor = self._attached_to
-        while ancestor is not None:
-            if ancestor is child_view:
-                raise ValueError(
-                    f"Circular attachment: {type(child_view).__name__} is already "
-                    f"an ancestor of {type(self).__name__}"
-                )
-            ancestor = ancestor._attached_to
 
         # Re-parent: detach from old parent if attached elsewhere
         old_parent = child_view._attached_to

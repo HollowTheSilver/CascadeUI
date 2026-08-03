@@ -3,8 +3,9 @@
 
 import copy
 import logging
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
+from .._batching import current_batch
 from ..types import Action, StateData
 
 logger = logging.getLogger(__name__)
@@ -108,6 +109,12 @@ def _diff_application_slots(pre: dict, post: dict) -> Dict[str, Any]:
     for name in set(pre) | set(post):
         pre_val = pre.get(name, _MISSING)
         post_val = post.get(name, _MISSING)
+        # Reducers shallow-spread, so a slot the action did not touch is the
+        # SAME object on both sides. Dict equality has no identity shortcut,
+        # so without this every undo-tracked action deep-compared the whole
+        # application namespace to prove nothing had changed in it.
+        if pre_val is post_val:
+            continue
         if pre_val is _MISSING:
             diff[name] = _MISSING
         elif post_val is _MISSING:
@@ -124,8 +131,9 @@ class UndoMiddleware:
     """Middleware that captures state snapshots for undo/redo support.
 
     Only captures snapshots for views that have ``enable_undo = True``.
-    Batched actions produce a single undo entry (snapshot taken before
-    the first action in the batch).
+    Batched actions produce a single undo entry: a diff is captured per
+    action while the batch is open and merged first-write-wins when it
+    commits, so the entry restores the state the batch started from.
 
     Usage:
         from cascadeui import setup_middleware
@@ -159,15 +167,16 @@ class UndoMiddleware:
 
         pre_application: Optional[dict] = None
         pre_shared: Optional[dict] = None
-        if should_snapshot and not self._store._batching:
+        pre_session_id: Optional[str] = None
+        if should_snapshot:
             # Hold the pre-state reference by identity -- reducers
             # shallow-spread, so the nested application dict survives
             # reducer execution unmutated and the diff pass can read it
             # back for comparison with the post-state.
             pre_application = state.get("application", {})
-            session_id = self._find_session_id(source_id, state)
-            if session_id:
-                session = state.get("sessions", {}).get(session_id, {})
+            pre_session_id = self._find_session_id(source_id, state)
+            if pre_session_id:
+                session = state.get("sessions", {}).get(pre_session_id, {})
                 pre_shared = copy.deepcopy(session.get("shared_data", {}))
             else:
                 pre_shared = {}
@@ -177,6 +186,25 @@ class UndoMiddleware:
         if pre_application is not None and source_id:
             post_application = result.get("application", {})
             diff = _diff_application_slots(pre_application, post_application)
+            batch = current_batch()
+            if batch is not None and batch.add_undo_record(
+                source_id, diff, pre_session_id, pre_shared, post_application
+            ):
+                # Inside a batch the push waits for the commit, so one entry
+                # lands on the view's stack instead of one per action. The
+                # diff is taken here because this frame is the only one
+                # holding the pre-state for this action. A refused record
+                # means the batch closed under a suspended chain, so the
+                # snapshot is pushed below rather than dropped.
+                return result
+            if not diff and self._restores_nothing(pre_shared, pre_session_id, result):
+                # An entry that can put nothing back still occupies a slot on
+                # a bounded stack, so a run of actions that write no slot
+                # evicts the history a user actually wants to reach: with
+                # undo_limit at 3, four of them clear it. Skipping applies
+                # only when the shared_data is unchanged as well, since an
+                # empty diff on its own says nothing about the session.
+                return result
             snapshot = {
                 "application_slots": diff,
                 "shared_data": pre_shared if pre_shared is not None else {},
@@ -184,11 +212,14 @@ class UndoMiddleware:
             limit = self._get_undo_limit(source_id)
             new_views = self._views_with_undo_pushed(result, source_id, snapshot, limit)
             if new_views is not None:
-                # ``result`` is this dispatch's freshly-reduced state (the
-                # store has already bound it to ``self.state`` in run_reducer),
-                # so writing the rebuilt ``views`` mapping onto it is the
-                # idiomatic middleware transform -- the nested view/undo_stack
-                # dicts are fresh (built by the helper), not shared structures.
+                # Writing the rebuilt ``views`` mapping onto ``result`` is the
+                # idiomatic middleware transform. What makes it safe is not
+                # that ``result`` is always a fresh dict -- a reducer that
+                # raised leaves ``run_reducer`` without a new state to bind, so
+                # ``result`` is then the live previous state and this writes
+                # into it. It is safe because the helper rebuilds the mapping
+                # and every view/undo_stack dict inside it, so no structure
+                # another holder can see is mutated in place.
                 result["views"] = new_views
 
         return result
@@ -208,42 +239,83 @@ class UndoMiddleware:
         view_data = views.get(source_id, {})
         return view_data.get("session_id")
 
-    def finalize_batch(self, pre_batch_state: StateData, actions: List[Action]) -> None:
+    def _restores_nothing(
+        self, pre_shared: Optional[dict], session_id: Optional[str], state: StateData
+    ) -> bool:
+        """Whether a snapshot with an empty slot diff would revert anything.
+
+        Only the ``shared_data`` half is left to check, and the question is
+        whether it *changed*, not whether it holds anything. Those come apart
+        on the case that matters: an action creating a session's first
+        shared_data records a pre-value of ``{}``, which is both falsy and
+        exactly what an UNDO has to put back. Reading the emptiness instead of
+        the change drops that entry and the creation becomes unrevertable.
+        """
+        post_shared: dict = {}
+        if session_id:
+            post_shared = state.get("sessions", {}).get(session_id, {}).get("shared_data", {})
+        return (pre_shared if pre_shared is not None else {}) == post_shared
+
+    def finalize_batch(
+        self,
+        records: List[
+            Tuple[int, str, Dict[str, Any], Optional[str], Optional[dict], Dict[str, Any]]
+        ],
+    ) -> None:
         """Push a single per-slot undo diff onto each participating view's stack.
 
-        Called by ``BatchContext.__aexit__`` on clean outermost commit.
-        Diffs ``pre_batch_state.application`` against the post-batch
-        ``self._store.state.application`` once, then shares the diff
-        across every participating view because every view in this batch
-        saw the same set of slot changes roll up at the same boundary.
+        Called by ``BatchContext.__aexit__`` on clean outermost commit with
+        the per-action records captured while the batch was open, in
+        reduction order. Slots merge first-write-wins, so the template holds
+        each slot's value from before the batch first touched it, and every
+        participating view receives that template because they all saw the
+        same slot changes roll up at the same boundary.
 
-        ``shared_data`` is cached per session because session-mates
-        share a single shared_data timeline.
+        Diffing per action rather than entry-state against live state is what
+        keeps concurrent batches apart: live state holds every open batch's
+        writes, so a whole-window diff would put one batch's slots into
+        another's undo entry and its UNDO would revert them.
+
+        ``shared_data`` is cached per session because session-mates share a
+        single shared_data timeline.
         """
-        source_ids: Set[str] = set()
-        for action in actions:
-            if action["type"] in _SKIP_ACTIONS:
-                continue
-            sid = action.get("source")
-            if sid and self._source_has_undo(sid):
-                source_ids.add(sid)
-
-        if not source_ids:
+        if not records:
             return
 
-        live_state = self._store.state
-        pre_application = pre_batch_state.get("application", {})
-        post_application = live_state.get("application", {})
-        diff_template = _diff_application_slots(pre_application, post_application)
-
+        diff_template: Dict[str, Any] = {}
         shared_data_cache: Dict[str, dict] = {}
+        session_by_source: Dict[str, str] = {}
 
-        for source_id in source_ids:
-            session_id = self._find_session_id(source_id, pre_batch_state)
+        for _sequence, source_id, diff, session_id, shared, _post in records:
+            for name, value in diff.items():
+                # First writer wins: the earliest record carries the value
+                # from before the batch, which is what an UNDO restores.
+                if name not in diff_template:
+                    diff_template[name] = value
             cache_key = session_id or ""
+            session_by_source.setdefault(source_id, cache_key)
             if cache_key not in shared_data_cache:
-                session = pre_batch_state.get("sessions", {}).get(cache_key, {})
-                shared_data_cache[cache_key] = copy.deepcopy(session.get("shared_data", {}))
+                shared_data_cache[cache_key] = shared if shared is not None else {}
+
+        # Drop slots the batch wrote and then put back. Per-action diffs each
+        # report a change, so a v0 -> tmp -> v0 sequence merges to "restore
+        # v0" and an UNDO would then overwrite whatever a sibling view wrote
+        # to that slot afterwards -- the cross-view contamination per-slot
+        # diffs exist to prevent. Compared against the last record's own
+        # post-state rather than live state, which holds every concurrent
+        # batch's writes too.
+        final_application = records[-1][5]
+        for name, pre_value in list(diff_template.items()):
+            present = name in final_application
+            if pre_value is _MISSING:
+                if not present:
+                    del diff_template[name]
+            elif present and final_application[name] == pre_value:
+                del diff_template[name]
+
+        live_state = self._store.state
+
+        for source_id, cache_key in session_by_source.items():
             # Per-view copy of the diff so a future mutation of one
             # view's undo entry cannot corrupt another's. ``_MISSING``
             # is skipped past ``deepcopy`` deliberately: ``deepcopy`` on
@@ -253,6 +325,13 @@ class UndoMiddleware:
                 name: value if value is _MISSING else copy.deepcopy(value)
                 for name, value in diff_template.items()
             }
+            if not view_diff and self._restores_nothing(
+                shared_data_cache[cache_key], cache_key or None, live_state
+            ):
+                # Same reasoning as the per-dispatch path: a batch whose slot
+                # writes all pruned, against unchanged shared_data, has
+                # nothing to give back and must not push a bounded stack.
+                continue
             snapshot = {
                 "application_slots": view_diff,
                 "shared_data": shared_data_cache[cache_key],

@@ -121,10 +121,28 @@ class InMemoryBackend:
         # whole batch, so a partial commit here would be re-applied on top
         # of itself. This backend is also the reference implementation, so
         # a new backend author reading it should see the contract honored.
-        snapshot = [dict(existing) for existing in self._rows.get(namespace, [])]
+        stored = self._rows.setdefault(namespace, [])
+        snapshot = [dict(existing) for existing in stored]
         try:
+            # One key index for the whole batch. Delegating to row_upsert
+            # rescanned every stored row per incoming row, making a flush
+            # O(batch x stored) -- 200 rows against 2000 stored measured two
+            # orders of magnitude slower than the same batch into an empty
+            # namespace. This is the reference implementation a new backend
+            # author reads, so the shape it models should be the good one.
+            index = {
+                tuple(existing.get(col) for col in key_columns): idx
+                for idx, existing in enumerate(stored)
+            }
             for row in rows:
-                await self.row_upsert(namespace, row, key_columns)
+                key = tuple(row.get(col) for col in key_columns)
+                if key in index:
+                    # Copy-on-store, same as row_upsert: caller mutation of
+                    # the input dict must not leak into the backing row.
+                    stored[index[key]] = dict(row)
+                else:
+                    index[key] = len(stored)
+                    stored.append(dict(row))
         except Exception:
             self._rows[namespace] = snapshot
             raise

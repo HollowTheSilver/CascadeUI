@@ -158,6 +158,7 @@ _INTERNAL_NAMES = frozenset(
         "await_maybe",
         "is_async_callable",
         "normalize_mapping",
+        "coerce_colour",
         "elapsed_since",
         "trailing_ack",
         "DISCORD_CALL_ERRORS",

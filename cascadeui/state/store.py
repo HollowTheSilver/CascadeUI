@@ -14,6 +14,7 @@ from typing import Any, Dict, Iterator, List, Mapping, Optional, Set, Tuple, Uni
 from ..utils.errors import with_error_boundary
 from ..utils.hooks import await_maybe
 from ..utils.tasks import get_task_manager
+from ._batching import _ACTIVE_BATCHES, current_batch, next_batch_sequence
 from .actions import ActionCreators
 from .slots import access_slot, read_slot
 from .types import Action, HookFn, MiddlewareFn, ReducerFn, SelectorFn, StateData, SubscriberFn
@@ -49,6 +50,17 @@ _CURRENT_INTERACTION: contextvars.ContextVar[Optional[Any]] = contextvars.Contex
 )
 
 
+# Contextvar holding the reducer-time slot for the current dispatch, so
+# ``run_reducer`` reports into the sample belonging to its own dispatch.
+# Sibling of the edit counter above and stored the same way, as a
+# single-element list the reducer writes in place. ``None`` means nothing is
+# collecting: profiling is off, or the action is batched and accounts for
+# itself under the batch's own sample.
+_CURRENT_REDUCER_MS: contextvars.ContextVar[Optional[List[float]]] = contextvars.ContextVar(
+    "_CURRENT_REDUCER_MS", default=None
+)
+
+
 # // ========================================( Batch Context )======================================== // #
 
 
@@ -65,14 +77,28 @@ class BatchContext:
     methods like ``_register_state()``, ``update_session()``, and the
     view-level ``dispatch()`` all route through ``store.dispatch()`` and
     are batched without the caller threading a context.
+
+    Membership follows the TASK, not the store. Two tasks that each open a
+    batch collect and flush independently; a batch opened inside another in
+    the same task still absorbs into it. A task spawned inside a batch
+    inherits the lineage as it stood at spawn, so its dispatches join the
+    innermost entry still open and fall through to an immediate notification
+    once they have all closed.
     """
 
     def __init__(self, store: "StateStore", source_id: Optional[str] = None):
         self._store = store
-        self._start_idx = 0
-        # Snapshot of ``store.state`` at batch entry -- compared at outermost
-        # exit to skip persistence when the batch produced no state change.
-        self._snapshot_state: Optional[StateData] = None
+        # This batch's own queued entries as ``(sequence, action)``. Per-batch
+        # rather than per-store, so an abort drops only what this batch queued
+        # and a concurrent batch's actions are untouchable from here.
+        self._entries: List[Tuple[int, Action]] = []
+        # Per-action undo records, accumulated by UndoMiddleware while this is
+        # the innermost open batch and merged into one diff per view at flush.
+        self._undo_records: List[
+            Tuple[int, str, Dict[str, Any], Optional[str], Optional[dict], Dict[str, Any]]
+        ] = []
+        self._token = None
+        self._closed = False
         # Propagated into ``BATCH_COMPLETE["source"]`` so _notify_subscribers
         # can award the inline slot to the acting view even in batched regimes
         # (push/pop, _send_pipeline, _cleanup_attached_children). ``None``
@@ -82,41 +108,127 @@ class BatchContext:
         # ``async with store.batch() as batch: batch.source_id = new_view.id``
         self.source_id = source_id
 
+    @property
+    def closed(self) -> bool:
+        """Whether this batch has exited and stopped accepting entries."""
+        return self._closed
+
+    def add_entry(self, action: Action) -> bool:
+        """Queue an action, or report that this batch has already closed.
+
+        A dispatch resolves its batch before running the middleware chain and
+        queues afterwards, so a chain that genuinely suspends can outlive the
+        batch it started in. Its reducer has committed by then; appending to
+        a drained buffer would leave that change unannounced, which is the
+        shape this batch redesign exists to remove. Refusing lets the caller
+        notify immediately instead.
+        """
+        if self._closed:
+            return False
+        self._entries.append((next_batch_sequence(), action))
+        return True
+
+    def add_undo_record(
+        self,
+        source_id: str,
+        diff: Dict[str, Any],
+        session_id: Optional[str],
+        shared: Optional[dict],
+        post_application: Dict[str, Any],
+    ) -> bool:
+        """Record one action's undo diff, or report that this batch closed.
+
+        Stamped on arrival rather than at queue time: undo runs inside the
+        middleware chain, before the action itself is queued, so its records
+        carry earlier stamps than the actions they describe. Only the order
+        among the records matters, and that is reduction order either way.
+
+        ``post_application`` is the state this action left behind, kept so
+        the merge can drop slots the batch wrote and then restored. Refusal
+        mirrors :meth:`add_entry`: a chain that outlived its batch pushes
+        its own snapshot rather than losing it.
+        """
+        if self._closed:
+            return False
+        self._undo_records.append(
+            (next_batch_sequence(), source_id, diff, session_id, shared, post_application)
+        )
+        return True
+
+    def _absorb(self, child: "BatchContext") -> None:
+        """Adopt a nested batch's entries and undo records on its exit."""
+        self._entries.extend(child._entries)
+        self._undo_records.extend(child._undo_records)
+
     async def __aenter__(self):
-        # Remember where this batch started so nested batches don't flush
-        # the outer batch's queued actions on inner exit.
-        self._start_idx = len(self._store._batched_actions)
-        self._snapshot_state = self._store.state
-        self._store._batch_depth += 1
+        # Both shapes are broken, and differently: re-entering while open
+        # would leave a stale duplicate in the lineage, and re-entering after
+        # the close would collect onto a buffer that has already flushed,
+        # where ``current_batch`` skips it and the dispatches escape.
+        if self._token is not None or self._closed:
+            raise RuntimeError(
+                "A BatchContext cannot be re-entered. Call store.batch() again "
+                "for a second batch."
+            )
+        self._token = _ACTIVE_BATCHES.set(_ACTIVE_BATCHES.get() + (self,))
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        self._store._batch_depth -= 1
+        # Close and leave the lineage BEFORE anything awaits below. The flush
+        # schedules background subscriber tasks, and ``create_task`` copies the
+        # context: a task spawned while this batch was still listed would
+        # inherit it and queue onto a buffer that is already being drained.
+        self._closed = True
+        if self._token is not None:
+            try:
+                _ACTIVE_BATCHES.reset(self._token)
+            except ValueError:
+                # Entered and exited under different contexts -- an async
+                # generator holding a batch across a yield and finalized from
+                # another task does this. The tuple is per-context, so the
+                # entry goes away with the context that created it.
+                pass
+            self._token = None
 
-        if exc_type is not None:
-            # Drop any actions queued in this batch. Outer batches keep their
-            # actions intact because slicing from ``_start_idx`` preserves them.
-            del self._store._batched_actions[self._start_idx :]
+        # An abort takes the same path as a clean exit, deliberately. An entry
+        # is queued only after its reducer has committed, so the queue is not a
+        # speculative sequence to discard -- it is exactly what already
+        # happened. Dropping it left state changed with no subscriber told and
+        # no undo entry to revert it, which is a silent desync rather than a
+        # rollback. The exception still propagates; what changes is that the
+        # committed prefix is announced and undoable.
+        #
+        # Nested batches absorb into the nearest ancestor still open in this
+        # task. Reading it after the reset above means this batch is already
+        # out of the lineage, so the scan cannot return self.
+        parent = current_batch()
+        if parent is not None:
+            parent._absorb(self)
             return False
 
-        # Nested batches absorb into the outer batch. Only the outermost
-        # exit fires BATCH_COMPLETE.
-        if self._store._batch_depth > 0:
-            return False
+        entries = sorted(self._entries, key=lambda entry: entry[0])
+        self._entries = []
+        actions = [action for _, action in entries]
 
-        actions = self._store._batched_actions
-        self._store._batched_actions = []
+        # Undo captures per action during a batch and pushes nothing until
+        # here, so one entry lands on each participating view's stack instead
+        # of N. Delegate the merge to the middleware so _SKIP_ACTIONS and the
+        # snapshot shape stay owned in one place.
+        #
+        # Runs BEFORE the empty-batch return: a dispatch whose chain suspends
+        # past its own batch has its action refused by ``add_entry`` and
+        # notified immediately, while ``UndoMiddleware`` re-resolves the
+        # lineage afterwards and lands its record on a still-open ancestor.
+        # That ancestor can hold records without holding a single action of
+        # its own, and returning first dropped the snapshot for a state change
+        # that had already committed.
+        undo_mw = self._store._undo_middleware
+        if undo_mw is not None and self._undo_records:
+            undo_mw.finalize_batch(sorted(self._undo_records, key=lambda rec: rec[0]))
+        self._undo_records = []
 
         if not actions:
             return False
-
-        # Undo middleware no-ops per-dispatch during batches so only one
-        # snapshot captures the pre-batch state instead of N. Delegate
-        # the commit-time push to the middleware so _SKIP_ACTIONS and the
-        # snapshot shape stay owned in one place.
-        undo_mw = self._store._undo_middleware
-        if undo_mw is not None:
-            undo_mw.finalize_batch(self._snapshot_state, actions)
 
         batch_action = {
             "type": "BATCH_COMPLETE",
@@ -146,7 +258,13 @@ class BatchContext:
                 t2 = time.perf_counter()
             finally:
                 _CURRENT_EDIT_COUNTER.reset(token)
-                store._perf_edit_stack.pop()
+                # Removed by identity, not popped: two batches flushing
+                # concurrently interleave their awaits, and a positional pop
+                # would take the other one's frame.
+                try:
+                    store._perf_edit_stack.remove(edit_counter)
+                except ValueError:
+                    pass
             store._perf_samples.append(
                 {
                     "action": "BATCH_COMPLETE",
@@ -257,12 +375,10 @@ class StateStore:
         for _name, (_selector, _fn) in _COMPUTED_REGISTRY.items():
             self._computed[_name] = ComputedValue(_name, _selector, _fn)
 
-        # Batch depth counter. ``dispatch()`` checks this: when > 0, the
-        # action is queued into ``_batched_actions`` and notification is
-        # deferred until the outermost ``BatchContext`` exits. Nested
-        # batches absorb into the outer batch.
-        self._batch_depth: int = 0
-        self._batched_actions: List[Action] = []
+        # Batch membership is task-scoped and lives in ``_batching.py``, not
+        # on the store: two tasks batching at once must not share one depth
+        # counter and one buffer, which read as a single nested batch and let
+        # whichever exited last flush both.
 
         # Views that have undo enabled: {view_id: undo_limit}
         # Populated by StatefulView.__init__ when enable_undo = True
@@ -302,12 +418,6 @@ class StateStore:
         # nested dispatches (a subscriber's ``on_state_changed``
         # dispatching its own action) without double-counting.
         self._perf_edit_stack: list = []
-        # Parallel stack for reducer-only timing. ``run_reducer`` writes
-        # the top-of-stack slot when profiling is on; the dispatch site
-        # reads it back and subtracts from the chain total to derive
-        # ``middleware_ms``. Stack handles nested dispatches the same
-        # way ``_perf_edit_stack`` does.
-        self._perf_reducer_stack: list = []
         # Per-subscriber timing samples. Populated by ``_safe_notify``
         # when profiling is on. Larger maxlen than ``_perf_samples``
         # because a single dispatch can fan out to many subscribers,
@@ -342,7 +452,6 @@ class StateStore:
         self._perf_samples.clear()
         self._refresh_samples.clear()
         self._perf_edit_stack.clear()
-        self._perf_reducer_stack.clear()
         self._notify_samples.clear()
 
     def _load_core_reducers(self):
@@ -458,11 +567,13 @@ class StateStore:
 
         async def run_reducer(act, state):
             # When profiling is on, record the reducer-only wall time into the
-            # top of ``_perf_reducer_stack`` so the dispatch site can subtract
-            # it from the chain total to derive ``middleware_ms``. The stack
-            # slot is pushed by ``dispatch()`` before the chain runs, so the
-            # write target always exists when profiling is active.
-            perf = self._perf_enabled and self._perf_reducer_stack
+            # slot this dispatch bound, so the dispatch site can subtract it
+            # from the chain total to derive ``middleware_ms``. Reached through
+            # a contextvar rather than a shared stack: a batched action binds
+            # no slot, and writing to the top of a shared one overwrote the
+            # timing of whichever unbatched dispatch was running concurrently.
+            reducer_slot = _CURRENT_REDUCER_MS.get()
+            perf = self._perf_enabled and reducer_slot is not None
             if perf:
                 r0 = time.perf_counter()
             if reducer_fn:
@@ -484,7 +595,7 @@ class StateStore:
                 else:
                     logger.warning(f"No reducer found for action type {action_type}")
             if perf:
-                self._perf_reducer_stack[-1] = (time.perf_counter() - r0) * 1000
+                reducer_slot[0] = (time.perf_counter() - r0) * 1000
             return self.state
 
         # Build the chain from inside out: last middleware wraps the reducer,
@@ -502,11 +613,6 @@ class StateStore:
 
         return await chain(action, self.state)
 
-    @property
-    def _batching(self) -> bool:
-        """Whether any batch context is currently active."""
-        return self._batch_depth > 0
-
     # // ========================================( Batching )======================================== // #
 
     def batch(self, source_id: Optional[str] = None) -> BatchContext:
@@ -516,6 +622,12 @@ class StateStore:
         into the batch, including transitive ones from view helpers like
         ``update_session()``, ``push()``, and ``_register_state()``. One
         ``BATCH_COMPLETE`` notification fires at the outermost exit.
+
+        Membership is per task. A batch opened inside another in the same
+        task absorbs into it, while two tasks batching at the same time
+        collect and flush separately, so concurrent work (restoring many
+        persistent panels, say) does not fold into one notification under
+        a single ``source_id``.
 
         ``source_id`` identifies the acting view whose refresh should ride
         the interaction's own ack cycle. When supplied, ``BATCH_COMPLETE``
@@ -1147,16 +1259,17 @@ class StateStore:
         # ``BatchContext`` exit. Individual profiling samples are suppressed
         # because notify_ms would be zero and hooks_ms is amortized across
         # the batch -- per-action timings are misleading in this mode.
-        if self._batch_depth > 0:
+        batch = current_batch()
+        chain_ran = False
+        if batch is not None:
             await self._run_middleware_chain(action, reducer)
-            self._batched_actions.append(action)
-            return self.state
-
-        # Capture pre-dispatch state identity so the persistence gate at the
-        # bottom can skip the write when the reducer returned ``state`` (no-op
-        # payload, missing entity, etc.) or raised an exception that left
-        # ``self.state`` unreassigned.
-        prev_state = self.state
+            if batch.add_entry(action):
+                return self.state
+            # The batch closed while this dispatch's chain was suspended, so
+            # there is no longer a flush that will announce this action. The
+            # reducer has already committed, so the immediate path below is
+            # what keeps the change from going unannounced.
+            chain_ran = True
 
         # Opt-in profiling. The hot path is a single bool check when
         # disabled; no timestamps, no sample dict, no deque append.
@@ -1166,12 +1279,14 @@ class StateStore:
             # list in place, and the sample dict stores the same reference so
             # late arrivals are still attributed to the right dispatch.
             edit_counter: List[int] = [0]
+            reducer_slot: List[float] = [0.0]
             self._perf_edit_stack.append(edit_counter)
-            self._perf_reducer_stack.append(0.0)
             token = _CURRENT_EDIT_COUNTER.set(edit_counter)
+            reducer_token = _CURRENT_REDUCER_MS.set(reducer_slot)
             try:
                 t0 = time.perf_counter()
-                await self._run_middleware_chain(action, reducer)
+                if not chain_ran:
+                    await self._run_middleware_chain(action, reducer)
                 t1 = time.perf_counter()
                 logger.debug(f"Notifying subscribers about {action_type}")
                 await self._notify_subscribers(action)
@@ -1180,8 +1295,14 @@ class StateStore:
                 t3 = time.perf_counter()
             finally:
                 _CURRENT_EDIT_COUNTER.reset(token)
-                self._perf_edit_stack.pop()
-            reducer_ms = self._perf_reducer_stack.pop()
+                _CURRENT_REDUCER_MS.reset(reducer_token)
+                # By identity: a batch flushing concurrently interleaves its
+                # awaits with this one, and a positional pop takes its frame.
+                try:
+                    self._perf_edit_stack.remove(edit_counter)
+                except ValueError:
+                    pass
+            reducer_ms = reducer_slot[0]
             chain_ms = (t1 - t0) * 1000
             # Middleware time is everything in the chain that wasn't the
             # reducer itself. Clamp to 0 to guard against clock drift on
@@ -1205,7 +1326,8 @@ class StateStore:
                 }
             )
         else:
-            await self._run_middleware_chain(action, reducer)
+            if not chain_ran:
+                await self._run_middleware_chain(action, reducer)
             logger.debug(f"Notifying subscribers about {action_type}")
             await self._notify_subscribers(action)
             await self._fire_hooks(action)
@@ -1241,6 +1363,14 @@ class StateStore:
         # scoped to the acting subscriber even if the message-id guard in
         # ``refresh()`` is later relaxed.
         interaction_token = _CURRENT_INTERACTION.set(None)
+        # Built once rather than per subscriber: the set is the same for every
+        # one of them, and rebuilding it inside the loop made a batch commit
+        # cost O(subscribers x actions) for a value that never varies.
+        batched_types = (
+            {a["type"] for a in action["payload"].get("actions", [])}
+            if action["type"] == "BATCH_COMPLETE"
+            else frozenset()
+        )
         try:
             for subscriber_id, (callback, action_filter, selector) in list(
                 self.subscribers.items()
@@ -1248,7 +1378,6 @@ class StateStore:
                 # For BATCH_COMPLETE, check subscriber's filter against any batched action
                 if action["type"] == "BATCH_COMPLETE":
                     if action_filter is not None:
-                        batched_types = {a["type"] for a in action["payload"].get("actions", [])}
                         if (
                             not (action_filter & batched_types)
                             and "BATCH_COMPLETE" not in action_filter
@@ -1283,10 +1412,19 @@ class StateStore:
                             )
                         new_value = self._SENTINEL
                     old_value = self._last_selected.get(subscriber_id, self._SENTINEL)
+                    # Identity first: a selector returning the same object is the
+                    # common case for a bare whole-bucket read, and dict/list
+                    # equality has no identity shortcut -- it walks every entry
+                    # to prove what `is` already answered. Views are immune
+                    # either way (``_build_selector`` returns a tuple, and tuple
+                    # comparison does shortcut identical elements), so this pays
+                    # for direct ``store.subscribe`` callers with fat selectors.
+                    # The one behavioral edge is a selector returning NaN, which
+                    # flips from notify-always to notify-never; pathological.
                     if (
                         new_value is not self._SENTINEL
                         and old_value is not self._SENTINEL
-                        and new_value == old_value
+                        and (new_value is old_value or new_value == old_value)
                     ):
                         logger.debug(f"Skipping subscriber {subscriber_id}: selector unchanged")
                         continue
@@ -1481,6 +1619,9 @@ class StateStore:
         if counter is not None:
             counter[0] += 1
             return
+        # Last resort only: the contextvar above is the attributed path. Under
+        # concurrent batches the top of this stack belongs to whichever frame
+        # pushed last, so an edit reaching here is credited approximately.
         if self._perf_edit_stack:
             top = self._perf_edit_stack[-1]
             if isinstance(top, list):

@@ -305,8 +305,8 @@ the inspector automatically refreshes its active tab.
 
 Its `state_selector` returns the identity set of the filtered views and
 sessions, not their counts. A push or a pop births one view and destroys
-another inside a single batch, so the count is unchanged across an action
-that changed everything on screen. Copy the identity approach, not a
+another, so the count is unchanged across an action that changed everything
+on screen. Copy the identity approach, not a
 count, for any dashboard that watches a set it does not own.
 
 ---

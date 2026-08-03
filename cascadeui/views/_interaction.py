@@ -25,6 +25,11 @@ from ..utils.responses import (
 
 logger = logging.getLogger(__name__)
 
+# Wait before re-attempting an arming edit that never reached Discord. Short
+# because the webhook token dies ~90 seconds after the handoff arms, and the
+# view has no other way to put the refresh button on screen once armed.
+_ARMING_RETRY_SECONDS = 5.0
+
 
 # // ========================================( Mixin )======================================== // #
 
@@ -355,6 +360,16 @@ class _InteractionMixin:
             # as-is instead of rebuilding over the button.
             self._cooldown_not_before = 0.0
             await self.refresh()
+            if self.refresh_degraded:
+                # Same hazard the 429 path documents, by a different route:
+                # the armed flag is already set, so no notification can put
+                # the button on screen if this edit was dropped. A transport
+                # failure carries no retry-after, so it is paced off a short
+                # fixed window rather than the rate-limit one -- the two
+                # windows mean different things and are kept apart. The
+                # deferred render honors the armed flag and ships the tree
+                # as-is, and there are ~90 seconds of token left to do it in.
+                self._queue_deferred_refresh(_ARMING_RETRY_SECONDS)
         except discord.NotFound:
             pass
         except discord.HTTPException as e:

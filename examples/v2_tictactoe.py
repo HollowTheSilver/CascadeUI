@@ -45,6 +45,7 @@ Usage:
 
 
 import logging
+from datetime import timedelta
 
 import discord
 from discord import app_commands
@@ -182,6 +183,9 @@ class TicTacToeChallengeView(StatefulLayoutView):
         self.size = size
         self.win_length = win_length
         self.allowed_users = {opponent.id}
+        # Stamped once, not per render: build_ui runs again on every rebuild,
+        # and recomputing here would walk the deadline forward each time.
+        self._expires_at = discord.utils.utcnow() + timedelta(seconds=self.timeout)
         self.build_ui()
 
     def build_ui(self):
@@ -217,9 +221,10 @@ class TicTacToeChallengeView(StatefulLayoutView):
                         callback=self._decline,
                     ),
                 ),
-                # Surfaces allowed_users and the prompt timeout in the UI.
+                # format_dt renders a Discord timestamp the client counts down
+                # live, so a reader who scrolls back sees the real remaining time.
                 f"-# Only <@{self.opponent.id}> can respond \N{MIDDLE DOT} "
-                f"expires in {int(self.timeout)} seconds",
+                f"expires {discord.utils.format_dt(self._expires_at, 'R')}",
                 color=discord.Color.blurple(),
             )
         )

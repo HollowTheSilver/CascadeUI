@@ -13,6 +13,7 @@ from ...components.base import StatefulButton
 from ...components.patterns.v2 import card, progress_bar
 from ...components.types import EmojiInput
 from ...utils.hooks import await_maybe
+from ...utils.responses import DISCORD_CALL_ERRORS
 from ..base import _StatefulMixin
 from ..layout import StatefulLayoutView
 from ..view import StatefulView
@@ -164,7 +165,7 @@ class _BaseWizardMixin:
             return
         try:
             await self.respond(interaction, error, ephemeral=True)
-        except discord.HTTPException as e:
+        except DISCORD_CALL_ERRORS as e:
             logger.debug(f"Could not send validation error in {self.__class__.__name__}: {e}")
 
     # // ----( Conditional step helpers )---- // #
@@ -318,9 +319,10 @@ class _BaseWizardMixin:
         if prev is not None:
             old_index = self._current_step
             await self._call_hook_safe(self.on_step_exited, old_index)
+            previous = self._current_step
             self._current_step = prev
             await self._call_hook_safe(self.on_step_entered, self._current_step)
-            await self._refresh_wizard()
+            await self._refresh_wizard(previous_step=previous)
 
     async def _go_next(self, interaction: Interaction):
         step = self._steps[self._current_step] if self._steps else None
@@ -346,9 +348,10 @@ class _BaseWizardMixin:
 
         old_index = self._current_step
         await self._call_hook_safe(self.on_step_exited, old_index)
+        previous = self._current_step
         self._current_step = next_visible
         await self._call_hook_safe(self.on_step_entered, self._current_step)
-        await self._refresh_wizard()
+        await self._refresh_wizard(previous_step=previous)
 
     # // ----( Properties )---- // #
 
@@ -463,7 +466,7 @@ class WizardView(_BaseWizardMixin, StatefulView):
     async def _reload_render(self) -> None:
         await self._refresh_wizard()
 
-    async def _refresh_wizard(self):
+    async def _refresh_wizard(self, *, previous_step: Optional[int] = None):
         """Update navigation state and rebuild current step content.
 
         Mutates the existing button instances in place; ``_build_nav_buttons``-registered
@@ -479,6 +482,12 @@ class WizardView(_BaseWizardMixin, StatefulView):
 
         kwargs = await self._nav_edit_kwargs()
         await self.refresh(**kwargs)
+        if self._edit_never_landed(previous_step, self._current_step, cursor="Step"):
+            # Nav state is the only tree-resident step artifact in V1 (the body
+            # rides the embed kwarg), so re-deriving it is the whole rollback.
+            # No second edit: the connection is still down.
+            self._current_step = previous_step
+            self._sync_wizard_nav()
 
     async def send(
         self,
@@ -678,11 +687,21 @@ class WizardLayoutView(_BaseWizardMixin, StatefulLayoutView):
             # Restore the navigation back button if push() added one.
             self._restore_navigation_artifacts()
 
-    async def _refresh_wizard(self):
-        """Update step content and mutate nav buttons in place."""
+    async def _refresh_wizard(self, *, previous_step: Optional[int] = None):
+        """Update step content and mutate nav buttons in place.
+
+        ``previous_step`` is the cursor the caller moved away from, so a step
+        change whose edit never reached Discord can put it back.
+        """
         self._sync_wizard_nav()
         await self._rebuild_step_content()
         await self.refresh()
+        if self._edit_never_landed(previous_step, self._current_step, cursor="Step"):
+            # A V2 tree IS the content, so the rollback rebuilds it or the next
+            # refresh ships the step the cursor no longer names.
+            self._current_step = previous_step
+            self._sync_wizard_nav()
+            await self._rebuild_step_content()
 
     async def on_load(self) -> None:
         """Build the current step's content before the view is displayed.
