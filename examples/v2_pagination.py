@@ -26,6 +26,10 @@ Two construction modes:
       is large enough that eager load would waste bandwidth/memory, or
       when the data lives behind an async source (database, HTTP API).
 
+Each mode has its own view class. ``instance_limit`` is keyed on the
+class, so one shared class would mean the two commands compete for a
+single slot.
+
 Commands:
     /v2pages    Browse the inventory in eager mode (from_data)
     /v2cursor   Browse the inventory in cursor mode (from_cursor with
@@ -111,7 +115,9 @@ class InventoryView(PaginatedLayoutView):
     instance_limit = 1
     instance_scope = "user_guild"
     instance_policy = "reject"
-    instance_limit_message = "You already have a browser open. Close it before opening another."
+    instance_limit_message = (
+        "You already have an eager browser open. Close it before opening another."
+    )
     # A disposable browse session, so Exit removes the message rather than
     # leaving a frozen card behind. The exit helpers below read this.
     exit_policy = "delete"
@@ -120,6 +126,21 @@ class InventoryView(PaginatedLayoutView):
     def _build_extra_items(self):
         """Add an exit button below the navigation row."""
         self.add_exit_button()
+
+
+class CursorInventoryView(InventoryView):
+    """Cursor-mode browser, subclassed so it holds its own instance slot.
+
+    ``instance_limit`` is keyed on the class, not on the command that
+    opened the view. Both commands here construct one browser each, so
+    sharing a class would let ``/v2pages`` occupy the only slot and turn
+    the first ``/v2cursor`` into a rejection naming a browser the user
+    did not knowingly open.
+    """
+
+    instance_limit_message = (
+        "You already have a cursor browser open. Close it before opening another."
+    )
 
 
 # // ========================================( Formatter )======================================== // #
@@ -215,7 +236,7 @@ class V2PaginationExample(commands.Cog, name="v2_pagination_example"):
         # which awaits its formatter during initial chunking. Cursor mode
         # defers the first fetch until ``send()``, so the constructor has
         # nothing to await.
-        view = InventoryView.from_cursor(
+        view = CursorInventoryView.from_cursor(
             fetch_inventory_page,
             total=len(SAMPLE_ITEMS),
             per_page=4,

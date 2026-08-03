@@ -27,11 +27,11 @@ Themes support the following built-in style keys:
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
-| `primary_color` | `discord.Color` | `Color.blue()` | Main embed color |
-| `secondary_color` | `discord.Color` | `Color.light_grey()` | Secondary/muted color |
-| `success_color` | `discord.Color` | `Color.green()` | Success state color |
-| `danger_color` | `discord.Color` | `Color.red()` | Error/danger state color |
-| `accent_colour` | `discord.Color` | same as `primary_color` | V2 container accent color |
+| `primary_color` | `discord.Color` or `int` | `Color.blue()` | Main embed color |
+| `secondary_color` | `discord.Color` or `int` | `Color.light_grey()` | Secondary/muted color |
+| `success_color` | `discord.Color` or `int` | `Color.green()` | Success state color |
+| `danger_color` | `discord.Color` or `int` | `Color.red()` | Error/danger state color |
+| `accent_colour` | `discord.Color` or `int` | same as `primary_color` | V2 container accent color |
 | `separator_spacing` | `str` | `"small"` | Default V2 separator spacing |
 | `header_emoji` | `str` | *(none)* | Prepended to embed titles |
 | `footer_text` | `str` | *(none)* | Default embed footer text |

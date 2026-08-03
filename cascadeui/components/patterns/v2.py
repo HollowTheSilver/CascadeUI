@@ -33,7 +33,7 @@ from discord.ui import (
     Thumbnail,
 )
 
-from ...utils.guards import normalize_mapping
+from ...utils.guards import coerce_colour, normalize_mapping
 from ...utils.hooks import await_maybe, call_hook_safe
 from ..base import StatefulButton, StatefulSelect
 from ..types import MAX_COMPONENT_ID, MAX_SELECT_OPTIONS, EmojiInput, MediaInput
@@ -315,6 +315,7 @@ def card(
             color=discord.Color.green(),
         )
     """
+    color = coerce_colour(color, owner="card", param="color")
     theme_managed = color is None
     if theme_managed:
         from ...theming.context import get_current_theme
@@ -1384,6 +1385,7 @@ def stats_card(
             footer="Updated just now",
         )
     """
+    color = coerce_colour(color, owner="stats_card", param="color")
     theme_managed = color is None
     if theme_managed:
         from ...theming.context import get_current_theme
@@ -2102,10 +2104,11 @@ class PaginatedRegion:
 
     def _make_step(self, delta: int):
         async def callback(interaction: discord.Interaction):
+            previous = self._page
             self._page += delta
             self._clamp()
             await _guard_hook(self.on_page_changed, self._page, owner=self)
-            await self._rerender()
+            await self._rerender(previous_page=previous)
 
         return callback
 
@@ -2113,10 +2116,11 @@ class PaginatedRegion:
         # target_fn re-resolves at click time so "last" tracks the live
         # item count, not the count captured when the row was built.
         async def callback(interaction: discord.Interaction):
+            previous = self._page
             self._page = target_fn()
             self._clamp()
             await _guard_hook(self.on_page_changed, self._page, owner=self)
-            await self._rerender()
+            await self._rerender(previous_page=previous)
 
         return callback
 
@@ -2145,10 +2149,11 @@ class PaginatedRegion:
                         ephemeral=True,
                     )
                     return
+                previous = region.page
                 region.set_page(max(1, min(page_num, total)) - 1)
                 await view._safe_defer(modal_interaction)
                 await _guard_hook(region.on_page_changed, region.page, owner=region)
-                await region._rerender()
+                await region._rerender(previous_page=previous)
 
         await view.open_modal(interaction, _GotoModal())
 
@@ -2162,15 +2167,25 @@ class PaginatedRegion:
         region to be attached (``controls(view)`` must have run), since
         there is no host to re-render before that.
         """
+        previous = self._page
         self.set_page(index)
         await _guard_hook(self.on_page_changed, self._page, owner=self)
         if self._view is not None:
-            await self._rerender()
+            await self._rerender(previous_page=previous)
 
-    async def _rerender(self) -> None:
+    async def _rerender(self, *, previous_page: Optional[int] = None) -> None:
         # Re-run the host's render path and ship the edit; shared with
         # Collapsible via _rerender_host.
         await _rerender_host(self._view)
+        if previous_page is None or self._page == previous_page:
+            return
+        if getattr(self._view, "refresh_degraded", False):
+            # The host's edit never reached Discord, so the region on screen
+            # still shows the old slice. Put the cursor back, or the next
+            # press pages on from a position the reader never saw. The host
+            # rebuilds from this cursor on its next render; no second edit
+            # here, because the connection is still down.
+            self._page = previous_page
 
 
 # // ========================================( Collapsible )======================================== // #
@@ -2420,9 +2435,16 @@ class Collapsible:
         )
 
     async def _toggle(self, interaction: discord.Interaction) -> None:
+        previous = self._expanded
         self._expanded = not self._expanded
         await _guard_hook(self.on_toggle, self._expanded, owner=self)
         await _rerender_host(self._view)
+        if getattr(self._view, "refresh_degraded", False):
+            # The trigger on screen still shows the previous state, so flip
+            # back to match it. Self-healing either way (one more click would
+            # resynchronize a binary toggle), but leaving them disagreed makes
+            # the next click read as a no-op to the reader.
+            self._expanded = previous
 
 
 # // ========================================( Media )======================================== // #

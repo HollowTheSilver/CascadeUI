@@ -2,6 +2,7 @@
 
 
 import asyncio
+import contextlib
 import functools
 import hashlib
 import inspect
@@ -11,6 +12,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, ClassVar, Dict, Optional, Set
 
+import aiohttp
 import discord
 from discord import Interaction
 from discord.ui import Button, Container
@@ -28,7 +30,7 @@ from ..utils.coercion import coerce_snowflake_id, coerce_snowflake_id_set, is_sn
 from ..utils.hooks import await_maybe, call_hook_safe, is_async_callable
 from ..utils.responses import DISCORD_CALL_ERRORS, ack_backstop, describe_discord_error
 from ..utils.tasks import get_task_manager
-from ._interaction import _InteractionMixin
+from ._interaction import _ARMING_RETRY_SECONDS, _InteractionMixin
 from ._navigation import _NavigationMixin
 
 logger = logging.getLogger(__name__)
@@ -775,7 +777,22 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     self._pending_init_kwargs = {
                         k: v for k, v in kw.items() if k not in _NON_RECONSTRUCTIBLE_KWARGS
                     }
-                original_init(self, *args, **kw)
+                try:
+                    original_init(self, *args, **kw)
+                except BaseException:
+                    # ``_StatefulMixin.__init__`` subscribes the view to the
+                    # store and may register it for undo before the subclass
+                    # body runs. A body that raises leaves both behind holding
+                    # a strong reference to a view no caller ever receives, so
+                    # neither is collected and a broad ``state_selector`` would
+                    # keep rendering it. Both removals are idempotent, so a
+                    # nested wrapper cleaning up first costs nothing.
+                    view_id = getattr(self, "id", None)
+                    store = getattr(self, "state_store", None)
+                    if view_id is not None and store is not None:
+                        store._unsubscribe(view_id)
+                        store._undo_enabled_views.pop(view_id, None)
+                    raise
 
             _capturing_init._cascadeui_captures_kwargs = True
             cls.__init__ = _capturing_init
@@ -948,6 +965,12 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         # ``None`` means no baseline has been recorded yet, so the
         # next refresh always runs through to the REST call.
         self._last_tree_digest: Optional[int] = None
+        # Set by ``refresh`` when it swallowed a transport failure, so a
+        # caller that needs the edit to have LANDED can tell that apart from
+        # a refresh that returned normally. A repaint is content to retry on
+        # the next state change; navigation is not, because it tears the
+        # source down on the strength of the edit having shipped.
+        self._refresh_degraded: bool = False
 
         # Whether state registration has been done
         self._registered = False
@@ -1474,19 +1497,37 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             # Batched so SESSION_CREATED + VIEW_CREATED collapse into one
             # BATCH_COMPLETE. On participant-rejection rollback, the queued
             # VIEW_DESTROYED joins the same batch and the whole self-cancelling
-            # sequence fires as a single notification -- subscribers never see
-            # a transient "view exists" state. ``source_id`` threads this view
+            # sequence fires as a single notification, so this batch's own
+            # notification never carries a transient "view exists" state. It
+            # bounds what this batch reports, not what a dispatch from another
+            # task reads: reducers commit inline, so a concurrent notification
+            # sees live state mid-sequence. ``source_id`` threads this view
             # through so its initial ``on_state_changed`` awaits inline and the
             # first render lands flush with the send response.
             async with self.state_store.batch(source_id=self.id):
                 self.state_store._register_view(self)
                 await self._register_state()
 
-                # Seed hook fires after registration so the view exists in
-                # state, but inside the batch so any seeding dispatches join
-                # the same BATCH_COMPLETE notification. Subscribers see the
-                # seeded slot from frame one. Default is a no-op.
-                await await_maybe(self.seed_initial_state(self.state_store.state))
+                try:
+                    # Seed hook fires after registration so the view exists in
+                    # state, but inside the batch so any seeding dispatches join
+                    # the same BATCH_COMPLETE notification. Subscribers see the
+                    # seeded slot from frame one. Default is a no-op.
+                    await await_maybe(self.seed_initial_state(self.state_store.state))
+                except BaseException:
+                    # BaseException, not Exception: a cancellation landing here
+                    # skips the rollback just as surely as a raise does, and
+                    # leaves the same registered view with no message.
+                    # Registration already happened, and this stage sits above
+                    # the send's own rollback, so a raising hook would leave a
+                    # registered view with no message: invisible to the user,
+                    # counted by the instance limit, and never torn down. Under
+                    # instance_policy="reject" that locks the owner out of the
+                    # view class for the life of the process. The rollback's
+                    # dispatches join this batch, so the whole sequence is
+                    # net-zero and the abort has nothing left to announce.
+                    await self._rollback_send(registered=True)
+                    raise
 
                 if type(self).auto_register_participants:
                     if not await self._auto_register_participants():
@@ -1543,6 +1584,11 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             self._apply_theme_defaults()
             self._sync_back_buttons()
             self._check_placement()
+            # The parent attach itself lands after the send, where a raise
+            # would report a failure for a message Discord already has. The
+            # chain is knowable now, so it is judged now.
+            if self._pending_parent is not None:
+                self._pending_parent._check_attachment(self)
 
             if self.context and hasattr(self.context, "send"):
                 if ephemeral:
@@ -1591,41 +1637,65 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             self._webhook_message = message
             try:
                 self._message = await message.channel.fetch_message(message.id)
-            except (discord.HTTPException, discord.RateLimited):
-                # RateLimited is a sibling of HTTPException, not a subclass.
-                # Uncaught it would escape a send that already succeeded,
-                # leaving the view with no _message: no cleanup listener, no
-                # parent attach, and a failure reported for a live message.
+            except DISCORD_CALL_ERRORS:
+                # RateLimited and aiohttp's transport errors are siblings of
+                # HTTPException, not subclasses. Uncaught, any of them would
+                # escape a send that already succeeded, leaving the view with
+                # no _message: no cleanup listener, no parent attach, and a
+                # failure reported for a live message.
                 self._message = message
         else:
             self._message = message
 
-        # Record the render-hash baseline: the tree Discord has right
-        # now is the tree just sent. Subsequent refresh() calls
-        # compare against this and skip the REST edit when nothing has
-        # changed.  For V1 views that include embed kwargs in send(),
-        # embed content is outside the digest, which is fine -- the
-        # digest only certifies the component tree, and refresh() only
-        # short-circuits when the caller passes no kwargs.
-        self._last_tree_digest = self._compute_tree_digest()
+        # Everything below is bookkeeping against a message Discord has
+        # already accepted, so it carries the same contract the re-fetch
+        # above states: a failure here must not surface as a failed send.
+        # The rollback path is behind us, so a raise would leave the view
+        # registered and the message live while telling the caller neither
+        # happened -- and a caller that retries on that answer posts a
+        # second copy. Failures degrade and are logged instead.
+        try:
+            # Record the render-hash baseline: the tree Discord has right
+            # now is the tree just sent. Subsequent refresh() calls
+            # compare against this and skip the REST edit when nothing has
+            # changed.  For V1 views that include embed kwargs in send(),
+            # embed content is outside the digest, which is fine -- the
+            # digest only certifies the component tree, and refresh() only
+            # short-circuits when the caller passes no kwargs.
+            self._last_tree_digest = self._compute_tree_digest()
 
-        await self._update_message_state(self._message)
+            await self._update_message_state(self._message)
 
-        # -- Stage 7: cleanup listener + ephemeral refresh + parent attach --
-        if not self.state_store._cleanup_listener_installed:
-            bot = getattr(self.interaction, "client", None) or getattr(self.context, "bot", None)
-            if isinstance(bot, discord.Client):
-                self.state_store._install_message_cleanup(bot)
+            # -- Stage 7: cleanup listener + ephemeral refresh + parent attach --
+            if not self.state_store._cleanup_listener_installed:
+                bot = getattr(self.interaction, "client", None) or getattr(
+                    self.context, "bot", None
+                )
+                if isinstance(bot, discord.Client):
+                    self.state_store._install_message_cleanup(bot)
 
-        if ephemeral and self.auto_refresh_ephemeral:
-            self._ephemeral_arm_deadline = time.monotonic() + max(
-                1, 900 - self.refresh_warning_seconds
+            if ephemeral and self.auto_refresh_ephemeral:
+                self._ephemeral_arm_deadline = time.monotonic() + max(
+                    1, 900 - self.refresh_warning_seconds
+                )
+                self.create_task(self._schedule_ephemeral_refresh())
+
+            if self._pending_parent is not None:
+                self._pending_parent.attach_child(self)
+                self._pending_parent = None
+        except Exception as e:
+            # Which step failed is unknown by the time this catches, so the
+            # digest is dropped rather than trusted: None means "no baseline"
+            # and the next refresh ships unconditionally, where a stale
+            # baseline would skip an edit the view needs.
+            self._last_tree_digest = None
+            logger.error(
+                f"{type(self).__name__} was sent, but post-send setup raised "
+                f"{type(e).__name__}: {e}. The message is live and the view is "
+                f"registered; deletion cleanup, the ephemeral refresh handoff, "
+                f"or the parent attachment may be inactive on it.",
+                exc_info=e,
             )
-            self.create_task(self._schedule_ephemeral_refresh())
-
-        if self._pending_parent is not None:
-            self._pending_parent.attach_child(self)
-            self._pending_parent = None
 
         return self._message
 
@@ -2101,8 +2171,14 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             # recolors marked cards must produce a new digest so the
             # re-render ships.
             elif isinstance(item, Container):
+                # discord.py types this Optional[Union[Colour, int]] and
+                # stores an int verbatim, so both spellings arrive here from
+                # a Container the caller built without a builder. Hashing
+                # the int form of each keeps one colour to one digest.
                 accent = item.accent_color
-                parts.append(("c", accent.value if accent else None, item.spoiler))
+                if isinstance(accent, discord.Colour):
+                    accent = accent.value
+                parts.append(("c", accent, item.spoiler))
             # Media-carrying items: the URL is the wire-visible state. A
             # rebuild that swaps only a banner or avatar URL must change
             # the digest, or refresh() short-circuits and the stale image
@@ -2186,19 +2262,33 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         self.state_store._undo_enabled_views.pop(self.id, None)
         await self.state_store._destroy_view(self.id, source_id=self.id)
 
-        # Skip the edit when the freeze changed nothing: a component-less
-        # display view (or one already fully disabled) would otherwise ship a
-        # no-op PATCH that re-sends an identical tree on every timeout.
-        if self._message and self._freeze_components():
+        # Skip the edit only when it would ship what is already on screen: a
+        # component-less display view (or one already fully disabled) would
+        # otherwise send a no-op PATCH on every timeout. The tree is checked
+        # alongside the freeze because an override that rebuilds before
+        # delegating here has something to say even though nothing froze.
+        if self._message and (
+            self._freeze_components() or self._compute_tree_digest() != self._last_tree_digest
+        ):
             try:
                 await self._bounded(self._message.edit(**self._freeze_edit_kwargs()))
             except discord.NotFound:
                 pass  # Message was already deleted
-            except asyncio.TimeoutError:
-                logger.warning(
-                    f"Timed out disabling components on timeout for "
-                    f"{type(self).__name__}; view torn down regardless."
-                )
+            except asyncio.TimeoutError as e:
+                if isinstance(e, aiohttp.ClientError):
+                    # aiohttp's connect and socket timeouts inherit both, and
+                    # fire below edit_timeout, so naming a stall here would
+                    # point a reader at the ceiling rather than the network.
+                    logger.warning(
+                        f"Disabling components on timeout did not reach Discord "
+                        f"for {type(self).__name__}: {describe_discord_error(e)}. "
+                        f"View torn down regardless."
+                    )
+                else:
+                    logger.warning(
+                        f"Timed out disabling components on timeout for "
+                        f"{type(self).__name__}; view torn down regardless."
+                    )
             except Exception as e:
                 # An ephemeral view that outlived its 15-minute interaction
                 # token cannot be edited -- the 401 is expected and
@@ -2602,6 +2692,10 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         consumed before ``super().reload()`` whose effect is not already in
         pre-gate view state is otherwise dropped when the reload defers.
         """
+        # reload() can return at the throttle gate below without reaching
+        # refresh(), so the flag is cleared here too rather than describing
+        # whatever the previous call did.
+        self._refresh_degraded = False
         # reload() never takes the acting waiver. Its gate throttles the
         # on_load fetch, not just the edit, so waiving it for interaction-
         # driven reloads would turn a manual refresh button into an
@@ -2636,12 +2730,192 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         """
         await self.refresh()
 
+    def _note_transport_failure(self, error: BaseException, *, where: str) -> None:
+        """Record an edit that never reached Discord.
+
+        Clears the render baseline so the next refresh ships unconditionally,
+        and raises the flag :attr:`refresh_degraded` reports. Shared by every
+        seam that can see one, including the timeout handlers: aiohttp's
+        connect and socket timeouts inherit BOTH ``ClientError`` and
+        ``asyncio.TimeoutError``, so a timeout clause placed first sees them
+        before the transport clause ever runs. A connect that never completed
+        is not the indeterminate case a cancelled ``wait_for`` is -- the
+        request definitively never left the host.
+        """
+        logger.warning(
+            f"{where} did not reach Discord for {type(self).__name__}: "
+            f"{describe_discord_error(error)}. The next refresh re-ships."
+        )
+        self._last_tree_digest = None
+        self._refresh_degraded = True
+
+    @contextlib.contextmanager
+    def restore_on_dropped_render(self, *attributes: str, rebuild: Optional[Callable] = None):
+        """Undo view-local writes when the render that would show them is dropped.
+
+        A callback that changes the view and then renders has two states to
+        keep together: the attribute and the screen. ``refresh()`` swallows a
+        transport failure, so the attribute can move while the screen does
+        not, and the next click reads a view the user never saw.
+
+        The sharp case is a control armed on one press and executed on the
+        next. If the arming render never reaches Discord, the button on
+        screen still looks unarmed, so the obvious response is to press it
+        again -- and that press executes, because the flag is already set. A
+        dropped packet turns a two-press confirmation into one, on exactly
+        the controls that ask for confirmation because they are destructive.
+
+        Snapshots each named attribute on entry and rebinds it if the render
+        was dropped. Pass ``rebuild`` to recompose the tree from the restored
+        values, which a V2 view needs and a V1 view carrying its body on an
+        ``embed`` kwarg does not::
+
+            with self.restore_on_dropped_render("_confirming", rebuild=self.build_ui):
+                self._confirming = True
+                self.build_ui()
+                await self.refresh()
+
+        Without it the attribute goes back and the tree does not, so the two
+        describe different states: a V2 tree IS the content, so the next
+        ``refresh()`` that does not rebuild first ships a screen the restored
+        attribute no longer names. ``rebuild`` runs only on a drop, after the
+        attributes are back, and is not re-rendered -- the render that failed
+        is the one being undone, and the next one ships the corrected tree.
+
+        The snapshot holds each attribute's value, so a name rebound inside
+        the block comes back and a list or dict mutated in place does not.
+        Flags and cursors are what this is for; rebuild a collection from the
+        restored cursor rather than editing it under the manager.
+
+        Nothing is restored when the render lands, nor when the block raises
+        -- an exception is its own signal and the caller owns the recovery.
+        Entry clears :attr:`refresh_degraded`, so the answer on exit describes
+        a render this block made rather than one already dropped before it.
+
+        Binding matters when two views are involved: the manager reads the
+        flag of the view it is called on, so a caller deciding on one view
+        while a sibling's render is the one that matters opens the block on
+        whichever view performs the refresh.
+        """
+        if rebuild is not None:
+            if not callable(rebuild):
+                raise TypeError(
+                    f"restore_on_dropped_render rebuild must be callable; "
+                    f"got {type(rebuild).__name__}. Fix: pass the bound method itself, "
+                    f"as in rebuild=self.build_ui."
+                )
+            if inspect.iscoroutinefunction(rebuild):
+                # The restore runs at the exit of a synchronous context
+                # manager, which has no way to await. Rejecting here names the
+                # problem at the call; returning an un-awaited coroutine would
+                # leave the tree unrebuilt and say nothing.
+                raise TypeError(
+                    f"restore_on_dropped_render rebuild must be synchronous; "
+                    f"{getattr(rebuild, '__qualname__', rebuild)} is async. Fix: rebuild "
+                    f"after the block instead, guarded on `if self.refresh_degraded:`."
+                )
+        snapshot = {name: getattr(self, name) for name in attributes}
+        # The flag is sticky until the next refresh clears it, so a drop from
+        # an earlier block (or from a refresh before this one) would answer for
+        # a render the body never made, and revert a write that was fine. Seen
+        # with a body whose refresh sits behind a conditional that did not run.
+        self._refresh_degraded = False
+        yield
+        if not self.refresh_degraded:
+            return
+        for name, value in snapshot.items():
+            setattr(self, name, value)
+        if rebuild is not None:
+            result = rebuild()
+            if inspect.isawaitable(result):
+                # An instance whose __call__ is async clears the check above.
+                # Close it so it does not also warn about never being awaited,
+                # then say what happened: the attributes are back and the tree
+                # is not, which is the state the rebuild existed to prevent.
+                result.close()
+                raise TypeError(
+                    f"restore_on_dropped_render rebuild returned an awaitable; the restore "
+                    f"cannot await it, so the tree still renders the value that was rolled "
+                    f"back. Fix: pass a synchronous rebuild, or rebuild after the block "
+                    f"guarded on `if self.refresh_degraded:`."
+                )
+        if attributes:
+            logger.debug(
+                f"Render dropped in {type(self).__name__}; restored "
+                f"{', '.join(attributes)} to match the screen."
+            )
+
+    def _edit_never_landed(self, previous: Any, current: Any, *, cursor: str) -> bool:
+        """Whether a navigation cursor should rewind after a dropped edit.
+
+        Every paging pattern moves its cursor before the repaint -- the page,
+        the wizard step, the active tab. A transport failure is the one edit
+        outcome where nothing shipped and nothing is known to be wrong, so it
+        leaves the cursor pointing somewhere the screen never went, and the
+        next click navigates from a position the user never saw.
+
+        Answers the question only; the caller owns the restore, because what
+        has to be rebuilt afterwards differs per pattern and per component
+        version. ``previous`` of ``None`` means the caller moved no cursor
+        (a data rebuild rather than a navigation), so nothing rewinds.
+        """
+        if previous is None or previous == current or not self.refresh_degraded:
+            return False
+        logger.debug(
+            f"{cursor} change in {type(self).__name__} did not reach Discord; "
+            f"rewinding from {current} to {previous} to match the screen."
+        )
+        return True
+
+    @property
+    def refresh_degraded(self) -> bool:
+        """Whether the last :meth:`refresh` was dropped by a transport failure.
+
+        A request that never reached Discord raises from aiohttp rather than
+        discord.py, and ``refresh()`` swallows it: the tree is unchanged on
+        screen, the state it renders is already committed, and the next state
+        change re-ships it. Raising instead would put a failure card in front
+        of the user over a repaint that merely needs repeating.
+
+        Read this when the caller changed something *before* the render that
+        should not stand if the render never landed. A paginated view is the
+        worked example. The page cursor advances first, so a dropped edit
+        otherwise leaves the reader on the previous page with the cursor
+        already moved::
+
+            before = self.current_page
+            await self.refresh()
+            if self.refresh_degraded:
+                self.current_page = before
+
+        Restoring the cursor is the whole rollback only when the rendered
+        body rides an ``embed`` / ``content`` kwarg. A V2 tree IS the
+        content, so a pattern that already recomposed its tree for the new
+        cursor has to recompose it back as well, or the next refresh ships
+        the state the cursor no longer names.
+        ``_BasePaginatedMixin._update_page`` is the worked reference for
+        both shapes.
+
+        Reset at the top of every ``refresh()``, so it always describes the
+        most recent call.
+        """
+        return self._refresh_degraded
+
     async def refresh(self, **kwargs) -> None:
         """Edit the view's message to reflect the current component state.
 
         Passes ``view=self`` along with any extra *kwargs* (``embed``,
         ``content``, etc.) to ``message.edit()``.  Silently handles the
         case where the message no longer exists (``discord.NotFound``).
+
+        Also swallows a transport failure -- a request that never reached
+        Discord, which raises from aiohttp and carries no HTTP status. The
+        edit is dropped, the render baseline is cleared so the next state
+        change re-ships, and :attr:`refresh_degraded` reports it. Raising
+        instead would put ``on_error``'s failure card in front of the user
+        over a repaint that merely needs repeating. Read
+        :attr:`refresh_degraded` when the caller changed something before
+        the render that should not stand if the render never landed.
 
         This does **not** rebuild components -- call your rebuild method
         (e.g. ``build_ui()``) before calling ``refresh()``.
@@ -2661,6 +2935,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         # reintroduce, in miniature, the send-state-dependent behavior this
         # guard exists to remove.
         self._reject_non_portable_edit_kwargs(kwargs)
+        self._refresh_degraded = False
 
         if not self._message:
             return
@@ -2788,7 +3063,10 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                         store._record_edit()
                     self._stamp_cooldown(acting=acting)
                     return
-                except asyncio.TimeoutError:
+                except asyncio.TimeoutError as e:
+                    if isinstance(e, aiohttp.ClientError):
+                        self._note_transport_failure(e, where="Refresh")
+                        return
                     logger.debug(
                         f"Acting-view fast path exceeded {fast_path_timeout:.2f}s "
                         f"in {type(self).__name__}; channel-endpoint fall-through "
@@ -2820,7 +3098,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     # channel path to ship the edit (no ack-budget concern,
                     # unlike the cancelled-fast-path TimeoutError case above).
                     pass
-                except (discord.HTTPException, discord.RateLimited) as e:
+                except DISCORD_CALL_ERRORS as e:
                     if self._handle_rate_limit(e):
                         return
                     # Any other HTTP error falls through to the channel path
@@ -2852,15 +3130,27 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                         store._record_edit()
                     self._stamp_cooldown(acting=acting)
                     return
-                except asyncio.TimeoutError:
+                except asyncio.TimeoutError as e:
+                    if isinstance(e, aiohttp.ClientError):
+                        # Not token expiry, so the webhook handle survives.
+                        self._note_transport_failure(e, where="Webhook edit")
+                        return
                     logger.warning(
                         f"Webhook edit stalled past {self.edit_timeout}s in "
                         f"{type(self).__name__}; the next refresh re-ships."
                     )
                     self._last_tree_digest = None
                     return
-                except (discord.HTTPException, discord.RateLimited) as e:
+                except DISCORD_CALL_ERRORS as e:
                     if self._handle_rate_limit(e):
+                        return
+                    if isinstance(e, aiohttp.ClientError):
+                        # A dropped connection says nothing about the token, and
+                        # this handle is the only endpoint that can edit an embed
+                        # on an interaction-owned message. Falling through would
+                        # forfeit it permanently over a blip and then silently
+                        # drop every later embed edit through the channel path.
+                        self._note_transport_failure(e, where="Webhook edit")
                         return
                     # Token expired (15-min lifetime) -- fall through to channel endpoint
                     self._webhook_message = None
@@ -2888,13 +3178,16 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                         f"on_message_gone failed for {type(self).__name__}: {exc}",
                         exc_info=exc,
                     )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    f"Edit stalled past {self.edit_timeout}s in {type(self).__name__}; "
-                    f"the next refresh re-ships."
-                )
-                self._last_tree_digest = None
-            except (discord.HTTPException, discord.RateLimited) as e:
+            except asyncio.TimeoutError as e:
+                if isinstance(e, aiohttp.ClientError):
+                    self._note_transport_failure(e, where="Refresh")
+                else:
+                    logger.warning(
+                        f"Edit stalled past {self.edit_timeout}s in "
+                        f"{type(self).__name__}; the next refresh re-ships."
+                    )
+                    self._last_tree_digest = None
+            except DISCORD_CALL_ERRORS as e:
                 if self._ephemeral and getattr(e, "status", None) == 401:
                     # The lifecycle exit() and on_timeout() already classify:
                     # an ephemeral past the 15-minute webhook cliff has no
@@ -2906,6 +3199,16 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                         f"Refresh skipped: ephemeral webhook token expired "
                         f"for {type(self).__name__}."
                     )
+                elif isinstance(e, aiohttp.ClientError):
+                    # The request never reached Discord, so nothing about the
+                    # message is known to be wrong. The tree is already
+                    # rebuilt and the state it renders is committed, and the
+                    # next refresh re-ships it. Raising instead turns a
+                    # dropped connection into on_error's failure card over a
+                    # read-only repaint, which reads to the user as the
+                    # content being untrustworthy rather than the network
+                    # being briefly down.
+                    self._note_transport_failure(e, where="Refresh")
                 elif not self._handle_rate_limit(e):
                     raise
         finally:
@@ -2928,9 +3231,11 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         Returns ``False`` for any other HTTP error (caller should re-raise
         or handle per its own contract).
 
-        Two exception types reach here, and only one of them carries the
-        delay as an attribute. ``discord.RateLimited`` exposes
-        ``retry_after`` directly. It appears only when the client sets
+        Three exception types reach here now that the shared catch-tuple
+        covers transport failures, and only one of them carries the delay as
+        an attribute. An ``aiohttp.ClientError`` is never a rate limit, so it
+        falls straight through to ``False`` and its caller degrades.
+        ``discord.RateLimited`` exposes ``retry_after`` directly. It appears only when the client sets
         ``max_ratelimit_timeout``, and from either side of the request: the
         bucket can predict the wait is too long and refuse to send, or a real
         429 can come back asking for longer than the ceiling allows. Either
@@ -3298,6 +3603,15 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 # back -- the user would be left with a stale panel and no
                 # recovery path once the webhook token expires.
                 await self.refresh()
+                if self.refresh_degraded:
+                    # Keep trying for as long as the token can still carry an
+                    # edit. A 429 re-queues itself through _handle_rate_limit,
+                    # so without this a transport drop was the one failure that
+                    # gave up after a single retry and froze the panel with
+                    # most of the ~90s arming window unspent. Bounded by the
+                    # cliff itself: past T+900s the edit answers 401, which
+                    # this flag does not report, and the chain ends.
+                    self._queue_deferred_refresh(_ARMING_RETRY_SECONDS)
             elif self._reload_pending:
                 self._reload_pending = False
                 kwargs = self._pending_reload_kwargs
@@ -3891,11 +4205,16 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     await self._bounded(self._message.delete())
                 elif self._is_layout():
                     # V2 messages ARE their components -- edit(view=None) would
-                    # produce an empty message (error 50006).  Freeze instead,
-                    # and skip the edit when nothing froze: a component-less
-                    # display view only re-sends an identical tree, so exit
-                    # tears down state and leaves the message untouched.
-                    if self._freeze_components():
+                    # produce an empty message (error 50006). Freeze instead.
+                    # The edit is skipped only when it would ship what is
+                    # already on screen: nothing froze AND the tree still
+                    # matches the last render. Testing the freeze alone read
+                    # a caller who rebuilt the tree before exiting as having
+                    # nothing to say, so a farewell card composed in
+                    # on_timeout was dropped and the expired prompt kept its
+                    # live-looking buttons until someone pressed one.
+                    froze = self._freeze_components()
+                    if froze or self._compute_tree_digest() != self._last_tree_digest:
                         await self._bounded(self._message.edit(**self._freeze_edit_kwargs()))
                 else:
                     await self._bounded(self._message.edit(view=None))
@@ -3904,14 +4223,23 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 # admin deleted the message, or the channel was deleted.
                 # Nothing left to clean up on Discord's side.
                 pass
-            except asyncio.TimeoutError:
-                # Visual cleanup stalled past edit_timeout. State teardown
-                # already ran above, so the view is gone regardless of the
-                # stale message on screen.
-                logger.warning(
-                    f"Exit cleanup edit stalled past {self.edit_timeout}s for "
-                    f"{type(self).__name__}; view torn down regardless."
-                )
+            except asyncio.TimeoutError as e:
+                # State teardown already ran above, so the view is gone either
+                # way and only the diagnostic differs. aiohttp's connect and
+                # socket timeouts inherit both and fire below edit_timeout, so
+                # the stall message would name a ceiling that was never reached
+                # -- and reads as "stalled past None s" when edit_timeout is off.
+                if isinstance(e, aiohttp.ClientError):
+                    logger.warning(
+                        f"Exit cleanup edit did not reach Discord for "
+                        f"{type(self).__name__}: {describe_discord_error(e)}. "
+                        f"View torn down regardless."
+                    )
+                else:
+                    logger.warning(
+                        f"Exit cleanup edit stalled past {self.edit_timeout}s for "
+                        f"{type(self).__name__}; view torn down regardless."
+                    )
             except discord.HTTPException as e:
                 if self._ephemeral and getattr(e, "status", None) == 401:
                     # Expected lifecycle for ephemerals past the 15-minute

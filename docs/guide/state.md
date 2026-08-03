@@ -387,6 +387,11 @@ await self.dispatch("SETTINGS_UPDATED", {
 | `dispatch_scoped()` | No | Yes |
 | `dispatch("NAMED_ACTION")` | Yes | Yes |
 
+A dispatch that writes no application slot and leaves `shared_data` alone
+records nothing, since the entry could put nothing back and `undo_limit`
+bounds the stack. Both methods participate in undo; a particular call
+lands on the stack when it changes something.
+
 !!! note "`dispatch_scoped` and undo"
     `dispatch_scoped()` creates undo snapshots for views with
     `enable_undo = True` -- scoped data lives under `state["application"]`,
@@ -561,13 +566,28 @@ async with self.batch():
 # One BATCH_COMPLETE fires here
 ```
 
+Absorption is per task. Two coroutines batching at the same time keep
+their own queues and each fires its own `BATCH_COMPLETE`, so running
+independent work concurrently does not merge it into one notification.
+
+A context is single-use. `store.batch()` returns a fresh one per call, and
+re-entering one that has already run raises `RuntimeError` -- storing a
+context on the view and reusing it across callbacks is the shape that hits
+this. Call `store.batch()` again instead.
+
 ### Exception handling
 
-If the `async with` block raises, every action queued during the batch is
-dropped from the outgoing notification -- subscribers never see the partial
-sequence. Reducers have already run (state is mutated in place as each
-dispatch returns), so `batch()` is not a transaction; it is a notification
-gate. Catch and inspect state explicitly if you need rollback semantics.
+Reducers run inline (state is mutated as each dispatch returns), so
+`batch()` is not a transaction; it is a notification gate. If the `async
+with` block raises, the dispatches that already committed are announced in
+one `BATCH_COMPLETE` and recorded on the undo stack, and the exception then
+propagates. State, subscribers, and undo agree on the prefix that landed,
+and `undo()` reverts it. Anything that must not survive the raise is rolled
+back by the block itself. The library's own pipelines do exactly that, so an
+aborted `send()` or `push()` still announces its create-then-destroy sequence
+in one `BATCH_COMPLETE` -- but that sequence nets to no lasting state change,
+and because view and navigation lifecycle actions are not undo-tracked it
+leaves nothing on the undo stack either.
 
 ### The library already batches its own pipelines
 

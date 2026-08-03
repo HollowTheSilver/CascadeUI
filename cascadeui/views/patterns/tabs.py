@@ -274,9 +274,10 @@ class _BaseTabMixin:
 
     def _make_switch_callback(self, index: int):
         async def callback(interaction: Interaction):
+            previous = self._active_tab
             self._active_tab = index
             await self._call_hook_safe(self.on_tab_switched, index)
-            await self._refresh_tabs()
+            await self._refresh_tabs(previous_tab=previous)
 
         return callback
 
@@ -294,9 +295,10 @@ class _BaseTabMixin:
             index = self._tab_names.index(name)
         except ValueError:
             raise ValueError(f"Tab '{name}' not found. Available: {self._tab_names}")
+        previous = self._active_tab
         self._active_tab = index
         await self._call_hook_safe(self.on_tab_switched, index)
-        await self._refresh_tabs()
+        await self._refresh_tabs(previous_tab=previous)
 
     async def refresh_content(self) -> None:
         """Re-render the current tab's content in place.
@@ -422,8 +424,12 @@ class TabView(_BaseTabMixin, StatefulView):
     async def _reload_render(self) -> None:
         await self._refresh_tabs()
 
-    async def _refresh_tabs(self):
-        """Mutate tab button styles in place and rebuild active content."""
+    async def _refresh_tabs(self, *, previous_tab: Optional[int] = None):
+        """Mutate tab button styles in place and rebuild active content.
+
+        ``previous_tab`` is the tab the caller switched away from, so a
+        switch whose edit never reached Discord can put the cursor back.
+        """
         self._sync_tab_styles()
 
         tab_name = self._tab_names[self._active_tab]
@@ -431,6 +437,12 @@ class TabView(_BaseTabMixin, StatefulView):
         embed = await await_maybe(builder())
 
         await self.refresh(embed=embed)
+        if self._edit_never_landed(previous_tab, self._active_tab, cursor="Tab"):
+            # Button styling is the only tree-resident tab artifact in V1 (the
+            # body rides the embed kwarg). No second edit: the connection is
+            # still down.
+            self._active_tab = previous_tab
+            self._sync_tab_styles()
 
 
 # // ========================================( V2: TabLayoutView )======================================== // #
@@ -555,7 +567,7 @@ class TabLayoutView(_BaseTabMixin, StatefulLayoutView):
         if self._tab_names:
             await self._compose_tab_tree()
 
-    async def _refresh_tabs(self):
+    async def _refresh_tabs(self, *, previous_tab: Optional[int] = None):
         """Rebuild the active tab's content and ship the edit.
 
         The tab-button ActionRow and any items registered through
@@ -564,3 +576,8 @@ class TabLayoutView(_BaseTabMixin, StatefulLayoutView):
         """
         await self._compose_tab_tree()
         await self.refresh()
+        if self._edit_never_landed(previous_tab, self._active_tab, cursor="Tab"):
+            # A V2 tree IS the content, so the rollback rebuilds it or the next
+            # refresh ships the tab the cursor no longer names.
+            self._active_tab = previous_tab
+            await self._compose_tab_tree()

@@ -578,13 +578,14 @@ class TestMiddlewareRetryBackoff:
         middleware._ns_application.interval = 0.01
 
         calls = {"count": 0}
-        original = backend.row_upsert
+        original = backend.row_upsert_many
 
-        async def failing(table, row, key_columns):
+        async def failing(table, rows, key_columns):
             calls["count"] += 1
             raise RuntimeError("simulated backend failure")
 
-        backend.row_upsert = failing  # type: ignore[method-assign]
+        # _flush prefers row_upsert_many, so that is the seam to fail on.
+        backend.row_upsert_many = failing  # type: ignore[method-assign]
         store = middleware._store
         store.state = {"application": {}, "sessions": {}}
         _slots_module._PERSISTENT_SLOTS.add("pref")
@@ -605,7 +606,7 @@ class TestMiddlewareRetryBackoff:
         # Restore backend and close middleware so any scheduled backoff
         # retry drains cleanly (close cancels pending tasks under the
         # write lock, then flushes the now-empty namespaces).
-        backend.row_upsert = original  # type: ignore[method-assign]
+        backend.row_upsert_many = original  # type: ignore[method-assign]
         middleware._ns_application.dirty_rows.clear()
         middleware._ns_application.deleted_keys.clear()
         await middleware.close()
@@ -614,10 +615,10 @@ class TestMiddlewareRetryBackoff:
         middleware, mgr, backend = await _make_middleware()
         ns = middleware._ns_application
 
-        async def failing(table, row, key_columns):
+        async def failing(table, rows, key_columns):
             raise RuntimeError("boom")
 
-        backend.row_upsert = failing  # type: ignore[method-assign]
+        backend.row_upsert_many = failing  # type: ignore[method-assign]
         ns.dirty_rows["pref"] = {
             "slot_name": "pref",
             "payload": "{}",
@@ -922,10 +923,10 @@ class TestMiddlewareObservabilityHooks:
 
         mgr.register_hook("on_error", observer)
 
-        async def failing(table, row, key_columns):
+        async def failing(table, rows, key_columns):
             raise RuntimeError("disk full")
 
-        backend.row_upsert = failing  # type: ignore[method-assign]
+        backend.row_upsert_many = failing  # type: ignore[method-assign]
         ns.dirty_rows["a"] = {
             "slot_name": "a",
             "payload": "{}",

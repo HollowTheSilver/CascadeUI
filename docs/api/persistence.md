@@ -30,7 +30,7 @@ await setup_middleware(
 - `registry`, `application` -- per-namespace overrides. Each accepts the matching config class from `cascadeui.persistence`. Explicit config wins over shorthand; passing the config with `backend=None` opts the namespace out entirely.
 - `bot` -- when supplied, enables the reattach pipeline for `PersistentView` subclasses and installs the message-deletion cleanup listener. When omitted, only state data is restored.
 - `migrators` -- optional dict with `"schema"` and/or `"kwargs"` keys, each mapping a `(name, from_version)` tuple to an async migrator callable. When omitted, no migrators are registered through this kwarg; the `@register_migrator` / `@register_kwargs_migrator` decorators are the canonical registration path, and this dict is the programmatic bulk alternative.
-- `restore_concurrency` -- positive int bounding how many persistent-view channel and message fetches run concurrently during startup reattach (default `8`).
+- `restore_concurrency` -- positive int bounding concurrency in both restore phases: the channel and message fetches during startup reattach, and the post-ready `on_restore` repaint that follows once the gateway is ready (default `8`).
 
 ### `async initialize(store)`
 

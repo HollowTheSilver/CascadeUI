@@ -94,30 +94,36 @@ _THEME_PRESETS = {
 
 @cascade_reducer("DASHBOARD_TAB_VISITED")
 async def _dashboard_tab_visited(action, state):
-    """Track per-tab visit counts in application state.
+    """Track per-tab visit counts in the visiting guild's own bucket.
 
-    The visits dict lives at ``state["application"]["dashboard"]["visits"]``
-    so the ``@computed`` aggregate below has a stable read path. Lifting
-    visits out of instance state is what lets the Overview tab back its
-    "Tab visits" line with a derived store value rather than a per-view
-    dict that would not survive a session restart.
+    The visits dict lives at
+    ``state["application"]["dashboard"][guild_id]`` so the ``@computed``
+    aggregate below has a stable read path. Lifting visits out of
+    instance state is what lets the Overview tab back its "Tab visits"
+    line with a derived store value rather than a per-view dict that
+    would not survive a session restart. Keying by guild matters here
+    because the Overview card is headed with the current guild's name:
+    an unpartitioned counter would show one server's tab clicks on
+    every other server's dashboard.
     """
-    visits = access_slot(state, "dashboard", "visits", default_factory=dict)
+    guild_id = action["payload"]["guild_id"]
+    visits = access_slot(state, "dashboard", guild_id, default_factory=dict)
     name = action["payload"]["tab_name"]
     visits[name] = visits.get(name, 0) + 1
     return state
 
 
-@computed(selector=lambda state: read_slot(state, "dashboard", "visits", default={}))
-def dashboard_total_visits(visits):
-    """Total tab visits across every dashboard session.
+@computed(selector=lambda state: read_slot(state, "dashboard", default={}))
+def dashboard_total_visits(visits_by_guild):
+    """Total tab visits per guild.
 
-    Selector returns the visits dict; the compute step sums values. The
-    cache key is the dict itself, so the sum only runs when a tab visit
-    actually mutates the slot -- subsequent renders reuse the cached
-    integer.
+    Returns ``{guild_id: total}``. Selector returns the guild-keyed
+    visits dict; the compute step sums each guild's tab counts. The
+    cache key is the dict itself, so the sums only run when some
+    guild's visit counts actually mutate -- subsequent renders reuse
+    the cached mapping.
     """
-    return sum(visits.values())
+    return {guild_id: sum(tab_counts.values()) for guild_id, tab_counts in visits_by_guild.items()}
 
 
 # // ========================================( Dashboard )======================================== // #
@@ -204,7 +210,7 @@ class DashboardView(TabLayoutView):
         total that the Overview surfaces.
         """
         name = self.active_tab
-        await self.dispatch("DASHBOARD_TAB_VISITED", {"tab_name": name})
+        await self.dispatch("DASHBOARD_TAB_VISITED", {"tab_name": name, "guild_id": self.guild_id})
 
     # // ==================( Helpers )================== // #
 
@@ -246,10 +252,11 @@ class DashboardView(TabLayoutView):
         enabled = sum(1 for v in self._modules.values() if v)
         # ``store.computed[name]`` returns the cached value produced by
         # the ``@computed`` registration above. The selector recomputes
-        # only when the visits dict changes; subsequent tab renders read
-        # the cached integer.
-        visits = read_slot(self.state_store.state, "dashboard", "visits", default={})
-        total_visits = self.state_store.computed["dashboard_total_visits"]
+        # only when some guild's visits change; subsequent tab renders
+        # read the cached mapping. Both reads take this guild's own key
+        # so a different server's tab clicks never show up here.
+        visits = read_slot(self.state_store.state, "dashboard", self.guild_id, default={})
+        total_visits = self.state_store.computed["dashboard_total_visits"].get(self.guild_id, 0)
 
         stats = card(
             f"## {name}",

@@ -10,7 +10,7 @@ from discord.ui import ActionRow, Container, TextDisplay
 from ...components.base import DynamicPersistentButton
 from ...components.patterns.v2 import card, divider
 from ...components.types import EmojiInput
-from ...utils.responses import respond_safe
+from ...utils.responses import DISCORD_CALL_ERRORS, respond_safe
 from ...utils.strings import slugify
 from ..layout import StatefulLayoutView
 from ..persistent import _PersistentMixin
@@ -346,9 +346,12 @@ class _BaseRolesMixin:
                 f"Missing permission to toggle role {role.name!r} for " f"{member}: {exc}"
             )
             await cls.on_role_error(interaction, exc)
-        except (discord.HTTPException, discord.RateLimited) as exc:
-            # RateLimited is a sibling of HTTPException, so it needs naming or
-            # it bypasses the on_role_error hook entirely.
+        except DISCORD_CALL_ERRORS as exc:
+            # RateLimited and aiohttp's transport errors are siblings of
+            # HTTPException, so they need naming or they bypass the
+            # on_role_error hook entirely. This button is a DynamicItem with no
+            # _scheduled_task beneath it, so an escape here reaches the user as
+            # a bare "interaction failed" rather than the hook.
             logger.warning(f"HTTP error toggling role {role.name!r}: {exc}")
             await cls.on_role_error(interaction, exc)
 

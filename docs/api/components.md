@@ -448,6 +448,8 @@ Convenience functions for building V2 component trees. All return standard disco
 
 Creates a `Container` with children and an optional accent color. Strings are automatically wrapped in `TextDisplay`. Pass `spoiler=True` to hide the entire container behind a spoiler overlay.
 
+`color` takes a `discord.Colour` or a plain int, so `color=0x5865F2` is equivalent to `color=discord.Colour(0x5865F2)`. A value outside `0x000000`-`0xFFFFFF`, a `bool`, or a non-colour type raises at construction, naming the builder and the parameter, rather than reaching Discord.
+
 ```python
 card(
     "## Title",              # Strings become TextDisplay automatically

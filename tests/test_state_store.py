@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from cascadeui.state.singleton import get_store
-from cascadeui.state.store import StateStore
+from cascadeui.state.store import _CURRENT_REDUCER_MS, StateStore
 
 
 class TestStateStoreSingleton:
@@ -707,6 +707,77 @@ class TestCascadeReducerAcceptsSyncFunctions:
         assert store.state["application"]["async_marker"] == 7
 
 
+class TestCopyStateMatchesDeepcopy:
+    """The hand-rolled state copy stands in for ``copy.deepcopy`` exactly.
+
+    It walks dicts and lists directly and delegates everything else, which
+    is where a divergence would hide. The memo is the part worth testing:
+    without it a self-referential value recurses until the stack ends, and
+    a reference appearing twice in the tree silently becomes two objects.
+    """
+
+    def test_a_self_referential_value_terminates(self):
+        from cascadeui.utils.decorators import _copy_state
+
+        cyclic = {"a": 1}
+        cyclic["self"] = cyclic
+
+        copied = _copy_state(cyclic)
+
+        assert copied is not cyclic
+        assert copied["self"] is copied
+
+    def test_a_reference_appearing_twice_stays_one_object(self):
+        from cascadeui.utils.decorators import _copy_state
+
+        shared = {"v": 1}
+        copied = _copy_state({"x": shared, "y": shared})
+
+        assert copied["x"] is copied["y"]
+        assert copied["x"] is not shared
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            {"a": (1, 2)},
+            {"a": {1, 2}},
+            {"a": [[1, [2]]]},
+            {"a": True, "b": 1},
+            {"a": None},
+            {"a": {"nested": {"deep": [1, {"x": "y"}]}}},
+        ],
+    )
+    def test_it_agrees_with_deepcopy(self, value):
+        import copy as _copy
+
+        from cascadeui.utils.decorators import _copy_state
+
+        def same(a, b):
+            # `==` alone would pass a copy that flattened True to 1, which is
+            # the divergence most worth catching here.
+            if type(a) is not type(b):
+                return False
+            if isinstance(a, dict):
+                return a.keys() == b.keys() and all(same(a[k], b[k]) for k in a)
+            if isinstance(a, (list, tuple)):
+                return len(a) == len(b) and all(same(x, y) for x, y in zip(a, b))
+            return a == b
+
+        assert same(_copy_state(value), _copy.deepcopy(value))
+
+    def test_an_exact_type_is_preserved_rather_than_flattened(self):
+        from enum import IntEnum
+
+        from cascadeui.utils.decorators import _copy_state
+
+        class Level(IntEnum):
+            HIGH = 1
+
+        copied = _copy_state({"a": Level.HIGH})
+
+        assert type(copied["a"]) is Level, "an int subclass must not degrade to int"
+
+
 class TestInspectorPurgedStaleReducer:
     """INSPECTOR_PURGED_STALE keeps the inspector's own entries and drops everything else."""
 
@@ -945,13 +1016,35 @@ class TestPerfSampling:
             store.disable_perf()
             store._unregister_reducer("PERF_SLOW_REDUCER")
 
-    def test_clear_wipes_reducer_stack(self):
-        """A stale in-progress dispatch's reducer timing cannot leak
-        across clears."""
+    async def test_a_batched_reducer_binds_no_timing_slot(self):
+        """Reducer timing binds to its own dispatch, not to a shared stack top.
+
+        A batched action owns no per-action sample; it accounts for itself
+        under the batch's. Writing into the top of a shared stack put its
+        reducer time on whichever unbatched dispatch was concurrently in
+        flight, so the slot is reached through a contextvar the dispatch
+        binds for itself and a batched action finds nothing bound.
+        """
         store = get_store()
-        store._perf_reducer_stack.append(12.5)
         store.clear_perf()
-        assert store._perf_reducer_stack == []
+        bound = []
+
+        async def probe_reducer(action, state):
+            bound.append(_CURRENT_REDUCER_MS.get())
+            return state
+
+        store._register_reducer("PERF_SLOT_PROBE", probe_reducer)
+        store.enable_perf()
+        try:
+            await store.dispatch("PERF_SLOT_PROBE")
+            async with store.batch():
+                await store.dispatch("PERF_SLOT_PROBE")
+        finally:
+            store.disable_perf()
+            store._unregister_reducer("PERF_SLOT_PROBE")
+
+        assert bound[0] is not None, "an unbatched dispatch collects its own reducer time"
+        assert bound[1] is None, "a batched action has no slot of its own to write into"
 
     async def test_notify_sample_per_subscriber(self):
         """Each subscriber touched by a dispatch produces exactly one
@@ -1049,3 +1142,105 @@ class TestPerfSampling:
         store._notify_samples.append({"subscriber_id": "x", "action": "Y", "ms": 1.0})
         store.clear_perf()
         assert len(store._notify_samples) == 0
+
+
+class TestSelectorCompareShortcutsOnIdentity:
+    """A selector returning the same object must not be walked to prove it.
+
+    Dict and list equality have no identity shortcut, so a bare whole-bucket
+    selector compared every entry on every dispatch to reach the same answer
+    ``is`` gives immediately. Views never paid this: ``_build_selector``
+    returns a tuple, and tuple comparison does shortcut identical elements.
+    It fell on direct ``store.subscribe`` callers instead.
+    """
+
+    class _CountingDict(dict):
+        compares = 0
+
+        def __eq__(self, other):
+            type(self).compares += 1
+            return super().__eq__(other)
+
+        __hash__ = None
+
+    async def test_an_unchanged_selection_is_not_compared_entry_by_entry(self):
+        store = get_store()
+        bucket = self._CountingDict({"a": 1})
+        store.state["application"]["bucket"] = bucket
+        notified = []
+
+        async def handler(state, action):
+            notified.append(action["type"])
+
+        store.subscribe("identity-sub", handler, selector=lambda s: s["application"]["bucket"])
+
+        await store.dispatch("WARM", {})
+        await store._flush_notifications()
+        type(bucket).compares = 0
+
+        await store.dispatch("AGAIN", {})
+        await store._flush_notifications()
+
+        assert type(bucket).compares == 0, "identity must answer before equality is tried"
+
+    async def test_a_changed_selection_still_notifies(self):
+        store = get_store()
+        store.state["application"]["bucket"] = {"a": 1}
+        seen = []
+
+        async def handler(state, action):
+            seen.append(action["type"])
+
+        store.subscribe("changed-sub", handler, selector=lambda s: s["application"]["bucket"])
+
+        await store.dispatch("FIRST", {})
+        await store._flush_notifications()
+        store.state["application"]["bucket"] = {"a": 2}
+        await store.dispatch("SECOND", {})
+        await store._flush_notifications()
+
+        assert seen == ["FIRST", "SECOND"]
+
+
+class TestCascadeReducerRejectsANonStateReturn:
+    """Forgetting the ``return`` must not install the return value as the state.
+
+    The store assigns whatever the reducer hands back. A reducer that fell off
+    the end returned ``None``, which became the entire state, and the failure
+    surfaced at whichever unrelated read came next.
+    """
+
+    async def test_a_reducer_with_no_return_leaves_the_state_alone(self):
+        from cascadeui.utils import cascade_reducer
+
+        store = get_store()
+        store.state = StateStore._build_initial_state()
+        store.state["application"]["keepme"] = {"n": 1}
+        before = store.state
+
+        @cascade_reducer("NO_RETURN_PROBE")
+        def _forgot(action, state):
+            state["application"]["keepme"]["n"] = 2
+
+        await store.dispatch("NO_RETURN_PROBE", {})
+
+        assert store.state is before
+        assert store.state["application"]["keepme"]["n"] == 1
+
+    async def test_the_error_names_the_reducer_and_the_fix(self):
+        from cascadeui.utils.decorators import cascade_reducer
+
+        store = get_store()
+        store.state = StateStore._build_initial_state()
+
+        @cascade_reducer("NON_DICT_RETURN_PROBE")
+        def _wrong(action, state):
+            return ["not", "a", "state"]
+
+        with pytest.raises(TypeError) as excinfo:
+            await _wrong({"type": "NON_DICT_RETURN_PROBE"}, store.state)
+
+        message = str(excinfo.value)
+        assert "_wrong" in message
+        assert "NON_DICT_RETURN_PROBE" in message
+        assert "return state" in message

@@ -210,6 +210,40 @@ class TestThemeValidation:
             theme = t
 
 
+class TestThemeColourCoercion:
+    """Colour styles are coerced at construction so every reader sees one type.
+
+    ``accent_colour`` defaults to ``primary_color``, and a themed card takes
+    its accent from the theme, so one hex literal declared here reaches every
+    themed Container in an app.
+    """
+
+    def test_int_primary_colour_is_coerced(self):
+        theme = Theme("brand", styles={"primary_color": 0xD4AF37})
+
+        assert theme.get_style("primary_color") == discord.Colour(0xD4AF37)
+
+    def test_the_derived_accent_is_coerced_too(self):
+        theme = Theme("brand", styles={"primary_color": 0xD4AF37})
+
+        assert theme.get_style("accent_colour") == discord.Colour(0xD4AF37)
+
+    def test_an_explicit_int_accent_is_coerced(self):
+        theme = Theme("brand", styles={"accent_colour": 0xD4AF37})
+
+        assert theme.get_style("accent_colour") == discord.Colour(0xD4AF37)
+
+    def test_non_colour_styles_are_left_alone(self):
+        theme = Theme("brand", styles={"footer_text": "hi", "separator_spacing": "large"})
+
+        assert theme.get_style("footer_text") == "hi"
+        assert theme.get_style("separator_spacing") == "large"
+
+    def test_a_string_colour_is_rejected(self):
+        with pytest.raises(TypeError, match="Theme styles"):
+            Theme("brand", styles={"primary_color": "#D4AF37"})
+
+
 class TestBuilderThemeFallback:
     """card() and stats_card() read theme context as color fallback."""
 

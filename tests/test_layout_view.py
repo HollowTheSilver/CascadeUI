@@ -6,6 +6,7 @@ import logging
 import time
 from unittest.mock import AsyncMock, MagicMock
 
+import aiohttp
 import discord
 import pytest
 from discord.ui import ActionRow, Container
@@ -15,6 +16,7 @@ from helpers import RenderableLayoutView
 from helpers import make_interaction as _make_interaction
 
 from cascadeui.components.base import StatefulButton, StatefulSelect
+from cascadeui.components.patterns.v2 import card
 from cascadeui.state.singleton import get_store
 from cascadeui.state.store import _CURRENT_INTERACTION
 from cascadeui.views.base import _StatefulMixin, _view_class_registry
@@ -2229,7 +2231,10 @@ class TestRefreshThrottling:
         # handler, so this holds however long the refresh takes. The second
         # assertion carries the discrimination the docstring describes.
         assert before + 0.75 <= view._ratelimit_not_before <= after + 0.75
-        assert view._ratelimit_not_before < before + 1.0
+        # Excludes the 60s Cloudflare-ban fallback, which is what a missed
+        # header would stamp. Five seconds separates the two by a wide
+        # margin and leaves the bound independent of how slow the box is.
+        assert view._ratelimit_not_before < before + 5.0
         # A 429 is Discord's window, not the library's opt-in pacing.
         assert view._cooldown_not_before == 0.0
 
@@ -2651,7 +2656,10 @@ class TestActingViewFastPath:
         # Exact bracket; the second assertion excludes the ban fallback the
         # docstring warns a lower bound alone would stay green through.
         assert before + 0.75 <= view._ratelimit_not_before <= after + 0.75
-        assert view._ratelimit_not_before < before + 1.0
+        # Excludes the 60s Cloudflare-ban fallback, which is what a missed
+        # header would stamp. Five seconds separates the two by a wide
+        # margin and leaves the bound independent of how slow the box is.
+        assert view._ratelimit_not_before < before + 5.0
         view._message.edit.assert_not_called()
         if view._deferred_refresh_task is not None:
             view._deferred_refresh_task.cancel()
@@ -3929,3 +3937,543 @@ class TestViewHooksAcceptPlainDef:
 
         assert allowed is False
         assert calls == [999]
+
+
+class TestContainerAccentAcceptsBothSpellings:
+    """discord.py types ``accent_colour`` ``Optional[Union[Colour, int]]``.
+
+    ``Embed.colour``'s setter coerces an int, so the same hex literal has
+    always worked on a V1 embed; ``Container.accent_colour`` stores one
+    verbatim, so both spellings reach the digest from any Container the
+    caller built without a builder.
+    """
+
+    def test_digest_reads_a_raw_int_accent(self):
+        view = DisplayLayoutView(container=Container(TextDisplay("x"), accent_colour=0xD4AF37))
+
+        assert view._compute_tree_digest() is not None
+
+    def test_both_spellings_of_one_colour_hash_equal(self):
+        as_int = DisplayLayoutView(container=Container(TextDisplay("x"), accent_colour=0xD4AF37))
+        as_colour = DisplayLayoutView(
+            container=Container(TextDisplay("x"), accent_colour=discord.Colour(0xD4AF37))
+        )
+
+        assert as_int._compute_tree_digest() == as_colour._compute_tree_digest()
+
+    def test_a_black_accent_is_not_read_as_no_accent(self):
+        black = DisplayLayoutView(container=Container(TextDisplay("x"), accent_colour=0x000000))
+        unset = DisplayLayoutView(container=Container(TextDisplay("x")))
+
+        assert black._compute_tree_digest() != unset._compute_tree_digest()
+
+
+class TestPostSendSetupNeverReportsAFailedSend:
+    """Bookkeeping after the send carries the send's own contract.
+
+    The rollback path ends at the Discord call, so a raise past it leaves
+    the view registered and the message live while reporting that neither
+    happened. A caller that retries on that answer posts a second copy.
+    """
+
+    async def test_a_raising_digest_still_returns_the_live_message(self, caplog):
+        ctx = MagicMock()
+        ctx.author.id = 100
+        ctx.guild.id = 200
+        sent = MagicMock()
+        sent.id = 999
+        ctx.send = AsyncMock(return_value=sent)
+
+        view = RenderableLayoutView(context=ctx, user_id=100, guild_id=200)
+        view._compute_tree_digest = MagicMock(side_effect=RuntimeError("boom"))
+
+        with caplog.at_level(logging.ERROR):
+            result = await view.send()
+
+        assert result is sent
+        assert view._message is sent
+        # No baseline was recorded, so the next refresh ships unconditionally
+        # rather than skipping an edit against a digest that never computed.
+        assert view._last_tree_digest is None
+        assert "post-send setup raised" in caplog.text
+
+    async def test_a_circular_parent_is_rejected_before_anything_is_sent(self):
+        parent_ctx = MagicMock()
+        parent_ctx.author.id = 100
+        parent_ctx.guild.id = 200
+        parent_ctx.send = AsyncMock(return_value=MagicMock(id=1))
+        parent = RenderableLayoutView(context=parent_ctx, user_id=100, guild_id=200)
+        await parent.send()
+
+        child_ctx = MagicMock()
+        child_ctx.author.id = 100
+        child_ctx.guild.id = 200
+        child_ctx.send = AsyncMock(return_value=MagicMock(id=2))
+        child = RenderableLayoutView(context=child_ctx, user_id=100, guild_id=200, parent=parent)
+        child.attach_child(parent)
+
+        with pytest.raises(ValueError, match="Circular attachment"):
+            await child.send()
+
+        child_ctx.send.assert_not_called()
+        assert child._message is None
+        assert child.id not in child.state_store.get_active_views()
+        assert child.id not in child.state_store.state["views"]
+
+
+class TestTransportFailuresDoNotSurfaceAsErrors:
+    """A request that never reached Discord is a third sibling.
+
+    ``RateLimited`` is a sibling of ``HTTPException``; aiohttp's client
+    errors are siblings of both, since a connection that drops carries no
+    HTTP status at all. Uncaught on a repaint they reach ``on_error`` and
+    render a failure card over content that is perfectly fine.
+    """
+
+    def test_transport_errors_are_not_http_exceptions(self):
+        assert not issubclass(aiohttp.ClientOSError, discord.HTTPException)
+        # The umbrella is ClientError, not OSError: ServerDisconnectedError
+        # is the former and not the latter, and asyncio.TimeoutError IS an
+        # OSError from 3.11 but not on 3.10, so an OSError clause would mean
+        # two different things across the supported interpreters.
+        assert not issubclass(aiohttp.ServerDisconnectedError, OSError)
+        assert issubclass(aiohttp.ServerDisconnectedError, aiohttp.ClientError)
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            aiohttp.ClientOSError(104, "Connection reset by peer"),
+            aiohttp.ServerDisconnectedError(),
+        ],
+        ids=["reset", "disconnected"],
+    )
+    async def test_refresh_degrades_instead_of_raising(self, error):
+        view = RenderableLayoutView(interaction=_make_interaction(), user_id=1, guild_id=2)
+        message = MagicMock()
+        message.id = 999
+        message.edit = AsyncMock(side_effect=error)
+        view._message = message
+        view._last_tree_digest = 12345
+
+        await view.refresh()
+
+        # No baseline, so the next refresh re-ships the tree unconditionally.
+        assert view._last_tree_digest is None
+        assert view._refresh_degraded is True
+
+    async def test_a_transport_failure_on_the_post_send_refetch_keeps_the_message(self):
+        ctx = MagicMock()
+        ctx.author.id = 100
+        ctx.guild.id = 200
+        sent = MagicMock()
+        sent.id = 999
+        sent.__class__ = discord.InteractionMessage
+        sent.channel.fetch_message = AsyncMock(
+            side_effect=aiohttp.ClientOSError(104, "Connection reset by peer")
+        )
+        ctx.send = AsyncMock(return_value=sent)
+
+        view = RenderableLayoutView(context=ctx, user_id=100, guild_id=200)
+        result = await view.send()
+
+        # The message is live; reporting a failed send would have the caller
+        # retry and post a second copy.
+        assert result is sent
+        assert view._message is sent
+
+    async def test_navigation_rolls_back_when_the_edit_never_landed(self):
+        # An interaction whose own message differs from the view's routes the
+        # edit through refresh() rather than the interaction fast path.
+        interaction = _make_interaction()
+        interaction.message = MagicMock()
+        interaction.message.id = 111
+
+        message = MagicMock()
+        message.id = 999
+        message.edit = AsyncMock(side_effect=aiohttp.ClientOSError(104, "reset"))
+
+        source = RenderableLayoutView(interaction=interaction, user_id=1, guild_id=2)
+        source._message = message
+        destination = RenderableLayoutView(user_id=1, guild_id=2)
+        destination._message = message
+
+        shipped = await source._apply_navigation_edit(destination, interaction, None)
+
+        # refresh() swallows the transport failure so a repaint can retry, but
+        # navigation tears the source down on the strength of the edit, so a
+        # swallowed failure has to read as "not shipped" here.
+        assert shipped is False
+
+    async def test_a_transport_blip_does_not_forfeit_the_webhook_handle(self):
+        """The webhook handle is the only endpoint that can edit an embed.
+
+        The channel endpoint silently strips embed edits on an
+        interaction-owned message, so nulling this ref on a dropped
+        connection would freeze a V1 view's embeds permanently over a blip.
+        Only an HTTP error means the token is actually gone.
+        """
+        from cascadeui.views.view import StatefulView
+
+        view = StatefulView(interaction=_make_interaction(), user_id=1, guild_id=2)
+        channel_message = MagicMock()
+        channel_message.id = 999
+        channel_message.edit = AsyncMock()
+        webhook = MagicMock()
+        webhook.id = 999
+        webhook.edit = AsyncMock(side_effect=aiohttp.ClientConnectionError("reset"))
+        view._message = channel_message
+        view._webhook_message = webhook
+        view._last_tree_digest = None
+
+        await view.refresh(embed=discord.Embed(title="x"))
+
+        assert view._webhook_message is webhook
+        assert view.refresh_degraded is True
+        # No fall-through: the channel endpoint would drop the embed silently.
+        channel_message.edit.assert_not_called()
+
+    async def test_refresh_degraded_is_public_and_resets_per_call(self):
+        view = RenderableLayoutView(interaction=_make_interaction(), user_id=1, guild_id=2)
+        message = MagicMock()
+        message.id = 999
+        message.edit = AsyncMock(side_effect=aiohttp.ClientOSError(104, "reset"))
+        view._message = message
+
+        assert view.refresh_degraded is False
+        await view.refresh()
+        assert view.refresh_degraded is True
+
+        message.edit = AsyncMock()
+        await view.refresh()
+        assert view.refresh_degraded is False
+
+    def test_aiohttp_connect_timeouts_are_also_transport_errors(self):
+        """The overlap that decides handler ordering.
+
+        aiohttp's connect and socket timeouts inherit BOTH ``ClientError``
+        and ``asyncio.TimeoutError``, so a timeout clause placed first sees
+        them before the transport clause runs. discord.py builds its session
+        with no ``timeout=``, so aiohttp's 30s ``sock_connect`` applies and
+        this is the likeliest transport failure in production, not an exotic
+        one.
+        """
+        assert issubclass(aiohttp.ConnectionTimeoutError, asyncio.TimeoutError)
+        assert issubclass(aiohttp.ConnectionTimeoutError, aiohttp.ClientError)
+        assert issubclass(aiohttp.SocketTimeoutError, asyncio.TimeoutError)
+        assert issubclass(aiohttp.SocketTimeoutError, aiohttp.ClientError)
+        # A cancelled wait_for is NOT one, so the stall branch keeps its case.
+        assert not issubclass(asyncio.TimeoutError, aiohttp.ClientError)
+
+    @pytest.mark.parametrize(
+        "error,degraded",
+        [
+            (aiohttp.ConnectionTimeoutError("connect"), True),
+            (aiohttp.SocketTimeoutError("sock"), True),
+            (asyncio.TimeoutError(), False),
+        ],
+        ids=["connect-timeout", "socket-timeout", "stall"],
+    )
+    async def test_a_connect_timeout_reads_as_transport_not_as_a_stall(self, error, degraded):
+        view = RenderableLayoutView(interaction=_make_interaction(), user_id=1, guild_id=2)
+        message = MagicMock()
+        message.id = 999
+        message.edit = AsyncMock(side_effect=error)
+        view._message = message
+        view._last_tree_digest = None
+
+        await view.refresh()
+
+        # A connect that never completed is not the indeterminate case a
+        # cancelled wait_for is: the request definitively never left the host.
+        assert view.refresh_degraded is degraded
+
+    async def test_reload_clears_the_flag_even_when_it_coalesces(self):
+        """``reload()`` can return at the throttle gate without reaching
+        ``refresh()``, so the flag must not describe an older call."""
+        view = RenderableLayoutView(interaction=_make_interaction(), user_id=1, guild_id=2)
+        message = MagicMock()
+        message.id = 999
+        message.edit = AsyncMock(side_effect=aiohttp.ClientOSError(104, "reset"))
+        view._message = message
+
+        await view.refresh()
+        assert view.refresh_degraded is True
+
+        view.refresh_cooldown_ms = 5000
+        view._cooldown_not_before = time.monotonic() + 5
+        await view.reload()
+
+        assert view.refresh_degraded is False
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            aiohttp.ClientOSError(104, "reset"),
+            aiohttp.ConnectionTimeoutError("connect"),
+        ],
+        ids=["reset", "connect-timeout"],
+    )
+    async def test_the_acting_fast_path_handles_transport_too(self, error):
+        """A real click takes the fast path first, and it has its own handling.
+
+        Every other transport test drives an unbound interaction, so the
+        refresh falls straight through to the channel endpoint and the fast
+        path's two branches (the hybrid-timeout split and the fall-through
+        for a plain ClientError) go unexercised.
+        """
+        interaction = _make_interaction()
+        interaction.message = MagicMock()
+        interaction.message.id = 999
+        interaction.response.is_done.return_value = False
+        interaction.response.edit_message = AsyncMock(side_effect=error)
+
+        view = RenderableLayoutView(interaction=interaction, user_id=1, guild_id=2)
+        message = MagicMock()
+        message.id = 999
+        message.edit = AsyncMock(side_effect=error)
+        view._message = message
+        view._last_tree_digest = None
+
+        token = _CURRENT_INTERACTION.set(interaction)
+        try:
+            await view.refresh()
+        finally:
+            _CURRENT_INTERACTION.reset(token)
+
+        interaction.response.edit_message.assert_awaited()
+        assert view.refresh_degraded is True
+
+
+class TestRestoreOnDroppedRender:
+    """A two-press confirmation must not become one press on a dropped render.
+
+    The arming write lands on the view before the render that would show it.
+    When that render is swallowed, the button on screen still looks unarmed,
+    so the obvious response is to press again -- and that press executes,
+    because the flag is already set.
+    """
+
+    class _ArmThenConfirm(RenderableLayoutView):
+        def __init__(self, **kwargs):
+            self.confirming = False
+            self.executed = False
+            super().__init__(**kwargs)
+
+        async def press(self):
+            if self.confirming:
+                self.executed = True
+                return
+            with self.restore_on_dropped_render("confirming"):
+                self.confirming = True
+                await self.refresh()
+
+    def _wire(self, view, *, error=None):
+        message = MagicMock()
+        message.id = 999
+        message.edit = AsyncMock(side_effect=error)
+        view._message = message
+        return message
+
+    async def test_a_dropped_arming_render_cannot_be_confirmed_by_the_next_press(self):
+        view = self._ArmThenConfirm(interaction=_make_interaction(), user_id=1, guild_id=2)
+        self._wire(view, error=aiohttp.ClientOSError(104, "reset"))
+
+        await view.press()
+        assert view.confirming is False, "the flag must match the unarmed button on screen"
+
+        await view.press()
+        assert view.executed is False, "a dropped packet must not collapse two presses into one"
+
+    async def test_a_landed_render_keeps_the_armed_state(self):
+        view = self._ArmThenConfirm(interaction=_make_interaction(), user_id=1, guild_id=2)
+        self._wire(view)
+
+        await view.press()
+        assert view.confirming is True
+
+        await view.press()
+        assert view.executed is True
+
+    async def test_an_exception_inside_the_block_restores_nothing(self):
+        """A raise is its own signal, and the caller owns the recovery."""
+        view = self._ArmThenConfirm(interaction=_make_interaction(), user_id=1, guild_id=2)
+        self._wire(view)
+
+        with pytest.raises(RuntimeError):
+            with view.restore_on_dropped_render("confirming"):
+                view.confirming = True
+                raise RuntimeError("callback blew up")
+
+        assert view.confirming is True
+
+    async def test_it_restores_every_attribute_it_was_given(self):
+        view = self._ArmThenConfirm(interaction=_make_interaction(), user_id=1, guild_id=2)
+        self._wire(view, error=aiohttp.ClientOSError(104, "reset"))
+        view.selection = "before"
+
+        with view.restore_on_dropped_render("confirming", "selection"):
+            view.confirming = True
+            view.selection = "after"
+            await view.refresh()
+
+        assert view.confirming is False
+        assert view.selection == "before"
+
+    async def test_an_earlier_drop_does_not_answer_for_this_block(self):
+        """The flag is sticky until a refresh clears it, so entry must reset it.
+
+        A block whose refresh sits behind a conditional that did not run has
+        made no render at all, and must keep its write no matter what the
+        previous refresh did.
+        """
+        view = self._ArmThenConfirm(interaction=_make_interaction(), user_id=1, guild_id=2)
+        self._wire(view, error=aiohttp.ClientOSError(104, "reset"))
+
+        await view.refresh()
+        assert view.refresh_degraded is True
+
+        with view.restore_on_dropped_render("confirming"):
+            view.confirming = True
+
+        assert view.confirming is True, "no render was made here, so nothing is owed a rewind"
+
+    async def test_a_drop_in_an_earlier_block_does_not_revert_a_later_one(self):
+        view = self._ArmThenConfirm(interaction=_make_interaction(), user_id=1, guild_id=2)
+        message = self._wire(view, error=aiohttp.ClientOSError(104, "reset"))
+        view.selection = "before"
+
+        await view.press()
+        assert view.confirming is False
+
+        message.edit = AsyncMock()
+        with view.restore_on_dropped_render("selection"):
+            view.selection = "kept"
+
+        assert view.selection == "kept"
+
+    async def test_rebuild_recomposes_the_tree_the_restored_value_names(self):
+        """A V2 tree IS the content, so rebinding the flag is only half of it.
+
+        Without the rebuild the attribute goes back and the tree keeps what
+        the arming render composed, so the next refresh that does not
+        rebuild first ships a screen the flag no longer names.
+        """
+        view = self._ArmThenConfirm(interaction=_make_interaction(), user_id=1, guild_id=2)
+        self._wire(view, error=aiohttp.ClientOSError(104, "reset"))
+        view.rebuilt_for = None
+
+        def _rebuild():
+            view.rebuilt_for = view.confirming
+
+        with view.restore_on_dropped_render("confirming", rebuild=_rebuild):
+            view.confirming = True
+            await view.refresh()
+
+        assert view.confirming is False
+        assert view.rebuilt_for is False, "the rebuild must see the restored value"
+
+    async def test_rebuild_is_skipped_when_the_render_lands(self):
+        view = self._ArmThenConfirm(interaction=_make_interaction(), user_id=1, guild_id=2)
+        self._wire(view)
+        calls = []
+
+        with view.restore_on_dropped_render("confirming", rebuild=lambda: calls.append(1)):
+            view.confirming = True
+            await view.refresh()
+
+        assert view.confirming is True
+        assert calls == []
+
+    async def test_a_non_callable_rebuild_is_rejected_at_the_call(self):
+        view = self._ArmThenConfirm(interaction=_make_interaction(), user_id=1, guild_id=2)
+
+        with pytest.raises(TypeError, match="must be callable"):
+            with view.restore_on_dropped_render("confirming", rebuild=42):
+                pass
+
+    async def test_an_async_rebuild_is_rejected_rather_than_left_unawaited(self):
+        """The restore runs at a synchronous exit and cannot await."""
+        view = self._ArmThenConfirm(interaction=_make_interaction(), user_id=1, guild_id=2)
+
+        async def _rebuild():
+            pass
+
+        with pytest.raises(TypeError, match="must be synchronous"):
+            with view.restore_on_dropped_render("confirming", rebuild=_rebuild):
+                pass
+
+    async def test_the_snapshot_holds_the_binding_not_the_contents(self):
+        """Documented contract: a name rebound comes back, in-place edits do not."""
+        view = self._ArmThenConfirm(interaction=_make_interaction(), user_id=1, guild_id=2)
+        self._wire(view, error=aiohttp.ClientOSError(104, "reset"))
+        view.rows = [1, 2]
+
+        with view.restore_on_dropped_render("rows"):
+            view.rows = view.rows + [3]
+            await view.refresh()
+
+        assert view.rows == [1, 2]
+
+
+class TestRebuiltTreeShipsOnTeardown:
+    """A farewell card composed before teardown has to reach the message.
+
+    The V2 teardown edit was gated on whether anything froze, which skips a
+    no-op PATCH for a display view that has no components to disable. A
+    caller that clears the tree and composes a closing card first has
+    nothing left to freeze either, so its card was dropped and the message
+    kept the live-looking controls the teardown was replacing. The next
+    press then landed on a stopped view and Discord reported it as failed.
+    """
+
+    def _wire(self, view):
+        message = MagicMock()
+        message.id = 4242
+        message.edit = AsyncMock()
+        message.delete = AsyncMock()
+        view._message = message
+        return message
+
+    async def test_exit_ships_a_tree_rebuilt_with_no_freezable_items(self):
+        view = RenderableLayoutView(interaction=_make_interaction(), user_id=1, guild_id=2)
+        view.add_item(ActionRow(StatefulButton(label="Accept")))
+        await view.send()
+        message = self._wire(view)
+
+        view.clear_items()
+        view.add_item(card("Challenge expired."))
+        await view.exit(delete_message=False)
+
+        message.edit.assert_awaited_once()
+
+    async def test_on_timeout_ships_a_tree_rebuilt_with_no_freezable_items(self):
+        view = RenderableLayoutView(interaction=_make_interaction(), user_id=1, guild_id=2)
+        view.add_item(ActionRow(StatefulButton(label="Accept")))
+        await view.send()
+        message = self._wire(view)
+
+        view.clear_items()
+        view.add_item(card("Challenge expired."))
+        await view.on_timeout()
+
+        message.edit.assert_awaited_once()
+
+    async def test_an_unchanged_display_view_still_skips_the_edit(self):
+        """The optimization the guard exists for has to survive the fix."""
+        view = RenderableLayoutView(interaction=_make_interaction(), user_id=1, guild_id=2)
+        await view.send()
+        message = self._wire(view)
+
+        await view.on_timeout()
+
+        message.edit.assert_not_called()
+
+    async def test_a_freezable_view_still_ships_its_disable_edit(self):
+        view = RenderableLayoutView(interaction=_make_interaction(), user_id=1, guild_id=2)
+        view.add_item(ActionRow(StatefulButton(label="Fire")))
+        await view.send()
+        message = self._wire(view)
+
+        await view.on_timeout()
+
+        message.edit.assert_awaited_once()

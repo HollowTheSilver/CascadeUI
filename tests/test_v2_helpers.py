@@ -2,7 +2,9 @@
 
 
 from io import BytesIO
+from unittest.mock import AsyncMock, MagicMock
 
+import aiohttp
 import discord
 import pytest
 from discord.components import MediaGalleryItem
@@ -16,7 +18,7 @@ from discord.ui import (
     TextDisplay,
     Thumbnail,
 )
-from helpers import make_interaction
+from helpers import RenderableLayoutView, make_interaction
 
 from cascadeui import (
     Choice,
@@ -112,6 +114,39 @@ class TestCard:
 
 
 # // ========================================( Action Section )======================================== // #
+
+
+class TestCardColour:
+    """``color=`` takes the int form its signature has always documented.
+
+    discord.py coerces an int in ``Embed.colour``'s setter but stores one
+    verbatim on ``Container.accent_colour``, so the builders coerce to keep
+    a single type in the tree.
+    """
+
+    def test_int_is_coerced_to_colour(self):
+        assert card("x", color=0xD4AF37).accent_colour == discord.Colour(0xD4AF37)
+
+    def test_colour_passes_through_untouched(self):
+        colour = discord.Colour(0xD4AF37)
+
+        assert card("x", color=colour).accent_colour is colour
+
+    def test_stats_card_coerces_the_same_way(self):
+        assert stats_card("T", {"a": 1}, color=0xD4AF37).accent_colour == discord.Colour(0xD4AF37)
+
+    def test_a_string_colour_is_rejected(self):
+        with pytest.raises(TypeError, match="card color must be a discord.Colour or an int"):
+            card("x", color="#D4AF37")
+
+    def test_a_bool_is_rejected(self):
+        # bool is an int subclass, so True would otherwise become Colour(1).
+        with pytest.raises(TypeError, match="got bool"):
+            card("x", color=True)
+
+    def test_an_out_of_range_int_is_rejected(self):
+        with pytest.raises(ValueError, match="between 0x000000 and 0xFFFFFF"):
+            card("x", color=0x1000000)
 
 
 class TestActionSection:
@@ -2007,3 +2042,55 @@ class TestPairSequenceAcceptance:
     def test_button_row_and_key_value_accept_pairs(self):
         assert [b.label for b in button_row([("Save", self._cb)]).children] == ["Save"]
         assert key_value([("k", "v")]).content == "**k:** v"
+
+
+class TestCompositeCursorRewindsWhenTheEditNeverLanded:
+    """The V2 composites hold their own cursor and repaint through the host.
+
+    Same shape as the paginated/wizard/tab patterns: state moves before the
+    host's edit ships, so a dropped edit leaves it pointing somewhere the
+    screen never went.
+    """
+
+    @staticmethod
+    def _host(child, *, kind):
+        class Host(RenderableLayoutView):
+            def __init__(self, *, child=None, **kw):
+                self.child = child
+                super().__init__(**kw)
+
+            def build_ui(self):
+                self.clear_items()
+                items = child.controls(self) if kind == "region" else child.render(self)
+                for item in items:
+                    self.add_item(item)
+
+        host = Host(child=child, interaction=make_interaction(), user_id=1, guild_id=2)
+        host.build_ui()
+        message = MagicMock()
+        message.id = 999
+        message.edit = AsyncMock(side_effect=aiohttp.ClientOSError(104, "reset"))
+        host._message = message
+        return host, message
+
+    async def test_paginated_region_rewinds_its_page(self):
+        region = PaginatedRegion(items=list(range(30)), per_page=5)
+        _host, message = self._host(region, kind="region")
+
+        await region._make_step(1)(make_interaction())
+        assert region.page == 0, "the cursor must stay on the slice still shown"
+
+        message.edit = AsyncMock()
+        await region._make_step(1)(make_interaction())
+        assert region.page == 1, "the recovery press advances one page, not two"
+
+    async def test_collapsible_rewinds_its_toggle(self):
+        collapsible = Collapsible(label="More", reveal=lambda: [TextDisplay("body")], key="c")
+        _host, message = self._host(collapsible, kind="collapsible")
+
+        await collapsible._toggle(make_interaction())
+        assert collapsible.expanded is False, "the trigger on screen never opened"
+
+        message.edit = AsyncMock()
+        await collapsible._toggle(make_interaction())
+        assert collapsible.expanded is True

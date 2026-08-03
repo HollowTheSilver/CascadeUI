@@ -1400,6 +1400,36 @@ class TestPostReadyRestore:
         view.on_restore = on_restore
         return view
 
+    async def test_the_repaint_runs_concurrently_bounded_by_restore_concurrency(self):
+        """Panels repaint in parallel, not one at a time.
+
+        The pass used to be serial because batch state was shared, so N panels
+        cost N repaints end to end. It is bounded rather than unbounded because
+        each repaint is a Discord edit.
+        """
+
+        class _FakeBot:
+            async def wait_until_ready(self):
+                return None
+
+        live = 0
+        peak = 0
+
+        async def _on_restore(bot):
+            nonlocal live, peak
+            live += 1
+            peak = max(peak, live)
+            await asyncio.sleep(0.01)
+            live -= 1
+
+        mgr = PersistenceManager(store=get_store(), bot=_FakeBot(), restore_concurrency=3)
+        views = [self._view(f"v-{i}", _on_restore) for i in range(9)]
+
+        await mgr._run_post_ready_restore(views)
+
+        assert peak > 1, "a serial pass would never see two in flight"
+        assert peak <= 3, "the semaphore bounds the burst against Discord"
+
     async def test_on_restore_waits_for_ready(self):
         events = []
         ready = asyncio.Event()

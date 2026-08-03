@@ -304,6 +304,10 @@ Edits the view's message with `view=self` plus any extra kwargs. Does NOT
 rebuild components -- call `build_ui()` first. Handles `discord.NotFound`
 silently. V2 callers pass no args; V1 callers pass `embed=` or `content=`.
 
+A transport failure (a request that never reached Discord) is swallowed
+rather than raised, and `refresh_degraded` reports it. See
+[Transport Failures Degrade Quietly](known-limitations.md#transport-failures-degrade-quietly).
+
 Only `content`, `embed`, `embeds`, `attachments`, and `allowed_mentions` are
 accepted. `refresh()` picks its edit endpoint at runtime, and a kwarg only one
 endpoint supports (`suppress`, `delete_after`) raises `TypeError` rather than

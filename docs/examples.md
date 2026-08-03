@@ -43,9 +43,9 @@ Registration form using `FormLayoutView` with native `text` fields, a dropdown s
 
 ### v2_pagination.py
 
-Paginated inventory viewer using `PaginatedLayoutView` with `from_data()`. Container-based page content with jump controls (first/last, go-to-page modal). Demonstrates `_build_extra_items()` for an exit button below navigation.
+Paginated inventory viewer using `PaginatedLayoutView`, showing both construction modes against the same data. `from_data()` chunks an in-memory list up front; `from_cursor()` fetches one page at a time through an async callable, caching pages in an LRU that protects the page on screen from eviction. Container-based page content with jump controls (first/last, go-to-page modal). Demonstrates `_build_extra_items()` for an exit button below navigation, and gives each mode its own view class so the two browsers do not compete for one `instance_limit` slot.
 
-**Command:** `/v2pages`
+**Commands:** `/v2pages` (eager), `/v2cursor` (cursor)
 
 ### v2_library.py
 
@@ -67,7 +67,7 @@ current repo data.
 
 ### v2_computed.py
 
-Quick poll demonstrating `@computed` for global memoized values that multiple views share without recalculating. Two `@computed` values derive vote totals and the current leader; the poll view reads both in `build_ui()` and displays them alongside the raw vote buttons. Contrast with `state_selector` (per-view change detection): computed values are global and shared across all views.
+Quick poll demonstrating `@computed` for global memoized values that multiple views share without recalculating. Two `@computed` values derive vote totals and the current leader; the poll view reads both in `build_ui()` and displays them alongside the raw vote buttons. Both key their result by guild, which is how a value the whole process shares still answers per guild. Contrast with `state_selector` (per-view change detection): computed values are global and shared across all views.
 
 **Command:** `/poll`
 
@@ -79,9 +79,9 @@ D&D character creator using `WizardLayoutView`. Six steps (Identity, Class, Abil
 
 ### v2_persistence.py
 
-A `PersistentRolesLayoutView`-based role selector panel that survives bot restarts. Categories are rendered as accent-colored containers, with exclusive-mode support (selecting one role in a category auto-removes the others). Running `/v2roles` again automatically cleans up the previous panel.
+A `PersistentRolesLayoutView`-based role selector panel that survives bot restarts. Categories are rendered as accent-colored containers, with exclusive-mode support (selecting one role in a category auto-removes the others). Running `/v2roles` again automatically cleans up the previous panel. `/v2visits` covers the other half of persistence: a per-user visit counter whose state is restored from disk rather than re-derived, so the count survives a restart.
 
-**Command:** `/v2roles`
+**Commands:** `/v2roles`, `/v2visits`
 
 ### v2_tictactoe.py
 
@@ -97,9 +97,9 @@ Open-join multi-user lobby demonstrating `participant_limit` with V2 components.
 
 ### v2_grids.py
 
-Display-only showcase for the grid helpers (`emoji_grid()` and `button_grid()`). Demonstrates grid construction from slash-command arguments, axis label presets, cell mutation, and `fill_rect()` -- all without surrounding game logic. For interactive grid usage, see `v2_battleship.py` and `v2_tictactoe.py`.
+Display-only showcase for the grid helpers (`emoji_grid()` and `button_grid()`). Demonstrates grid construction from slash-command arguments, axis label presets, cell mutation, and `fill_rect()` -- all without surrounding game logic. `/grid_gallery` renders eight variations across three messages for comparison, and `/image_gallery` covers the media side (`MediaGallery` plus a Thumbnail `Section` built from avatars). For interactive grid usage, see `v2_battleship.py` and `v2_tictactoe.py`.
 
-**Commands:** `/emoji_grid`, `/button_grid`
+**Commands:** `/emoji_grid`, `/button_grid`, `/grid_gallery`, `/image_gallery`
 
 ### v2_attachments.py
 

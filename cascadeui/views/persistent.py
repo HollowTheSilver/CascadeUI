@@ -227,7 +227,20 @@ class _PersistentMixin:
         if message is None:
             return message
 
-        await self._register_persistent(message)
+        # Same contract as the send pipeline's own post-send tail: the
+        # message exists, so a failure here is reported rather than raised.
+        # The consequence is named because it is invisible until the next
+        # restart, when the panel does not come back.
+        try:
+            await self._register_persistent(message)
+        except Exception as e:
+            logger.error(
+                f"{type(self).__name__} was sent, but registering persistence_key "
+                f"{self.persistence_key!r} raised {type(e).__name__}: {e}. The "
+                f"message is live and interactive, and will not be reattached "
+                f"after a restart.",
+                exc_info=e,
+            )
         return message
 
     async def exit(self, delete_message: bool | None = None):

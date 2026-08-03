@@ -5,11 +5,61 @@ import asyncio
 import copy
 import logging
 from functools import wraps
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Optional
 
 from .hooks import await_maybe
 
 logger = logging.getLogger(__name__)
+
+
+# // ========================================( Helpers )======================================== // #
+
+
+_COPY_ATOMS = (str, int, float, bool, type(None))
+
+
+def _copy_state(value: Any, memo: Optional[Dict[int, Any]] = None) -> Any:
+    """Deep-copy JSON-shaped state without ``copy.deepcopy``'s dispatch cost.
+
+    Store state is dicts, lists and scalars, because it round-trips through
+    ``json.dumps`` on the persistence path. ``copy.deepcopy`` cannot know
+    that: it consults ``__reduce_ex__`` and the copy dispatch table for every
+    node. Walking the two container shapes directly, passing scalars through,
+    and delegating anything else is most of the saving.
+
+    The memo is not part of the saving and is carried anyway, because dropping
+    it changes results rather than timing. ``copy.deepcopy`` keeps one to
+    terminate on a self-referential structure and to preserve a reference that
+    appears twice in the tree as one object on the other side; without it the
+    first recurses until the stack ends and the second silently becomes two
+    objects. Neither shape is reachable through the library's own writes, and
+    both are reachable through a value a caller stored.
+
+    Type tests are exact rather than ``isinstance`` so an ``IntEnum`` member,
+    a ``discord.Colour``, or a ``dict`` subclass keeps its own class through
+    the fallback instead of being flattened to the builtin it derives from.
+    """
+    kind = type(value)
+    if kind in _COPY_ATOMS:
+        return value
+    if memo is None:
+        memo = {}
+    seen = memo.get(id(value))
+    if seen is not None:
+        return seen
+    if kind is dict:
+        out = {}
+        memo[id(value)] = out
+        for key, item in value.items():
+            out[key] = item if type(item) in _COPY_ATOMS else _copy_state(item, memo)
+        return out
+    if kind is list:
+        out = []
+        memo[id(value)] = out
+        for item in value:
+            out.append(item if type(item) in _COPY_ATOMS else _copy_state(item, memo))
+        return out
+    return copy.deepcopy(value, memo)
 
 
 # // ========================================( Functions )======================================== // #
@@ -48,7 +98,20 @@ def cascade_reducer(action_type: str):
             # dict failed on being awaited, and the store logged the
             # TypeError and kept the old state. Same polarity as every
             # other seam that runs a caller's function.
-            return await await_maybe(func(action, copy.deepcopy(state)))
+            result = await await_maybe(func(action, _copy_state(state)))
+            if not isinstance(result, dict):
+                # The store assigns whatever comes back, so a reducer that
+                # forgot its ``return`` used to install ``None`` as the whole
+                # state and every later read failed somewhere else entirely.
+                # Raising here is caught by the store's own reducer guard,
+                # which logs and keeps the previous state, so the mistake
+                # names itself and costs one dispatch instead of the session.
+                raise TypeError(
+                    f"Reducer {func.__name__!r} for {action_type!r} returned "
+                    f"{type(result).__name__}, not a state dict. "
+                    f"Fix: end {func.__name__!r} with `return state`."
+                )
+            return result
 
         # Import lazily to avoid circular imports
         from ..state.singleton import get_store

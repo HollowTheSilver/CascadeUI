@@ -56,10 +56,13 @@ slow middleware used to inflate `reducer_ms` and misdirect attention.
 If `total_ms` is high, start with the largest phase:
 
 - **`reducer_ms` dominates** -- the reducer itself is slow. Check for
-  deepcopy usage (library reducers shallow-spread, but user reducers
-  registered via `@cascade_reducer` still deepcopy state on entry by
-  design; heavy computation should live in a selector or a computed
-  value, not the reducer).
+  deepcopy usage: library reducers shallow-spread, but a custom reducer
+  registered via `@cascade_reducer` still deepcopies state on entry by
+  design ("mutate freely" is the documented contract, and the copy is
+  what makes that safe). It is the largest fixed cost on a custom-reducer
+  dispatch, and it scales with how much state the store holds, not with
+  how much the reducer writes. Heavy computation should live in a
+  selector or a computed value, not the reducer.
 - **`middleware_ms` dominates** -- something in the chain is slow.
   Common culprits: a logging middleware writing synchronously, a
   persistence middleware serializing large state on every action
@@ -171,6 +174,34 @@ for this purpose; see the cross-view notification tests in
 flush requirement: views subscribe once and never block on subscriber
 completion mid-interaction.
 
+### Fan-out cost at scale
+
+Background subscriber notification is scheduled work, not free work --
+each subscribed view costs roughly 0.25ms of CPU on the event loop per
+dispatch it reacts to. A single dispatch is negligible at that rate.
+The ceiling shows up when the *subscriber count* grows with the
+deployment: a bot running hundreds of guilds with hundreds of
+persistent, always-subscribed views turns one broadcast-style dispatch
+(a global announcement, a scheduled sweep, anything that touches state
+every subscriber selects on) into a proportionally larger block of
+scheduling work on the same event loop that also has to ack every
+other bot's interactions within Discord's 3-second window.
+
+This is not a per-dispatch latency problem: the acting view's own
+refresh is unaffected, since it is awaited inline and every other
+subscriber runs in the background. It is an event-loop saturation
+problem: past the point where scheduled subscriber work outpaces the
+loop's spare capacity, the failure mode is bot-wide, not scoped to the
+view that dispatched. Interactions unrelated to the dispatch start
+missing the 3-second ack deadline because the loop is busy running
+notification callbacks. `state_selector()` is the mitigation -- a
+tight selector removes a subscriber from the fan-out entirely for
+dispatches it does not care about, which is the only lever that
+reduces subscriber *count* rather than per-subscriber cost. Watch the
+Subscriber card's `n` column at deployment scale, not just `p95`: a
+high `n` across many view classes is the signal that selectors are
+under-applied, even when no single subscriber looks slow.
+
 ---
 
 ## Exporting a Profile
@@ -227,17 +258,43 @@ dispatches that change `count` fire the update.
 
 ### Selector return value rules
 
-The selector's return value is compared with `==`. Anything hashable
-or comparable works:
+The store skips the subscriber when the selector's return value is
+unchanged. The comparison checks identity (`is`) first and falls back
+to equality (`==`) only when identity fails. Anything hashable or
+comparable works:
 
 - A scalar (`int`, `str`, `bool`, `None`)
 - A tuple of scalars
 - A `frozenset` of scalars
 
+The identity check is what makes a bare whole-bucket selector cheap:
+the built-in reducers shallow-spread, so a slice the current dispatch
+did not touch is the *same object* it was before, and `is` answers
+"unchanged" without walking it. Dict equality has no such shortcut of
+its own, so this is worth more than it looks: comparing a
+50,000-key dict to *itself* still walks every entry.
+
+Two things switch the shortcut off, and both are worth knowing before
+relying on it. A selector that builds a fresh container on every call
+(`dict(...)`, a comprehension, a manual snapshot) returns a new object
+whether or not the underlying data changed, so every comparison falls
+through to `==`. And a dispatch handled by a custom `@cascade_reducer`
+hands the reducer its own copy to mutate, which rebuilds every dict and
+list in the state. A slice that is a scalar or a tuple of scalars comes
+back as the same object and still matches by identity. Every
+bucket-shaped slice is a new object and falls through to `==` for that
+dispatch, whether or not the reducer touched it. Equality is still the
+backstop and it short-circuits on the first difference, so this costs
+the most when a large slice is *unchanged*, which is the case identity
+would otherwise have answered for free.
+
 Mutable collections compare by value in Python (`dict == dict` does
-element comparison), so returning a dict works, but returning a dict
-snapshot on every dispatch costs the comparison work on every call.
-Prefer a tuple of the specific keys the view cares about:
+element comparison), so returning a dict works. Both dict and tuple
+comparison stop at the first difference, so the cost that matters is
+the *matching* case, which has to walk to the end either way. Prefer a
+tuple of the specific keys the view cares about: it holds fewer
+elements than the bucket it came from, and each comparison is a slot
+read rather than a hash lookup.
 
 ```python
 def state_selector(self, state):

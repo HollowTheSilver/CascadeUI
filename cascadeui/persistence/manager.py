@@ -55,6 +55,7 @@ from ..exceptions import (
 )
 from ..state.actions import ActionCreators
 from ..utils.hooks import await_maybe
+from ..utils.responses import DISCORD_CALL_ERRORS
 from .config import (
     NAMESPACE_APPLICATION,
     NAMESPACE_REGISTRY,
@@ -516,9 +517,9 @@ class PersistenceManager:
         prepared = await asyncio.gather(*(_prepare(row) for row in rows))
 
         # Phase 2 (serial): construct + register each prepared view. Store
-        # mutation (add_view, _register_view, the registration batch) must
-        # stay serial -- concurrent dispatches would race the shared
-        # registries and the store's batch state.
+        # mutation (add_view, _register_view) must stay serial -- concurrent
+        # dispatches would race the shared registries. Batch state is
+        # task-scoped and is no longer a reason on its own.
         restored_views: list = []
         for item in prepared:
             if item is None:
@@ -692,13 +693,15 @@ class PersistenceManager:
             return None
         except (
             discord.Forbidden,
-            discord.HTTPException,
-            discord.RateLimited,
             discord.InvalidData,
+            *DISCORD_CALL_ERRORS,
         ) as exc:
-            # RateLimited and InvalidData are siblings of HTTPException, not
-            # subclasses; uncaught they would land the row in "failed" (never
-            # retried) instead of "unreachable" (retried next restart).
+            # RateLimited, InvalidData, and aiohttp's transport errors are all
+            # siblings of HTTPException rather than subclasses; uncaught they
+            # would land the row in "failed" (never retried) instead of
+            # "unreachable" (retried next restart). Transport matters most
+            # here: reattach runs at boot, which is exactly when the host may
+            # not have its connection yet.
             logger.debug(
                 f"Could not reach channel {channel_id} for {persistence_key!r} "
                 f"({type(exc).__name__}); leaving the entry for the next restart."
@@ -720,7 +723,7 @@ class PersistenceManager:
             logger.warning(f"Message {message_id} for {persistence_key!r} is gone; pruning entry.")
             removed_keys.append(persistence_key)
             return None
-        except (discord.Forbidden, discord.HTTPException, discord.RateLimited) as exc:
+        except (discord.Forbidden, *DISCORD_CALL_ERRORS) as exc:
             logger.warning(
                 f"Could not reach message {message_id} for {persistence_key!r} "
                 f"({type(exc).__name__}); leaving the entry for the next restart."
@@ -935,25 +938,34 @@ class PersistenceManager:
             )
             return
         start = time.monotonic()
-        rendered = 0
-        for view in views:
+        # Batch membership is task-scoped, so each panel's on_restore collects
+        # and flushes its own batch: rendering concurrently no longer folds
+        # independent panels into one false-nested batch where whichever
+        # finished last flushed them all. Bounded by ``restore_concurrency``,
+        # the ceiling the reattach fetch phase already uses, so a large
+        # install does not open its entire repaint against Discord at once.
+        semaphore = asyncio.Semaphore(self.restore_concurrency)
+
+        async def _render(view) -> bool:
             if view.is_finished():
-                continue
+                return False
             persistence_key = getattr(view, "_persistence_key", "?")
-            try:
-                async with self._store.batch(source_id=view.id):
-                    await await_maybe(view.on_restore(self._bot))
-                rendered += 1
-            except Exception as exc:
-                logger.error(
-                    f"on_restore failed for persistent view {persistence_key!r}: {exc}",
-                    exc_info=exc,
-                )
-        # The render loop is serial: each on_restore runs inside store.batch,
-        # whose depth/action state is instance-shared, so concurrency would
-        # interleave independent panels into false-nested batches. For many
-        # panels this is a slow repaint tail on already-interactive views, so
-        # surface its duration. Startup is unaffected (this runs post-ready).
+            async with semaphore:
+                try:
+                    async with self._store.batch(source_id=view.id):
+                        await await_maybe(view.on_restore(self._bot))
+                    return True
+                except Exception as exc:
+                    logger.error(
+                        f"on_restore failed for persistent view {persistence_key!r}: {exc}",
+                        exc_info=exc,
+                    )
+                    return False
+
+        rendered = sum(await asyncio.gather(*(_render(view) for view in views)))
+        # The repaint runs on already-interactive views, so its duration is
+        # surfaced rather than guarded. Startup is unaffected (this runs
+        # post-ready).
         if rendered:
             logger.info(
                 f"Post-ready restore rendered {rendered} view(s) in "

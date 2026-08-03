@@ -14,10 +14,12 @@ that multiple views can share without recalculating:
     - ``subscribed_actions`` + default ``on_state_changed()`` for
       automatic rebuild on cross-view state changes
 
-The poll stores raw votes in application state via a custom reducer.
-Two ``@computed`` values derive totals and the current leader. The
-view reads both in ``build_ui()`` and displays them alongside the
-raw vote buttons.
+The poll stores raw votes in application state via a custom reducer,
+keyed per guild so one bot serving several servers keeps each
+server's poll separate. Two ``@computed`` values derive per-guild
+totals and the current leader in one shared cache; the view reads its
+own guild's slice in ``build_ui()`` and displays it alongside the raw
+vote buttons.
 
 Commands:
     /poll   Open a quick poll
@@ -65,13 +67,16 @@ CHOICES = {
 
 @cascade_reducer("POLL_VOTE")
 async def poll_vote_reducer(action, state):
-    """Record a vote in application state.
+    """Record a vote in the voting guild's own bucket of application state.
 
-    Each user gets one vote. Changing your vote removes the old one.
-    The ``@cascade_reducer`` decorator auto-deepcopies state, so
-    mutations here are safe.
+    Each user gets one vote per guild. Changing your vote removes the
+    old one. The ``@cascade_reducer`` decorator auto-deepcopies state,
+    so mutations here are safe. ``access_slot``'s ``key=`` partitions
+    the bucket by guild: without it, every guild running this cog
+    would read and write the same votes dict, and a poll opened in one
+    server would show votes cast in another.
     """
-    poll = access_slot(state, "poll")
+    poll = access_slot(state, "poll", action["payload"]["guild_id"])
     poll.setdefault("votes", {})
     poll.setdefault("total_voters", 0)
 
@@ -114,37 +119,45 @@ async def poll_vote_reducer(action, state):
 # reading the same computed value share one cached result.
 
 
-@computed(selector=lambda s: s.get("application", {}).get("poll", {}).get("votes", {}))
-def vote_totals(votes):
-    """Derive per-choice vote counts from the raw votes dict.
+@computed(selector=lambda s: s.get("application", {}).get("poll", {}))
+def vote_totals(poll_by_guild):
+    """Derive per-choice vote counts for every guild's poll.
 
-    Without ``@computed``, every view would recalculate this on every
-    render. With it, the totals are computed once and cached until the
+    Returns ``{guild_id: {choice: count}}`` -- one cached computation
+    serves every guild's ``PollView``, and each view reads its own
+    ``guild_id`` key. Mirrors the per-guild ``@computed`` leaderboards
+    in the TicTacToe and Battleship examples. Without ``@computed``,
+    every view would recalculate this on every render; with it, the
+    totals are computed once per guild and cached until that guild's
     votes dict changes.
     """
-    return {lang: len(voters) for lang, voters in votes.items()}
+    return {
+        guild_id: {lang: len(voters) for lang, voters in data.get("votes", {}).items()}
+        for guild_id, data in poll_by_guild.items()
+    }
 
 
-@computed(selector=lambda s: s.get("application", {}).get("poll", {}).get("votes", {}))
-def poll_leader(votes):
-    """Derive the current leader (or None for a tie/empty).
+@computed(selector=lambda s: s.get("application", {}).get("poll", {}))
+def poll_leader(poll_by_guild):
+    """Derive the current leader (or None for a tie/empty) per guild.
 
-    Demonstrates a computed value that returns a derived scalar
-    rather than a transformed collection.
+    Returns ``{guild_id: leader_or_None}``. Demonstrates a computed
+    value that returns a derived scalar per key rather than a
+    transformed collection.
     """
-    if not votes:
-        return None
+    leaders = {}
+    for guild_id, data in poll_by_guild.items():
+        votes = data.get("votes", {})
+        counts = {lang: len(voters) for lang, voters in votes.items()}
+        max_count = max(counts.values(), default=0)
 
-    counts = {lang: len(voters) for lang, voters in votes.items()}
-    max_count = max(counts.values(), default=0)
+        if max_count == 0:
+            leaders[guild_id] = None
+            continue
 
-    if max_count == 0:
-        return None
-
-    leaders = [lang for lang, count in counts.items() if count == max_count]
-    if len(leaders) == 1:
-        return leaders[0]
-    return None  # Tie
+        top = [lang for lang, count in counts.items() if count == max_count]
+        leaders[guild_id] = top[0] if len(top) == 1 else None  # None on a tie
+    return leaders
 
 
 # // ========================================( Views )======================================== // #
@@ -189,10 +202,11 @@ class PollView(StatefulLayoutView):
         # Read computed values from the store's global cache.
         # ``store.computed["name"]`` calls ``ComputedValue.get(state)``
         # internally -- the selector checks if the input changed, and
-        # only then runs the compute function.
-        totals = store.computed["vote_totals"]
-        leader = store.computed["poll_leader"]
-        total_voters = read_slot(store.state, "poll", "total_voters", default=0)
+        # only then runs the compute function. Both values are keyed by
+        # guild, so this view reads only its own guild's slice.
+        totals = store.computed["vote_totals"].get(self.guild_id, {})
+        leader = store.computed["poll_leader"].get(self.guild_id)
+        total_voters = read_slot(store.state, "poll", self.guild_id, "total_voters", default=0)
 
         # Header card -- theme accent applied automatically via
         # the contextvars-based theme context set by build_ui wrapping
@@ -247,7 +261,7 @@ class PollView(StatefulLayoutView):
         async def callback(interaction):
             await self.dispatch(
                 "POLL_VOTE",
-                {"user_id": interaction.user.id, "choice": choice},
+                {"user_id": interaction.user.id, "choice": choice, "guild_id": self.guild_id},
             )
 
         return callback

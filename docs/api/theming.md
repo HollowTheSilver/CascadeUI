@@ -13,15 +13,22 @@ Theme(name, styles=None)
 
 | Property | Type | Default |
 |----------|------|---------|
-| `primary_color` | `discord.Color` | `Color.blue()` |
-| `secondary_color` | `discord.Color` | `Color.light_grey()` |
-| `success_color` | `discord.Color` | `Color.green()` |
-| `danger_color` | `discord.Color` | `Color.red()` |
-| `accent_colour` | `discord.Color` | same as `primary_color` |
+| `primary_color` | `discord.Color` or `int` | `Color.blue()` |
+| `secondary_color` | `discord.Color` or `int` | `Color.light_grey()` |
+| `success_color` | `discord.Color` or `int` | `Color.green()` |
+| `danger_color` | `discord.Color` or `int` | `Color.red()` |
+| `accent_colour` | `discord.Color` or `int` | same as `primary_color` |
 | `separator_spacing` | `str` | `"small"` |
 
 Additional properties can be set freely via the `styles` dict (e.g.
 `header_emoji`, `footer_text`, or custom keys).
+
+An `int` is stored as a `discord.Colour`, so `get_style()` returns the
+`Colour` for a style written as an int. Code comparing that value against the
+literal it passed needs `.value`; `Colour(0x5865F2) == 0x5865F2` is `False`
+rather than an error. A value outside `0x000000`-`0xFFFFFF` raises
+`ValueError` and a non-colour type raises `TypeError`, both naming the theme
+and the style key, at the point the style is set rather than at render.
 
 ### Instance Attributes
 

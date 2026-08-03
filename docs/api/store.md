@@ -76,10 +76,25 @@ internal `_register_state`) participates in the active batch. Nested
 `batch()` blocks absorb into the outermost batch; no intermediate
 `BATCH_COMPLETE` is emitted.
 
-**Exception semantics.** If the block raises, queued actions for this
-batch are discarded before the exception propagates -- subscribers do not
-see the partial sequence. Reducers have already executed, so state
-reflects completed dispatches up to the raise point.
+**Scope.** A batch belongs to the task that opened it. Nesting absorbs
+within one task, while two tasks batching concurrently keep separate
+queues and each fires its own `BATCH_COMPLETE` with its own `source_id`.
+A dispatch from an unrelated background task is never swallowed by a
+batch it knows nothing about.
+
+Because reducers commit inline, a dispatch from another task while a
+batch is open is notified against state that may include that batch's
+committed prefix. Every such state is a complete post-action state
+(reducers replace whole top-level keys, so there is no half-written value
+to observe), and `BATCH_COMPLETE` re-notifies with the final state when
+the batch closes.
+
+**Exception semantics.** `batch()` is a notification gate, not a
+transaction. Reducers run inline, so the dispatches before a raise have
+already changed state. Those are announced in one `BATCH_COMPLETE` and
+recorded on the undo stack, and the exception then propagates: state,
+subscribers, and undo all agree on the prefix that committed. Anything
+that must not survive the raise is rolled back by the block itself.
 
 **Profiling.** Per-dispatch profiling samples are suppressed inside a
 batch (individual `notify_ms` would be zero); the `BATCH_COMPLETE`
@@ -161,6 +176,10 @@ async def my_reducer(action, state):
     state["my_key"] = action["payload"]["value"]
     return state
 ```
+
+The `return state` is required, not stylistic: the store commits whatever the
+reducer hands back. Falling off the end raises `TypeError` naming the reducer
+and the action, which the store logs while keeping the previous state.
 
 ---
 

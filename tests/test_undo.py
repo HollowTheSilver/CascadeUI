@@ -1,5 +1,6 @@
 """Tests for undo/redo middleware and state snapshot restoration."""
 
+import asyncio
 import copy
 
 import pytest
@@ -7,6 +8,7 @@ from helpers import make_interaction as _make_interaction
 
 from cascadeui.state.actions import ActionCreators
 from cascadeui.state.middleware import UndoMiddleware
+from cascadeui.state.middleware.undo import _diff_application_slots
 from cascadeui.state.singleton import get_store
 from cascadeui.state.slots import access_slot, read_slot
 from cascadeui.views.layout import StatefulLayoutView
@@ -762,11 +764,11 @@ class TestUndoDepthProperties:
 class TestBatchUndoIntegration:
     """Batched dispatches produce a single undo entry per participating view.
 
-    ``UndoMiddleware.__call__`` skips snapshot capture while the store is
-    batching; ``BatchContext.__aexit__`` delegates to
-    ``UndoMiddleware.finalize_batch`` so exactly one snapshot of the
-    pre-batch state is pushed onto each participating view's stack when
-    the outermost batch commits.
+    ``UndoMiddleware.__call__`` captures a diff per action while a batch is
+    open but pushes nothing; ``BatchContext.__aexit__`` delegates to
+    ``UndoMiddleware.finalize_batch``, which merges those records
+    first-write-wins so exactly one snapshot lands on each participating
+    view's stack when the outermost batch commits.
     """
 
     async def _register_view(self, store, view_id, session_id, user_id, limit=20):
@@ -808,6 +810,43 @@ class TestBatchUndoIntegration:
         view = store.state["views"]["bv_1"]
         assert len(view["undo_stack"]) == 1
         assert store.state["application"]["counter"] == 3
+
+    async def test_concurrent_batches_do_not_share_undo_slots(self):
+        """One batch's slot writes stay out of a concurrent batch's undo entry.
+
+        Diffing a batch's entry snapshot against live state pulled in every
+        other open batch's writes, so an UNDO reverted slots the view had
+        never touched.
+        """
+        store = get_store()
+        _undo_mw = UndoMiddleware()
+        store._add_middleware(_undo_mw)
+        await _undo_mw.initialize(store)
+
+        await self._register_view(store, "iso_a", "iso_sa", user_id=1)
+        await self._register_view(store, "iso_b", "iso_sb", user_id=2)
+
+        async def write(action, state):
+            new = copy.deepcopy(state)
+            new["application"][action["payload"]["slot"]] = action["payload"]["value"]
+            return new
+
+        store._register_reducer("ISO_WRITE", write)
+
+        async def batched(view_id, slot):
+            async with store.batch(source_id=view_id):
+                # Yield first so both batches are genuinely open when either
+                # writes; dispatching on entry lets them serialise by luck.
+                await asyncio.sleep(0.01)
+                await store.dispatch("ISO_WRITE", {"slot": slot, "value": 1}, source_id=view_id)
+
+        await asyncio.gather(batched("iso_a", "slot_a"), batched("iso_b", "slot_b"))
+
+        entry_a = store.state["views"]["iso_a"]["undo_stack"][-1]["application_slots"]
+        entry_b = store.state["views"]["iso_b"]["undo_stack"][-1]["application_slots"]
+
+        assert set(entry_a) == {"slot_a"}
+        assert set(entry_b) == {"slot_b"}
 
     async def test_undo_after_batch_restores_pre_batch_state(self):
         """UNDO rewinds to the state visible at batch entry, not to any intermediate step."""
@@ -863,8 +902,88 @@ class TestBatchUndoIntegration:
         assert len(view["undo_stack"]) == 1
         assert store.state["application"]["n"] == 4
 
-    async def test_exception_inside_batch_pushes_no_undo(self):
-        """A batch aborted by exception drops its queued actions and pushes no snapshot."""
+    async def test_a_batched_shared_data_write_is_undoable_from_an_empty_session(self):
+        """A batch whose only change is shared_data still owes an undo entry.
+
+        The pre-state to restore here is an empty dict, so any guard keyed on
+        the truthiness of the captured shared_data drops exactly the case
+        where the batch created that data.
+        """
+        store = get_store()
+        _undo_mw = UndoMiddleware()
+        store._add_middleware(_undo_mw)
+        await _undo_mw.initialize(store)
+
+        await self._register_view(store, "bv_shared", "batch_shared", user_id=9)
+        assert store.state["sessions"]["batch_shared"].get("shared_data") == {}
+
+        async with store.batch(source_id="bv_shared"):
+            await store.dispatch(
+                "SESSION_UPDATED",
+                {"session_id": "batch_shared", "shared_data": {"k": "val"}},
+                source_id="bv_shared",
+            )
+
+        assert store.state["sessions"]["batch_shared"]["shared_data"] == {"k": "val"}
+        assert len(store.state["views"]["bv_shared"].get("undo_stack", [])) == 1
+
+        await store.dispatch("UNDO", {"view_id": "bv_shared", "session_id": "batch_shared"})
+        assert store.state["sessions"]["batch_shared"]["shared_data"] == {}
+
+    async def test_a_record_landing_on_an_actionless_ancestor_still_pushes(self):
+        """An ancestor batch can hold undo records without holding actions.
+
+        A dispatch resolves its batch before the middleware chain and queues
+        after it, while ``UndoMiddleware`` re-resolves the lineage afterwards.
+        When a chain suspends past the nested batch it started in, the action
+        is refused and notified immediately while the record lands on the
+        still-open ancestor. Returning early on an empty action list dropped
+        that snapshot for a change that had already committed.
+        """
+        store = get_store()
+        _undo_mw = UndoMiddleware()
+        store._add_middleware(_undo_mw)
+        await _undo_mw.initialize(store)
+
+        await self._register_view(store, "bv_anc", "batch_anc", user_id=11)
+
+        async def slow_middleware(action, state, next_fn):
+            if action["type"] == "LATE_WRITE":
+                await asyncio.sleep(0.02)
+            return await next_fn(action, state)
+
+        async def write(action, state):
+            new = copy.deepcopy(state)
+            new["application"]["k"] = action["payload"]["v"]
+            return new
+
+        store._add_middleware(slow_middleware)
+        store._register_reducer("LATE_WRITE", write)
+        try:
+
+            async def late():
+                await asyncio.sleep(0.005)
+                await store.dispatch("LATE_WRITE", {"v": 1}, source_id="bv_anc")
+
+            async with store.batch():  # ancestor: dispatches nothing itself
+                async with store.batch():  # nested: closes under the suspended chain
+                    spawned = asyncio.create_task(late())
+                    await asyncio.sleep(0.01)
+                await spawned
+        finally:
+            store._remove_middleware(slow_middleware)
+
+        assert store.state["application"]["k"] == 1
+        assert len(store.state["views"]["bv_anc"].get("undo_stack", [])) == 1
+
+    async def test_an_aborted_batch_is_undoable_up_to_the_raise(self):
+        """An abort commits its prefix, so that prefix owes an undo entry.
+
+        Reducers run inline, so the dispatches before the raise have already
+        changed state. Pushing no snapshot left that change with nothing able
+        to revert it, and an ``undo()`` would have reverted some earlier
+        change instead.
+        """
         store = get_store()
         _undo_mw = UndoMiddleware()
         store._add_middleware(_undo_mw)
@@ -885,8 +1004,12 @@ class TestBatchUndoIntegration:
                 await store.dispatch("SET_VAL", {"val": "changed"}, source_id="bv_4")
                 raise RuntimeError("abort")
 
+        assert store.state["application"]["val"] == "changed"
         view = store.state["views"]["bv_4"]
-        assert view.get("undo_stack", []) == []
+        assert len(view.get("undo_stack", [])) == 1
+
+        await store.dispatch("UNDO", {"view_id": "bv_4", "session_id": "batch_s4"})
+        assert store.state["application"]["val"] == "safe"
 
     async def test_enable_undo_false_receives_no_entry(self):
         """Views without enable_undo get no snapshot even when they dispatch inside a batch."""
@@ -1223,15 +1346,23 @@ class TestUndoSlotIsolation:
 
 
 class TestMissingSentinelDeepCopy:
-    """``_MISSING`` must survive ``copy.deepcopy`` without losing identity.
+    """``_MISSING`` must survive the reducer copy without losing identity.
 
     ``@cascade_reducer`` deep-copies state before every reducer. State
     contains undo-stack diffs that may carry ``_MISSING`` sentinels
-    (marking "this slot did not exist pre-action"). If deepcopy creates
+    (marking "this slot did not exist pre-action"). If the copy creates
     fresh ``object()`` instances in place of ``_MISSING``, the identity
     check ``target_value is _MISSING`` in ``_apply_slot_diff`` fails and
     the bare ``object()`` lands in the slot value, corrupting state for
     every subsequent reducer that reads the slot.
+
+    ``copy.deepcopy`` is the mechanism the sentinel defends against
+    directly, via ``__deepcopy__`` returning self. The reducer boundary
+    reaches it indirectly: ``_copy_state`` walks dicts and lists itself
+    and delegates everything else, so the sentinel rides the delegation.
+    That indirection is why the last test here drives a real dispatch
+    rather than the copy helper -- a fast path added to ``_copy_state``
+    would leave the direct ``copy.deepcopy`` tests green.
     """
 
     def test_deepcopy_preserves_identity(self):
@@ -1259,6 +1390,61 @@ class TestMissingSentinelDeepCopy:
         assert (
             copied["application_slots"]["settings"] is not snapshot["application_slots"]["settings"]
         )
+
+    async def test_the_sentinel_survives_a_custom_reducer_dispatch(self):
+        """A second custom-reducer dispatch copies a state holding ``_MISSING``.
+
+        The first dispatch adds a slot, so the undo diff records the
+        sentinel. The second routes that whole state through the reducer
+        copy. If the sentinel loses identity there, UNDO stores the bare
+        object AS the slot value instead of popping the slot.
+        """
+        from cascadeui.state.middleware.undo import _MISSING, _MissingSentinel
+        from cascadeui.utils.decorators import cascade_reducer
+
+        store = get_store()
+        undo_mw = UndoMiddleware()
+        store._add_middleware(undo_mw)
+        await undo_mw.initialize(store)
+
+        @cascade_reducer("SENTINEL_PROBE_ADD")
+        async def _add(action, state):
+            state["application"].setdefault("prefs", {})["theme"] = "dark"
+            return state
+
+        @cascade_reducer("SENTINEL_PROBE_OTHER")
+        async def _other(action, state):
+            state["application"]["counter"] = 1
+            return state
+
+        await store.dispatch("SESSION_CREATED", {"session_id": "sent_s", "user_id": 7})
+        await store.dispatch(
+            "VIEW_CREATED",
+            {
+                "view_id": "sent_v",
+                "view_type": "Test",
+                "user_id": 7,
+                "session_id": "sent_s",
+            },
+        )
+        store._undo_enabled_views["sent_v"] = 20
+
+        await store.dispatch("SENTINEL_PROBE_ADD", {}, source_id="sent_v")
+        diff = store.state["views"]["sent_v"]["undo_stack"][-1]["application_slots"]
+        assert diff["prefs"] is _MISSING, "the add must record the real sentinel"
+
+        await store.dispatch("SENTINEL_PROBE_OTHER", {}, source_id="sent_v")
+        carried = store.state["views"]["sent_v"]["undo_stack"][0]["application_slots"]
+        assert carried["prefs"] is _MISSING, "the reducer copy must preserve sentinel identity"
+
+        await store.dispatch("UNDO", {"view_id": "sent_v", "session_id": "sent_s"})
+        await store.dispatch("UNDO", {"view_id": "sent_v", "session_id": "sent_s"})
+
+        application = store.state["application"]
+        assert not isinstance(
+            application.get("prefs"), _MissingSentinel
+        ), "a sentinel landed in the slot instead of popping it"
+        assert "prefs" not in application
 
     async def test_undo_followed_by_dispatch_does_not_corrupt_application_slot(self):
         """End-to-end regression for the live-bot SETTINGS_UPDATED crash.
@@ -1320,3 +1506,159 @@ class TestMissingSentinelDeepCopy:
 
         result = StateStore.get_scoped_from(store.state, "user", user_id=7)
         assert result == {"theme": "light"}
+
+
+class TestUndoDiffSkipsUntouchedSlots:
+    """An untouched slot is the same object on both sides, not merely equal.
+
+    Reducers shallow-spread, so a slot the action did not write is identical
+    by reference. Dict equality has no identity shortcut, so comparing it
+    walked the whole slot to prove what ``is`` already answered -- making
+    every undo-tracked action cost O(all application data).
+    """
+
+    class _CountingDict(dict):
+        """Records equality comparisons so the skip can be asserted directly."""
+
+        compares = 0
+
+        def __eq__(self, other):
+            type(self).compares += 1
+            return super().__eq__(other)
+
+        def __ne__(self, other):
+            type(self).compares += 1
+            return super().__ne__(other)
+
+        __hash__ = None
+
+    def test_an_identical_sibling_is_never_compared(self):
+        sibling = self._CountingDict({"a": 1})
+        type(sibling).compares = 0
+        pre = {"scoped": {"x": 1}, "sibling": sibling}
+        post = {"scoped": {"x": 2}, "sibling": sibling}
+
+        diff = _diff_application_slots(pre, post)
+
+        assert type(sibling).compares == 0, "an identical slot must not be compared at all"
+        assert "sibling" not in diff
+        assert "scoped" in diff
+
+    def test_a_changed_slot_is_still_diffed(self):
+        pre = {"scoped": {"x": 1}}
+        post = {"scoped": {"x": 2}}
+
+        diff = _diff_application_slots(pre, post)
+
+        assert diff["scoped"] == {"x": 1}
+
+
+class TestUndoSkipsSnapshotsThatRestoreNothing:
+    """An entry that can put nothing back must not consume a stack slot.
+
+    ``undo_limit`` bounds the stack, so entries recording no change evict the
+    ones a user actually wants to reach. A view dispatching actions that write
+    no application slot (a selection change, a view-local toggle, a
+    re-render) cleared its own history without ever touching it.
+
+    The guard reads whether ``shared_data`` *changed*, not whether it holds
+    anything. Those come apart on the case that matters: an action creating a
+    session's first shared_data records a pre-value of ``{}``, which is falsy
+    and is exactly what an UNDO has to put back.
+    """
+
+    async def _setup(self, limit=3):
+        store = get_store()
+        store.state = store._build_initial_state()
+        store._middleware = []
+        mw = UndoMiddleware()
+        store._add_middleware(mw)
+        await mw.initialize(store)
+        await store.dispatch("SESSION_CREATED", {"session_id": "s", "user_id": 1})
+        store._undo_enabled_views["v1"] = limit
+        await store.dispatch(
+            "VIEW_CREATED",
+            {"view_id": "v1", "view_type": "T", "user_id": 1, "session_id": "s"},
+        )
+        store.state["application"]["real"] = {"n": 0}
+        return store
+
+    def _stack(self, store):
+        return store.state["views"]["v1"].get("undo_stack", [])
+
+    async def test_actions_writing_no_slot_do_not_evict_real_history(self):
+        from cascadeui.utils import cascade_reducer
+
+        store = await self._setup(limit=3)
+
+        @cascade_reducer("EVICT_REAL_WRITE")
+        def _real(action, state):
+            state["application"]["real"]["n"] += 1
+            return state
+
+        @cascade_reducer("EVICT_NOOP")
+        def _noop(action, state):
+            return state
+
+        await store.dispatch("EVICT_REAL_WRITE", {}, source_id="v1")
+        for _ in range(4):
+            await store.dispatch("EVICT_NOOP", {}, source_id="v1")
+
+        assert len(self._stack(store)) == 1
+        assert self._stack(store)[0]["application_slots"], "the real write must still be reachable"
+
+    async def test_a_session_gaining_its_first_shared_data_is_still_recorded(self):
+        store = await self._setup()
+
+        await store.dispatch(
+            "SESSION_UPDATED", {"session_id": "s", "shared_data": {"x": 1}}, source_id="v1"
+        )
+
+        stack = self._stack(store)
+        assert len(stack) == 1, "an empty pre-value is the restore target, not an absent one"
+        assert stack[0]["shared_data"] == {}
+
+    async def test_a_normal_slot_write_is_unaffected(self):
+        from cascadeui.utils import cascade_reducer
+
+        store = await self._setup()
+
+        @cascade_reducer("UNAFFECTED_WRITE")
+        def _real(action, state):
+            state["application"]["real"]["n"] += 1
+            return state
+
+        await store.dispatch("UNAFFECTED_WRITE", {}, source_id="v1")
+
+        assert len(self._stack(store)) == 1
+
+    async def test_a_batch_that_writes_and_reverts_pushes_nothing(self):
+        from cascadeui.utils import cascade_reducer
+
+        store = await self._setup()
+
+        @cascade_reducer("BATCH_SET")
+        def _set(action, state):
+            state["application"]["real"]["n"] = action["payload"]["n"]
+            return state
+
+        async with store.batch(source_id="v1"):
+            await store.dispatch("BATCH_SET", {"n": 9}, source_id="v1")
+            await store.dispatch("BATCH_SET", {"n": 0}, source_id="v1")
+
+        assert self._stack(store) == [], "the batch left the slot as it found it"
+
+    async def test_a_batch_that_changes_something_still_pushes(self):
+        from cascadeui.utils import cascade_reducer
+
+        store = await self._setup()
+
+        @cascade_reducer("BATCH_KEEP")
+        def _set(action, state):
+            state["application"]["real"]["n"] = action["payload"]["n"]
+            return state
+
+        async with store.batch(source_id="v1"):
+            await store.dispatch("BATCH_KEEP", {"n": 9}, source_id="v1")
+
+        assert len(self._stack(store)) == 1

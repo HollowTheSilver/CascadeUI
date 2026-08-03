@@ -325,9 +325,10 @@ bots running far from Discord's regions hit this more than ones
 running near them. The framework cannot mitigate platform-wide
 latency.
 
-**Distinct from a hung connection.** Everything above concerns slow
-*responses* -- Discord eventually replies. A connection that opens
-but never responds (a TCP-level hang) is a different failure, and
+**Distinct from a hung connection, and from a dropped one.** Everything
+above concerns slow *responses* -- Discord eventually replies. A
+connection that opens but never responds (a TCP-level hang) is a
+different failure, and
 discord.py issues edits with no total HTTP timeout. `edit_timeout`
 (default `60.0` seconds) bounds every refresh, navigation, and
 teardown edit so a hung socket is cancelled and the view recovers on
@@ -337,11 +338,94 @@ bound. Set `edit_timeout = None` to restore unbounded awaits, or
 raise it (e.g. `120.0`) for views that routinely upload large
 attachments.
 
+A request that never reached Discord at all is a third case and is
+classified separately, even when it surfaces as a timeout: aiohttp's
+connect and socket timeouts are `asyncio.TimeoutError` *and*
+`aiohttp.ClientError`, and the library reads them as transport rather
+than as a stalled edit. Those set `refresh_degraded`; a genuine
+`edit_timeout` cancellation does not. See
+[Transport Failures Degrade Quietly](#transport-failures-degrade-quietly).
+
 **On observing this at scale.** Run `/cascadeui perf` against real
 user load. If `notify_ms` p95 routinely exceeds
 `(auto_defer_delay - 1.0) * 1000` ms, the fast path is being
 cancelled often enough to be visible -- tune toward whatever
 threshold the data implies.
+
+---
+
+## Transport Failures Degrade Quietly
+
+A request can fail before Discord ever sees it: a reset connection, a
+dropped keep-alive, a DNS blip. These raise from aiohttp rather than
+discord.py, so they carry no HTTP status and are not `HTTPException`.
+CascadeUI treats them as a third sibling alongside `HTTPException` and
+`RateLimited`, and the response is always the same shape: **log a
+warning naming the cause, and carry on**. The alternative is raising
+out of a component callback, where the exception reaches `on_error`
+and renders a failure card over content that is perfectly fine.
+
+What that means per surface:
+
+| Surface | On a transport failure |
+|---|---|
+| `refresh()` | The edit is dropped and the render baseline is cleared, so the next state change re-ships the tree unconditionally. |
+| `send()`'s post-send message re-fetch | The message stays; `send()` returns it rather than reporting a live message as a failed send. |
+| `push()` / `pop()` | The channel endpoint is tried before giving up. If that fails too, the navigation rolls back and the source view stays live and clickable. |
+| `respond()` / `respond_safe()` | The reply is dropped. It is **not** retried on the followup path: whether the first send landed is unknowable from here, and a duplicate reply is worse than a missing transient notice. |
+| `open_modal()` | Returns `False`. The fallback notice is skipped, since it would travel the same broken connection. |
+
+**The cost is one missed update or one missed notice.** Nothing is
+left half-applied: state changes are already committed before the edit
+is attempted, so the next interaction renders from correct state.
+
+**Paging patterns rewind their own cursor.** A page, wizard step, or
+active tab moves before the repaint, so a dropped edit would otherwise
+leave the reader where they were with the cursor already moved, and the
+next press would skip past content they never saw. `PaginatedView`,
+`PaginatedLayoutView`, `WizardView`, `WizardLayoutView`, `TabView`,
+`TabLayoutView`, `PaginatedRegion`, and `Collapsible` all put the cursor
+back when the edit never landed, so the recovery press moves one step.
+The `on_*` hook is not re-fired: it reports the navigation the user asked
+for, which did happen; only the render did not.
+
+This covers cursor moves the reader drove. A data rebuild
+(`refresh_data`, `refresh_pages`, `rebuild_pages`) that shrinks the page
+count still clamps the cursor into the new range even if its edit is
+dropped, because the page the reader was on no longer exists. The render
+baseline is cleared either way, so the next refresh ships the corrected
+view.
+
+**A callback that changes the view before rendering owes the same
+rollback.** This is the case to watch in your own code, because the
+library cannot know which of your attributes should survive a render
+that never happened. The sharp shape is a control armed on one press
+and executed on the next: if the arming render is dropped, the button
+on screen still looks unarmed, so the obvious response is to press it
+again -- and that press executes, because the flag is already set. A
+dropped packet turns a two-press confirmation into one, on exactly the
+controls that ask for confirmation because they are destructive.
+
+`restore_on_dropped_render()` puts the rollback next to the write:
+
+```python
+with self.restore_on_dropped_render("_confirming"):
+    self._confirming = True
+    self.build_ui()
+    await self.refresh()
+```
+
+It snapshots each named attribute and rebinds it only when the render
+inside the block was dropped, so the flag and the screen cannot disagree.
+The snapshot holds the attribute's value, which makes flags and cursors
+the fit and a collection edited in place the exception. Reading
+`refresh_degraded` directly stays available for anything else.
+
+**Watch for these in logs** rather than in exception handlers. Every
+degradation above logs at `WARNING` through the `cascadeui` logger and
+names the underlying error, so `setup_logging()` surfaces them without
+any per-call-site handling. A burst of them means the host lost its
+connection to Discord, not that anything in the view is wrong.
 
 ---
 

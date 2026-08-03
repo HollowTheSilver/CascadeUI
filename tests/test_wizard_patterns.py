@@ -2,6 +2,7 @@
 
 from unittest.mock import AsyncMock, MagicMock
 
+import aiohttp
 import discord
 import pytest
 from discord.ui import Container, TextDisplay
@@ -870,3 +871,57 @@ class TestWizardRefreshContent:
         await view.reload()
         embed = view.refresh.call_args.kwargs.get("embed")
         assert embed is not None
+
+
+class TestStepCursorRewindsWhenTheEditNeverLanded:
+    """The step advances before the repaint, so a dropped edit desyncs them.
+
+    ``_refresh_wizard``'s own docstring names the hazard the unconditional
+    edit exists to prevent: the cursor advancing while the display keeps the
+    previous step. A swallowed transport failure reintroduces it, so the
+    cursor goes back to where the screen still is.
+    """
+
+    @staticmethod
+    def _wire(view):
+        view.interaction = _make_interaction()
+        view.user_id = 1
+        view.guild_id = 2
+        message = MagicMock()
+        message.id = 999
+        message.edit = AsyncMock()
+        view._message = message
+        return message
+
+    @pytest.mark.parametrize(
+        "cls,steps",
+        [
+            (
+                WizardLayoutView,
+                [
+                    {"name": "a", "builder": lambda: [TextDisplay("a")]},
+                    {"name": "b", "builder": lambda: [TextDisplay("b")]},
+                    {"name": "c", "builder": lambda: [TextDisplay("c")]},
+                ],
+            ),
+            (
+                WizardView,
+                [
+                    {"name": "a", "builder": lambda: discord.Embed(title="a")},
+                    {"name": "b", "builder": lambda: discord.Embed(title="b")},
+                ],
+            ),
+        ],
+        ids=["v2", "v1"],
+    )
+    async def test_a_dropped_next_does_not_skip_a_step(self, cls, steps):
+        view = cls(steps=steps)
+        message = self._wire(view)
+
+        message.edit = AsyncMock(side_effect=aiohttp.ClientOSError(104, "reset"))
+        await view._go_next(_make_interaction())
+        assert view._current_step == 0, "the cursor must stay on the step still shown"
+
+        message.edit = AsyncMock()
+        await view._go_next(_make_interaction())
+        assert view._current_step == 1, "the recovery press advances one step, not two"

@@ -1438,6 +1438,27 @@ class TestParentKwarg:
         with pytest.raises(ValueError, match="Circular attachment"):
             c.attach_child(a)
 
+    async def test_the_circular_message_distinguishes_two_of_one_class(self):
+        """Two instances of the same view class share a type name.
+
+        The bare class name doesn't distinguish the ancestor from the new
+        child, so the message carries each view's id and the chain that
+        connects them.
+        """
+        a = StatefulView(interaction=_make_interaction())
+        await a.send()
+        b = StatefulView(interaction=_make_interaction())
+        await b.send()
+        a.attach_child(b)
+
+        with pytest.raises(ValueError) as excinfo:
+            b.attach_child(a)
+
+        message = str(excinfo.value)
+        assert a.id in message and b.id in message
+        assert "Chain:" in message
+        assert "Fix:" in message
+
     async def test_parent_kwarg_invalid_type_raises(self):
         """parent= rejects non-view values at construction time."""
         with pytest.raises(TypeError, match="parent= must be"):

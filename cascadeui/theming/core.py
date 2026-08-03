@@ -6,7 +6,20 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
 import discord
 from discord import Color
 
-from ..utils.guards import normalize_mapping
+from ..utils.guards import coerce_colour, normalize_mapping
+
+# // ========================================( Constants )======================================== // #
+
+
+# Style keys whose value reaches a discord.py colour parameter. Coerced at
+# construction so every reader of a theme colour sees one type.
+_COLOUR_STYLE_KEYS = (
+    "primary_color",
+    "secondary_color",
+    "success_color",
+    "danger_color",
+    "accent_colour",
+)
 
 # // ========================================( Classes )======================================== // #
 
@@ -51,6 +64,17 @@ class Theme:
             self.styles["accent_colour"] = self.styles.get("primary_color")
         if "separator_spacing" not in self.styles:
             self.styles["separator_spacing"] = "small"
+
+        # Runs after the defaults so a derived ``accent_colour`` is covered
+        # too. discord.py coerces an int in ``Embed.colour``'s setter but
+        # stores one verbatim on ``Container.accent_colour``, so a hex
+        # literal that themes a V1 embed would otherwise reach a V2
+        # container as a bare int.
+        for key in _COLOUR_STYLE_KEYS:
+            if key in self.styles:
+                self.styles[key] = coerce_colour(
+                    self.styles[key], owner="Theme", param=f"styles[{key!r}]"
+                )
 
     def get_style(self, key: str, default: Any = None) -> Any:
         """Get a style value from the theme."""

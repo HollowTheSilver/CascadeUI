@@ -5,6 +5,7 @@
 
 from unittest.mock import AsyncMock, MagicMock
 
+import aiohttp
 import discord
 import pytest
 
@@ -546,3 +547,58 @@ class TestRespondSafe:
         await respond_safe(interaction, "hi", ephemeral=True)
         interaction.followup.send.assert_awaited_once()
         interaction.response.send_message.assert_not_awaited()
+
+
+class _RoleErrorProbeView(RolesLayoutView):
+    """Declared once: category names are globally unique per process, so a
+    class defined inside a parametrized test would collide with itself."""
+
+    categories = [RoleCategory(name="ProbeErrColors", roles={"Blue": 123})]
+    seen: list = []
+
+    @classmethod
+    async def on_role_error(cls, interaction, exc):
+        cls.seen.append(type(exc).__name__)
+
+
+class TestRoleErrorsRouteThroughTheHook:
+    """`_RoleToggleButton` is a DynamicItem with no `_scheduled_task` beneath it.
+
+    An exception escaping `_handle_role_click` therefore reaches the user as a
+    bare "interaction failed" rather than through `on_role_error`, so the catch
+    owes every sibling of `HTTPException` -- including the transport errors
+    that carry no HTTP status at all.
+    """
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            discord.HTTPException(MagicMock(status=500), "boom"),
+            discord.RateLimited(retry_after=1.0),
+            aiohttp.ClientOSError(104, "reset"),
+            aiohttp.ConnectionTimeoutError("connect"),
+        ],
+        ids=["http", "ratelimited", "reset", "connect-timeout"],
+    )
+    async def test_every_failure_shape_reaches_on_role_error(self, error):
+        _RoleErrorProbeView.seen = []
+
+        role = MagicMock()
+        role.id = 123
+        role.name = "Blue"
+        member = MagicMock()
+        member.roles = []
+        member.add_roles = AsyncMock(side_effect=error)
+        member.remove_roles = AsyncMock(side_effect=error)
+
+        interaction = MagicMock()
+        interaction.guild.get_role.return_value = role
+        interaction.user = member
+
+        await _RoleErrorProbeView._handle_role_click(
+            interaction, _RoleErrorProbeView.categories[0], 123
+        )
+
+        assert _RoleErrorProbeView.seen == [
+            type(error).__name__
+        ], "the hook must see it, not the user"

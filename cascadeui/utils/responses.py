@@ -5,19 +5,29 @@ import asyncio
 import logging
 from typing import Optional
 
+import aiohttp
 import discord
 
 logger = logging.getLogger(__name__)
 
 # Every way a Discord call reports that it did not land. ``RateLimited``
 # is a sibling of ``HTTPException`` rather than a subclass, so catching
-# the latter alone misses it -- and it is raised whenever the client was
+# the latter alone misses it. It is raised whenever the client was
 # built with ``max_ratelimit_timeout`` and a bucket exceeds it, which is
-# a supported upstream option, not an exotic one. Catch this tuple at
-# any seam that must survive a failed call; catch ``InteractionResponded``
-# separately, since at an ack it means the work is already done and at an
-# edit it means to try another endpoint.
-DISCORD_CALL_ERRORS = (discord.HTTPException, discord.RateLimited)
+# a supported upstream option, not an exotic one. ``aiohttp.ClientError``
+# is the third sibling: a request that never reached Discord raises from
+# the transport rather than from discord.py, so a reset connection or a
+# dropped keep-alive carries none of the HTTP types. It is the umbrella
+# rather than ``OSError`` for two reasons: ``ServerDisconnectedError``
+# is a ``ClientError`` and NOT an ``OSError``, and ``asyncio.TimeoutError``
+# IS an ``OSError`` from 3.11 but not on 3.10, so an ``OSError`` clause
+# would mean different things across the supported interpreters and would
+# swallow the ack-deadline timeouts these seams handle separately.
+#
+# Catch this tuple at any seam that must survive a failed call; catch
+# ``InteractionResponded`` separately, since at an ack it means the work
+# is already done and at an edit it means to try another endpoint.
+DISCORD_CALL_ERRORS = (discord.HTTPException, discord.RateLimited, aiohttp.ClientError)
 
 # // ========================================( Functions )======================================== // #
 
@@ -28,11 +38,16 @@ def describe_discord_error(exc: BaseException) -> str:
     ``RateLimited`` carries ``retry_after`` and neither ``status`` nor
     ``code``, so a log line written for ``HTTPException`` prints two
     question marks and hides the one number that explains the failure.
+    A transport error carries neither either, and the exception type is
+    the whole diagnosis: a reset connection and a refused one read the
+    same as ``status=? code=?``.
     """
     if isinstance(exc, discord.RateLimited):
         return f"rate limited, retry_after={exc.retry_after:.1f}s"
     if isinstance(exc, discord.InteractionResponded):
         return "interaction already acknowledged"
+    if isinstance(exc, aiohttp.ClientError):
+        return f"transport failure before Discord answered ({type(exc).__name__}: {exc})"
     return f"status={getattr(exc, 'status', '?')} code={getattr(exc, 'code', '?')}"
 
 
@@ -234,11 +249,24 @@ async def open_modal_safe(
             return True
         except discord.InteractionResponded:
             pass
+        except aiohttp.ClientError as e:
+            # The request never reached Discord, so the dialog did not open
+            # and the fallback would travel the same broken connection.
+            # Report non-delivery rather than raising: the caller is a
+            # component callback, where an escaping exception renders an
+            # error card over a click that merely needs repeating.
+            logger.warning(
+                f"Modal {modal.title!r} did not reach Discord: " f"{describe_discord_error(e)}"
+            )
+            return False
         except discord.HTTPException as e:
             if getattr(e, "code", None) != 40060:
                 raise
     msg = fallback_message or "Could not open the dialog. Please try again."
-    await interaction.followup.send(msg, ephemeral=True)
+    try:
+        await interaction.followup.send(msg, ephemeral=True)
+    except aiohttp.ClientError as e:
+        logger.warning(f"Modal fallback notice did not reach Discord: {describe_discord_error(e)}")
     return False
 
 
@@ -284,6 +312,15 @@ async def respond_safe(
             # so the check passing does not mean the send will. Falling through
             # to the followup path delivers the same reply either way.
             pass
+        except aiohttp.ClientError as e:
+            # The request never reached Discord, so whether the reply landed
+            # is unknowable from here. The followup path is not retried: if
+            # the send did arrive, a second copy is worse than the missing
+            # one, and this is a transient notice either way. Raising is the
+            # worst of the three -- it renders an error card over a reply the
+            # user may already be reading.
+            logger.warning(f"Reply did not reach Discord: {describe_discord_error(e)}")
+            return
         except discord.HTTPException as e:
             if getattr(e, "code", None) != 40060:
                 raise
@@ -296,21 +333,28 @@ async def respond_safe(
     # backstop fired first, outside the caller's control. Rather than
     # let the same call crash only sometimes, the timer is run here.
     delete_after = kwargs.pop("delete_after", None)
-    if delete_after is None:
-        await interaction.followup.send(content, ephemeral=ephemeral, **kwargs)
+    try:
+        if delete_after is None:
+            await interaction.followup.send(content, ephemeral=ephemeral, **kwargs)
+            return
+
+        # wait=True is what makes followup.send return the Message the timer
+        # below needs a handle on.
+        message = await interaction.followup.send(content, ephemeral=ephemeral, wait=True, **kwargs)
+    except aiohttp.ClientError as e:
+        # Same contract as the response path above: a notice that never left
+        # the host is logged, not raised into the caller's callback.
+        logger.warning(f"Followup reply did not reach Discord: {describe_discord_error(e)}")
         return
 
-    # wait=True is what makes followup.send return the Message the timer
-    # below needs a handle on.
-    message = await interaction.followup.send(content, ephemeral=ephemeral, wait=True, **kwargs)
-
     async def _delete_later() -> None:
-        # RateLimited is a sibling of HTTPException, not a subclass, so it
-        # needs naming; NotFound is a subclass and does not.
+        # RateLimited and aiohttp's transport errors are siblings of
+        # HTTPException, not subclasses, so they need naming; NotFound is a
+        # subclass and does not.
         try:
             await asyncio.sleep(delete_after)
             await message.delete()
-        except (discord.HTTPException, discord.RateLimited) as e:
+        except DISCORD_CALL_ERRORS as e:
             logger.debug(f"delete_after cleanup failed for a followup: {e!r}")
 
     def _report(task) -> None:
