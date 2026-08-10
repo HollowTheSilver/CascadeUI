@@ -2,7 +2,8 @@
 
 :class:`InMemoryBackend` implements the full :class:`PersistenceBackend`
 Protocol using plain Python dicts as storage. Declares every capability
-flag, so any namespace config works against it without configuration.
+flag except ``RAW_SQL``, so any namespace config works against it
+without configuration.
 
 Two intended uses:
 
@@ -29,8 +30,10 @@ from ..protocols import Capability
 class InMemoryBackend:
     """Dict-backed implementation of :class:`PersistenceBackend`.
 
-    Declares every capability flag so namespace configs that require
-    ``RELATIONAL`` or ``TTL_INDEX`` work unchanged. Single-writer asyncio
+    Declares every capability flag except ``RAW_SQL``, so namespace
+    configs that require ``RELATIONAL`` or ``TTL_INDEX`` work unchanged.
+    Rows are open mappings (``Capability.OPEN_ROWS``): unknown columns
+    round-trip and a missing one reads as ``None``. Single-writer asyncio
     semantics are assumed -- concurrent access from multiple event loops
     is not supported.
 
@@ -49,6 +52,10 @@ class InMemoryBackend:
         | Capability.RELATIONAL
         | Capability.TTL_INDEX
         | Capability.SCHEMA_META
+        # OPEN_ROWS: rows are plain dicts, so a schema migration that adds
+        # a column has nothing to alter -- a key that was never written
+        # already reads as None. The migration runner skips DDL on this flag.
+        | Capability.OPEN_ROWS
         # Capability.RAW_SQL deliberately omitted -- in-memory storage
         # has no SQL engine to escape to. Code paths that require raw SQL
         # must check `Capability.RAW_SQL in backend.capabilities` first.

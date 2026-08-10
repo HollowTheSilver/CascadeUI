@@ -149,6 +149,49 @@ class TestCardColour:
             card("x", color=0x1000000)
 
 
+class TestCardContainerChild:
+    """card() rejects a Container child at construction.
+
+    A Container is never a legal Container child, so the mistake is
+    decidable at the composing call. Before the guard it constructed
+    silently and failed at whichever seam shipped the view, as a placement
+    rejection naming Container indexes rather than the call -- on a pushed
+    screen, a failed navigation.
+    """
+
+    def test_alert_child_rejected_naming_position(self):
+        with pytest.raises(ValueError, match="card: child 1 is a Container"):
+            card("## Display", alert("none yet", level="info"))
+
+    def test_nested_card_rejected(self):
+        with pytest.raises(ValueError, match="Container inside a Container"):
+            card(card("inner"))
+
+    def test_stats_card_child_rejected(self):
+        with pytest.raises(ValueError, match="card: child 0 is a Container"):
+            card(stats_card("T", {"a": 1}))
+
+    def test_raw_container_child_rejected(self):
+        with pytest.raises(ValueError, match="card: child 0 is a Container"):
+            card(Container(TextDisplay("x")))
+
+    def test_container_subclass_rejected_naming_subclass(self):
+        class BrandedContainer(Container):
+            pass
+
+        with pytest.raises(ValueError, match="BrandedContainer"):
+            card("heading", BrandedContainer(TextDisplay("x")))
+
+    def test_message_names_sibling_placement_as_the_fix(self):
+        with pytest.raises(ValueError, match="sibling"):
+            card("x", alert("y"))
+
+    def test_container_legal_children_still_accepted(self):
+        result = card("## T", TextDisplay("body"), Separator(), ActionRow())
+        assert isinstance(result, Container)
+        assert len(result.children) == 4
+
+
 class TestActionSection:
     """action_section() creates a Section with a StatefulButton accessory."""
 
@@ -1139,6 +1182,79 @@ class TestPaginatedRegionControlButtons:
         region = PaginatedRegion(per_page=2, items=list(range(10)), key="big")
         with pytest.raises(ValueError):
             ActionRow(*region.control_buttons(view), view.make_back_button())
+
+
+class TestCompositeHostAccessor:
+    """Both stateful composites expose the captured host as read-only ``host``.
+
+    ``on_page_changed`` / ``on_toggle`` overrides that prefetch or respond
+    need the host, and the documented public surface previously offered no
+    path to it -- consumers reached into ``_view``. Mirrors the
+    ``_BaseLeaderboardMixin.bot`` property: a read-only accessor over the
+    private capture.
+    """
+
+    def test_region_host_none_before_attach(self):
+        region = PaginatedRegion(per_page=2, items=list(range(6)))
+        assert region.host is None
+
+    def test_region_host_set_by_controls(self):
+        region = PaginatedRegion(per_page=2, items=list(range(6)))
+        host = _FakeHost()
+        region.controls(host)
+        assert region.host is host
+
+    def test_region_host_set_by_control_buttons(self):
+        region = PaginatedRegion(per_page=2, items=list(range(6)))
+        host = _FakeHost()
+        region.control_buttons(host)
+        assert region.host is host
+
+    def test_region_host_is_read_only(self):
+        region = PaginatedRegion(per_page=2, items=list(range(6)))
+        with pytest.raises(AttributeError):
+            region.host = _FakeHost()
+
+    async def test_region_hook_reads_host_on_page_turn(self):
+        seen = []
+
+        class Prefetching(PaginatedRegion):
+            async def on_page_changed(self, page):
+                seen.append(self.host)
+
+        region = Prefetching(per_page=2, items=list(range(6)))
+        host = _FakeHost()
+        region.controls(host)
+        await region._make_step(1)(make_interaction())
+        assert seen == [host]
+
+    def test_collapsible_host_none_before_render(self):
+        collapsible = Collapsible(label="More", reveal=lambda: TextDisplay("body"))
+        assert collapsible.host is None
+
+    def test_collapsible_host_set_by_render(self):
+        collapsible = Collapsible(label="More", reveal=lambda: TextDisplay("body"))
+        host = _FakeHost()
+        collapsible.render(host)
+        assert collapsible.host is host
+
+    def test_collapsible_host_is_read_only(self):
+        collapsible = Collapsible(label="More", reveal=lambda: TextDisplay("body"))
+        with pytest.raises(AttributeError):
+            collapsible.host = _FakeHost()
+
+    async def test_collapsible_hook_reads_host_on_toggle(self):
+        seen = []
+
+        class Loading(Collapsible):
+            async def on_toggle(self, expanded):
+                seen.append(self.host)
+
+        collapsible = Loading(label="More", reveal=lambda: TextDisplay("body"))
+        host = _FakeHost()
+        collapsible.render(host)
+        await collapsible._toggle(make_interaction())
+        assert seen == [host]
 
 
 class TestPaginatedRegionLabels:

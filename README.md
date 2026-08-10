@@ -79,7 +79,7 @@ CascadeUI ports Redux's mental model onto Discord. Most core primitives have a c
 | Middleware chain | `applyMiddleware` |
 | `PersistenceMiddleware` | `redux-persist` (opt-in per slot) |
 
-**Full treatment:** [`guide/concepts.md`](https://hollowthesilver.github.io/CascadeUI/guide/concepts/) walks through each mapping in depth, including where the two diverge - middleware is async, state persists across bot restarts (Discord messages outlive your code), and Discord's platform layer (ephemeral 15-minute wall, webhook tokens, rate limits) has no React/Redux equivalent.
+The table is the whole mapping; the analogues stop being useful where Discord's platform does not resemble a browser. Middleware is async, state outlives the process because Discord messages do, and the interaction model (a three-second acknowledgement wall, webhook tokens that expire at fifteen minutes, per-channel rate limits) has no React or Redux equivalent. Those are covered on their own terms in [Core Concepts](https://hollowthesilver.github.io/CascadeUI/guide/concepts/) under Data Flow, State Topology, and Discord Interactions, rather than as a comparison.
 
 </details>
 

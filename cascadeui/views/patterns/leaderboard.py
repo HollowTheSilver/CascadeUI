@@ -16,7 +16,7 @@ from ...components.patterns.v2 import (
     image_section,
 )
 from ...components.types import MediaInput
-from ..base import _StatefulMixin
+from ..base import RenderOutcome, _StatefulMixin
 from ..persistent import _PersistentMixin
 from .paginated import PaginatedLayoutView, _BasePaginatedMixin
 
@@ -509,7 +509,10 @@ class _BaseLeaderboardMixin:
         The returned components render inside the rankings card, so
         they must be Container-legal children (``gallery(...)``,
         ``TextDisplay``, ``Section``; a nested ``card(...)`` is rejected
-        by the placement validator). Pages rebuild only when the entry
+        by ``card()`` itself during the page build). The empty-state
+        page has no rankings card, so the masthead renders at the page's
+        top level there; the same components stay legal. Pages rebuild
+        only when the entry
         signature changes, so a masthead that depends on data outside
         the entries needs ``reload(force=True)`` -- the same contract as
         the other frame hooks.
@@ -548,7 +551,10 @@ class _BaseLeaderboardMixin:
         here: the value is placed as given. Read ``self.ranked_entries``
         for aggregate stats; an Overview ``stats_card(...)`` is the
         typical use. Return a single V2 component, a list of components, or
-        ``None`` (default) for no header.
+        ``None`` (default) for no header. On the empty-state page the
+        return renders above the masthead, at the page's top level;
+        ``ranked_entries`` is empty there, so a hook computing aggregates
+        must tolerate an empty slice.
 
         Pages rebuild only when the entry signature changes, so a header
         that depends on data outside the entries needs ``reload(force=True)``.
@@ -570,7 +576,10 @@ class _BaseLeaderboardMixin:
         rankings. Return a single component, a list (each item placed by
         its own type), or ``None`` (default) for no footer.
 
-        The rebuild caveat on :meth:`build_header` applies identically.
+        The rebuild caveat on :meth:`build_header` applies identically. On
+        the empty-state page there is no rankings card to fold into, so
+        every footer component (raw or ``Container``) renders at the
+        page's top level below the empty-state content, in returned order.
         """
         return None
 
@@ -579,14 +588,31 @@ class _BaseLeaderboardMixin:
             return self.leaderboard_per_page
         return self.leaderboard_top_n
 
-    def on_leaderboard_empty(self) -> list:
-        """Return the V2 component list shown when no entries exist.
+    def on_leaderboard_empty(self) -> Union[Item, List[Item]]:
+        """Return the V2 components shown when no entries exist.
 
         Default wraps ``leaderboard_empty_message`` in a single card.
         Override to provide a richer empty state: an intro card with a
         call-to-action, a stats legend, or a "play your first game"
-        button. Returns any V2 component list that should render as the
-        sole page while the leaderboard is empty.
+        button. Returns the V2 component list that should render as the
+        sole page while the leaderboard is empty; a single component is
+        accepted and wrapped, same as a page value.
+
+        The masthead (``banner`` / ``title``, or whatever ``build_title``
+        returns) is composed above this return rather than inside it, so
+        the board keeps its identity while empty and an override inherits
+        it without composing it. ``build_title`` returning ``[]`` renders
+        no masthead on this page, same as on any other. The
+        ``build_header`` / ``build_footer`` frames compose around this
+        return the same way: header components render above the masthead,
+        footer components below this return. There is no rankings card
+        here, so every frame component sits at the page's top level in
+        returned order -- a raw footer floats below the empty-state
+        content instead of folding into a card.
+
+        ``ranked_entries`` is empty here, so a hook that reads it for
+        aggregate stats sees an empty board rather than the last
+        populated build's slice.
 
         Returns:
             A list of V2 components that become the single empty-state
@@ -635,7 +661,29 @@ class _BaseLeaderboardMixin:
         entries = _normalize_entries(self.get_entries(), type(self).__name__, "get_entries()")
 
         if not entries:
-            return [self.on_leaderboard_empty()]
+            # Cleared before the masthead and frames compose, so a hook
+            # reading ranked_entries sees an empty board rather than the
+            # slice from the last populated build.
+            self._ranked_entries = []
+            items = self._build_masthead(0)
+            if items and self.show_title_divider:
+                items.append(divider())
+            # The frames run here for the same reason the masthead does: the
+            # board keeps its frame while empty, and an override inherits it
+            # rather than having to know it was lost. There is no rankings
+            # card on this page, so the return-type fold has nothing to fold
+            # into: header components render above the masthead (mirroring
+            # their above-the-card placement), footer components below the
+            # empty-state content, each in returned order at the page's top
+            # level.
+            header = _as_frame_items(self.build_header(0))
+            footer = _as_frame_items(self.build_footer(0))
+            # The empty-state content is composed here rather than inside the
+            # default hook -- see on_leaderboard_empty. Routed through
+            # _resolve_page so the same non-list shapes (bare component,
+            # string) every page value accepts also work on an override's
+            # return.
+            return [[*header, *items, *self._resolve_page(self.on_leaderboard_empty()), *footer]]
 
         top = entries[: self.leaderboard_top_n]
         # Expose the loaded top-N slice so build_header / build_footer /
@@ -918,12 +966,16 @@ class LeaderboardLayoutView(_BaseLeaderboardMixin, PaginatedLayoutView):
         signature = self._entries_signature_for(entries)
         if not force and signature == getattr(self, "_entries_signature", None) and self.pages:
             return
+        pages = await self._build_leaderboard_pages()
+        # Stamped only after the build returns: a raising hook (an avatar
+        # resolver, a frame hook) leaves the signature unstamped, so the next
+        # rebuild retries instead of short-circuiting onto the stale pages.
         self._entries_signature = signature
-        self.pages = await self._build_leaderboard_pages()
+        self.pages = pages
         if self.current_page >= len(self.pages):
             self.current_page = max(0, len(self.pages) - 1)
 
-    async def reload(self, *, force: bool = False) -> None:
+    async def reload(self, *, force: bool = False) -> Optional[RenderOutcome]:
         """Re-fetch entries, re-render, and re-store the board out of band.
 
         The inherited :meth:`reload` runs ``on_load`` then ``refresh``.
@@ -940,7 +992,7 @@ class LeaderboardLayoutView(_BaseLeaderboardMixin, PaginatedLayoutView):
         # at the boundary (the deferred re-entry calls reload with the captured
         # kwargs). The signature is already nulled above, so the rebuild forces
         # even without the replay, but forwarding keeps the general contract.
-        await super().reload(force=force)
+        return await super().reload(force=force)
 
     @staticmethod
     def _entries_signature_for(entries) -> tuple:

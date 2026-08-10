@@ -194,7 +194,9 @@ Sync pre-check that returns `True` if a new instance slot is available, `False` 
 
 #### `auto_refresh_ephemeral` *(class attribute)*
 
-Engages the 15-minute ephemeral refresh handoff. Default `None` derives from `timeout`: ephemeral views with `timeout > 900` (or `timeout=None`) engage the handoff; shorter timeouts decline it. Set `True` to pin on, `False` to pin off.
+Engages the 15-minute ephemeral refresh handoff. Default `None` derives from `timeout`: ephemeral views with `timeout > 900` (or `timeout=None`) engage the handoff; shorter timeouts decline it. Set `True` to pin on, `False` to pin off. The attribute is a declaration the library never modifies: reading it always returns what the class or the caller set, and the derived answer is tracked internally.
+
+The derivation and the arming deadline are fixed at `send()`; navigation never restarts the clock. A `push()`/`pop()` destination arms against the chain's deadline under its own flag: an explicit `False` pins the handoff off on every path, an explicit `True` engages it even when the original send declined, and `None` inherits the effective policy of the view it was pushed or popped from -- the nearest hop's explicit setting when one exists, else the answer the original send derived. The destination's own `timeout` is not consulted, and its `auto_refresh_ephemeral` is not modified. Whatever engages the handoff, the button arms before the original send's 15-minute window closes.
 
 Customization knobs (all class attributes):
 
@@ -377,7 +379,11 @@ def restore_nav_state(self, state):
 
 #### `await reload()`
 
-Runs `on_load()` followed by `refresh()`. The out-of-band counterpart to the automatic `on_load()` calls: use it inside a callback that mutated the view's data source and needs an immediate re-fetch and re-render. Under an active `refresh_cooldown_ms` window (or a 429 backoff), the whole reload, including the `on_load()` fetch, is deferred to the window boundary and coalesced with any other pending reload.
+Runs `on_load()` followed by `refresh()`. The out-of-band counterpart to the automatic `on_load()` calls: use it inside a callback that mutated the view's data source and needs an immediate re-fetch and re-render. Under an active `refresh_cooldown_ms` window (or a 429 backoff), the whole reload, including the `on_load()` fetch, is deferred to the window boundary and coalesced with any other pending reload. Boolean keywords OR across a coalesced window, so a `force=True` is not lost to a later unforced call.
+
+Reloads on one view run one at a time. A reload arriving while another is mid-fetch waits its turn and then re-fetches, so the last to run renders the freshest data. Calling `reload()` from inside the view's own `on_load` raises `RuntimeError`.
+
+Returns a `RenderOutcome`: `RENDERED` (the edit reached Discord), `SKIPPED` (the tree matches the last shipped render), `DEFERRED` (a scheduled task re-renders at the throttle boundary), `DROPPED` (attempted, not known to have landed, nothing scheduled), or `NO_MESSAGE` (no editable message remains, so retrying cannot help). `None` when a subclass render override reports nothing. Members compare equal to their string values, so `outcome == "deferred"` works. `refresh()` returns the same type.
 
 ```python
 async def on_refresh(self, interaction):
@@ -799,7 +805,7 @@ failing later inside the page build.
 | `build_title(page)` | Optional components replacing the rankings card's masthead (the `banner` image + `## title` heading) inside the Container. `None` (default) composes the masthead from the declarative `banner` / `title` pair. Same return shapes and `page` semantics as `build_header`. |
 | `build_header(page)` | Content above the rankings card. The value is prepended as-is: a `Container` renders as its own card (an Overview `stats_card`, a banner), anything else floats as a bare top-level item (no return-type branching, unlike `build_footer`). Read `ranked_entries` for aggregate stats. Returns a component, a list, or `None` (default). `page` is the zero-based page index. |
 | `build_footer(page)` | Content below the rankings, placed by return type: a raw component folds inside the rankings card below the entries, a `Container` renders as its own standalone card below it. Same return shapes and `page` semantics as `build_header`. |
-| `on_leaderboard_empty()` | Returns the V2 component list shown when `entries` is empty. |
+| `on_leaderboard_empty()` | Returns the V2 component list shown when `entries` is empty. The masthead composes above this return, so a board keeps its `banner` / `title` while empty and an override inherits it; `build_title` returning `[]` renders no masthead on that page. `ranked_entries` is empty here. `build_header` and `build_footer` run on this page too: header content renders above the masthead, footer content below the empty-state card, each in the order returned. |
 | `ranked_entries` *(property)* | The loaded top-N `(user_id, stats)` slice for the current render; read it in `build_header` / `build_footer` / `build_title` to compute aggregate stats without re-fetching. |
 | `bot` *(property, read-only)* | The client passed via `bot=` (or injected by `on_bind`). Read it in a `resolve_avatar_urls` / `get_avatar_url` override to resolve avatars through `self.bot` instead of a private attribute. `None` when no bot was supplied. |
 | `on_state_changed(state)` *(async, override)* | Calls `rebuild_pages()` then the paginated refresh; live-data subclasses subscribe to data actions and override `get_entries()`. |
@@ -1152,7 +1158,7 @@ Write-through middleware that owns the full persistence pipeline. Install via `s
 - `backend`: a `PersistenceBackend` instance (e.g. `SQLiteBackend`, `InMemoryBackend`) used as the shorthand for any namespace not configured explicitly
 - `registry`, `application`: per-namespace configs (`RegistryPersistence`, `ApplicationPersistence`) that override the shorthand. Scoped state rides under the application namespace -- opt a scoped slot in via `persistent_slots = ("scoped",)` on the view class.
 - `migrators`: optional dict with `"schema"` and/or `"kwargs"` keys, each mapping a `(name, from_version)` tuple to an async migrator callable. When omitted, no migrators are registered through this kwarg; the `@register_migrator` / `@register_kwargs_migrator` decorators are the canonical registration path, and this dict is the programmatic bulk alternative.
-- `restore_concurrency`: positive int bounding concurrency in both restore phases: the channel and message fetches during startup reattach, and the post-ready `on_restore` repaint that follows (default `8`).
+- `restore_concurrency`: positive int bounding concurrency in both restore phases: the channel and message fetches during startup reattach, and the post-ready `on_restore` repaint that follows (default `8`). The repaint additionally serializes panels sharing a channel (message edits rate-bucket per channel) while panels in distinct channels fan out under this bound.
 
 ```python
 from cascadeui import PersistenceMiddleware, setup_middleware

@@ -30,7 +30,7 @@ await setup_middleware(
 - `registry`, `application` -- per-namespace overrides. Each accepts the matching config class from `cascadeui.persistence`. Explicit config wins over shorthand; passing the config with `backend=None` opts the namespace out entirely.
 - `bot` -- when supplied, enables the reattach pipeline for `PersistentView` subclasses and installs the message-deletion cleanup listener. When omitted, only state data is restored.
 - `migrators` -- optional dict with `"schema"` and/or `"kwargs"` keys, each mapping a `(name, from_version)` tuple to an async migrator callable. When omitted, no migrators are registered through this kwarg; the `@register_migrator` / `@register_kwargs_migrator` decorators are the canonical registration path, and this dict is the programmatic bulk alternative.
-- `restore_concurrency` -- positive int bounding concurrency in both restore phases: the channel and message fetches during startup reattach, and the post-ready `on_restore` repaint that follows once the gateway is ready (default `8`).
+- `restore_concurrency` -- positive int bounding concurrency in both restore phases: the channel and message fetches during startup reattach, and the post-ready `on_restore` repaint that follows once the gateway is ready (default `8`). The repaint additionally serializes panels that share a channel (message edits rate-bucket per channel), so same-channel repaints run one at a time regardless of this value, while panels in distinct channels fan out under it.
 
 ### `async initialize(store)`
 
@@ -128,8 +128,11 @@ Flag enum advertising which method sets a backend implements. Any combination vi
 - `Capability.SCHEMA_META` -- `get_schema_version`, `set_schema_version`
 - `Capability.TTL_INDEX` -- declares the backend has an indexed TTL column. Required when any `SlotPolicy` declares `ttl_days`.
 - `Capability.RAW_SQL` -- `execute`, `fetch`, `fetch_one`, `executemany`, and the `transaction()` context manager (which yields a `Transaction`, the typed protocol importable from the package root that a custom backend's `transaction()` returns). Declared by the SQL backends; `InMemoryBackend` omits it.
+- `Capability.OPEN_ROWS` -- rows are open mappings: `row_upsert` accepts unknown columns, `row_select` round-trips them, and a missing column reads as `None`. Schema migrators skip their DDL on such a backend, since a column-add alters nothing on disk. Declared by `InMemoryBackend`; the SQL backends have fixed columns and declare `RAW_SQL` instead.
 
 The namespace configs check the backend's *declared* capability flags against what the namespace requires, raising `PersistenceConfigError` when a flag is absent. That check runs while the config object is constructed, before any backend method is called. Declaring a flag whose methods are not implemented is not caught here; it surfaces as an `AttributeError` at the first call.
+
+One check runs later and conditionally: when `apply_migrations` finds a pending schema migration for a namespace, that namespace's backend must declare `OPEN_ROWS` or `RAW_SQL`. A backend declaring neither raises `PersistenceConfigError` during `PersistenceMiddleware.initialize`, rather than rejecting registry writes after the new version is recorded. A backend with nothing to migrate is never asked for either flag.
 
 ---
 
@@ -137,7 +140,7 @@ The namespace configs check the backend's *declared* capability flags against wh
 
 ### `InMemoryBackend`
 
-Always available. Declares `KV | RELATIONAL | TTL_INDEX | SCHEMA_META` (every capability except `RAW_SQL`, which an in-memory store has no engine for). Process-local; state is lost on restart. Useful for tests and single-run bots.
+Always available. Declares `KV | RELATIONAL | TTL_INDEX | SCHEMA_META | OPEN_ROWS` (every capability except `RAW_SQL`, which an in-memory store has no engine for; `OPEN_ROWS` is what schema migrations key on instead). Process-local; state is lost on restart. Useful for tests and single-run bots.
 
 ```python
 from cascadeui.persistence import InMemoryBackend
@@ -188,6 +191,41 @@ await mgr.prune_registry(persistence_keys=["roles:main", "tickets:panel"])
 ```
 
 `slot=` and `older_than_days=` are mutually exclusive on `prune_application`.
+
+`prune_registry` also takes `reason=`, which labels the `REGISTRY_PRUNED`
+dispatch so a subscriber can tell why a row went. Left unset it keeps the
+value the method has always computed.
+
+### `unreachable_since`
+
+Read-only `dict[str, int]` of `persistence_key` to the epoch second at which
+a registry row was first found unreachable. A row absent from the mapping is
+either reachable or has never been observed otherwise. Reflects this process's
+view; `prune_unreachable` reads disk.
+
+### `prune_unreachable(*, older_than_days)`
+
+Deletes registry rows that have stayed unreachable past a cutoff, after
+re-checking each one against Discord.
+
+```python
+result = await mgr.prune_unreachable(older_than_days=30)
+# {"pruned": [...], "recovered": [...], "kept": [...]}
+```
+
+A candidate that fetches successfully is kept and its stamp cleared
+(`recovered`), whatever its age. A definitive `discord.NotFound` is deleted
+regardless of age. Everything still unreachable is deleted only when its
+stamp predates the cutoff, and reported as `kept` otherwise. A row rewritten
+mid-pass, or one whose pre-delete re-read failed at the backend, is `kept`
+too: neither verdict describes the row as it stands. Deletions route
+through `prune_registry` with `reason="unreachable"`.
+
+Raises `ValueError` when `older_than_days` is negative or not an `int`
+(`bool` included), and `RuntimeError` when the middleware was constructed
+without `bot=`. Returns the empty summary when the registry namespace has no
+backend. `older_than_days=0` is allowed: re-verification, not the age, is
+what makes a deletion safe.
 
 ---
 

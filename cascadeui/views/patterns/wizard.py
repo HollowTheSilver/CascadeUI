@@ -14,7 +14,7 @@ from ...components.patterns.v2 import card, progress_bar
 from ...components.types import EmojiInput
 from ...utils.hooks import await_maybe
 from ...utils.responses import DISCORD_CALL_ERRORS
-from ..base import _StatefulMixin
+from ..base import RenderOutcome, _StatefulMixin
 from ..layout import StatefulLayoutView
 from ..view import StatefulView
 from .types import WizardSchema, _normalize_steps
@@ -463,10 +463,12 @@ class WizardView(_BaseWizardMixin, StatefulView):
         )
         self.add_item(self._next_btn)
 
-    async def _reload_render(self) -> None:
-        await self._refresh_wizard()
+    async def _reload_render(self) -> Optional[RenderOutcome]:
+        return await self._refresh_wizard()
 
-    async def _refresh_wizard(self, *, previous_step: Optional[int] = None):
+    async def _refresh_wizard(
+        self, *, previous_step: Optional[int] = None
+    ) -> Optional[RenderOutcome]:
         """Update navigation state and rebuild current step content.
 
         Mutates the existing button instances in place; ``_build_nav_buttons``-registered
@@ -481,13 +483,14 @@ class WizardView(_BaseWizardMixin, StatefulView):
         self._sync_wizard_nav()
 
         kwargs = await self._nav_edit_kwargs()
-        await self.refresh(**kwargs)
+        outcome = await self.refresh(**kwargs)
         if self._edit_never_landed(previous_step, self._current_step, cursor="Step"):
             # Nav state is the only tree-resident step artifact in V1 (the body
             # rides the embed kwarg), so re-deriving it is the whole rollback.
             # No second edit: the connection is still down.
             self._current_step = previous_step
             self._sync_wizard_nav()
+        return outcome
 
     async def send(
         self,

@@ -15,7 +15,7 @@ from ...components.inputs import TextInput as CascadeTextInput
 from ...components.patterns.v2 import alert, card
 from ...components.types import EmojiInput
 from ...utils.hooks import await_maybe
-from ..base import _StatefulMixin
+from ..base import RenderOutcome, _StatefulMixin
 from ..layout import StatefulLayoutView
 from ..view import StatefulView
 from .types import FormSchema, _normalize_fields
@@ -968,13 +968,13 @@ class FormView(_BaseFormMixin, StatefulView):
 
         return embed
 
-    async def _reload_render(self) -> None:
-        await self._update_form_display()
+    async def _reload_render(self) -> Optional[RenderOutcome]:
+        return await self._update_form_display()
 
-    async def _update_form_display(self):
+    async def _update_form_display(self) -> Optional[RenderOutcome]:
         """Rebuild the form embed and ship it."""
         self._sync_select_defaults()
-        await self.refresh(**await self._nav_edit_kwargs())
+        return await self.refresh(**await self._nav_edit_kwargs())
 
     async def send(
         self,

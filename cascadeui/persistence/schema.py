@@ -21,7 +21,7 @@ from typing import Final
 
 
 CURRENT_SCHEMA_VERSIONS: Final[dict[str, int]] = {
-    "persistent_views": 1,
+    "persistent_views": 2,
     "application_slots": 1,
     "cascadeui_schema": 1,
     "cascadeui_kv": 1,
@@ -57,7 +57,8 @@ CREATE TABLE IF NOT EXISTS persistent_views (
     kwargs_schema_version INTEGER NOT NULL DEFAULT 1,
     schema_version INTEGER NOT NULL DEFAULT 1,
     created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    first_unreachable_at INTEGER
 )
 """
 

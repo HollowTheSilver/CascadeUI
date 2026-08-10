@@ -448,6 +448,8 @@ Convenience functions for building V2 component trees. All return standard disco
 
 Creates a `Container` with children and an optional accent color. Strings are automatically wrapped in `TextDisplay`. Pass `spoiler=True` to hide the entire container behind a spoiler overlay.
 
+Raises `ValueError` when a child is a `Container`. Discord forbids a Container inside a Container, so `card(heading, alert(...))` is never legal -- place the alert as a sibling of the card. `alert()`, `card()` and `stats_card()` are the builders that produce one.
+
 `color` takes a `discord.Colour` or a plain int, so `color=0x5865F2` is equivalent to `color=discord.Colour(0x5865F2)`. A value outside `0x000000`-`0xFFFFFF`, a `bool`, or a non-colour type raises at construction, naming the builder and the parameter, rather than reaching Discord.
 
 ```python
@@ -694,7 +696,7 @@ PaginatedRegion(
 )
 ```
 
-`items` holds the full list, `page_items` exposes the current slice, and `controls(view)` captures the host and returns the nav row. Drive all three from the host's `build_ui()` or `on_load()`:
+`items` holds the full list, `page_items` exposes the current slice, and `controls(view)` captures the host and returns the nav row. The captured host is readable afterwards as `host` (read-only, `None` before the first capture), which is what a hook needing the view's own data reaches for. Drive all three from the host's `build_ui()` or `on_load()`:
 
 ```python
 def build_ui(self):
@@ -726,7 +728,7 @@ def build_ui(self):
 
 #### `async on_page_changed(page) -> None`
 
-Override hook. Called after the page index updates, before the refresh. Default is a no-op. Use for analytics, async prefetch, or per-page validation.
+Override hook. Called after the page index updates, before the refresh. Default is a no-op. Use for analytics, async prefetch, or per-page validation. Read `self.host` for the view the region renders into, which is what a prefetch needs; it is `None` until the host's first render.
 
 #### `await show_page(index)`
 
@@ -777,7 +779,7 @@ When `summary` returns an empty value (data not loaded yet), the trigger falls b
 
 #### `async on_toggle(expanded) -> None`
 
-Override hook. Called after the state flips, before the re-render. Default is a no-op. Use to fetch async data when expanded, log toggle events, or validate on every open/close.
+Override hook. Called after the state flips, before the re-render. Default is a no-op. Use to fetch async data when expanded, log toggle events, or validate on every open/close. Read `self.host` for the view the collapsible renders into; it is `None` until the host's first render captures it.
 
 ---
 

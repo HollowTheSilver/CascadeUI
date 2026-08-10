@@ -130,6 +130,7 @@ from .validation import (
     validate_field,
     validate_fields,
 )
+from .views.base import RenderOutcome
 from .views.layout import DisplayLayoutView, StatefulLayoutView
 from .views.patterns import (
     FormLayoutView,
@@ -168,7 +169,7 @@ if "PostgresBackend" in _persistence_all:
 # // ========================================( Script )======================================== // #
 
 
-__version__ = "3.9.1"
+__version__ = "3.10.0"
 
 # Export public API
 __all__ = [
@@ -200,6 +201,7 @@ __all__ = [
     "register_kwargs_migrator",
     "register_migrator",
     # V2 Layout Views
+    "RenderOutcome",
     "StatefulLayoutView",
     "DisplayLayoutView",
     "PersistentLayoutView",

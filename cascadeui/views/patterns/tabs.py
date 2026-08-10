@@ -11,7 +11,7 @@ from discord.ui import ActionRow
 from ...components.base import StatefulButton
 from ...utils.guards import normalize_mapping
 from ...utils.hooks import await_maybe
-from ..base import _StatefulMixin
+from ..base import RenderOutcome, _StatefulMixin
 from ..layout import StatefulLayoutView
 from ..view import StatefulView
 
@@ -421,10 +421,10 @@ class TabView(_BaseTabMixin, StatefulView):
         builder = self._tabs[self._tab_names[self._active_tab]]
         return {"embed": await await_maybe(builder())}
 
-    async def _reload_render(self) -> None:
-        await self._refresh_tabs()
+    async def _reload_render(self) -> Optional[RenderOutcome]:
+        return await self._refresh_tabs()
 
-    async def _refresh_tabs(self, *, previous_tab: Optional[int] = None):
+    async def _refresh_tabs(self, *, previous_tab: Optional[int] = None) -> Optional[RenderOutcome]:
         """Mutate tab button styles in place and rebuild active content.
 
         ``previous_tab`` is the tab the caller switched away from, so a
@@ -436,13 +436,14 @@ class TabView(_BaseTabMixin, StatefulView):
         builder = self._tabs[tab_name]
         embed = await await_maybe(builder())
 
-        await self.refresh(embed=embed)
+        outcome = await self.refresh(embed=embed)
         if self._edit_never_landed(previous_tab, self._active_tab, cursor="Tab"):
             # Button styling is the only tree-resident tab artifact in V1 (the
             # body rides the embed kwarg). No second edit: the connection is
             # still down.
             self._active_tab = previous_tab
             self._sync_tab_styles()
+        return outcome
 
 
 # // ========================================( V2: TabLayoutView )======================================== // #

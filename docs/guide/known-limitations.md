@@ -142,8 +142,26 @@ naturally. Shortly before the wall, CascadeUI replaces
 the view's children with a single "Continue Session" button. When the user
 clicks it, the click carries a brand new interaction token (independent of the
 original), and CascadeUI spawns a fresh ephemeral with another full 15-minute
-window. The handoff preserves all state: no need to close and reopen
-from a parent panel. See `auto_refresh_ephemeral` in
+window, so there is no need to close and reopen from a parent panel.
+
+**What the replacement is rebuilt from.** The reopen reconstructs the view
+from the kwargs its constructor was given, plus whatever
+[`get_nav_state()`](../api/views.md#get_nav_state-override) returns. An attribute
+assigned after `__init__` is not carried unless that hook names it, and the
+loss is invisible until a reopen actually fires. A view holding state its
+constructor did not receive (a step index, a confirmed flag, a fetched row)
+overrides `get_nav_state()` / `restore_nav_state()` to carry it.
+
+The arming deadline is measured from the original `send(ephemeral=True)`,
+because the 15-minute window belongs to the original interaction. Views
+reached by `push()` or `pop()` arm against that same deadline under their own
+policy: an explicit `auto_refresh_ephemeral = False` keeps the handoff off, an
+explicit `True` engages it even when the original send declined, and the
+default `None` inherits the effective policy of the view navigated from --
+the nearest explicit setting on the chain, else the original send's
+derivation.
+
+See `auto_refresh_ephemeral` in
 [`api/views.md`](../api/views.md) for the customization knobs
 (`refresh_warning_seconds`, `refresh_button_label`, `refresh_button_emoji`,
 `refresh_button_style`, and the `_build_refresh_button` hook). Set

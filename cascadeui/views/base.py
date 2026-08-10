@@ -10,6 +10,7 @@ import logging
 import time
 import uuid
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any, Callable, ClassVar, Dict, Optional, Set
 
 import aiohttp
@@ -99,6 +100,66 @@ def _register_view_class(cls):
     short class names without clobbering each other in the registry.
     """
     _view_class_registry[f"{cls.__module__}.{cls.__qualname__}"] = cls
+
+
+# // ========================================( Render Outcome )======================================== // #
+
+
+class RenderOutcome(str, Enum):
+    """What a render call did with the edit it was asked to ship.
+
+    Returned by :meth:`_StatefulMixin.refresh` and relayed by
+    :meth:`_StatefulMixin.reload`, so a caller that changed something before
+    rendering can tell a shipped edit from one that never left, and a reload
+    that ran from one the throttle handed to a scheduled task. Members compare
+    equal to their string values (``outcome == "deferred"``), so a caller can
+    branch without importing the enum.
+
+    - ``RENDERED``: the edit reached Discord.
+    - ``SKIPPED``: the tree matches the last shipped render, so no edit was
+      owed; the screen already shows this state.
+    - ``DEFERRED``: no edit has shipped yet; a scheduled task re-runs the
+      render when the active cooldown or rate-limit window closes.
+    - ``DROPPED``: the edit was attempted and is not known to have landed (a
+      transport failure, or a request stalled past ``edit_timeout``), and
+      nothing is scheduled to retry it. The definitively-dropped case also
+      reports through :attr:`_StatefulMixin.refresh_degraded`; a stalled
+      request is indeterminate, so only the disposition covers it.
+    - ``NO_MESSAGE``: no editable message remains. The view has not been
+      sent, the message was deleted, or an ephemeral's webhook token has
+      expired. Retrying cannot help.
+    """
+
+    RENDERED = "rendered"
+    SKIPPED = "skipped"
+    DEFERRED = "deferred"
+    DROPPED = "dropped"
+    NO_MESSAGE = "no_message"
+
+    def __str__(self) -> str:
+        # str() of a str-mixin enum member differs across the supported
+        # interpreter range; pinning it to the value keeps log and f-string
+        # output stable everywhere.
+        return self.value
+
+
+def _merge_reload_kwargs(pending: dict, new: dict) -> dict:
+    """Combine a coalesced reload's kwargs into the already-pending set.
+
+    Boolean values OR across the calls, so a ``force=True`` request survives
+    an unforced reload landing later in the same window; any other value
+    takes the newest call's, since the single replay stands in for the last
+    state asked for. Replacing the dict wholesale would silently drop the
+    earlier call's ``force=True``.
+    """
+    merged = dict(pending)
+    for key, value in new.items():
+        previous = merged.get(key)
+        if isinstance(previous, bool) and isinstance(value, bool):
+            merged[key] = previous or value
+        else:
+            merged[key] = value
+    return merged
 
 
 # // ========================================( Mixin )======================================== // #
@@ -285,13 +346,19 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
     # 15-minute webhook token expires. The user clicks it to spawn a
     # fresh ephemeral via a new interaction token, bypassing the cliff.
     #
-    # Default ``None`` means "derive from ``timeout`` at send() time":
-    # any view with ``timeout=None`` or ``timeout > 900`` engages the
-    # handoff (the view wants to outlive the 900s webhook cliff);
-    # anything ``<= 900`` skips it (the token outlives the view).
-    # Explicit ``True`` or ``False`` overrides the derivation. The
-    # declared ``timeout`` is never rewritten -- the flag is the only
-    # thing the library decides.
+    # This attribute is the author's declaration; the library never
+    # assigns to it (see ``_refresh_handoff`` for how the effective
+    # policy resolves). Default ``None`` means "derive from ``timeout``
+    # at each ephemeral send()": any view with ``timeout=None`` or
+    # ``timeout > 900`` engages the handoff (the view wants to outlive
+    # the 900s webhook cliff); anything ``<= 900`` skips it (the token
+    # outlives the view). The declared ``timeout`` is never rewritten --
+    # the resolution is the only thing the library decides. Explicit
+    # ``True`` or ``False`` overrides the derivation. A push/pop
+    # destination is honored the same way against the chain's arming
+    # deadline: ``True`` engages even when the send declined, ``False``
+    # stays off, and ``None`` inherits the immediate source's effective
+    # policy.
     auto_refresh_ephemeral: Optional[bool] = None
     refresh_warning_seconds: int = 90  # how early to swap before the 900s wall
     refresh_button_label: str = "Continue Session"
@@ -950,10 +1017,19 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         self._message = None
         self._webhook_message = None
         self._ephemeral = False
-        # Monotonic deadline for the ephemeral refresh-button arming (set at
-        # send when the handoff engages). Lets a re-schedule after a failed
+        # Monotonic deadline for the ephemeral refresh-button arming, stamped
+        # at every ephemeral send. It records when the send token's 900s
+        # window closes; whether the handoff acts on it is
+        # auto_refresh_ephemeral's call. Lets a re-schedule after a failed
         # navigation rollback sleep the REMAINING time, not a fresh window.
         self._ephemeral_arm_deadline = None
+        # Library-side resolution of the auto_refresh_ephemeral ``None``
+        # sentinel: derived from ``timeout`` at each ephemeral send,
+        # inherited from the immediate source on push/pop. Kept apart from
+        # the declaration, which only ever holds what the class or the
+        # caller set -- an explicit declaration wins over this value (see
+        # ``_refresh_handoff``). ``None`` until something resolves it.
+        self._refresh_handoff_resolved: Optional[bool] = None
 
         # Render-hash short-circuit. Stores a structural digest of the
         # component tree as it was last shipped to Discord. refresh()
@@ -1043,6 +1119,11 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         # deferred boundary task so a forwarded reload keyword (e.g. force)
         # survives the defer.
         self._pending_reload_kwargs: dict = {}
+        # Reload serialization primitives (one reload's on_load + render
+        # at a time); see reload() for the full contract and the
+        # reentrancy raise.
+        self._reload_lock = asyncio.Lock()
+        self._reload_task: Optional[asyncio.Task] = None
 
         # Derive user_id, guild_id, and session_id from context/interaction
         if self.interaction is None and self.context is not None:
@@ -1534,25 +1615,21 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                         await self._rollback_send(registered=True)
                         return None
 
-            # -- Stage 4: ephemeral refresh-handoff derivation --
-            # auto_refresh_ephemeral is Optional[bool]. None means "derive
-            # from the declared timeout"; explicit True or False overrides
-            # the derivation. The declared timeout is the sole source of
-            # truth for longevity -- the library never rewrites it. The
-            # 900s threshold is the webhook token cliff: any view that
-            # wants to live past it needs the handoff, anything inside it
-            # does not.
+            # -- Stage 4: ephemeral refresh-handoff resolution --
+            # auto_refresh_ephemeral is the author's declaration and is never
+            # assigned here (see _refresh_handoff for the read-time
+            # precedence). None re-derives against the declared timeout on
+            # every send and lands on _refresh_handoff_resolved; the 900s
+            # threshold is the webhook token cliff, so a view that wants to
+            # live past it needs the handoff and one that does not skips it.
             # _ephemeral tracks the current send unconditionally, so an instance
             # reused for a non-ephemeral send (a replace() destination that
             # inherited a stale True) does not keep the flag set. The handoff
-            # derivation runs only for an ephemeral send: a public send has no
+            # resolution runs only for an ephemeral send: a public send has no
             # webhook cliff to outlive.
             self._ephemeral = ephemeral
             if ephemeral and self.auto_refresh_ephemeral is None:
-                if self.timeout is None or self.timeout > 900:
-                    self.auto_refresh_ephemeral = True
-                else:
-                    self.auto_refresh_ephemeral = False
+                self._refresh_handoff_resolved = self.timeout is None or self.timeout > 900
         finally:
             # Pre-send stages are done (or bailed). If the work overran, the
             # timer already fired and Stage 5 routes through followup; otherwise
@@ -1674,11 +1751,16 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 if isinstance(bot, discord.Client):
                     self.state_store._install_message_cleanup(bot)
 
-            if ephemeral and self.auto_refresh_ephemeral:
+            if ephemeral:
+                # Stamped for every ephemeral send, since the deadline is a
+                # fact about the message's token clock, not about whether
+                # this view acts on it -- the timer below runs only when the
+                # effective handoff policy engaged.
                 self._ephemeral_arm_deadline = time.monotonic() + max(
                     1, 900 - self.refresh_warning_seconds
                 )
-                self.create_task(self._schedule_ephemeral_refresh())
+                if self._refresh_handoff:
+                    self.create_task(self._schedule_ephemeral_refresh())
 
             if self._pending_parent is not None:
                 self._pending_parent.attach_child(self)
@@ -1891,7 +1973,9 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
     ) -> None:
         """Called when the ephemeral refresh button fails to spawn a replacement.
 
-        Only fires for ephemeral views with ``auto_refresh_ephemeral = True``.
+        Only fires for ephemeral views whose refresh handoff engaged (an
+        explicit ``auto_refresh_ephemeral = True``, or the default ``None``
+        resolving to engaged from a ``timeout`` past the 900s cliff).
         When the user clicks the refresh button after the 15-minute
         interaction token expires, the library attempts to construct a new
         view instance. This hook fires if that construction fails.
@@ -2672,7 +2756,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 kwargs = result
         await self.refresh(**kwargs)
 
-    async def reload(self, **kwargs) -> None:
+    async def reload(self, **kwargs) -> Optional["RenderOutcome"]:
         """Re-run :meth:`on_load`, then edit the message to show the result.
 
         The out-of-band counterpart to the automatic ``on_load`` calls on
@@ -2682,44 +2766,87 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         button). Equivalent to ``await self.on_load()`` followed by
         ``await self.refresh()``.
 
+        Reloads on one view run one at a time. Interactions serialize on
+        their own lock and state notifications coalesce, but a reload can
+        arrive from a background task while another is mid-fetch, and two
+        ``on_load`` bodies interleaving on the same view read and stamp
+        each other's half-built state. A reload that finds one in flight
+        waits its turn, then runs its own fetch against the source as it
+        stands at run time, so the last reload to run renders the freshest
+        data. Calling ``reload()`` from inside the view's own ``on_load``
+        or render path raises ``RuntimeError``: the surrounding reload
+        already re-runs the fetch and ships the result.
+
+        Returns a :class:`RenderOutcome` naming what happened (rendered,
+        skipped as unchanged, deferred to the throttle boundary, dropped in
+        transit, or no message to edit), or ``None`` when a subclass
+        render override reports nothing. Callers that must know the edit
+        landed (a one-shot notice, a stamp written after the render) check
+        the outcome instead of assuming a returned ``reload()`` rendered.
+
         Respects the refresh throttle at the reload layer: a reload landing
         inside an active cooldown (``refresh_cooldown_ms`` or a 429 backoff)
-        defers the whole reload (``on_load``'s fetch included) and a burst
-        collapses to one fetch + edit at the window boundary. The deferred
-        boundary task replays the coalesced call's keyword arguments, so a
-        subclass that adds a reload keyword (e.g. ``force``) must forward it to
-        ``super().reload(**kwargs)`` for the replay to carry it. A keyword
-        consumed before ``super().reload()`` whose effect is not already in
-        pre-gate view state is otherwise dropped when the reload defers.
+        defers the whole reload (``on_load``'s fetch included), returns
+        ``RenderOutcome.DEFERRED``, and a burst collapses to one fetch +
+        edit at the window boundary. The deferred boundary task replays the
+        coalesced calls' keyword arguments, so a subclass that adds a reload
+        keyword (e.g. ``force``) must forward it to ``super().reload(**kwargs)``
+        for the replay to carry it. Boolean keywords OR across coalesced
+        calls (a ``force=True`` is never dropped by a later unforced reload
+        in the same window); any other keyword takes the newest call's
+        value. A keyword consumed before ``super().reload()`` whose effect
+        is not already in pre-gate view state is otherwise dropped when the
+        reload defers.
         """
-        # reload() can return at the throttle gate below without reaching
-        # refresh(), so the flag is cleared here too rather than describing
-        # whatever the previous call did.
-        self._refresh_degraded = False
-        # reload() never takes the acting waiver. Its gate throttles the
-        # on_load fetch, not just the edit, so waiving it for interaction-
-        # driven reloads would turn a manual refresh button into an
-        # unbounded query against the caller's data source.
-        if self._refresh_armed:
-            # Same reason the deferred path and the notification dispatcher
-            # refuse to rebuild here: the tree is the refresh button now, and
-            # re-running on_load would replace it. The armed flag then drops
-            # every notification that could put it back, leaving a stale panel
-            # with no recovery once the webhook token expires.
-            await self.refresh()
-            return
+        if self._reload_task is not None and self._reload_task is asyncio.current_task():
+            raise RuntimeError(
+                f"reload() called from inside its own on_load() or render path on "
+                f"{type(self).__name__}. The surrounding reload() already re-runs "
+                f"on_load and ships the result. Fix: mutate state and return, or "
+                f"schedule the follow-up reload with create_task()."
+            )
+        async with self._reload_lock:
+            self._reload_task = asyncio.current_task()
+            try:
+                # Cleared at run start, inside the lock, so a queued reload
+                # clears its own run's flag rather than one a concurrent
+                # holder is mid-render on. reload() can still return at the
+                # throttle gate below without reaching refresh(), so the
+                # clear stays ahead of the gate rather than describing
+                # whatever the previous call did.
+                self._refresh_degraded = False
+                # reload() never takes the acting waiver. Its gate throttles
+                # the on_load fetch, not just the edit, so waiving it for
+                # interaction-driven reloads would turn a manual refresh
+                # button into an unbounded query against the caller's data
+                # source.
+                if self._refresh_armed:
+                    # Same reason the deferred path and the notification
+                    # dispatcher refuse to rebuild here: the tree is the
+                    # refresh button now, and re-running on_load would
+                    # replace it. The armed flag then drops every
+                    # notification that could put it back, leaving a stale
+                    # panel with no recovery once the webhook token expires.
+                    return await self.refresh()
 
-        now = time.monotonic()
-        wait = self._throttle_until() - now
-        if wait > 0:
-            self._reload_pending = True
-            self._pending_reload_kwargs = kwargs
-            self._queue_deferred_refresh(wait)
-            return
-        await self._run_on_load()
-        await self._reload_render()
+                now = time.monotonic()
+                wait = self._throttle_until() - now
+                if wait > 0:
+                    if self._reload_pending:
+                        self._pending_reload_kwargs = _merge_reload_kwargs(
+                            self._pending_reload_kwargs, kwargs
+                        )
+                    else:
+                        self._reload_pending = True
+                        self._pending_reload_kwargs = dict(kwargs)
+                    self._queue_deferred_refresh(wait)
+                    return RenderOutcome.DEFERRED
+                await self._run_on_load()
+                return await self._reload_render()
+            finally:
+                self._reload_task = None
 
-    async def _reload_render(self) -> None:
+    async def _reload_render(self) -> Optional["RenderOutcome"]:
         """Render step of :meth:`reload`, after ``on_load`` runs.
 
         The base ships a bare ``refresh()``, which is correct for V2 views
@@ -2727,8 +2854,13 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         ships. A V1 pattern whose content is an embed overrides this to route
         through its embed-carrying render, so ``reload()`` updates the embed
         instead of shipping an edit with no kwargs.
+
+        Returns the :class:`RenderOutcome` of the edit it shipped, so
+        ``reload()`` can relay it. An override returns the outcome of its
+        final ``refresh(...)`` call; returning ``None`` makes ``reload()``
+        report nothing for the run.
         """
-        await self.refresh()
+        return await self.refresh()
 
     def _note_transport_failure(self, error: BaseException, *, where: str) -> None:
         """Record an edit that never reached Discord.
@@ -2901,12 +3033,21 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         """
         return self._refresh_degraded
 
-    async def refresh(self, **kwargs) -> None:
+    async def refresh(self, **kwargs) -> "RenderOutcome":
         """Edit the view's message to reflect the current component state.
 
         Passes ``view=self`` along with any extra *kwargs* (``embed``,
         ``content``, etc.) to ``message.edit()``.  Silently handles the
         case where the message no longer exists (``discord.NotFound``).
+
+        Returns a :class:`RenderOutcome` naming what happened to the edit:
+        ``RENDERED`` (shipped), ``SKIPPED`` (render-hash match, nothing
+        owed), ``DEFERRED`` (a throttle or rate-limit window holds it and a
+        scheduled task re-renders at the boundary), ``DROPPED`` (attempted
+        and not known to have landed, nothing scheduled), or ``NO_MESSAGE``
+        (no editable message remains). Callers that only repaint can ignore
+        it; callers that must know the edit landed read it instead of
+        inferring from a normal return.
 
         Also swallows a transport failure -- a request that never reached
         Discord, which raises from aiohttp and carries no HTTP status. The
@@ -2938,7 +3079,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         self._refresh_degraded = False
 
         if not self._message:
-            return
+            return RenderOutcome.NO_MESSAGE
 
         # Is this edit the direct answer to a click on this view's own
         # message? Resolved before the gate, because the answer decides
@@ -2963,7 +3104,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         wait = self._throttle_until(acting=acting) - now
         if wait > 0:
             self._queue_deferred_refresh(wait)
-            return
+            return RenderOutcome.DEFERRED
 
         store = self.state_store
         perf_on = getattr(store, "_perf_enabled", False)
@@ -2998,7 +3139,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 current_digest = self._compute_tree_digest()
                 if current_digest == self._last_tree_digest:
                     skipped = True
-                    return
+                    return RenderOutcome.SKIPPED
 
             # Pre-flight check on the assembled tree before any of the
             # three edit paths ships. Skipped refreshes (digest match
@@ -3062,11 +3203,11 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     if perf_on:
                         store._record_edit()
                     self._stamp_cooldown(acting=acting)
-                    return
+                    return RenderOutcome.RENDERED
                 except asyncio.TimeoutError as e:
                     if isinstance(e, aiohttp.ClientError):
                         self._note_transport_failure(e, where="Refresh")
-                        return
+                        return RenderOutcome.DROPPED
                     logger.debug(
                         f"Acting-view fast path exceeded {fast_path_timeout:.2f}s "
                         f"in {type(self).__name__}; channel-endpoint fall-through "
@@ -3087,7 +3228,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     # process this one) is cheaper than a stuck UI (when
                     # it did not).
                     self._last_tree_digest = None
-                    return
+                    return RenderOutcome.DROPPED
                 except discord.InteractionResponded:
                     # The auto-defer timer acked in the window between the
                     # is_done() guard and edit_message's own internal guard.
@@ -3100,7 +3241,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     pass
                 except DISCORD_CALL_ERRORS as e:
                     if self._handle_rate_limit(e):
-                        return
+                        return RenderOutcome.DEFERRED
                     # Any other HTTP error falls through to the channel path
                     # so a transient failure on the interaction endpoint does
                     # not lose the edit entirely.
@@ -3129,21 +3270,21 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     if perf_on:
                         store._record_edit()
                     self._stamp_cooldown(acting=acting)
-                    return
+                    return RenderOutcome.RENDERED
                 except asyncio.TimeoutError as e:
                     if isinstance(e, aiohttp.ClientError):
                         # Not token expiry, so the webhook handle survives.
                         self._note_transport_failure(e, where="Webhook edit")
-                        return
+                        return RenderOutcome.DROPPED
                     logger.warning(
                         f"Webhook edit stalled past {self.edit_timeout}s in "
                         f"{type(self).__name__}; the next refresh re-ships."
                     )
                     self._last_tree_digest = None
-                    return
+                    return RenderOutcome.DROPPED
                 except DISCORD_CALL_ERRORS as e:
                     if self._handle_rate_limit(e):
-                        return
+                        return RenderOutcome.DEFERRED
                     if isinstance(e, aiohttp.ClientError):
                         # A dropped connection says nothing about the token, and
                         # this handle is the only endpoint that can edit an embed
@@ -3151,7 +3292,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                         # forfeit it permanently over a blip and then silently
                         # drop every later embed edit through the channel path.
                         self._note_transport_failure(e, where="Webhook edit")
-                        return
+                        return RenderOutcome.DROPPED
                     # Token expired (15-min lifetime) -- fall through to channel endpoint
                     self._webhook_message = None
 
@@ -3161,6 +3302,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 if perf_on:
                     store._record_edit()
                 self._stamp_cooldown(acting=acting)
+                return RenderOutcome.RENDERED
             except discord.NotFound:
                 # The message was deleted out from under the view (admin
                 # delete, purge, channel delete) and this edit just observed
@@ -3178,6 +3320,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                         f"on_message_gone failed for {type(self).__name__}: {exc}",
                         exc_info=exc,
                     )
+                return RenderOutcome.NO_MESSAGE
             except asyncio.TimeoutError as e:
                 if isinstance(e, aiohttp.ClientError):
                     self._note_transport_failure(e, where="Refresh")
@@ -3187,6 +3330,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                         f"{type(self).__name__}; the next refresh re-ships."
                     )
                     self._last_tree_digest = None
+                return RenderOutcome.DROPPED
             except DISCORD_CALL_ERRORS as e:
                 if self._ephemeral and getattr(e, "status", None) == 401:
                     # The lifecycle exit() and on_timeout() already classify:
@@ -3199,6 +3343,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                         f"Refresh skipped: ephemeral webhook token expired "
                         f"for {type(self).__name__}."
                     )
+                    return RenderOutcome.NO_MESSAGE
                 elif isinstance(e, aiohttp.ClientError):
                     # The request never reached Discord, so nothing about the
                     # message is known to be wrong. The tree is already
@@ -3209,8 +3354,10 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     # content being untrustworthy rather than the network
                     # being briefly down.
                     self._note_transport_failure(e, where="Refresh")
+                    return RenderOutcome.DROPPED
                 elif not self._handle_rate_limit(e):
                     raise
+                return RenderOutcome.DEFERRED
         finally:
             if perf_on:
                 store._refresh_samples.append(
@@ -3619,6 +3766,23 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 await self.reload(**kwargs)
             else:
                 await self._run_state_changed(self.state_store.state)
+            if (
+                self._reload_pending
+                and not self._refresh_armed
+                and not self.is_finished()
+                and self._message
+            ):
+                # A reload was coalesced while the render above was in
+                # flight: its gate found this task alive and declined to
+                # queue a second one, but this task is already past its own
+                # dispatch and would otherwise exit leaving the pending
+                # reload latched with no task left to run it. Queue a
+                # successor (the slot helper allows self-replacement) so the
+                # coalesced fetch still ships. Skipped while armed: an armed
+                # view's reload is a plain refresh of the frozen tree, and
+                # requeueing on a flag the armed branch never clears would
+                # respawn successors until the token cliff.
+                self._queue_deferred_refresh(max(0.0, self._throttle_until() - time.monotonic()))
         finally:
             # Only disown the slot if it still points at this task. The render
             # above can be rate-limited, and that path schedules a successor

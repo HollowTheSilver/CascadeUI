@@ -11,16 +11,19 @@ Two registries cover the two migration surfaces:
   registry rehydrate.
 
 Migrators register via :func:`register_migrator` and
-:func:`register_kwargs_migrator` decorators. The library ships
-zero migrators today -- the infrastructure is in place so future
-schema changes have a clear landing spot without another breaking
-release.
+:func:`register_kwargs_migrator` decorators. The library's own
+migrators live at the bottom of this module, so importing it
+registers them before :meth:`PersistenceManager.apply_migrations`
+looks any of them up.
 """
+
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
+
+from .protocols import Capability
+from .schema import TABLE_PERSISTENT_VIEWS
 
 # // ========================================( Modules )======================================== // #
 
-
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 if TYPE_CHECKING:
     from .protocols import PersistenceBackend
@@ -37,13 +40,19 @@ if TYPE_CHECKING:
 # are supported today on every backend that implements Capability.RELATIONAL.
 #
 # DDL-level migrations (ALTER TABLE, ADD COLUMN, DROP INDEX) go through
-# the backend's raw-SQL surface, which the SQL backends declare via
-# Capability.RAW_SQL. Gate on the flag first, since a KV-only backend
-# (InMemoryBackend) raises rather than pretending to run the statement:
+# the backend's raw-SQL surface (Capability.RAW_SQL). A backend that
+# declares Capability.OPEN_ROWS stores rows as open mappings, so a
+# column-level change alters nothing on disk -- skip on that flag, for
+# that reason, never on the absence of RAW_SQL (which only says the
+# escape hatch is missing, not that skipping is safe):
 #
-#     if Capability.RAW_SQL in backend.capabilities:
-#         async with backend.transaction():
-#             await backend.execute("ALTER TABLE ...")
+#     if Capability.OPEN_ROWS in backend.capabilities:
+#         return  # open rows already read a missing column as None
+#     async with backend.transaction():
+#         await backend.execute("ALTER TABLE ...")
+#
+# apply_migrations refuses to run a migrator on a backend declaring
+# neither flag, so the DDL branch can assume the raw-SQL surface exists.
 #
 # Group the statements inside one transaction() block: apply_migrations
 # records the new version in a separate call after the migrator returns,
@@ -151,3 +160,50 @@ def get_kwargs_migrator(view_class_qualname: str, from_version: int) -> KwargsMi
     """Return the registered kwargs migrator for a view class+version,
     or ``None`` if no migrator handles that step."""
     return _KWARGS_MIGRATORS.get((view_class_qualname, from_version))
+
+
+# // ========================================( Library migrators )======================================== // #
+
+
+@register_migrator(TABLE_PERSISTENT_VIEWS, 1)
+async def _persistent_views_1_to_2(backend: Any) -> None:
+    """Add ``first_unreachable_at`` to the registry table.
+
+    A row the reattach pass cannot fetch is kept rather than pruned,
+    because a permission blip at boot must not delete a live panel. The
+    stamp is what lets an operator tell a blip from a channel the bot
+    will never see again, so the column is nullable with no default:
+    ``NULL`` means reachable, or never yet observed otherwise.
+
+    Open-row backends need no DDL: a key that was never written already
+    reads as ``NULL``, which is exactly what the nullable column means.
+    """
+    # apply_migrations rejects a backend declaring neither OPEN_ROWS nor
+    # RAW_SQL before this runs, so falling through the skip means the
+    # raw-SQL surface exists.
+    if Capability.OPEN_ROWS in backend.capabilities:
+        return
+
+    # apply_migrations records the new version only after this returns, so a
+    # crash in that window re-runs the migrator against a table that already
+    # has the column -- and SQLite has no ADD COLUMN IF NOT EXISTS. Probing
+    # first is what makes the re-run a no-op instead of a duplicate-column
+    # error. The except is broad because the driver raises its own vendor
+    # type unwrapped; anything that is not a missing column resurfaces on the
+    # ALTER below with its real message intact.
+    try:
+        await backend.fetch(f"SELECT first_unreachable_at FROM {TABLE_PERSISTENT_VIEWS} LIMIT 1")
+        return
+    except Exception:
+        pass
+
+    # PostgreSQL supports IF NOT EXISTS on ADD COLUMN and SQLite does not.
+    # Using it where it exists closes the two-process boot race: both can pass
+    # the probe above, and without it the process that loses the ALTER fails
+    # its whole startup over a column the winner just added. SQLite keeps the
+    # bare form, where the probe is the only guard available and a single-file
+    # database makes the race far less reachable.
+    guard = "" if backend.placeholder_style == "qmark" else "IF NOT EXISTS "
+    await backend.execute(
+        f"ALTER TABLE {TABLE_PERSISTENT_VIEWS} ADD COLUMN {guard}first_unreachable_at BIGINT"
+    )

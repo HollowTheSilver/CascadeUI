@@ -307,6 +307,12 @@ def card(
     Returns:
         A ``Container`` ready to be added to a ``StatefulLayoutView``.
 
+    Raises:
+        ValueError: If a child is a ``Container`` (including ``alert()``,
+            ``card()``, and ``stats_card()`` returns). Discord forbids a
+            Container inside a Container, so no tree holding the result
+            could ever send; place the child as a sibling instead.
+
     Example::
 
         card(
@@ -315,6 +321,21 @@ def card(
             color=discord.Color.green(),
         )
     """
+    for index, child in enumerate(children):
+        # A Container is never a legal Container child, so the mistake is
+        # decidable here, while the composing call is still on the stack.
+        # Left in, the same tree fails at whichever seam ships the view,
+        # where the placement validator names Container indexes rather
+        # than this call -- on a push, that surfaces as a failed
+        # navigation instead of a construction error.
+        if isinstance(child, Container):
+            raise ValueError(
+                f"card: child {index} is a Container ({type(child).__name__}), "
+                f"and Discord forbids a Container inside a Container. alert(), "
+                f"card(), and stats_card() all build Containers.\n"
+                f"  Fix: place it as a sibling of the card (its own add_item "
+                f"call or page entry), not as a card child."
+            )
     color = coerce_colour(color, owner="card", param="color")
     theme_managed = color is None
     if theme_managed:
@@ -1730,7 +1751,9 @@ class PaginatedRegion:
     The ``async def on_page_changed(self, page)`` hook runs after the page
     index updates and before the refresh -- the seam for analytics, async
     prefetch, or per-page validation. It mirrors the same hook on
-    ``PaginatedView`` / ``PaginatedLayoutView``.
+    ``PaginatedView`` / ``PaginatedLayoutView``. An override that needs
+    the host's data or helpers reads them through the read-only
+    :attr:`host` property.
 
     Two regions in one view need distinct ``key`` values so their button
     custom_ids do not collide::
@@ -1848,7 +1871,9 @@ class PaginatedRegion:
 
         ``page`` is the zero-based index of the new current page. Default
         is a no-op. Override for analytics, async prefetch, or per-page
-        validation that should fire on every page turn.
+        validation that should fire on every page turn. The host owns the
+        data, so an override that prefetches reads it through
+        :attr:`host` (set by the time any page can turn).
         """
         return None
 
@@ -1880,6 +1905,19 @@ class PaginatedRegion:
         self._clamp()
         start = self._page * self._per_page
         return self._items[start : start + self._per_page]
+
+    @property
+    def host(self) -> Optional[Any]:
+        """The host ``StatefulLayoutView`` the region is attached to, or ``None``.
+
+        Read-only. ``on_page_changed`` overrides read this to reach the
+        host (refetching the host's data source on a page turn, or
+        calling its ``respond`` for per-page feedback) instead of
+        reaching into ``_view``. ``None`` until the host renders: the
+        capture happens on the first ``controls(view)`` /
+        ``control_buttons(view)`` call, inside the host's own build.
+        """
+        return self._view
 
     def set_page(self, index: int) -> None:
         """Move the cursor to a zero-based page index without re-rendering.
@@ -2355,6 +2393,8 @@ class Collapsible:
         ``expanded`` is the post-flip state (``True`` once revealed, ``False``
         once collapsed). Default is a no-op. Override to fetch async data when
         expanded, log toggle events, or run validation on every open/close.
+        An override that needs the host's data or helpers reads them through
+        :attr:`host` (set by the time the trigger can be clicked).
         """
         return None
 
@@ -2372,6 +2412,18 @@ class Collapsible:
     def collapse(self) -> None:
         """Hide the region on the next render."""
         self._expanded = False
+
+    @property
+    def host(self) -> Optional[Any]:
+        """The host ``StatefulLayoutView`` the collapsible is attached to, or ``None``.
+
+        Read-only. ``on_toggle`` overrides read this to reach the host
+        (loading data on expand, or calling its ``respond``) instead of
+        reaching into ``_view``. ``None`` until the host renders: the
+        capture happens on the first ``render(view)`` call, inside the
+        host's own build.
+        """
+        return self._view
 
     def render(self, view) -> List[Any]:
         """Stash the host view and return the collapsible's components.

@@ -144,6 +144,7 @@ owner-gated cogs can carry the same marker so one check covers them all.
 | Command | Description |
 |---------|-------------|
 | `/cascadeui persistent` | List registered `PersistentView` classes (`module.QualName` keys) |
+| `/cascadeui unreachable [prune_older_than_days]` | List registry rows that could not be reached and how long each has been that way; with the argument, prune the aged ones after re-checking each against Discord |
 | `/cascadeui scoped [slot]` | Inspect a scoped bucket under `state["application"]` (default slot: `scoped`); groups keys by scope kind |
 | `/cascadeui computed [name]` | List `@computed` registrations with cache-primed status; pass a name to force a read |
 | `/cascadeui middleware` | List installed middleware in dispatch order |

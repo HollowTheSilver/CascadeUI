@@ -65,6 +65,14 @@ class Capability(Flag):
       for user-managed tables and vendor-specific features. SQL
       backends declare this; in-memory and key-value-only backends
       do not.
+    - ``OPEN_ROWS`` -- rows are open mappings: ``row_upsert`` accepts
+      unknown columns, ``row_select`` round-trips them, and a missing
+      column reads as ``None``. Schema migrators skip their DDL on such
+      a backend because a column-level change alters nothing on disk.
+      A backend declaring neither ``OPEN_ROWS`` nor ``RAW_SQL`` is
+      rejected during :meth:`PersistenceMiddleware.initialize` when a
+      schema migration is pending, rather than failing at the first
+      write that carries the new column.
     """
 
     KV = auto()
@@ -72,6 +80,7 @@ class Capability(Flag):
     TTL_INDEX = auto()
     SCHEMA_META = auto()
     RAW_SQL = auto()
+    OPEN_ROWS = auto()
 
 
 # // ========================================( Backend Protocol )======================================== // #
@@ -215,7 +224,9 @@ class PersistenceBackend(Protocol):
 
     async def get_schema_version(self, table: str) -> int:
         """Return the on-disk schema version for ``table``. Returns
-        ``0`` when the table has no recorded version (fresh install)."""
+        ``0`` when the table has no recorded version: a fresh install,
+        or a database that predates schema versioning -- the migration
+        runner tells the two apart by whether the table has rows."""
         ...
 
     async def set_schema_version(self, table: str, version: int) -> None:
