@@ -194,8 +194,10 @@ class TestEphemeralDoesNotAffectLimits:
 
 class TestAutoRefreshEphemeralDerivation:
     """When ``auto_refresh_ephemeral`` is left at its default (``None``), the
-    library derives the flag from ``timeout`` at send() time. ``timeout>900``
-    or ``None`` engages the handoff; ``timeout<=900`` declines it."""
+    library derives the handoff from ``timeout`` at send() time. ``timeout>900``
+    or ``None`` engages the handoff; ``timeout<=900`` declines it. The derived
+    answer lands on ``_refresh_handoff_resolved``; the declaration itself is
+    never written, so introspection keeps returning what the author set."""
 
     async def test_none_timeout_engages_handoff(self):
         """``timeout=None`` means "never expire"; the handoff is required
@@ -206,7 +208,8 @@ class TestAutoRefreshEphemeralDerivation:
 
         v = _View(interaction=_make_interaction())
         await v.send(ephemeral=True)
-        assert v.auto_refresh_ephemeral is True
+        assert v.auto_refresh_ephemeral is None
+        assert v._refresh_handoff_resolved is True
 
     async def test_long_timeout_engages_handoff(self):
         class _View(StatefulView):
@@ -215,7 +218,8 @@ class TestAutoRefreshEphemeralDerivation:
         v = _View(interaction=_make_interaction())
         await v.send(ephemeral=True)
         assert v.timeout == 3600
-        assert v.auto_refresh_ephemeral is True
+        assert v.auto_refresh_ephemeral is None
+        assert v._refresh_handoff_resolved is True
 
     async def test_short_timeout_declines_handoff(self):
         class _View(StatefulView):
@@ -224,7 +228,8 @@ class TestAutoRefreshEphemeralDerivation:
         v = _View(interaction=_make_interaction())
         await v.send(ephemeral=True)
         assert v.timeout == 300
-        assert v.auto_refresh_ephemeral is False
+        assert v.auto_refresh_ephemeral is None
+        assert v._refresh_handoff_resolved is False
 
     async def test_boundary_timeout_declines_handoff(self):
         """timeout==900 sits exactly on the webhook cliff, so the handoff
@@ -235,11 +240,12 @@ class TestAutoRefreshEphemeralDerivation:
 
         v = _View(interaction=_make_interaction())
         await v.send(ephemeral=True)
-        assert v.auto_refresh_ephemeral is False
+        assert v.auto_refresh_ephemeral is None
+        assert v._refresh_handoff_resolved is False
 
     async def test_non_ephemeral_send_does_not_derive(self):
-        """Channel sends never touch ``auto_refresh_ephemeral`` because the
-        flag only governs the webhook-token handoff."""
+        """Channel sends resolve nothing because the handoff only governs
+        the webhook-token cliff, which a public send does not have."""
 
         class _View(StatefulView):
             timeout = 3600
@@ -247,6 +253,7 @@ class TestAutoRefreshEphemeralDerivation:
         v = _View(interaction=_make_interaction())
         await v.send()
         assert v.auto_refresh_ephemeral is None
+        assert v._refresh_handoff_resolved is None
 
 
 # // ========================================( Mixed Attribute Validation )======================================== // #

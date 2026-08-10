@@ -535,6 +535,8 @@ discord.py components.
 Creates a `Container`. Strings are auto-wrapped in `TextDisplay`. Pass
 `spoiler=True` to hide the whole container behind a spoiler overlay:
 
+Raises `ValueError` when a child is a `Container`. Discord forbids a Container inside a Container, so `card(heading, alert(...))` is never legal -- place the alert as a sibling of the card. `alert()`, `card()` and `stats_card()` are the builders that produce one.
+
 ```python
 from cascadeui import card, divider
 from discord.ui import TextDisplay
@@ -610,6 +612,31 @@ self.add_item(link_section(
     url="https://hollowthesilver.github.io/CascadeUI/",
 ))
 ```
+
+!!! note "One accessory per Section -- a row cannot carry both a button and an image"
+    Discord gives a Section a single `accessory` slot, so text with a thumbnail
+    *and* a per-row button is not a shape that exists. The three builders above
+    are alternatives, not ingredients. Two layouts get close, and which one
+    fits depends on how many rows a page holds:
+
+    - **Keep the thumbnail inline** with `image_section`, and put one
+      [`choice_row`](#choice_rowoptions-on_select-selectednone-multifalse) under
+      the list keyed to the visible rows. Number the rows in their text and
+      label the options to match. This is the cheaper layout and the one that
+      scales: the control costs the same whether the page holds four rows or
+      twenty, and it becomes a dropdown on its own past `button_threshold`.
+      Pass `allow_reselect=True` when picking a row performs an action rather
+      than setting a selection, or the last-picked option renders disabled.
+    - **Keep the button inline** with `action_section`, and render the image
+      full width through `gallery()` above or below. The image no longer reads
+      as belonging to that row, which is usually the reason the first layout
+      wins.
+
+    A button per row is possible (`image_section` followed by its own
+    `ActionRow`), but it costs five components per row against the
+    40-per-message budget, so a page holds eight such rows before
+    `add_item` refuses the tree -- fewer once the page carries any other
+    chrome (a header, a nav row, an exit button).
 
 ### `confirm_section(text, *, on_confirm, on_cancel, ...)`
 

@@ -3,6 +3,7 @@
 # // ========================================( Modules )======================================== // #
 
 
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 from discord.ui import ActionRow, Container, LayoutView, TextDisplay
@@ -887,7 +888,7 @@ class TestDevToolsCogListDisplayCap:
 
 
 class TestDevToolsCogRegistryCommands:
-    """persistent / scoped / computed / middleware introspection commands."""
+    """persistent / scoped / computed / middleware / unreachable introspection."""
 
     def _make_ctx(self):
         ctx = MagicMock()
@@ -907,6 +908,84 @@ class TestDevToolsCogRegistryCommands:
             assert str(len(_persistent_view_classes)) in sent
         else:
             assert "No persistent view classes" in sent
+
+    async def test_unreachable_reports_no_backlog(self):
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = self._make_ctx()
+        manager = MagicMock()
+        manager.unreachable_since = {}
+        get_store().persistence_manager = manager
+        try:
+            await cog.unreachable.callback(cog, ctx)
+        finally:
+            del get_store().persistence_manager
+
+        assert "No unreachable registry rows" in ctx.send.call_args[0][0]
+
+    async def test_unreachable_lists_the_backlog_with_ages(self):
+        """Ages come from the stamp, so a day-old row reads as a day old."""
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = self._make_ctx()
+        manager = MagicMock()
+        manager.unreachable_since = {"panel_a": int(time.time()) - 86400 * 3}
+        get_store().persistence_manager = manager
+        try:
+            await cog.unreachable.callback(cog, ctx)
+        finally:
+            del get_store().persistence_manager
+
+        sent = ctx.send.call_args[0][0]
+        assert "panel_a" in sent
+        assert "3d" in sent
+
+    async def test_unreachable_prunes_when_given_a_cutoff(self):
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = self._make_ctx()
+        manager = MagicMock()
+        manager.prune_unreachable = AsyncMock(
+            return_value={"pruned": ["a", "b"], "recovered": ["c"], "kept": []}
+        )
+        get_store().persistence_manager = manager
+        try:
+            await cog.unreachable.callback(cog, ctx, prune_older_than_days=30)
+        finally:
+            del get_store().persistence_manager
+
+        # The prune re-checks every candidate against Discord, one fetch per
+        # row. A slash command has no auto-defer backstop, so the ack has to
+        # be explicit or a real backlog crosses the 3s wall. Asserted because
+        # a mocked ctx.send succeeds whether or not the slot was acked, which
+        # is what let this ship missing.
+        ctx.defer.assert_awaited_once_with(ephemeral=True)
+        manager.prune_unreachable.assert_awaited_once_with(older_than_days=30)
+        sent = ctx.send.call_args[0][0]
+        assert "Pruned 2" in sent and "recovered 1" in sent
+
+    async def test_unreachable_surfaces_a_rejected_cutoff(self):
+        """prune_unreachable validates its argument; the command reports it
+        rather than letting the traceback reach the invoking user."""
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = self._make_ctx()
+        manager = MagicMock()
+        manager.prune_unreachable = AsyncMock(side_effect=ValueError("must be an int"))
+        get_store().persistence_manager = manager
+        try:
+            await cog.unreachable.callback(cog, ctx, prune_older_than_days=-1)
+        finally:
+            del get_store().persistence_manager
+
+        assert "must be an int" in ctx.send.call_args[0][0]
+
+    async def test_unreachable_without_persistence_configured(self):
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = self._make_ctx()
+        store = get_store()
+        had = hasattr(store, "persistence_manager")
+        if had:
+            del store.persistence_manager
+        await cog.unreachable.callback(cog, ctx)
+
+        assert "Persistence is not configured" in ctx.send.call_args[0][0]
 
     async def test_scoped_reports_empty_when_bucket_missing(self):
         store = get_store()

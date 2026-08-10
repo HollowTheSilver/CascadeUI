@@ -587,6 +587,75 @@ class TestPageFrameHooks:
         # Sibling fallback: the nav row is a top-level child, not nested.
         assert view._nav_row in list(view.children)
 
+    async def test_frames_render_on_the_empty_page(self):
+        """The frames compose around the empty state the same way the
+        masthead does: the board keeps its frame while empty. A footer
+        that carries board state (a pause notice on a lapsed board) is
+        needed most exactly when there are no entries to render.
+        """
+
+        class Framed(LeaderboardLayoutView):
+            def build_header(self, page):
+                return TextDisplay("header line")
+
+            def build_footer(self, page):
+                return TextDisplay("-# paused: season lapsed")
+
+        view = await _make_view(cls=Framed)
+        page = view.pages[0]
+        # Header above the masthead, mirroring its above-the-card placement.
+        assert isinstance(page[0], TextDisplay)
+        assert page[0].content == "header line"
+        # Footer below the empty-state content. No rankings card exists on
+        # this page, so the raw component floats at top level instead of
+        # folding into a card.
+        assert isinstance(page[-1], TextDisplay)
+        assert page[-1].content == "-# paused: season lapsed"
+        assert "No entries recorded yet" in _page_text(view)
+
+    async def test_container_footer_renders_as_own_card_on_empty_page(self):
+        from cascadeui.components.patterns.v2 import card
+
+        class CardFooted(LeaderboardLayoutView):
+            def build_footer(self, page):
+                return card(TextDisplay("standalone footer card"))
+
+        view = await _make_view(cls=CardFooted)
+        page = view.pages[0]
+        assert isinstance(page[-1], Container)
+        texts = [t.content for t in page[-1].walk_children() if isinstance(t, TextDisplay)]
+        assert texts == ["standalone footer card"]
+
+    async def test_empty_page_frame_hooks_see_empty_ranked_entries(self):
+        seen = {}
+
+        class Aggregating(LeaderboardLayoutView):
+            def build_header(self, page):
+                seen["header"] = list(self.ranked_entries)
+                return None
+
+            def build_footer(self, page):
+                seen["footer"] = list(self.ranked_entries)
+                return None
+
+        await _make_view(cls=Aggregating)
+        assert seen == {"header": [], "footer": []}
+
+    async def test_framed_empty_page_is_send_legal(self):
+        from cascadeui.components.patterns.v2 import card, gallery
+        from cascadeui.views._placement import validate_placement
+
+        class Framed(LeaderboardLayoutView):
+            def build_header(self, page):
+                return gallery("https://example.com/banner.png")
+
+            def build_footer(self, page):
+                return [TextDisplay("-# paused"), card(TextDisplay("footer card"))]
+
+        view = await _make_view(cls=Framed)
+        view._recompose_page_tree(rebuild_nav=True)
+        validate_placement(view)
+
 
 class TestCardMasthead:
     """banner / title / build_title masthead composition."""
@@ -992,6 +1061,34 @@ class TestLeaderboardReload:
         assert build_calls["n"] == 0
         await view.reload(force=True)  # forced -> rebuilds
         assert build_calls["n"] == 1
+
+    async def test_failed_build_retries_on_next_rebuild(self):
+        """A raising hook leaves the entry signature unstamped, so the next
+        rebuild retries instead of short-circuiting onto the stale pages."""
+        data = [(1, {"wins": 1, "games": 1})]
+
+        class FlakyBoard(LeaderboardLayoutView):
+            boom = False
+
+            def get_entries(self):
+                return list(data)
+
+            def build_header(self, page):
+                if self.boom:
+                    raise RuntimeError("transient hook failure")
+                return None
+
+        view = FlakyBoard(interaction=_make_interaction())
+        await view.on_load()
+
+        data.append((2, {"wins": 9, "games": 9}))
+        view.boom = True
+        with pytest.raises(RuntimeError):
+            await view.rebuild_pages()
+
+        view.boom = False
+        await view.rebuild_pages()  # same data, no force -- must retry
+        assert "<@2>" in _page_text(view)
 
 
 # // ========================================( PersistentLeaderboardLayoutView )======================================== // #
@@ -1680,3 +1777,110 @@ class TestEmptySecondaryDoesNotFailThePage:
         validate_placement(view)
         stacked = [c for c in view.walk_children() if isinstance(c, TextDisplay)]
         assert all(not c.content.endswith("\n") for c in stacked)
+
+
+class TestEmptyBoardKeepsItsMasthead:
+    """An empty board carries the same identity a populated one does.
+
+    The empty-state short-circuit returned before the masthead composed, so
+    a board with a banner rendered it while it had entries and dropped it
+    while it had none. The masthead composes at the page seam rather than
+    inside the default hook, so an override inherits it.
+    """
+
+    BANNER = "https://example.invalid/banner.png"
+
+    async def test_banner_renders_on_an_empty_board(self):
+        class Board(LeaderboardLayoutView):
+            banner = TestEmptyBoardKeepsItsMasthead.BANNER
+            title = "Season Standings"
+
+        view = await _make_view(cls=Board)
+        page = view.pages[0]
+        galleries = [c for c in page if isinstance(c, MediaGallery)]
+        assert galleries, "empty board dropped its banner"
+        assert galleries[0].items[0].media.url == self.BANNER
+
+    async def test_title_heading_renders_on_an_empty_board(self):
+        class Board(LeaderboardLayoutView):
+            title = "Season Standings"
+
+        view = await _make_view(cls=Board)
+        headings = [c.content for c in view.pages[0] if isinstance(c, TextDisplay)]
+        assert "## Season Standings" in headings
+
+    async def test_an_override_inherits_the_masthead(self):
+        """The point of composing outside the hook: a replaced body keeps it."""
+        from cascadeui.components.patterns.v2 import card
+
+        class Board(LeaderboardLayoutView):
+            banner = TestEmptyBoardKeepsItsMasthead.BANNER
+            title = "Season Standings"
+
+            def on_leaderboard_empty(self):
+                return [card(TextDisplay("Play your first match!"))]
+
+        view = await _make_view(cls=Board)
+        page = view.pages[0]
+        assert [c for c in page if isinstance(c, MediaGallery)]
+        assert "Play your first match!" in _page_text(view)
+
+    async def test_build_title_empty_list_opts_out(self):
+        """The existing per-page opt-out governs the empty page too."""
+
+        class Board(LeaderboardLayoutView):
+            banner = TestEmptyBoardKeepsItsMasthead.BANNER
+            title = "Season Standings"
+
+            def build_title(self, page):
+                return []
+
+        view = await _make_view(cls=Board)
+        page = view.pages[0]
+        assert not [c for c in page if isinstance(c, MediaGallery)]
+        assert not [c for c in page if isinstance(c, Separator)]
+
+    async def test_ranked_entries_clears_when_the_board_empties(self):
+        """A populated build leaves a slice behind; the empty build must not
+        hand it to build_title or build_header as if it were current."""
+        rows = [(1, {"wins": 3, "games": 4})]
+
+        class Board(LeaderboardLayoutView):
+            def get_entries(self):
+                return rows
+
+        view = await _make_view(cls=Board)
+        assert view.ranked_entries
+
+        rows.clear()
+        await view.rebuild_pages(force=True)
+        assert view.ranked_entries == []
+
+    async def test_a_bare_component_return_still_renders(self):
+        """The hook's return accepts the non-list shapes every page value
+        accepts (a bare component wraps, same as _resolve_page)."""
+        from cascadeui.components.patterns.v2 import card
+
+        class Board(LeaderboardLayoutView):
+            banner = TestEmptyBoardKeepsItsMasthead.BANNER
+
+            def on_leaderboard_empty(self):
+                return card(TextDisplay("bare, not a list"))
+
+        view = await _make_view(cls=Board)
+        assert [c for c in view.pages[0] if isinstance(c, MediaGallery)]
+        assert "bare, not a list" in _page_text(view)
+
+    async def test_empty_page_composes_a_valid_tree(self):
+        """The masthead sits at the page's top level (no rankings card while
+        the board is empty), so the composed tree must clear the placement
+        validator's top-level rules."""
+        from cascadeui.views._placement import validate_placement
+
+        class Board(LeaderboardLayoutView):
+            banner = TestEmptyBoardKeepsItsMasthead.BANNER
+            title = "Season Standings"
+
+        view = Board(interaction=_make_interaction())
+        await view.on_load()
+        validate_placement(view)

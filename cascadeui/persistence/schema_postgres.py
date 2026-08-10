@@ -65,7 +65,8 @@ CREATE TABLE IF NOT EXISTS {TABLE_PERSISTENT_VIEWS} (
     kwargs_schema_version INTEGER NOT NULL DEFAULT 1,
     schema_version INTEGER NOT NULL DEFAULT 1,
     created_at BIGINT NOT NULL,
-    updated_at BIGINT NOT NULL
+    updated_at BIGINT NOT NULL,
+    first_unreachable_at BIGINT
 )
 """
 

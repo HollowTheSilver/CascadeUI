@@ -20,17 +20,227 @@ preserved below for historical reference but are not the supported baseline.
   Pillow-backed; core install stays lean because the extra is opt-in.
 - **Redis persistence backend.** Capability-flag conformant `RedisBackend`
   with multi-process coordination and pub/sub for scoped invalidation.
-- **An age on an unreachable registry row, and a prune that reads it.** A row
-  whose channel or message answers `Forbidden` is kept rather than pruned, so
-  a permission change during startup never deletes a live panel. The cost is
-  that a channel the bot will never see again is indistinguishable from one it
-  cannot see this minute, and each costs a message fetch at every boot for the
-  life of the deployment. A `first_unreachable_at` stamp on the row, reported
-  alongside the existing count, gives an operator the one fact that separates
-  the two; `prune_unreachable(older_than=...)` then acts on it. The library
-  keeps out of the delete decision: a count of consecutive failures cannot
-  make it safely, since a restart loop spends a boot-based threshold in
-  minutes, which is exactly when the rows are least safe to drop.
+
+---
+
+## [3.10.0] - 2026-08-10
+
+### Breaking
+
+- **A custom backend serving the registry namespace declares
+  `Capability.OPEN_ROWS` or `Capability.RAW_SQL`.** This release ships the
+  library's first schema migration, so the migration runner needs to know
+  whether a backend can alter its own table or has nothing to alter. Declare
+  `OPEN_ROWS` if rows are open mappings (unknown columns round-trip through
+  `row_upsert` / `row_select` and a missing one reads as `None`), or `RAW_SQL`
+  with the raw-SQL surface implemented so the migrator can run the `ALTER`.
+  A backend declaring neither is rejected at `PersistenceMiddleware.initialize`
+  with `PersistenceConfigError` naming both remedies, rather than accepting the
+  version bump and then failing on the first registry write carrying a column
+  its table lacks. Every built-in backend already qualifies: `SQLiteBackend` and
+  `PostgresBackend` declare `RAW_SQL`, `InMemoryBackend` declares `OPEN_ROWS`.
+  A backend with no migration pending is never asked for either flag, so a
+  fresh install is unaffected whatever it declares.
+
+### Added
+
+- **Registry rows that stay unreachable now carry an age, and an operator can
+  act on it.** Keeping an unreachable row is what stops a permission change
+  during startup from deleting a live panel, and the cost is that a channel the
+  bot will never see again is re-fetched at every boot forever. The first failed
+  fetch stamps `first_unreachable_at`; the stamp clears the moment a fetch
+  succeeds, and records the first failure rather than the latest so the age
+  grows across boots instead of resetting.
+  `PersistenceManager.unreachable_since` reads the backlog and
+  `prune_unreachable(older_than_days=)` acts on it,
+  re-checking every candidate against Discord first: a row that answers is kept
+  and cleared whatever its age, a definitive 404 goes regardless of age, and the
+  rest are deleted only past the cutoff. A stamp alone is one observation, and a
+  host that has not restarted for a month carries a month-old stamp from a
+  single failure. `/cascadeui unreachable` lists the backlog and takes an
+  optional cutoff to run the same prune. The `persistent_views` schema migrates
+  to v2 at startup; a migration that fails raises `PersistenceSchemaError`
+  naming the table, the version step, and the underlying error, and leaves the
+  on-disk version alone so the next start retries. PostgreSQL needs table
+  ownership for `ALTER TABLE`, which the documented grants do not confer.
+- **`prune_registry` takes `reason=`,** labeling the `REGISTRY_PRUNED` dispatch
+  so a subscriber can tell an operator giving up on a row from a boot finding a
+  404. Unset, it keeps the value the method already computed.
+- **`refresh()` and `reload()` say what happened to the edit.** Both returned
+  `None`, so a caller that had to know its render reached Discord inferred it
+  from the absence of an exception, and a `reload()` that returned at the
+  throttle gate without attempting anything was indistinguishable from one that
+  landed. They now return a `RenderOutcome`: rendered, skipped as unchanged,
+  deferred to the throttle boundary, dropped in transit, or no message left to
+  edit. Members compare equal to their string values, and a caller ignoring the
+  return is unaffected.
+- **`PaginatedRegion.host` and `Collapsible.host`.** Both composites document
+  hooks whose stated purpose needs the host they render into, and the only way
+  there was the private `_view`. The read-only accessor mirrors
+  `LeaderboardLayoutView.bot`, which exists for the same reason. It reads
+  `None` until the host's first render captures it.
+- **A note on Section accessories** in the components guide: a Section carries
+  one accessory, so a row cannot hold both a thumbnail and its own button, and
+  the two layouts that get closest are named.
+
+### Changed
+
+- **An empty leaderboard keeps its masthead.** The empty-state page returned
+  before the masthead composed, so a board rendered its `banner` and `title`
+  while it had entries and dropped both while it had none, and the banner
+  reappeared on its own once the first entry landed. The masthead now composes
+  above the empty-state page, and above it rather than inside it so an
+  override of `on_leaderboard_empty` inherits the board's identity instead of
+  having to know it was lost. `build_title` returning `[]` renders no masthead
+  on that page, as on any other. `title` defaults to `"Leaderboard"`, so a
+  board that never set one gains an `## Leaderboard` heading while it is
+  empty. `title=None` renders no heading on any page; to bare only the empty
+  page, return `[]` from `build_title` while `ranked_entries` is empty. An
+  override that composes the banner or title itself now renders them twice;
+  drop that composition, or return `[]` from `build_title`.
+- **The leaderboard's page frames run on the empty page.** `build_header` and
+  `build_footer` were skipped there, so an override that needed a frame on an
+  empty board had to know it was lost and recompose the library's own
+  return-type placement rule to get it back. Header content renders above the
+  masthead and footer content below the empty-state card, each in the order
+  returned. Two consequences worth checking on upgrade: an override returning
+  frame content unconditionally now renders it on an empty board, and one that
+  computes aggregates from `ranked_entries` without guarding an empty slice
+  raises during the empty-page build, where before it never ran.
+
+### Fixed
+
+- **Pruning re-reads a row before deleting it.** Every reachability verdict
+  costs a Discord fetch, so on a real backlog the snapshot behind one can be
+  minutes old by the time it is acted on. A panel re-posted under its stable
+  key in that window writes a fresh row the verdict knows nothing about, and
+  deleting by key alone removed the live panel because the message it replaced
+  answered 404. Both destructive paths now confirm the row still points at the
+  message that was judged, and report a rewritten one as kept rather than
+  pruned. A backend that raises while that confirmation is read no longer
+  takes the whole reattach pass down with it: the key is reported rather than
+  acted on, never deleted unconfirmed, and the pass still schedules its warm
+  repaint. A prune that raises at the same seam is contained the same way,
+  where before it left restored panels unrepainted and let a later
+  `reattach()` re-register rows it had already restored.
+- **A pruned registry row leaves this process's copy too.** `prune_registry`
+  deleted from disk and left the row in memory, so a later `reattach()` walked
+  rows whose messages were already gone and spent one fetch per dead row per
+  pass. That is the cost the unreachable stamp exists to stop paying. The
+  mirror is kept honest in the two other cases that move a row underneath a
+  pass: one re-posted under its key is refreshed to its new coordinates rather
+  than left pointing at the message it replaced, and one deleted out from
+  under the pass is dropped. Neither is stamped unreachable, since one is live
+  and the other no longer exists.
+- **Panels sharing a channel repaint one at a time.** Discord buckets message
+  edits per channel, and message writes carry sub-limits that response headers
+  do not report, so the concurrent post-ready `on_restore` pass opened several
+  edits into one channel's bucket at once and collected 429s no header-paced
+  client can pre-empt. Panels that share a channel now repaint serially, in
+  registry row order; panels in distinct channels keep the concurrent repaint
+  under `restore_concurrency`, so a deployment spread across channels boots as
+  before. The reattach fetches stay concurrent: read buckets report their
+  limits in headers, so the HTTP layer paces those itself.
+- **A registry table whose version record is missing migrates instead of being
+  recorded as current.** No version row was read as a fresh install, which was
+  safe while the table had only ever had one shape. Now that a migration
+  exists, a store whose version record was lost (a partial restore, a
+  hand-edited schema table) would be stamped at the current version while still
+  shaped as the old one, and every write to a column that version claims would
+  fail from then on. Rows are the discriminator: a table with rows predates the
+  record and migrates, an empty one is a genuine fresh install. The check runs
+  only on the boot that writes the record.
+- **A migrator passed to `migrators=` that collides with one already registered
+  now says so.** The decorator path raises on a duplicate; this path skipped
+  silently, so a consumer's migrator for a table and version the library had
+  claimed was discarded without a word.
+- **`InMemoryBackend` said it declared every capability flag.** It has never
+  declared `RAW_SQL`, so the docstring sent anyone reading it in an editor
+  tooltip to `execute()` and `transaction()`, which raise on that backend.
+- **A leaderboard that empties stops reporting the entries it used to hold.**
+  `ranked_entries` was assigned after the empty-board short-circuit, so a board
+  going from populated to empty kept the previous slice. A `build_header`
+  reading it for aggregate stats rendered totals for entries that no longer
+  exist, above a card saying there are none. It is cleared before the empty
+  page composes.
+- **A leaderboard build that raises retries on the next rebuild.** The entry
+  signature was stamped before the pages were built, so a hook that raised
+  once (an avatar resolver, a frame hook) left the board on its previous
+  pages, and the short-circuit then skipped every rebuild until the entry data
+  changed again. The signature now stamps only after the build returns, so a
+  transient failure recovers on the next rebuild without `force=True`.
+- **A second ephemeral send no longer lets the first one's timer take the new
+  panel early.** Both sends stamp their own token clock, but the first send's
+  arm timer was already asleep against the older one, so it woke as much as
+  thirteen minutes before the live token needed anything and swapped the
+  working panel's children for a Continue Session button, freezing it against
+  further state changes. A timer that wakes to find the deadline re-stamped
+  stands down, and the second send's own timer arms on the new schedule.
+- **A view re-sent publicly no longer offers to reopen the public message.**
+  Re-sending the same instance without `ephemeral=True` cancelled nothing and
+  cleared nothing, so the first send's arm timer woke against a message that
+  was no longer ephemeral and swapped the view's children for a Continue
+  Session button. It stands down on waking now, when the view no longer
+  manages an ephemeral message. Ephemeral navigation chains and reopens still
+  arm.
+- **`auto_refresh_ephemeral = False` set after send is honored.** The handoff
+  timer read the flag on the way in and slept through most of the token's life
+  without re-reading it, so a view pinning the handoff off mid-session was
+  armed anyway.
+- **`auto_refresh_ephemeral` is honored on a view reached by navigation, in
+  both directions.** The arming deadline records when the message's webhook
+  token expires, but it was written only when the sending view wanted the
+  handoff, so the navigation gates read its presence as the policy. Presence
+  cannot tell "derive this" from "explicitly off", nor "explicitly on" from
+  "never written": a view pinning the handoff off was armed anyway the moment
+  a push reached it and offered a Continue Session button around thirteen
+  minutes later, and a view pinning it on stayed silent when the original
+  send had declined. Every ephemeral send now stamps the deadline, since the
+  clock belongs to the message rather than to any view on it, and each
+  destination is judged on its own flag: `True` arms against the original
+  send's window, `False` stays off, and the `None` default inherits the
+  effective policy of the view it was pushed from. A pop hands the restored
+  view back the resolution it held when it was pushed away from, so a
+  departing child's declaration never travels up the chain. A rolled-back
+  navigation re-arms only a source whose handoff had engaged. A control that
+  arms on one press and executes on the next is the shape the off case
+  reaches: a reopen rebuilds it from constructor kwargs, which is not where
+  the record of an already-completed action lives.
+- **`auto_refresh_ephemeral` reads back what its author declared.** Resolving
+  the `None` default wrote the derived answer onto the attribute itself, so a
+  class declaring nothing reported `True` or `False` after its first send, and
+  nothing could tell an author's explicit choice from the library's computed
+  one. The frozen answer could not re-derive either: a second ephemeral send,
+  or a `timeout` changed between sends, carried the first one. The declaration
+  is now input the library never writes, and the resolution rides privately
+  beside the arming deadline, re-derived at every ephemeral send, inherited
+  down a push chain, and handed back on pop. Nothing else about when the
+  handoff engages changed.
+- **The ephemeral handoff no longer claims to preserve all state.** It
+  reconstructs from constructor kwargs plus `get_nav_state()`, so an attribute
+  assigned after `__init__` is lost unless that hook names it, and the loss is
+  invisible until a reopen fires. The guide said "preserves all state" and
+  never pointed at the hook.
+- **Overlapping `reload()` calls on one view run one at a time.** Two `on_load`
+  bodies could interleave at any await inside them and corrupt each other's
+  half-built render state: a forced leaderboard rebuild parked at its avatar
+  fetch could resume into entries a transient empty reload had already cleared,
+  drop its masthead on a populated page, and then stamp a signature that made
+  every later unforced reload short-circuit onto it. The library reaches this
+  itself, from the avatar backfill task a caller cannot serialize from outside,
+  while the two sibling entry points into the same state were already guarded.
+  A reload arriving mid-fetch now waits and re-fetches, so the last to run
+  renders the freshest data. A `reload()` called from inside its own `on_load`
+  raises instead of recursing, a `force=True` folded into a throttle window is
+  no longer dropped by a later unforced reload, and a reload gated while the
+  deferred render task was mid-flight is no longer lost.
+- **`card()` rejects a Container child at the call.** A Container is never a
+  legal child of a Container, and the composition was accepted silently and
+  rejected later by the placement validator, naming component indexes rather
+  than the call that built it. On a pushed screen that surfaced as a failed
+  navigation. The error names the child's position and points at placing it as
+  a sibling. `alert()` and `stats_card()` compose their own children and admit
+  no caller Container, so this is `card()` alone.
 
 ---
 

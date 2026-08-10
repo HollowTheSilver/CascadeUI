@@ -13,7 +13,7 @@ from discord.ui import ActionRow, Button, Container, TextDisplay
 from ...components.base import StatefulButton
 from ...components.types import EmojiInput
 from ...utils.hooks import await_maybe
-from ..base import _StatefulMixin
+from ..base import RenderOutcome, _StatefulMixin
 from ..layout import StatefulLayoutView
 from ..view import StatefulView
 
@@ -819,19 +819,22 @@ class PaginatedView(_BasePaginatedMixin, StatefulView):
             return {}
         return self._extract_page(self.pages[self.current_page])
 
-    async def _reload_render(self) -> None:
-        await self._update_page()
+    async def _reload_render(self) -> Optional[RenderOutcome]:
+        return await self._update_page()
 
-    async def _update_page(self, *, previous_page: Optional[int] = None):
+    async def _update_page(self, *, previous_page: Optional[int] = None) -> Optional[RenderOutcome]:
         """Mutate nav buttons in place and refresh the page content.
 
         ``previous_page`` is the cursor value the caller moved away from.
         Navigation callbacks pass it so a page turn whose edit never reached
         Discord can put the cursor back; rebuild callers (``refresh_data``,
         ``rebuild_pages``) leave it ``None`` because they moved no cursor.
+
+        Returns the :class:`RenderOutcome` of the edit, or ``None`` when
+        there are no pages to render.
         """
         if not self.pages:
-            return
+            return None
 
         # The cursor can be set before the list it indexes exists (a page
         # carried across a pop lands before the pages do), so clamp ahead of
@@ -854,12 +857,13 @@ class PaginatedView(_BasePaginatedMixin, StatefulView):
                 self.add_item(btn)
         else:
             self._sync_nav_state()
-        await self.refresh(**page_kwargs)
+        outcome = await self.refresh(**page_kwargs)
         if self._rewind_page_if_edit_never_landed(previous_page):
             # Nav state is the only tree-resident page artifact in V1 (the
             # body rides the embed kwarg), so re-deriving it is the whole
             # rollback. No second edit: the connection is still down.
             self._sync_nav_state()
+        return outcome
 
 
 # // ========================================( V2: PaginatedLayoutView )======================================== // #

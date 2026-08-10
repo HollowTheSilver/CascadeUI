@@ -4,7 +4,9 @@
 import io
 import json
 import logging
+import time
 from datetime import datetime, timezone
+from typing import Optional
 
 import discord
 from discord import app_commands
@@ -1648,6 +1650,59 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
         return ctx.guild.id if ctx.guild else None
 
     # // ==================( Registry Commands )================== // #
+
+    @cascadeui_group.command(
+        name="unreachable",
+        description="List registry rows that could not be reached, or prune the old ones.",
+    )
+    @app_commands.describe(
+        prune_older_than_days=(
+            "Delete rows unreachable at least this long. Each is re-checked first. "
+            "Omit to only list."
+        )
+    )
+    async def unreachable(self, ctx: Context, prune_older_than_days: Optional[int] = None) -> None:
+        """Report the unreachable-row backlog, and optionally prune it.
+
+        A row whose channel or message cannot be fetched is kept rather
+        than pruned, so a permission change during boot never deletes a
+        live panel. The cost is that a channel the bot will never see
+        again is re-fetched every startup. This surfaces how long each
+        one has been that way, and hands the delete decision to whoever
+        runs the command.
+        """
+        store = get_store()
+        manager = getattr(store, "persistence_manager", None)
+        if manager is None:
+            return await ctx.send("Persistence is not configured.", ephemeral=True)
+
+        if prune_older_than_days is None:
+            stamped = manager.unreachable_since
+            if not stamped:
+                return await ctx.send("No unreachable registry rows.", ephemeral=True)
+            now = int(time.time())
+            lines = [f"**{len(stamped)} unreachable row(s)**"]
+            for key, since in sorted(stamped.items(), key=lambda kv: kv[1])[:_LIST_DISPLAY_CAP]:
+                lines.append(f"`{key}` -- unreachable for {(now - since) // 86400}d")
+            if len(stamped) > _LIST_DISPLAY_CAP:
+                lines.append(f"*...and {len(stamped) - _LIST_DISPLAY_CAP} more*")
+            lines.append("*Re-run with `prune_older_than_days:` to delete the aged ones.*")
+            return await ctx.send("\n".join(lines), ephemeral=True)
+
+        # Defer before the prune: it re-checks every candidate against
+        # Discord, one fetch per row, past the 3s wall on a real backlog.
+        await ctx.defer(ephemeral=True)
+        try:
+            result = await manager.prune_unreachable(older_than_days=prune_older_than_days)
+        except (ValueError, RuntimeError) as exc:
+            return await ctx.send(f"⚠️ {exc}", ephemeral=True)
+
+        await ctx.send(
+            f"\U0001f9f9 Pruned {len(result['pruned'])}, "
+            f"recovered {len(result['recovered'])}, "
+            f"kept {len(result['kept'])} within the {prune_older_than_days}d cutoff.",
+            ephemeral=True,
+        )
 
     @cascadeui_group.command(
         name="persistent", description="List registered PersistentView classes."

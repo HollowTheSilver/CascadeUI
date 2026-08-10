@@ -426,6 +426,10 @@ One more knob lives on the persistence layer rather than the view:
 `PersistenceMiddleware(restore_concurrency=8)` bounds how many
 persistent views reattach concurrently on startup. Raise it when a bot
 restores many panels and the serial fetch cost dominates `setup_hook`.
+The post-ready repaint that follows serializes panels sharing a channel
+regardless of this value (message edits rate-bucket per channel), so
+raising the bound speeds deployments whose panels are spread across
+channels, not stacked in one.
 
 `auto_defer` is the one to understand. The safety-net timer runs
 independently of the serialization lock, so a callback that *awaits* for a

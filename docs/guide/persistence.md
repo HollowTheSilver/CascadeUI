@@ -140,17 +140,58 @@ summary = await store.persistence_manager.reattach_persistent_views()
 - `restored`: view reattached successfully.
 - `skipped`: view class not imported, or kwargs migrator missing. Row stays
   on disk so the next restart retries.
-- `failed`: construction or kwargs migrator raised during reattach.
-  (`on_restore` runs later, after the bot is ready; its failures are logged
-  there, not reflected in this bucket.) Row stays on disk for manual recovery.
+- `failed`: construction or a kwargs migrator raised during reattach, or a
+  404-verdicted row could not be confirmed or pruned because the backend
+  raised. (`on_restore` runs later, after the bot is ready; its failures are
+  logged there, not reflected in this bucket.) Row stays on disk; the next
+  pass retries it.
 - `removed`: channel or message returned a definitive 404 (`discord.NotFound`)
-  while the bot was offline. Row removed via `prune_registry` (which dispatches
-  `REGISTRY_PRUNED`).
+  while the bot was offline, re-confirmed against the live row. Row removed
+  via `prune_registry` (which dispatches `REGISTRY_PRUNED`).
 - `unreachable`: channel or message could not be fetched for a transient reason
   (`Forbidden`, `RateLimited`, `HTTPException`, a transport failure, or a
-  non-messageable channel). The row is left on
+  non-messageable channel), or the row was re-posted under its key mid-pass
+  and now points at a message the pass never fetched. The row is left on
   disk so a clean restart retries; nothing is pruned. Do not reconcile external
   records from this bucket: the panel may still exist.
+
+### Rows that stay unreachable
+
+Keeping an unreachable row is what stops a permission change during startup
+from deleting a live panel, and it has a cost: a channel the bot will never
+see again is re-fetched at every boot, forever. Nothing in a `Forbidden`
+distinguishes "not right now" from "not ever".
+
+So the first failed fetch stamps the row with `first_unreachable_at`, and the
+stamp clears the moment a fetch succeeds. It records the *first* failure, not
+the latest, so the age keeps growing across boots rather than resetting.
+
+```python
+mgr = store.persistence_manager
+mgr.unreachable_since
+# {"tickets:panel": 1754300000}
+
+await mgr.prune_unreachable(older_than_days=30)
+# {"pruned": [...], "recovered": [...], "kept": [...]}
+```
+
+`prune_unreachable` re-checks every candidate against Discord before deleting
+anything. A row that answers is kept and its stamp cleared, however old that
+stamp was; a row returning a definitive 404 goes regardless of age; the rest
+are deleted only if the stamp predates the cutoff. A stamp on its own is one
+observation, and a host that simply has not restarted for a month carries a
+month-old stamp from a single failure -- the second look is what turns it into
+evidence. Deletions route through `prune_registry`, so `REGISTRY_PRUNED` fires
+with `reason="unreachable"`.
+
+It raises `ValueError` for a negative or non-integer cutoff and `RuntimeError`
+when the middleware was built without `bot=`, since there is nothing to
+re-verify against. `/cascadeui unreachable` lists the backlog with ages, and
+takes an optional `prune_older_than_days` to run the same prune from Discord.
+
+The clear is keyed on the *fetch* succeeding, not on the view reconstructing.
+A row whose class raises during construction lands in `failed`, but its
+message was reachable, so its stamp clears and it is never a prune candidate.
 
 The middleware runs `reattach_persistent_views()` inside `setup_middleware`,
 after cogs are loaded but before `on_ready` fires. A `REGISTRY_PRUNED`
@@ -211,7 +252,7 @@ The library ships three backends:
 
 | Backend | Import | Capabilities |
 |---------|--------|--------------|
-| `InMemoryBackend` | `cascadeui.persistence` | KV, RELATIONAL, TTL_INDEX, SCHEMA_META |
+| `InMemoryBackend` | `cascadeui.persistence` | KV, RELATIONAL, TTL_INDEX, SCHEMA_META, OPEN_ROWS |
 | `SQLiteBackend` | `cascadeui.persistence` (requires `aiosqlite`) | KV, RELATIONAL, TTL_INDEX, SCHEMA_META, RAW_SQL |
 | `PostgresBackend` | `cascadeui.persistence` (requires `asyncpg`) | KV, RELATIONAL, TTL_INDEX, SCHEMA_META, RAW_SQL |
 
@@ -285,6 +326,19 @@ GRANT SELECT, INSERT, UPDATE, DELETE
     ON persistent_views, application_slots, cascadeui_kv, cascadeui_schema
     TO cascadeui_app;
 ```
+
+!!! warning "Schema migrations need more than this"
+    A version bump that alters a table's columns (see [Migrations](#migrations))
+    runs `ALTER TABLE` during `apply_migrations()`, and PostgreSQL grants no
+    privilege for that short of table ownership -- the DML grants above are not
+    enough. Under a locked-down `cascadeui_app` role the migration fails and the
+    bot does not boot, raising `PersistenceSchemaError` naming the table, the
+    version step, and the driver's own error. The on-disk version is left
+    unchanged, so the migration simply runs on the next start once the
+    privilege is there. Run it once as the table owner (or a role with `ALTER`
+    rights), then resume running the bot as `cascadeui_app`.
+    SQLite has no equivalent step: file-level write access covers `ALTER TABLE`
+    the same as any other write.
 
 #### Cross-process invalidation
 
@@ -509,11 +563,40 @@ A backend is any class that satisfies the `PersistenceBackend` Protocol and
 declares its capabilities. No inheritance is required; the Protocol is
 `@runtime_checkable`:
 
+!!! note "Declare how schema migrations reach your backend"
+    Library releases occasionally migrate the tables they own (the
+    `persistent_views` v2 migration adds a nullable column). A migrator needs
+    one of two declarations from the backend. `Capability.OPEN_ROWS` says rows
+    are open mappings: `row_upsert` accepts unknown columns, `row_select`
+    returns them untouched, and reading a missing one gives `None` -- a
+    column-add alters nothing on such a backend, so the migrator skips its
+    DDL. `Capability.RAW_SQL` with an implemented `execute` lets the migrator
+    alter the table instead. A backend declaring neither is rejected with
+    `PersistenceConfigError` during `PersistenceMiddleware.initialize` when a
+    migration is pending, with both remedies named in the message. A backend
+    with nothing to migrate is never asked for either flag.
+
+    The fresh-install case above is literal: migration only runs on a table
+    an older release created. A
+    backend that builds its own fixed-column tables owns keeping that DDL at
+    the current column set, because a table it creates today is stamped at
+    today's version and no migrator ever inspects it. Miss a column and the
+    first registry write fails at the driver, past the reach of the check
+    above. Building the table from the shared DDL constants in
+    `cascadeui.persistence.schema` is the way not to drift.
+
 ```python
 from cascadeui.persistence import Capability, PersistenceBackend
 
 class MyBackend:
-    capabilities = Capability.KV | Capability.RELATIONAL | Capability.SCHEMA_META
+    # OPEN_ROWS: rows here are open mappings, so schema migrations skip
+    # their DDL. A fixed-column backend declares RAW_SQL instead.
+    capabilities = (
+        Capability.KV
+        | Capability.RELATIONAL
+        | Capability.SCHEMA_META
+        | Capability.OPEN_ROWS
+    )
 
     async def initialize(self) -> None: ...
     async def close(self) -> None: ...
@@ -550,6 +633,13 @@ backend method runs:
 | `RegistryPersistence` | `RELATIONAL \| SCHEMA_META` |
 | `ApplicationPersistence` (no TTL slots) | `RELATIONAL \| SCHEMA_META` |
 | `ApplicationPersistence` (any `ttl_days` slot) | `RELATIONAL \| SCHEMA_META \| TTL_INDEX` |
+
+`OPEN_ROWS` and `RAW_SQL` sit outside the required sets above. They are
+checked at one conditional seam instead: when `apply_migrations` finds a
+pending schema migration for a namespace, that namespace's backend must
+declare one of the two, and a backend declaring neither raises
+`PersistenceConfigError` at that point. A backend with no migrations
+pending is never asked for either.
 
 Declare capabilities on the class, not the instance:
 
@@ -815,7 +905,9 @@ drives the reattach pipeline during startup:
 7. After `setup_hook` returns and the gateway connects, a background task
    awaits `bot.wait_until_ready()` and then calls `on_restore(bot)` on each
    restored view. The gateway cache is warm at that point, so renders resolve
-   real users, members, and channels instead of cold defaults.
+   real users, members, and channels instead of cold defaults. Panels sharing
+   a channel render one at a time (message edits rate-bucket per channel);
+   panels in distinct channels render concurrently.
 
 ### View identity: `user_id` and `session_id` follow the construction context
 
@@ -1022,9 +1114,8 @@ a `DynamicPersistentButton` so buttons differ only by their encoded
 Two migrator surfaces exist:
 
 - **Schema migrators** (library-owned, `register_migrator`): rewrite a
-  backend table from version N to N+1. The library ships zero migrators
-  today; the registry exists so future schema changes have a clean
-  landing spot without another breaking release.
+  backend table from version N to N+1. The registry exists so schema
+  changes have a clean landing spot without another breaking release.
 - **Kwargs migrators** (user-owned, `register_kwargs_migrator`): rewrite
   a single `PersistentView`'s stored `init_kwargs` blob from version N
   to N+1. Pure function of the kwargs dict, no backend access.
@@ -1043,7 +1134,20 @@ async def _migrate_persistent_views_1_to_2(backend):
 Library-owned migrators run automatically during `apply_migrations` in the
 setup pipeline. A missing migrator for a required version step raises
 `PersistenceSchemaError`. Fresh installs skip this path entirely because
-the DDL creates tables at the current version.
+the DDL creates tables at the current version; a table that has rows but no
+recorded version predates schema versioning and is treated as version 1, so
+its migrators still run. A pending migration also
+checks the backend's capability declaration: `OPEN_ROWS` skips the DDL,
+`RAW_SQL` runs it, and neither raises `PersistenceConfigError` (see
+[Writing a custom backend](#writing-a-custom-backend)).
+
+The library ships one schema migrator today: `persistent_views` from
+version 1 to 2, adding the `first_unreachable_at` column described in
+[Rows that stay unreachable](#rows-that-stay-unreachable). A database
+created before that column existed migrates automatically on the next
+startup against a library new enough to know about it; a database already
+migrated to version 2 raises `PersistenceSchemaError` against an older
+library that only knows version 1, so a downgrade is not silent.
 
 ### Registering migrators as data
 
@@ -1072,7 +1176,7 @@ migrator was authored.
 
 ## Pruning
 
-Two prune methods live on the manager. Callers typically reach them via
+Three prune methods live on the manager. Callers typically reach them via
 the `/cascadeui` DevTools command group or a scheduled task:
 
 ```python
@@ -1084,7 +1188,16 @@ await manager.prune_application(older_than_days=7)
 
 # Registry: delete specific persistent-view rows (or everything).
 await manager.prune_registry(persistence_keys=["roles:main", "tickets:panel"])
+
+# Registry: delete rows that have stayed unreachable past a cutoff, after
+# re-checking each one against Discord.
+await manager.prune_unreachable(older_than_days=30)
 ```
+
+`prune_unreachable` is the safe way to clear the backlog described in
+[Rows that stay unreachable](#rows-that-stay-unreachable) -- it re-verifies
+every candidate before deleting anything, so a row that has recovered is
+never mistaken for one that never will.
 
 Each prune dispatches a bookkeeping action (`APPLICATION_SLOTS_PRUNED`,
 `REGISTRY_PRUNED`) so subscribers and hooks observe the deletion without

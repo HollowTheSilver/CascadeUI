@@ -281,6 +281,24 @@ class _InteractionMixin:
 
     # // ==================( Ephemeral Refresh )================== // #
 
+    @property
+    def _refresh_handoff(self) -> Optional[bool]:
+        """Effective refresh-handoff policy for this view.
+
+        ``auto_refresh_ephemeral`` is the author's declaration and the
+        library never assigns to it; an explicit ``True``/``False`` --
+        including a ``set_class_attribute`` pin applied after send --
+        always wins. ``None`` falls through to
+        ``_refresh_handoff_resolved``, the library's own resolution:
+        derived from ``timeout`` at each ephemeral send, inherited from
+        the immediate source on push/pop. ``None`` from this property
+        means nothing has resolved the policy yet.
+        """
+        declared = self.auto_refresh_ephemeral
+        if declared is not None:
+            return declared
+        return self._refresh_handoff_resolved
+
     def _build_refresh_button(self) -> StatefulButton:
         """Build the button shown when an ephemeral session is about to expire.
 
@@ -310,21 +328,57 @@ class _InteractionMixin:
         timer fires ``refresh_warning_seconds`` early so the swap edit still
         succeeds inside the token window.
 
-        The wait is computed against ``_ephemeral_arm_deadline`` (stamped once
-        at send), so a re-schedule after a failed-navigation rollback sleeps
+        The wait is computed against ``_ephemeral_arm_deadline`` (stamped at
+        the original ephemeral send and carried across navigation), so a
+        re-schedule after a failed-navigation rollback sleeps
         only the time remaining until the original deadline -- not a fresh
         window that would overshoot the 900s token cliff.
+
+        Four conditions are re-read after the sleep rather than trusted from
+        before it, because each can change during the wait: the view can
+        finish or lose its message, a same-instance send can make the
+        managed message public, the effective handoff policy can be pinned
+        off or re-derived against a shorter timeout, and a same-instance
+        ephemeral re-send can stamp a new deadline with its own timer. Any
+        one of them means this timer no longer describes the view it slept
+        for, so it arms nothing and returns.
         """
+        if self._refresh_handoff is False:
+            # Refused already by the send pipeline and both navigation gates
+            # for every pinned-off view; this only catches a direct schedule
+            # call or a pin landing before the first await below. ``is
+            # False`` rather than falsy, because an unresolved ``None`` must
+            # keep the timer running.
+            return
         deadline = self._ephemeral_arm_deadline
-        if deadline is not None:
-            delay = max(1, deadline - time.monotonic())
-        else:
-            delay = max(1, 900 - self.refresh_warning_seconds)
+        if deadline is None:
+            # Every scheduler stamps or requires a deadline before this
+            # runs; reaching here without one means a direct call with
+            # nothing to arm against.
+            return
+        delay = max(1, deadline - time.monotonic())
         try:
             await asyncio.sleep(delay)
         except asyncio.CancelledError:
             return
         if self.is_finished() or self._refresh_armed or not self._message:
+            return
+        if not self._ephemeral:
+            # A same-instance public re-send flips this without clearing the
+            # stale deadline; this is what stops the timer from arming the
+            # reopen button over a live public panel.
+            return
+        if self._refresh_handoff is False:
+            # set_class_attribute can pin the policy off, or a second
+            # ephemeral send can re-derive it against a shorter timeout,
+            # either mid-sleep -- re-reading here catches both.
+            return
+        if self._ephemeral_arm_deadline != deadline:
+            # Deadline equality stands in for timer identity here: a
+            # same-instance re-send stamps a fresh deadline and arms its own
+            # timer, while navigation carries the value unchanged. Arming
+            # against a stale deadline would clear the new panel's children
+            # early and then freeze it for the rest of the session.
             return
         await self._arm_refresh_button()
 

@@ -184,8 +184,10 @@ super().__init__(*args, timeout=None, **kwargs)  # Never timeout
 ```
 
 !!! note "Ephemeral timeout derivation"
-    `send(ephemeral=True)` derives `auto_refresh_ephemeral` from the declared
-    `timeout`. The `timeout` value itself is never rewritten.
+    `send(ephemeral=True)` derives the refresh-handoff behavior from the
+    declared `timeout`. Neither declaration is rewritten: `timeout` stays as
+    the author set it, and `auto_refresh_ephemeral` keeps reading whatever the
+    class or the caller set -- the derived answer is tracked internally.
 
     - Left at the `None` default, the refresh handoff engages when
       `timeout is None or timeout > 900`: the view intends to outlive the
@@ -1153,6 +1155,20 @@ the derivation:
 class QuickInfo(StatefulLayoutView):
     auto_refresh_ephemeral = False
 ```
+
+The deadline is stamped at `send()` and measured from that original send,
+because the 15-minute window belongs to the original interaction. Navigation
+never restarts the clock: `push()` and `pop()` destinations arm against the
+chain's deadline, each under its own `auto_refresh_ephemeral`. An explicit
+`False` keeps the handoff off on every path, an explicit `True` engages it
+even when the original send declined, and a destination left at the `None`
+default inherits the effective policy of the view it navigated from: the
+nearest hop's explicit setting when one exists, else the answer the original
+send derived. Its own `timeout` is not consulted, and its
+`auto_refresh_ephemeral` is not modified -- the inherited answer rides the
+chain internally. The one thing a destination cannot change is the window
+itself: however the handoff engages, the button arms before the original
+send's 15 minutes run out.
 
 Customization knobs:
 

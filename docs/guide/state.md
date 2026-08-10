@@ -365,7 +365,7 @@ consistently from views, reducers, and selectors:
 | `StateStore.scope_key(scope, *, user_id=None, guild_id=None)` | Staticmethod -- build the scope-key string, or `None` when a required id is missing. |
 | `StateStore.merge_scoped(state, scope, data, *, slot_name="scoped", subkey=None, **ids)` | Reducer-side writer -- mutates the deep-copied state in place. |
 
-### Cross-View Reactivity
+### Cross-View Reactivity from Scoped Writes
 
 `dispatch_scoped()` fires `SCOPED_UPDATE`, which other views don't subscribe
 to by default. For live cross-view updates, dispatch a named action with a
@@ -488,7 +488,7 @@ restart is the end of liveness, and the new panel is a new session that
 happens to use the same Discord message. Any data the panel cares about
 lives in the scoped or application namespace, not in session bookkeeping.
 
-### Cross-View Reactivity
+### Cross-View Reactivity from Session Writes
 
 Other views can subscribe to `SESSION_UPDATED` to react to session data
 changes:

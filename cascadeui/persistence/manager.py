@@ -49,6 +49,7 @@ import time
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from ..exceptions import (
+    PersistenceConfigError,
     PersistenceInitError,
     PersistenceRehydrateError,
     PersistenceSchemaError,
@@ -64,7 +65,7 @@ from .config import (
     SlotPolicy,
 )
 from .migrations import get_kwargs_migrator, get_schema_migrator
-from .protocols import PersistenceBackend
+from .protocols import Capability, PersistenceBackend
 from .schema import (
     CURRENT_SCHEMA_VERSIONS,
     TABLE_APPLICATION_SLOTS,
@@ -103,10 +104,9 @@ class PersistenceManager:
     ) -> None:
         self._store = store
         self._bot = bot
-        # Maximum concurrent fetch_channel / fetch_message calls during
-        # reattach_persistent_views. Bounds the per-row Discord round-trips
-        # so a many-panel deployment overlaps them within Discord's rate
-        # budget on startup.
+        # Bounds per-row Discord round-trips across both restore phases; see
+        # _run_post_ready_restore for the per-channel serialization the
+        # repaint adds on top of this bound.
         self.restore_concurrency = restore_concurrency
 
         # Default to opted-out configs so every namespace has a config
@@ -271,6 +271,22 @@ class PersistenceManager:
         via :func:`get_schema_migrator`. The loop advances one version
         per iteration so multi-step upgrades (v1 -> v3) run v1->v2
         then v2->v3 sequentially.
+
+        A pending migration also checks the backend's capability
+        declaration: :data:`Capability.OPEN_ROWS` means the migrator can
+        skip its DDL, :data:`Capability.RAW_SQL` means it can run it, and
+        a backend declaring neither raises
+        :class:`~cascadeui.exceptions.PersistenceConfigError` here rather
+        than rejecting registry writes after the version is recorded. The
+        check never fires for a backend with nothing to migrate.
+
+        A missing version row is not automatically a fresh install: a
+        table with rows predates the version record (a partial restore, a
+        hand-edited schema table) and is assumed to sit at v1, walked
+        forward by the migrator chain from there; an empty table is a
+        genuine fresh install, recorded directly at the current version.
+        The row probe that tells them apart runs only on the boot that
+        writes the record.
         """
         for ns_cfg, table in (
             (self.registry, TABLE_PERSISTENT_VIEWS),
@@ -282,10 +298,17 @@ class PersistenceManager:
             on_disk = await ns_cfg.backend.get_schema_version(table)
 
             if on_disk == 0:
-                # Fresh install. DDL already created the table at
-                # current version, so record it and move on.
-                await ns_cfg.backend.set_schema_version(table, current)
-                continue
+                # Rows predate the version record and walk forward from v1
+                # (see the docstring); an empty table is a fresh install. A
+                # wrong guess only costs a re-run: every migrator is
+                # idempotent (SQLite probes for the column, PostgreSQL uses
+                # IF NOT EXISTS, an OPEN_ROWS backend skips its DDL entirely).
+                if await ns_cfg.backend.row_select(table):
+                    on_disk = 1
+                    await ns_cfg.backend.set_schema_version(table, on_disk)
+                else:
+                    await ns_cfg.backend.set_schema_version(table, current)
+                    continue
 
             while on_disk < current:
                 migrator = get_schema_migrator(table, on_disk)
@@ -294,7 +317,39 @@ class PersistenceManager:
                         f"No migrator registered for {table} "
                         f"v{on_disk} -> v{on_disk + 1}; cannot upgrade"
                     )
-                await migrator(ns_cfg.backend)
+                caps = ns_cfg.backend.capabilities
+                if not caps & (Capability.OPEN_ROWS | Capability.RAW_SQL):
+                    # The migrator cannot run DDL without a raw-SQL surface,
+                    # and skipping it is only safe when rows are open
+                    # mappings. Refusing here is what keeps the failure at
+                    # the misconfiguration instead of at the first registry
+                    # write carrying a column the table does not have.
+                    raise PersistenceConfigError(
+                        f"{table} has a pending schema migration "
+                        f"(v{on_disk} -> v{on_disk + 1}), and backend "
+                        f"{type(ns_cfg.backend).__name__} declares neither "
+                        f"Capability.OPEN_ROWS nor Capability.RAW_SQL. Declare "
+                        f"OPEN_ROWS if rows are open mappings (unknown columns "
+                        f"round-trip through row_upsert/row_select and a missing "
+                        f"column reads as None), or declare RAW_SQL and implement "
+                        f"the raw-SQL surface so the migrator can alter the table."
+                    )
+                try:
+                    await migrator(ns_cfg.backend)
+                except PersistenceSchemaError:
+                    raise
+                except Exception as exc:
+                    # Unwrapped, the driver's own error leaves setup_hook
+                    # naming neither the table nor the step; initialize_backends
+                    # already wraps its failures this way, and this seam had
+                    # nothing to wrap until the library shipped a migrator.
+                    raise PersistenceSchemaError(
+                        f"Migrating {table} from v{on_disk} to v{on_disk + 1} failed: "
+                        f"{type(exc).__name__}: {exc}. The on-disk version is unchanged, "
+                        f"so the migration retries on the next start. A migrator runs DDL: "
+                        f"on PostgreSQL that needs table ownership, which the usual "
+                        f"SELECT/INSERT/UPDATE/DELETE grants do not confer."
+                    ) from exc
                 on_disk += 1
                 await ns_cfg.backend.set_schema_version(table, on_disk)
                 logger.info(f"Migrated {table} to v{on_disk}")
@@ -393,17 +448,21 @@ class PersistenceManager:
         - ``skipped`` -- view class not imported OR missing kwargs
           migrator. Row stays on disk so the next restart can pick it
           up once the import or migrator is fixed.
-        - ``failed`` -- construction or migrator raised during reattach.
-          (``on_restore`` runs later, in a post-ready background task; its
-          failures are logged there, not reflected in this bucket.) Row stays
-          on disk for manual recovery.
+        - ``failed`` -- construction or a migrator raised during reattach, or
+          a 404-verdicted row could not be re-read or pruned because the
+          backend raised. (``on_restore`` runs later, in a post-ready
+          background task; its failures are logged there, not reflected in
+          this bucket.) Row stays on disk; the next pass retries it.
         - ``removed`` -- channel or message returned a definitive 404
           (``discord.NotFound``). Row deleted from disk via :meth:`prune_registry`
           and its bookkeeping action dispatched.
         - ``unreachable`` -- channel or message could not be fetched for a
           transient reason (``Forbidden``, ``HTTPException``, or a non-messageable
-          channel). The row is left on disk so a clean restart retries; nothing
-          is pruned.
+          channel), or the row was rewritten mid-pass (re-posted under its
+          stable key while this pass held a 404 verdict against the message it
+          replaced) and points at a message this pass never fetched. The row is
+          left on disk so a clean restart retries; nothing is pruned, and a
+          rewritten row is not stamped.
 
         Requires ``self._bot``. No-op when bot is absent (data-only
         persistence mode). Every pass also re-registers the full
@@ -457,6 +516,12 @@ class PersistenceManager:
 
         removed_keys: list[str] = []
         unreachable_keys: list[str] = []
+        # Fetch SUCCEEDED, whatever construction then did. Clearing on
+        # restore-success instead would leave a stamp ageing on a panel
+        # whose message is perfectly reachable and whose view merely
+        # raised -- and that panel is live, so pruning it is the exact
+        # outcome the stamp exists to prevent.
+        reachable_keys: list[str] = []
 
         # Phase 1 (concurrent): resolve the view class, migrate kwargs, and
         # fetch the Discord channel + message for every row. These are the
@@ -465,7 +530,12 @@ class PersistenceManager:
         # network latency within Discord's rate budget instead of paying it
         # serially on the setup_hook critical path. The per-row helpers
         # already isolate failures (skipped / removed / failed land in the
-        # summary), so a bad row never aborts the fan-out.
+        # summary), so a bad row never aborts the fan-out. No per-channel
+        # ordering here, unlike the post-ready repaint: read buckets report
+        # their limits in response headers, so the HTTP layer paces a
+        # same-channel fetch burst itself. Message edits carry
+        # header-invisible sub-limits and get grouped in
+        # _run_post_ready_restore.
         self._reattach_passes += 1
         sem = asyncio.Semaphore(self.restore_concurrency)
 
@@ -505,6 +575,7 @@ class PersistenceManager:
                     # Already appended to removed_keys or unreachable_keys.
                     return None
                 _channel, message = fetched
+                reachable_keys.append(persistence_key)
                 return (row, view_cls, migrated, message)
             except Exception as exc:
                 logger.error(
@@ -532,15 +603,41 @@ class PersistenceManager:
 
         # Delete rows whose channel or message disappeared while the bot
         # was offline. prune_registry dispatches REGISTRY_PRUNED so
-        # subscribers observe the bookkeeping action.
+        # subscribers observe the bookkeeping action. Nothing in this block
+        # may escape the pass: phase 2 already registered views, and an
+        # abort here skips the warm repaint and the _restored_keys update,
+        # so a later reattach() re-drive would construct a second view for
+        # a message that already has a live one.
         if removed_keys:
-            await self.prune_registry(persistence_keys=removed_keys)
-            summary["removed"].extend(removed_keys)
+            verdicted = {r.get("persistence_key"): r for r in rows}
+            confirmed, rewritten, unverified = await self._confirm_unchanged(
+                removed_keys, verdicted
+            )
+            if confirmed:
+                try:
+                    await self.prune_registry(persistence_keys=confirmed)
+                    summary["removed"].extend(confirmed)
+                except Exception as exc:
+                    logger.warning(
+                        f"Pruning {len(confirmed)} gone row(s) failed mid-reattach: {exc}. "
+                        f"The rows stay on disk and the next pass re-verdicts them."
+                    )
+                    summary["failed"].extend(confirmed)
+            # A rewritten row points at a message this pass never fetched: it
+            # is reported unreachable and left on disk with its mirror already
+            # refreshed, so the next pass fetches the new coordinates. It is
+            # kept out of the stamp write below -- nothing about the new
+            # message failed, and stamping it would age a live panel.
+            summary["unreachable"].extend(rewritten)
+            summary["failed"].extend(unverified)
         # Transiently unreachable rows are NOT pruned -- they stay on disk so a
         # clean restart retries the fetch. Reported separately so a consumer
         # does not mistake a momentary glitch for a definitive deletion.
         if unreachable_keys:
             summary["unreachable"].extend(unreachable_keys)
+            await self._write_unreachable_stamps(unreachable_keys, int(time.time()))
+        if reachable_keys:
+            await self._write_unreachable_stamps(reachable_keys, None)
 
         # Defer every restored view's on_restore render to after the gateway
         # is ready. on_restore reads the bot cache (avatars, members,
@@ -576,8 +673,9 @@ class PersistenceManager:
         if summary["unreachable"]:
             logger.warning(
                 f"{len(summary['unreachable'])} persistent view(s) could not be reached "
-                f"(missing permissions, or a channel that is gone); the rows are kept and "
-                f"retried next restart. Keys at DEBUG on this logger."
+                f"(missing permissions, a channel that is gone, or a row re-posted "
+                f"mid-pass); the rows are kept and retried next restart. Keys at DEBUG "
+                f"on this logger."
             )
         return summary
 
@@ -732,6 +830,181 @@ class PersistenceManager:
             return None
 
         return channel, message
+
+    async def _confirm_unchanged(
+        self, keys: list[str], verdicted: dict[str, dict]
+    ) -> tuple[list[str], list[str], list[str]]:
+        """Split keys into confirmed, rewritten, and unverified against live rows.
+
+        Every reachability verdict costs a Discord fetch, so by the time one is
+        acted on the snapshot behind it can be old -- minutes old on a real
+        backlog. A panel re-posted under its stable key in that window writes a
+        fresh row the verdict knows nothing about, and deleting by key alone
+        would remove a live panel because the message it replaced returned a
+        404. Every destructive path re-reads before it acts.
+
+        A rewritten key's mirror row is refreshed with the fresh coordinates,
+        so a later pass fetches the message the row now points at instead of
+        re-404ing the one the verdict was about, warning per pass that it is
+        pruning an entry it never prunes.
+
+        A re-read that fails is logged and the key returned as unverified,
+        never confirmed. The caller is mid-pass and still owes its summary,
+        and the safe direction is the one that does not delete: the row stays
+        on disk and the next pass re-verdicts it from scratch.
+
+        A key whose row vanished from disk between the verdict and this
+        re-read appears in none of the three lists: the deletion it was headed
+        for already happened by another hand, and that hand did its own
+        bookkeeping. Its mirror copy is dropped so later passes stop
+        re-fetching a row that no longer exists.
+        """
+        backend = self.registry.backend
+        if backend is None:
+            return list(keys), [], []
+
+        confirmed: list[str] = []
+        rewritten: list[str] = []
+        unverified: list[str] = []
+        for key in keys:
+            before = verdicted.get(key)
+            try:
+                current = await backend.row_select(TABLE_PERSISTENT_VIEWS, {"persistence_key": key})
+            except Exception as exc:
+                logger.warning(
+                    f"Could not re-read {key!r} to confirm its prune: {exc}. "
+                    f"The row is kept; the next pass re-verdicts it."
+                )
+                unverified.append(key)
+                continue
+            if not current:
+                self._registry_rows = [
+                    r for r in self._registry_rows if r.get("persistence_key") != key
+                ]
+                logger.debug(
+                    f"Row for {key!r} vanished from disk before its prune; "
+                    f"whoever deleted it did the bookkeeping."
+                )
+                continue
+            if before is not None and (
+                current[0].get("channel_id") != before.get("channel_id")
+                or current[0].get("message_id") != before.get("message_id")
+            ):
+                logger.info(
+                    f"Skipping prune of {key!r}: the row was rewritten while this pass "
+                    f"was running, so the verdict describes a message it no longer "
+                    f"points at."
+                )
+                # Adopt the fresh coordinates in place. Absent keys are not
+                # appended: the mirror bounds what reattach re-drives walk,
+                # and a row this process never mirrored stays outside it.
+                fresh = dict(current[0])
+                for i, r in enumerate(self._registry_rows):
+                    if r.get("persistence_key") == key:
+                        self._registry_rows[i] = fresh
+                        break
+                rewritten.append(key)
+                continue
+            confirmed.append(key)
+        return confirmed, rewritten, unverified
+
+    async def _write_unreachable_stamps(self, keys: list[str], stamp: Optional[int]) -> None:
+        """Set or clear ``first_unreachable_at`` on registry rows.
+
+        ``stamp=None`` clears. Setting preserves an existing value, because
+        the column records the FIRST failure: refreshing it on every boot
+        would reset the age of exactly the rows that have earned one.
+
+        Each row is read back from disk and written whole. A partial upsert
+        is not an option: ``InMemoryBackend`` replaces the stored row, so a
+        two-key dict would delete the panel's message reference, and a SQL
+        backend would fail the row's NOT NULL columns on a missing key.
+
+        A write that fails is logged and skipped rather than raised. The
+        caller is a reattach pass that still owes its summary, and a lost
+        stamp self-heals: the row is still unreachable next boot, so it is
+        stamped then, one boot later, which only prunes more conservatively.
+        """
+        backend = self.registry.backend
+        if backend is None or not keys:
+            return
+
+        mirror = {r.get("persistence_key"): r for r in self._registry_rows}
+
+        for key in keys:
+            cached = mirror.get(key)
+            if cached is not None:
+                # Cheap agreement check first: the common boot writes nothing.
+                if (stamp is None) == (cached.get("first_unreachable_at") is None):
+                    continue
+            try:
+                found = await backend.row_select(TABLE_PERSISTENT_VIEWS, {"persistence_key": key})
+                if not found:
+                    continue
+                current = found[0]
+
+                # The verdict was rendered against the row read at rehydrate.
+                # A re-post under the same key writes a new channel/message to
+                # disk without refreshing that copy, so stamping blind would
+                # age a panel that is live somewhere else.
+                if cached is not None and (
+                    current.get("channel_id") != cached.get("channel_id")
+                    or current.get("message_id") != cached.get("message_id")
+                ):
+                    logger.debug(
+                        f"Skipping unreachable stamp for {key!r}: the row was rewritten "
+                        f"since this pass read it."
+                    )
+                    continue
+
+                if (stamp is None) == (current.get("first_unreachable_at") is None):
+                    continue
+
+                if Capability.RAW_SQL in backend.capabilities:
+                    # Touch the one column. Reading the row and writing it back
+                    # whole would carry the rest of the snapshot with it, and a
+                    # registry flush landing in the gap between that read and
+                    # that write is silently reverted -- leaving the registry
+                    # pointing at a message that was already replaced, which the
+                    # next boot then 404-prunes. One UPDATE cannot lose a column
+                    # it never names.
+                    ph = "?" if backend.placeholder_style == "qmark" else "$1"
+                    ph2 = "?" if backend.placeholder_style == "qmark" else "$2"
+                    await backend.execute(
+                        f"UPDATE {TABLE_PERSISTENT_VIEWS} SET first_unreachable_at = {ph} "
+                        f"WHERE persistence_key = {ph2}",
+                        stamp,
+                        key,
+                    )
+                else:
+                    # No SQL, and no await between the read and the write on a
+                    # dict-shaped backend, so there is no gap for a flush to
+                    # land in. Whole-row is required here: these backends
+                    # replace on upsert, so a partial dict would delete the
+                    # panel's own message reference.
+                    updated = dict(current)
+                    updated["first_unreachable_at"] = stamp
+                    await backend.row_upsert(TABLE_PERSISTENT_VIEWS, updated, ["persistence_key"])
+                if cached is not None:
+                    cached["first_unreachable_at"] = stamp
+            except Exception as exc:
+                logger.warning(f"Could not update the unreachable stamp for {key!r}: {exc}")
+
+    @property
+    def unreachable_since(self) -> dict[str, int]:
+        """Registry keys currently carrying an unreachable stamp, epoch seconds.
+
+        Read from this process's view of the rows, so it reflects rehydrate
+        plus whatever this process has observed since. That can over-report
+        a row another process has already recovered; it cannot under-report
+        one, and nothing destructive reads it -- :meth:`prune_unreachable`
+        goes to disk.
+        """
+        return {
+            r["persistence_key"]: r["first_unreachable_at"]
+            for r in self._registry_rows
+            if r.get("persistence_key") and r.get("first_unreachable_at") is not None
+        }
 
     async def _reattach_one(
         self,
@@ -924,6 +1197,11 @@ class PersistenceManager:
         gateway can connect), then renders warm. Each view is already
         registered, so interactions route during the wait. ``on_restore``
         failures are logged per view and never abort the rest.
+
+        Repaints group by channel: panels sharing a channel render one at a
+        time, in registry row order (message edits rate-bucket per channel),
+        while panels in distinct channels render concurrently under
+        ``restore_concurrency``.
         """
         try:
             await self._bot.wait_until_ready()
@@ -962,7 +1240,30 @@ class PersistenceManager:
                     )
                     return False
 
-        rendered = sum(await asyncio.gather(*(_render(view) for view in views)))
+        # A repaint is a message edit, and Discord buckets message edits per
+        # channel (channel id is a Route major parameter), with sub-limits
+        # that response headers do not report -- so a same-channel burst 429s
+        # no matter how the HTTP layer paces on headers. Panels sharing a
+        # channel therefore repaint serially, in registry row order; panels in
+        # distinct channels are distinct buckets and still fan out under the
+        # semaphore. A view with no message ref (deleted out from under it
+        # during the ready wait: on_message_delete nulls ``_message`` before
+        # ``exit()``) derives no channel and repaints in its own group, so it
+        # neither crashes the grouping nor serializes unrelated panels.
+        groups: dict[Any, list] = {}
+        for view in views:
+            channel = getattr(getattr(view, "_message", None), "channel", None)
+            channel_id = getattr(channel, "id", None)
+            groups.setdefault(channel_id if channel_id is not None else object(), []).append(view)
+
+        async def _render_channel(channel_views: list) -> int:
+            count = 0
+            for view in channel_views:
+                if await _render(view):
+                    count += 1
+            return count
+
+        rendered = sum(await asyncio.gather(*(_render_channel(g) for g in groups.values())))
         # The repaint runs on already-interactive views, so its duration is
         # surfaced rather than guarded. Startup is unaffected (this runs
         # post-ready).
@@ -1059,10 +1360,15 @@ class PersistenceManager:
         self,
         *,
         persistence_keys: Optional[list[str]] = None,
+        reason: Optional[str] = None,
     ) -> int:
         """Delete persistent_views rows. When ``persistence_keys`` is given,
         only those rows are removed; otherwise clears the whole
-        registry (destructive, rarely wanted)."""
+        registry (destructive, rarely wanted).
+
+        ``reason`` labels the ``REGISTRY_PRUNED`` dispatch so a subscriber can
+        tell why a row went. Left unset it keeps the value this method has
+        always computed, so no existing caller or subscriber sees a change."""
         backend = self.registry.backend
         if backend is None:
             return 0
@@ -1089,15 +1395,130 @@ class PersistenceManager:
                     pruned.append(sk)
                     deleted += 1
 
+        # Drop the pruned rows from this process's mirror. Without it a later
+        # reattach() re-drive walks rows whose messages are already gone and
+        # spends one HTTP fetch per dead row per pass, which is the same cost
+        # the unreachable stamp exists to stop paying.
+        if pruned:
+            gone = set(pruned)
+            self._registry_rows = [
+                r for r in self._registry_rows if r.get("persistence_key") not in gone
+            ]
+
         await self._store.dispatch(
             "REGISTRY_PRUNED",
             {
                 "deleted": deleted,
                 "keys": pruned,
-                "reason": "explicit" if persistence_keys else "clear_all",
+                "reason": reason or ("explicit" if persistence_keys else "clear_all"),
             },
         )
         return deleted
+
+    async def prune_unreachable(self, *, older_than_days: int) -> dict[str, list[str]]:
+        """Delete registry rows that have stayed unreachable past a cutoff.
+
+        Candidates are rows carrying a ``first_unreachable_at`` stamp, set
+        when a reattach pass cannot fetch the row's channel or message for a
+        non-definitive reason and cleared the moment a fetch succeeds. Every
+        candidate is re-verified against Discord before anything is deleted:
+
+        - the fetch succeeds: the row is kept and its stamp cleared
+          (``recovered``);
+        - ``discord.NotFound``: deleted whatever its age (``pruned``), the
+          same definitive verdict a reattach pass already prunes on;
+        - still unreachable: deleted only when the stamp predates the cutoff
+          (``pruned``), kept otherwise (``kept``). A row rewritten mid-pass,
+          or one whose pre-delete re-read failed at the backend, is kept too:
+          neither verdict describes the row as it stands.
+
+        Re-verifying is what makes this safe to run. A stamp records one
+        observation, so a host that simply has not rebooted for a month
+        carries a month-old stamp on the strength of a single failure. The
+        second look turns that into "unreachable then, and unreachable now",
+        and guarantees a row that answers today cannot be deleted.
+
+        Returns ``{"pruned": [...], "recovered": [...], "kept": [...]}`` of
+        persistence keys. Deletions route through :meth:`prune_registry`, so
+        ``REGISTRY_PRUNED`` fires with ``reason="unreachable"``.
+
+        Raises ``ValueError`` for a negative or non-integer
+        ``older_than_days`` and ``RuntimeError`` when the middleware was
+        built without ``bot=``, since re-verification needs the client. A
+        registry with no backend returns the empty summary.
+        """
+        if isinstance(older_than_days, bool) or not isinstance(older_than_days, int):
+            raise ValueError(
+                f"prune_unreachable older_than_days must be an int; "
+                f"got {type(older_than_days).__name__}."
+            )
+        if older_than_days < 0:
+            raise ValueError(
+                f"prune_unreachable older_than_days must be zero or greater; "
+                f"got {older_than_days}."
+            )
+
+        summary: dict[str, list[str]] = {"pruned": [], "recovered": [], "kept": []}
+        backend = self.registry.backend
+        if backend is None:
+            return summary
+        if self._bot is None:
+            raise RuntimeError(
+                "prune_unreachable() requires a middleware constructed with bot=; "
+                "without a client there is nothing to re-verify against, and without "
+                "one no reattach pass runs, so no rows are ever stamped."
+            )
+
+        # From disk, never the in-memory mirror: a re-send in this process
+        # clears the stamp on disk without refreshing the copy, and the
+        # destructive path has to read the authority.
+        rows = await backend.row_select(TABLE_PERSISTENT_VIEWS)
+        candidates = [r for r in rows if r.get("first_unreachable_at") is not None]
+        if not candidates:
+            return summary
+
+        cutoff = int(time.time()) - older_than_days * 86400
+        kill: list[str] = []
+
+        for row in candidates:
+            key = row.get("persistence_key")
+            removed_scratch: list[str] = []
+            unreachable_scratch: list[str] = []
+            fetched = await self._fetch_restore_message(row, removed_scratch, unreachable_scratch)
+
+            if fetched is not None:
+                summary["recovered"].append(key)
+                await self._write_unreachable_stamps([key], None)
+            elif removed_scratch:
+                # A definitive 404. Age is irrelevant; the message is gone.
+                kill.append(key)
+            elif row["first_unreachable_at"] <= cutoff:
+                kill.append(key)
+            else:
+                summary["kept"].append(key)
+
+        if kill:
+            # Re-read before deleting -- see _confirm_unchanged for why. The
+            # reattach pass guards this same shape on its own 404s; this is
+            # the second destructive caller and needs the identical guard.
+            verdicted = {r["persistence_key"]: r for r in candidates}
+            confirmed, rewritten, unverified = await self._confirm_unchanged(kill, verdicted)
+            summary["kept"].extend(rewritten)
+            # Unverified means the re-read itself failed, so the verdict was
+            # never checked against the live row. Kept, not pruned: deleting
+            # on an unread verdict is the blindness the re-read prevents.
+            summary["kept"].extend(unverified)
+            if confirmed:
+                await self.prune_registry(persistence_keys=confirmed, reason="unreachable")
+                summary["pruned"].extend(confirmed)
+
+        logger.info(
+            f"prune_unreachable: {len(summary['pruned'])} pruned, "
+            f"{len(summary['recovered'])} recovered, {len(summary['kept'])} still within "
+            f"the {older_than_days}d cutoff."
+        )
+        logger.debug(f"prune_unreachable keys: {summary}")
+        return summary
 
     # // ========================================( Shutdown )======================================== // #
 

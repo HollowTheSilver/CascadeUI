@@ -14,6 +14,7 @@ fan-out coverage lives in :mod:`test_persistence_middleware`.
 import asyncio
 import json
 import logging
+import time
 from unittest.mock import MagicMock
 
 import discord
@@ -333,6 +334,68 @@ class TestManagerApplyMigrations:
             await be.get_schema_version(TABLE_PERSISTENT_VIEWS)
             == CURRENT_SCHEMA_VERSIONS[TABLE_PERSISTENT_VIEWS]
         )
+
+    async def test_open_rows_backend_skips_the_migrator_and_advances(self):
+        # InMemoryBackend declares OPEN_ROWS, so the pending v1 -> v2
+        # migrator no-ops and the version still advances. Without the
+        # skip this raises: the migrator's DDL path needs a raw-SQL
+        # surface InMemoryBackend does not have.
+        be = InMemoryBackend()
+        await be.set_schema_version(TABLE_PERSISTENT_VIEWS, 1)
+        mgr = PersistenceManager(
+            store=get_store(),
+            registry=RegistryPersistence(backend=be),
+        )
+        await mgr.initialize_backends()
+        await mgr.apply_migrations()
+        assert (
+            await be.get_schema_version(TABLE_PERSISTENT_VIEWS)
+            == CURRENT_SCHEMA_VERSIONS[TABLE_PERSISTENT_VIEWS]
+        )
+
+    async def test_neither_flag_with_a_pending_migration_raises_config_error(self):
+        # A fixed-column backend with no raw-SQL surface cannot run the
+        # migrator, and skipping it is only safe on open rows. The
+        # rejection lands here, at initialize, naming both remedies --
+        # not at the first registry write carrying the new column.
+        class _FixedColumns(InMemoryBackend):
+            capabilities = Capability.KV | Capability.RELATIONAL | Capability.SCHEMA_META
+
+        be = _FixedColumns()
+        await be.set_schema_version(TABLE_PERSISTENT_VIEWS, 1)
+        mgr = PersistenceManager(
+            store=get_store(),
+            registry=RegistryPersistence(backend=be),
+        )
+        await mgr.initialize_backends()
+        with pytest.raises(PersistenceConfigError) as excinfo:
+            await mgr.apply_migrations()
+
+        message = str(excinfo.value)
+        assert "_FixedColumns" in message
+        assert "OPEN_ROWS" in message
+        assert "RAW_SQL" in message
+        # The version must not advance: the on-disk rows are still v1.
+        assert await be.get_schema_version(TABLE_PERSISTENT_VIEWS) == 1
+
+    async def test_neither_flag_with_nothing_pending_is_not_rejected(self):
+        # The capability question only exists when a migrator is about to
+        # run. A fresh install records current without running one, and a
+        # store already at current never enters the loop.
+        class _FixedColumns(InMemoryBackend):
+            capabilities = Capability.KV | Capability.RELATIONAL | Capability.SCHEMA_META
+
+        be = _FixedColumns()
+        mgr = PersistenceManager(
+            store=get_store(),
+            registry=RegistryPersistence(backend=be),
+        )
+        await mgr.initialize_backends()
+        await mgr.apply_migrations()
+        current = CURRENT_SCHEMA_VERSIONS[TABLE_PERSISTENT_VIEWS]
+        assert await be.get_schema_version(TABLE_PERSISTENT_VIEWS) == current
+        # Already at current: still nothing to reject.
+        await mgr.apply_migrations()
 
 
 # // ========================================( Manager rehydrate )======================================== // #
@@ -1393,11 +1456,13 @@ class TestPostReadyRestore:
     (avatars, members, channels) land warm, off the setup_hook critical path
     where the cache is still cold."""
 
-    def _view(self, vid, on_restore, finished=False):
+    def _view(self, vid, on_restore, finished=False, channel_id=None):
         view = MagicMock()
         view.id = vid
         view.is_finished.return_value = finished
         view.on_restore = on_restore
+        if channel_id is not None:
+            view._message.channel.id = channel_id
         return view
 
     async def test_the_repaint_runs_concurrently_bounded_by_restore_concurrency(self):
@@ -1429,6 +1494,108 @@ class TestPostReadyRestore:
 
         assert peak > 1, "a serial pass would never see two in flight"
         assert peak <= 3, "the semaphore bounds the burst against Discord"
+
+    async def test_same_channel_repaints_serialize(self):
+        """Panels sharing a channel repaint one at a time.
+
+        Message edits rate-bucket per channel (channel id is a Route major
+        parameter) and carry sub-limits response headers do not report, so a
+        same-channel burst 429s no matter how the HTTP layer paces on
+        headers. Serial per channel never exceeds any allowance.
+        """
+
+        class _FakeBot:
+            async def wait_until_ready(self):
+                return None
+
+        live = 0
+        peak = 0
+
+        async def _on_restore(bot):
+            nonlocal live, peak
+            live += 1
+            peak = max(peak, live)
+            await asyncio.sleep(0.01)
+            live -= 1
+
+        mgr = PersistenceManager(store=get_store(), bot=_FakeBot(), restore_concurrency=8)
+        views = [self._view(f"v-{i}", _on_restore, channel_id=111) for i in range(4)]
+
+        await mgr._run_post_ready_restore(views)
+
+        assert peak == 1, "same-channel repaints share one rate bucket and must not overlap"
+
+    async def test_channels_repaint_concurrently_with_each_other(self):
+        """Per-channel serialization does not cost the cross-channel fan-out:
+        distinct channels are distinct rate buckets and still overlap under
+        the ``restore_concurrency`` ceiling."""
+
+        class _FakeBot:
+            async def wait_until_ready(self):
+                return None
+
+        live: dict = {}
+        peaks: dict = {}
+        global_live = 0
+        global_peak = 0
+
+        def _track(channel_id):
+            async def _on_restore(bot):
+                nonlocal global_live, global_peak
+                live[channel_id] = live.get(channel_id, 0) + 1
+                peaks[channel_id] = max(peaks.get(channel_id, 0), live[channel_id])
+                global_live += 1
+                global_peak = max(global_peak, global_live)
+                await asyncio.sleep(0.01)
+                live[channel_id] -= 1
+                global_live -= 1
+
+            return _on_restore
+
+        mgr = PersistenceManager(store=get_store(), bot=_FakeBot(), restore_concurrency=8)
+        views = [
+            self._view(f"v-{cid}-{i}", _track(cid), channel_id=cid)
+            for cid in (111, 222, 333)
+            for i in range(2)
+        ]
+
+        await mgr._run_post_ready_restore(views)
+
+        assert global_peak > 1, "distinct channels still overlap"
+        assert all(p == 1 for p in peaks.values()), f"a channel overlapped itself: {peaks}"
+
+    async def test_view_without_message_ref_still_repaints(self):
+        """A view whose message ref was nulled during the ready wait
+        (``on_message_delete`` clears ``_message`` before ``exit()``) derives
+        no channel key; each such view repaints in its own group, so the pass
+        neither crashes on the missing ref nor serializes unrelated panels
+        behind it."""
+
+        class _FakeBot:
+            async def wait_until_ready(self):
+                return None
+
+        live = 0
+        peak = 0
+        ran = []
+
+        async def _on_restore(bot):
+            nonlocal live, peak
+            live += 1
+            peak = max(peak, live)
+            ran.append("ok")
+            await asyncio.sleep(0.01)
+            live -= 1
+
+        mgr = PersistenceManager(store=get_store(), bot=_FakeBot(), restore_concurrency=8)
+        views = [self._view(f"v-{i}", _on_restore) for i in range(2)]
+        for view in views:
+            view._message = None
+
+        await mgr._run_post_ready_restore(views)
+
+        assert ran == ["ok", "ok"], "both channel-less views rendered"
+        assert peak == 2, "channel-less views stay concurrent rather than falsely grouped"
 
     async def test_on_restore_waits_for_ready(self):
         events = []
@@ -1975,26 +2142,38 @@ class TestPersistenceMiddlewareSetup:
 class TestMigratorRegistries:
     """register_migrator / register_kwargs_migrator collision and lookup."""
 
+    # A fake table, because the library now ships its own migrator for
+    # persistent_views v1 and these tests would collide with it.
+    TABLE = "_test_migrator_table"
+
+    def setup_method(self, method):
+        # Snapshot rather than clear: the registries are module-level, so
+        # wiping them would deregister the library's own migrator for every
+        # test that runs after this class.
+        self._schema_snapshot = dict(_MIGRATORS)
+        self._kwargs_snapshot = dict(_KWARGS_MIGRATORS)
+
     def teardown_method(self, method):
-        # Clean per-test so re-registration succeeds without raising.
         _MIGRATORS.clear()
+        _MIGRATORS.update(self._schema_snapshot)
         _KWARGS_MIGRATORS.clear()
+        _KWARGS_MIGRATORS.update(self._kwargs_snapshot)
 
     def test_register_migrator_stores_callable(self):
-        @register_migrator(TABLE_PERSISTENT_VIEWS, 1)
+        @register_migrator(self.TABLE, 1)
         async def migrator(backend):
             pass
 
-        assert (TABLE_PERSISTENT_VIEWS, 1) in _MIGRATORS
+        assert (self.TABLE, 1) in _MIGRATORS
 
     def test_duplicate_migrator_raises(self):
-        @register_migrator(TABLE_PERSISTENT_VIEWS, 1)
+        @register_migrator(self.TABLE, 1)
         async def first(backend):
             pass
 
         with pytest.raises(ValueError, match="already registered"):
 
-            @register_migrator(TABLE_PERSISTENT_VIEWS, 1)
+            @register_migrator(self.TABLE, 1)
             async def second(backend):
                 pass
 
@@ -2159,3 +2338,902 @@ class TestReattachLogLevels:
             await mgr.reattach_persistent_views()
 
         assert "before PersistenceMiddleware.initialize()" not in caplog.text
+
+
+class TestUnreachableStampLifecycle:
+    """``first_unreachable_at`` records the FIRST failure and clears on recovery.
+
+    The stamp is what separates a permission blip from a channel the bot will
+    never see again, so a wrong value is not cosmetic: it decides whether
+    ``prune_unreachable`` deletes a live panel.
+    """
+
+    def _row(self, key, stamp=None, message_id=1, channel_id=2):
+        return {
+            "persistence_key": key,
+            "view_class": "V",
+            "custom_id": None,
+            "message_id": message_id,
+            "channel_id": channel_id,
+            "guild_id": 3,
+            "user_id": 4,
+            "session_id": "s",
+            "init_kwargs": "{}",
+            "kwargs_schema_version": 1,
+            "schema_version": 2,
+            "created_at": 1,
+            "updated_at": 1,
+            "first_unreachable_at": stamp,
+        }
+
+    async def _mgr(self, rows):
+        backend = InMemoryBackend()
+        await backend.initialize()
+        for r in rows:
+            await backend.row_upsert(TABLE_PERSISTENT_VIEWS, r, ["persistence_key"])
+        mgr = PersistenceManager(
+            store=get_store(), registry=RegistryPersistence(backend=backend), bot=MagicMock()
+        )
+        mgr._registry_rows = [dict(r) for r in rows]
+        return mgr, backend
+
+    async def _stamp_of(self, backend, key):
+        found = await backend.row_select(TABLE_PERSISTENT_VIEWS, {"persistence_key": key})
+        return found[0].get("first_unreachable_at")
+
+    async def test_the_first_failure_is_the_one_recorded(self):
+        mgr, backend = await self._mgr([self._row("a")])
+        before = int(time.time())
+        await mgr._write_unreachable_stamps(["a"], before)
+        after = int(time.time())
+        first = await self._stamp_of(backend, "a")
+        assert before <= first <= after
+
+        await mgr._write_unreachable_stamps(["a"], int(time.time()) + 500)
+        assert await self._stamp_of(backend, "a") == first, "a later pass must not reset the age"
+
+    async def test_clearing_removes_the_stamp(self):
+        mgr, backend = await self._mgr([self._row("a", stamp=1000)])
+        await mgr._write_unreachable_stamps(["a"], None)
+        assert await self._stamp_of(backend, "a") is None
+
+    async def test_the_write_never_drops_the_rest_of_the_row(self):
+        """InMemoryBackend replaces on upsert, so a partial write would delete
+        the panel's own message reference."""
+        mgr, backend = await self._mgr([self._row("a")])
+        await mgr._write_unreachable_stamps(["a"], 1234)
+        row = (await backend.row_select(TABLE_PERSISTENT_VIEWS, {"persistence_key": "a"}))[0]
+        assert row["view_class"] == "V"
+        assert row["message_id"] == 1
+        assert row["init_kwargs"] == "{}"
+
+    async def test_a_row_rewritten_since_the_pass_read_it_is_left_alone(self):
+        """A re-post under the same key must not inherit the dead row's age."""
+        mgr, backend = await self._mgr([self._row("a")])
+        await backend.row_upsert(
+            TABLE_PERSISTENT_VIEWS,
+            self._row("a", message_id=999, channel_id=888),
+            ["persistence_key"],
+        )
+
+        await mgr._write_unreachable_stamps(["a"], 1234)
+
+        assert await self._stamp_of(backend, "a") is None
+
+    async def test_unreachable_since_reports_only_stamped_rows(self):
+        mgr, _ = await self._mgr([self._row("a", stamp=1000), self._row("b")])
+        assert mgr.unreachable_since == {"a": 1000}
+
+    async def test_the_lifecycle_holds_on_a_raw_sql_backend(self, tmp_path):
+        """SQLiteBackend takes the single-column UPDATE branch, which exists so
+        a stamp write cannot revert a registry flush landing between a
+        whole-row read and write. The in-memory tests above all take the
+        whole-row branch, so the UPDATE gets driven on the real backend:
+        set, first-failure preservation against disk, clear, and the rest
+        of the row untouched throughout.
+        """
+        pytest.importorskip("aiosqlite")
+        from cascadeui.persistence.backends.sqlite import SQLiteBackend
+
+        backend = SQLiteBackend(str(tmp_path / "stamps.db"))
+        await backend.initialize()
+        try:
+            row = self._row("a")
+            await backend.row_upsert(TABLE_PERSISTENT_VIEWS, row, ["persistence_key"])
+
+            mgr = PersistenceManager(
+                store=get_store(), registry=RegistryPersistence(backend=backend), bot=MagicMock()
+            )
+            mgr._registry_rows = [dict(row)]
+
+            # The branch's point is that the whole row is never rewritten;
+            # record any row_upsert reaching the backend after the seed.
+            whole_row_writes = []
+            real_upsert = backend.row_upsert
+
+            async def _spy(*args, **kwargs):
+                whole_row_writes.append(args)
+                return await real_upsert(*args, **kwargs)
+
+            backend.row_upsert = _spy
+
+            before = int(time.time())
+            await mgr._write_unreachable_stamps(["a"], before)
+            after = int(time.time())
+            first = await self._stamp_of(backend, "a")
+            assert before <= first <= after
+
+            # A second failure judged against disk, not the mirror's
+            # short-circuit: a fresh pass with an empty mirror must still
+            # preserve the first stamp.
+            mgr._registry_rows = []
+            await mgr._write_unreachable_stamps(["a"], first + 500)
+            assert (
+                await self._stamp_of(backend, "a") == first
+            ), "a later pass must not reset the age"
+
+            survivor = (await backend.row_select(TABLE_PERSISTENT_VIEWS, {"persistence_key": "a"}))[
+                0
+            ]
+            assert survivor["view_class"] == "V"
+            assert survivor["message_id"] == 1
+            assert survivor["init_kwargs"] == "{}"
+
+            await mgr._write_unreachable_stamps(["a"], None)
+            assert await self._stamp_of(backend, "a") is None
+
+            assert whole_row_writes == [], (
+                "the RAW_SQL branch touches one column; a whole-row write here "
+                "can revert a concurrent registry flush"
+            )
+        finally:
+            await backend.close()
+
+
+class TestStampClearsOnFetchNotOnRestore:
+    """The clear is keyed on the FETCH succeeding, not the restore.
+
+    A row whose view raises during construction still fetched fine: its
+    message is reachable and its panel is live. Keying the clear on
+    ``summary["restored"]`` would leave that row ageing until an operator
+    pruned a panel that was never unreachable at all.
+    """
+
+    async def test_a_row_that_fetched_but_failed_to_construct_is_cleared(self):
+        from cascadeui.views.persistent import (
+            PersistentLayoutView,
+            _persistent_view_classes,
+        )
+
+        class _BrokenPanel(PersistentLayoutView):
+            def __init__(self, *args, **kwargs):
+                raise RuntimeError("construction blew up")
+
+        qualname = next(k for k, v in _persistent_view_classes.items() if v is _BrokenPanel)
+
+        backend = InMemoryBackend()
+        await backend.initialize()
+        row = {
+            "persistence_key": "panel:a",
+            "view_class": qualname,
+            "custom_id": None,
+            "message_id": 1,
+            "channel_id": 2,
+            "guild_id": 3,
+            "user_id": 4,
+            "session_id": "s",
+            "init_kwargs": "{}",
+            "kwargs_schema_version": 1,
+            "schema_version": 2,
+            "created_at": 1,
+            "updated_at": 1,
+            "first_unreachable_at": 1000,
+        }
+        await backend.row_upsert(TABLE_PERSISTENT_VIEWS, row, ["persistence_key"])
+
+        mgr = PersistenceManager(
+            store=get_store(), registry=RegistryPersistence(backend=backend), bot=MagicMock()
+        )
+        mgr._registry_rows = [dict(row)]
+
+        async def _fetch(r, removed, unreachable):
+            return (MagicMock(), MagicMock())
+
+        mgr._fetch_restore_message = _fetch
+
+        summary = await mgr.reattach_persistent_views()
+
+        assert "panel:a" in summary["failed"], "construction failed, so it is not restored"
+        found = await backend.row_select(TABLE_PERSISTENT_VIEWS, {"persistence_key": "panel:a"})
+        assert found, "the row must survive: its message is reachable"
+        assert found[0]["first_unreachable_at"] is None
+
+    async def test_a_class_that_never_imported_leaves_the_stamp_alone(self):
+        """No fetch ran, so there is no reachability evidence either way."""
+        backend = InMemoryBackend()
+        await backend.initialize()
+        row = {
+            "persistence_key": "panel:b",
+            "view_class": "nowhere.Missing",
+            "custom_id": None,
+            "message_id": 1,
+            "channel_id": 2,
+            "guild_id": 3,
+            "user_id": 4,
+            "session_id": "s",
+            "init_kwargs": "{}",
+            "kwargs_schema_version": 1,
+            "schema_version": 2,
+            "created_at": 1,
+            "updated_at": 1,
+            "first_unreachable_at": 1000,
+        }
+        await backend.row_upsert(TABLE_PERSISTENT_VIEWS, row, ["persistence_key"])
+        mgr = PersistenceManager(
+            store=get_store(), registry=RegistryPersistence(backend=backend), bot=MagicMock()
+        )
+        mgr._registry_rows = [dict(row)]
+
+        summary = await mgr.reattach_persistent_views()
+
+        assert "panel:b" in summary["skipped"]
+        found = await backend.row_select(TABLE_PERSISTENT_VIEWS, {"persistence_key": "panel:b"})
+        assert found[0]["first_unreachable_at"] == 1000
+
+
+class TestPruneUnreachable:
+    """Deleting a registry row is the operator's call, and never blind.
+
+    Every candidate is re-verified before deletion, so a row that answers
+    at prune time is recovered rather than removed however old its stamp.
+    """
+
+    def _row(self, key, stamp):
+        return {
+            "persistence_key": key,
+            "view_class": "V",
+            "custom_id": None,
+            "message_id": 1,
+            "channel_id": 2,
+            "guild_id": 3,
+            "user_id": 4,
+            "session_id": "s",
+            "init_kwargs": "{}",
+            "kwargs_schema_version": 1,
+            "schema_version": 2,
+            "created_at": 1,
+            "updated_at": 1,
+            "first_unreachable_at": stamp,
+        }
+
+    async def _mgr(self, rows, bot=True):
+        backend = InMemoryBackend()
+        await backend.initialize()
+        for r in rows:
+            await backend.row_upsert(TABLE_PERSISTENT_VIEWS, r, ["persistence_key"])
+        mgr = PersistenceManager(
+            store=get_store(),
+            registry=RegistryPersistence(backend=backend),
+            bot=MagicMock() if bot else None,
+        )
+        mgr._registry_rows = [dict(r) for r in rows]
+        return mgr, backend
+
+    async def test_it_classifies_every_candidate(self):
+        now = int(time.time())
+        mgr, backend = await self._mgr(
+            [
+                self._row("old", now - 40 * 86400),
+                self._row("young", now - 86400),
+                self._row("recovers", now - 40 * 86400),
+                self._row("gone", now - 40 * 86400),
+            ]
+        )
+
+        async def _fetch(row, removed, unreachable):
+            key = row["persistence_key"]
+            if key == "recovers":
+                return (MagicMock(), MagicMock())
+            if key == "gone":
+                removed.append(key)
+                return None
+            unreachable.append(key)
+            return None
+
+        mgr._fetch_restore_message = _fetch
+
+        result = await mgr.prune_unreachable(older_than_days=30)
+
+        assert sorted(result["pruned"]) == ["gone", "old"]
+        assert result["recovered"] == ["recovers"]
+        assert result["kept"] == ["young"]
+        left = sorted(
+            r["persistence_key"] for r in await backend.row_select(TABLE_PERSISTENT_VIEWS)
+        )
+        assert left == ["recovers", "young"]
+
+    async def test_a_row_that_answers_now_is_never_pruned(self):
+        """The whole point of re-verifying: age alone must not delete."""
+        mgr, backend = await self._mgr([self._row("live", 0)])  # stamp from the epoch
+
+        async def _fetch(row, removed, unreachable):
+            return (MagicMock(), MagicMock())
+
+        mgr._fetch_restore_message = _fetch
+
+        result = await mgr.prune_unreachable(older_than_days=0)
+
+        assert result["pruned"] == []
+        assert result["recovered"] == ["live"]
+        found = await backend.row_select(TABLE_PERSISTENT_VIEWS, {"persistence_key": "live"})
+        assert found[0]["first_unreachable_at"] is None
+
+    async def test_pruning_drops_the_row_from_the_in_memory_mirror(self):
+        now = int(time.time())
+        mgr, _ = await self._mgr([self._row("old", now - 40 * 86400)])
+
+        async def _fetch(row, removed, unreachable):
+            unreachable.append(row["persistence_key"])
+            return None
+
+        mgr._fetch_restore_message = _fetch
+
+        await mgr.prune_unreachable(older_than_days=30)
+
+        assert mgr._registry_rows == []
+        assert mgr.unreachable_since == {}
+
+    @pytest.mark.parametrize("bad", [True, -1, "30", 1.5])
+    async def test_it_rejects_a_bad_cutoff(self, bad):
+        mgr, _ = await self._mgr([])
+        with pytest.raises(ValueError):
+            await mgr.prune_unreachable(older_than_days=bad)
+
+    async def test_it_requires_a_bot(self):
+        mgr, _ = await self._mgr([self._row("a", 1)], bot=False)
+        with pytest.raises(RuntimeError, match="requires a middleware constructed with bot="):
+            await mgr.prune_unreachable(older_than_days=1)
+
+    async def test_no_registry_backend_returns_the_empty_shape(self):
+        mgr = PersistenceManager(store=get_store(), bot=MagicMock())
+        assert await mgr.prune_unreachable(older_than_days=1) == {
+            "pruned": [],
+            "recovered": [],
+            "kept": [],
+        }
+
+
+class TestRegistrySchemaMigration:
+    """The registry table gains ``first_unreachable_at`` at v2.
+
+    ``apply_migrations`` records the new version only after the migrator
+    returns, so a crash in that window re-runs it against a table that
+    already has the column, and SQLite has no ADD COLUMN IF NOT EXISTS.
+    """
+
+    async def test_the_summary_keys_do_not_shift(self):
+        """A consumer keying a boot-log assertion on these already shifted once."""
+        mgr = PersistenceManager(store=get_store(), bot=MagicMock())
+        summary = await mgr.reattach_persistent_views()
+        assert set(summary) == {"restored", "skipped", "failed", "removed", "unreachable"}
+
+    async def test_the_migrator_is_a_no_op_on_open_rows(self):
+        # An open-rows backend reads a missing key as None already, which
+        # is what the nullable column means. Without the OPEN_ROWS skip
+        # this raises: InMemoryBackend has no raw-SQL surface to run the
+        # ALTER against.
+        from cascadeui.persistence.migrations import get_schema_migrator
+
+        backend = InMemoryBackend()
+        await backend.initialize()
+        migrator = get_schema_migrator(TABLE_PERSISTENT_VIEWS, 1)
+        assert migrator is not None
+        await migrator(backend)
+
+    async def test_the_migrator_adds_the_column_on_a_v1_sqlite_database(self, tmp_path):
+        aiosqlite = pytest.importorskip("aiosqlite")
+        from cascadeui.persistence.backends.sqlite import SQLiteBackend
+
+        db_path = str(tmp_path / "v1.db")
+        # Recreate a v1 database by hand: the table exists without the
+        # column, so initialize()'s CREATE TABLE IF NOT EXISTS leaves it
+        # alone -- the same state a real pre-v2 file arrives in.
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.execute("""
+                CREATE TABLE persistent_views (
+                    persistence_key TEXT PRIMARY KEY,
+                    view_class TEXT NOT NULL,
+                    custom_id TEXT,
+                    message_id INTEGER NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    guild_id INTEGER,
+                    user_id INTEGER,
+                    session_id TEXT,
+                    init_kwargs TEXT NOT NULL,
+                    kwargs_schema_version INTEGER NOT NULL DEFAULT 1,
+                    schema_version INTEGER NOT NULL DEFAULT 1,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+                """)
+            await conn.commit()
+
+        backend = SQLiteBackend(db_path)
+        await backend.initialize()
+        try:
+            await backend.set_schema_version(TABLE_PERSISTENT_VIEWS, 1)
+            names = {
+                r["name"]
+                for r in await backend.fetch(
+                    "SELECT name FROM pragma_table_info('persistent_views')"
+                )
+            }
+            assert "first_unreachable_at" not in names
+
+            mgr = PersistenceManager(
+                store=get_store(),
+                registry=RegistryPersistence(backend=backend),
+            )
+            await mgr.apply_migrations()
+
+            names = {
+                r["name"]
+                for r in await backend.fetch(
+                    "SELECT name FROM pragma_table_info('persistent_views')"
+                )
+            }
+            assert "first_unreachable_at" in names
+            assert (
+                await backend.get_schema_version(TABLE_PERSISTENT_VIEWS)
+                == CURRENT_SCHEMA_VERSIONS[TABLE_PERSISTENT_VIEWS]
+            )
+        finally:
+            await backend.close()
+
+    async def test_an_unversioned_table_with_rows_migrates_from_v1(self, tmp_path):
+        """A database from before schema versioning has rows and no version
+        row. Recording it at current would skip the migrator while the table
+        still has the v1 shape: the version then claims a column the table
+        does not have, and every stamp write fails against it. Rows are the
+        discriminator, because a genuinely fresh install's table is empty.
+        """
+        aiosqlite = pytest.importorskip("aiosqlite")
+        from cascadeui.persistence.backends.sqlite import SQLiteBackend
+
+        db_path = str(tmp_path / "premeta.db")
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.execute("""
+                CREATE TABLE persistent_views (
+                    persistence_key TEXT PRIMARY KEY,
+                    view_class TEXT NOT NULL,
+                    custom_id TEXT,
+                    message_id INTEGER NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    guild_id INTEGER,
+                    user_id INTEGER,
+                    session_id TEXT,
+                    init_kwargs TEXT NOT NULL,
+                    kwargs_schema_version INTEGER NOT NULL DEFAULT 1,
+                    schema_version INTEGER NOT NULL DEFAULT 1,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+                """)
+            await conn.execute(
+                "INSERT INTO persistent_views "
+                "(persistence_key, view_class, message_id, channel_id, "
+                "init_kwargs, created_at, updated_at) "
+                "VALUES ('old', 'V', 1, 2, '{}', 1, 1)"
+            )
+            await conn.commit()
+
+        backend = SQLiteBackend(db_path)
+        await backend.initialize()
+        try:
+            assert await backend.get_schema_version(TABLE_PERSISTENT_VIEWS) == 0
+
+            mgr = PersistenceManager(
+                store=get_store(),
+                registry=RegistryPersistence(backend=backend),
+            )
+            await mgr.apply_migrations()
+
+            names = {
+                r["name"]
+                for r in await backend.fetch(
+                    "SELECT name FROM pragma_table_info('persistent_views')"
+                )
+            }
+            assert "first_unreachable_at" in names, (
+                "a table with rows and no version row predates versioning and "
+                "is at v1; it must migrate, not be recorded as current unchanged"
+            )
+            assert (
+                await backend.get_schema_version(TABLE_PERSISTENT_VIEWS)
+                == CURRENT_SCHEMA_VERSIONS[TABLE_PERSISTENT_VIEWS]
+            )
+            rows = await backend.row_select(TABLE_PERSISTENT_VIEWS)
+            assert [r["persistence_key"] for r in rows] == ["old"]
+        finally:
+            await backend.close()
+
+    async def test_a_fresh_row_carries_an_explicit_null_stamp(self):
+        """Omitting the column would preserve a previous row's age on re-post."""
+        from cascadeui.state.middleware.persistence import PersistenceMiddleware
+
+        mw = PersistenceMiddleware.__new__(PersistenceMiddleware)
+        view = MagicMock()
+        view.kwargs_schema_version = 1
+        view.session_id = "s"
+        view._init_kwargs = {}
+        row = mw._build_registry_row(
+            {
+                "class_name": "V",
+                "message_id": "1",
+                "channel_id": "2",
+                "guild_id": "3",
+                "user_id": "4",
+                "persistence_key": "k",
+            },
+            view,
+        )
+        assert row is not None
+        assert "first_unreachable_at" in row
+        assert row["first_unreachable_at"] is None
+
+
+class TestMigratorFailureNamesItself:
+    """A migrator runs DDL, which a least-privilege role usually cannot.
+
+    Unwrapped, the driver's own error escapes ``setup_hook`` naming neither
+    the table nor the step. This seam had nothing to wrap until the library
+    shipped its first migrator, and the first deployment to reach it is any
+    Postgres install provisioned from the documented grant list.
+    """
+
+    async def test_a_failing_migrator_raises_a_directed_schema_error(self):
+        from cascadeui.persistence.migrations import _MIGRATORS
+
+        backend = InMemoryBackend()
+        await backend.initialize()
+        await backend.set_schema_version(TABLE_PERSISTENT_VIEWS, 1)
+
+        saved = _MIGRATORS.get((TABLE_PERSISTENT_VIEWS, 1))
+
+        async def _boom(_backend):
+            raise PermissionError("must be owner of table persistent_views")
+
+        _MIGRATORS[(TABLE_PERSISTENT_VIEWS, 1)] = _boom
+        try:
+            mgr = PersistenceManager(
+                store=get_store(),
+                registry=RegistryPersistence(backend=backend),
+                bot=MagicMock(),
+            )
+            with pytest.raises(PersistenceSchemaError) as excinfo:
+                await mgr.apply_migrations()
+
+            message = str(excinfo.value)
+            assert TABLE_PERSISTENT_VIEWS in message
+            assert "v1 to v2" in message
+            assert "PermissionError" in message
+            assert isinstance(excinfo.value.__cause__, PermissionError)
+            assert (
+                await backend.get_schema_version(TABLE_PERSISTENT_VIEWS) == 1
+            ), "the version must not advance, so the migration retries next start"
+        finally:
+            if saved is not None:
+                _MIGRATORS[(TABLE_PERSISTENT_VIEWS, 1)] = saved
+            else:
+                _MIGRATORS.pop((TABLE_PERSISTENT_VIEWS, 1), None)
+
+
+class TestPruneDoesNotDeleteARePostedPanel:
+    """Each verdict costs a Discord fetch, so the snapshot goes stale.
+
+    A panel re-posted under its stable key while the pass is re-checking
+    writes a fresh row the verdict knows nothing about. Deleting by key
+    alone would remove a live panel on the strength of a 404 against the
+    message it replaced.
+    """
+
+    def _row(self, key, message_id, stamp):
+        return {
+            "persistence_key": key,
+            "view_class": "V",
+            "custom_id": None,
+            "message_id": message_id,
+            "channel_id": 2,
+            "guild_id": 3,
+            "user_id": 4,
+            "session_id": "s",
+            "init_kwargs": "{}",
+            "kwargs_schema_version": 1,
+            "schema_version": 2,
+            "created_at": 1,
+            "updated_at": 1,
+            "first_unreachable_at": stamp,
+        }
+
+    async def test_a_row_rewritten_mid_pass_is_kept_not_pruned(self):
+        backend = InMemoryBackend()
+        await backend.initialize()
+        old = self._row("panel", 111, int(time.time()) - 40 * 86400)
+        await backend.row_upsert(TABLE_PERSISTENT_VIEWS, old, ["persistence_key"])
+
+        mgr = PersistenceManager(
+            store=get_store(), registry=RegistryPersistence(backend=backend), bot=MagicMock()
+        )
+        mgr._registry_rows = [dict(old)]
+
+        async def _fetch(row, removed, unreachable):
+            # An admin re-posts the panel while this fetch is in flight.
+            await backend.row_upsert(
+                TABLE_PERSISTENT_VIEWS, self._row("panel", 999, None), ["persistence_key"]
+            )
+            removed.append(row["persistence_key"])  # 404 against the OLD message
+            return None
+
+        mgr._fetch_restore_message = _fetch
+
+        result = await mgr.prune_unreachable(older_than_days=30)
+
+        assert result["pruned"] == []
+        assert result["kept"] == ["panel"]
+        survived = await backend.row_select(TABLE_PERSISTENT_VIEWS, {"persistence_key": "panel"})
+        assert survived, "the freshly re-posted panel must not be deleted"
+        assert survived[0]["message_id"] == 999
+
+    async def test_an_unchanged_row_is_still_pruned(self):
+        """The guard must not make the prune a no-op."""
+        backend = InMemoryBackend()
+        await backend.initialize()
+        old = self._row("dead", 111, int(time.time()) - 40 * 86400)
+        await backend.row_upsert(TABLE_PERSISTENT_VIEWS, old, ["persistence_key"])
+
+        mgr = PersistenceManager(
+            store=get_store(), registry=RegistryPersistence(backend=backend), bot=MagicMock()
+        )
+        mgr._registry_rows = [dict(old)]
+
+        async def _fetch(row, removed, unreachable):
+            unreachable.append(row["persistence_key"])
+            return None
+
+        mgr._fetch_restore_message = _fetch
+
+        result = await mgr.prune_unreachable(older_than_days=30)
+
+        assert result["pruned"] == ["dead"]
+        assert await backend.row_select(TABLE_PERSISTENT_VIEWS, {"persistence_key": "dead"}) == []
+
+
+class TestConfirmReReadFailureNeverDeletesOrAborts:
+    """The pre-prune confirm re-read can hit a backend hiccup mid-pass.
+
+    Raising there escapes the whole reattach pass after phase 2 registered
+    views: restored panels never get their warm repaint, and ``_restored_keys``
+    never updates, so a later ``reattach()`` re-drive constructs a second view
+    for a message that already has a live one. A key that cannot be re-read is
+    never deleted (deleting on an unread verdict is the exact blindness the
+    re-read exists to prevent), and the pass still finishes its summary.
+    """
+
+    def _row(self, key, message_id=111, stamp=None):
+        return {
+            "persistence_key": key,
+            "view_class": "V",
+            "custom_id": None,
+            "message_id": message_id,
+            "channel_id": 2,
+            "guild_id": 3,
+            "user_id": 4,
+            "session_id": "s",
+            "init_kwargs": "{}",
+            "kwargs_schema_version": 1,
+            "schema_version": 2,
+            "created_at": 1,
+            "updated_at": 1,
+            "first_unreachable_at": stamp,
+        }
+
+    @staticmethod
+    def _flaky_filtered_select(backend):
+        """row_select that raises only for the confirm's filtered re-read.
+
+        The unfiltered select (prune_unreachable's candidate read) still
+        works, so the hiccup lands exactly on the confirm."""
+        real_select = backend.row_select
+
+        async def _flaky(namespace, where=None):
+            if where is not None:
+                raise RuntimeError("backend hiccup")
+            return await real_select(namespace, where)
+
+        backend.row_select = _flaky
+        return real_select
+
+    async def test_a_backend_hiccup_mid_reattach_lands_in_failed(self):
+        from cascadeui.views.persistent import (
+            PersistentLayoutView,
+            _persistent_view_classes,
+        )
+
+        class _HiccupPanel(PersistentLayoutView):
+            pass
+
+        qualname = next(k for k, v in _persistent_view_classes.items() if v is _HiccupPanel)
+
+        backend = InMemoryBackend()
+        await backend.initialize()
+        row = self._row("panel:h")
+        row["view_class"] = qualname
+        await backend.row_upsert(TABLE_PERSISTENT_VIEWS, row, ["persistence_key"])
+
+        mgr = PersistenceManager(
+            store=get_store(), registry=RegistryPersistence(backend=backend), bot=MagicMock()
+        )
+        mgr._registry_rows = [dict(row)]
+
+        async def _fetch(r, removed, unreachable):
+            removed.append(r["persistence_key"])  # definitive 404
+            return None
+
+        mgr._fetch_restore_message = _fetch
+        real_select = self._flaky_filtered_select(backend)
+
+        summary = await mgr.reattach_persistent_views()
+
+        assert summary["failed"] == ["panel:h"], "an unverified verdict is a failure, not a delete"
+        assert summary["removed"] == []
+        backend.row_select = real_select
+        assert await backend.row_select(
+            TABLE_PERSISTENT_VIEWS, {"persistence_key": "panel:h"}
+        ), "the row must survive: its verdict could not be confirmed"
+
+    async def test_a_confirm_hiccup_during_prune_unreachable_keeps_the_row(self):
+        backend = InMemoryBackend()
+        await backend.initialize()
+        stamp = int(time.time()) - 40 * 86400
+        row = self._row("dead", stamp=stamp)
+        await backend.row_upsert(TABLE_PERSISTENT_VIEWS, row, ["persistence_key"])
+
+        mgr = PersistenceManager(
+            store=get_store(), registry=RegistryPersistence(backend=backend), bot=MagicMock()
+        )
+        mgr._registry_rows = [dict(row)]
+
+        async def _fetch(r, removed, unreachable):
+            unreachable.append(r["persistence_key"])
+            return None
+
+        mgr._fetch_restore_message = _fetch
+        real_select = self._flaky_filtered_select(backend)
+
+        result = await mgr.prune_unreachable(older_than_days=30)
+
+        assert result["pruned"] == []
+        assert result["kept"] == ["dead"], "an unverified row is kept for the next pass"
+        backend.row_select = real_select
+        survivor = await backend.row_select(TABLE_PERSISTENT_VIEWS, {"persistence_key": "dead"})
+        assert survivor and survivor[0]["first_unreachable_at"] == stamp
+
+
+class TestRewrittenRowRefreshesTheMirrorAndTheSummary:
+    """A 404'd-but-re-posted key is skipped by the confirm -- and then what?
+
+    Leaving the stale coordinates in the in-memory mirror makes every later
+    ``reattach()`` re-drive re-fetch the dead message and warn that it is
+    pruning an entry it never prunes, and the key lands in no summary bucket
+    at all. The confirm refreshes the mirror row from disk (the next pass
+    fetches the re-posted message) and the key reports as unreachable: on
+    disk, not pruned, retried -- with no first-failure stamp, because nothing
+    about the new message failed.
+    """
+
+    def _row(self, key, message_id=111, stamp=None):
+        return {
+            "persistence_key": key,
+            "view_class": "V",
+            "custom_id": None,
+            "message_id": message_id,
+            "channel_id": 2,
+            "guild_id": 3,
+            "user_id": 4,
+            "session_id": "s",
+            "init_kwargs": "{}",
+            "kwargs_schema_version": 1,
+            "schema_version": 2,
+            "created_at": 1,
+            "updated_at": 1,
+            "first_unreachable_at": stamp,
+        }
+
+    async def test_a_rewritten_row_lands_in_unreachable_with_a_fresh_mirror(self):
+        from cascadeui.views.persistent import (
+            PersistentLayoutView,
+            _persistent_view_classes,
+        )
+
+        class _RePostedPanel(PersistentLayoutView):
+            pass
+
+        qualname = next(k for k, v in _persistent_view_classes.items() if v is _RePostedPanel)
+
+        backend = InMemoryBackend()
+        await backend.initialize()
+        old = self._row("panel:r", message_id=111)
+        old["view_class"] = qualname
+        await backend.row_upsert(TABLE_PERSISTENT_VIEWS, old, ["persistence_key"])
+
+        mgr = PersistenceManager(
+            store=get_store(), registry=RegistryPersistence(backend=backend), bot=MagicMock()
+        )
+        mgr._registry_rows = [dict(old)]
+
+        async def _fetch(r, removed, unreachable):
+            # An admin re-posts the panel while this fetch is in flight.
+            fresh = dict(old)
+            fresh["message_id"] = 999
+            await backend.row_upsert(TABLE_PERSISTENT_VIEWS, fresh, ["persistence_key"])
+            removed.append(r["persistence_key"])  # 404 against the OLD message
+            return None
+
+        mgr._fetch_restore_message = _fetch
+
+        summary = await mgr.reattach_persistent_views()
+
+        assert summary["removed"] == []
+        assert summary["unreachable"] == ["panel:r"], "a rewritten row owes the summary a fate"
+        assert mgr._registry_rows[0]["message_id"] == 999, (
+            "the mirror must point at the re-posted message, or every re-drive "
+            "re-fetches the dead one"
+        )
+        disk = await backend.row_select(TABLE_PERSISTENT_VIEWS, {"persistence_key": "panel:r"})
+        assert (
+            disk[0]["first_unreachable_at"] is None
+        ), "the re-posted message never failed a fetch; stamping it would age a live panel"
+
+    async def test_a_row_that_vanished_mid_pass_leaves_the_mirror(self):
+        from cascadeui.views.persistent import (
+            PersistentLayoutView,
+            _persistent_view_classes,
+        )
+
+        class _VanishedPanel(PersistentLayoutView):
+            pass
+
+        qualname = next(k for k, v in _persistent_view_classes.items() if v is _VanishedPanel)
+
+        backend = InMemoryBackend()
+        await backend.initialize()
+        row = self._row("panel:v")
+        row["view_class"] = qualname
+        await backend.row_upsert(TABLE_PERSISTENT_VIEWS, row, ["persistence_key"])
+
+        mgr = PersistenceManager(
+            store=get_store(), registry=RegistryPersistence(backend=backend), bot=MagicMock()
+        )
+        mgr._registry_rows = [dict(row)]
+
+        async def _fetch(r, removed, unreachable):
+            # The row is deleted out from under the pass (another process
+            # pruned it, or the panel was exited) before the 404 verdict
+            # is acted on.
+            await backend.row_delete(
+                TABLE_PERSISTENT_VIEWS, {"persistence_key": r["persistence_key"]}
+            )
+            removed.append(r["persistence_key"])
+            return None
+
+        mgr._fetch_restore_message = _fetch
+
+        summary = await mgr.reattach_persistent_views()
+
+        # The deletion it was headed for already happened by another hand,
+        # and that hand did its own bookkeeping: no bucket claims it.
+        all_keys = [k for bucket in summary.values() for k in bucket]
+        assert "panel:v" not in all_keys
+        assert (
+            mgr._registry_rows == []
+        ), "a vanished row left in the mirror is re-fetched on every re-drive"

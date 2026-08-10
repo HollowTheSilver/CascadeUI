@@ -19,7 +19,7 @@ from cascadeui.components.base import StatefulButton, StatefulSelect
 from cascadeui.components.patterns.v2 import card
 from cascadeui.state.singleton import get_store
 from cascadeui.state.store import _CURRENT_INTERACTION
-from cascadeui.views.base import _StatefulMixin, _view_class_registry
+from cascadeui.views.base import RenderOutcome, _StatefulMixin, _view_class_registry
 from cascadeui.views.layout import DisplayLayoutView, StatefulLayoutView
 
 
@@ -729,6 +729,295 @@ class TestReloadThrottleCoalescing:
 
         assert replayed == [{"force": True}]
         assert view._pending_reload_kwargs == {}
+
+
+class TestReloadSerialization:
+    """Overlapping ``reload()`` calls run one at a time on the reload lock.
+
+    Interactions serialize on ``_interaction_lock`` and notifications coalesce
+    on ``_update_lock``, but ``reload()`` is reachable from paths neither
+    covers (a background task, callbacks on two different interactions). Two
+    ``on_load`` bodies interleaving on one view read and stamp each other's
+    half-built state; the lock makes each run atomic, and each queued reload
+    re-fetches at run time so the last one to run renders the freshest data.
+    """
+
+    async def test_concurrent_reloads_do_not_interleave_on_load(self):
+        interaction = _make_interaction()
+        order = []
+        gate = asyncio.Event()
+
+        class ParkingLoader(RenderableLayoutView):
+            _parked = False
+
+            async def on_load(self):
+                order.append("start")
+                if not type(self)._parked:
+                    type(self)._parked = True
+                    await gate.wait()
+                order.append("end")
+
+            async def refresh(self, **kwargs):
+                pass
+
+        view = ParkingLoader(interaction=interaction)
+        first = asyncio.create_task(view.reload())
+        await asyncio.sleep(0)  # first enters on_load and parks on the gate
+        second = asyncio.create_task(view.reload())
+        # Drain the ready queue so the second reload runs as far as it can get.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        # The second reload has not entered on_load while the first is parked
+        # mid-fetch, and the lock is what held it out.
+        assert order == ["start"]
+        assert view._reload_lock.locked()
+
+        gate.set()
+        await first
+        await second
+        # Serialized: each run completes before the next begins.
+        assert order == ["start", "end", "start", "end"]
+
+    async def test_older_reload_cannot_overwrite_a_newer_ones_fetch(self):
+        """A build that started first and stalls mid-fetch must not finish
+        after a later build and overwrite its rows: serialized reloads run in
+        start order, so the last reload to run fetched last."""
+        interaction = _make_interaction()
+        gate = asyncio.Event()
+
+        class SlowThenFast(RenderableLayoutView):
+            rows = None
+            _parked = False
+
+            async def on_load(self):
+                if not type(self)._parked:
+                    type(self)._parked = True
+                    await gate.wait()
+                    self.rows = "first-fetch"
+                else:
+                    self.rows = "second-fetch"
+
+            async def refresh(self, **kwargs):
+                pass
+
+        view = SlowThenFast(interaction=interaction)
+        first = asyncio.create_task(view.reload())
+        await asyncio.sleep(0)  # first parks mid-fetch
+        second = asyncio.create_task(view.reload())
+        await asyncio.sleep(0)
+        gate.set()
+        await first
+        await second
+
+        assert view.rows == "second-fetch"
+
+    async def test_reload_from_inside_on_load_raises_a_directed_error(self):
+        """reload() inside its own on_load would deadlock on the lock it
+        already holds (and recursed unboundedly before the lock existed), so
+        the reentrancy is rejected with an error naming the mistake."""
+        interaction = _make_interaction()
+
+        class Reentrant(RenderableLayoutView):
+            async def on_load(self):
+                await self.reload()
+
+            async def refresh(self, **kwargs):
+                pass
+
+        view = Reentrant(interaction=interaction)
+        with pytest.raises(RuntimeError, match=r"reload\(\) called from inside"):
+            await view.reload()
+        # The failed run released the lock; the view is not wedged.
+        assert not view._reload_lock.locked()
+
+
+class TestReloadDisposition:
+    """``reload()`` and ``refresh()`` name what they did with the edit.
+
+    A caller that stamps something on the strength of a reload (a one-shot
+    notice panel marking itself delivered) could not previously tell a shipped
+    edit from a reload the throttle handed to a scheduled task: both returned
+    ``None``, ``refresh_degraded`` read ``False`` in both cases, and the
+    distinguishing state (``_reload_pending``) was private.
+    """
+
+    def _sent_view(self, cls=RenderableLayoutView, **kwargs):
+        view = cls(interaction=_make_interaction(), **kwargs)
+        message = MagicMock()
+        message.id = 999
+        message.edit = AsyncMock()
+        view._message = message
+        view._webhook_message = None
+        return view
+
+    async def _cancel_deferred(self, view):
+        task = view._deferred_refresh_task
+        if task is not None:
+            await asyncio.sleep(0)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    async def test_deferred_at_the_reload_gate(self):
+        loads = []
+
+        class Loader(RenderableLayoutView):
+            async def on_load(self):
+                loads.append(1)
+
+        view = self._sent_view(Loader)
+        view._cooldown_not_before = time.monotonic() + 30
+
+        outcome = await view.reload()
+
+        # The gate decided, not the render: no fetch ran, the reload is
+        # pending on the single deferred task, and the caller is told so.
+        assert outcome is RenderOutcome.DEFERRED
+        assert loads == []
+        assert view._reload_pending is True
+        await self._cancel_deferred(view)
+
+    async def test_rendered_then_skipped_as_unchanged(self):
+        view = self._sent_view()
+
+        first = await view.reload()
+        second = await view.reload()
+
+        assert first is RenderOutcome.RENDERED
+        assert second is RenderOutcome.SKIPPED
+        # The digest short-circuit decided the second call: exactly one edit
+        # shipped, and nothing was queued for later.
+        assert view._message.edit.await_count == 1
+        assert view._reload_pending is False
+
+    async def test_dropped_on_transport_failure(self):
+        view = self._sent_view()
+        view._message.edit = AsyncMock(side_effect=aiohttp.ClientOSError(104, "reset"))
+
+        outcome = await view.reload()
+
+        assert outcome is RenderOutcome.DROPPED
+        assert view.refresh_degraded is True
+
+    async def test_no_message_before_send(self):
+        loads = []
+
+        class Loader(RenderableLayoutView):
+            async def on_load(self):
+                loads.append(1)
+
+        view = Loader(interaction=_make_interaction())
+
+        outcome = await view.reload()
+
+        # The fetch still runs on an unsent view (unchanged behavior); the
+        # outcome says no editable message exists rather than claiming a render.
+        assert loads == [1]
+        assert outcome is RenderOutcome.NO_MESSAGE
+
+    async def test_armed_reload_relays_the_frozen_refresh_outcome(self):
+        loads = []
+
+        class Loader(RenderableLayoutView):
+            async def on_load(self):
+                loads.append(1)
+
+        view = self._sent_view(Loader)
+        view._refresh_armed = True
+
+        outcome = await view.reload()
+
+        # on_load is skipped while armed (the tree is the refresh button);
+        # the disposition describes the frozen-tree edit that shipped.
+        assert loads == []
+        assert outcome is RenderOutcome.RENDERED
+        assert view._message.edit.await_count == 1
+
+    async def test_refresh_reports_deferred_on_a_rate_limit(self):
+        view = self._sent_view()
+        view._message.edit = AsyncMock(side_effect=_FakeRateLimit(30.0))
+
+        outcome = await view.refresh()
+
+        # The 429 armed the backoff window and queued the retry; the caller
+        # is told the edit is deferred, not that it landed.
+        assert outcome is RenderOutcome.DEFERRED
+        assert view._ratelimit_not_before > time.monotonic()
+        await self._cancel_deferred(view)
+
+    async def test_coalesced_boolean_kwargs_or_across_calls(self):
+        """A ``force=True`` gated into the window survives an unforced reload
+        landing in the same window, in either order; wholesale replacement of
+        the pending kwargs silently dropped it. Non-boolean keywords take the
+        newest call's value."""
+
+        async def gated_pair(first_kwargs, second_kwargs):
+            view = self._sent_view()
+            view._cooldown_not_before = time.monotonic() + 30
+            assert await view.reload(**first_kwargs) is RenderOutcome.DEFERRED
+            assert await view.reload(**second_kwargs) is RenderOutcome.DEFERRED
+            pending = dict(view._pending_reload_kwargs)
+            await self._cancel_deferred(view)
+            return pending
+
+        assert await gated_pair({"force": True}, {}) == {"force": True}
+        assert await gated_pair({"force": False}, {"force": True}) == {"force": True}
+        assert await gated_pair({"cursor": 3}, {"cursor": 0}) == {"cursor": 0}
+
+    async def test_gated_reload_during_a_live_deferred_task_is_not_latched(self):
+        """A reload gated while the single deferred task is already past its
+        own dispatch must leave a task to serve it. The gate declines to queue
+        a second task while one is alive; without the exiting task requeueing
+        a successor, the slot clears and the pending reload is latched with
+        nothing left to run it."""
+        park = asyncio.Event()
+
+        class ParkingRender(RenderableLayoutView):
+            async def on_state_changed(self, state):
+                await park.wait()
+
+        view = self._sent_view(ParkingRender)
+        deferred = asyncio.create_task(view._deferred_refresh(0))
+        view._deferred_refresh_task = deferred
+        await asyncio.sleep(0)  # wakes, window inactive, parks in the render
+        await asyncio.sleep(0)
+
+        view._cooldown_not_before = time.monotonic() + 30
+        await view.reload(force=True)
+        # The gate declined to queue: the live task still owns the slot.
+        # (The DEFERRED disposition itself is asserted in its own test.)
+        assert view._reload_pending is True
+        assert view._deferred_refresh_task is deferred
+
+        park.set()
+        await deferred
+
+        # The exiting task queued a successor for the coalesced reload
+        # instead of clearing the slot over a still-pending fetch.
+        assert view._reload_pending is True
+        successor = view._deferred_refresh_task
+        assert successor is not None
+        assert successor is not deferred
+        await self._cancel_deferred(view)
+
+    async def test_stale_pending_reload_does_not_respawn_while_armed(self):
+        """The successor requeue skips armed views. An armed reload is a plain
+        refresh of the frozen tree and never clears ``_reload_pending``, so
+        requeueing on the flag would respawn a successor after every dispatch
+        until the token cliff."""
+        view = self._sent_view()
+        view._refresh_armed = True
+        view._reload_pending = True  # latched before the view armed
+
+        await view._deferred_refresh(0)
+
+        # The armed dispatch ran (frozen-tree edit shipped) and the task
+        # exited without spawning a successor for the moot reload.
+        assert view._message.edit.await_count == 1
+        assert view._deferred_refresh_task is None
 
 
 class TestOnLoadDurationWarning:

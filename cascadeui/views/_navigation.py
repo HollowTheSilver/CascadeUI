@@ -250,6 +250,12 @@ class _NavigationMixin:
                         # here. A raising override costs the restore, not the
                         # navigation -- the user still reaches the child view.
                         "view_state": self._capture_nav_state(),
+                        # The library's own handoff resolution as this view holds
+                        # it now. pop() hands it back so the restored view resumes
+                        # the policy it had: inheritance flows down a chain, never
+                        # back up it, and the declaration is a class attribute
+                        # that rides the reconstruction on its own.
+                        "refresh_handoff_resolved": self._refresh_handoff_resolved,
                     }
                     new_view._nav_stack = list(self._nav_stack) + [entry]
                 elif action_type == "NAVIGATION_POP":
@@ -442,8 +448,15 @@ class _NavigationMixin:
         # restored value rather than the constructor's default.
         if new_view is not None:
             new_view._apply_nav_state(entry.get("view_state") or {})
+            # Resume the handoff resolution this view held when it was
+            # pushed away from. Reconstruction resets it to None and
+            # _settle_navigation never inherits on pop, so without the
+            # hand-back a derived engagement would be lost to the token
+            # cliff -- and a view that held no resolution comes back
+            # holding none.
+            new_view._refresh_handoff_resolved = entry.get("refresh_handoff_resolved")
 
-        await self._settle_navigation(new_view, interaction, rebuild)
+        await self._settle_navigation(new_view, interaction, rebuild, inherit_handoff=False)
 
         return new_view
 
@@ -689,16 +702,22 @@ class _NavigationMixin:
             )
             return False
 
-    async def _settle_navigation(self, new_view, interaction, rebuild) -> None:
+    async def _settle_navigation(
+        self, new_view, interaction, rebuild, *, inherit_handoff=True
+    ) -> None:
         """Edit the message to the destination, then commit or roll back.
 
         Shared tail of push()/pop(). ``_apply_navigation_edit`` reports whether
         the destination reached the message. On success the source's attachment
         tracking hands off to the destination, the deferred source teardown
         commits, and the destination's ephemeral handoff timer (when the source
-        carried an arming deadline) is scheduled. On failure -- a contained
-        edit error or a raising preload/rebuild -- the navigation rolls back
-        to the live source view.
+        carried an arming deadline) is scheduled. ``inherit_handoff`` gates the
+        policy adoption inside that scheduling: ``True`` on push, where a
+        destination with no answer of its own adopts the source's, and
+        ``False`` on pop, where the restored view resumes the resolution
+        ``pop()`` handed back from the nav-stack entry. On failure -- a
+        contained edit error or a raising preload/rebuild -- the navigation
+        rolls back to the live source view.
         """
         try:
             edited = await self._apply_navigation_edit(new_view, interaction, rebuild)
@@ -733,11 +752,28 @@ class _NavigationMixin:
             # recovered source. The carried deadline means the timer sleeps
             # only the time remaining to the 900s token cliff; the next hop's
             # cancel_tasks reaps this task, so the chain holds one live timer.
-            # The gate reads the deadline, not auto_refresh_ephemeral -- the
-            # flag's derivation runs only at send, so it is unset on
-            # navigation targets.
+            #
+            # Two separate questions gate the timer; conflating them would
+            # read the deadline's mere presence as the policy itself. The
+            # deadline answers WHEN: the message's token clock, present on
+            # any ephemeral chain. The destination answers WHETHER, via
+            # _refresh_handoff (see its property for the precedence).
+            # Inheritance flows down the chain only. A push destination with
+            # no answer of its own (no declaration and no resolution) adopts
+            # the source's onto _refresh_handoff_resolved, so the next hop
+            # and a rollback re-arm read a resolved policy rather than
+            # presence. On pop the source is the departing descendant, so
+            # nothing is adopted: pop() hands the restored view the
+            # resolution it held when it was pushed away from, and a view
+            # that held none does not acquire the child's.
+            handoff = new_view._refresh_handoff
+            if handoff is None and inherit_handoff:
+                handoff = self._refresh_handoff
+                if handoff is not None:
+                    new_view._refresh_handoff_resolved = handoff
             if (
-                new_view._ephemeral_arm_deadline is not None
+                handoff is not False
+                and new_view._ephemeral_arm_deadline is not None
                 and not new_view._refresh_armed
                 and not new_view.is_finished()
             ):
@@ -792,10 +828,15 @@ class _NavigationMixin:
         # _navigate_to cancelled the source's tasks ahead of the (now-failed)
         # teardown. Re-arm the ephemeral refresh handoff so a recovered
         # long-lived ephemeral source still swaps in its refresh button before
-        # the 900s token cliff. A non-None deadline means the handoff engaged at
-        # send; the re-scheduled timer sleeps only the remaining time to it.
+        # the 900s token cliff. The deadline is stamped for every ephemeral
+        # send, so its presence only says the token clock is running --
+        # whether this view engaged is _refresh_handoff's call, which is why
+        # a pinned-off source comes back pinned off and a derived-declined
+        # one comes back declined. The re-scheduled timer sleeps only the
+        # remaining time to the original deadline.
         if (
-            self._ephemeral_arm_deadline is not None
+            self._refresh_handoff is not False
+            and self._ephemeral_arm_deadline is not None
             and not self._refresh_armed
             and not self.is_finished()
         ):

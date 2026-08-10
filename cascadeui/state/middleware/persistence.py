@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 from ...persistence.manager import _NON_PERSISTABLE_KWARGS
 from ...persistence.protocols import PersistenceBackend
 from ...persistence.schema import (
+    CURRENT_SCHEMA_VERSIONS,
     TABLE_APPLICATION_SLOTS,
     TABLE_PERSISTENT_VIEWS,
 )
@@ -451,12 +452,29 @@ class PersistenceMiddleware:
             register_migrator,
         )
 
+        # Skip-if-present keeps re-constructing the middleware from raising a
+        # duplicate-key ValueError. The cost is that a genuine collision is
+        # silent, and the library now ships its own migrator, so a consumer
+        # registering one for the same table and version loses theirs without
+        # being told. The decorator path already raises; this path logs.
         for (table, from_version), fn in (migrators.get("schema") or {}).items():
-            if get_schema_migrator(table, from_version) is None:
-                register_migrator(table, from_version)(fn)
+            if get_schema_migrator(table, from_version) is not None:
+                logger.warning(
+                    f"A schema migrator for {table} v{from_version} is already "
+                    f"registered; keeping it and ignoring the one passed via "
+                    f"migrators=. Rename the step or drop the duplicate."
+                )
+                continue
+            register_migrator(table, from_version)(fn)
         for (qualname, from_version), fn in (migrators.get("kwargs") or {}).items():
-            if get_kwargs_migrator(qualname, from_version) is None:
-                register_kwargs_migrator(qualname, from_version)(fn)
+            if get_kwargs_migrator(qualname, from_version) is not None:
+                logger.warning(
+                    f"A kwargs migrator for {qualname} v{from_version} is already "
+                    f"registered; keeping it and ignoring the one passed via "
+                    f"migrators=."
+                )
+                continue
+            register_kwargs_migrator(qualname, from_version)(fn)
 
     # // ========================================( Middleware entry )======================================== // #
 
@@ -576,7 +594,7 @@ class PersistenceMiddleware:
             ns.dirty_rows[slot_name] = {
                 "slot_name": slot_name,
                 "payload": serialized,
-                "schema_version": 1,
+                "schema_version": CURRENT_SCHEMA_VERSIONS[TABLE_APPLICATION_SLOTS],
                 "updated_at": now,
                 "expires_at": expires_at,
             }
@@ -819,9 +837,14 @@ class PersistenceMiddleware:
             "session_id": getattr(view, "session_id", None),
             "init_kwargs": init_kwargs_json,
             "kwargs_schema_version": kwargs_version,
-            "schema_version": 1,
+            "schema_version": CURRENT_SCHEMA_VERSIONS[TABLE_PERSISTENT_VIEWS],
             "created_at": now,
             "updated_at": now,
+            # Explicit None, not omission. A SQL upsert only writes the columns
+            # it is given, so leaving this out preserves whatever stamp the row
+            # already carried -- and a panel re-posted under the same key into a
+            # reachable channel would inherit the dead one's age and be pruned.
+            "first_unreachable_at": None,
         }
 
     async def _fire_hook(self, hook_name: str, *args) -> None:

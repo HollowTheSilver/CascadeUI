@@ -1209,10 +1209,502 @@ class TestEphemeralFlagResetOnSend:
 
         assert view._ephemeral is True
 
+    async def test_public_re_send_stops_a_sleeping_timer_from_arming(self):
+        """A timer asleep when the same instance is re-sent publicly must not
+        arm when it wakes. The public re-send cancels nothing and clears
+        nothing: the stale deadline stays (the non-ephemeral branch stamps
+        nothing) and the stale True resolution keeps the effective handoff
+        True, so the policy backstop would arm the reopen button over the
+        live public panel. Only the flag (reassigned at every send) records
+        that the managed message changed.
+
+        The drain between the sends is load-bearing: it lets the timer take
+        its first step and commit to its sleep while the instance still
+        manages the ephemeral send. Without it, none of the second send's
+        mocked awaits yields to the event loop, the timer first runs after
+        the flag flipped, and the interleaving under test is never reached.
+        """
+
+        class _View(RenderableLayoutView):
+            timeout = None  # first send resolves the handoff True
+            refresh_warning_seconds = 899  # arm deadline = send + max(1, 900 - 899) = ~1s
+
+        view = _View(interaction=_make_interaction())
+        captured = []
+        real_create = view.create_task
+
+        def _capture(coro):
+            task = real_create(coro)
+            captured.append(task)
+            return task
+
+        with patch.object(view, "create_task", side_effect=_capture):
+            await view.send(ephemeral=True)
+
+        try:
+            assert view._ephemeral is True
+            assert view._refresh_handoff is True
+            assert len(captured) == 1
+            timer = captured[0]
+
+            # First step: the timer passes the entry backstop (the policy is
+            # engaged, the flag is True) and suspends inside its sleep.
+            for _ in range(3):
+                await asyncio.sleep(0)
+            assert not timer.done(), "the entry backstop declined a timer the send engaged"
+
+            view.interaction = _make_interaction()
+            await view.send(ephemeral=False)
+
+            # The re-send flipped only the flag. The stale resolution keeps
+            # the effective policy True -- the exact value the policy
+            # backstop reads -- so it cannot be the gate that declines.
+            assert view._ephemeral is False
+            assert view._refresh_handoff_resolved is True
+            assert view._refresh_handoff is True
+            assert view._ephemeral_arm_deadline is not None
+
+            # The second send neither cancelled nor replaced the first
+            # timer; it is still asleep with ~1s left on the original
+            # deadline. A done timer here means the interleaving under test
+            # was never reached.
+            assert not timer.cancelled()
+            assert not timer.done(), "harness: the timer woke before the second send finished"
+
+            # Every guard other than the flag check is clear going into the
+            # wake, so the flag check is the deciding gate.
+            assert not view.is_finished()
+            assert view._refresh_armed is False
+            assert view._message is not None
+
+            public_message = view._message
+            try:
+                await asyncio.wait_for(timer, timeout=30)
+            except asyncio.TimeoutError:
+                pytest.fail("the ephemeral refresh timer never woke from its sleep")
+
+            # Still clear after the wake: nothing but the flag check could
+            # have declined the arm, and no edit reached the public message.
+            assert not view.is_finished()
+            assert view._message is not None
+            assert view._refresh_armed is False
+            public_message.edit.assert_not_awaited()
+        finally:
+            view.task_manager.cancel_tasks(view.id)
+
+
+class TestArmDeadlineStampedOnEveryEphemeralSend:
+    """The arming deadline records the send token's 900s window (a fact
+    about the message), so every ephemeral send stamps it. Whether the
+    handoff timer runs stays ``auto_refresh_ephemeral``'s call: stamping by
+    itself schedules nothing.
+    """
+
+    async def test_declined_send_stamps_deadline_without_scheduling(self):
+        runs = []
+
+        class _Declined(RenderableLayoutView):
+            auto_refresh_ephemeral = False
+
+            async def _schedule_ephemeral_refresh(self):
+                runs.append(True)
+
+        view = _Declined(interaction=_make_interaction())
+        before = time.monotonic()
+        await view.send(ephemeral=True)
+        after = time.monotonic()
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+        # 810 = 900 - refresh_warning_seconds (default 90), bracketed
+        # between clock readings taken either side of the send.
+        assert view._ephemeral_arm_deadline is not None
+        assert before + 810 <= view._ephemeral_arm_deadline <= after + 810
+        assert runs == []
+
+    async def test_engaged_send_stamps_deadline_and_schedules(self):
+        runs = []
+
+        class _Engaged(RenderableLayoutView):
+            auto_refresh_ephemeral = True
+
+            async def _schedule_ephemeral_refresh(self):
+                runs.append(True)
+
+        view = _Engaged(interaction=_make_interaction())
+        await view.send(ephemeral=True)
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+        assert view._ephemeral_arm_deadline is not None
+        assert runs == [True]
+
+    async def test_non_ephemeral_send_stamps_nothing(self):
+        view = RenderableLayoutView(interaction=_make_interaction())
+        await view.send(ephemeral=False)
+
+        assert view._ephemeral_arm_deadline is None
+
+    async def test_ephemeral_re_send_retires_the_first_sends_sleeping_timer(self):
+        """A timer asleep across a same-instance ephemeral re-send must not
+        arm against the first send's deadline: the re-send stamped a new
+        token's clock and scheduled its own timer, so the first timer waking
+        early would clear the new panel's children minutes before the new
+        token needs the handoff and freeze state notifications from that
+        moment. The liveness, flag, and policy gates are all clear here (the
+        second send is ephemeral and engaged), so only the deadline
+        comparison can retire the stale timer, and the second send's own
+        timer must still arm on the new deadline.
+
+        The drain between the sends is load-bearing: it lets the first timer
+        capture the first deadline and commit to its sleep before the
+        re-send stamps the new one. The two windows differ by construction
+        (899 vs 898 warning seconds), so the mismatch does not depend on
+        clock resolution.
+        """
+
+        class _View(RenderableLayoutView):
+            timeout = None  # both sends resolve the handoff True
+            refresh_warning_seconds = 899  # first arm deadline = send + ~1s
+
+        view = _View(interaction=_make_interaction())
+        captured = []
+        real_create = view.create_task
+
+        def _capture(coro):
+            task = real_create(coro)
+            captured.append(task)
+            return task
+
+        with patch.object(view, "create_task", side_effect=_capture):
+            await view.send(ephemeral=True)
+            first_deadline = view._ephemeral_arm_deadline
+
+            # First step: the timer captures the first deadline and commits
+            # to its sleep while it is still the current send's timer.
+            for _ in range(3):
+                await asyncio.sleep(0)
+            assert len(captured) == 1
+            assert not captured[0].done(), "the entry backstop declined a timer the send engaged"
+
+            # Second ephemeral send on the same instance. The wider warning
+            # window makes the re-stamped deadline structurally different
+            # (send + ~2s), so timer identity is decided by construction.
+            view.set_class_attribute("refresh_warning_seconds", 898)
+            view.interaction = _make_interaction()
+            await view.send(ephemeral=True)
+
+        try:
+            assert len(captured) == 2
+            timer1, timer2 = captured
+
+            second_deadline = view._ephemeral_arm_deadline
+            assert first_deadline is not None
+            assert second_deadline is not None
+            assert second_deadline != first_deadline
+
+            # The re-send neither cancelled nor woke the first timer.
+            assert not timer1.cancelled()
+            assert (
+                not timer1.done()
+            ), "harness: the first timer woke before the second send finished"
+
+            # Liveness, flag, and policy are all clear going into the first
+            # wake -- the second send is ephemeral with the handoff engaged --
+            # so the deadline comparison is the deciding gate.
+            assert not view.is_finished()
+            assert view._refresh_armed is False
+            assert view._message is not None
+            assert view._ephemeral is True
+            assert view._refresh_handoff is True
+
+            second_message = view._message
+            try:
+                await asyncio.wait_for(timer1, timeout=30)
+            except asyncio.TimeoutError:
+                pytest.fail("the first send's timer never woke from its sleep")
+
+            # Still clear after the wake: nothing but the deadline
+            # comparison could have declined, and no early arm reached the
+            # second send's message.
+            assert not view.is_finished()
+            assert view._ephemeral is True
+            assert view._refresh_handoff is True
+            assert view._refresh_armed is False
+            second_message.edit.assert_not_awaited()
+
+            # The second send's own timer still arms on the new deadline --
+            # retiring the stale timer must not orphan the engaged handoff.
+            try:
+                await asyncio.wait_for(timer2, timeout=30)
+            except asyncio.TimeoutError:
+                pytest.fail("the second send's timer never woke from its sleep")
+            assert view._refresh_armed is True
+            assert second_message.edit.await_count == 1
+        finally:
+            view.task_manager.cancel_tasks(view.id)
+
+
+# // ========================================( Declaration vs Resolution )======================================== // #
+
+
+class TestDeclarationSeparateFromResolution:
+    """``auto_refresh_ephemeral`` is the author's declaration and the library
+    never assigns to it. The ``None`` sentinel resolves into the private
+    ``_refresh_handoff_resolved`` at each ephemeral send, so introspecting
+    the declaration always returns what the class or the caller set, and a
+    later send re-derives instead of carrying a stale answer.
+    """
+
+    async def test_derived_engagement_leaves_declaration_unset(self):
+        runs = []
+
+        class _View(RenderableLayoutView):
+            timeout = None
+
+            async def _schedule_ephemeral_refresh(self):
+                runs.append(True)
+
+        view = _View(interaction=_make_interaction())
+        await view.send(ephemeral=True)
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+        assert view.auto_refresh_ephemeral is None
+        assert view._refresh_handoff_resolved is True
+        assert runs == [True]
+
+    async def test_derived_decline_leaves_declaration_unset(self):
+        runs = []
+
+        class _View(RenderableLayoutView):
+            timeout = 300
+
+            async def _schedule_ephemeral_refresh(self):
+                runs.append(True)
+
+        view = _View(interaction=_make_interaction())
+        await view.send(ephemeral=True)
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+        assert view.auto_refresh_ephemeral is None
+        assert view._refresh_handoff_resolved is False
+        assert runs == []
+
+    async def test_explicit_engagement_records_no_resolution(self):
+        """An explicit pin is its own answer. The resolution field records
+        only what the library decided, which for a pin is nothing.
+        """
+
+        class _On(RenderableLayoutView):
+            auto_refresh_ephemeral = True
+            timeout = 300
+
+        view = _On(interaction=_make_interaction())
+        await view.send(ephemeral=True)
+        try:
+            assert view.auto_refresh_ephemeral is True
+            assert view._refresh_handoff_resolved is None
+            assert view._refresh_handoff is True
+        finally:
+            view.task_manager.cancel_tasks(view.id)
+
+    async def test_explicit_decline_records_no_resolution(self):
+        class _Off(RenderableLayoutView):
+            auto_refresh_ephemeral = False
+            timeout = None
+
+        view = _Off(interaction=_make_interaction())
+        await view.send(ephemeral=True)
+
+        assert view.auto_refresh_ephemeral is False
+        assert view._refresh_handoff_resolved is None
+        assert view._refresh_handoff is False
+
+    async def test_non_ephemeral_send_resolves_nothing(self):
+        view = RenderableLayoutView(interaction=_make_interaction())
+        await view.send(ephemeral=False)
+
+        assert view.auto_refresh_ephemeral is None
+        assert view._refresh_handoff_resolved is None
+        assert view._refresh_handoff is None
+
+    async def test_re_send_re_derives_from_the_current_timeout(self):
+        """The resolution is per-send, not per-instance. A second ephemeral
+        send derives against the timeout as it stands then, where writing
+        the answer onto the declaration froze the first derivation forever.
+        """
+        runs = []
+
+        class _View(RenderableLayoutView):
+            timeout = None
+
+            async def _schedule_ephemeral_refresh(self):
+                runs.append(True)
+
+        view = _View(interaction=_make_interaction())
+        await view.send(ephemeral=True)
+        assert view._refresh_handoff_resolved is True
+
+        view.timeout = 300
+        view.interaction = _make_interaction()
+        await view.send(ephemeral=True)
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+        assert view._refresh_handoff_resolved is False
+        assert view.auto_refresh_ephemeral is None
+        assert runs == [True]  # only the first send engaged
+
+    async def test_second_send_decline_stops_a_sleeping_timer_from_arming(self):
+        """A timer already asleep when a second send re-derives the handoff
+        to False must not arm when it wakes. The declaration is still None
+        at that point (only the resolution flipped), so a post-sleep check
+        that reads ``auto_refresh_ephemeral`` finds None and arms a view
+        whose effective policy is False; the check must read
+        ``_refresh_handoff``.
+
+        The drain between the sends is load-bearing: it lets the timer take
+        its first step and commit to its sleep while the policy is still
+        engaged. Without it, none of the second send's mocked awaits yields
+        to the event loop, the timer first runs after the re-derivation, and
+        the entry backstop (not the post-sleep one) decides, which turns
+        this test into a false green for the branch it names.
+        """
+
+        class _View(RenderableLayoutView):
+            timeout = None  # first send resolves the handoff True
+            refresh_warning_seconds = 899  # arm deadline = send + max(1, 900 - 899) = ~1s
+
+        view = _View(interaction=_make_interaction())
+        captured = []
+        real_create = view.create_task
+
+        def _capture(coro):
+            task = real_create(coro)
+            captured.append(task)
+            return task
+
+        with patch.object(view, "create_task", side_effect=_capture):
+            await view.send(ephemeral=True)
+
+        try:
+            assert view._refresh_handoff_resolved is True
+            assert view._refresh_handoff is True
+            assert len(captured) == 1
+            timer = captured[0]
+
+            # First step: the timer passes the entry backstop (the policy is
+            # engaged) and suspends inside its sleep. A completed task here
+            # would mean the entry backstop declined -- the wrong gate.
+            for _ in range(3):
+                await asyncio.sleep(0)
+            assert not timer.done(), "the entry backstop declined a timer the send engaged"
+
+            view.timeout = 300
+            view.interaction = _make_interaction()
+            await view.send(ephemeral=True)
+
+            # The re-derivation flipped only the resolution. The unset
+            # declaration is the exact value the pre-fix post-sleep check
+            # read: None is not False, so it armed.
+            assert view.auto_refresh_ephemeral is None
+            assert view._refresh_handoff_resolved is False
+            assert view._refresh_handoff is False
+
+            # The second send neither cancelled nor replaced the first
+            # timer; it is still asleep with ~1s left on the original
+            # deadline. A done timer here means the interleaving under test
+            # was never reached.
+            assert not timer.cancelled()
+            assert not timer.done(), "harness: the timer woke before the second send finished"
+
+            # Every guard ahead of the policy check is clear going into the
+            # wake, so the policy check is the deciding gate.
+            assert not view.is_finished()
+            assert view._refresh_armed is False
+            assert view._message is not None
+
+            try:
+                await asyncio.wait_for(timer, timeout=30)
+            except asyncio.TimeoutError:
+                pytest.fail("the ephemeral refresh timer never woke from its sleep")
+
+            # Still clear after the wake: every gate ahead of the policy
+            # check passed, so the policy check declined first. The re-send
+            # also restamped the deadline, so the identity comparison after
+            # it would have declined too -- these assertions establish
+            # first, not sole.
+            assert not view.is_finished()
+            assert view._message is not None
+            assert view._refresh_armed is False
+        finally:
+            view.task_manager.cancel_tasks(view.id)
+
+    async def test_a_pin_after_send_overrides_a_derived_engagement(self):
+        """``set_class_attribute`` writes the declaration, and both of the
+        timer's ``is False`` backstops read the declaration -- so a pin
+        applied after send wins over the derived engagement without
+        disturbing the resolution record.
+        """
+
+        class _View(RenderableLayoutView):
+            timeout = None
+
+        view = _View(interaction=_make_interaction())
+        await view.send(ephemeral=True)
+        view.task_manager.cancel_tasks(view.id)
+        assert view.auto_refresh_ephemeral is None
+        assert view._refresh_handoff is True
+
+        view.set_class_attribute("auto_refresh_ephemeral", False)
+
+        assert view._refresh_handoff is False
+        assert view._refresh_handoff_resolved is True  # record intact
+        view._ephemeral_arm_deadline = time.monotonic() + 500
+        await view._schedule_ephemeral_refresh()  # entry backstop returns
+
+        assert view._refresh_armed is False
+
+    async def test_reopen_re_derives_on_the_replacement(self):
+        """A reopen runs a fresh ``send()`` on a fresh token, so the
+        replacement resolves from its own class declaration and timeout.
+        The dying instance's resolution (here a chain-inherited decline)
+        does not carry.
+        """
+        created = []
+
+        class _View(RenderableLayoutView):
+            timeout = None
+
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                created.append(self)
+
+        old = _View(interaction=_make_interaction())
+        old._ephemeral = True
+        old._message = MagicMock()
+        old._message.delete = AsyncMock()
+        old._message.edit = AsyncMock()
+        old._refresh_handoff_resolved = False  # as if inherited from a declined chain
+        old.exit = AsyncMock()
+
+        created.clear()
+        await old._reopen_ephemeral(_make_interaction())
+
+        assert len(created) == 1
+        replacement = created[0]
+        try:
+            assert replacement.auto_refresh_ephemeral is None
+            assert replacement._refresh_handoff_resolved is True
+        finally:
+            replacement.task_manager.cancel_tasks(replacement.id)
+
 
 class TestEphemeralRearmOnNavRollback:
     """A failed-navigation rollback re-arms the source's ephemeral refresh
-    handoff -- cancelled in _navigate_to ahead of the deferred teardown -- so a
+    handoff (cancelled in _navigate_to ahead of the deferred teardown), so a
     recovered long-lived ephemeral source still swaps in its refresh button
     before the 900s token cliff. The re-schedule uses the original deadline, so
     it sleeps the remaining time rather than a fresh window.
@@ -1275,6 +1767,71 @@ class TestEphemeralRearmOnNavRollback:
         source._ephemeral = True
         source._ephemeral_arm_deadline = _time.monotonic() + 500
         source._refresh_armed = True  # already armed -> nothing to re-arm
+
+        new_view = _Source(interaction=_make_interaction(user_id=1, guild_id=100))
+        scheduled, spy = self._capture_tasks(source)
+        with spy:
+            await source._rollback_navigation(new_view)
+
+        assert scheduled == []
+
+    async def test_rollback_does_not_rearm_a_pinned_off_source(self):
+        """The deadline is stamped for every ephemeral send, so its presence
+        alone no longer implies the handoff engaged. A source that pinned the
+        handoff off comes back from a rollback still pinned off.
+        """
+
+        class _Source(RenderableLayoutView):
+            auto_refresh_ephemeral = False
+
+        source = _Source(interaction=_make_interaction(user_id=1, guild_id=100))
+        await source.send(ephemeral=True)
+        assert source._ephemeral_arm_deadline is not None
+        assert source._refresh_armed is False
+
+        new_view = _Source(interaction=_make_interaction(user_id=1, guild_id=100))
+        scheduled, spy = self._capture_tasks(source)
+        with spy:
+            await source._rollback_navigation(new_view)
+
+        assert scheduled == []
+
+    async def test_rollback_rearms_a_derived_engaged_source(self):
+        """The rollback gate reads the effective policy, so a send whose
+        ``None`` declaration derived "engaged" re-arms -- with the
+        declaration itself still reading ``None``.
+        """
+
+        class _Source(RenderableLayoutView):
+            timeout = None
+
+        source = _Source(interaction=_make_interaction(user_id=1, guild_id=100))
+        await source.send(ephemeral=True)
+        # Mirror _navigate_to's pre-teardown cancel of the send-scheduled timer.
+        source.task_manager.cancel_tasks(source.id)
+        assert source.auto_refresh_ephemeral is None
+
+        new_view = _Source(interaction=_make_interaction(user_id=1, guild_id=100))
+        scheduled, spy = self._capture_tasks(source)
+        with spy:
+            await source._rollback_navigation(new_view)
+
+        assert len(scheduled) == 1
+
+    async def test_rollback_does_not_rearm_a_derived_declined_source(self):
+        """The other polarity: a send whose ``None`` declaration derived
+        "declined" comes back declined. The deadline is present (stamped at
+        every ephemeral send), so only the resolved policy can say no here.
+        """
+
+        class _Source(RenderableLayoutView):
+            timeout = 300
+
+        source = _Source(interaction=_make_interaction(user_id=1, guild_id=100))
+        await source.send(ephemeral=True)
+        assert source.auto_refresh_ephemeral is None
+        assert source._ephemeral_arm_deadline is not None
+        assert source._refresh_armed is False
 
         new_view = _Source(interaction=_make_interaction(user_id=1, guild_id=100))
         scheduled, spy = self._capture_tasks(source)
@@ -1498,3 +2055,412 @@ class TestArmingRetriesWhileTheTokenLives:
         await view._deferred_refresh(0)
 
         assert queued == [], "a dead token must not spin a retry loop"
+
+
+class _ArmedSource(RenderableLayoutView):
+    """Ephemeral sender with the handoff engaged and the arming point ~1s out
+    (``900 - 899``), so a destination timer fires within a short test sleep.
+    """
+
+    auto_refresh_ephemeral = True
+    refresh_warning_seconds = 899
+
+
+class _DeclinedSource(RenderableLayoutView):
+    """Ephemeral sender with the handoff pinned off. The send still stamps
+    the arming deadline -- the token clock is a fact about the message.
+    """
+
+    auto_refresh_ephemeral = False
+    refresh_warning_seconds = 899
+
+
+class TestHandoffPolicyAcrossNavigation:
+    """``auto_refresh_ephemeral`` holds on navigation destinations in both
+    polarities. The arming deadline is stamped at every ephemeral send (it
+    records the message's token clock, not the policy), so the post-commit
+    gate can honor the destination's own flag against it: an explicit
+    ``False`` stays off even when the source armed, an explicit ``True``
+    engages even when the source declined, and a ``None`` push destination
+    inherits the immediate source's effective policy, carried on the
+    private ``_refresh_handoff_resolved`` -- the declaration itself never
+    changes. The inheritance is push-only; ``TestHandoffPolicyOnPop``
+    covers the pop direction, where the restored view resumes its own
+    resolution instead.
+    """
+
+    @staticmethod
+    async def _push_to(source_cls, dest_cls):
+        source = source_cls(interaction=_make_interaction(user_id=1), user_id=1, guild_id=2)
+        await source.send(ephemeral=True)
+        destination = await source.push(
+            dest_cls, interaction=_make_interaction(user_id=1, guild_id=2)
+        )
+        destination._message = MagicMock()
+        destination._message.edit = AsyncMock()
+        return destination
+
+    async def test_a_pinned_off_destination_is_not_armed_by_an_armed_source(self):
+        armed = []
+
+        class _PinnedOff(RenderableLayoutView):
+            auto_refresh_ephemeral = False
+
+            async def _arm_refresh_button(self):
+                armed.append(True)
+
+        dest = await self._push_to(_ArmedSource, _PinnedOff)
+        assert dest._ephemeral_arm_deadline is not None
+        await asyncio.sleep(1.3)
+
+        assert armed == []
+
+    async def test_a_pinned_on_destination_is_armed_by_an_armed_source(self):
+        armed = []
+
+        class _PinnedOn(RenderableLayoutView):
+            auto_refresh_ephemeral = True
+
+            async def _arm_refresh_button(self):
+                armed.append(True)
+
+        await self._push_to(_ArmedSource, _PinnedOn)
+        await asyncio.sleep(1.3)
+
+        assert armed == [True]
+
+    async def test_an_unset_destination_inherits_an_armed_source(self):
+        armed = []
+
+        class _Derived(RenderableLayoutView):
+            async def _arm_refresh_button(self):
+                armed.append(True)
+
+        assert _Derived.auto_refresh_ephemeral is None
+        dest = await self._push_to(_ArmedSource, _Derived)
+        # The inherited decision rides the private resolution field so the
+        # next hop and a rollback re-arm read policy, never deadline
+        # presence. The declaration is the author's and stays untouched.
+        assert dest.auto_refresh_ephemeral is None
+        assert dest._refresh_handoff_resolved is True
+        await asyncio.sleep(1.3)
+
+        assert armed == [True]
+
+    async def test_a_pinned_on_destination_is_armed_by_a_declined_source(self):
+        """The other polarity of the pinned-off guarantee. Fails on any tree
+        where a declined send skips the deadline stamp: there is then no
+        clock for the destination's ``True`` to arm against.
+        """
+        armed = []
+
+        class _PinnedOn(RenderableLayoutView):
+            auto_refresh_ephemeral = True
+
+            async def _arm_refresh_button(self):
+                armed.append(True)
+
+        dest = await self._push_to(_DeclinedSource, _PinnedOn)
+        assert dest._ephemeral_arm_deadline is not None
+        await asyncio.sleep(1.3)
+
+        assert armed == [True]
+
+    async def test_a_pinned_off_destination_stays_off_after_a_declined_source(self):
+        armed = []
+
+        class _PinnedOff(RenderableLayoutView):
+            auto_refresh_ephemeral = False
+
+            async def _arm_refresh_button(self):
+                armed.append(True)
+
+        dest = await self._push_to(_DeclinedSource, _PinnedOff)
+        # The clock is carried even here: presence records the token window,
+        # not the policy.
+        assert dest._ephemeral_arm_deadline is not None
+        await asyncio.sleep(1.3)
+
+        assert armed == []
+
+    async def test_an_unset_destination_inherits_a_declined_source(self):
+        armed = []
+
+        class _Derived(RenderableLayoutView):
+            async def _arm_refresh_button(self):
+                armed.append(True)
+
+        assert _Derived.auto_refresh_ephemeral is None
+        dest = await self._push_to(_DeclinedSource, _Derived)
+        assert dest._ephemeral_arm_deadline is not None
+        assert dest.auto_refresh_ephemeral is None
+        assert dest._refresh_handoff_resolved is False
+        await asyncio.sleep(1.3)
+
+        assert armed == []
+
+    async def test_a_declined_decision_survives_two_unset_hops(self):
+        """The carried resolution is what takes the decision past the first
+        hop: a second ``None`` destination inherits from the first's
+        ``_refresh_handoff_resolved``, while both declarations stay ``None``.
+        Without the carry, the second hop would find no policy anywhere and
+        fall back to the carried clock, arming a chain whose send declined.
+        """
+        armed = []
+
+        class _Mid(RenderableLayoutView):
+            pass
+
+        class _Deep(RenderableLayoutView):
+            async def _arm_refresh_button(self):
+                armed.append(True)
+
+        mid = await self._push_to(_DeclinedSource, _Mid)
+        deep = await mid.push(_Deep, interaction=_make_interaction(user_id=1, guild_id=2))
+        deep._message = MagicMock()
+        deep._message.edit = AsyncMock()
+        assert mid.auto_refresh_ephemeral is None
+        assert deep.auto_refresh_ephemeral is None
+        assert deep._refresh_handoff_resolved is False
+        await asyncio.sleep(1.3)
+
+        assert armed == []
+
+    async def test_an_engaged_decision_survives_two_unset_hops(self):
+        """The engaged polarity of the two-hop carry. The mid view's own
+        in-window ``timeout`` shows navigation inherits the source's
+        resolution rather than re-deriving at the destination.
+        """
+
+        class _Src(RenderableLayoutView):
+            timeout = None
+
+        class _Mid(RenderableLayoutView):
+            timeout = 300
+
+        class _Deep(RenderableLayoutView):
+            pass
+
+        src = _Src(interaction=_make_interaction(user_id=1), user_id=1, guild_id=2)
+        await src.send(ephemeral=True)
+        mid = await src.push(_Mid, interaction=_make_interaction(user_id=1, guild_id=2))
+        deep = await mid.push(_Deep, interaction=_make_interaction(user_id=1, guild_id=2))
+        try:
+            assert mid.auto_refresh_ephemeral is None
+            assert deep.auto_refresh_ephemeral is None
+            assert mid._refresh_handoff_resolved is True
+            assert deep._refresh_handoff_resolved is True
+            # The carried decision holds a live timer on the deepest hop.
+            assert deep.task_manager.get_task_count(deep.id) == 1
+        finally:
+            deep.task_manager.cancel_tasks(deep.id)
+
+    async def test_an_unresolved_chain_keeps_the_carried_deadline_behavior(self):
+        """A deadline stamped outside the send pipeline (no resolved flag
+        anywhere on the chain) keeps the presence behavior: with no policy
+        to consult, the carried clock arms.
+        """
+        armed = []
+
+        class _Derived(RenderableLayoutView):
+            async def _arm_refresh_button(self):
+                armed.append(True)
+
+        source = RenderableLayoutView(
+            interaction=_make_interaction(user_id=1), user_id=1, guild_id=2
+        )
+        await source.send()
+        source._message = MagicMock()
+        source._message.edit = AsyncMock()
+        source._ephemeral = True
+        source._ephemeral_arm_deadline = time.monotonic() - 5
+        dest = await source.push(_Derived, interaction=_make_interaction(user_id=1, guild_id=2))
+        dest._message = MagicMock()
+        dest._message.edit = AsyncMock()
+        await asyncio.sleep(1.3)
+
+        assert armed == [True]
+
+
+# // ========================================( Handoff Policy on Pop )======================================== // #
+
+
+class TestHandoffPolicyOnPop:
+    """Policy inheritance flows down a navigation chain, never back up it.
+
+    A push destination with no answer of its own adopts the source's
+    effective policy; a popped-to view resumes the resolution it held when
+    it was pushed away from, handed back through the nav-stack entry. The
+    departing child's declaration therefore never reaches the restored
+    view: a derived engagement survives a round trip through a pinned-off
+    child, a pinned parent's declaration stands untouched in both
+    polarities, and a view that held no policy comes back holding none.
+    """
+
+    @staticmethod
+    async def _round_trip(root_cls, child_cls):
+        root = root_cls(interaction=_make_interaction(user_id=1), user_id=1, guild_id=2)
+        await root.send(ephemeral=True)
+        child = await root.push(child_cls, interaction=_make_interaction(user_id=1, guild_id=2))
+        child._message = MagicMock()
+        child._message.edit = AsyncMock()
+        popped = await child.pop(interaction=_make_interaction(user_id=1, guild_id=2))
+        assert popped is not None
+        popped._message = MagicMock()
+        popped._message.edit = AsyncMock()
+        return child, popped
+
+    async def test_pop_from_a_pinned_off_child_resumes_a_derived_engagement(self):
+        """The freezing shape: a root whose ``None`` declaration derived
+        "engaged" at its ephemeral send pushes into a child pinning the
+        handoff off, then pops back. The restored root resumes its own
+        resolution (the child's ``False`` does not flow up), so the
+        post-commit gate schedules its timer against the carried deadline
+        rather than leaving the panel frozen at the token cliff.
+        """
+        armed = []
+
+        class _Root(RenderableLayoutView):
+            timeout = None  # the send derives the handoff engaged
+            refresh_warning_seconds = 899  # arm deadline = send + ~1s
+
+            async def _arm_refresh_button(self):
+                armed.append(True)
+
+        class _PinnedOffChild(RenderableLayoutView):
+            auto_refresh_ephemeral = False
+
+        _, popped = await self._round_trip(_Root, _PinnedOffChild)
+        try:
+            # The post-commit gate is the seam under test: it reads the
+            # restored resolution, so its decision is visible before any
+            # sleep -- declaration untouched, resumed resolution engaged,
+            # timer scheduled.
+            assert popped.auto_refresh_ephemeral is None
+            assert popped._refresh_handoff_resolved is True
+            assert popped._refresh_handoff is True
+            assert popped.task_manager.get_task_count(popped.id) == 1
+
+            await asyncio.sleep(1.3)
+            assert armed == [True]
+        finally:
+            popped.task_manager.cancel_tasks(popped.id)
+
+    async def test_pop_from_an_unset_child_keeps_the_engagement(self):
+        """The control cell: an unset child inherits the engagement on the
+        way down, and the pop hands the root back its own resolution. Both
+        directions agree, so the round trip changes nothing.
+        """
+        armed = []
+
+        class _Root(RenderableLayoutView):
+            timeout = None
+            refresh_warning_seconds = 899
+
+            async def _arm_refresh_button(self):
+                armed.append(True)
+
+        class _UnsetChild(RenderableLayoutView):
+            pass
+
+        child, popped = await self._round_trip(_Root, _UnsetChild)
+        try:
+            assert child._refresh_handoff_resolved is True  # inherited on push
+            assert popped._refresh_handoff_resolved is True  # resumed on pop
+            assert popped.task_manager.get_task_count(popped.id) == 1
+
+            await asyncio.sleep(1.3)
+            assert armed == [True]
+        finally:
+            popped.task_manager.cancel_tasks(popped.id)
+
+    async def test_a_pinned_on_parent_acquires_no_resolution_from_the_child(self):
+        """A declared parent needs no hand-back (the declaration rides the
+        class through reconstruction) and must not pick up a resolution
+        record it never made. The restored view arms on its own ``True``
+        with the resolution still unset.
+        """
+        armed = []
+
+        class _Root(RenderableLayoutView):
+            auto_refresh_ephemeral = True
+            refresh_warning_seconds = 899
+
+            async def _arm_refresh_button(self):
+                armed.append(True)
+
+        class _PinnedOffChild(RenderableLayoutView):
+            auto_refresh_ephemeral = False
+
+        _, popped = await self._round_trip(_Root, _PinnedOffChild)
+        try:
+            assert popped._refresh_handoff is True  # the declaration decides
+            assert popped._refresh_handoff_resolved is None
+            assert popped.task_manager.get_task_count(popped.id) == 1
+
+            await asyncio.sleep(1.3)
+            assert armed == [True]
+        finally:
+            popped.task_manager.cancel_tasks(popped.id)
+
+    async def test_a_pinned_off_parent_stays_off_after_pop(self):
+        """The other polarity: the parent's own ``False`` declaration
+        decides at the post-commit gate, and the engaged child's ``True``
+        does not flow up any more than a ``False`` does. No timer.
+        """
+
+        class _Root(RenderableLayoutView):
+            auto_refresh_ephemeral = False
+            refresh_warning_seconds = 899
+
+        class _PinnedOnChild(RenderableLayoutView):
+            auto_refresh_ephemeral = True
+
+        _, popped = await self._round_trip(_Root, _PinnedOnChild)
+        try:
+            assert popped._refresh_handoff is False
+            assert popped._refresh_handoff_resolved is None
+            assert popped.task_manager.get_task_count(popped.id) == 0
+        finally:
+            popped.task_manager.cancel_tasks(popped.id)
+
+    async def test_a_parent_with_no_policy_does_not_acquire_the_childs(self):
+        """A chain whose deadline was stamped outside the send pipeline has
+        no resolution anywhere, so the presence fallback governs it.
+        Popping back from a pinned-off child leaves the restored view
+        unresolved rather than adopting the child's ``False``, and the
+        carried clock still arms.
+        """
+        armed = []
+
+        class _Root(RenderableLayoutView):
+            async def _arm_refresh_button(self):
+                armed.append(True)
+
+        class _PinnedOffChild(RenderableLayoutView):
+            auto_refresh_ephemeral = False
+
+        root = _Root(interaction=_make_interaction(user_id=1), user_id=1, guild_id=2)
+        await root.send()
+        root._message = MagicMock()
+        root._message.edit = AsyncMock()
+        root._ephemeral = True
+        root._ephemeral_arm_deadline = time.monotonic() + 0.5
+        child = await root.push(
+            _PinnedOffChild, interaction=_make_interaction(user_id=1, guild_id=2)
+        )
+        child._message = MagicMock()
+        child._message.edit = AsyncMock()
+        popped = await child.pop(interaction=_make_interaction(user_id=1, guild_id=2))
+        assert popped is not None
+        popped._message = MagicMock()
+        popped._message.edit = AsyncMock()
+        try:
+            assert popped.auto_refresh_ephemeral is None
+            assert popped._refresh_handoff_resolved is None
+            assert popped.task_manager.get_task_count(popped.id) == 1
+
+            await asyncio.sleep(1.3)
+            assert armed == [True]
+        finally:
+            popped.task_manager.cancel_tasks(popped.id)
