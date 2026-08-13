@@ -62,6 +62,10 @@ class MainMenuView(StatefulView):
     timeout = 300.0
     # Manual back buttons on sub-views; the hub has no parent to pop to.
     auto_back_button = False
+    # Sub-views pop back here without passing rebuild=, so the hub names its
+    # own edit. A V1 destination that names none ships components alone, and
+    # the sub-view's embed stays on screen above the hub's buttons.
+    nav_rebuild = staticmethod(lambda v: {"embed": v.build_embed()})
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

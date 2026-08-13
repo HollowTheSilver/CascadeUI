@@ -61,6 +61,62 @@ class TestClassRegistry:
 
         assert _ChildPanel._class_session_key() in _persistent_view_classes
 
+    def test_two_classes_sharing_a_pin_are_refused(self):
+        """The registry holds one class per key, so the second definition
+        displaced the first and every row written by either reattached as
+        whichever was defined last, silently and in the wrong class."""
+
+        class _PinnedA(PersistentView):
+            session_class_key = "fam.SharedPanel"
+
+        with pytest.raises(ValueError, match="both resolve to the persistent class key"):
+
+            class _PinnedB(PersistentView):
+                session_class_key = "fam.SharedPanel"
+
+        assert _persistent_view_classes["fam.SharedPanel"] is _PinnedA
+        # Rejection precedes every registry write, so a refused class is
+        # not resolvable afterwards. The check runs before the super() call
+        # that registers the class path.
+        from cascadeui.views.base import _view_class_registry
+
+        assert not [k for k in _view_class_registry if k.endswith("._PinnedB")]
+
+    @pytest.mark.parametrize(
+        "pin", [123, ["a"], {"k": 1}, ""], ids=["int", "list", "dict", "empty"]
+    )
+    def test_a_wrong_pin_shape_is_refused_before_it_keys_a_registry(self, pin):
+        """The persistent registry keys on the pin, so its shape settles first.
+
+        An unhashable value reached ``dict.get`` and raised from inside the
+        lookup, naming neither the attribute nor the fix -- on the one class
+        family the pin exists for.
+        """
+        from cascadeui.views.base import _view_class_registry
+
+        before = set(_view_class_registry)
+        with pytest.raises(ValueError, match="session_class_key must be a non-empty string"):
+
+            class _BadPin(PersistentView):
+                session_class_key = pin
+
+        # A refused definition is never left resolvable by a later lookup.
+        assert not [k for k in set(_view_class_registry) - before if "_BadPin" in k]
+
+    def test_redefining_the_same_class_still_overwrites(self):
+        """A cog reload rebuilds the class object under the same path. That
+        is the intended overwrite, and must not read as a collision."""
+        source = (
+            "from cascadeui import PersistentView\n"
+            "class _Reloadable(PersistentView):\n"
+            "    session_class_key = 'fam.Reloadable'\n"
+        )
+        first, second = {"__name__": "acog"}, {"__name__": "acog"}
+        exec(compile(source, "acog.py", "exec"), first)
+        exec(compile(source, "acog.py", "exec"), second)
+
+        assert _persistent_view_classes["fam.Reloadable"] is second["_Reloadable"]
+
     async def test_persistence_key_required(self):
         """PersistentView should raise ValueError without persistence_key."""
 

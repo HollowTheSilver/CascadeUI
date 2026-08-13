@@ -5,6 +5,10 @@ state at runtime. Two entry points: a `/cascadeui` command group for
 quick CLI-style operations, and a visual `InspectorView` for interactive
 exploration.
 
+<p align="center">
+  <img src="../../assets/patterns/inspector.gif" alt="The visual inspector switching between its tabs" width="560">
+</p>
+
 ---
 
 ## Recommended dev-bot setup

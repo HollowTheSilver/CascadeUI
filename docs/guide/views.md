@@ -885,12 +885,22 @@ when no `instance_limit` is set or when scope can't be determined (missing IDs).
 
 CascadeUI identifies view classes by `f"{cls.__module__}.{cls.__qualname__}"`.
 Two classes sharing a short name in different modules are treated as distinct.
-Override with `session_class_key` for stability across renames:
+The key feeds session IDs, the instance index, session origin tracking, and,
+for persistent views, the `view_class` column each registry row stores across
+restarts.
+
+A `session_class_key` class attribute overrides the derived name:
 
 ```python
 class HubView(StatefulLayoutView):
     session_class_key = "myapp.HubView"
 ```
+
+The pin does not inherit; each class opts in for itself. Its load-bearing use
+is persistent panels, whose stored rows resolve only against the name they
+recorded, so the pin is what keeps a moved or renamed class reattaching. See
+[Class identity](persistence.md#class-identity-rows-resolve-by-the-name-they-recorded)
+for the failure shape and the pin's requirements.
 
 ---
 

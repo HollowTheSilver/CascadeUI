@@ -20,7 +20,7 @@ looks any of them up.
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from .protocols import Capability
-from .schema import TABLE_PERSISTENT_VIEWS
+from .schema import LEGACY_TABLE_RENAMES, TABLE_PERSISTENT_VIEWS
 
 # // ========================================( Modules )======================================== // #
 
@@ -82,6 +82,15 @@ _MIGRATORS: dict[tuple[str, int], Migrator] = {}
 _KWARGS_MIGRATORS: dict[tuple[str, int], KwargsMigrator] = {}
 
 
+# Old table name -> current name, for the registration guard below. A
+# migrator keyed on a pre-rename name would never match a lookup: the
+# pending step raises "No migrator registered" naming only the current
+# table, with nothing pointing at the stale key as the cause.
+_RENAMED_TABLES: dict[str, str] = {
+    legacy.old_name: current for current, legacy in LEGACY_TABLE_RENAMES.items()
+}
+
+
 # // ========================================( Registration decorators )======================================== // #
 
 
@@ -93,15 +102,32 @@ def register_migrator(table: str, from_version: int) -> Callable[[Migrator], Mig
     in sequence (``from_version=N`` then ``from_version=N+1``, etc.)
     until the on-disk version matches current.
 
+    The row API resolves a namespace to its table, so ``row_select`` and
+    ``row_upsert`` need nothing extra. Raw SQL names its own table, and the
+    logical name is not the physical one under a ``table_prefix``: resolve
+    it through :func:`physical_table` first, or the statement runs against
+    the unprefixed table, which on a prefixed deployment is either absent
+    or a consumer's own.
+
+    The pre-rename table names (``persistent_views``,
+    ``application_slots``) are refused with a ``ValueError`` naming the
+    current name; a migrator keyed on one would never be looked up.
+
     Example::
 
-        @register_migrator("persistent_views", 1)
+        @register_migrator("cascadeui_persistent_views", 1)
         async def _migrate_persistent_views_1_to_2(backend):
-            # ALTER TABLE, rewrite rows, etc.
-            ...
+            table = physical_table(backend, "cascadeui_persistent_views")
+            await backend.execute(f"ALTER TABLE {table} ADD COLUMN ...")
     """
 
     def decorator(fn: Migrator) -> Migrator:
+        current = _RENAMED_TABLES.get(table)
+        if current is not None:
+            raise ValueError(
+                f"Table {table!r} was renamed to {current!r}; key the migrator "
+                f"on the current name -- one keyed on {table!r} is never looked up."
+            )
         key = (table, from_version)
         if key in _MIGRATORS:
             raise ValueError(f"Migrator already registered for {table} v{from_version}")
@@ -165,6 +191,19 @@ def get_kwargs_migrator(view_class_qualname: str, from_version: int) -> KwargsMi
 # // ========================================( Library migrators )======================================== // #
 
 
+def physical_table(backend: Any, table: str) -> str:
+    """Resolve a logical table name to the one this backend actually reads.
+
+    Migrators are keyed and versioned by the logical name, and issue their
+    SQL through the raw surface, which does no prefixing of its own. A
+    backend configured with ``table_prefix`` therefore has to be asked, or
+    the statement runs against the unprefixed name: absent on that database,
+    or worse, a consumer's own table of the same name, which is exactly what
+    the prefix was set to stay away from.
+    """
+    return f"{getattr(backend, 'table_prefix', '')}{table}"
+
+
 @register_migrator(TABLE_PERSISTENT_VIEWS, 1)
 async def _persistent_views_1_to_2(backend: Any) -> None:
     """Add ``first_unreachable_at`` to the registry table.
@@ -191,8 +230,9 @@ async def _persistent_views_1_to_2(backend: Any) -> None:
     # error. The except is broad because the driver raises its own vendor
     # type unwrapped; anything that is not a missing column resurfaces on the
     # ALTER below with its real message intact.
+    table = physical_table(backend, TABLE_PERSISTENT_VIEWS)
     try:
-        await backend.fetch(f"SELECT first_unreachable_at FROM {TABLE_PERSISTENT_VIEWS} LIMIT 1")
+        await backend.fetch(f"SELECT first_unreachable_at FROM {table} LIMIT 1")
         return
     except Exception:
         pass
@@ -204,6 +244,4 @@ async def _persistent_views_1_to_2(backend: Any) -> None:
     # bare form, where the probe is the only guard available and a single-file
     # database makes the race far less reachable.
     guard = "" if backend.placeholder_style == "qmark" else "IF NOT EXISTS "
-    await backend.execute(
-        f"ALTER TABLE {TABLE_PERSISTENT_VIEWS} ADD COLUMN {guard}first_unreachable_at BIGINT"
-    )
+    await backend.execute(f"ALTER TABLE {table} ADD COLUMN {guard}first_unreachable_at BIGINT")

@@ -46,6 +46,7 @@ import inspect
 import json
 import logging
 import time
+from collections import Counter
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from ..exceptions import (
@@ -64,12 +65,15 @@ from .config import (
     RegistryPersistence,
     SlotPolicy,
 )
-from .migrations import get_kwargs_migrator, get_schema_migrator
+from .migrations import get_kwargs_migrator, get_schema_migrator, physical_table
 from .protocols import Capability, PersistenceBackend
 from .schema import (
     CURRENT_SCHEMA_VERSIONS,
+    LEGACY_TABLE_RENAMES,
     TABLE_APPLICATION_SLOTS,
     TABLE_PERSISTENT_VIEWS,
+    TABLE_SCHEMA_META,
+    apply_table_prefix,
 )
 
 if TYPE_CHECKING:
@@ -262,6 +266,206 @@ class PersistenceManager:
         self._initialized = True
         logger.debug(f"Initialized {len(self._unique_backends)} backend(s)")
 
+    async def _reconcile_legacy_table_names(self) -> None:
+        """Rename tables created under the pre-prefix names to the current ones.
+
+        The registry and slots tables shipped as ``persistent_views`` and
+        ``application_slots``; both now carry the ``cascadeui_`` prefix. A
+        database created under the old names still holds every row a posted
+        panel needs to reattach, so each configured namespace is checked
+        before schema versions resolve -- this cannot be a versioned
+        migrator, because migrators are keyed by table name and the name is
+        what changes.
+
+        Per table, the rename runs only when the old name exists, the old
+        table carries the library's column signature, and the current name
+        is absent or empty. ``initialize()`` runs the DDL before this, so on
+        the first boot after an upgrade the current name always exists as a
+        just-created empty shell; a table with zero rows is dropped to make
+        way, which loses nothing by construction. Shell drop, rename, index
+        swap, and version-row move commit as one transaction: a crash leaves
+        either the old database or the finished rename, never a half state.
+
+        The other combinations are left alone. An old table without the
+        signature columns is a consumer's own and is never touched -- the
+        case the prefixed names exist to protect. A populated table under
+        both names is ambiguous: the library uses the current name and logs
+        at WARNING so an operator can reconcile. No old table means a fresh
+        install or a database already renamed, and nothing happens.
+        """
+        for ns_cfg, table in (
+            (self.registry, TABLE_PERSISTENT_VIEWS),
+            (self.application, TABLE_APPLICATION_SLOTS),
+        ):
+            backend = ns_cfg.backend
+            if backend is None:
+                continue
+            if Capability.RAW_SQL not in backend.capabilities:
+                # No SQL surface means no tables to rename: InMemoryBackend
+                # holds nothing across restarts, and a custom non-SQL backend
+                # keys rows by namespace string, which its author moves.
+                logger.debug(
+                    f"Skipping legacy-name reconciliation for {table} on "
+                    f"{type(backend).__name__} (no raw-SQL surface)"
+                )
+                continue
+            try:
+                await self._reconcile_one_legacy_table(backend, table)
+            except Exception as exc:
+                legacy_name = physical_table(backend, LEGACY_TABLE_RENAMES[table].old_name)
+                # The probes run before the transaction opens, so a second
+                # process booting alongside this one can commit the rename in
+                # between and this one fails on a table that is already gone.
+                # Losing that race is the healthy outcome, and reporting it as
+                # a rename failure would send an operator after GRANTs.
+                if await self._legacy_rename_already_done(backend, legacy_name, table):
+                    logger.debug(
+                        f"Another process renamed {legacy_name!r} to "
+                        f"{physical_table(backend, table)!r} first; nothing to do."
+                    )
+                    continue
+                # Every other step of the pipeline wraps its failures in a
+                # persistence-domain error; unwrapped, the driver's own type
+                # leaves setup_hook naming neither the table nor the step. This
+                # runs before the version loop, so on a role that cannot rename
+                # it is the first DDL to fail and the one an operator sees.
+                raise PersistenceSchemaError(
+                    f"Renaming {legacy_name!r} to {physical_table(backend, table)!r} "
+                    f"failed: {type(exc).__name__}: {exc}. The rename commits as one "
+                    f"transaction, so the database is unchanged and it retries on the "
+                    f"next start. A rename runs DDL: on PostgreSQL that needs table "
+                    f"ownership, which the usual SELECT/INSERT/UPDATE/DELETE grants do "
+                    f"not confer."
+                ) from exc
+
+    async def _legacy_rename_already_done(
+        self, backend: PersistenceBackend, legacy_name: str, table: str
+    ) -> bool:
+        """Report whether another process completed this rename first.
+
+        Answered by the state on disk rather than by the exception, because
+        the drivers spell a missing table differently and a message match
+        would go stale on a driver upgrade. Any failure here answers False,
+        so the caller reports the original error rather than swallowing it
+        behind a diagnostic that could not run.
+        """
+        try:
+            if backend.placeholder_style == "qmark":
+                sql = "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?"
+            else:
+                sql = (
+                    "SELECT 1 AS present FROM information_schema.tables "
+                    "WHERE table_schema = current_schema() "
+                    "AND table_type = 'BASE TABLE' AND table_name = $1"
+                )
+            old_gone = await backend.fetch_one(sql, legacy_name) is None
+            new_there = await backend.fetch_one(sql, physical_table(backend, table)) is not None
+            return old_gone and new_there
+        except Exception:
+            return False
+
+    async def _reconcile_one_legacy_table(self, backend: PersistenceBackend, table: str) -> None:
+        """Probe one table's rename preconditions, then rename atomically.
+
+        See :meth:`_reconcile_legacy_table_names` for the decision table.
+        """
+        legacy = LEGACY_TABLE_RENAMES[table]
+        prefix = getattr(backend, "table_prefix", "")
+        phys_old = physical_table(backend, legacy.old_name)
+        phys_new = physical_table(backend, table)
+        qmark = backend.placeholder_style == "qmark"
+
+        # Probes run before the transaction opens: a failed statement inside
+        # a PostgreSQL transaction aborts the whole block, and the signature
+        # probe below fails by design on a consumer's table.
+        if qmark:
+            exists_sql = "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?"
+        else:
+            # information_schema filters by privilege, which is load-bearing
+            # rather than incidental: a role that cannot see the old table also
+            # cannot rename it, so the skip below is correct instead of lucky.
+            # pg_class and pg_tables do not filter, and reading either here
+            # turns a correct silent skip into a wrong one.
+            exists_sql = (
+                "SELECT 1 AS present FROM information_schema.tables "
+                "WHERE table_schema = current_schema() "
+                "AND table_type = 'BASE TABLE' AND table_name = $1"
+            )
+        old_exists = await backend.fetch_one(exists_sql, phys_old) is not None
+        if not old_exists:
+            return
+        new_exists = await backend.fetch_one(exists_sql, phys_new) is not None
+
+        cols = ", ".join(legacy.signature_columns)
+        try:
+            await backend.fetch(f"SELECT {cols} FROM {phys_old} LIMIT 0")
+        except Exception:
+            # The driver raises its own vendor type unwrapped, so the except is
+            # broad, and a broad except cannot tell a missing column from a
+            # table that stopped existing between the check above and here.
+            # Re-read existence before naming a cause: a concurrent boot that
+            # renamed it is the one other way in, and reporting the library's
+            # own table as a consumer's would send an operator after the wrong
+            # one. Anything else resurfaces on the next statement.
+            if await backend.fetch_one(exists_sql, phys_old) is None:
+                logger.debug(
+                    f"Table {phys_old!r} went away between the existence check "
+                    f"and the column probe; another process reconciled it."
+                )
+                return
+            logger.info(
+                f"Table {phys_old!r} exists but does not carry the library's "
+                f"columns ({cols}); leaving it alone. The library uses "
+                f"{phys_new!r}."
+            )
+            return
+
+        if new_exists and await backend.fetch_one(f"SELECT 1 AS present FROM {phys_new} LIMIT 1"):
+            logger.warning(
+                f"Both {phys_old!r} and {phys_new!r} exist and hold rows. The "
+                f"library reads and writes {phys_new!r} and will not touch "
+                f"{phys_old!r}. Reconcile manually: move any rows still needed "
+                f"into {phys_new!r}, then drop {phys_old!r}."
+            )
+            return
+
+        ph1 = "?" if qmark else "$1"
+        ph2 = "?" if qmark else "$2"
+        meta = physical_table(backend, TABLE_SCHEMA_META)
+        ver_sql = f"SELECT schema_version FROM {meta} WHERE table_name = {ph1}"
+        old_ver = await backend.fetch_one(ver_sql, legacy.old_name)
+        new_ver = await backend.fetch_one(ver_sql, table)
+
+        async with backend.transaction():
+            if new_exists:
+                # The empty shell this boot's CREATE TABLE IF NOT EXISTS just
+                # created; its index drops with it.
+                await backend.execute(f"DROP TABLE {phys_new}")
+            await backend.execute(f"ALTER TABLE {phys_old} RENAME TO {phys_new}")
+            # A rename keeps the table's index under its old name on both
+            # engines. Drop it and recreate from the current DDL: an index is
+            # derived state, so the swap is safe, and left in place the next
+            # boot's CREATE INDEX IF NOT EXISTS would add a second index over
+            # the same columns under the current name.
+            await backend.execute(
+                f"DROP INDEX IF EXISTS {physical_table(backend, legacy.old_index)}"
+            )
+            await backend.execute(apply_table_prefix(legacy.index_ddl, prefix))
+            if old_ver is not None:
+                # Move the version record with the data it describes, or the
+                # renamed table reads as unversioned and its migrators re-run.
+                # A record already keyed by the current name loses to the
+                # moved one: the only table it can describe is the shell
+                # dropped above.
+                if new_ver is not None:
+                    await backend.execute(f"DELETE FROM {meta} WHERE table_name = {ph1}", table)
+                await backend.execute(
+                    f"UPDATE {meta} SET table_name = {ph1} WHERE table_name = {ph2}",
+                    table,
+                    legacy.old_name,
+                )
+        logger.info(f"Renamed legacy table {phys_old!r} to {phys_new!r}")
+
     async def apply_migrations(self) -> None:
         """Run registered schema migrators up to current version for
         each configured namespace. No-op when on-disk version equals
@@ -287,7 +491,14 @@ class PersistenceManager:
         genuine fresh install, recorded directly at the current version.
         The row probe that tells them apart runs only on the boot that
         writes the record.
+
+        Version resolution is keyed by table name, so
+        :meth:`_reconcile_legacy_table_names` runs first: a database
+        created under the pre-prefix table names is renamed, version
+        record and all, before anything below reads it.
         """
+        await self._reconcile_legacy_table_names()
+
         for ns_cfg, table in (
             (self.registry, TABLE_PERSISTENT_VIEWS),
             (self.application, TABLE_APPLICATION_SLOTS),
@@ -516,6 +727,10 @@ class PersistenceManager:
 
         removed_keys: list[str] = []
         unreachable_keys: list[str] = []
+        # Stored view_class strings no imported class registered under, counted
+        # per string. summary["skipped"] also collects rows a kwargs migrator
+        # turned away, so it cannot answer "which class is missing" on its own.
+        missing_classes: Counter = Counter()
         # Fetch SUCCEEDED, whatever construction then did. Clearing on
         # restore-success instead would leave a stamp ageing on a panel
         # whose message is perfectly reachable and whose view merely
@@ -562,6 +777,9 @@ class PersistenceManager:
                         f"persistence_key {persistence_key!r}; leaving it for reattach()."
                     )
                     summary["skipped"].append(persistence_key)
+                    # Keyed by str: an OPEN_ROWS backend can store a NULL here,
+                    # and a mixed-type Counter cannot be sorted for the message.
+                    missing_classes[str(class_name)] += 1
                     return None
 
                 migrated = await self._migrate_init_kwargs(row, view_cls, summary)
@@ -664,11 +882,21 @@ class PersistenceManager:
         # import them. reattach() is that chance, so the first pass says
         # nothing louder than the count above and a later pass, finding the
         # class still absent, reports it as the real problem it is by then.
-        if summary["skipped"] and self._reattach_passes > 1:
+        # The stored string is the fix itself: what a class must register
+        # under, or what session_class_key pins to after a move. The warning
+        # names each one rather than counting them; distinct classes number
+        # in the single digits however many rows they own.
+        if missing_classes and self._reattach_passes > 1:
+            unresolved = ", ".join(
+                f"{name} ({count} row{'s' if count != 1 else ''})"
+                for name, count in sorted(missing_classes.items(), key=lambda kv: str(kv[0]))
+            )
             logger.warning(
-                f"{len(summary['skipped'])} persistent view(s) still have no imported "
-                f"class after a reattach() pass; their messages stay dead until the "
-                f"class is importable. Keys at DEBUG on this logger."
+                f"{sum(missing_classes.values())} persistent view row(s) still have "
+                f"no imported class after a reattach() pass; their messages stay dead "
+                f"until a class registers under the stored name. Unresolved: "
+                f"{unresolved}. A moved or renamed class re-registers by setting "
+                f"session_class_key to the stored name. Keys at DEBUG on this logger."
             )
         if summary["unreachable"]:
             logger.warning(
@@ -970,8 +1198,11 @@ class PersistenceManager:
                     # it never names.
                     ph = "?" if backend.placeholder_style == "qmark" else "$1"
                     ph2 = "?" if backend.placeholder_style == "qmark" else "$2"
+                    # Raw SQL does no prefixing of its own; the logical name
+                    # targets the wrong table under a table_prefix.
+                    stamp_table = physical_table(backend, TABLE_PERSISTENT_VIEWS)
                     await backend.execute(
-                        f"UPDATE {TABLE_PERSISTENT_VIEWS} SET first_unreachable_at = {ph} "
+                        f"UPDATE {stamp_table} SET first_unreachable_at = {ph} "
                         f"WHERE persistence_key = {ph2}",
                         stamp,
                         key,
@@ -1327,7 +1558,7 @@ class PersistenceManager:
         slot: Optional[str] = None,
         older_than_days: Optional[int] = None,
     ) -> int:
-        """Delete application_slots rows.
+        """Delete cascadeui_application_slots rows.
 
         When ``slot`` is given, deletes that one slot (any age). When
         ``older_than_days`` is given, deletes rows whose ``expires_at``
@@ -1362,13 +1593,13 @@ class PersistenceManager:
         persistence_keys: Optional[list[str]] = None,
         reason: Optional[str] = None,
     ) -> int:
-        """Delete persistent_views rows. When ``persistence_keys`` is given,
+        """Delete cascadeui_persistent_views rows. When ``persistence_keys`` is given,
         only those rows are removed; otherwise clears the whole
         registry (destructive, rarely wanted).
 
         ``reason`` labels the ``REGISTRY_PRUNED`` dispatch so a subscriber can
-        tell why a row went. Left unset it keeps the value this method has
-        always computed, so no existing caller or subscriber sees a change."""
+        tell why a row went. Left unset it defaults to ``"explicit"`` for a
+        targeted prune and ``"clear_all"`` for a full wipe."""
         backend = self.registry.backend
         if backend is None:
             return 0

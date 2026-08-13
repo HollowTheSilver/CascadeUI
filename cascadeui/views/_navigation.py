@@ -100,6 +100,8 @@ class _NavigationMixin:
             view_class = view_or_class
             new_view = None  # constructed inside the batch below
 
+        from .base import _class_path
+
         current_interaction = interaction or self.interaction
 
         # Version enforcement for push/pop -- these edit the same message, so
@@ -240,7 +242,11 @@ class _NavigationMixin:
                 # starts fresh (one-way transition).
                 if action_type == "NAVIGATION_PUSH":
                     entry = {
-                        "class_name": type(self)._class_session_key(),
+                        # The class path, not _class_session_key(): pop() resolves
+                        # this against _view_class_registry, which is keyed on the
+                        # import path, and a session key answers a different
+                        # question -- two classes may deliberately share one.
+                        "class_name": _class_path(type(self)),
                         "module": self.__class__.__module__,
                         "kwargs": self._init_kwargs if self._init_kwargs else {},
                         # Selection state the kwargs snapshot cannot carry: it was
@@ -370,9 +376,11 @@ class _NavigationMixin:
             **kwargs: Additional kwargs passed to the new view constructor.
                 Must be empty when ``view_or_class`` is an instance.
         """
+        from .base import _class_path
+
         push_payload = ActionCreators.navigation_push(
             session_id=self.session_id,
-            class_name=type(self)._class_session_key(),
+            class_name=_class_path(type(self)),
             module=self.__class__.__module__,
             kwargs=self._init_kwargs if self._init_kwargs else None,
         )
@@ -1106,16 +1114,19 @@ class _NavigationMixin:
             for child in self._attached_children:
                 if child is None:
                     continue
+                # Cleared before the finished-child skip, not after: the list
+                # is emptied below either way, so a child that kept the
+                # back-pointer would name a parent that no longer tracks it
+                # and is itself tearing down.
+                child._attached_to = None
                 if child.is_finished():
                     continue
-                child._attached_to = None
                 try:
                     await child.exit(delete_message=True)
                 except Exception as e:
                     # The list is cleared below either way, so a child that
                     # cannot tear itself down leaves nothing else to find
-                    # it by. Every comparable teardown seam logs; this one
-                    # was the exception.
+                    # it by.
                     logger.debug(
                         f"Attached child {type(child).__name__} failed to exit "
                         f"under {type(self).__name__}: {type(e).__name__}: {e}"

@@ -3,13 +3,10 @@ V2 Form -- CascadeUI V2 Form & Validation
 ==========================================
 
 A registration form built entirely from a declarative ``fields=[...]``
-list on ``FormLayoutView``. No ``Modal`` subclass, no
-``_create_form_controls`` override, no shadow validator map.
-``FormLayoutView`` now renders ``"text"`` fields natively through a
-grouped "Edit Text Fields" button that opens a single
-:class:`cascadeui.Modal` pre-populated from ``self.values``; every
-builtin validator factory is demonstrated in one place, along with one
-async validator.
+list on ``FormLayoutView``. ``"text"`` fields render through a grouped
+"Edit Text Fields" button that opens a single :class:`cascadeui.Modal`
+pre-populated from ``self.values``; every builtin validator factory is
+demonstrated in one place, along with one async validator.
 
 Each entry is a :class:`cascadeui.FormField` dataclass. The typed
 variant validates ``id``, ``label``, and ``type`` at construction --
@@ -128,7 +125,7 @@ class RegistrationFormView(FormLayoutView):
 
     def __init__(self, *args, **kwargs):
         # Each field is a ``FormField`` dataclass -- the typed construction
-        # path catches typos (e.g. ``type="interger"``) at class-load time
+        # path catches typos (e.g. ``type="interger"``) at construction time
         # rather than at first render. ``FormField`` lowers to the same
         # internal dict shape the pattern has always consumed via
         # ``to_dict()``, so every downstream helper keeps working unchanged.

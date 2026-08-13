@@ -45,11 +45,25 @@ def is_async_callable(fn: Any) -> bool:
     ``__call__`` is async. It does see a ``functools.partial`` around an
     ``async def``, on every supported interpreter. Both shapes are
     checked here so a caller cannot pass the one the narrow check misses.
+
+    A ``staticmethod`` or ``classmethod`` wrapping an ``async def`` is
+    unwrapped first. Read out of a class body before the descriptor
+    protocol runs, the wrapper answers False to both checks while calling
+    it still produces a coroutine, and supplying a hook that way is
+    ordinary rather than exotic.
+
+    An async generator function is reported too. It is neither a coroutine
+    function nor awaitable, so both checks above miss it, and calling one
+    returns a truthy object that a refusing seam would consume as an
+    answer: a stray ``yield`` in an ``async def`` renders its own repr.
     """
-    if inspect.iscoroutinefunction(fn):
+    fn = getattr(fn, "__func__", fn)
+    if inspect.iscoroutinefunction(fn) or inspect.isasyncgenfunction(fn):
         return True
     call = getattr(fn, "__call__", None)
-    return call is not None and inspect.iscoroutinefunction(call)
+    return call is not None and (
+        inspect.iscoroutinefunction(call) or inspect.isasyncgenfunction(call)
+    )
 
 
 async def call_hook_safe(

@@ -4,10 +4,10 @@ V2 Leaderboard -- CascadeUI Ranked Display Pattern
 
 A server leaderboard that ranks guild members by a simulated MMR value.
 Works in any guild without configuration: when the Members privileged
-intent is enabled and the cache is populated, real members fill the
-top of the board; any remaining slots are padded with deterministic
-synthetic Demo Player rows so the display is always exactly 25
-entries across 5 pages.
+intent is enabled and the cache is populated, real members take the
+available slots and deterministic synthetic Demo Player rows fill the
+rest, so the display is always exactly 25 entries across 5 pages. The
+assembled board ranks by MMR, so the two kinds interleave.
 
 Demonstrates:
 
@@ -43,7 +43,7 @@ Demonstrates:
       Overview card from ``build_header`` already carries its own heading.
     - ``leaderboard_top_n`` + ``leaderboard_per_page`` for multi-page nav
     - The ``(user_id, stats_dict)`` tuple contract the pattern consumes
-    - ``progress_bar`` used inline for a live win-rate cell
+    - ``render_progress`` used inline for a live win-rate cell
     - ``reload(force=True)``: a "Toggle bars" button flips a render-only
       display flag and reloads; ``force`` bypasses the entry-signature
       short-circuit so an unchanged-entries re-render still rebuilds the
@@ -78,7 +78,7 @@ from cascadeui import (
     divider,
     image_section,
     key_value,
-    progress_bar,
+    render_progress,
 )
 
 # // ========================================( Config )======================================== // #
@@ -132,24 +132,32 @@ def _synthetic_entry(index: int) -> tuple:
 def _build_entries(real_members) -> tuple:
     """Produce exactly ``_TARGET_SIZE`` entries plus a mode label.
 
-    Real members fill the top by MMR and anchor the rankings; any
-    remaining slots take synthetic rows. When ``real_members`` is
-    empty (intent disabled or cache not populated), the full board
-    is synthetic so the example never errors out.
+    Real members take the available slots first; any remainder is
+    filled with synthetic rows. When ``real_members`` is empty (intent
+    disabled or cache not populated), the full board is synthetic so
+    the example never errors out.
     """
     real = [(member.id, _mock_stats_for(member.id)) for member in real_members if not member.bot]
     real.sort(key=lambda row: row[1]["mmr"], reverse=True)
 
     if not real:
         entries = [_synthetic_entry(i) for i in range(_TARGET_SIZE)]
-        return entries, "Demo (Members intent disabled)"
-
-    real = real[:_TARGET_SIZE]
-    if len(real) < _TARGET_SIZE:
+        label = "Demo (Members intent disabled)"
+    else:
+        real = real[:_TARGET_SIZE]
         pad = [_synthetic_entry(i) for i in range(_TARGET_SIZE - len(real))]
-        return real + pad, f"Live server ({len(real)} real + {len(pad)} demo)"
+        entries = real + pad
+        label = (
+            f"Live server ({len(real)} real + {len(pad)} demo)"
+            if pad
+            else f"Live server ({len(real)} real)"
+        )
 
-    return real, f"Live server ({len(real)} real)"
+    # Rank the assembled board, not just the real half. The footer states
+    # "sorted by MMR", and synthetic padding interleaves with real members
+    # rather than trailing them.
+    entries.sort(key=lambda row: row[1]["mmr"], reverse=True)
+    return entries, label
 
 
 # // ========================================( Leaderboard View )======================================== // #
@@ -159,9 +167,10 @@ class ServerLeaderboard(LeaderboardLayoutView):
     """Server leaderboard with real-member ranking and demo padding.
 
     Always renders exactly 25 entries across 5 pages of 5. Real members
-    occupy the top slots when available; synthetic Demo Player rows
-    pad the rest so the paginated layout stays consistent regardless
-    of guild size or intent configuration.
+    take the available slots when present and synthetic Demo Player rows
+    fill the rest, so the paginated layout stays consistent regardless of
+    guild size or intent configuration. Ranking is by MMR across the whole
+    board, so a synthetic row can outrank a real one.
 
     Runs in Section render mode: each entry is a two-line
     ``Section`` with an avatar thumbnail accessory. Passing ``bot=``
@@ -197,17 +206,18 @@ class ServerLeaderboard(LeaderboardLayoutView):
     def format_secondary(self, rank: int, user_id: int, stats: dict) -> str:
         """Bottom line of the section: MMR, W/G, and a live win-rate bar.
 
-        ``progress_bar`` is a first-class V2 builder that returns a
-        ``TextDisplay``; the ``.content`` attribute holds the rendered
-        bar string, which this override embeds inline in the secondary
-        row. Bar width stays small (6 cells) so it fits cleanly alongside
-        the numeric stats without wrapping.
+        ``render_progress`` returns the bar as a string, which is what a
+        row wants: this override embeds it inline rather than adding a
+        component. ``progress_bar`` is the same bar wrapped in a
+        ``TextDisplay``, for when it stands on its own. Bar width stays
+        small (6 cells) so it fits alongside the numeric stats without
+        wrapping.
         """
         games = stats["games"]
         wins = stats["wins"]
         line = f"`{stats['mmr']}` MMR \N{BULLET} {wins}W / {games}G"
         if self._detailed:
-            bar = progress_bar(wins, games or 1, width=6, show_percent=True).content
+            bar = render_progress(wins, games or 1, width=6, show_percent=True)
             line = f"{line} \N{BULLET} {bar}"
         return line
 
@@ -290,9 +300,9 @@ class LeaderboardCog(commands.Cog, name="v2_leaderboard_example"):
         """Build the leaderboard with real members when available.
 
         The cog inspects ``bot.intents.members`` and the guild member
-        cache. When both are available, real members fill the top by
-        MMR and synthetic rows pad up to 25 entries. Otherwise the
-        board is fully synthetic so the example still produces a
+        cache. When both are available, real members take the available
+        slots and synthetic rows fill up to 25. Otherwise the board is
+        fully synthetic so the example still produces a
         complete five-page display.
         """
         if not context.guild:

@@ -3,6 +3,12 @@
 Build a working stateful counter in 5 minutes. This tutorial introduces the
 core concepts one at a time -- by the end, the full data flow pattern is clear.
 
+This is the counter from the [landing page](../index.md) with one change: `count`
+moves off the view and into the store. That is what buys per-user scoping, other
+views reacting to the same value, and (once the [persistence
+middleware](persistence.md) is installed) survival across a restart. The view
+code barely changes; where the number lives does.
+
 ## Prerequisites
 
 - Python 3.10+ with discord.py 2.7+ installed

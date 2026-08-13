@@ -424,3 +424,25 @@ class TestPostgresInternalHelpers:
         # Hardcoded channel name; bumping it would require a coordinated
         # cross-version migration, so the test pins it.
         assert CHANNEL_INVALIDATION == "cascadeui_invalidation"
+
+    def test_channel_carries_the_table_prefix(self):
+        """Prefixed deployments must not share an invalidation bus.
+
+        The payload names the LOGICAL namespace, which the prefix does not
+        touch, so a listener receiving a neighbour's notification cannot
+        tell that key from one of its own. The oversized-payload fallback
+        sends an empty key, meaning "drop this whole namespace", so a
+        shared channel turns one large write next door into a full cache
+        flush here.
+        """
+        from cascadeui.persistence.backends.postgres import PostgresBackend
+
+        dsn = "postgresql://u:p@localhost/db"
+        a = PostgresBackend(dsn, table_prefix="a_")
+        b = PostgresBackend(dsn, table_prefix="b_")
+
+        assert a._channel == f"a_{CHANNEL_INVALIDATION}"
+        assert a._channel != b._channel
+
+        # Default parity: an unprefixed backend listens where it always did.
+        assert PostgresBackend(dsn)._channel == CHANNEL_INVALIDATION

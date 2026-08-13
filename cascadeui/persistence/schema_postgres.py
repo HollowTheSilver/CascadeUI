@@ -72,7 +72,7 @@ CREATE TABLE IF NOT EXISTS {TABLE_PERSISTENT_VIEWS} (
 
 
 DDL_PERSISTENT_VIEWS_INDEX_PG: Final[str] = f"""
-CREATE INDEX IF NOT EXISTS idx_persistent_views_message
+CREATE INDEX IF NOT EXISTS idx_cascadeui_persistent_views_message
     ON {TABLE_PERSISTENT_VIEWS}(channel_id, message_id)
 """
 
@@ -89,7 +89,7 @@ CREATE TABLE IF NOT EXISTS {TABLE_APPLICATION_SLOTS} (
 
 
 DDL_APPLICATION_SLOTS_INDEX_PG: Final[str] = f"""
-CREATE INDEX IF NOT EXISTS idx_application_slots_expires
+CREATE INDEX IF NOT EXISTS idx_cascadeui_application_slots_expires
     ON {TABLE_APPLICATION_SLOTS}(expires_at)
 """
 

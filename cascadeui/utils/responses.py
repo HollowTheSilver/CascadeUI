@@ -92,6 +92,14 @@ async def ack_backstop(
     ``Modal.on_submit``. The caller cancels the task once it has
     responded, so the common path never reaches the ``defer``.
 
+    Three outcomes, each recorded to match what it costs. Cancelled is
+    the healthy path and stays silent. Expired means Discord already
+    dropped the interaction, and warns or debug-logs per
+    ``warn_on_expiry``. Fired means the handler used its whole budget and
+    the ack landed anyway, which logs at INFO: nothing broke, so it is
+    not a warning, but it is the leading indicator for the surface that
+    eventually expires and it is invisible from outside the library.
+
     Args:
         interaction: The interaction to acknowledge.
         delay: Seconds to wait before acking.
@@ -119,6 +127,12 @@ async def ack_backstop(
                 await interaction.response.defer(ephemeral=True)
             else:
                 await interaction.response.defer()
+            # The fired case from the docstring, priced inside the guard so
+            # the cancelled path never takes a measurement.
+            log.info(
+                f"Auto-defer backstop acked for {owner} after the handler used its "
+                f"full {delay:.2f}s budget: {elapsed_since(interaction)}"
+            )
     except asyncio.CancelledError:
         pass
     except discord.NotFound:

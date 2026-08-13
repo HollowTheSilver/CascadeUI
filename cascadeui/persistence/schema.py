@@ -15,14 +15,15 @@ import the SQL strings directly -- they are tied to SQLite syntax
 # // ========================================( Modules )======================================== // #
 
 
-from typing import Final
+import re
+from typing import Final, NamedTuple
 
 # // ========================================( Versions )======================================== // #
 
 
 CURRENT_SCHEMA_VERSIONS: Final[dict[str, int]] = {
-    "persistent_views": 2,
-    "application_slots": 1,
+    "cascadeui_persistent_views": 2,
+    "cascadeui_application_slots": 1,
     "cascadeui_schema": 1,
     "cascadeui_kv": 1,
 }
@@ -34,17 +35,45 @@ CURRENT_SCHEMA_VERSIONS: Final[dict[str, int]] = {
 # Exposed as constants so migrators, backends, and tests agree on one
 # source of truth.
 
-TABLE_PERSISTENT_VIEWS: Final[str] = "persistent_views"
-TABLE_APPLICATION_SLOTS: Final[str] = "application_slots"
+TABLE_PERSISTENT_VIEWS: Final[str] = "cascadeui_persistent_views"
+TABLE_APPLICATION_SLOTS: Final[str] = "cascadeui_application_slots"
 TABLE_SCHEMA_META: Final[str] = "cascadeui_schema"
 TABLE_KV: Final[str] = "cascadeui_kv"
+
+ALL_TABLES: Final[tuple[str, ...]] = (
+    TABLE_PERSISTENT_VIEWS,
+    TABLE_APPLICATION_SLOTS,
+    TABLE_SCHEMA_META,
+    TABLE_KV,
+)
+
+# Index names carry their table's name, so a prefix has to reach them too:
+# two databases sharing a schema under different prefixes would otherwise
+# collide on the index while their tables stayed apart.
+_INDEX_PREFIX: Final[str] = "idx_"
+
+
+def apply_table_prefix(sql: str, prefix: str) -> str:
+    """Rewrite every library table and index name in ``sql`` under ``prefix``.
+
+    Word-boundary matched, so ``idx_cascadeui_persistent_views_message`` is
+    not caught by the ``cascadeui_persistent_views`` pass (an underscore is a
+    word character, so no boundary sits before the table name there); the
+    index pass renames it on its own. An empty prefix returns ``sql``
+    unchanged, which is the default path and does no work.
+    """
+    if not prefix:
+        return sql
+    for name in ALL_TABLES:
+        sql = re.sub(rf"\b{re.escape(name)}\b", f"{prefix}{name}", sql)
+    return re.sub(rf"\b{_INDEX_PREFIX}", f"{prefix}{_INDEX_PREFIX}", sql)
 
 
 # // ========================================( DDL -- SQLite )======================================== // #
 
 
 DDL_PERSISTENT_VIEWS: Final[str] = """
-CREATE TABLE IF NOT EXISTS persistent_views (
+CREATE TABLE IF NOT EXISTS cascadeui_persistent_views (
     persistence_key TEXT PRIMARY KEY,
     view_class TEXT NOT NULL,
     custom_id TEXT,
@@ -64,13 +93,13 @@ CREATE TABLE IF NOT EXISTS persistent_views (
 
 
 DDL_PERSISTENT_VIEWS_INDEX: Final[str] = """
-CREATE INDEX IF NOT EXISTS idx_persistent_views_message
-    ON persistent_views(channel_id, message_id)
+CREATE INDEX IF NOT EXISTS idx_cascadeui_persistent_views_message
+    ON cascadeui_persistent_views(channel_id, message_id)
 """
 
 
 DDL_APPLICATION_SLOTS: Final[str] = """
-CREATE TABLE IF NOT EXISTS application_slots (
+CREATE TABLE IF NOT EXISTS cascadeui_application_slots (
     slot_name TEXT PRIMARY KEY,
     payload TEXT NOT NULL,
     schema_version INTEGER NOT NULL DEFAULT 1,
@@ -81,8 +110,8 @@ CREATE TABLE IF NOT EXISTS application_slots (
 
 
 DDL_APPLICATION_SLOTS_INDEX: Final[str] = """
-CREATE INDEX IF NOT EXISTS idx_application_slots_expires
-    ON application_slots(expires_at)
+CREATE INDEX IF NOT EXISTS idx_cascadeui_application_slots_expires
+    ON cascadeui_application_slots(expires_at)
 """
 
 
@@ -120,3 +149,54 @@ ALL_DDL: Final[tuple[str, ...]] = (
     DDL_APPLICATION_SLOTS_INDEX,
     DDL_KV,
 )
+
+
+# // ========================================( Legacy Names )======================================== // #
+
+
+class LegacyTableRename(NamedTuple):
+    """One table's pre-rename identity, consumed by
+    :meth:`~cascadeui.persistence.manager.PersistenceManager.apply_migrations`
+    when it reconciles a database created under the old names.
+
+    Attributes
+    ----------
+    old_name
+        The unprefixed name the table shipped under.
+    signature_columns
+        Columns that identify the old table as library-owned. A
+        consumer's same-named table without them is left alone.
+    old_index
+        The index the old DDL created. A rename keeps the index under
+        its old name on both engines, so reconciliation drops it and
+        recreates from ``index_ddl`` under the current name.
+    index_ddl
+        The current ``CREATE INDEX IF NOT EXISTS`` statement. The
+        SQLite text is valid PostgreSQL verbatim (the two schema
+        modules differ only in column types, which an index statement
+        never names), so one string serves both engines.
+    """
+
+    old_name: str
+    signature_columns: tuple[str, ...]
+    old_index: str
+    index_ddl: str
+
+
+# The registry and slots tables shipped without the ``cascadeui_``
+# prefix. Keyed by current name so the reconciliation loop and the
+# migration loop walk the same vocabulary.
+LEGACY_TABLE_RENAMES: Final[dict[str, LegacyTableRename]] = {
+    TABLE_PERSISTENT_VIEWS: LegacyTableRename(
+        old_name="persistent_views",
+        signature_columns=("persistence_key", "view_class"),
+        old_index="idx_persistent_views_message",
+        index_ddl=DDL_PERSISTENT_VIEWS_INDEX,
+    ),
+    TABLE_APPLICATION_SLOTS: LegacyTableRename(
+        old_name="application_slots",
+        signature_columns=("slot_name", "payload"),
+        old_index="idx_application_slots_expires",
+        index_ddl=DDL_APPLICATION_SLOTS_INDEX,
+    ),
+}

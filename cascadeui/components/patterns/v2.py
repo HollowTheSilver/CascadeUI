@@ -34,7 +34,7 @@ from discord.ui import (
 )
 
 from ...utils.guards import coerce_colour, normalize_mapping
-from ...utils.hooks import await_maybe, call_hook_safe
+from ...utils.hooks import await_maybe, call_hook_safe, is_async_callable
 from ..base import StatefulButton, StatefulSelect
 from ..types import MAX_COMPONENT_ID, MAX_SELECT_OPTIONS, EmojiInput, MediaInput
 
@@ -1433,6 +1433,69 @@ def stats_card(
     )
 
 
+def render_progress(
+    value: Union[int, float],
+    max_value: Union[int, float],
+    *,
+    width: int = 20,
+    filled: str = "\u2588",
+    empty: str = "\u2591",
+    show_percent: bool = True,
+    _owner: str = "render_progress",
+) -> str:
+    """Render a text progress bar and return it as a string.
+
+    The string underneath :func:`progress_bar`, for callers that want the
+    bar inline rather than as its own component: a leaderboard row's
+    secondary line, a key-value cell, a field inside a ``stats_card``.
+    Reach for this rather than reading ``.content`` off a ``TextDisplay``
+    built to be thrown away, or hand-rolling a glyph loop, which renders
+    past its intended width as soon as the value exceeds it.
+
+    ``value`` is clamped to ``[0, max_value]``, so a caller does not guard
+    against overshoots.
+
+    Args:
+        value: Current progress.
+        max_value: Maximum progress. Must be positive.
+        width: Number of glyph cells (default: 20).
+        filled: Glyph for completed cells. Defaults to U+2588 (full block).
+        empty: Glyph for remaining cells. Defaults to U+2591 (light shade).
+        show_percent: Append a trailing ``N%`` after the bar.
+
+    Returns:
+        The rendered bar, e.g. ``"[\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2591\u2591\u2591] 70%"``.
+
+    Raises:
+        TypeError: If ``value``, ``max_value``, or ``width`` is not a number.
+        ValueError: If ``max_value <= 0`` or ``width <= 0``.
+
+    Example::
+
+        f"{name} {render_progress(wins, total, width=5, show_percent=False)}"
+    """
+    for name, number in (("value", value), ("max_value", max_value), ("width", width)):
+        # Checked before the comparisons below, which are what fail otherwise:
+        # a string operand raises a bare "'<=' not supported" naming neither
+        # parameter, and the division further down does the same.
+        if isinstance(number, bool) or not isinstance(number, (int, float)):
+            raise TypeError(
+                f"{_owner}: {name} must be a number, got " f"{type(number).__name__}: {number!r}"
+            )
+    if max_value <= 0:
+        raise ValueError(f"{_owner}: max_value must be positive, got {max_value}.")
+    if width <= 0:
+        raise ValueError(f"{_owner}: width must be positive, got {width}.")
+
+    ratio = max(0.0, min(1.0, value / max_value))
+    fill_cells = round(ratio * width)
+    bar = filled * fill_cells + empty * (width - fill_cells)
+    text = f"[{bar}]"
+    if show_percent:
+        text = f"{text} {int(round(ratio * 100))}%"
+    return text
+
+
 def progress_bar(
     value: Union[int, float],
     max_value: Union[int, float],
@@ -1470,28 +1533,18 @@ def progress_bar(
 
         progress_bar(7, 10, width=10)  # [███████░░░] 70%
     """
-    for name, number in (("value", value), ("max_value", max_value), ("width", width)):
-        # Checked before the comparisons below, which are what fail otherwise:
-        # a string operand raises a bare "'<=' not supported" naming neither
-        # parameter, and the division further down does the same.
-        if isinstance(number, bool) or not isinstance(number, (int, float)):
-            raise TypeError(
-                f"progress_bar: {name} must be a number, got "
-                f"{type(number).__name__}: {number!r}"
-            )
-    if max_value <= 0:
-        raise ValueError(f"progress_bar: max_value must be positive, got {max_value}.")
-    if width <= 0:
-        raise ValueError(f"progress_bar: width must be positive, got {width}.")
-
-    ratio = max(0.0, min(1.0, value / max_value))
-    fill_cells = round(ratio * width)
-    bar = filled * fill_cells + empty * (width - fill_cells)
-    text = f"[{bar}]"
-    if show_percent:
-        text = f"{text} {int(round(ratio * 100))}%"
     return _with_id(
-        TextDisplay(text),
+        TextDisplay(
+            render_progress(
+                value,
+                max_value,
+                width=width,
+                filled=filled,
+                empty=empty,
+                show_percent=show_percent,
+                _owner="progress_bar",
+            )
+        ),
         id,
         "progress_bar",
     )
@@ -1860,6 +1913,12 @@ class PaginatedRegion:
         self._key = key
 
         self._page = 0
+        # A negative index names a page from the end, and the count it counts
+        # back from is the one the NEXT render loads, not the one in hand when
+        # the call was made. Held here until fresh items land; cleared by any
+        # explicit cursor move. The Last button arms it too: resolving at click
+        # time is still one render too early on a host that reloads.
+        self._from_end: Optional[int] = None
         # Captured by controls() so click callbacks can rebuild + refresh
         # the host view (mirrors ToggleGroup.add_to_view).
         self._view = None
@@ -1887,6 +1946,14 @@ class PaginatedRegion:
     @items.setter
     def items(self, value: Sequence[Any]) -> None:
         self._items = list(value)
+        if self._from_end is not None:
+            # The count these fresh items produce is the one a pending
+            # from-end index meant. Without this the cursor keeps the value
+            # resolved against the old count, and a list that grew across a
+            # per_page boundary renders the second-to-last page under a
+            # request for the last one.
+            self._page = max(0, self.page_count + self._from_end)
+            self._from_end = None
         self._clamp()
 
     @property
@@ -1963,9 +2030,14 @@ class PaginatedRegion:
         Use this one where there is no tree to re-render yet: before the
         region is attached, or from ``restore_nav_state`` on a popped host.
 
-        With no items there is one page and page zero is already the last,
-        so a negative index resolves to zero rather than waiting.
+        A negative index resolves against the current count immediately
+        and stays pending: the next ``items`` assignment re-resolves it
+        against the fresh count, so a seek to the last page lands on the
+        last page of whatever the render loads. Any explicit move (a nav
+        click, a non-negative ``set_page``) drops the pending index. With
+        no items there is one page, so the immediate resolution is zero.
         """
+        self._from_end = index if index < 0 else None
         if index < 0:
             index += self.page_count
         self._page = max(0, index)
@@ -2120,7 +2192,7 @@ class PaginatedRegion:
                     style=self.last_button_style,
                     custom_id=f"region_{self._key}_last",
                     disabled=at_last,
-                    callback=self._make_jump(lambda: self.page_count - 1),
+                    callback=self._make_jump(lambda: self.page_count - 1, from_end=-1),
                 )
             )
 
@@ -2143,6 +2215,7 @@ class PaginatedRegion:
     def _make_step(self, delta: int):
         async def callback(interaction: discord.Interaction):
             previous = self._page
+            self._from_end = None
             self._page += delta
             self._clamp()
             await _guard_hook(self.on_page_changed, self._page, owner=self)
@@ -2150,11 +2223,16 @@ class PaginatedRegion:
 
         return callback
 
-    def _make_jump(self, target_fn: Callable[[], int]):
-        # target_fn re-resolves at click time so "last" tracks the live
-        # item count, not the count captured when the row was built.
+    def _make_jump(self, target_fn: Callable[[], int], *, from_end: Optional[int] = None):
+        # target_fn re-resolves at click time rather than at build time, which
+        # is enough for a page named absolutely. It is not enough for "last":
+        # the re-render below reloads the host, so a list that grew since the
+        # previous render moves the last page after the click resolved it.
+        # Naming it from the end instead defers that to the fresh count, the
+        # same way set_page(-1) does.
         async def callback(interaction: discord.Interaction):
             previous = self._page
+            self._from_end = from_end
             self._page = target_fn()
             self._clamp()
             await _guard_hook(self.on_page_changed, self._page, owner=self)
@@ -2169,7 +2247,7 @@ class PaginatedRegion:
 
         class _GotoModal(discord.ui.Modal, title="Go to Page"):
             page_input = discord.ui.TextInput(
-                label=f"Page number (1–{total})",
+                label=f"Page number (1\u2013{total})",
                 placeholder=str(region._page + 1),
                 min_length=1,
                 max_length=len(str(total)),
@@ -2223,6 +2301,7 @@ class PaginatedRegion:
             # press pages on from a position the reader never saw. The host
             # rebuilds from this cursor on its next render; no second edit
             # here, because the connection is still down.
+            self._from_end = None
             self._page = previous_page
 
 
@@ -2348,7 +2427,7 @@ class Collapsible:
             )
         if not callable(reveal):
             raise TypeError(f"reveal must be callable, got {type(reveal).__name__}")
-        if inspect.iscoroutinefunction(reveal):
+        if is_async_callable(reveal):
             raise TypeError(
                 "reveal must be synchronous; load async data in the host's "
                 "on_load() and have reveal read the result synchronously"
@@ -2356,7 +2435,7 @@ class Collapsible:
         if summary is not None:
             if not callable(summary):
                 raise TypeError(f"summary must be callable or None, got {type(summary).__name__}")
-            if inspect.iscoroutinefunction(summary):
+            if is_async_callable(summary):
                 raise TypeError(
                     "summary must be synchronous; load async data in the host's "
                     "on_load() and have summary read the result synchronously"

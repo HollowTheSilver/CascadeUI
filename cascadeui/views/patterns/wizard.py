@@ -12,7 +12,7 @@ from discord.ui import ActionRow, Button
 from ...components.base import StatefulButton
 from ...components.patterns.v2 import card, progress_bar
 from ...components.types import EmojiInput
-from ...utils.hooks import await_maybe
+from ...utils.hooks import await_maybe, is_async_callable
 from ...utils.responses import DISCORD_CALL_ERRORS
 from ..base import RenderOutcome, _StatefulMixin
 from ..layout import StatefulLayoutView
@@ -102,6 +102,26 @@ class _BaseWizardMixin:
         *_StatefulMixin._BOOL_ATTRS,
         "show_progress_bar",
     )
+
+    @classmethod
+    def _validate_class_attributes(cls) -> None:
+        """Definition-time checks for the wizard's own attributes.
+
+        ``step_indicator_label`` resolves inside the synchronous button
+        build, which cannot await it. An async one is not loud there:
+        discord.py stringifies whatever it gets, so the indicator renders
+        "<coroutine object ...>" as its label and nothing raises.
+        """
+        super()._validate_class_attributes()
+        label = cls.__dict__.get("step_indicator_label")
+        if label is not None and is_async_callable(label):
+            raise TypeError(
+                f"{cls.__name__}.step_indicator_label must be synchronous; it is "
+                f"resolved while building the indicator button, which cannot await "
+                f"it, so an async one renders as a coroutine repr on the button."
+                f"\n  Fix: keep it a plain callable returning str. Resolve anything "
+                f"that needs awaiting in on_load and read the result here."
+            )
 
     # // ----( Override hooks )---- // #
 

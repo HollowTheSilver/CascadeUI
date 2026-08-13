@@ -8,8 +8,8 @@ A display-only showcase for the grid helpers plus the V2 media builders:
                         optional axis labels, and bulk assignment
     - button_grid()   -- (row, col) -> Button factory packed into ActionRows,
                         enforcing Discord's 5x5 component cap
-    - gallery()       -- MediaGallery from any MediaInput: a URL string, a discord.File, a
-discord.Asset, or an UnfurledMediaItem
+    - gallery()       -- MediaGallery from any MediaInput: a URL string, a
+                        discord.File, a discord.Asset, or an UnfurledMediaItem
     - image_section() -- Section with a Thumbnail accessory
 
 This cog demonstrates that grids and media components are standalone
@@ -401,10 +401,11 @@ class V2GridsExample(commands.Cog, name="v2_grids_example"):
 
         The invoker and the bot supply their own avatar URLs, which Discord
         serves indefinitely from its CDN -- no external host needed. The
-        builders both accept the ``MediaInput`` union (URL string OR a
-        live ``discord.File`` whose ``.uri`` is read internally); this
-        showcase uses URL strings so the example runs without local file
-        assets. For the ``discord.File`` form plus ``view.send(files=[...])``
+        builders both accept the ``MediaInput`` union (a URL string, a
+        ``discord.File`` whose ``.uri`` is read internally, or an
+        ``UnfurledMediaItem``) and coerce a ``discord.Asset`` through its
+        ``.url``; this showcase uses URL strings so the example runs
+        without local file assets. For the ``discord.File`` form plus ``view.send(files=[...])``
         pairing, see ``docs/guide/components.md#local-file-attachments``.
         """
         invoker_url = context.author.display_avatar.url

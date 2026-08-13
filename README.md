@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/docs/assets/banner.png" alt="CascadeUI - A Redux-Inspired Framework for Discord.py" width="100%">
+  <img src="https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/docs/assets/banner.png?v=2" alt="CascadeUI - A Redux-Inspired Framework for Discord.py" width="100%">
 </p>
 
 <p align="center">
@@ -21,7 +21,7 @@
 </p>
 
 <div align="center">
-  <img src="https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-devtools.gif" alt="CascadeUI Hero Demo" width="600">
+  <img src="https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-devtools.gif?v=2" alt="CascadeUI Hero Demo" width="600">
 </div>
 
 <p align="center">
@@ -180,7 +180,7 @@ class NotificationPanel(StatefulLayoutView):
     # build_ui() re-runs whenever SETTINGS_UPDATED fires anywhere.
 ```
 
-![Cross-View](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-cross-view-reactivity.gif)
+![Cross-View](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-cross-view-reactivity.gif?v=2)
 
 ---
 
@@ -215,7 +215,7 @@ class MyFleetView(StatefulLayoutView):
 # no manual refresh() or on_state_changed() override needed.
 ```
 
-![Dynamic Rendering](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-dynamic-rendering.gif)
+![Dynamic Rendering](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-dynamic-rendering.gif?v=2)
 
 ---
 
@@ -243,7 +243,7 @@ class SettingsMenu(MenuLayoutView):
         super().__init__(*args, categories=categories, **kwargs)
 ```
 
-![Navigation](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-settings.gif)
+![Navigation](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-settings.gif?v=2)
 
 ---
 
@@ -264,7 +264,7 @@ class BattleshipView(StatefulLayoutView):
         self.allowed_users = {self.user_id, opponent_id}
 ```
 
-![Ownership Control](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-ownership-control.gif)
+![Ownership Control](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-ownership-control.gif?v=2)
 
 ---
 
@@ -280,7 +280,7 @@ class SettingsHubView(MenuLayoutView):
     exit_policy = "disable"          # Old view's buttons grey out, message stays
 ```
 
-![V2 Instance Limiting](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-session-limiting.gif)
+![V2 Instance Limiting](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-session-limiting.gif?v=2)
 
 ---
 
@@ -312,7 +312,7 @@ panel = GuildRoles(context=ctx, persistence_key=f"roles:{ctx.guild.id}")
 await panel.send()
 ```
 
-![Persistence](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-persistence-restart.gif)
+![Persistence](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-persistence-restart.gif?v=2)
 
 ---
 
@@ -332,7 +332,7 @@ class NotificationsView(StatefulLayoutView):
         await self.redo()   # Reapply the reverted snapshot
 ```
 
-![Undo/Redo](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-undo-redo.gif)
+![Undo/Redo](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-undo-redo.gif?v=2)
 
 ---
 
@@ -346,7 +346,32 @@ class FleetView(StatefulLayoutView):
     refresh_button_label = "Refresh"     # Default: "Continue Session"
 ```
 
-![Ephemeral Refresh](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-refresh.gif)
+![Ephemeral Refresh](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-refresh.gif?v=2)
+
+---
+
+### Inline Disclosure
+
+> `Collapsible` hides a region behind a trigger that relabels itself. The host owns the revealed content and when to collapse it, so two per view stay independent.
+
+```python
+from cascadeui import Collapsible, card, key_value
+
+self.details = Collapsible(
+    label="Show details",
+    expanded_label="Hide details",
+    summary=lambda: "**Match 14** - Gold Tier",
+    reveal=lambda: [card(key_value({"Score": "12 - 9", "MVP": "@player"}))],
+    key="match_14",
+)
+
+def build_ui(self):
+    self.clear_items()
+    for item in self.details.render(self):
+        self.add_item(item)
+```
+
+![Collapsible](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-collapsible.gif?v=2)
 
 ---
 
@@ -361,7 +386,7 @@ from cascadeui import DevToolsCog
 await bot.add_cog(DevToolsCog(bot))
 ```
 
-![DevTools](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-devtools.gif)
+![DevTools](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-devtools.gif?v=2)
 
 ---
 
@@ -391,13 +416,48 @@ class ConfigHub(MenuLayoutView):
         return [card("## Server Config", key_value(self._summary()))]
 ```
 
+![Category Menu](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-settings.gif?v=2)
+
 ---
 
 ### Tabbed Dashboard
 
-> Structured, multi-section interfaces with tab-based navigation and composable layouts.
+> Structured, multi-section interfaces with tab-based navigation and composable layouts. Each tab is an async builder returning that panel's components; the pattern owns the button row, the active-tab styling, and the swap.
 
-![Dashboard](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-dashboard.gif)
+```python
+from cascadeui import TabLayoutView, action_section, card, gap, key_value
+
+class DashboardView(TabLayoutView):
+    instance_limit = 1
+    instance_scope = "user_guild"
+    instance_policy = "replace"
+
+    def __init__(self, *args, **kwargs):
+        tabs = {
+            "\N{BAR CHART} Overview": self.build_overview,
+            "\N{JIGSAW PUZZLE PIECE} Modules": self.build_modules,
+            "\N{GEAR}\N{VARIATION SELECTOR-16} Controls": self.build_controls,
+            "\N{INFORMATION SOURCE}\N{VARIATION SELECTOR-16} About": self.build_about,
+        }
+        super().__init__(*args, tabs=tabs, **kwargs)
+
+    async def build_overview(self):
+        guild = self.context.guild
+        stats = card(
+            f"## {guild.name}",
+            action_section(f"**Members:** {guild.member_count}",
+                           label="Refresh", callback=self._refresh_overview),
+            key_value(await self._server_stats()),
+        )
+        actions = card(
+            "## Quick Actions",
+            action_section("View and manage active bot modules",
+                           label="Modules", callback=self._go_to_modules),
+        )
+        return [stats, gap(), actions, self.make_nav_row(back=False, exit_label="Close")]
+```
+
+![Dashboard](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-dashboard.gif?v=2)
 
 ---
 
@@ -427,7 +487,28 @@ view = await PaginatedLayoutView.from_data(
 await view.send()
 ```
 
-![Pagination](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-pagination.gif)
+![Pagination](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-pagination.gif?v=2)
+
+---
+
+### Sectional Pagination
+
+> `PaginatedRegion` pages one slice of a view while the host owns the rest. Give two regions distinct keys and they page independently in the same message.
+
+```python
+from cascadeui import PaginatedRegion, card
+
+self.region = PaginatedRegion(items=rows, per_page=5, key="tasks")
+
+def build_ui(self):
+    self.clear_items()
+    body = "\n".join(f"- {row}" for row in self.region.page_items)
+    self.add_item(card(f"## Page {self.region.page + 1} of {self.region.page_count}", body))
+    for control in self.region.controls(self):
+        self.add_item(control)
+```
+
+![Paginated Region](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-paginated-region.gif?v=2)
 
 ---
 
@@ -477,7 +558,7 @@ panel = PersistentBoard(
 await panel.send()
 ```
 
-![Leaderboards](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-leaderboard.gif)
+![Leaderboards](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-leaderboard.gif?v=2)
 
 ---
 
@@ -521,7 +602,7 @@ class RegistrationForm(FormLayoutView):
         await self.exit()
 ```
 
-![Forms](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-form.gif)
+![Forms](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-form.gif?v=2)
 
 ---
 
@@ -552,7 +633,7 @@ class CharacterCreator(WizardLayoutView):
         super().__init__(*args, steps=steps, **kwargs)
 ```
 
-![Wizard](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-wizard.gif)
+![Wizard](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-wizard.gif?v=2)
 
 ---
 
@@ -587,8 +668,8 @@ for row in rows:
 ```
 
 <div align="center">
-  <img src="https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/pngs/v2-emoji-grid.PNG" width="30%" alt="Emoji Grid" style="border-radius: 8px; margin: 5px;" />
-  <img src="https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/pngs/v2-button-grid.PNG" width="30%" alt="Button Grid" style="border-radius: 8px; margin: 5px;" />
+  <img src="https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/pngs/v2-emoji-grid.PNG?v=2" width="30%" alt="Emoji Grid" style="border-radius: 8px; margin: 5px;" />
+  <img src="https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/pngs/v2-button-grid.PNG?v=2" width="30%" alt="Button Grid" style="border-radius: 8px; margin: 5px;" />
 </div>
 
 ---
@@ -676,7 +757,7 @@ for row in rows:
 - Multi-user games with shared state, hidden information, and challenge flows (TicTacToe, Battleship)
 - Open-join lobbies with capacity caps and host-vs-participant authority (Werewolf-style)
 
-![Examples](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-hero.gif)
+![Examples](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v2-hero.gif?v=2)
 
 ---
 
@@ -690,7 +771,7 @@ Use V1 when you need:
 
 All core features such as navigation, persistence, and undo/redo are supported.
 
-![Ticket System](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v1-ticket-system.gif)
+![Ticket System](https://raw.githubusercontent.com/HollowTheSilver/CascadeUI/main/assets/gifs/v1-ticket-system.gif?v=2)
 
 ---
 

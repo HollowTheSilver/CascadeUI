@@ -26,14 +26,15 @@ from typing import ClassVar, Optional
 
 from ..exceptions import PersistenceConfigError
 from .protocols import Capability, PersistenceBackend
+from .schema import TABLE_APPLICATION_SLOTS, TABLE_PERSISTENT_VIEWS
 
 # // ========================================( Namespace Names )======================================== // #
 
 
-# Logical namespace names. Match the table names in schema.py so the
+# Logical namespace names. Aliased to the table names in schema.py so the
 # manager can pass one string through to backend row/kv operations.
-NAMESPACE_REGISTRY: str = "persistent_views"
-NAMESPACE_APPLICATION: str = "application_slots"
+NAMESPACE_REGISTRY: str = TABLE_PERSISTENT_VIEWS
+NAMESPACE_APPLICATION: str = TABLE_APPLICATION_SLOTS
 
 
 # // ========================================( Slot Policy )======================================== // #
@@ -111,7 +112,7 @@ def _validate_capabilities(
 
 @dataclass
 class RegistryPersistence:
-    """Configuration for the ``persistent_views`` registry namespace.
+    """Configuration for the ``cascadeui_persistent_views`` registry namespace.
 
     Holds ``PersistentView`` re-attachment rows so views survive a bot
     restart. Relational by nature (one row per ``persistence_key``) and has
@@ -139,7 +140,7 @@ class RegistryPersistence:
 
 @dataclass
 class ApplicationPersistence:
-    """Configuration for the ``application_slots`` namespace.
+    """Configuration for the ``cascadeui_application_slots`` namespace.
 
     Application slots hold user reducer state. Each slot carries its
     own policy via :class:`SlotPolicy` -- ``persistent=True`` opts the
@@ -150,7 +151,7 @@ class ApplicationPersistence:
     starts a daily background sweeper during initialization that deletes
     rows whose ``expires_at`` has passed. No cadence
     configuration is exposed: TTLs are expressed in days, sub-day
-    granularity is meaningless, and asking the user to also schedule a
+    resolution is meaningless, and asking the user to also schedule a
     prune task is friction the library can absorb. Explicit prune
     (:meth:`PersistenceManager.prune_application`) remains available
     for devtools and one-off ops use.

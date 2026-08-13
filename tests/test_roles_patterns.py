@@ -226,6 +226,36 @@ class TestFormatHooks:
         )
         assert _SampleRolesForHooks.format_button_style("X", 1, cat) == discord.ButtonStyle.success
 
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "format_category_title",
+            "format_category_hint",
+            "format_button_label",
+            "format_button_style",
+            "format_button_emoji",
+        ],
+    )
+    def test_an_async_compose_hook_is_refused_at_definition(self, name, clean_role_registries):
+        """All five compose inside build_ui, which runs from __init__ and
+        cannot await them. An async one is not loud there: the coroutine
+        becomes the card's text or a button's label, the placement validator
+        skips non-string content by design, and the mistake surfaces at HTTP
+        send naming neither the hook nor the class."""
+
+        async def hook(cls, *args, **kwargs):
+            return "x"
+
+        with pytest.raises(TypeError, match=f"{name} must be synchronous"):
+            type(
+                "_AsyncComposeHook",
+                (RolesLayoutView,),
+                {
+                    "categories": [RoleCategory(name="RefusalCat", roles={"A": 9001})],
+                    name: classmethod(hook),
+                },
+            )
+
 
 # // ========================================( Subclass Overrides )======================================== // #
 
@@ -407,6 +437,95 @@ class TestHookOverrides:
         assert captured.get("fired") is True
         assert captured["role_name"] == "A"
         assert captured["category_name"] == "HookOverride"
+
+    async def test_a_synchronous_override_fires(self, clean_role_registries):
+        """A hook that needs no await is written ``def``, and must work.
+
+        The dispatch bare-awaited the hook, so a sync override returned
+        None and the await raised TypeError. The handler catches only
+        Forbidden and the transport errors, and a role button is a
+        DynamicItem with no _scheduled_task beneath it, so that TypeError
+        escaped to the user as "This interaction failed".
+        """
+        captured = {}
+
+        class _SyncHook(RolesLayoutView):
+            categories = [RoleCategory(name="SyncHook", roles={"B": 3002})]
+
+            @classmethod
+            def on_role_assigned(cls, interaction, member, role, category):
+                captured["role_name"] = role.name
+
+        role = _make_role(3002, "B")
+        member = _make_member(roles=[])
+        interaction = _make_interaction(member, guild_roles=[role])
+
+        await _SyncHook._handle_role_click(interaction, _SyncHook.categories[0], 3002)
+
+        assert captured.get("role_name") == "B"
+
+    async def test_a_synchronous_on_role_removed_fires(self, clean_role_registries):
+        """Each dispatch awaits through its own await_maybe, so a sibling
+        site can regress alone. Removal is the one a member reaches by
+        clicking a role they already hold."""
+        captured = {}
+
+        class _SyncRemoved(RolesLayoutView):
+            categories = [RoleCategory(name="SyncRemoved", roles={"B": 3012})]
+
+            @classmethod
+            def on_role_removed(cls, interaction, member, role, category):
+                captured["role_name"] = role.name
+
+        role = _make_role(3012, "B")
+        member = _make_member(roles=[role])
+        interaction = _make_interaction(member, guild_roles=[role])
+
+        await _SyncRemoved._handle_role_click(interaction, _SyncRemoved.categories[0], 3012)
+
+        assert captured.get("role_name") == "B"
+
+    async def test_a_synchronous_on_role_swap_fires(self, clean_role_registries):
+        """An exclusive category swaps rather than adds, and reports both
+        sides through its own dispatch site."""
+        captured = {}
+
+        class _SyncSwap(RolesLayoutView):
+            categories = [
+                RoleCategory(name="SyncSwap", roles={"B": 3022, "C": 3023}, exclusive=True)
+            ]
+
+            @classmethod
+            def on_role_swap(cls, interaction, member, role_added, roles_removed, category):
+                captured["swap"] = (role_added.name, [r.name for r in roles_removed])
+
+        held = _make_role(3022, "B")
+        wanted = _make_role(3023, "C")
+        member = _make_member(roles=[held])
+        interaction = _make_interaction(member, guild_roles=[held, wanted])
+
+        await _SyncSwap._handle_role_click(interaction, _SyncSwap.categories[0], 3023)
+
+        assert captured.get("swap") == ("C", ["B"])
+
+    async def test_a_synchronous_on_role_error_fires(self, clean_role_registries):
+        """The error dispatch is reached without touching Discord: a button
+        naming a role the guild no longer has routes straight to it."""
+        captured = {}
+
+        class _SyncError(RolesLayoutView):
+            categories = [RoleCategory(name="SyncError", roles={"B": 3032})]
+
+            @classmethod
+            def on_role_error(cls, interaction, error):
+                captured["error"] = str(error)
+
+        member = _make_member(roles=[])
+        interaction = _make_interaction(member, guild_roles=[])
+
+        await _SyncError._handle_role_click(interaction, _SyncError.categories[0], 3032)
+
+        assert "3032" in captured.get("error", "")
 
 
 # // ========================================( Persistent Variant )======================================== // #

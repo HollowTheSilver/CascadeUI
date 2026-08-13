@@ -1551,9 +1551,9 @@ class StateStore:
             # subscriber is notified on every action, the exact opposite
             # of what passing a selector asks for, and each unawaited
             # coroutine warns from the user's console.
-            if inspect.iscoroutinefunction(selector) or inspect.iscoroutinefunction(
-                getattr(selector, "__call__", None)
-            ):
+            from ..utils.hooks import is_async_callable
+
+            if is_async_callable(selector):
                 raise TypeError(
                     f"subscribe({subscriber_id!r}) selector= must be synchronous; the "
                     f"change check runs inline in dispatch and cannot await. Read the "

@@ -19,6 +19,7 @@ from cascadeui.state.reducers import (
     reduce_navigation_replace,
 )
 from cascadeui.state.singleton import get_store
+from cascadeui.views.base import _class_path
 from cascadeui.views.layout import StatefulLayoutView
 from cascadeui.views.view import StatefulView
 
@@ -225,7 +226,7 @@ class TestNavStackForwardTransfer:
 
         child = await root.push(_ViewB)
         assert len(child._nav_stack) == 1
-        assert child._nav_stack[0]["class_name"] == _ViewA._class_session_key()
+        assert child._nav_stack[0]["class_name"] == _class_path(_ViewA)
 
     async def test_deep_push_chain(self):
         """Pushing A -> B -> C -> D should give D a nav_stack with 3 entries."""
@@ -252,9 +253,9 @@ class TestNavStackForwardTransfer:
         d = await c.push(_D)
 
         assert len(d._nav_stack) == 3
-        assert d._nav_stack[0]["class_name"] == _A._class_session_key()
-        assert d._nav_stack[1]["class_name"] == _B._class_session_key()
-        assert d._nav_stack[2]["class_name"] == _C._class_session_key()
+        assert d._nav_stack[0]["class_name"] == _class_path(_A)
+        assert d._nav_stack[1]["class_name"] == _class_path(_B)
+        assert d._nav_stack[2]["class_name"] == _class_path(_C)
 
     async def test_pop_shrinks_nav_stack(self):
         """Popping from C (depth 2) should give the restored view a nav_stack of depth 1."""
@@ -316,6 +317,38 @@ class TestNavStackForwardTransfer:
         page = await hub.push(_Page)
         session = store.state["sessions"].get(session_id, {})
         assert "nav_stack" not in session
+
+    async def test_pop_resolves_a_class_that_pins_its_session_key(self):
+        """A session_class_key pin must not break pop's class resolution.
+
+        The entry records the class path, which is what _view_class_registry
+        is keyed on. Recording the session key instead made the lookup miss,
+        so Back died as a warning and a None rather than an exception.
+        """
+
+        class _PinnedHub(StatefulView):
+            session_class_key = "legacy.app.Hub"
+
+            async def on_state_changed(self, state):
+                pass
+
+        class _Page(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        hub = _PinnedHub(interaction=_make_interaction())
+        await hub.send()
+        page = await hub.push(_Page)
+
+        restored = await page.pop()
+        assert restored is not None, "pop() could not resolve the pinned parent class"
+        assert type(restored) is _PinnedHub
+        # The mechanism, asserted after the symptom so a regression reports the
+        # dead Back button rather than the entry format that caused it.
+        assert page._nav_stack[0]["class_name"] == _class_path(_PinnedHub)
+        # The pin still does its own job: a session key it no longer shares
+        # with the nav entry is not a pin that stopped applying.
+        assert restored.session_id.startswith("legacy.app.Hub:")
 
 
 # // ========================================( Kwargs Round-Trip )======================================== // #
@@ -576,6 +609,130 @@ class TestNavigationAttachmentTransfer:
 
         assert new._attached_children == []
         assert child._attached_to is old
+
+    async def test_parent_reads_before_and_after_the_attaching_send(self):
+        """A child constructed with parent= holds it from construction.
+
+        The attach itself happens in the send pipeline, so a child that
+        reads its parent during on_load or build_ui runs before that, and
+        one reading it in a callback runs after. Both resolve here.
+        """
+
+        class _Parent(StatefulView):
+            pass
+
+        class _Child(StatefulView):
+            pass
+
+        parent = _Parent(interaction=_make_interaction(user_id=1, guild_id=100))
+        await parent.send()
+
+        child = _Child(
+            interaction=_make_interaction(user_id=1, guild_id=100),
+            parent=parent,
+        )
+        assert child.parent is parent  # pending, before the send attaches it
+
+        await child.send()
+        assert child.parent is parent  # attached
+        assert parent.parent is None  # a root has none
+
+    async def test_parent_clears_when_the_parent_tears_down(self):
+        """A child that finished on its own still gets the back-pointer
+        cleared: the parent's list is emptied either way, so keeping it
+        would name a parent that no longer tracks this child."""
+
+        class _Parent(StatefulView):
+            pass
+
+        class _Child(StatefulView):
+            pass
+
+        parent = _Parent(interaction=_make_interaction(user_id=1, guild_id=100))
+        await parent.send()
+        child = _Child(interaction=_make_interaction(user_id=1, guild_id=100))
+        parent.attach_child(child)
+        child.stop()  # the child finished on its own first
+
+        await parent._cleanup_attached_children()
+
+        assert child.parent is None
+
+    async def test_parent_clears_when_the_send_that_would_attach_it_fails(self):
+        """The attach is the last stage of a successful send, so a failed
+        one leaves no parent to report."""
+
+        class _Parent(StatefulView):
+            pass
+
+        class _Child(StatefulView):
+            pass
+
+        parent = _Parent(interaction=_make_interaction(user_id=1, guild_id=100))
+        await parent.send()
+        child = _Child(
+            interaction=_make_interaction(user_id=1, guild_id=100),
+            parent=parent,
+        )
+        assert child.parent is parent
+
+        await child._rollback_send(registered=False)
+
+        assert child.parent is None
+
+    async def test_a_notification_queued_before_teardown_does_not_rebuild(self):
+        """A state notification landing after teardown must not rebuild.
+
+        Subscriber fan-out runs as tasks, so a dispatch can outlive the
+        view it targets, and teardown clears the parent link before the
+        child exits. Before the guard, the rebuild read ``parent`` as
+        ``None`` and raised inside the subscriber wrapper. Seen live: a
+        fleet panel logged ``'NoneType' object has no attribute
+        'player_1'`` as its game view tore down.
+        """
+        rebuilds = []
+
+        class _Parent(StatefulView):
+            pass
+
+        class _Child(StatefulView):
+            def build_ui(self):
+                rebuilds.append(1)
+                # What the panel does: read something off the parent.
+                assert self.parent is not None
+
+        parent = _Parent(interaction=_make_interaction(user_id=1, guild_id=100))
+        await parent.send()
+        child = _Child(interaction=_make_interaction(user_id=1, guild_id=100))
+        parent.attach_child(child)
+
+        await parent._cleanup_attached_children()
+        assert child.is_finished()
+
+        # The queued notification lands now, after the teardown.
+        await child._handle_state_notification(child.state_store.state, {"type": "BATCH_COMPLETE"})
+
+        assert rebuilds == []
+
+    async def test_parent_follows_a_re_parent(self):
+        class _First(StatefulView):
+            pass
+
+        class _Second(StatefulView):
+            pass
+
+        class _Child(StatefulView):
+            pass
+
+        first = _First(interaction=_make_interaction(user_id=1, guild_id=100))
+        second = _Second(interaction=_make_interaction(user_id=1, guild_id=100))
+        child = _Child(interaction=_make_interaction(user_id=1, guild_id=100))
+
+        first.attach_child(child)
+        assert child.parent is first
+
+        second.attach_child(child)
+        assert child.parent is second
 
 
 class TestNavigationMessageState:
@@ -1527,7 +1684,7 @@ class TestNavigationInstanceForm:
         assert pushed is child
         # Nav stack on the pushed view records the parent.
         assert len(pushed._nav_stack) == 1
-        assert pushed._nav_stack[0]["class_name"] == _Root._class_session_key()
+        assert pushed._nav_stack[0]["class_name"] == _class_path(_Root)
         # Message reference propagates from parent.
         assert pushed._message is root._message
 

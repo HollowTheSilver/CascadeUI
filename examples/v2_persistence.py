@@ -361,14 +361,23 @@ class PersonalVisitsView(StatefulLayoutView):
 class V2PersistenceExample(commands.Cog, name="v2_persistence_example"):
     """V2 persistent role selector panel + per-user visit counter.
 
-    Requires ``PersistenceMiddleware`` installed in the bot's setup_hook::
+    Requires ``PersistenceMiddleware`` installed in the bot's setup_hook,
+    with this cog loaded first: the reattach pass inside ``setup_middleware``
+    resolves stored rows against the persistent view classes that have
+    registered themselves, and a class registers when its module imports::
 
         from cascadeui import PersistenceMiddleware, SQLiteBackend, setup_middleware
 
         async def setup_hook(self):
+            await self.load_extension("cogs.v2_persistence")
             await setup_middleware(
                 PersistenceMiddleware(backend=SQLiteBackend("cascadeui.db"), bot=self),
             )
+
+    A cog loaded after the middleware lands its panel in the reattach
+    summary's ``skipped`` bucket for that boot, leaving a live message with
+    dead buttons. Call ``store.persistence_manager.reattach()`` once every
+    cog is loaded to pick up late arrivals.
     """
 
     def __init__(self, bot) -> None:

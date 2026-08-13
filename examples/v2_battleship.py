@@ -27,7 +27,9 @@ CascadeUI patterns demonstrated
   with ``auto_register_participants`` to claim both players atomically.
 * Ephemeral fleet panels with ``auto_refresh_ephemeral`` for the 15-min
   token handoff, ``parent=`` kwarg for automatic cleanup attachment, and
-  ``instance_policy="replace"`` for dedup.
+  ``instance_policy="replace"`` for dedup. The panel reads the game view
+  back through ``self.parent`` rather than keeping a second reference of
+  its own, which is what every board and grid read below resolves through.
 * Phase-aware ``exit()`` override (delete during setup, freeze on
   completion) and ``task_manager`` for the auto-start timer.
 * ``seed_initial_state`` hook -- fleet randomization, defense-grid
@@ -88,8 +90,8 @@ from cascadeui import (
     get_store,
     image_section,
     key_value,
-    progress_bar,
     read_slot,
+    render_progress,
     stats_card,
     with_cooldown,
 )
@@ -426,7 +428,6 @@ class BattleshipChallengeView(StatefulLayoutView):
             interaction=interaction,
             user_id=self.opponent.id,
             guild_id=self.guild_id,
-            parent_view=view,
             parent=view,
         )
         try:
@@ -513,10 +514,11 @@ class BattleshipView(StatefulLayoutView):
     participant_limit = 2
     auto_register_participants = True
     # exit_policy is not set here -- the choice is phase-dependent, so
-    # exit() is overridden below. Subscriptions are narrowed to
-    # BATTLESHIP_REROLL only: the default VIEW_DESTROYED set would
-    # trigger redundant rebuilds every time a child fleet panel exits
-    # during _cleanup_attached_children.
+    # exit() is overridden below. subscribed_actions defaults to an empty
+    # set (no notifications), so this is an opt-in rather than a narrowing:
+    # a re-roll clicked inside a player's own fleet panel has to repaint the
+    # public card, and every other rebuild here runs from this view's own
+    # callbacks.
     subscribed_actions = {"BATTLESHIP_REROLL"}
     # The setup card, turn indicator, and shot results all name the
     # players, and the tree rebuilds on every Ready toggle, re-roll, and
@@ -1018,7 +1020,6 @@ class BattleshipView(StatefulLayoutView):
             interaction=interaction,
             user_id=interaction.user.id,
             guild_id=self.guild_id,
-            parent_view=self,
             parent=self,
         )
         # See _accept for the rationale on the narrowed except clause.
@@ -1294,42 +1295,38 @@ class MyShipsView(StatefulLayoutView):
           incoming damage always produces a rebuild regardless of whose
           turn it was.
 
-        All three read through ``self.parent_view._match_key`` so a
+        All three read through ``self.parent._match_key`` so a
         concurrent, unrelated match never contributes a false-positive
         (or false-negative) change to this tuple.
         """
-        match_key = self.parent_view._match_key
+        match_key = self.parent._match_key
         return (
             read_slot(state, "battleship", match_key, "fleets", self.user_id),
             read_slot(state, "battleship", match_key, "phase"),
             read_slot(state, "battleship", match_key, "shots_fired", default=0),
         )
 
-    def __init__(self, *, parent_view: "BattleshipView", **kwargs):
+    def __init__(self, **kwargs):
+        # parent= attaches this panel to the game view for cleanup, and
+        # self.parent reads it back, so the panel keeps no reference of
+        # its own. Resolved by the time build_ui runs below.
         super().__init__(**kwargs)
-        self.parent_view = parent_view
         self.build_ui()
 
     def _own_ships(self) -> dict[str, list[int]]:
-        return (
-            self.parent_view.ships_1
-            if self.user_id == self.parent_view.player_1
-            else self.parent_view.ships_2
-        )
+        return self.parent.ships_1 if self.user_id == self.parent.player_1 else self.parent.ships_2
 
     def _own_sunk(self) -> set[str]:
         return (
-            self.parent_view.sunk_by_2
-            if self.user_id == self.parent_view.player_1
-            else self.parent_view.sunk_by_1
+            self.parent.sunk_by_2 if self.user_id == self.parent.player_1 else self.parent.sunk_by_1
         )
 
     def _own_defense_grid(self) -> EmojiGrid:
         """Return the defense grid for this player."""
         return (
-            self.parent_view._defense_1
-            if self.user_id == self.parent_view.player_1
-            else self.parent_view._defense_2
+            self.parent._defense_1
+            if self.user_id == self.parent.player_1
+            else self.parent._defense_2
         )
 
     def build_ui(self):
@@ -1339,7 +1336,7 @@ class MyShipsView(StatefulLayoutView):
         defense = self._own_defense_grid()
         fleet = _ship_status_line(ships=ships, sunk_ships=sunk)
 
-        in_setup = self.parent_view.phase == "setup"
+        in_setup = self.parent.phase == "setup"
         title = "## \N{SHIP} My Fleet (Setup)" if in_setup else "## \N{SHIP} My Fleet"
         prompt = (
             "Generate a new board layout, or close and hit **Ready**."
@@ -1394,7 +1391,7 @@ class MyShipsView(StatefulLayoutView):
         # Phase guard: re-roll is meaningless once the game has started or
         # the parent has been torn down. No awaits between this guard and
         # the defense-grid refresh below, so the window is closed.
-        if self.parent_view.is_finished() or self.parent_view.phase != "setup":
+        if self.parent.is_finished() or self.parent.phase != "setup":
             return
 
         new_ships = _place_ships(BOARD_SIZE, SHIPS)
@@ -1403,14 +1400,14 @@ class MyShipsView(StatefulLayoutView):
         for name, cells in new_ships.items():
             defense[cells] = SHIP_COLORS.get(name, "\N{WHITE LARGE SQUARE}")
 
-        self.parent_view._ready.discard(self.user_id)
+        self.parent._ready.discard(self.user_id)
 
         await self.dispatch(
             "BATTLESHIP_REROLL",
             {
                 "player_id": self.user_id,
                 "ships": new_ships,
-                "match_id": self.parent_view._match_key,
+                "match_id": self.parent._match_key,
             },
         )
 
@@ -1556,7 +1553,7 @@ class BattleshipExample(commands.Cog, name="v2_battleship_example"):
                 wins = stats.get("wins", 0)
                 games = stats.get("games", 0)
                 forfeits = stats.get("forfeits", 0)
-                bar = progress_bar(wins, games or 1, width=6, show_percent=True).content
+                bar = render_progress(wins, games or 1, width=6, show_percent=True)
                 return f"{wins}W / {games}G \N{BULLET} {forfeits}F \N{BULLET} {bar}"
 
             def build_header(self, page):

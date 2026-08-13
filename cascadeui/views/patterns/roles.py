@@ -10,6 +10,7 @@ from discord.ui import ActionRow, Container, TextDisplay
 from ...components.base import DynamicPersistentButton
 from ...components.patterns.v2 import card, divider
 from ...components.types import EmojiInput
+from ...utils.hooks import await_maybe, is_async_callable
 from ...utils.responses import DISCORD_CALL_ERRORS, respond_safe
 from ...utils.strings import slugify
 from ..layout import StatefulLayoutView
@@ -163,6 +164,30 @@ class _BaseRolesMixin:
         """
         super().__init_subclass__(**kwargs)
 
+        # The card and its buttons compose inside the synchronous build_ui,
+        # which runs from __init__ and cannot await these. An async override
+        # is not loud there: the coroutine becomes the card's text or the
+        # button's label, the placement validator passes it (it skips
+        # non-string content by design), and the mistake surfaces at HTTP
+        # send as unserializable JSON naming neither hook nor class.
+        for name in (
+            "format_category_title",
+            "format_category_hint",
+            "format_button_label",
+            "format_button_style",
+            "format_button_emoji",
+        ):
+            hook = cls.__dict__.get(name)
+            if hook is not None and is_async_callable(hook):
+                raise TypeError(
+                    f"{cls.__name__}.{name} must be synchronous; the role card and "
+                    f"its buttons compose inside build_ui, which runs from __init__ "
+                    f"and cannot await it, so an async one reaches Discord as a "
+                    f"coroutine rather than text."
+                    f"\n  Fix: keep it a plain def. Resolve anything that needs "
+                    f"awaiting in on_load and read the result here."
+                )
+
         own_categories = cls.__dict__.get("categories")
         if not own_categories:
             # Intermediate mixin subclasses (RolesLayoutView itself,
@@ -305,9 +330,11 @@ class _BaseRolesMixin:
         member = interaction.user
         role = guild.get_role(role_id)
         if role is None:
-            await cls.on_role_error(
-                interaction,
-                f"Role with ID {role_id} not found in this server.",
+            await await_maybe(
+                cls.on_role_error(
+                    interaction,
+                    f"Role with ID {role_id} not found in this server.",
+                )
             )
             return
 
@@ -320,11 +347,13 @@ class _BaseRolesMixin:
                 if category.required:
                     current_in_category = [r for r in member.roles if r.id in category_role_ids]
                     if len(current_in_category) <= 1:
-                        await cls.on_role_required_block(interaction, member, role, category)
+                        await await_maybe(
+                            cls.on_role_required_block(interaction, member, role, category)
+                        )
                         return
 
                 await member.remove_roles(role, reason="Role panel toggle")
-                await cls.on_role_removed(interaction, member, role, category)
+                await await_maybe(cls.on_role_removed(interaction, member, role, category))
             else:
                 # Assignment path
                 roles_removed: List[discord.Role] = []
@@ -338,14 +367,16 @@ class _BaseRolesMixin:
                 await member.add_roles(role, reason="Role panel toggle")
 
                 if roles_removed:
-                    await cls.on_role_swap(interaction, member, role, roles_removed, category)
+                    await await_maybe(
+                        cls.on_role_swap(interaction, member, role, roles_removed, category)
+                    )
                 else:
-                    await cls.on_role_assigned(interaction, member, role, category)
+                    await await_maybe(cls.on_role_assigned(interaction, member, role, category))
         except discord.Forbidden as exc:
             logger.warning(
                 f"Missing permission to toggle role {role.name!r} for " f"{member}: {exc}"
             )
-            await cls.on_role_error(interaction, exc)
+            await await_maybe(cls.on_role_error(interaction, exc))
         except DISCORD_CALL_ERRORS as exc:
             # RateLimited and aiohttp's transport errors are siblings of
             # HTTPException, so they need naming or they bypass the
@@ -353,7 +384,7 @@ class _BaseRolesMixin:
             # _scheduled_task beneath it, so an escape here reaches the user as
             # a bare "interaction failed" rather than the hook.
             logger.warning(f"HTTP error toggling role {role.name!r}: {exc}")
-            await cls.on_role_error(interaction, exc)
+            await await_maybe(cls.on_role_error(interaction, exc))
 
     # === Event hooks (classmethods; override for custom behavior) ===
 

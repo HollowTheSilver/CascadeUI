@@ -27,7 +27,7 @@ from typing import Any, AsyncIterator, ClassVar, Optional
 import aiosqlite  # hard import -- backends/__init__.py catches ImportError
 
 from ..protocols import Capability
-from ..schema import ALL_DDL, TABLE_KV, TABLE_SCHEMA_META
+from ..schema import ALL_DDL, TABLE_KV, TABLE_SCHEMA_META, apply_table_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -94,11 +94,23 @@ class SQLiteBackend:
 
     placeholder_style: ClassVar[str] = "qmark"
 
-    def __init__(self, db_path: str = "cascadeui.db") -> None:
+    def __init__(self, db_path: str = "cascadeui.db", *, table_prefix: str = "") -> None:
         self.db_path = db_path
+        self.table_prefix = table_prefix
         self._conn: aiosqlite.Connection | None = None
         self._write_lock = asyncio.Lock()
         self._txn_depth: int = 0
+
+    def _table(self, name: str) -> str:
+        """Quote ``name`` under this backend's table prefix.
+
+        Every table this backend reads or writes resolves here, including the
+        namespace a row operation is given, since a namespace names its own
+        table. The default names all carry the ``cascadeui_`` prefix; the
+        ``table_prefix`` kwarg keeps two CascadeUI deployments sharing one
+        database apart.
+        """
+        return _quote_ident(f"{self.table_prefix}{name}")
 
     # // ========================================( Lifecycle )======================================== // #
 
@@ -141,7 +153,7 @@ class SQLiteBackend:
         await conn.execute("PRAGMA busy_timeout=5000")
 
         for stmt in ALL_DDL:
-            await conn.execute(stmt)
+            await conn.execute(apply_table_prefix(stmt, self.table_prefix))
         await conn.commit()
 
         self._conn = conn
@@ -174,7 +186,7 @@ class SQLiteBackend:
 
     async def kv_read(self, namespace: str, key: str) -> bytes | None:
         db = self._db()
-        table = _quote_ident(TABLE_KV)
+        table = self._table(TABLE_KV)
         cursor = await db.execute(
             f"SELECT value FROM {table} WHERE namespace = ? AND key = ?",
             (namespace, key),
@@ -185,7 +197,7 @@ class SQLiteBackend:
 
     async def kv_write(self, namespace: str, key: str, value: bytes) -> None:
         db = self._db()
-        table = _quote_ident(TABLE_KV)
+        table = self._table(TABLE_KV)
         async with self._write_lock:
             await db.execute(
                 f"""
@@ -199,7 +211,7 @@ class SQLiteBackend:
 
     async def kv_delete(self, namespace: str, key: str) -> None:
         db = self._db()
-        table = _quote_ident(TABLE_KV)
+        table = self._table(TABLE_KV)
         async with self._write_lock:
             await db.execute(
                 f"DELETE FROM {table} WHERE namespace = ? AND key = ?",
@@ -209,7 +221,7 @@ class SQLiteBackend:
 
     async def kv_scan(self, namespace: str, prefix: str = "") -> AsyncIterator[tuple[str, bytes]]:
         db = self._db()
-        table = _quote_ident(TABLE_KV)
+        table = self._table(TABLE_KV)
         if prefix:
             # LIKE with ESCAPE so a caller-supplied prefix containing %
             # or _ is treated literally. Paired with _escape_like above.
@@ -245,7 +257,7 @@ class SQLiteBackend:
         every column is a key column the conflict is a DO NOTHING -- the row
         already exists with identical values.
         """
-        table = _quote_ident(namespace)
+        table = self._table(namespace)
         placeholders = ", ".join("?" for _ in cols)
         col_list = ", ".join(_quote_ident(c) for c in cols)
 
@@ -325,7 +337,7 @@ class SQLiteBackend:
         where: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         db = self._db()
-        table = _quote_ident(namespace)
+        table = self._table(namespace)
         if where:
             clause = " AND ".join(f"{_quote_ident(c)} = ?" for c in where.keys())
             sql = f"SELECT * FROM {table} WHERE {clause}"
@@ -351,7 +363,7 @@ class SQLiteBackend:
             raise ValueError("row_delete requires a non-empty where clause")
 
         db = self._db()
-        table = _quote_ident(namespace)
+        table = self._table(namespace)
         clause = " AND ".join(f"{_quote_ident(c)} = ?" for c in where.keys())
         sql = f"DELETE FROM {table} WHERE {clause}"
         async with self._write_lock:
@@ -371,7 +383,7 @@ class SQLiteBackend:
         # (never true), so rows without a timestamp are preserved. No
         # explicit null handling needed.
         db = self._db()
-        table = _quote_ident(namespace)
+        table = self._table(namespace)
         col = _quote_ident(column)
         sql = f"DELETE FROM {table} WHERE {col} < ?"
         async with self._write_lock:
@@ -385,7 +397,7 @@ class SQLiteBackend:
 
     async def get_schema_version(self, table: str) -> int:
         db = self._db()
-        meta = _quote_ident(TABLE_SCHEMA_META)
+        meta = self._table(TABLE_SCHEMA_META)
         cursor = await db.execute(
             f"SELECT schema_version FROM {meta} WHERE table_name = ?",
             (table,),
@@ -396,7 +408,7 @@ class SQLiteBackend:
 
     async def set_schema_version(self, table: str, version: int) -> None:
         db = self._db()
-        meta = _quote_ident(TABLE_SCHEMA_META)
+        meta = self._table(TABLE_SCHEMA_META)
         applied_at = int(time.time())
         async with self._write_lock:
             await db.execute(

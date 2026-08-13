@@ -1004,9 +1004,9 @@ class TestLeaderboardReload:
         build_calls = {"n": 0}
         original_build = view._build_leaderboard_pages
 
-        async def _counting_build():
+        async def _counting_build(entries=None):
             build_calls["n"] += 1
-            return await original_build()
+            return await original_build(entries)
 
         view._build_leaderboard_pages = _counting_build
 
@@ -1026,9 +1026,9 @@ class TestLeaderboardReload:
         build_calls = {"n": 0}
         original_build = view._build_leaderboard_pages
 
-        async def _counting_build():
+        async def _counting_build(entries=None):
             build_calls["n"] += 1
-            return await original_build()
+            return await original_build(entries)
 
         view._build_leaderboard_pages = _counting_build
 
@@ -1051,9 +1051,9 @@ class TestLeaderboardReload:
         build_calls = {"n": 0}
         original_build = view._build_leaderboard_pages
 
-        async def _counting_build():
+        async def _counting_build(entries=None):
             build_calls["n"] += 1
-            return await original_build()
+            return await original_build(entries)
 
         view._build_leaderboard_pages = _counting_build
 
@@ -1884,3 +1884,159 @@ class TestEmptyBoardKeepsItsMasthead:
         view = Board(interaction=_make_interaction())
         await view.on_load()
         validate_placement(view)
+
+
+# // ========================================( Hook Async Shapes )======================================== // #
+
+
+class TestHooksAcceptEitherShape:
+    """Overridable hooks resolve whether the override is sync or async.
+
+    The seams that run user code award them the shape the work needs: a
+    board reading a database writes ``async def``, a board reading memory
+    writes ``def``, and neither has to know which one the library expected.
+    """
+
+    ROWS = [(700000000000000000 + i, {"score": 100 - i}) for i in range(6)]
+
+    async def test_async_get_entries_resolves(self):
+        """The hook is documented for live data sources, and a live source
+        is the one thing a synchronous method cannot read."""
+
+        class Board(LeaderboardLayoutView):
+            async def get_entries(self):
+                return TestHooksAcceptEitherShape.ROWS
+
+        view = Board()
+        await view.rebuild_pages()
+        assert view.pages
+        assert len(view.ranked_entries) == len(TestHooksAcceptEitherShape.ROWS)
+
+    async def test_one_rebuild_reads_get_entries_once(self):
+        """rebuild_pages read the hook for the signature and the page build
+        read it again, which is two queries per rebuild once the hook does
+        real I/O, against a signature describing the first of the two."""
+        reads = {"n": 0}
+
+        class Board(LeaderboardLayoutView):
+            async def get_entries(self):
+                reads["n"] += 1
+                return TestHooksAcceptEitherShape.ROWS
+
+        view = Board()
+        await view.rebuild_pages()
+        assert reads["n"] == 1
+
+    async def test_sync_get_avatar_url_resolves(self):
+        """Sections mode gathered the hook's results directly, so an override
+        returning a plain string (no await needed) failed the gather with a
+        message naming neither the hook nor the class."""
+
+        class Board(LeaderboardLayoutView):
+            entry_layout = "sections"
+
+            def get_avatar_url(self, user_id, stats):
+                return f"https://cdn.example.invalid/{user_id}.png"
+
+        view = Board(entries=TestHooksAcceptEitherShape.ROWS)
+        pages = await view._build_leaderboard_pages()
+        assert pages
+
+    async def test_async_format_entry_resolves(self):
+        """Lines mode built its rows in a comprehension that never awaited."""
+
+        class Board(LeaderboardLayoutView):
+            async def format_entry(self, rank, user_id, stats):
+                return f"{rank}. scored {stats['score']}"
+
+        view = Board(entries=TestHooksAcceptEitherShape.ROWS)
+        pages = await view._build_leaderboard_pages()
+        assert "1. scored 100" in _page_text_from(pages)
+
+    async def test_every_named_frame_and_row_hook_accepts_async(self):
+        """Every frame and row hook resolves an async override in one build.
+
+        Each site awaits through its own `await_maybe(...)` call rather than
+        a shared helper, so one can regress without the others; all are
+        driven together.
+        """
+
+        class Board(LeaderboardLayoutView):
+            entry_layout = "sections"
+            leaderboard_per_page = 3
+
+            async def build_title(self, page):
+                return [TextDisplay("## async-title")]
+
+            async def build_header(self, page):
+                return "async-header"
+
+            async def build_footer(self, page):
+                return "async-footer"
+
+            async def format_primary(self, rank, user_id, stats):
+                return f"async-primary-{rank}"
+
+            async def format_secondary(self, rank, user_id, stats):
+                return "async-secondary"
+
+            async def get_avatar_url(self, user_id, stats):
+                return "https://cdn.example.invalid/a.png"
+
+        view = Board(entries=TestHooksAcceptEitherShape.ROWS)
+        text = _page_text_from(await view._build_leaderboard_pages())
+        for expected in (
+            "async-title",
+            "async-header",
+            "async-footer",
+            "async-primary-1",
+            "async-secondary",
+        ):
+            assert expected in text, f"{expected} missing -- that hook did not resolve"
+
+    async def test_empty_board_hook_accepts_async(self):
+        """on_leaderboard_empty renders on its own page, so it needs its
+        own drive: the populated build never reaches it."""
+
+        class Board(LeaderboardLayoutView):
+            async def on_leaderboard_empty(self):
+                return "async-empty"
+
+        view = Board(entries=[])
+        assert "async-empty" in _page_text_from(await view._build_leaderboard_pages())
+
+    def test_async_format_rank_is_refused_at_definition(self):
+        """format_rank composes inside the synchronous format_entry, which
+        cannot await it. An async one is not loud there (the coroutine
+        formats into the row and renders as its repr), so it is refused
+        where the mistake is still visible."""
+        with pytest.raises(TypeError, match="format_rank must be synchronous"):
+
+            class Board(LeaderboardLayoutView):
+                async def format_rank(self, rank):
+                    return f"#{rank}"
+
+
+def _page_text_from(pages) -> str:
+    """Every string rendered anywhere in a built page list.
+
+    Recurses, and reads Section accessories: a row's text sits two levels
+    below the page, so a one-level walk misses the row hooks entirely and
+    an assertion against it fails for the wrong reason.
+    """
+
+    def walk(node, out):
+        content = getattr(node, "content", None)
+        if isinstance(content, str):
+            out.append(content)
+        for child in getattr(node, "children", None) or []:
+            walk(child, out)
+        accessory = getattr(node, "accessory", None)
+        if accessory is not None:
+            walk(accessory, out)
+
+    collected: list = []
+    for page in pages:
+        for component in page:
+            walk(component, collected)
+    return " ".join(collected)
