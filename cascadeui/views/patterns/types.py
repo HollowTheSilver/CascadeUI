@@ -27,6 +27,8 @@ from typing import Any, Callable, Dict, FrozenSet, List, Optional
 
 import discord
 
+from ...utils.hooks import is_async_callable
+
 # // ========================================( FormField )======================================== // #
 
 
@@ -150,7 +152,7 @@ def _validate_step_callables(label: str, step: Dict[str, Any]) -> None:
                 f"{label}.{key} must be callable or absent, got {type(value).__name__}"
             )
     condition = step.get("condition")
-    if condition is not None and inspect.iscoroutinefunction(condition):
+    if condition is not None and is_async_callable(condition):
         raise TypeError(
             f"{label}.condition must be synchronous; load async data in the "
             f"view's on_load() and have the predicate read the result."
@@ -183,7 +185,7 @@ def _validate_step_values(label: str, name, builder, validator, condition) -> No
     # The visibility check reads the predicate's answer synchronously, so an
     # async one returns a coroutine, and a coroutine is truthy: the step
     # renders whatever the predicate would have said.
-    if condition is not None and inspect.iscoroutinefunction(condition):
+    if condition is not None and is_async_callable(condition):
         raise TypeError(
             f"{label}.condition must be synchronous (step name={name!r}); "
             f"load async data in the view's on_load() and have the predicate "

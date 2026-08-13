@@ -42,6 +42,10 @@ generates a button (V1) or `action_section()` (V2) that pushes to a
 target view class. The pattern eliminates the repetitive `go_*` callback
 methods that every hub view would otherwise need.
 
+<p align="center">
+  <img src="../../assets/patterns/menu.gif" alt="A settings menu drilling into Appearance to switch the theme to light, then into Notifications to toggle several options" width="520">
+</p>
+
 ### Category Definitions
 
 Categories are passed as a list of dicts to the `categories` constructor
@@ -204,6 +208,10 @@ Collect structured input through select menus, boolean toggles, and
 text fields (via modal). Text fields are grouped into a single
 `Modal` -- Discord limits modals to 5 text inputs, enforced at
 construction time.
+
+<p align="center">
+  <img src="../../assets/patterns/form.gif" alt="A form opening its modal, taking input, and re-rendering with the filled value" width="520">
+</p>
 
 ### Field Definitions
 
@@ -418,6 +426,10 @@ called `exit()`, `push()`, or `replace()`.
 
 Multi-step form with back/next navigation and per-step validation.
 
+<p align="center">
+  <img src="../../assets/patterns/wizard.gif" alt="A wizard advancing through steps, with the progress indicator tracking each one" width="520">
+</p>
+
 ### Step Definitions
 
 Steps are passed as a list of dicts to the `steps` constructor parameter:
@@ -511,7 +523,7 @@ Per-step values live on the view as they always have.
 | `finish_button_label` | `None` | Label on the last step's button. `None` renders "Finish" |
 | `finish_button_emoji` | `None` | Emoji on the Finish button |
 | `finish_button_style` | `success` | Style of the Finish button |
-| `step_indicator_label` | `None` | `Callable(current, total) -> str` for custom indicator |
+| `step_indicator_label` | `None` | `Callable(current, total) -> str` for custom indicator. Must be synchronous; an `async def` is refused at class definition. |
 | `show_progress_bar` | `True` | V2 only -- renders a progress header above the step content whenever more than one step is visible |
 
 The step indicator defaults to `"Step {n}/{total}"`. Pass a callable
@@ -623,6 +635,10 @@ async def on_finish(self, interaction):
 
 Tabbed interface with button-based tab switching.
 
+<p align="center">
+  <img src="../../assets/patterns/tabs.gif" alt="Tab buttons switching the panel below them while the row stays in place" width="520">
+</p>
+
 !!! tip "Tabs vs navigation vs `tab_nav`"
     Three tools cover "more than one view," and their use cases are distinct:
 
@@ -731,6 +747,10 @@ def _build_tab_rows(self, buttons):
 
 Navigate through multi-page content with built-in first/prev/next/last
 buttons.
+
+<p align="center">
+  <img src="../../assets/patterns/paginated.gif" alt="Paging forward and back, with the nav buttons enabling and disabling at the ends" width="520">
+</p>
 
 ### Page Data
 
@@ -1033,6 +1053,10 @@ plus cross-page rank numbering. Builds on top of `PaginatedLayoutView`, so
 every paginated feature (first/last buttons, go-to modal, jump
 threshold) is available.
 
+<p align="center">
+  <img src="../../assets/patterns/leaderboard.gif" alt="A ranked board paging between pages of entries" width="520">
+</p>
+
 When all entries fit on a single page, no navigation buttons render --
 the view behaves as a static card.
 
@@ -1070,9 +1094,9 @@ change (multi-line, different separator).
 
 | Hook | Purpose |
 |------|---------|
-| `get_entries()` | Data source. Default returns the constructor `entries=` kwarg. Override to read from `store.computed` or `StateStore.iter_scoped`. |
+| `get_entries()` | Data source. Default returns the constructor `entries=` kwarg. A synchronous override reads memory (`store.computed`, `StateStore.iter_scoped`, a cache of your own); `async def` is accepted for a source that must be awaited. |
 | `format_rank(rank)` | Rank column. Default returns a medal emoji for ranks 1-3 (gold, silver, bronze) and `**<rank>.**` for rank 4+. |
-| `format_name(user_id, stats)` | Name column. Default renders `<@user_id>`; rows carrying a `display_name` key render as an italic plain label instead. |
+| `format_name(user_id, stats)` | Name column. Default renders `<@user_id>`; rows carrying a `display_name` key render that value verbatim, so any markdown in it is yours to choose. |
 | `format_stats(user_id, stats)` | Inline stat column. Default returns `<W>W / <G>G`. Override to surface game-specific stats (MMR, win rate, streak). |
 | `format_accessory(user_id, stats)` | Optional right-side accessory appended to the row. Default returns `None` (omitted). |
 | `format_entry(rank, user_id, stats)` | Composes the four hooks above into one line. Override directly only when the row layout itself needs to change. |
@@ -1087,6 +1111,8 @@ change (multi-line, different separator).
 | `on_leaderboard_empty()` | Returns the V2 component list shown when `entries` is empty. Default wraps `leaderboard_empty_message` in a single card. The masthead composes above this return, so a board keeps its `banner` / `title` while empty and an override inherits it; `build_title` returning `[]` renders no masthead on that page. `ranked_entries` is empty here. `build_header` and `build_footer` run on this page too: header content renders above the masthead, footer content below the empty-state card, each in the order returned. |
 | `on_state_changed(state)` | Runs `rebuild_pages()` before the paginated refresh -- lets live-data subclasses re-fetch on every subscribed action. The rebuild short-circuits when the entries signature (user ids + stats) is unchanged, so identical re-fetches cost one comparison instead of a full page rebuild. |
 
+`format_rank`, `format_name`, `format_stats`, and `format_accessory` compose the row inside the synchronous `format_entry`, so they must be plain `def`s; an `async def` override is refused at class definition.
+
 **What `entries=` accepts.** A sequence of `(user_id, stats_dict)` pairs is
 the documented shape. Three other containers carrying the same data convert
 rather than being refused, and anything else raises `TypeError` naming the
@@ -1094,14 +1120,14 @@ class, the argument, and the offending index. See
 [the API reference](../api/views.md#leaderboardlayoutview-persistentleaderboardlayoutview) for the full list.
 
 ```python
-from cascadeui import LeaderboardLayoutView, progress_bar
+from cascadeui import LeaderboardLayoutView, render_progress
 
 
 class MmrBoard(LeaderboardLayoutView):
     def format_stats(self, user_id, stats):
         wins = stats["wins"]
         games = stats["games"]
-        bar = progress_bar(wins, games or 1, width=6, show_percent=True).content
+        bar = render_progress(wins, games or 1, width=6, show_percent=True)
         return f"`{stats['mmr']}` MMR \u2022 {wins}W / {games}G \u2022 {bar}"
 ```
 
@@ -1203,6 +1229,51 @@ avatar cache; a synthetic-id example row would schedule a resolve that never
 completes. This guide section is the reference for `avatar_backfill` -- the
 shipped examples use the eager per-row `get_avatar_url` instead.
 
+### Boards backed by a database
+
+`get_entries()` accepts an `async def` override, so a source that must be
+awaited is read directly:
+
+```python
+class GuildRankings(LeaderboardLayoutView):
+    async def get_entries(self):
+        rows = await self.pool.fetch(
+            "SELECT user_id, wins, losses FROM ranks WHERE guild_id = $1"
+            " ORDER BY wins DESC LIMIT 25",
+            self.guild_id,
+        )
+        return [(r["user_id"], {"wins": r["wins"], "losses": r["losses"]}) for r in rows]
+```
+
+One rebuild reads the hook once, and a rebuild runs on every store dispatch
+the view is notified for. Which dispatches those are is
+[`subscribed_actions`](../api/views.md#shared-class-attributes): unset or
+`set()` is none of them, a set of action names is those, and `None` is all of
+them. So a board that subscribes broadly re-queries its source on traffic that
+never touched its data. Where that matters, fetch at explicit seams instead:
+load in
+`on_load`, cache on an attribute of your own, and return the cache from a
+synchronous `get_entries()`.
+
+```python
+class GuildRankings(LeaderboardLayoutView):
+    async def on_load(self):
+        self._rows = await self.fetch_rankings()
+        await super().on_load()
+
+    def get_entries(self):
+        return getattr(self, "_rows", [])
+```
+
+[`reload()`](views.md#navigating-database-backed-views) is then the explicit
+re-fetch: it re-runs `on_load` and re-renders, serialized against itself and
+coalesced under `refresh_cooldown_ms`, so a burst collapses to one query.
+Call it from whatever writes the data. The cache is yours -- the view's own
+`_entries` holds the `entries=` constructor kwarg and is not a place to write.
+
+The trade is freshness for traffic: with the cache, a state dispatch re-renders
+what was last loaded rather than re-reading the source.
+
 ### Persistent variant
 
 `PersistentLeaderboardLayoutView` composes `_PersistentMixin` with
@@ -1253,6 +1324,10 @@ an ActionRow of role toggle buttons. Cardinality (at-most-one /
 at-least-one) is enforced automatically inside the pattern -- clicks
 apply role mutation via the Discord API and send an ephemeral
 response without any per-role callback boilerplate.
+
+<p align="center">
+  <img src="../../assets/patterns/roles.gif" alt="Role toggles flipping state as they are clicked" width="520">
+</p>
 
 Underneath, each role button is a `DynamicPersistentButton` subclass
 declared once at module import. Clicks route by `custom_id` template
@@ -1369,6 +1444,8 @@ to suppress the hint entirely. Per-category dynamic hints override
 | `on_role_swap(interaction, member, role_added, roles_removed, category)` | Called after an exclusive-mode swap. Default: reads `swap_message` with `{removed}` formatted as a comma-joined list of removed role names. |
 | `on_role_required_block(interaction, member, role, category)` | Called when a required-category last-role removal is rejected. Default: reads `required_message`. |
 | `on_role_error(interaction, error)` | Called on role mutation failure (`discord.Forbidden`, `discord.RateLimited`, `discord.HTTPException`, a transport failure, or role-not-found string). Default: reads `role_error_message`. |
+
+The five `format_*` hooks compose the role card inside the synchronous `build_ui`, so they must be plain `def`s; an `async def` override is refused at class definition. The `on_role_*` hooks respond after the role mutation and accept either `def` or `async def`.
 
 ### Tier 1 customization (class attributes)
 

@@ -10,6 +10,7 @@ from typing import Dict
 import discord
 
 from ..state.actions import ActionCreators
+from .base import _class_path
 from .layout import StatefulLayoutView
 from .view import StatefulView
 
@@ -19,9 +20,12 @@ logger = logging.getLogger(__name__)
 # // ========================================( Registry )======================================== // #
 
 
-# Maps fully-qualified class path (module.QualName) -> class for all PersistentView subclasses.
-# The qualified key prevents cross-module collisions when two unrelated cogs define a class
-# with the same bare name (e.g. ``TicketPanel`` in two different bots).
+# Maps the class session key (module.QualName, or a ``session_class_key`` pin
+# when set) -> class, for all PersistentView subclasses. Rows record the same
+# key in their ``view_class`` column, which is what lets a pinned class keep
+# reattaching after it moves. The qualified default prevents cross-module
+# collisions when two unrelated cogs define a class with the same bare name
+# (e.g. ``TicketPanel`` in two different bots).
 _persistent_view_classes: Dict[str, type] = {}
 
 
@@ -57,8 +61,29 @@ class _PersistentMixin:
 
     def __init_subclass__(cls, **kwargs):
         """Auto-register every concrete subclass so restore can find it by name."""
+        # Checked before super() runs, because super() registers the class in
+        # the view registry: a rejection that has already mutated a registry
+        # leaves the refused class resolvable by a later pop.
+        cls._validate_session_class_key()
+        key = cls._class_session_key()
+        existing = _persistent_view_classes.get(key)
+        # One slot per key, so two classes sharing a session_class_key means
+        # the second silently displaces the first and every row written by
+        # either reattaches as whichever was defined last. Refused here
+        # because there is no correct outcome to pick at restore time. A cog
+        # reload re-registers the same class path and is the intended
+        # overwrite, so the paths are what distinguish the two cases.
+        if existing is not None and _class_path(existing) != _class_path(cls):
+            raise ValueError(
+                f"{_class_path(cls)} and {_class_path(existing)} both resolve to the "
+                f"persistent class key {key!r}, so stored rows cannot say which class "
+                f"wrote them and would all reattach as one."
+                f"\n  Fix: give each class its own session_class_key. If one of them is "
+                f"the old definition of a class you moved, delete that one rather than "
+                f"changing the pin -- the pin has to keep matching what the rows hold."
+            )
         super().__init_subclass__(**kwargs)
-        _persistent_view_classes[cls._class_session_key()] = cls
+        _persistent_view_classes[key] = cls
 
     def __init__(self, *args, **kwargs):
         # Persistent views never time out

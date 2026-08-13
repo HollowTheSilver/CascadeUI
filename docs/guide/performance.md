@@ -443,6 +443,35 @@ wall becomes a risk only when the safety net is weakened
 (`auto_defer = False`, or `auto_defer_delay` raised toward 3s) *and* the
 render is slow.
 
+### Watching the safety net
+
+The net reports the two outcomes worth acting on, so a slow surface is
+visible before it starts failing:
+
+```
+INFO     Auto-defer backstop acked for FleetPanel after the handler used its
+         full 2.50s budget: 2.61s since interaction creation by local clock
+WARNING  Auto-defer ack missed the 3s deadline in FleetPanel: 3.42s since
+         interaction creation by local clock (event-loop congestion, slow
+         pre-callback work, or a rate-limit wait inside an earlier HTTP call)
+```
+
+The INFO line is the one to watch for. It means the handler spent its
+entire budget without answering and the net caught it, so the click still
+worked and nobody complained. A surface that logs it under load is the
+same surface that logs the WARNING once the loop gets busier. The
+WARNING means Discord already dropped the interaction and the user saw
+"This interaction failed".
+
+The window both lines measure opens before the access checks and before
+any `serialize_interactions` lock wait, not just around your callback, so
+the elapsed time covers queueing behind another click as well as the work
+itself. Nothing is timed on the healthy path: a callback that answers in
+time cancels the timer mid-sleep and no measurement is taken.
+
+Neither line is a substitute for the profiler above. They price the ack
+window; `enable_perf()` prices the dispatch and the render that follow.
+
 ### Pacing a Panel vs. Guarding a Button
 
 Two throttles exist and they solve different problems. Reaching for the

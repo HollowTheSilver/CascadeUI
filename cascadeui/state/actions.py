@@ -147,7 +147,7 @@ class ActionCreators:
         """Create an APPLICATION_SLOTS_PRUNED action payload.
 
         Fires after the persistence manager deletes expired rows from the
-        application_slots namespace. ``deleted`` is the row count removed;
+        cascadeui_application_slots namespace. ``deleted`` is the row count removed;
         ``cutoff`` is the ``expires_at`` threshold used (epoch seconds) or
         ``None`` if prune was manual.
         """
@@ -160,7 +160,7 @@ class ActionCreators:
         """Create a REGISTRY_PRUNED action payload.
 
         Fires after the persistence manager deletes rows from the
-        persistent_views namespace. ``deleted`` is the row count removed,
+        cascadeui_persistent_views namespace. ``deleted`` is the row count removed,
         ``keys`` is the list of ``persistence_key`` values actually pruned (so
         a subscriber can reconcile its own records surgically), and ``reason``
         is a short tag (``"explicit"`` for a targeted prune, ``"clear_all"``

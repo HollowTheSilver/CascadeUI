@@ -9,7 +9,7 @@ from .config import (
     SlotPolicy,
 )
 from .manager import PersistenceManager
-from .migrations import register_kwargs_migrator, register_migrator
+from .migrations import physical_table, register_kwargs_migrator, register_migrator
 from .protocols import Capability, PersistenceBackend, Transaction
 
 __all__ = [
@@ -22,6 +22,7 @@ __all__ = [
     "ApplicationPersistence",
     "SlotPolicy",
     "register_kwargs_migrator",
+    "physical_table",
     "register_migrator",
 ]
 

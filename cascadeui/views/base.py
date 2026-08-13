@@ -93,13 +93,24 @@ _NON_RECONSTRUCTIBLE_KWARGS = frozenset(
 _CLOUDFLARE_BAN_BACKOFF = 60.0
 
 
+def _class_path(cls) -> str:
+    """Return the import path (``module.QualName``) that identifies a class.
+
+    The key `_view_class_registry` is built on, and the value navigation
+    entries record so `pop()` can resolve them. Distinct from
+    `_class_session_key()`, which names a session *family* and may be shared
+    by two classes: anything reconstructing a specific class reads this.
+    """
+    return f"{cls.__module__}.{cls.__qualname__}"
+
+
 def _register_view_class(cls):
     """Auto-register view classes for nav stack class resolution.
 
     Keyed by the fully-qualified class path so sibling modules can reuse
     short class names without clobbering each other in the registry.
     """
-    _view_class_registry[f"{cls.__module__}.{cls.__qualname__}"] = cls
+    _view_class_registry[_class_path(cls)] = cls
 
 
 # // ========================================( Render Outcome )======================================== // #
@@ -279,6 +290,22 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
     @property
     def participants(self) -> frozenset:
         return frozenset(self._participants)
+
+    @property
+    def parent(self):
+        """The view this one is attached to, or ``None``.
+
+        Read-only. A child constructed with ``parent=`` reads it before the
+        send that attaches it, and every child reads it after. Reach for this
+        rather than storing the same view a second time under a name of your
+        own: a child panel that needs its parent to read state or call
+        ``respond`` already has it here.
+
+        Mutation goes through ``attach_child`` on the parent, which enforces
+        the invariants a plain assignment cannot (no self-attachment, no
+        cycles, clean re-parenting).
+        """
+        return self._attached_to or self._pending_parent
 
     # Subclass config: auto-defer safety net
     auto_defer: bool = True
@@ -782,8 +809,13 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
-        _register_view_class(cls)
+        # Validated before the class is registered anywhere, so a definition
+        # that is going to be refused is never left resolvable by a later
+        # lookup. Subclass hooks further down the chain read the pin to key
+        # their own registries, which is why its shape is settled first.
+        cls._validate_session_class_key()
         cls._validate_class_attributes()
+        _register_view_class(cls)
 
         # A selector runs inline inside dispatch, where nothing can await it.
         # An async override is therefore never resolved: the store compares
@@ -944,25 +976,57 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             cls.on_load = _themed_on_load
 
     @classmethod
+    def _validate_session_class_key(cls) -> None:
+        """Settle the pin's shape before anything keys a registry on it.
+
+        A non-string reaches the backend as the ``view_class`` column, where
+        SQLite's TEXT affinity stores an int as its digits and the lookup
+        then misses forever, and asyncpg refuses the bind outright. An empty
+        string is worse than wrong: the truthiness read in
+        ``_class_session_key`` falls back to the class path, so the attribute
+        is set and never applied.
+
+        Called from ``__init_subclass__`` for every view, and again by the
+        persistent registration before it uses the pin as a dict key,
+        where an unhashable value would otherwise raise from inside the
+        lookup naming neither the attribute nor the fix.
+        """
+        if "session_class_key" not in cls.__dict__:
+            return
+        pin = cls.__dict__["session_class_key"]
+        if not isinstance(pin, str) or not pin:
+            raise ValueError(
+                f"{cls.__name__}.session_class_key must be a non-empty string "
+                f"naming the class identity to pin; got {pin!r}."
+                f"\n  Fix: use the class path its stored rows already hold, "
+                f'e.g. session_class_key = "mybot.views.TicketPanel".'
+            )
+
+    @classmethod
     def _class_session_key(cls) -> str:
-        """Collision-free identifier for this view class.
+        """Identifier for this view class's session family.
 
-        Returns the fully-qualified class path (``module.QualName``) by
-        default, which the Python import system guarantees unique across
-        a running process. Used as the internal discriminator for session
-        IDs, the instance index, the nav-stack class registry, and session
-        origin tracking.
+        Returns the class path (``module.QualName``) by default, which the
+        Python import system guarantees unique across a running process.
+        Discriminates session IDs, the instance index, session origin
+        tracking, and the ``view_class`` column persistent registry rows
+        store. Navigation entries record `_class_path` instead: `pop()`
+        reconstructs the exact class that pushed, and a family may hold two.
 
-        Subclasses may set a ``session_class_key`` class attribute to
-        override the default, but should only do so to intentionally
-        unify two distinct classes into one session family (rare). The
-        override is read via ``cls.__dict__`` so it does not inherit  --
-        each class opts in for itself.
+        Subclasses set a ``session_class_key`` class attribute to override
+        it. The load-bearing use is a persistent view whose class moves or
+        is renamed: stored rows resolve only against the name they recorded,
+        so pinning the old one is what keeps those panels reattaching. It
+        can also unify two classes into one session family, which is rare
+        and never safe for persistent classes -- they share one registry
+        slot, so rows reattach to whichever class was defined last. The
+        override is read via ``cls.__dict__`` so it does not inherit: each
+        class opts in for itself.
         """
         override = cls.__dict__.get("session_class_key")
         if override:
             return override
-        return f"{cls.__module__}.{cls.__qualname__}"
+        return _class_path(cls)
 
     def __init__(self, *args, **kwargs):
         # Extract custom arguments before passing to View/LayoutView
@@ -1484,6 +1548,10 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         self.task_manager.cancel_tasks(self.id)
         self.state_store._unsubscribe(self.id)
         self.state_store._undo_enabled_views.pop(self.id, None)
+        # The attach never happened: it is the last stage of a successful
+        # send. Left set, `parent` would name a view that does not track
+        # this one and will not tear it down.
+        self._pending_parent = None
         if registered:
             await self.state_store._destroy_view(self.id, source_id=self.id)
 
@@ -2446,6 +2514,13 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         with the latest store state after completing, capturing both
         changes in a single rebuild + edit cycle.
 
+        Notifications that reach a finished view are dropped outright. The
+        cross-view fan-out is fire-and-forget, so a task created ahead of a
+        teardown can run after ``exit()`` completes; rebuilding then renders
+        into a view that is no longer interactive, and reads attributes the
+        teardown already cleared (an exited child's parent link, for
+        example).
+
         Once the ephemeral refresh button has been armed, subsequent
         notifications are dropped: the view is intentionally frozen on the
         refresh button so it stays clickable inside the 90-second
@@ -2454,6 +2529,9 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         interaction token expires.
         """
         logger.debug(f"View '{self.id}' received state update for action '{action['type']}'")
+
+        if self.is_finished():
+            return
 
         if self._refresh_armed:
             return
@@ -2936,7 +3014,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     f"got {type(rebuild).__name__}. Fix: pass the bound method itself, "
                     f"as in rebuild=self.build_ui."
                 )
-            if inspect.iscoroutinefunction(rebuild):
+            if is_async_callable(rebuild):
                 # The restore runs at the exit of a synchronous context
                 # manager, which has no way to await. Rejecting here names the
                 # problem at the call; returning an un-awaited coroutine would

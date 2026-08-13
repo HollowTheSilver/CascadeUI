@@ -148,7 +148,7 @@ from cascadeui.persistence import InMemoryBackend
 backend = InMemoryBackend()
 ```
 
-### `SQLiteBackend(db_path="cascadeui.db")`
+### `SQLiteBackend(db_path="cascadeui.db", *, table_prefix="")`
 
 Requires `pip install pycascadeui[sqlite]`. Declares all five capabilities (including `RAW_SQL`). Uses WAL mode and prepared statements, with `synchronous=NORMAL` and a 5-second busy timeout applied as connection PRAGMAs.
 
@@ -158,9 +158,9 @@ from cascadeui.persistence import SQLiteBackend
 backend = SQLiteBackend("cascadeui.db")
 ```
 
-Importable from `cascadeui.persistence` only when `aiosqlite` is installed; the import is optional and silent otherwise.
+Importable from `cascadeui.persistence` only when `aiosqlite` is installed; the import is optional and silent otherwise. `table_prefix` moves every table and index the backend creates and queries under the prefix, which keeps two CascadeUI deployments sharing one database apart -- see [the table set](../guide/persistence.md#the-tables-a-sql-backend-creates).
 
-### `PostgresBackend(dsn, *, pool_kwargs=None)`
+### `PostgresBackend(dsn, *, pool_kwargs=None, table_prefix="")`
 
 Requires `pip install pycascadeui[postgres]`. Declares all five capabilities (including `RAW_SQL`). Backed by an `asyncpg` connection pool with JSONB storage, and adds `LISTEN`/`NOTIFY` for cross-process scoped-state invalidation: the right choice for a multi-process deployment.
 
@@ -170,7 +170,7 @@ from cascadeui.persistence import PostgresBackend
 backend = PostgresBackend("postgresql://user:pass@host/db?sslmode=verify-full")
 ```
 
-Importable from `cascadeui.persistence` only when `asyncpg` is installed; the import is optional and silent otherwise. `dsn` takes the standard libpq URL; `pool_kwargs` forwards extra arguments to the `asyncpg` pool.
+Importable from `cascadeui.persistence` only when `asyncpg` is installed; the import is optional and silent otherwise. `dsn` takes the standard libpq URL; `pool_kwargs` forwards extra arguments to the `asyncpg` pool. `table_prefix` behaves as on `SQLiteBackend`.
 
 ---
 

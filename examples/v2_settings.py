@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 #
 # Dispatching ``SETTINGS_UPDATED`` from either the V1 or V2 cog updates
 # both panels live if both are open simultaneously -- they share the same
-# scope bucket via ``"user_guild"``.
+# ``"user"`` scope bucket for the theme, notification, and locale keys.
 @cascade_reducer("SETTINGS_UPDATED")
 async def settings_reducer(action, state):
     """Merge settings changes into the user's scoped state.
@@ -274,6 +274,11 @@ class V2SettingsHubView(MenuLayoutView):
                     message="This will restore every preference to its default value.",
                     confirm_label="Reset",
                     cancel_label="Keep",
+                    # The defaults suit a Yes/No confirm (green yes, red no).
+                    # This one destroys data, so the destructive choice carries
+                    # the warning colour and the safe one stays neutral.
+                    confirm_style=discord.ButtonStyle.danger,
+                    cancel_style=discord.ButtonStyle.secondary,
                     confirmed_message="Settings reset to defaults.",
                     cancelled_message="Reset cancelled.",
                 ),

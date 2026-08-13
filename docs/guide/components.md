@@ -533,7 +533,7 @@ discord.py components.
 ### `card(*children, color=None, spoiler=False)`
 
 Creates a `Container`. Strings are auto-wrapped in `TextDisplay`. Pass
-`spoiler=True` to hide the whole container behind a spoiler overlay:
+`spoiler=True` to hide the whole container behind a spoiler overlay.
 
 Raises `ValueError` when a child is a `Container`. Discord forbids a Container inside a Container, so `card(heading, alert(...))` is never legal -- place the alert as a sibling of the card. `alert()`, `card()` and `stats_card()` are the builders that produce one.
 
@@ -550,6 +550,10 @@ self.add_item(card(
 ))
 ```
 
+<p align="center">
+  <img src="../../assets/surfaces/card.png" alt="A card with a heading, body text, and an accent stripe" width="460">
+</p>
+
 ### `key_value(data)`
 
 Converts a dict to a formatted `TextDisplay`:
@@ -560,6 +564,10 @@ from cascadeui import key_value
 self.add_item(key_value({"Status": "Online", "Users": "42"}))
 # Renders: **Status:** Online\n**Users:** 42
 ```
+
+<p align="center">
+  <img src="../../assets/surfaces/key_value.png" alt="A key-value block rendering three labeled rows" width="460">
+</p>
 
 ### `action_section(text, *, label, callback, ...)`
 
@@ -575,6 +583,10 @@ self.add_item(action_section(
 ))
 ```
 
+<p align="center">
+  <img src="../../assets/surfaces/action_section.png" alt="A section with text on the left and a button accessory on the right" width="460">
+</p>
+
 ### `toggle_section(text, *, active, callback, labels=("Enabled", "Disabled"), ...)`
 
 A `Section` with a green/red toggle button. `labels` sets the (active, inactive)
@@ -585,16 +597,26 @@ Pass `disabled=True` to render the button greyed out and non-interactive:
 from cascadeui import toggle_section
 
 self.add_item(toggle_section(
-    "**Dark Mode**\nEnable dark theme",
-    active=self.dark_mode, callback=self.toggle_dark,
+    "Notifications",
+    active=self.notify, callback=self.toggle_notify,
 ))
 ```
+
+One section, shown in both states:
+
+<p align="center">
+  <img src="../../assets/surfaces/toggle_section.png" alt="A section reading Notifications with a green Enabled button, and the same section with a red Disabled one" width="380">
+</p>
 
 ### `image_section(text, *more_text, url, description=None, spoiler=False)`
 
 A `Section` with a `Thumbnail` image. `url` accepts a [`MediaInput`](../api/components.md#mediainput). `description` sets the thumbnail's alt text (up to
 256 chars); `spoiler=True` hides it behind a spoiler. See
 [Local file attachments](#local-file-attachments).
+
+<p align="center">
+  <img src="../../assets/surfaces/image_section.png" alt="A section with text beside a thumbnail accessory" width="460">
+</p>
 
 ### `link_section(text, *, label, url, emoji=None, disabled=False)`
 
@@ -612,6 +634,10 @@ self.add_item(link_section(
     url="https://hollowthesilver.github.io/CascadeUI/",
 ))
 ```
+
+<p align="center">
+  <img src="../../assets/surfaces/link_section.png" alt="A section whose accessory is a link button" width="460">
+</p>
 
 !!! note "One accessory per Section -- a row cannot carry both a button and an image"
     Discord gives a Section a single `accessory` slot, so text with a thumbnail
@@ -648,28 +674,34 @@ run the supplied callbacks:
 from cascadeui import card, confirm_section
 
 self.add_item(card(
-    "## Delete Server Data",
+    "## Confirm Section",
     *confirm_section(
-        "This cannot be undone.",
+        "Delete this panel?",
         on_confirm=self._do_delete,
         on_cancel=self._do_cancel,
-        confirm_label="Delete",
-        confirm_style=discord.ButtonStyle.danger,
-        cancel_style=discord.ButtonStyle.secondary,
     ),
-    color=discord.Color.red(),
 ))
 ```
 
+<p align="center">
+  <img src="../../assets/surfaces/confirm_section.png" alt="A green Confirm and a red Cancel button beneath the prompt Delete this panel?" width="460">
+</p>
+
 Defaults: confirm is green with a check emoji, cancel is red with a cross
-emoji, which suits a constructive prompt. A destructive one wants the
-opposite, as above, or the button that deletes renders green beside a red
-one that does nothing. Override any of `confirm_label`, `cancel_label`,
-`confirm_emoji`, `cancel_emoji`, `confirm_style`, `cancel_style`.
+emoji, which suits a constructive prompt. A destructive one like the delete
+above wants the styles swapped (`confirm_style=discord.ButtonStyle.danger`,
+`cancel_style=discord.ButtonStyle.secondary`), or the button that deletes
+renders green beside a red one that does nothing. Override any of
+`confirm_label`, `cancel_label`, `confirm_emoji`, `cancel_emoji`,
+`confirm_style`, `cancel_style` when the defaults read wrong for the action.
 
 ### `alert(message, *, level="info")`
 
 A colored status container:
+
+<p align="center">
+  <img src="../../assets/surfaces/alert.png" alt="Alerts at the success, warning, error, and info levels" width="460">
+</p>
 
 | Level | Color |
 |-------|-------|
@@ -691,12 +723,14 @@ back blank degrades to a bare stats card:
 from cascadeui import stats_card
 
 self.add_item(stats_card(
-    "Server Overview",
-    {"Members": 42, "Channels": 12, "Roles": 5},
-    color=discord.Color.green(),
-    footer="Updated just now",
+    "Season Stats",
+    {"Wins": 24, "Losses": 7, "Streak": "5W"},
 ))
 ```
+
+<p align="center">
+  <img src="../../assets/surfaces/stats_card.png" alt="A card headed Season Stats over three labeled figures: Wins 24, Losses 7, Streak 5W" width="460">
+</p>
 
 When `color` is omitted, the active theme's `accent_colour` is used
 automatically inside a view's `build_ui()`.
@@ -714,19 +748,49 @@ from cascadeui import progress_bar
 self.add_item(progress_bar(7, 10, width=10))  # [███████░░░] 70%
 ```
 
+The same bar at three values:
+
+<p align="center">
+  <img src="../../assets/surfaces/progress_bar.png" alt="The same progress bar at 30, 70, and 100 percent" width="460">
+</p>
+
 Override `filled` / `empty` for alternative glyphs, or set
 `show_percent=False` to drop the trailing percentage.
+
+When the bar belongs inside text rather than beside it, reach for
+`render_progress`, which returns the same bar as a string:
+
+```python
+from cascadeui import render_progress
+
+def format_secondary(self, rank, user_id, stats):
+    bar = render_progress(stats["wins"], stats["games"] or 1, width=6)
+    return f"{stats['mmr']} MMR  {bar}"
+```
+
+`progress_bar` builds its `TextDisplay` from this, so a bar inlined in a row
+and a bar standing on its own always render identically. Both clamp `value`
+to `[0, max_value]` and hold the bar to `width` cells, which a hand-rolled
+`"█" * count` does not.
 
 ### `divider()` and `gap(large=False)`
 
 `divider()` creates a thin line separator. `gap()` creates spacing without a
 visible line.
 
+<p align="center">
+  <img src="../../assets/surfaces/divider_gap.png" alt="A divider and a gap separating three lines of text" width="460">
+</p>
+
 ### `gallery(*media, descriptions=None, spoilers=None)`
 
 A `MediaGallery` from one or more image references. Each reference is
 a [`MediaInput`](../api/components.md#mediainput). See
 [Local file attachments](#local-file-attachments) for the send-time pairing.
+
+<p align="center">
+  <img src="../../assets/surfaces/gallery.png" alt="A media gallery of three images" width="460">
+</p>
 
 ### `file_attachment(url, *, spoiler=False)`
 
@@ -766,6 +830,10 @@ self.add_item(button_row(
 ))
 ```
 
+<p align="center">
+  <img src="../../assets/surfaces/button_row.png" alt="A row of three independent action buttons" width="460">
+</p>
+
 Raises `ValueError` if the mapping is empty or exceeds Discord's
 5-buttons-per-row limit. For per-button customization, build the `ActionRow`
 by hand.
@@ -792,11 +860,16 @@ self.add_item(choice_row(
 ```
 
 When the option count outgrows a button row (more than `button_threshold`,
-default 5), `choice_row` renders a dropdown instead -- up to Discord's
-25-option select limit (exported as `MAX_SELECT_OPTIONS`), past which it
-raises. Discord requires select option values to be strings; the builder maps
-to and from that form, so `on_select` always receives the real Python value,
-never a stringified index.
+default 5), `choice_row` renders a dropdown instead:
+
+<p align="center">
+  <img src="../../assets/surfaces/choice_row.png" alt="Three options rendered as a button row with Normal highlighted, and six options rendered as a dropdown" width="520">
+</p>
+
+The dropdown runs up to Discord's 25-option select limit (exported as
+`MAX_SELECT_OPTIONS`), past which `choice_row` raises. Discord requires select
+option values to be strings; the builder maps to and from that form, so
+`on_select` always receives the real Python value, never a stringified index.
 
 Set `multi=True` to let several options be active at once. `selected` is
 then read as a collection of active values rather than one, the buttons
@@ -835,17 +908,23 @@ advances to the next value (wrapping) and updates the label before the
 ```python
 from cascadeui import cycle_button
 
-async def _preset_changed(interaction, value):
-    self.preset = value
+async def _range_changed(interaction, value):
+    self.report_range = value
     self.build_ui()
     await self.refresh()
 
 self.add_item(ActionRow(cycle_button(
-    values=["Low", "Medium", "High"],
-    on_change=self._preset_changed,
-    emoji="⚙️",
+    values=["Daily", "Weekly", "Monthly"],
+    on_change=_range_changed,
 )))
 ```
+
+One button, shown here at each position in that cycle so the label change is
+visible:
+
+<p align="center">
+  <img src="../../assets/surfaces/cycle_button.png" alt="The same cycle button at three positions, reading Daily, then Weekly, then Monthly, with the card body tracking each" width="380">
+</p>
 
 The callback receives the *new* value (post-advance). Optional `labels=`
 customizes the display strings, `start=` picks the initial index.
@@ -859,17 +938,23 @@ Use `toggle_button` when the button stands alone in an `ActionRow`:
 ```python
 from cascadeui import toggle_button
 
-async def _dark_mode(interaction, active):
-    self.dark = active
+async def _notifications(interaction, active):
+    self.notify = active
     self.build_ui()
     await self.refresh()
 
 self.add_item(ActionRow(toggle_button(
-    active=self.dark,
-    on_toggle=_dark_mode,
-    labels=("Dark", "Light"),
+    active=self.notify,
+    on_toggle=_notifications,
 )))
 ```
+
+The default `labels` are `("Enabled", "Disabled")`, green when active and red
+when not. Both states, side by side:
+
+<p align="center">
+  <img src="../../assets/surfaces/toggle_button.png" alt="A green Enabled button beside a red Disabled one" width="300">
+</p>
 
 The button flips its own state (`button._toggle_active`) and calls
 `on_toggle(interaction, new_state)` with the post-flip value. Style and
@@ -887,13 +972,20 @@ from cascadeui import tab_nav
 
 self.add_item(tab_nav(
     {
-        "Stats": self._show_stats,
+        "Overview": self._show_overview,
+        "Members": self._show_members,
         "Settings": self._show_settings,
-        "Help": self._show_help,
     },
-    active="Stats",
+    active="Overview",
 ))
 ```
+
+`tab_nav` returns the row alone. The panel below it is whatever the active
+callback renders, which is the part your view owns:
+
+<p align="center">
+  <img src="../../assets/surfaces/tab_nav.png" alt="A row of three tab buttons with Overview highlighted, above the card that tab renders" width="420">
+</p>
 
 The tab matching `active` renders with `active_style` (primary by default);
 all others render with `inactive_style` (secondary). If `active` is
@@ -1288,11 +1380,22 @@ content on every mutation:
 ```python
 from cascadeui import emoji_grid
 
-grid = emoji_grid(10, 10, fill="🟦", row_labels="alpha", col_labels="numeric")
-grid[(2, 3)] = "🔥"       # Set single cell
-grid.fill_rect((0, 0), (2, 2), "⬜")  # Fill rectangle
-grid.clear()               # Reset all cells to fill
+grid = emoji_grid(3, 3, fill="⬜", row_labels="numeric", col_labels="alpha")
+grid[(0, 1)] = "❌"                    # Set a single cell
+grid[(1, 1)] = "⭕"
+grid.fill_rect((2, 2), (2, 2), "❌")   # Fill a rectangle
+grid.clear()                           # Reset every cell back to fill
 ```
+
+The grid after the three writes, before the `clear()`:
+
+<p align="center">
+  <img src="../../assets/surfaces/emoji_grid.png" alt="A three-by-three grid with A B C column labels and 1 2 3 row labels, carrying two crosses and a nought" width="460">
+</p>
+
+The grid scales to any size Discord's 4000-character text limit allows, which
+`emoji_grid` checks at construction. `v2_battleship.py` renders two ten-by-ten
+fleets this way.
 
 #### Retained Mode vs Immediate Mode
 
@@ -1364,6 +1467,10 @@ rows = button_grid(3, 3, lambda r, c: StatefulButton(
 for row in rows:
     self.add_item(row)
 ```
+
+<p align="center">
+  <img src="../../assets/surfaces/button_grid.png" alt="A three-by-three grid of buttons" width="460">
+</p>
 
 Discord caps at 5 rows × 5 buttons. Both dimensions must be 1-5.
 
@@ -1454,6 +1561,10 @@ class TaskListView(StatefulLayoutView):
         self.add_item(card("## Tasks", *rows, *self.pager.controls(self)))
 ```
 
+<p align="center">
+  <img src="../../assets/motion/paginated_region.gif" alt="A paginated region turning pages inside its host view" width="520">
+</p>
+
 `controls(self)` captures the host and returns the nav row (empty on a single page). A page click re-runs the host's render path and re-slices. Each region keeps its own page index, so two regions can share a view if you give them distinct `key` values. Customization mirrors `PaginatedLayoutView` -- subclass and override the `{first,prev,indicator,next,last}_button_{label,emoji,style}` class attributes, `jump_threshold`, or the `on_page_changed` hook. See the API reference for the full surface.
 
 ### `Collapsible`
@@ -1486,6 +1597,10 @@ class FilterView(StatefulLayoutView):
         self.build_ui()
         await self.refresh()
 ```
+
+<p align="center">
+  <img src="../../assets/motion/collapsible.gif" alt="A collapsible expanding and collapsing its revealed region" width="520">
+</p>
 
 `render(self)` returns the trigger alone while collapsed, or the trigger plus the `reveal()` content while expanded (order via `trigger_first`). The collapse policy is the caller's -- `collapse()` after a revealed action finishes, or leave it open for multi-step use. The trigger relabels and restyles between states via `expanded_label` / `expanded_style` / `expanded_emoji`, and two collapsibles in one view need distinct `key` values.
 

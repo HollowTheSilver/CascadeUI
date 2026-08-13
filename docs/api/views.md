@@ -176,6 +176,10 @@ Use `self.open_modal()` instead of `interaction.response.send_modal()` in any Ca
 
 Registers a child view for automatic cleanup. When the parent exits or times out, all attached children that haven't finished are exited with `delete_message=True`. Enforces three invariants: self-attachment raises `ValueError`, circular chains raise `ValueError`, and re-parenting detaches from the old parent cleanly. The `parent=` kwarg on the child's constructor automates this -- `send()` calls `attach_child` on success. See [Child Attachment](../guide/views.md#child-attachment).
 
+#### `parent`
+
+Read-only property holding the view this one is attached to, or `None` for a root. A child constructed with `parent=` reads it before the send that attaches it, and every child reads it after, so a child panel that needs its parent to read state or call `respond` has it without storing the same view a second time under its own name. Mutation goes through `attach_child` on the parent, which enforces the invariants above.
+
 #### `on_message_delete()` *(async, override)*
 
 Called when the view's Discord message is deleted externally (admin delete, bulk purge, channel delete). Default calls `exit(delete_message=False)`. Override for custom behavior (logging, re-sending). If overriding without calling `exit()`, the view remains as a ghost in the state store.
@@ -486,6 +490,7 @@ Called before every component callback. Returns `True` to allow, `False` to bloc
 - `serialize_interactions` (bool): Serialize rapid button clicks with an `asyncio.Lock` (default: `True`). Set to `False` for views that handle parallel callbacks.
 - `edit_timeout` (float | None): Maximum seconds any single Discord edit may stall before it is cancelled. Bounds the edits the library issues after the initial send -- state-driven refresh, exit/teardown, and navigation edits. discord.py issues edits with no total HTTP timeout, so without this a stalled connection would pin the view until the socket drops. Default `60.0` (clears realistic attachment uploads while capping a true hang). Set to `None` to disable the bound (unbounded, matching discord.py's own default). The acting-view fast path keeps its own tighter bound, which protects the 3-second ack deadline rather than guarding against a hang.
 - `session_continuity` (bool): Governs `session_id` auto-derivation polarity. Default `False` gives every invocation a per-instance UUID suffix, so repeat opens of the same view class are independent sessions with their own nav stack, undo timeline, and `shared_data`. Set to `True` on views that want repeat-open state coalescing (undo history surviving close-and-reopen, `shared_data` continuity across gestures); the opt-in collapses derivation back to the class-coalesced shape. Push/pop chains stay on one session regardless because `_navigate_to` forwards `session_id` explicitly.
+- `session_class_key` (str, unset): Overrides the derived class-identity string (`f"{cls.__module__}.{cls.__qualname__}"`) used for session IDs, the instance index, session origin tracking, and the `view_class` column persistent registry rows store. Read from the class's own body, so it does not inherit. Pin it to the previously stored name when moving or renaming a persistent view class; two persistent classes sharing one pin raise at class definition. See [Class identity](../guide/persistence.md#class-identity-rows-resolve-by-the-name-they-recorded).
 
 #### `allowed_mentions`
 
@@ -649,7 +654,7 @@ Back, Next, and Finish buttons are added automatically. Back is disabled on the 
 | `finish_button_label` | `None` | Finish button label. `None` renders "Finish" |
 | `finish_button_emoji` | `None` | Finish button emoji |
 | `finish_button_style` | `ButtonStyle.success` | Finish button style |
-| `step_indicator_label` | `None` | Callable `(current, total) -> str`. Default: `"Step {current}/{total}"` |
+| `step_indicator_label` | `None` | Callable `(current, total) -> str`. Default: `"Step {current}/{total}"`. Must be synchronous; an `async def` is refused at class definition |
 
 ---
 
@@ -793,7 +798,7 @@ failing later inside the page build.
 
 | Hook | Purpose |
 |---|---|
-| `get_entries()` | Data source. Default returns the constructor `entries=` kwarg. |
+| `get_entries()` | Data source. Sync or `async def`; an awaited override is read once per rebuild. Default returns the constructor `entries=` kwarg. |
 | `format_rank(rank)` | Rank column. Default reads `podium_emojis` for ranks 1-3, falls back to `f"**{rank}.**"`. |
 | `format_name(user_id, stats)` | Name column. Default mentions the user (`<@user_id>`) or returns `stats['display_name']` when present. |
 | `format_stats(user_id, stats)` | Inline stat column. Default `f"{wins}W / {games}G"`. |
@@ -809,6 +814,8 @@ failing later inside the page build.
 | `ranked_entries` *(property)* | The loaded top-N `(user_id, stats)` slice for the current render; read it in `build_header` / `build_footer` / `build_title` to compute aggregate stats without re-fetching. |
 | `bot` *(property, read-only)* | The client passed via `bot=` (or injected by `on_bind`). Read it in a `resolve_avatar_urls` / `get_avatar_url` override to resolve avatars through `self.bot` instead of a private attribute. `None` when no bot was supplied. |
 | `on_state_changed(state)` *(async, override)* | Calls `rebuild_pages()` then the paginated refresh; live-data subclasses subscribe to data actions and override `get_entries()`. |
+
+`format_rank`, `format_name`, `format_stats`, and `format_accessory` compose the row inside the synchronous `format_entry` and are refused at class definition when `async def`. The frame hooks (`build_title`, `build_header`, `build_footer`), `format_entry`, `format_primary`, `format_secondary`, and `on_leaderboard_empty` accept either shape.
 
 **Out-of-band refresh.** `reload()` re-fetches entries, recomposes the tree, and edits the message (the public path for a manual refresh button or `on_restore`); `rebuild_pages()` rebuilds only the page list. Both accept `force=True` to bypass the entry-signature short-circuit when something outside the row data changed the render: a filter, or a select's highlighted option read by `build_header`.
 
@@ -988,6 +995,8 @@ Hooks on `RolesLayoutView` are `@classmethod` (not instance methods). The dispat
 | `on_role_swap(interaction, member, role_added, roles_removed, category)` | Response after exclusive-mode swap. |
 | `on_role_required_block(interaction, member, role, category)` | Response when required-category last-role removal rejected. |
 | `on_role_error(interaction, error)` | Response on role mutation failure. |
+
+The five `format_*` hooks compose inside the synchronous `build_ui` and are refused at class definition when `async def`. The `on_role_*` hooks accept either `def` or `async def`.
 
 #### Persistent Variant
 

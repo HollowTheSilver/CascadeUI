@@ -1,10 +1,12 @@
 """Tests for event hooks (on/off lifecycle observation)."""
 
 import copy
+import functools
 
 import pytest
 
 from cascadeui.state.singleton import get_store
+from cascadeui.utils.hooks import is_async_callable
 
 
 class TestEventHooks:
@@ -171,3 +173,158 @@ class TestAwaitMaybe:
             return False
 
         assert await await_maybe(work()) is False
+
+
+class TestIsAsyncCallable:
+    """The predicate the refusal seams read to reject an async override.
+
+    It answers one question (would calling this produce a coroutine?)
+    for every shape a hook can be supplied as. A shape it cannot see is a
+    refusal that silently does not happen, and the failures these seams
+    guard against are silent by nature: a coroutine repr rendered as a
+    button label or a leaderboard row.
+    """
+
+    async def _async_fn(self):
+        return "x"
+
+    def _sync_fn(self):
+        return "x"
+
+    def test_bare_async_def(self):
+        async def fn():
+            return 1
+
+        assert is_async_callable(fn) is True
+
+    def test_staticmethod_wrapping_async(self):
+        """The shape a class body must use for a plain-function hook.
+
+        Read out of ``cls.__dict__`` the descriptor has not resolved, so
+        the wrapper answers False to the naive check while calling it
+        still produces a coroutine.
+        """
+
+        async def fn():
+            return 1
+
+        assert is_async_callable(staticmethod(fn)) is True
+
+    def test_classmethod_wrapping_async(self):
+        async def fn(cls):
+            return 1
+
+        assert is_async_callable(classmethod(fn)) is True
+
+    def test_async_generator_function(self):
+        """A stray ``yield`` in an ``async def``. Neither a coroutine
+        function nor awaitable, and truthy when called."""
+
+        async def fn():
+            yield 1
+
+        assert is_async_callable(fn) is True
+
+    def test_partial_around_async(self):
+        async def fn(a):
+            return a
+
+        assert is_async_callable(functools.partial(fn, 1)) is True
+
+    def test_instance_with_async_call(self):
+        class Callable:
+            async def __call__(self):
+                return 1
+
+        assert is_async_callable(Callable()) is True
+
+    @pytest.mark.parametrize(
+        "supplied",
+        [
+            lambda: 1,
+            staticmethod(lambda: 1),
+            classmethod(lambda cls: 1),
+            functools.partial(lambda a: a, 1),
+        ],
+        ids=["lambda", "staticmethod", "classmethod", "partial"],
+    )
+    def test_synchronous_shapes_are_not_flagged(self, supplied):
+        """A false positive refuses a legitimate override at import."""
+        assert is_async_callable(supplied) is False
+
+    def test_instance_with_sync_call(self):
+        class Callable:
+            def __call__(self):
+                return 1
+
+        assert is_async_callable(Callable()) is False
+
+
+class TestRefusalSeamsShareOnePredicate:
+    """Every seam that refuses an async hook refuses the same set.
+
+    The seams that read a hook off a class body and the seams that take one
+    as an argument were hardened separately, and the argument seams kept a
+    narrower check. A consumer cannot see which kind of seam they are using,
+    so a shape refused at one and accepted at another is the library
+    disagreeing with itself.
+    """
+
+    @staticmethod
+    async def _async_fn(*args):
+        return True
+
+    @staticmethod
+    async def _async_gen(*args):
+        yield True
+
+    def _shapes(self):
+        class AsyncCall:
+            async def __call__(self, *args):
+                return True
+
+        return [
+            ("plain", self._async_fn),
+            ("staticmethod", staticmethod(self._async_fn)),
+            ("async generator", self._async_gen),
+            ("async __call__", AsyncCall()),
+        ]
+
+    def test_collapsible_reveal_refuses_every_async_shape(self):
+        from cascadeui import Collapsible
+
+        for label, fn in self._shapes():
+            with pytest.raises(TypeError, match="synchronous"):
+                Collapsible(label="x", reveal=fn, key=f"probe_{label}")
+
+    def test_wizard_step_condition_refuses_every_async_shape(self):
+        from cascadeui.views.patterns.types import _normalize_steps
+
+        for label, fn in self._shapes():
+            step = {"label": "A", "builder": lambda v: [], "condition": fn}
+            with pytest.raises(TypeError, match="synchronous"):
+                _normalize_steps([step], None, "W")
+
+    def test_subscribe_selector_refuses_every_async_shape(self):
+        from cascadeui.state.singleton import get_store
+
+        store = get_store()
+
+        async def _callback(state, action):
+            return None
+
+        for label, fn in self._shapes():
+            with pytest.raises(TypeError, match="synchronous"):
+                store.subscribe(f"probe_{label}", _callback, selector=fn)
+
+    def test_synchronous_hooks_still_pass_every_seam(self):
+        """A false positive here refuses a legitimate callable at construction."""
+        from cascadeui import Collapsible
+        from cascadeui.views.patterns.types import _normalize_steps
+
+        def plain(*args):
+            return []
+
+        for label, fn in (("def", plain), ("lambda", lambda *a: [])):
+            Collapsible(label="x", reveal=fn, key=f"sync_{label}")
+            _normalize_steps([{"label": "A", "builder": lambda v: [], "condition": fn}], None, "W")

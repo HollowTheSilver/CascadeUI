@@ -69,7 +69,7 @@ from cascadeui import (
     get_store,
     image_section,
     key_value,
-    progress_bar,
+    render_progress,
     stats_card,
 )
 
@@ -316,7 +316,8 @@ class TicTacToeView(StatefulLayoutView):
     # (``state_scope`` is ``None``) so nothing else here depends on disk.
     scoped_slot = "tictactoe_stats"
     persistent_slots = ("tictactoe_stats",)
-    auto_defer = True  # No Redux reactivity -- the board rebuilds from instance state on
+    auto_defer = True
+    # No Redux reactivity -- the board rebuilds from instance state on
     # every move. Stats dispatches happen at game end and are not
     # observed by this view.
     subscribed_actions = set()
@@ -799,7 +800,7 @@ class TicTacToeExample(commands.Cog, name="v2_tictactoe_example"):
                 wins = stats.get("wins", 0)
                 games = stats.get("games", 0)
                 draws = stats.get("draws", 0)
-                bar = progress_bar(wins, games or 1, width=6, show_percent=True).content
+                bar = render_progress(wins, games or 1, width=6, show_percent=True)
                 return f"{wins}W / {games}G \N{BULLET} {draws}D \N{BULLET} {bar}"
 
             def build_header(self, page):

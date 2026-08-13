@@ -19,11 +19,13 @@ unsubscribe immediately.
 
 Cross-process invalidation: writes to the KV and application-slots
 surfaces broadcast a ``cascadeui_invalidation`` notification with a
-JSON payload naming the namespace and key. Other CascadeUI processes
-listening on the same database receive the notification and can drop
-cached state. The library ships the broadcast machinery; consumer-
-side cache invalidation hooks register via
-:meth:`set_invalidation_callback`.
+JSON payload naming the namespace and key. The channel carries the
+backend's ``table_prefix``, so deployments sharing one database stay
+off each other's bus the same way they stay out of each other's
+tables. Other CascadeUI processes listening on the same database
+receive the notification and can drop cached state. The library ships
+the broadcast machinery; consumer-side cache invalidation hooks
+register via :meth:`set_invalidation_callback`.
 """
 
 # // ========================================( Modules )======================================== // #
@@ -39,7 +41,7 @@ from typing import Any, AsyncIterator, Callable, ClassVar, Optional
 import asyncpg  # hard import -- backends/__init__.py catches ImportError
 
 from ..protocols import Capability
-from ..schema import TABLE_KV, TABLE_SCHEMA_META
+from ..schema import TABLE_KV, TABLE_SCHEMA_META, apply_table_prefix
 from ..schema_postgres import ALL_DDL_PG, JSONB_COLUMNS
 
 logger = logging.getLogger(__name__)
@@ -49,8 +51,10 @@ logger = logging.getLogger(__name__)
 
 
 CHANNEL_INVALIDATION: str = "cascadeui_invalidation"
-"""Single library-owned LISTEN/NOTIFY channel name. Hard-coded so no
-identifier-injection vector crosses the seam from user-supplied state."""
+"""Base LISTEN/NOTIFY channel name, resolved per backend under its
+``table_prefix``. Hard-coded rather than composed from user state so no
+identifier-injection vector crosses the seam; the prefix is the only
+caller-supplied part, and it is the same value the table names carry."""
 
 
 _NOTIFY_PAYLOAD_LIMIT_BYTES: int = 7900
@@ -166,7 +170,8 @@ class PostgresBackend:
     it without configuration.
 
     Cross-process invalidation: writes broadcast on the
-    ``cascadeui_invalidation`` channel. Register a callback with
+    ``cascadeui_invalidation`` channel, prefixed by ``table_prefix`` when
+    one is set. Register a callback with
     :meth:`set_invalidation_callback` to consume notifications.
     """
 
@@ -195,6 +200,7 @@ class PostgresBackend:
         dsn: str,
         *,
         pool_kwargs: Optional[dict[str, Any]] = None,
+        table_prefix: str = "",
     ) -> None:
         """Construct a PostgresBackend.
 
@@ -210,6 +216,11 @@ class PostgresBackend:
             Set ``statement_cache_size=0`` when running behind pgbouncer
             in transaction or statement mode -- asyncpg's prepared
             statement cache is incompatible with those modes.
+        :param table_prefix: Prepended to every table and index name this
+            backend creates and queries. Empty by default, which leaves the
+            names unchanged. The default names all carry the ``cascadeui_``
+            prefix; ``table_prefix`` keeps two CascadeUI deployments sharing
+            one database apart.
         """
         if not isinstance(dsn, str):
             raise TypeError(f"dsn must be str, got {type(dsn).__name__}")
@@ -219,6 +230,15 @@ class PostgresBackend:
             raise TypeError(f"pool_kwargs must be dict, got {type(pool_kwargs).__name__}")
 
         self._dsn = dsn
+        self.table_prefix = table_prefix
+        # The channel carries the prefix for the same reason the tables do.
+        # Two deployments sharing a database write to separate tables, and on
+        # one channel each would receive the other's invalidations: the
+        # payload names the LOGICAL namespace, which the prefix does not
+        # touch, so neither can tell a neighbour's key from its own. The
+        # oversized-payload fallback makes that worse than a stray cache miss,
+        # since an empty key means "drop this whole namespace".
+        self._channel = f"{table_prefix}{CHANNEL_INVALIDATION}"
         self._pool_kwargs: dict[str, Any] = {
             "min_size": 2,
             "max_size": 10,
@@ -235,6 +255,15 @@ class PostgresBackend:
         self._tasks: set[asyncio.Task] = set()
         self._invalidation_callback: Optional[Callable[[str, str], None]] = None
         self._closing: bool = False
+
+    def _table(self, name: str) -> str:
+        """Quote ``name`` under this backend's table prefix.
+
+        Every table this backend reads or writes resolves here, including
+        the namespace a row operation is given, since a namespace names its
+        own table.
+        """
+        return _quote_ident(f"{self.table_prefix}{name}")
 
     # // ========================================( Lifecycle )======================================== // #
 
@@ -259,12 +288,12 @@ class PostgresBackend:
 
         async with self._pool.acquire() as conn:
             for stmt in ALL_DDL_PG:
-                await conn.execute(stmt)
+                await conn.execute(apply_table_prefix(stmt, self.table_prefix))
 
         # Listener connection is separate from the pool. add_listener
         # auto-issues LISTEN and commits.
         self._listen_conn = await asyncpg.connect(self._dsn)
-        await self._listen_conn.add_listener(CHANNEL_INVALIDATION, self._on_notify)
+        await self._listen_conn.add_listener(self._channel, self._on_notify)
         listen_task = asyncio.create_task(self._listen_loop())
         self._tasks.add(listen_task)
         listen_task.add_done_callback(self._tasks.discard)
@@ -332,7 +361,7 @@ class PostgresBackend:
 
     async def kv_read(self, namespace: str, key: str) -> Optional[bytes]:
         pool = self._pool_or_raise()
-        table = _quote_ident(TABLE_KV)
+        table = self._table(TABLE_KV)
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 f"SELECT value FROM {table} WHERE namespace = $1 AND key = $2",
@@ -343,7 +372,7 @@ class PostgresBackend:
 
     async def kv_write(self, namespace: str, key: str, value: bytes) -> None:
         pool = self._pool_or_raise()
-        table = _quote_ident(TABLE_KV)
+        table = self._table(TABLE_KV)
         async with pool.acquire() as conn:
             async with conn.transaction():
                 await conn.execute(
@@ -360,7 +389,7 @@ class PostgresBackend:
 
     async def kv_delete(self, namespace: str, key: str) -> None:
         pool = self._pool_or_raise()
-        table = _quote_ident(TABLE_KV)
+        table = self._table(TABLE_KV)
         async with pool.acquire() as conn:
             async with conn.transaction():
                 result: str = await conn.execute(
@@ -376,7 +405,7 @@ class PostgresBackend:
 
     async def kv_scan(self, namespace: str, prefix: str = "") -> AsyncIterator[tuple[str, bytes]]:
         pool = self._pool_or_raise()
-        table = _quote_ident(TABLE_KV)
+        table = self._table(TABLE_KV)
         async with pool.acquire() as conn:
             if prefix:
                 pattern = _escape_like(prefix) + "%"
@@ -405,7 +434,7 @@ class PostgresBackend:
         """Assemble an excluded-table upsert INSERT for ``cols`` with ``$n``
         placeholders. Non-key columns are overwritten on conflict; an
         all-key-column row resolves to DO NOTHING."""
-        table = _quote_ident(namespace)
+        table = self._table(namespace)
         placeholders = ", ".join(f"${i + 1}" for i in range(len(cols)))
         col_list = ", ".join(_quote_ident(c) for c in cols)
 
@@ -496,7 +525,7 @@ class PostgresBackend:
         where: Optional[dict[str, Any]] = None,
     ) -> list[dict[str, Any]]:
         pool = self._pool_or_raise()
-        table = _quote_ident(namespace)
+        table = self._table(namespace)
         if where:
             cols = list(where.keys())
             clause = " AND ".join(f"{_quote_ident(c)} = ${i + 1}" for i, c in enumerate(cols))
@@ -524,7 +553,7 @@ class PostgresBackend:
             raise ValueError("row_delete requires a non-empty where clause")
 
         pool = self._pool_or_raise()
-        table = _quote_ident(namespace)
+        table = self._table(namespace)
         cols = list(where.keys())
         clause = " AND ".join(f"{_quote_ident(c)} = ${i + 1}" for i, c in enumerate(cols))
         sql = f"DELETE FROM {table} WHERE {clause}"
@@ -549,7 +578,7 @@ class PostgresBackend:
         # (never true), so rows without a value in ``column`` are preserved.
         # Same SQL standard semantic SQLiteBackend relies on.
         pool = self._pool_or_raise()
-        table = _quote_ident(namespace)
+        table = self._table(namespace)
         col = _quote_ident(column)
         sql = f"DELETE FROM {table} WHERE {col} < $1"
         async with pool.acquire() as conn:
@@ -568,7 +597,7 @@ class PostgresBackend:
 
     async def get_schema_version(self, table: str) -> int:
         pool = self._pool_or_raise()
-        meta = _quote_ident(TABLE_SCHEMA_META)
+        meta = self._table(TABLE_SCHEMA_META)
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 f"SELECT schema_version FROM {meta} WHERE table_name = $1",
@@ -578,7 +607,7 @@ class PostgresBackend:
 
     async def set_schema_version(self, table: str, version: int) -> None:
         pool = self._pool_or_raise()
-        meta = _quote_ident(TABLE_SCHEMA_META)
+        meta = self._table(TABLE_SCHEMA_META)
         applied_at = int(time.time())
         async with pool.acquire() as conn:
             async with conn.transaction():
@@ -727,7 +756,7 @@ class PostgresBackend:
             # Fallback to namespace-only payload; consumers treat empty
             # key as "invalidate everything in this namespace."
             payload = json.dumps({"namespace": namespace, "key": ""})
-        await conn.execute("SELECT pg_notify($1, $2)", CHANNEL_INVALIDATION, payload)
+        await conn.execute("SELECT pg_notify($1, $2)", self._channel, payload)
 
     def _on_notify(
         self,
@@ -777,7 +806,7 @@ class PostgresBackend:
                     new_conn = None
                     try:
                         new_conn = await asyncpg.connect(self._dsn)
-                        await new_conn.add_listener(CHANNEL_INVALIDATION, self._on_notify)
+                        await new_conn.add_listener(self._channel, self._on_notify)
                         self._listen_conn = new_conn
                         new_conn = None
                         logger.info("PostgresBackend listener reconnected")

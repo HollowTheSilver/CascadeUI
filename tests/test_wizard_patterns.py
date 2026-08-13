@@ -925,3 +925,31 @@ class TestStepCursorRewindsWhenTheEditNeverLanded:
         message.edit = AsyncMock()
         await view._go_next(_make_interaction())
         assert view._current_step == 1, "the recovery press advances one step, not two"
+
+
+# // ========================================( Indicator Label Shape )======================================== // #
+
+
+class TestStepIndicatorLabelMustBeSynchronous:
+    """The indicator label resolves inside the synchronous button build.
+
+    discord.py stringifies whatever it is handed, so an async callable
+    renders "<coroutine object ...>" on the button and nothing raises --
+    the worst shape a wrong override can take, and the reason this one is
+    refused at definition rather than backstopped at render.
+    """
+
+    def test_async_label_is_refused_at_definition(self):
+        async def _labeller(current, total):
+            return f"{current}/{total}"
+
+        with pytest.raises(TypeError, match="step_indicator_label must be synchronous"):
+
+            class _Bad(WizardLayoutView):
+                step_indicator_label = _labeller
+
+    def test_sync_label_still_defines(self):
+        class _Good(WizardLayoutView):
+            step_indicator_label = staticmethod(lambda current, total: f"{current} of {total}")
+
+        assert _Good.step_indicator_label(2, 5) == "2 of 5"

@@ -44,7 +44,7 @@ class CounterView(StatefulLayoutView):
 
     # -- Access control --
     # Only the user who opened this view can click its buttons.
-    # Rejected users see an ephemeral "This view belongs to someone else."
+    # Rejected users see an ephemeral "You cannot interact with this."
     owner_only = True
 
     # -- Instance control --

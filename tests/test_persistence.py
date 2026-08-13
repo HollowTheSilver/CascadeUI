@@ -2143,7 +2143,7 @@ class TestMigratorRegistries:
     """register_migrator / register_kwargs_migrator collision and lookup."""
 
     # A fake table, because the library now ships its own migrator for
-    # persistent_views v1 and these tests would collide with it.
+    # cascadeui_persistent_views v1 and these tests would collide with it.
     TABLE = "_test_migrator_table"
 
     def setup_method(self, method):
@@ -2194,6 +2194,38 @@ class TestMigratorRegistries:
             @register_kwargs_migrator("MyView", 1)
             async def second(kwargs):
                 return kwargs
+
+    def test_a_pre_rename_table_key_is_refused_with_the_current_name(self):
+        """A migrator keyed on the old table name is never looked up: the
+        pending step raises "No migrator registered" naming only the current
+        table, so the stale key has to be refused where it is written.
+        """
+        for old, current in (
+            ("persistent_views", "cascadeui_persistent_views"),
+            ("application_slots", "cascadeui_application_slots"),
+        ):
+            with pytest.raises(ValueError, match=current):
+
+                @register_migrator(old, 5)
+                async def migrator(backend):
+                    pass
+
+            assert (old, 5) not in _MIGRATORS
+
+    def test_the_bulk_migrators_path_refuses_a_pre_rename_key_too(self):
+        """migrators= routes through register_migrator, so the guard covers
+        both registration routes; the skip-if-present check cannot absorb an
+        old key because the registry only ever holds current names.
+        """
+
+        async def migrator(backend):
+            pass
+
+        with pytest.raises(ValueError, match="cascadeui_persistent_views"):
+            PersistenceMiddleware._register_migrators(
+                {"schema": {("persistent_views", 5): migrator}}
+            )
+        assert ("persistent_views", 5) not in _MIGRATORS
 
 
 class TestManagerMiddlewareWiring:
@@ -2326,8 +2358,67 @@ class TestReattachLogLevels:
 
         warnings = [r for r in caplog.records if r.levelname == "WARNING"]
         assert len(warnings) == 1
-        assert "12 persistent view(s)" in warnings[0].message
+        assert "12 persistent view row(s)" in warnings[0].message
         assert "reattach()" in warnings[0].message
+
+    async def test_the_warning_names_the_unresolved_class(self, caplog):
+        """The stored string is the fix, so counting rows is not enough.
+
+        An operator acts by registering a class under that name, or by
+        pinning session_class_key to it after a move. Recovering it from a
+        count meant raising the log level and restarting a third time.
+        """
+        mgr = self._manager(self._rows(12))
+        await mgr.reattach_persistent_views()
+
+        with caplog.at_level("DEBUG", logger="cascadeui.persistence.manager"):
+            await mgr.reattach()
+
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert "cogs.later.LatePanel (12 rows)" in warnings[0].message
+        assert "session_class_key" in warnings[0].message
+
+    async def test_migrator_skips_are_not_counted_as_missing_classes(self, caplog):
+        """``skipped`` is fed by two branches, and only one is a missing class.
+
+        A row whose class resolves but whose kwargs migrator does not is
+        skipped too. Counting the bucket attributed those to a missing
+        class and sent the operator after an import that was never absent.
+        """
+        from cascadeui.views.persistent import PersistentView
+
+        class _MigratorGapPanel(PersistentView):
+            session_class_key = "cogs.present.MigratorGapPanel"
+            kwargs_schema_version = 2
+
+        rows = self._rows(3)
+        rows += [
+            {
+                "persistence_key": f"needs-migrator:{i}",
+                "view_class": "cogs.present.MigratorGapPanel",
+                "channel_id": 1,
+                "message_id": 2,
+                "init_kwargs": "{}",
+                "kwargs_schema_version": 1,
+            }
+            for i in range(4)
+        ]
+        mgr = self._manager(rows)
+        await mgr.reattach_persistent_views()
+
+        with caplog.at_level("DEBUG", logger="cascadeui.persistence.manager"):
+            summary = await mgr.reattach()
+
+        assert len(summary["skipped"]) == 7
+        aggregate = [
+            r for r in caplog.records if r.levelname == "WARNING" and "Unresolved:" in r.message
+        ]
+        assert len(aggregate) == 1
+        # Three rows lack a class; the other four lack a migrator and are
+        # reported by their own per-row warning, not by this one.
+        assert "3 persistent view row(s)" in aggregate[0].message
+        assert "cogs.present.MigratorGapPanel" not in aggregate[0].message
 
     async def test_the_advice_no_longer_names_a_pre_import(self, caplog):
         """The old message told an operator to import before initialize(),
@@ -2486,6 +2577,30 @@ class TestUnreachableStampLifecycle:
                 "the RAW_SQL branch touches one column; a whole-row write here "
                 "can revert a concurrent registry flush"
             )
+        finally:
+            await backend.close()
+
+    async def test_the_raw_sql_branch_resolves_the_table_through_the_prefix(self, tmp_path):
+        """The single-column UPDATE names its own table, and raw SQL does no
+        prefixing of its own: unresolved, it targets the unprefixed name,
+        which a prefixed database does not have, and the stamp write dies
+        as a logged warning instead of landing.
+        """
+        pytest.importorskip("aiosqlite")
+        from cascadeui.persistence.backends.sqlite import SQLiteBackend
+
+        backend = SQLiteBackend(str(tmp_path / "pfx_stamps.db"), table_prefix="pfx_")
+        await backend.initialize()
+        try:
+            row = self._row("a")
+            await backend.row_upsert(TABLE_PERSISTENT_VIEWS, row, ["persistence_key"])
+            mgr = PersistenceManager(
+                store=get_store(), registry=RegistryPersistence(backend=backend), bot=MagicMock()
+            )
+            mgr._registry_rows = [dict(row)]
+
+            await mgr._write_unreachable_stamps(["a"], 1234)
+            assert await self._stamp_of(backend, "a") == 1234
         finally:
             await backend.close()
 
@@ -2776,10 +2891,12 @@ class TestRegistrySchemaMigration:
             )
             await mgr.apply_migrations()
 
+            # apply_migrations renames the legacy table before versions
+            # resolve, so the migrated column lives under the current name.
             names = {
                 r["name"]
                 for r in await backend.fetch(
-                    "SELECT name FROM pragma_table_info('persistent_views')"
+                    f"SELECT name FROM pragma_table_info('{TABLE_PERSISTENT_VIEWS}')"
                 )
             }
             assert "first_unreachable_at" in names
@@ -2841,7 +2958,7 @@ class TestRegistrySchemaMigration:
             names = {
                 r["name"]
                 for r in await backend.fetch(
-                    "SELECT name FROM pragma_table_info('persistent_views')"
+                    f"SELECT name FROM pragma_table_info('{TABLE_PERSISTENT_VIEWS}')"
                 )
             }
             assert "first_unreachable_at" in names, (

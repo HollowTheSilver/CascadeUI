@@ -2,6 +2,10 @@
 
 Working examples are in the [`examples/`](https://github.com/HollowTheSilver/CascadeUI/tree/main/examples) directory. Each is a discord.py cog that can be loaded into any bot.
 
+<p align="center">
+  <img src="../assets/examples/games.gif" alt="Two players taking turns in a game view built from the examples" width="560">
+</p>
+
 ---
 
 ## V2 Examples
@@ -115,7 +119,7 @@ Two-player 10x10 Battleship with a standard fleet, text-rendered emoji grids, a 
 
 ### v2_leaderboard.py
 
-Server leaderboard built on `LeaderboardLayoutView` in Section render mode: overrides `format_secondary` for two-line rows with inline win-rate bars, passes `bot=` so the library's default `get_avatar_url` resolves avatar thumbnails, and overrides `build_header` for an Overview stats card (with the guild icon on its heading, computed from `ranked_entries`). `leaderboard_top_n=25` with `leaderboard_per_page=5` produces five-page navigation. The cog inspects `bot.intents.members` and the guild cache: real members fill the top of the board when available, and synthetic Demo Player rows pad any remaining slots so the display always renders exactly 25 entries regardless of guild size or intent configuration. Stats are derived deterministically from member ID via `random.Random(member_id)`, so repeat invocations return a stable ranking without a persistence layer. Contrast with `v2_battleship.py`, which feeds the same view class from live computed state -- the tuple shape fed into the pattern is identical, the data source differs.
+Server leaderboard built on `LeaderboardLayoutView` in Section render mode: overrides `format_secondary` for two-line rows with inline win-rate bars, passes `bot=` so the library's default `get_avatar_url` resolves avatar thumbnails, and overrides `build_header` for an Overview stats card (with the guild icon on its heading, computed from `ranked_entries`). `leaderboard_top_n=25` with `leaderboard_per_page=5` produces five-page navigation. The cog inspects `bot.intents.members` and the guild cache: real members take the available slots when present and synthetic Demo Player rows fill the rest, so the display always renders exactly 25 entries regardless of guild size or intent configuration. The assembled board ranks by MMR, so the two kinds interleave. Stats are derived deterministically from member ID via `random.Random(member_id)`, so repeat invocations return a stable ranking without a persistence layer. Contrast with `v2_battleship.py`, which feeds the same view class from live computed state -- the tuple shape fed into the pattern is identical, the data source differs.
 
 **Command:** `/leaderboard`
 

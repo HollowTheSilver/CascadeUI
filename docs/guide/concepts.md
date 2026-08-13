@@ -335,10 +335,16 @@ builders and validators, and the fetch function behind
 returned rather than inspecting the function, so a callable object with an
 async `__call__` and a `functools.partial` around one both work.
 
-Three places want a synchronous function specifically, because the answer
-is needed inside a check that cannot pause: a wizard step's `condition`, a
-subscriber's `selector`, and `Collapsible`'s `reveal` and `summary`. Each
-rejects a coroutine function where you declare it.
+A seam wants a synchronous function specifically when its answer is
+consumed inside a check or a composition that cannot pause: a wizard
+step's `condition` and the wizard's `step_indicator_label`, selectors
+(`state_selector`, a subscriber's `selector`, `@computed`),
+`Collapsible`'s `reveal` and `summary`, `restore_on_dropped_render`'s
+`rebuild`, the leaderboard's four row-column hooks (`format_rank`,
+`format_name`, `format_stats`, `format_accessory`), and the roles panel's
+five card-compose hooks (the `format_category_*` and `format_button_*`
+family). Each rejects an async function where you declare it, naming the
+seam and the fix.
 
 `build_ui` carries one more constraint. The patterns that compose their tree
 in `__init__` (`MenuLayoutView`, `RolesLayoutView`, and `DisplayLayoutView`)

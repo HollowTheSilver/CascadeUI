@@ -44,8 +44,9 @@ class MyBot(commands.Bot):
     The persistence middleware must initialize **after** every cog that
     defines a `PersistentView` subclass is imported. Python's import
     machinery populates the class registry via `__init_subclass__`;
-    initializing against an empty registry silently orphans every
-    surviving persistent view.
+    initializing against an empty registry lands every surviving panel in
+    the `skipped` bucket, dead until a `reattach()` re-drive or the next
+    restart picks it up.
 
 !!! warning "Cogs do not install middleware"
     Middleware install belongs to the bot author, not a cog. A cog that
@@ -263,14 +264,52 @@ single-process production default: WAL mode for concurrent reads,
 `PostgresBackend` adds cross-process coordination via `LISTEN`/`NOTIFY`
 and is the right choice for multi-process deployments.
 
+#### The tables a SQL backend creates
+
+Both SQL backends create four tables and two indexes:
+
+| Table | Holds |
+|-------|-------|
+| `cascadeui_persistent_views` | One reattach row per `persistence_key` |
+| `cascadeui_application_slots` | One row per persistent application slot |
+| `cascadeui_schema` | Per-table schema version, read by the migrator |
+| `cascadeui_kv` | The namespaced key-value surface |
+
+All four carry the `cascadeui_` prefix, so a scope written against that
+pattern (a filtered backup, a grant, an audit query) reaches every table the
+library owns, and the names are distinctive enough not to collide with a
+consumer's own schema when both share a database.
+
+A database created before the registry and slots tables carried the prefix
+is renamed in place: `apply_migrations` finds `persistent_views` or
+`application_slots`, confirms the table carries the library's columns, and
+renames it -- indexes and schema-version record included -- in one
+transaction before schema versions resolve. A same-named table *without*
+the library's columns is a consumer's own and is never touched; when both
+the old and new names exist and both hold rows, nothing is renamed, the
+library uses the new name, and a WARNING names both tables so an operator
+can reconcile.
+
+Pass `table_prefix=` to move every table and index the backend owns, which
+keeps two CascadeUI deployments sharing one database apart:
+
+```python
+SQLiteBackend("bot.db", table_prefix="cascade_")
+PostgresBackend(dsn, table_prefix="cascade_")
+```
+
+The prefix applies to all four tables and both indexes. It is empty by
+default. Changing it on a database that already holds rows points the
+backend at a fresh, empty set of tables; the old rows stay where they are.
+
 !!! note "Inspecting the database directly"
     CascadeUI partitions its state across dedicated tables, not one blob.
-    `persistent_views` holds the `PersistentView` registry -- one row per
-    posted panel, written through immediately on registration.
-    `application_slots` holds persisted application and scoped slots.
-    `cascadeui_kv` is a generic key-value surface for the KV Protocol methods
-    and does **not** hold view registry rows. To confirm a panel's row
-    exists, query `persistent_views`, not `cascadeui_kv`.
+    `cascadeui_persistent_views` holds the `PersistentView` registry -- one
+    row per posted panel, written through immediately on registration.
+    `cascadeui_application_slots` holds persisted application and scoped
+    slots. `cascadeui_kv` is a generic key-value surface for the KV Protocol
+    methods and does **not** hold view registry rows. To confirm a panel's
+    row exists, query `cascadeui_persistent_views`, not `cascadeui_kv`.
 
 ```bash
 pip install pycascadeui[sqlite]
@@ -323,7 +362,8 @@ The CascadeUI database user needs minimal `GRANT`s:
 GRANT CONNECT ON DATABASE cascadeui TO cascadeui_app;
 GRANT USAGE ON SCHEMA public TO cascadeui_app;
 GRANT SELECT, INSERT, UPDATE, DELETE
-    ON persistent_views, application_slots, cascadeui_kv, cascadeui_schema
+    ON cascadeui_persistent_views, cascadeui_application_slots,
+       cascadeui_kv, cascadeui_schema
     TO cascadeui_app;
 ```
 
@@ -340,6 +380,15 @@ GRANT SELECT, INSERT, UPDATE, DELETE
     SQLite has no equivalent step: file-level write access covers `ALTER TABLE`
     the same as any other write.
 
+    A database still carrying the pre-rename table names meets this wall one
+    step earlier. The in-place rename described above runs before any version
+    step, and `ALTER TABLE ... RENAME TO` needs the same ownership, so on a
+    locked-down role it is the first statement to fail. It raises
+    `PersistenceSchemaError` naming both table names and the same remedy, and
+    the rename commits as one transaction, so the database is unchanged and it
+    retries once the privilege is there. A role that cannot see the old table
+    at all skips the rename silently and reaches the version step as before.
+
 #### Cross-process invalidation
 
 `PostgresBackend` uses `LISTEN`/`NOTIFY` to broadcast slot invalidations
@@ -348,6 +397,15 @@ running multiple workers automatically observe each other's writes. The
 listener connection sits outside the connection pool (LISTEN
 registrations are session-scoped per the PostgreSQL contract) and
 auto-reconnects on drop.
+
+The channel carries `table_prefix` when one is set, so two deployments
+sharing a database stay off each other's bus the same way they stay out of
+each other's tables. Workers of the *same* deployment share a prefix and so
+still see each other's writes, which is the point. A notification names the
+logical namespace and key, and the key is empty when the payload would
+exceed PostgreSQL's 8000-byte limit, meaning "drop this whole namespace" --
+so a shared channel would turn one neighbour's large write into a full cache
+flush here.
 
 Register a per-process callback to consume the invalidation stream:
 
@@ -548,8 +606,8 @@ For portability across backends, use the documented subset:
 #### When raw SQL is wrong
 
 Reach for raw SQL when the namespace API genuinely cannot express what
-you need. Anything CascadeUI's UI state covers (`persistent_views`,
-`application_slots`, `cascadeui_kv`) should flow through the
+you need. Anything CascadeUI's UI state covers (`cascadeui_persistent_views`,
+`cascadeui_application_slots`, `cascadeui_kv`) should flow through the
 namespace API. The escape hatch is for code outside that domain.
 
 `InMemoryBackend` does not declare `Capability.RAW_SQL`; tests against
@@ -565,7 +623,7 @@ declares its capabilities. No inheritance is required; the Protocol is
 
 !!! note "Declare how schema migrations reach your backend"
     Library releases occasionally migrate the tables they own (the
-    `persistent_views` v2 migration adds a nullable column). A migrator needs
+    `cascadeui_persistent_views` v2 migration adds a nullable column). A migrator needs
     one of two declarations from the backend. `Capability.OPEN_ROWS` says rows
     are open mappings: `row_upsert` accepts unknown columns, `row_select`
     returns them untouched, and reading a missing one gives `None` -- a
@@ -892,7 +950,8 @@ After a restart, `setup_middleware(PersistenceMiddleware(bot=self, ...))`
 drives the reattach pipeline during startup:
 
 1. Reads the registry via `RegistryPersistence.backend.row_select()`.
-2. Looks up each row's `view_class` in the class registry.
+2. Looks up each row's `view_class` in the class registry (see
+   [Class identity](#class-identity-rows-resolve-by-the-name-they-recorded)).
 3. Walks the kwargs migrator chain from the stored `kwargs_schema_version`
    to the class's current version.
 4. Fetches the target channel and message (skips non-messageable channels).
@@ -908,6 +967,50 @@ drives the reattach pipeline during startup:
    real users, members, and channels instead of cold defaults. Panels sharing
    a channel render one at a time (message edits rate-bucket per channel);
    panels in distinct channels render concurrently.
+
+### Class identity: rows resolve by the name they recorded
+
+Step 2 resolves each row by string. The `view_class` column holds the
+qualified class name recorded when the panel was posted
+(`f"{cls.__module__}.{cls.__qualname__}"` by default), and the class registry
+is keyed the same way at import. Moving the class to another module, renaming
+it, or renaming a parent package changes the key on the import side only.
+Existing rows still hold the old string, so the lookup misses: they land in
+the `skipped` bucket, and each posted panel stays in its channel with frozen
+content and dead controls.
+
+Nothing breaks at refactor time or in the running process. The failure waits
+for the next restart, where the signal is the reattach summary and, once a
+`reattach()` pass has run, a warning naming the unresolved strings. Pin the
+stored name before shipping the refactor:
+
+```python
+class TicketPanel(PersistentLayoutView):            # moved from mybot.views
+    session_class_key = "mybot.views.TicketPanel"   # the name the rows hold
+```
+
+`session_class_key` replaces the derived name in session IDs, the instance
+index, session origin tracking, and the `view_class` column rows record, so
+existing rows keep resolving and new rows record the pin. Navigation entries
+are the one string it does not touch: they record the class's import path,
+which is what `pop()` reconstructs by.
+
+- The pin must equal the `view_class` value the rows already hold: the class's
+  `module.QualName` at the time they were written.
+- One pin per class. Two persistent classes sharing a pin raise at class
+  definition, because their rows could not say which class wrote them. If the
+  other class is the old definition of the one you moved, delete it rather
+  than changing the pin.
+- The pin does not inherit. A subclass records its own name unless it sets its
+  own pin.
+- Kwargs migrators key on the same stored string, so after pinning, register
+  them under the pin rather than the class's new path (see
+  [Kwargs migrations](#kwargs-migrations-for-persistentview-subclasses)).
+
+Rows that already missed a pass are not lost. They stay on disk in the
+`skipped` bucket and recover on the next restart, or immediately via
+[`reattach()`](#re-driving-reattach-after-a-runtime-cog-load), once a class
+registers under the stored name.
 
 ### View identity: `user_id` and `session_id` follow the construction context
 
@@ -1008,10 +1111,13 @@ async def migrate_ticket_panel_1_to_2(kwargs):
     return kwargs
 ```
 
-The qualified class name must match the stored `view_class` column
-(typically `f"{module}.{cls.__qualname__}"`). Rows whose version is
-ahead of what any migrator handles are skipped with a WARNING and left
-on disk for later recovery.
+The qualified class name must match the stored `view_class` column: the
+class's `f"{module}.{cls.__qualname__}"` at post time, or its
+[`session_class_key`](#class-identity-rows-resolve-by-the-name-they-recorded)
+pin. A migrator registered under a name the rows do not hold never runs, so
+after a class move, key it by the pinned name rather than the class's new
+path. Rows whose stored version is behind the class with no migrator for the
+next step are skipped with a WARNING and left on disk for later recovery.
 
 **Stale entry handling:**
 
@@ -1019,7 +1125,7 @@ on disk for later recovery.
 |----------|---------|
 | Message or channel returns a definitive 404 (`discord.NotFound`) | Row removed, reattach summary logs as `removed` |
 | Message or channel transiently unreachable (`Forbidden`, `RateLimited`, `HTTPException`, a transport failure, or non-messageable) | Row kept, reattach summary logs as `unreachable` |
-| View class not imported | Row kept, reattach summary logs as `skipped` |
+| View class not imported, or no class registers under the stored name (a moved or renamed class with no `session_class_key` pin) | Row kept, reattach summary logs as `skipped` |
 | Kwargs migrator raises or returns non-dict | Row kept, reattach summary logs as `failed` |
 | Construction raises during reattach | Row kept, reattach summary logs as `failed` |
 | `on_restore` raises (post-ready render) | View stays registered; failure is logged, not in the summary |
@@ -1123,12 +1229,27 @@ Two migrator surfaces exist:
 ```python
 from cascadeui.persistence import register_migrator
 
-@register_migrator("persistent_views", from_version=1)
+@register_migrator("cascadeui_persistent_views", from_version=1)
 async def _migrate_persistent_views_1_to_2(backend):
-    rows = await backend.row_select("persistent_views")
+    rows = await backend.row_select("cascadeui_persistent_views")
     for row in rows:
         row["new_column"] = derive(row)
-        await backend.row_upsert("persistent_views", row, ["persistence_key"])
+        await backend.row_upsert("cascadeui_persistent_views", row, ["persistence_key"])
+```
+
+The row API resolves a namespace to a table itself, so the example above
+works under any `table_prefix`. Raw SQL does not. A migrator that reaches
+for `backend.execute` or `backend.fetch` names its own table, and naming
+the logical one there targets the unprefixed table: absent on a prefixed
+database, or a consumer's own table of that name. Resolve it first:
+
+```python
+from cascadeui.persistence import physical_table, register_migrator
+
+@register_migrator("cascadeui_persistent_views", from_version=2)
+async def _migrate_persistent_views_2_to_3(backend):
+    table = physical_table(backend, "cascadeui_persistent_views")
+    await backend.execute(f"ALTER TABLE {table} ADD COLUMN priority INTEGER")
 ```
 
 Library-owned migrators run automatically during `apply_migrations` in the
@@ -1141,8 +1262,15 @@ checks the backend's capability declaration: `OPEN_ROWS` skips the DDL,
 `RAW_SQL` runs it, and neither raises `PersistenceConfigError` (see
 [Writing a custom backend](#writing-a-custom-backend)).
 
-The library ships one schema migrator today: `persistent_views` from
-version 1 to 2, adding the `first_unreachable_at` column described in
+Registering a migrator under one of the pre-rename table names raises
+`ValueError` naming the current name. `persistent_views` and
+`application_slots` are no longer keys the migration loop resolves, so a
+migrator keyed on either would sit in the registry and never be looked up.
+The same refusal covers the `migrators=` bulk form, which registers through
+the same function.
+
+The library ships one schema migrator today: `cascadeui_persistent_views`
+from version 1 to 2, adding the `first_unreachable_at` column described in
 [Rows that stay unreachable](#rows-that-stay-unreachable). A database
 created before that column existed migrates automatically on the next
 startup against a library new enough to know about it; a database already
@@ -1161,7 +1289,7 @@ await setup_middleware(
         backend=SQLiteBackend("state.db"),
         bot=bot,
         migrators={
-            "schema": {("persistent_views", 1): _migrate_views_1_to_2},
+            "schema": {("cascadeui_persistent_views", 1): _migrate_views_1_to_2},
             "kwargs": {("mybot.cogs.panel.TicketPanel", 1): _migrate_panel_1_to_2},
         },
     )
@@ -1207,7 +1335,7 @@ inferring it from row counts.
 
 When any slot declares `ttl_days`, the manager starts a daily background
 sweeper during initialization. It calls `row_delete_where_lt` on
-`application_slots.expires_at` once every 24 hours and drops rows whose
+`cascadeui_application_slots.expires_at` once every 24 hours and drops rows whose
 absolute wall-clock expiration has passed. No cadence configuration is
 exposed -- TTLs are expressed in days, sub-day precision is meaningless,
 and asking the user to also schedule a prune task is friction the library

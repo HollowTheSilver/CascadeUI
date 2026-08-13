@@ -52,6 +52,7 @@ from .components.patterns import (
     key_value,
     link_section,
     progress_bar,
+    render_progress,
     stats_card,
     tab_nav,
     toggle_button,
@@ -90,6 +91,7 @@ from .persistence import (
 )
 from .persistence import __all__ as _persistence_all
 from .persistence import (
+    physical_table,
     register_kwargs_migrator,
     register_migrator,
 )
@@ -133,6 +135,7 @@ from .validation import (
 from .views.base import RenderOutcome
 from .views.layout import DisplayLayoutView, StatefulLayoutView
 from .views.patterns import (
+    EntryList,
     FormLayoutView,
     FormView,
     LeaderboardLayoutView,
@@ -169,7 +172,7 @@ if "PostgresBackend" in _persistence_all:
 # // ========================================( Script )======================================== // #
 
 
-__version__ = "3.10.0"
+__version__ = "3.11.0"
 
 # Export public API
 __all__ = [
@@ -198,6 +201,7 @@ __all__ = [
     "RegistryPersistence",
     "ApplicationPersistence",
     "SlotPolicy",
+    "physical_table",
     "register_kwargs_migrator",
     "register_migrator",
     # V2 Layout Views
@@ -252,6 +256,7 @@ __all__ = [
     # Type aliases
     "EmojiInput",
     "MediaInput",
+    "EntryList",
     "MAX_COMPONENT_ID",
     "MAX_SELECT_OPTIONS",
     # V2 Cards & Sections
@@ -273,6 +278,7 @@ __all__ = [
     "alert",
     "stats_card",
     "progress_bar",
+    "render_progress",
     # V2 Separators
     "divider",
     "gap",

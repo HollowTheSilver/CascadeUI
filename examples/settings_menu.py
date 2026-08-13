@@ -188,6 +188,11 @@ class SettingsHubView(MenuView):
                 message="This will restore every preference to its default value.",
                 confirm_label="Reset",
                 cancel_label="Keep",
+                # The defaults suit a Yes/No confirm (green yes, red no). This
+                # one destroys data, so the destructive choice carries the
+                # warning colour and the safe one stays neutral.
+                confirm_style=discord.ButtonStyle.danger,
+                cancel_style=discord.ButtonStyle.secondary,
                 confirmed_message="Settings reset to defaults.",
                 cancelled_message="Reset cancelled.",
             )
@@ -283,6 +288,11 @@ class AppearanceView(StatefulView):
     state_scope = "user"
     exit_policy = "disable"
     subscribed_actions = {"SETTINGS_UPDATED"}
+    # The menu pushes here without its own rebuild=, so this names the edit.
+    # Routing it through build_ui is what marks the saved theme on the select
+    # for the first render; an embed-only rebuild shows every option unmarked
+    # until the user changes something.
+    nav_rebuild = staticmethod(lambda v: v.build_ui())
 
     _THEME_OPTIONS = [
         ("Default", "default", "\N{LARGE BLUE CIRCLE}"),
@@ -517,6 +527,10 @@ class LocaleView(StatefulView):
     state_scope = "user"
     exit_policy = "disable"
     subscribed_actions = {"SETTINGS_UPDATED"}
+    # Same reason as AppearanceView: build_ui marks the saved language and
+    # timezone on their selects, and an embed-only rebuild would leave both
+    # showing placeholder text over stored values.
+    nav_rebuild = staticmethod(lambda v: v.build_ui())
 
     _LANGUAGES = ["English", "Spanish", "French", "German", "Japanese"]
     _TIMEZONES = [

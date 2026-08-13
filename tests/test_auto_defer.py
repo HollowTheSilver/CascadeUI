@@ -45,6 +45,47 @@ def _http_error(status, code):
 # // ========================================( Timer Fires )======================================== // #
 
 
+class TestAckBackstopRecordsWhatItCosts:
+    """Three outcomes, each recorded to match what it costs.
+
+    The fired branch is the one worth a line: the handler used its whole
+    budget and the interaction was rescued rather than lost, which is the
+    state a surface passes through on its way to expiring and the only
+    one that shows up while the user still sees everything working.
+    """
+
+    async def test_a_fired_backstop_names_the_surface(self, caplog):
+        view = StatefulView(interaction=_make_interaction())
+        view.auto_defer_delay = 0.05
+        view.owner_only = False
+        interaction = _make_interaction(is_done=False)
+
+        async def slow_callback(inter):
+            await asyncio.sleep(0.15)
+
+        with caplog.at_level(logging.INFO, logger="cascadeui.views._interaction"):
+            await view._scheduled_task(_make_item(slow_callback), interaction)
+
+        interaction.response.defer.assert_called_once_with()
+        assert "Auto-defer backstop acked for StatefulView" in caplog.text
+
+    async def test_a_cancelled_backstop_stays_silent(self, caplog):
+        """The healthy path is every click that answers in time; a line
+        here would be one per interaction."""
+        view = StatefulView(interaction=_make_interaction())
+        view.auto_defer_delay = 0.30
+        view.owner_only = False
+        interaction = _make_interaction(is_done=False)
+
+        async def prompt_callback(inter):
+            await inter.response.defer()
+
+        with caplog.at_level(logging.DEBUG, logger="cascadeui.views._interaction"):
+            await view._scheduled_task(_make_item(prompt_callback), interaction)
+
+        assert "Auto-defer backstop acked" not in caplog.text
+
+
 class TestAutoDeferFires:
     """Auto-defer timer fires when callbacks take longer than the delay threshold."""
 

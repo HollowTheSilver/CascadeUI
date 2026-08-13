@@ -42,6 +42,7 @@ from cascadeui import (
     key_value,
     link_section,
     progress_bar,
+    render_progress,
     stats_card,
     tab_nav,
     toggle_button,
@@ -711,6 +712,30 @@ class TestStatsCard:
         assert len(children) == 3
 
 
+class TestRenderProgress:
+    """The bar as a string, for callers inlining it into a row."""
+
+    def test_returns_a_string_not_a_component(self):
+        assert isinstance(render_progress(5, 10), str)
+
+    def test_the_builder_composes_the_same_string(self):
+        """One renderer, so the two can never drift apart."""
+        assert progress_bar(7, 10, width=10).content == render_progress(7, 10, width=10)
+
+    def test_width_bounds_the_bar_however_large_the_value(self):
+        """A hand-rolled glyph loop grows a cell per unit; this does not."""
+        bar = render_progress(400, 5, width=5, show_percent=False)
+        assert len(bar) == 7  # five cells plus the two brackets
+
+    def test_rejects_a_non_numeric_value(self):
+        with pytest.raises(TypeError, match="render_progress: value must be a number"):
+            render_progress("x", 10)
+
+    def test_rejects_a_non_positive_max(self):
+        with pytest.raises(ValueError, match="render_progress: max_value must be positive"):
+            render_progress(1, 0)
+
+
 class TestProgressBar:
     """text-based progress bar as TextDisplay."""
 
@@ -988,6 +1013,32 @@ class TestPaginatedRegionSlicing:
         assert region.page == 3
         assert region.page_items == [9]
 
+    def test_a_from_end_index_resolves_against_the_items_that_arrive(self):
+        """``set_page(-1)`` names the last page of the next render, not this one.
+
+        ``show_page`` seeks and then re-renders, and the host's ``on_load``
+        assigns fresh items during that render. Resolved against the list in
+        hand, a negative index leaves the cursor on the old last page whenever
+        the new list crossed a ``per_page`` boundary, so the row that prompted
+        the jump renders off-screen.
+        """
+        region = PaginatedRegion(per_page=4, items=list(range(8)))
+        region.set_page(-1)
+        assert region.page == 1  # last page of the list in hand
+
+        region.items = list(range(9))  # the render loads one more, crossing 4
+        assert region.page == 2
+        assert region.page_items == [8]
+
+    def test_an_explicit_move_drops_a_pending_from_end_index(self):
+        """Only an unconsumed seek re-resolves; a later move is the user's."""
+        region = PaginatedRegion(per_page=4, items=list(range(8)))
+        region.set_page(-1)
+        region.set_page(0)
+
+        region.items = list(range(9))
+        assert region.page == 0
+
     def test_deferred_page_still_clamps_once_the_list_is_known(self):
         """Holding the index is not the same as trusting it."""
         region = PaginatedRegion(per_page=3, items=[])
@@ -1005,11 +1056,16 @@ class TestPaginatedRegionSlicing:
         assert region.page_items == []
         assert region.page == 0  # the read corrected it
 
-    def test_set_page_rejects_negative_without_items(self):
-        """A negative index needs no item list to be wrong."""
+    def test_a_negative_index_on_an_empty_region_resolves_to_zero_and_waits(self):
+        """With no items there is one page, so the immediate resolution is
+        zero. The request is still held: an index counted from an end the
+        region does not have yet is answered when the items arrive."""
         region = PaginatedRegion(per_page=3, items=[])
         region.set_page(-5)
         assert region.page == 0
+
+        region.items = list(range(30))  # ten pages; -5 counts back from ten
+        assert region.page == 5
 
     def test_carousel_per_page_one(self):
         region = PaginatedRegion(per_page=1, items=["a", "b", "c"])
@@ -1301,6 +1357,44 @@ class TestPaginatedRegionNavigation:
         region.controls(_FakeHost())
         await region._make_jump(lambda: region.page_count - 1)(make_interaction())
         assert region.page == 2
+
+    async def test_the_last_button_lands_on_the_page_the_render_loads(self):
+        """Resolving at click time is one render too early on a reloading host.
+
+        The button names the last page, then the re-render reloads the host,
+        which is where a grown list arrives. Resolved against the count in
+        hand, the click lands one page short of the row that prompted it and
+        the nav row reports there is a page after this one.
+        """
+
+        class _GrowingHost:
+            def __init__(self, region, source):
+                self.region, self.source = region, source
+
+            def build_ui(self):
+                self.region.items = list(self.source)
+
+            async def refresh(self, **kwargs):
+                return None
+
+            def is_finished(self):
+                return False
+
+        source = list(range(25))
+        region = PaginatedRegion(per_page=5, items=list(source))
+        rows = region.controls(_GrowingHost(region, source))
+        last_button = next(
+            child
+            for row in rows
+            for child in row.children
+            if (getattr(child, "custom_id", "") or "").endswith("_last")
+        )
+
+        source[:] = list(range(26))  # crosses the per_page boundary
+        await last_button.callback(make_interaction())
+
+        assert region.page == region.page_count - 1 == 5
+        assert 25 in region.page_items  # the row that prompted the jump
 
     async def test_jump_first_returns_to_zero(self):
         region = PaginatedRegion(per_page=2, items=list(range(6)))

@@ -23,6 +23,142 @@ preserved below for historical reference but are not the supported baseline.
 
 ---
 
+## [3.11.0] - 2026-08-13
+
+### Breaking
+
+- **The two unprefixed library tables are renamed.** `persistent_views` is now
+  `cascadeui_persistent_views`, and `application_slots` is now
+  `cascadeui_application_slots` (`cascadeui_schema` and `cascadeui_kv` are
+  unchanged). The old names made an operator scope on `cascadeui_%` (a
+  filtered backup, a grant, an audit query) silently miss the registry, and
+  let `CREATE TABLE IF NOT EXISTS` adopt a consumer's same-named table. The
+  SQL backends migrate an existing database in place on the first boot:
+  the old table is renamed -- indexes and schema-version record included --
+  in one transaction, only after its columns confirm it is the library's. A
+  same-named consumer table without those columns is never touched, and when
+  both names exist with rows, nothing is renamed, the library uses the new
+  name, and a WARNING names both tables. On PostgreSQL the rename needs table
+  ownership, which the usual DML grants do not confer: a role without it gets
+  `PersistenceSchemaError` naming both tables and the privilege, the database
+  is left unchanged, and the rename retries once the privilege is there. A role
+  that cannot see the old table at all skips it silently. What needs a hand:
+  external scripts, grants, and backup filters naming the old tables move to
+  the new names; a schema migrator keyed on an old name is refused at
+  registration with a `ValueError` naming the current one (keyed on the old
+  string, it would never be looked up); a custom non-SQL backend that persists
+  rows keyed by namespace string moves its `persistent_views` /
+  `application_slots` keys itself; and every process sharing one database
+  upgrades together, since an older library will not find the renamed tables.
+
+### Added
+
+- `LeaderboardLayoutView.get_entries()` accepts an `async def` override, so a
+  board whose rows live in a database reads them through the documented seam
+  instead of caching into a private field. The patterns guide covers both
+  shapes and when to prefer each.
+- `EntryList` type alias, exported from the package root beside `EmojiInput`
+  and `MediaInput`, for annotating a `get_entries()` override.
+- `render_progress()` returns a progress bar as a string, for inlining into
+  text a caller is already building: a leaderboard row's secondary line, a
+  `key_value` cell, a `stats_card` field. `progress_bar()` composes its
+  `TextDisplay` from it, so an inlined bar and a standalone one cannot
+  render differently. Both clamp `value` and hold the bar to `width` cells.
+- `view.parent` reads the view a child is attached to, or `None` for a root.
+  Available from construction when the child was built with `parent=`, so a
+  child panel reaching its parent no longer stores the same view twice.
+- The auto-defer backstop logs at INFO when it fires, naming the surface and
+  the elapsed time. Firing means a handler used its whole `auto_defer_delay`
+  budget and the interaction was rescued rather than lost: the leading
+  indicator for a surface that will eventually miss the deadline. It covers
+  all four acked
+  surfaces (view callbacks, the send pipeline, `DynamicPersistentButton`, and
+  `Modal.on_submit`), and the window it measures starts before the access
+  check and any `serialize_interactions` lock wait, so it prices work no
+  wrapper around a callback can reach. The cancelled path stays silent and
+  free: nothing is timed unless the ack actually lands late.
+- `table_prefix=` on `SQLiteBackend` and `PostgresBackend`, applied to every
+  table and index they create and query, carried on PostgreSQL's invalidation
+  channel so two prefixed deployments do not read each other's notifications,
+  and `physical_table(backend, name)` for a migrator resolving a table name
+  through it. The prefix keeps two CascadeUI deployments sharing one database
+  apart. Empty by default, so existing databases are unaffected. The
+  persistence guide now names the full table set.
+- `docs/guide/persistence.md` gains a "Class identity" section: moving or
+  renaming a persistent view class leaves its stored rows holding the old
+  name, and `session_class_key` is what keeps them resolving.
+- Screenshots and short recordings throughout the documentation site and the
+  README, covering every V2 builder, composite, and view pattern. The landing
+  page now opens with a working counter beside the view it renders.
+
+### Fixed
+
+- A view that set `session_class_key` could not be popped back to. Navigation
+  entries recorded the session key while the class registry is keyed on the
+  import path, so the lookup missed and Back died as a logged warning and a
+  `None`. Entries now record the class path. The pin is the sanctioned answer
+  to a persistence hazard, so following that advice on a navigating view had
+  traded one bug for another.
+- Two persistent view classes sharing one `session_class_key` silently
+  displaced each other in the class registry, and every stored row under that
+  key reattached as whichever class was defined last. The collision now raises
+  at class definition, before either registry is written.
+- `session_class_key` accepted any truthy value. A non-string reached the
+  backend as the `view_class` column, where SQLite stored its digits and the
+  lookup then missed forever. An empty string was ignored outright, so a
+  class that declared one was never pinned and would orphan its rows on the
+  first move. Both are refused at class definition. Several refusals below
+  fire there too, so a class that imported on 3.10.0 can now fail at import
+  rather than at first render; each entry names the seam it guards.
+- The reattach warning attributed every skipped row to a missing class, though
+  rows turned away by a kwargs migrator land in the same bucket. It now counts
+  only unresolved classes and names each stored string with its row count, the
+  name an operator registers a class under or pins `session_class_key` to.
+- The five `on_role_*` hooks, `get_avatar_url`, and `resolve_avatar_urls` were
+  awaited unconditionally, so an override that needed no `await` and was
+  written `def` raised a `TypeError` from inside the library. On a role button
+  it escaped the handler entirely and surfaced as "This interaction failed".
+- The leaderboard's frame and row hooks (`build_title`, `build_header`,
+  `build_footer`, `format_entry`, `format_primary`, `format_secondary`,
+  `on_leaderboard_empty`) accept `async def` overrides; an async one
+  previously leaked its coroutine into the page build.
+- `format_rank`, `format_name`, `format_stats`, `format_accessory`, the roles
+  panel's five compose hooks, and the wizard's `step_indicator_label` resolve
+  where nothing can await them, so an async override rendered as a coroutine
+  repr in the board, on the button, or in the role card with nothing raised.
+  They are refused at class definition, naming the seam.
+- Every seam that refuses an async override missed one supplied as a
+  `staticmethod` or `classmethod`, which is how a class body declares a
+  plain-function hook, and missed an `async def` carrying a stray `yield`.
+  `state_selector` and `@computed` selectors accepted both shapes silently,
+  leaving the view deaf to state updates or the value never resolved.
+- The seams that take their hook as an argument rather than reading it off a
+  class body kept the narrower check: `Collapsible(reveal=)` and `summary=`,
+  `StateStore.subscribe(selector=)`, `restore_on_dropped_render(rebuild=)`,
+  and a wizard step's `condition`. All refuse the same set now.
+- A leaderboard rebuild read `get_entries()` twice, once for the change
+  signature and again for the page build, and stamped the signature from the
+  first read while rendering the second.
+- `PaginatedRegion.set_page()` resolved a negative index against the page
+  count it had at the time of the call, but `show_page()` seeks and then
+  re-renders, and the host loads fresh items during that render. A list that
+  grew across a `per_page` boundary therefore left `show_page(-1)` on the old
+  last page, so the row that prompted the jump rendered off-screen under a
+  cursor reporting a later page. The index now resolves against the items that
+  arrive; an explicit move drops a pending one.
+- A state notification queued before a view's teardown could arrive after it,
+  and the torn-down view still rebuilt. Cross-view fan-out is fire-and-forget,
+  so the gap is ordinary rather than rare: the rebuild rendered into a view
+  that could no longer be interacted with, and read attributes the teardown
+  had already cleared, which surfaced as an ERROR and a traceback from inside
+  the subscriber wrapper rather than as anything the user could act on.
+  Finished views now skip the rebuild.
+- The `v2_leaderboard` example sorted only its real guild members, so a board
+  padded with demo rows rendered out of order beneath a footer stating
+  "Rankings sorted by MMR". The assembled board is now sorted.
+
+---
+
 ## [3.10.0] - 2026-08-10
 
 ### Breaking

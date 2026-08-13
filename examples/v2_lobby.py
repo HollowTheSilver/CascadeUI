@@ -309,9 +309,9 @@ class LobbyView(StatefulLayoutView):
         channel. This override pings each participant by mention so
         they know the lobby they joined is gone.
         """
-        if self.participants and self._message:
+        if self.participants and self.message:
             mentions = " ".join(f"<@{uid}>" for uid in self.participants)
-            await self._message.channel.send(
+            await self.message.channel.send(
                 f"{mentions} - the host opened a new lobby. This one has been closed."
             )
 

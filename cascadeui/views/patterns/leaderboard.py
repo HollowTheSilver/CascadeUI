@@ -16,9 +16,15 @@ from ...components.patterns.v2 import (
     image_section,
 )
 from ...components.types import MediaInput
+from ...utils.hooks import await_maybe, is_async_callable
 from ..base import RenderOutcome, _StatefulMixin
 from ..persistent import _PersistentMixin
 from .paginated import PaginatedLayoutView, _BasePaginatedMixin
+
+# What ``get_entries()`` resolves to. Public so a subclass can annotate its own
+# override, and the same annotation whether that override is sync or async: an
+# async function's return annotation names the value it resolves to.
+EntryList = List[Tuple[int, dict]]
 
 # Sentinel distinguishing an explicitly passed ``None`` (suppress that
 # masthead piece) from an omitted kwarg (fall back to the class default).
@@ -276,12 +282,38 @@ class _BaseLeaderboardMixin:
         if "banner" in own:
             cls._validate_attribute_value("banner", own["banner"])
 
-    def get_entries(self) -> List[Tuple[int, dict]]:
+        # These four compose the rank row inside the synchronous
+        # ``format_entry``, which cannot await them. An async override is not
+        # loud there: the coroutine formats into the row and the board renders
+        # "<coroutine object ...>" where the name or the score belongs, with
+        # nothing raised. Rejected here so the mistake surfaces at import.
+        for name in ("format_rank", "format_name", "format_stats", "format_accessory"):
+            hook = own.get(name)
+            if hook is not None and is_async_callable(hook):
+                raise TypeError(
+                    f"{cls.__name__}.{name} must be synchronous; it composes the "
+                    f"rank row inside format_entry, which cannot await it, so an "
+                    f"async one renders as a coroutine repr in the board."
+                    f"\n  Fix: keep it a plain def. Resolve anything that needs "
+                    f"awaiting in get_entries or on_load, and read the result here."
+                )
+
+    def get_entries(self) -> EntryList:
         """Return the sorted leaderboard entries as ``(user_id, stats)`` pairs.
 
-        Override for live data sources (e.g. reading ``store.computed``
-        or calling ``StateStore.iter_scoped``). Default returns the
-        ``entries=`` kwarg passed at construction.
+        Override for live data sources. A synchronous override reads
+        something already in memory (``store.computed``,
+        ``StateStore.iter_scoped``, a cache the view owns); ``async def``
+        is accepted for a source that must be awaited, such as a database.
+
+        An async override is read on every rebuild, and a rebuild runs on
+        every store dispatch the view is notified for. Where that is too
+        much traffic for the source, fetch in :meth:`on_load` instead,
+        cache on an attribute of your own, and return the cache from a
+        synchronous override here: :meth:`reload` is then the explicit
+        re-fetch, and it serializes and coalesces those fetches.
+
+        Default returns the ``entries=`` kwarg passed at construction.
         """
         return self._entries
 
@@ -436,7 +468,7 @@ class _BaseLeaderboardMixin:
 
         _CURRENT_INTERACTION.set(None)
         try:
-            resolved = await self.resolve_avatar_urls(user_ids)
+            resolved = await await_maybe(self.resolve_avatar_urls(user_ids))
         except asyncio.CancelledError:
             # Cancelled before completing (view teardown, or a navigation that
             # later rolled back to this view). Clear the schedule stamp so a
@@ -519,7 +551,7 @@ class _BaseLeaderboardMixin:
         """
         return None
 
-    def _build_masthead(self, page: int) -> list:
+    async def _build_masthead(self, page: int) -> list:
         """Compose the rankings card's masthead components for one page.
 
         The ``build_title`` hook wins whenever it returns non-``None``:
@@ -528,7 +560,7 @@ class _BaseLeaderboardMixin:
         to the declarative pair, in order: the ``banner`` image, then
         the ``## title`` heading. Both unset composes an empty masthead.
         """
-        hook_value = self.build_title(page)
+        hook_value = await await_maybe(self.build_title(page))
         if hook_value is not None:
             return _as_frame_items(hook_value)
         items: list = []
@@ -636,13 +668,16 @@ class _BaseLeaderboardMixin:
         await self.rebuild_pages()
         await super().on_state_changed(state)
 
-    async def _build_leaderboard_pages(self) -> list:
+    async def _build_leaderboard_pages(self, entries=None) -> list:
         """Convert entries into a list of V2 component lists for pagination.
 
         Async because ``entry_layout = "sections"`` awaits
         ``get_avatar_url`` once per entry to resolve optional thumbnails.
         Lines mode never awaits but shares this coroutine so the two
         render branches sit behind one coherent builder.
+
+        ``entries`` accepts a set already read from ``get_entries()`` so one
+        rebuild costs one read; omit it and the hook is consulted here.
 
         The whole build runs inside the view's theme context so the
         rankings card and every user hook invoked here (``build_title``,
@@ -652,20 +687,24 @@ class _BaseLeaderboardMixin:
         from ...theming.context import theme_context
 
         with theme_context(self.get_theme()):
-            return await self._build_leaderboard_pages_inner()
+            return await self._build_leaderboard_pages_inner(entries)
 
-    async def _build_leaderboard_pages_inner(self) -> list:
-        # Normalized here as well as in ``rebuild_pages``: page building is
-        # reachable without it, and a hook is re-consulted on every call, so
-        # an override returning a different shape later gets the same answer.
-        entries = _normalize_entries(self.get_entries(), type(self).__name__, "get_entries()")
+    async def _build_leaderboard_pages_inner(self, entries=None) -> list:
+        # Reading the hook here as well leaves page building reachable on its
+        # own, and re-consults an override that returns a different shape
+        # later. rebuild_pages passes what it already read, because an async
+        # override backed by a database would otherwise be queried twice per
+        # rebuild and render a set its own signature did not describe.
+        if entries is None:
+            entries = await await_maybe(self.get_entries())
+        entries = _normalize_entries(entries, type(self).__name__, "get_entries()")
 
         if not entries:
             # Cleared before the masthead and frames compose, so a hook
             # reading ranked_entries sees an empty board rather than the
             # slice from the last populated build.
             self._ranked_entries = []
-            items = self._build_masthead(0)
+            items = await self._build_masthead(0)
             if items and self.show_title_divider:
                 items.append(divider())
             # The frames run here for the same reason the masthead does: the
@@ -676,14 +715,21 @@ class _BaseLeaderboardMixin:
             # their above-the-card placement), footer components below the
             # empty-state content, each in returned order at the page's top
             # level.
-            header = _as_frame_items(self.build_header(0))
-            footer = _as_frame_items(self.build_footer(0))
+            header = _as_frame_items(await await_maybe(self.build_header(0)))
+            footer = _as_frame_items(await await_maybe(self.build_footer(0)))
             # The empty-state content is composed here rather than inside the
             # default hook -- see on_leaderboard_empty. Routed through
             # _resolve_page so the same non-list shapes (bare component,
             # string) every page value accepts also work on an override's
             # return.
-            return [[*header, *items, *self._resolve_page(self.on_leaderboard_empty()), *footer]]
+            return [
+                [
+                    *header,
+                    *items,
+                    *self._resolve_page(await await_maybe(self.on_leaderboard_empty())),
+                    *footer,
+                ]
+            ]
 
         top = entries[: self.leaderboard_top_n]
         # Expose the loaded top-N slice so build_header / build_footer /
@@ -707,7 +753,7 @@ class _BaseLeaderboardMixin:
         # bucket and run serially, so keep HTTP off this path.
         if self.entry_layout == "sections":
             avatar_urls = await asyncio.gather(
-                *(self.get_avatar_url(uid, stats) for uid, stats in top),
+                *(await_maybe(self.get_avatar_url(uid, stats)) for uid, stats in top),
                 return_exceptions=False,
             )
             self._maybe_schedule_avatar_backfill(top, avatar_urls)
@@ -720,7 +766,7 @@ class _BaseLeaderboardMixin:
             end = start + per_page
             page_entries = top[start:end]
 
-            items: list = self._build_masthead(page_idx)
+            items: list = await self._build_masthead(page_idx)
             if items and self.show_title_divider:
                 items.append(divider())
 
@@ -733,8 +779,8 @@ class _BaseLeaderboardMixin:
                     items.append(gap())
                 for offset, (uid, stats) in enumerate(page_entries):
                     rank = start + offset + 1
-                    primary = self.format_primary(rank, uid, stats)
-                    secondary = self.format_secondary(rank, uid, stats)
+                    primary = await await_maybe(self.format_primary(rank, uid, stats))
+                    secondary = await await_maybe(self.format_secondary(rank, uid, stats))
                     avatar = avatar_urls[start + offset]
                     if avatar:
                         items.append(image_section(primary, secondary, url=avatar))
@@ -748,7 +794,7 @@ class _BaseLeaderboardMixin:
                         items.append(TextDisplay(stacked))
             else:
                 lines = [
-                    self.format_entry(start + offset + 1, uid, stats)
+                    await await_maybe(self.format_entry(start + offset + 1, uid, stats))
                     for offset, (uid, stats) in enumerate(page_entries)
                 ]
                 body = "\n".join(lines)
@@ -766,12 +812,12 @@ class _BaseLeaderboardMixin:
             # renders as its own standalone card below the rankings. Folding a raw
             # footer in also keeps the page a single wrappable Container under
             # nav_inside_container.
-            footer = _as_frame_items(self.build_footer(page_idx))
+            footer = _as_frame_items(await await_maybe(self.build_footer(page_idx)))
             footer_cards = [f for f in footer if isinstance(f, Container)]
             footer_inline = [f for f in footer if not isinstance(f, Container)]
             card_children = [*items, *footer_inline] if footer_inline else items
             page_components: list = [card(*card_children, color=self.card_color)]
-            header = _as_frame_items(self.build_header(page_idx))
+            header = _as_frame_items(await await_maybe(self.build_header(page_idx)))
             pages.append([*header, *page_components, *footer_cards])
 
         return pages
@@ -962,11 +1008,13 @@ class LeaderboardLayoutView(_BaseLeaderboardMixin, PaginatedLayoutView):
         rendered pages (a filter, or a select's highlighted option read
         by ``build_header``).
         """
-        entries = _normalize_entries(self.get_entries(), type(self).__name__, "get_entries()")
+        entries = _normalize_entries(
+            await await_maybe(self.get_entries()), type(self).__name__, "get_entries()"
+        )
         signature = self._entries_signature_for(entries)
         if not force and signature == getattr(self, "_entries_signature", None) and self.pages:
             return
-        pages = await self._build_leaderboard_pages()
+        pages = await self._build_leaderboard_pages(entries)
         # Stamped only after the build returns: a raising hook (an avatar
         # resolver, a frame hook) leaves the signature unstamped, so the next
         # rebuild retries instead of short-circuiting onto the stale pages.

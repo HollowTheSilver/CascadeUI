@@ -47,6 +47,7 @@ from cascadeui import (
     get_store,
     key_value,
     read_slot,
+    render_progress,
     stats_card,
 )
 
@@ -217,9 +218,14 @@ class PollView(StatefulLayoutView):
         # stats_card() reads get_current_theme() when no explicit
         # color= is passed, same as card().
         result_stats = {}
+        # Scaled against the leading choice rather than a fixed vote count, so
+        # the bar stays five cells wide however many votes arrive. render_progress
+        # returns the bar as a string for inlining; progress_bar() is the same
+        # thing wrapped in a TextDisplay, for when it is its own component.
+        busiest = max([*totals.values(), 1])
         for lang, emoji in CHOICES.items():
             count = totals.get(lang, 0)
-            bar = "\N{FULL BLOCK}" * count + "\N{LIGHT SHADE}" * max(0, 5 - count)
+            bar = render_progress(count, busiest, width=5, show_percent=False)
             label = f"{emoji} {lang.capitalize()}"
             result_stats[label] = f"`{bar}` {count}"
 

@@ -160,13 +160,15 @@ class CharacterCreatorView(WizardLayoutView):
     auto_defer = True
     instance_limit = 1
     instance_scope = "user"  # One open creator per user, across guilds.
-    instance_policy = "replace"
-    replace_policy = "delete"
+    # Reject rather than replace: a half-built character lives on instance
+    # attributes, so replacing the view would discard six steps of input with
+    # nothing to recover it from. Rejecting sends the message below instead,
+    # which only the reject path ever reads.
+    instance_policy = "reject"
     exit_policy = "delete"
     # state_scope = None because character sheet state lives on instance
     # attributes (_name, _race, etc.), not the Redux tree.
     state_scope = None
-    auto_refresh_ephemeral = False  # Non-ephemeral view; the refresh handoff never arms.
     instance_limit_message = (
         "You already have a character creator open. Finish or exit it before starting another."
     )
@@ -212,7 +214,7 @@ class CharacterCreatorView(WizardLayoutView):
         # ``self.build_identity()``) -- the wizard calls them each time a
         # step renders, reading whatever the instance attributes above hold
         # at that moment. An accidental trailing ``()`` raises ``ValueError``
-        # at class-load time rather than on the first click. Review has no
+        # at construction time rather than on the first click. Review has no
         # validator because the finish button runs on the last step.
         steps = [
             WizardStep(

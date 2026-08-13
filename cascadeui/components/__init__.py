@@ -42,6 +42,7 @@ from .patterns import (
     key_value,
     link_section,
     progress_bar,
+    render_progress,
     stats_card,
     tab_nav,
     toggle_button,
@@ -118,6 +119,7 @@ __all__ = [
     "alert",
     "stats_card",
     "progress_bar",
+    "render_progress",
     # V2 separators
     "divider",
     "gap",

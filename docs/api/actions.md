@@ -303,8 +303,8 @@ registry.
 ### `REGISTRY_PRUNED`
 
 Dispatched by `PersistenceManager.prune_registry()` after deleting rows from the
-`persistent_views` registry (reattach pruning a message deleted while the bot was
-offline, or an explicit clear). Dispatch-only: no reducer, no state change.
+`cascadeui_persistent_views` registry (reattach pruning a message deleted while the
+bot was offline, or an explicit clear). Dispatch-only: no reducer, no state change.
 
 During startup reattach, `REGISTRY_PRUNED` fires synchronously inside `setup_middleware`.
 Under the canonical setup order (cogs loaded before `setup_middleware`), a subscription wired
@@ -319,7 +319,7 @@ only in `on_ready` or later misses it (dispatches once, no replay). For that cas
 |-----|------|-------------|
 | `deleted` | `int` | Number of rows removed |
 | `keys` | `list[str]` | The `persistence_key`s actually pruned; a key passed in but absent on disk is not listed |
-| `reason` | `str` | `"explicit"` for a targeted prune, `"clear_all"` for a full wipe |
+| `reason` | `str` | Why the rows went: `"explicit"` for a targeted prune, `"clear_all"` for a full wipe, `"unreachable"` when `prune_unreachable` deleted them. `prune_registry(reason=)` passes any caller-supplied string through, so treat the value as open rather than a closed set |
 
 **State change:** None. The `keys` list lets a subscriber clear exactly the affected external records without sweeping its whole domain against the registry.
 

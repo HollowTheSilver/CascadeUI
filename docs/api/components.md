@@ -60,6 +60,27 @@ Discord's upper bound on a component `id`. See
 
 ---
 
+### `EntryList`
+
+```python
+EntryList = List[Tuple[int, dict]]
+```
+
+Exported from the package root beside `EmojiInput` and `MediaInput`. The
+shape `LeaderboardLayoutView.get_entries()` resolves to: `(user_id, stats)`
+pairs. Annotate an override with `EntryList` whichever shape it takes: an
+`async def`'s return annotation names the value it resolves to, so both a
+plain `def` and an `async def` reading an awaited source annotate the same
+way.
+
+```python
+from cascadeui import EntryList, LeaderboardLayoutView
+
+class GuildRankings(LeaderboardLayoutView):
+    async def get_entries(self) -> EntryList:
+        return await self.fetch_rankings()
+```
+
 ## Naming a component
 
 Every V2 builder that returns exactly one component takes an optional
@@ -660,6 +681,14 @@ A text progress bar rendered into a `TextDisplay`. `width` is the bar length in 
 
 ```python
 progress_bar(7, 10)   # [██████████████░░░░░░] 70%
+```
+
+### `render_progress(value, max_value, *, width=20, filled="█", empty="░", show_percent=True)`
+
+The same bar as a `str`, for inlining into text a caller is already building: a leaderboard row's secondary line, a `key_value` cell, a `stats_card` field. `progress_bar` composes this into a `TextDisplay`, so the two never render differently.
+
+```python
+f"{name} {render_progress(wins, games, width=6)}"   # Ada [████░░] 66%
 ```
 
 ---
