@@ -164,7 +164,7 @@ applications that mix both.
 
 **Decision:** Backends implement a Python `Protocol` and declare their
 capabilities via a `Capability` flag enum (`KV`, `RELATIONAL`,
-`TTL_INDEX`, `SCHEMA_META`, `RAW_SQL`).
+`TTL_INDEX`, `SCHEMA_META`, `RAW_SQL`, `OPEN_ROWS`).
 
 **Alternatives considered:** Abstract base class forcing a SQL-shaped
 interface; hard-coded SQLite integration.

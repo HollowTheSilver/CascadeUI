@@ -284,6 +284,58 @@ class TestAttributeOverrides:
         formatted = _CustomMessages.assigned_message.format(role="TestRole", category="X")
         assert formatted == "✅ Got **TestRole**."
 
+    def test_a_typod_message_placeholder_is_refused(self, clean_role_registries):
+        """Each message renders inside a click handler, which cannot report it.
+
+        A wrong placeholder surfaced as a bare ``KeyError`` from library
+        code on the click that used it, naming neither the attribute nor
+        the valid placeholders.
+        """
+        with pytest.raises(ValueError, match="assigned_message is not a valid format template"):
+
+            class _Typo(RolesLayoutView):
+                categories = [RoleCategory(name="Typo", roles={"A": 1})]
+                assigned_message = "You now have {roles}"
+
+    def test_an_unbalanced_message_brace_is_refused(self, clean_role_registries):
+        with pytest.raises(ValueError, match="not a valid format template"):
+
+            class _Unbalanced(RolesLayoutView):
+                categories = [RoleCategory(name="Unbalanced", roles={"A": 1})]
+                required_message = "Keep one {category"
+
+    def test_a_format_spec_on_error_is_refused_at_definition(self, clean_role_registries):
+        """The validation sample is an exception instance, like the runtime value.
+
+        ``on_role_error`` formats a caught exception into the template, and
+        an exception accepts only the empty format spec. A string sample
+        would accept this template at definition and hand the author a bare
+        ``TypeError`` on the first failing click instead.
+        """
+        with pytest.raises(ValueError, match="role_error_message is not a valid"):
+
+            class _SpecOnError(RolesLayoutView):
+                categories = [RoleCategory(name="SpecOnError", roles={"A": 1})]
+                role_error_message = "failed: {error:>10}"
+
+    def test_every_message_placeholder_its_render_site_passes_is_accepted(
+        self, clean_role_registries
+    ):
+        """The table's placeholders match what the hooks actually format with."""
+
+        class _AllPlaceholders(RolesLayoutView):
+            categories = [RoleCategory(name="AllPlaceholders", roles={"A": 1})]
+            assigned_message = "{role} in {category}"
+            removed_message = "{role} out of {category}"
+            required_message = "keep one {role} in {category}"
+            swap_message = "{role} in {category}, dropped {removed}"
+            role_error_message = "failed: {error}"
+
+        assert (
+            _AllPlaceholders.swap_message.format(role="r", category="c", removed="x")
+            == "r in c, dropped x"
+        )
+
 
 # // ========================================( Cardinality Behavior )======================================== // #
 

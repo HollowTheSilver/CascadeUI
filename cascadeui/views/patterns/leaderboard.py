@@ -5,19 +5,21 @@ import asyncio
 from typing import ClassVar, Dict, List, Optional, Tuple, Union
 
 import discord
-from discord.ui import Container, Item, TextDisplay
+from discord.ui import Container, Item, Section, TextDisplay
 
 from ...components.patterns.v2 import (
-    _coerce_media_ref,
+    _media_ref_url,
+    _resolve_media_ref,
     card,
     divider,
     gallery,
     gap,
     image_section,
 )
-from ...components.types import MediaInput
+from ...components.types import MAX_MESSAGE_COMPONENTS, MediaInput
 from ...utils.hooks import await_maybe, is_async_callable
 from ..base import RenderOutcome, _StatefulMixin
+from ..layout import _OVER_CAPACITY_MARKER
 from ..persistent import _PersistentMixin
 from .paginated import PaginatedLayoutView, _BasePaginatedMixin
 
@@ -112,14 +114,31 @@ def _coerce_banner(value, owner: str):
     """Coerce a ``banner`` value to the media reference ``gallery`` accepts.
 
     ``None`` passes through, since a banner is optional where a builder's
-    media argument is required. Everything else resolves through the same
-    coercion the V2 media builders use, so an Asset, a File, and a URL
-    string mean here exactly what they mean there.
+    media argument is required. An empty or whitespace-only reference
+    normalizes to ``None`` for the same reason, rather than raising the
+    builders' required-media error: a blank banner means no banner, and
+    the masthead skips an absent one. Everything else resolves through
+    the same coercion the V2 media builders use, so an Asset, a File, and
+    a URL string mean here exactly what they mean there.
     """
     if value is None:
         return None
-    return _coerce_media_ref(value, owner=owner, param="banner=")
+    resolved = _resolve_media_ref(value, owner=owner, param="banner=")
+    url = _media_ref_url(resolved)
+    if url is not None and not url.strip():
+        return None
+    return resolved
 
+
+# A Section row costs four components (the Section, two text nodes, and
+# the thumbnail accessory), and the default single-page frame costs four
+# more. Measured against the message cap: nine rows land exactly on it,
+# ten overflow. A paged board fits fewer because it also pays a nav row.
+_SECTIONS_ROW_COMPONENTS = 4
+_SECTIONS_FRAME_COMPONENTS = 4
+_SECTIONS_SINGLE_PAGE_MAX = (
+    MAX_MESSAGE_COMPONENTS - _SECTIONS_FRAME_COMPONENTS
+) // _SECTIONS_ROW_COMPONENTS
 
 _DEFAULT_AVATAR_CDN = "https://cdn.discordapp.com/embed/avatars/{index}.png"
 
@@ -134,6 +153,18 @@ def _default_avatar_url(user_id: int) -> str:
     TextDisplay fallback.
     """
     return _DEFAULT_AVATAR_CDN.format(index=(user_id >> 22) % 6)
+
+
+def _per_page_advice(per_page: Optional[int]) -> str:
+    """Phrase the per-page fix for whichever value the board is carrying.
+
+    A None per_page collapses every entry onto one page, which is the
+    configuration most likely to overflow -- and the one where "lower
+    leaderboard_per_page" is not an instruction anyone can follow.
+    """
+    if per_page is None:
+        return "set leaderboard_per_page to split the board across pages"
+    return f"lower leaderboard_per_page (currently {per_page!r})"
 
 
 # // ========================================( Shared Mixin )======================================== // #
@@ -782,6 +813,12 @@ class _BaseLeaderboardMixin:
                     primary = await await_maybe(self.format_primary(rank, uid, stats))
                     secondary = await await_maybe(self.format_secondary(rank, uid, stats))
                     avatar = avatar_urls[start + offset]
+                    # A whitespace-only override return can never resolve as
+                    # media, so it takes the same stacked fallback as None
+                    # instead of raising the empty-media error from inside a
+                    # page build the library drives.
+                    if isinstance(avatar, str) and not avatar.strip():
+                        avatar = None
                     if avatar:
                         items.append(image_section(primary, secondary, url=avatar))
                     else:
@@ -987,6 +1024,119 @@ class LeaderboardLayoutView(_BaseLeaderboardMixin, PaginatedLayoutView):
         # pushed leaderboard is not stranded. Subclasses that override on_load
         # must keep this call after fetching.
         self._recompose_page_tree(rebuild_nav=True)
+
+    def _recompose_page_tree(self, *, rebuild_nav: bool = False) -> None:
+        """Compose the page tree, restating an overflow in board terms.
+
+        Every path that rebuilds a board arrives here: the initial load, a
+        state change that grew the entry list, and an explicit reload. The
+        restatement belongs at this one seam rather than at each caller, or
+        the automatic path reports the overflow in a vocabulary that does
+        not apply to a board while the explicit one reports it correctly.
+        """
+        try:
+            super()._recompose_page_tree(rebuild_nav=rebuild_nav)
+        except ValueError as exc:
+            if _OVER_CAPACITY_MARKER not in str(exc):
+                raise
+            raise ValueError(self._over_budget_message()) from exc
+
+    def _page_renders_sections(self) -> bool:
+        """Report whether the built page actually carries Section rows.
+
+        A bound client is what lets an avatar resolve, not what guarantees
+        one did. The page in hand is the only place the answer is settled.
+        """
+        pages = self.pages or []
+        if not pages:
+            return self.bot is not None
+        page = pages[min(self.current_page, len(pages) - 1)]
+        items = page if isinstance(page, list) else [page]
+        for item in items:
+            if isinstance(item, Section):
+                return True
+            walk = getattr(item, "walk_children", None)
+            if walk is not None and any(isinstance(child, Section) for child in walk()):
+                return True
+        return False
+
+    def _over_budget_message(self) -> str:
+        """Explain a component-budget overflow in leaderboard terms.
+
+        The layout error the tree raises names components and suggests
+        folding text nodes, which is the right advice for a hand-composed
+        view and the wrong advice for a board, whose size is set by how many
+        entries a page carries.
+
+        The rows are only the whole story when they can account for the
+        overflow. A section row costs four components once a client is bound
+        and one without, so the same class fits offline and overflows in
+        production; a lines board costs one either way, and a five-row lines
+        board that overflows is carrying its weight in the page frame
+        instead. Naming the rows there would send the reader to two knobs
+        that cannot fix it.
+
+        The per-row cost is counted off the page that was just built rather
+        than inferred from the client. Whether a section row becomes a
+        Section is decided by whether an avatar resolved, so a
+        ``get_avatar_url`` override returning nothing degrades every row to
+        a stacked text node with a client still bound -- and pricing those
+        rows at four blames them for a page whose weight is in its frame.
+        """
+        owner = type(self).__name__
+        per_page = self.leaderboard_per_page
+        rows = per_page if per_page is not None else self.leaderboard_top_n
+        sections = self.entry_layout == "sections"
+        per_row = _SECTIONS_ROW_COMPONENTS if sections and self._page_renders_sections() else 1
+        rows_cost = rows * per_row
+
+        if rows_cost <= MAX_MESSAGE_COMPONENTS // 2:
+            # The entries are a minority of the budget, so the frame is
+            # where it went.
+            return (
+                f"{owner} exceeds Discord's {MAX_MESSAGE_COMPONENTS}-component "
+                f"budget for one message. Its {rows} entries account for about "
+                f"{rows_cost} of that, so the rest is page frame: whatever "
+                f"build_header, build_footer, and _build_extra_items add to "
+                f"every page.\n"
+                f"  Fix: trim those hooks, or {_per_page_advice(per_page)} "
+                f"to leave them more room."
+            )
+
+        bound = "bound" if self.bot is not None else "not bound"
+        # Every clause below is conditioned on what the page did, not on
+        # what the layout asked for.
+        as_sections = sections and per_row > 1
+        if as_sections:
+            note = (
+                " A section row resolves an avatar into a thumbnail only when a "
+                "client is bound, so a board that fits with none can overflow "
+                "once one is."
+            )
+            alternative = (
+                ", or set entry_layout='lines', which renders one component "
+                "per row whatever the client state."
+            )
+        elif sections:
+            note = (
+                " Its section rows render as stacked text because no avatar "
+                "resolved, so they already cost the one component a lines row "
+                "costs and entry_layout is not the knob here."
+            )
+            alternative = ", or trim build_header / build_footer."
+        else:
+            note = ""
+            alternative = ", or trim build_header / build_footer."
+        return (
+            f"{owner} composes {rows} entries per page in "
+            f"entry_layout={self.entry_layout!r} with a client {bound}, which "
+            f"costs {per_row} component(s) per row and exceeds Discord's "
+            f"{MAX_MESSAGE_COMPONENTS}-component budget for one message."
+            f"{note}\n"
+            f"  Fix: {_per_page_advice(per_page)} so "
+            f"fewer entries share a page, lower leaderboard_top_n (currently "
+            f"{self.leaderboard_top_n})" + alternative
+        )
 
     async def rebuild_pages(self, *, force: bool = False) -> None:
         """Re-fetch entries and rebuild the page list.

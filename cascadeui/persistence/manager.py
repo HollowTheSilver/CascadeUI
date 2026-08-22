@@ -337,6 +337,10 @@ class PersistenceManager:
                     f"ownership, which the usual SELECT/INSERT/UPDATE/DELETE grants do "
                     f"not confer."
                 ) from exc
+            # Outside the rename path on purpose: a database renamed under an
+            # earlier release early-returns at the old_exists probe and would
+            # never reach a repair living inside that transaction.
+            await self._normalize_pkey_name(backend, table)
 
     async def _legacy_rename_already_done(
         self, backend: PersistenceBackend, legacy_name: str, table: str
@@ -465,6 +469,115 @@ class PersistenceManager:
                     legacy.old_name,
                 )
         logger.info(f"Renamed legacy table {phys_old!r} to {phys_new!r}")
+
+    async def _normalize_pkey_name(self, backend: PersistenceBackend, table: str) -> None:
+        """Rename a primary-key constraint left under a table's legacy name.
+
+        ``ALTER TABLE ... RENAME TO`` renames the table and nothing else on
+        PostgreSQL: the inline PRIMARY KEY's auto-named constraint keeps
+        ``persistent_views_pkey``, so an upgraded database and a fresh
+        install diverge in the catalog by upgrade path alone. SQLite's
+        autoindex follows the table through a rename, so only PostgreSQL
+        needs this. ``RENAME CONSTRAINT`` renames the backing index with
+        the constraint and needs the same table ownership the table rename
+        needed, so it rides the same grant story.
+
+        Failures log and return rather than raise: the table rename guards
+        data reachability, but a constraint name guards only catalog
+        uniformity (no library SQL names the primary-key index), so a
+        stale name degrades nothing at runtime, and the normalization
+        retries on the next start.
+        """
+        # placeholder_style stands in for "speaks pg_catalog SQL", the same
+        # engine discriminator the existence probes above read. Positive
+        # match, so an unknown engine skips rather than receiving this SQL.
+        if backend.placeholder_style != "numeric":
+            return
+
+        phys = physical_table(backend, table)
+        # PostgreSQL truncates an identifier at 63 bytes, so a long
+        # table_prefix makes the name it stores shorter than the one built
+        # here. Comparing the untruncated form would never match, and this
+        # would try to rename on every boot and warn each time.
+        desired = f"{phys}_pkey".encode()[:63].decode(errors="ignore")
+        # Keyed on the table's own relation, never on a hardcoded old name:
+        # PostgreSQL uniquifies auto-names (persistent_views_pkey1) when the
+        # plain one is taken, and those must normalize too.
+        conname_sql = (
+            "SELECT c.conname AS conname "
+            "FROM pg_constraint c "
+            "JOIN pg_class t ON t.oid = c.conrelid "
+            "JOIN pg_namespace n ON n.oid = t.relnamespace "
+            "WHERE c.contype = 'p' AND t.relname = $1 "
+            "AND n.nspname = current_schema()"
+        )
+        try:
+            row = await backend.fetch_one(conname_sql, phys)
+            if row is None:
+                # Table absent, or a consumer's table with no primary key.
+                return
+            conname = row["conname"]
+            if conname == desired:
+                return
+            # Index names are relations, so a squatter on the desired name
+            # makes the rename fail; warn and leave the legacy name in place.
+            taken = await backend.fetch_one(
+                "SELECT 1 AS present FROM pg_class r "
+                "JOIN pg_namespace n ON n.oid = r.relnamespace "
+                "WHERE r.relname = $1 AND n.nspname = current_schema()",
+                desired,
+            )
+            if taken is not None:
+                logger.warning(
+                    f"The primary-key constraint on {phys!r} keeps its legacy "
+                    f"name {conname!r}: another relation already holds "
+                    f"{desired!r} in this schema. Rename or drop that relation "
+                    f"and the next start normalizes the constraint."
+                )
+                return
+        except Exception as exc:
+            logger.warning(
+                f"Could not read the primary-key constraint name on {phys!r}: "
+                f"{type(exc).__name__}: {exc}. Retried on the next start."
+            )
+            return
+
+        # The discovered name is catalog data; quote it the way the backends
+        # quote identifiers. The desired name is library-constructed.
+        quoted = '"' + conname.replace('"', '""') + '"'
+        try:
+            # The rename takes ACCESS EXCLUSIVE, so any open read against the
+            # table blocks it: a long query, a running dump, an outgoing
+            # process still shutting down. Without a bound it waits rather
+            # than failing, and a step designed to warn and retry would hang
+            # the boot instead. The transaction scopes the timeout to this
+            # statement, so nothing is left set on a pooled connection.
+            async with backend.transaction():
+                await backend.execute("SET LOCAL lock_timeout = '3s'")
+                await backend.execute(f"ALTER TABLE {phys} RENAME CONSTRAINT {quoted} TO {desired}")
+        except Exception as exc:
+            # Same shape as _legacy_rename_already_done: a second booting
+            # process can commit the rename between the probe and the ALTER.
+            try:
+                again = await backend.fetch_one(conname_sql, phys)
+            except Exception:
+                again = None
+            if again is not None and again["conname"] == desired:
+                logger.debug(
+                    f"Another process renamed the primary-key constraint on "
+                    f"{phys!r} to {desired!r} first; nothing to do."
+                )
+                return
+            logger.warning(
+                f"Renaming the primary-key constraint on {phys!r} from "
+                f"{conname!r} to {desired!r} failed: {type(exc).__name__}: "
+                f"{exc}. The stale name affects only catalog uniformity and "
+                f"the rename retries on the next start. Renaming a constraint "
+                f"needs table ownership, the same grant the table rename "
+                f"needed."
+            )
+            return
+        logger.info(f"Renamed primary-key constraint {conname!r} to {desired!r} on {phys!r}")
 
     async def apply_migrations(self) -> None:
         """Run registered schema migrators up to current version for
@@ -1638,11 +1751,11 @@ class PersistenceManager:
 
         await self._store.dispatch(
             "REGISTRY_PRUNED",
-            {
-                "deleted": deleted,
-                "keys": pruned,
-                "reason": reason or ("explicit" if persistence_keys else "clear_all"),
-            },
+            ActionCreators.registry_pruned(
+                deleted,
+                reason or ("explicit" if persistence_keys else "clear_all"),
+                keys=pruned,
+            ),
         )
         return deleted
 

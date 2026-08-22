@@ -9,7 +9,7 @@ Requires the ``aiosqlite`` extra::
 
     pip install pycascadeui[sqlite]
 
-One physical database serves all three namespaces plus the generic KV
+One physical database serves both namespaces plus the generic KV
 surface; shared table-name constants are the partitioning key. A single
 persistent connection is opened in :meth:`initialize` and reused; the
 :class:`~asyncio.Lock` on the connection guards SQLite's single-writer
@@ -27,7 +27,13 @@ from typing import Any, AsyncIterator, ClassVar, Optional
 import aiosqlite  # hard import -- backends/__init__.py catches ImportError
 
 from ..protocols import Capability
-from ..schema import ALL_DDL, TABLE_KV, TABLE_SCHEMA_META, apply_table_prefix
+from ..schema import (
+    ALL_DDL,
+    TABLE_KV,
+    TABLE_SCHEMA_META,
+    apply_table_prefix,
+    validate_table_prefix,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +102,7 @@ class SQLiteBackend:
 
     def __init__(self, db_path: str = "cascadeui.db", *, table_prefix: str = "") -> None:
         self.db_path = db_path
+        validate_table_prefix(table_prefix, "SQLiteBackend")
         self.table_prefix = table_prefix
         self._conn: aiosqlite.Connection | None = None
         self._write_lock = asyncio.Lock()
@@ -127,34 +134,49 @@ class SQLiteBackend:
         conn = await aiosqlite.connect(self.db_path)
         conn.row_factory = aiosqlite.Row  # dict-like access via column name
 
-        # WAL mode requires SQLite 3.7.0+. The PRAGMA returns the new
-        # journal mode as a string -- "wal" on success, the prior mode
-        # if the engine could not switch. Fail loud rather than running
-        # silently in DELETE mode with degraded concurrency.
-        cursor = await conn.execute("PRAGMA journal_mode=WAL")
-        mode_row = await cursor.fetchone()
-        await cursor.close()
-        if mode_row is None or str(mode_row[0]).lower() != "wal":
-            await conn.close()
-            raise RuntimeError(
-                f"SQLiteBackend could not enable WAL journal mode "
-                f"(got {mode_row[0] if mode_row else None!r}). "
-                f"WAL requires SQLite 3.7.0+ (released 2010-07-21)."
-            )
-        await conn.execute("PRAGMA foreign_keys=ON")
-        # synchronous=NORMAL is corruption-safe under WAL per
-        # sqlite.org/pragma.html#pragma_synchronous and substantially
-        # faster than the FULL default for commit-heavy workloads.
-        await conn.execute("PRAGMA synchronous=NORMAL")
-        # busy_timeout=5000 (5s) lets concurrent writers wait for the
-        # lock instead of raising OperationalError immediately. Important
-        # when an external SQLite process (devtools, ad-hoc scripts)
-        # holds the write lock briefly.
-        await conn.execute("PRAGMA busy_timeout=5000")
+        # Everything below runs against a connection this method owns and
+        # that ``close()`` cannot reach, because ``self._conn`` is assigned
+        # only once setup succeeds. aiosqlite backs each connection with a
+        # NON-daemon worker thread, so a connection dropped here outlives
+        # the failure, keeps the file handle, and blocks interpreter exit.
+        # Reachable from a corrupt or non-SQLite file at ``db_path``, a
+        # same-named consumer table whose columns fail the index DDL, a
+        # write lock held past ``busy_timeout``, and a full disk.
+        try:
+            # WAL mode requires SQLite 3.7.0+. The PRAGMA returns the new
+            # journal mode as a string -- "wal" on success, the prior mode
+            # if the engine could not switch. Fail loud rather than running
+            # silently in DELETE mode with degraded concurrency.
+            cursor = await conn.execute("PRAGMA journal_mode=WAL")
+            mode_row = await cursor.fetchone()
+            await cursor.close()
+            if mode_row is None or str(mode_row[0]).lower() != "wal":
+                raise RuntimeError(
+                    f"SQLiteBackend could not enable WAL journal mode "
+                    f"(got {mode_row[0] if mode_row else None!r}). "
+                    f"WAL requires SQLite 3.7.0+ (released 2010-07-21)."
+                )
+            await conn.execute("PRAGMA foreign_keys=ON")
+            # synchronous=NORMAL is corruption-safe under WAL per
+            # sqlite.org/pragma.html#pragma_synchronous and substantially
+            # faster than the FULL default for commit-heavy workloads.
+            await conn.execute("PRAGMA synchronous=NORMAL")
+            # busy_timeout=5000 (5s) lets concurrent writers wait for the
+            # lock instead of raising OperationalError immediately. Important
+            # when an external SQLite process (devtools, ad-hoc scripts)
+            # holds the write lock briefly.
+            await conn.execute("PRAGMA busy_timeout=5000")
 
-        for stmt in ALL_DDL:
-            await conn.execute(apply_table_prefix(stmt, self.table_prefix))
-        await conn.commit()
+            for stmt in ALL_DDL:
+                await conn.execute(apply_table_prefix(stmt, self.table_prefix))
+            await conn.commit()
+        except BaseException:
+            # BaseException so a cancelled initialize releases it too.
+            try:
+                await conn.close()
+            except Exception:
+                pass
+            raise
 
         self._conn = conn
         logger.debug(f"SQLiteBackend initialized: {self.db_path}")

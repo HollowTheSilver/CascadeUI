@@ -481,8 +481,10 @@ Condition callables are evaluated on every navigation, so toggling
 ### Typed schemas (`WizardStep` / `WizardSchema`)
 
 Same pattern as the form side. Both forms reject a non-callable `builder`,
-`validator` or `condition` at construction, and both reject an async
-`condition`. What the typed variant adds is IDE auto-complete, a required
+`validator` or `condition` at construction, and both reject a `condition`
+that is async or cannot accept the view (the visibility check treats a
+raising predicate as visible, so a zero-argument one would render the step
+it meant to hide). What the typed variant adds is IDE auto-complete, a required
 `builder` (the dict form treats it as optional, since a step with none
 renders its navigation alone), and failure at schema-definition time rather
 than when the view is built.
@@ -816,10 +818,18 @@ await view.send()
 ```
 
 `fetch_fn(offset, limit)` matches SQL / REST / Firestore idioms so
-typical backends drop in unchanged. Pages load lazily as the caller
-navigates; up to `cache_size` (default 10) recent pages stay
-resident, evicted in LRU order. The page currently displayed is
-never evicted -- revisiting it always avoids a refetch.
+typical backends drop in unchanged. A `fetch_fn` that cannot take both
+positional arguments raises `TypeError` at `from_cursor()` naming the
+signature it saw: cursor mode stores the callable and calls it for the
+first time from inside `on_load`, so an arity mismatch is caught before
+that first page load rather than surfacing from the page loader. The
+`formatter` gets the same check: one that cannot take the page's item
+chunk raises `TypeError` here too. `from_data` needs no equivalent,
+since it applies the formatter during construction and a wrong signature
+already fails on the caller's own line. Pages
+load lazily as the caller navigates; up to `cache_size` (default 10)
+recent pages stay resident, evicted in LRU order. The page currently
+displayed is never evicted -- revisiting it always avoids a refetch.
 
 `total` is required because the `Page N/M` indicator, the goto
 modal, and the first/last jump buttons all need the total page
@@ -851,6 +861,7 @@ Each navigation button exposes a `{label, emoji, style}` triple:
 | `prev_button_emoji` | `None` | |
 | `prev_button_style` | `secondary` | |
 | `indicator_button_label` | `None` (auto) | Page indicator and go-to button |
+| `indicator_button_format` | `None` (auto) | Page indicator and go-to button |
 | `indicator_button_emoji` | `None` | Go-to button only |
 | `indicator_button_style` | `primary` | Go-to button only |
 | `next_button_label` | `"▶"` | Next page button |
@@ -867,8 +878,35 @@ go-to-page modal triggered by clicking the page indicator.
 
 Below that threshold the indicator is a disabled button that always renders
 `secondary` with no emoji, since a disabled button in an accent colour reads
-as one that is broken. `indicator_button_label` still applies; the style and
-emoji reach the clickable go-to button only.
+as one that is broken. `indicator_button_label` and
+`indicator_button_format` still apply; the style and emoji reach the
+clickable go-to button only.
+
+#### Reformatting the page indicator
+
+`indicator_button_label` replaces the middle button's text with a literal,
+which freezes one string across every page. `indicator_button_format`
+templates it instead:
+
+```python
+class StandingsBoard(LeaderboardLayoutView):
+    indicator_button_format = "{page}/{total}"   # "3/12" rather than "Page 3/12"
+    jump_threshold = 999                          # keep the three-button row at any page count
+```
+
+`{page}` and `{total}` are one-based, matching the rendered defaults and the
+go-to modal's prompt. Unset, each node keeps its own default: the passive
+indicator reads `Page 3/12` and the clickable go-to button reads `3/12`. A
+literal `indicator_button_label` still wins when both are set.
+
+A template that cannot render raises `ValueError` at class definition rather
+than from inside a click, so a typo'd placeholder (`{pages}`), an unbalanced
+brace, or a positional `{}` fails at import.
+
+Raising `jump_threshold` above the page count is what keeps the row narrow:
+the same branch decides whether the first and last buttons appear and which
+of the two labels the middle takes, so a three-button row and the short text
+are reachable together only through the format attribute.
 
 ### `set_page(n)`
 
@@ -1417,6 +1455,11 @@ to suppress the hint entirely. Per-category dynamic hints override
 - `swap_message` -- sent after an exclusive-mode swap.
 - `role_error_message` -- sent on role mutation failure (forbidden,
   HTTP error).
+
+Each template is checked at class definition against its placeholders --
+a typo (`{roel}`) or an unbalanced brace raises `ValueError` naming the
+attribute and the placeholders it accepts, rather than a bare `KeyError`
+from inside the click that renders it.
 
 ### Override hooks
 

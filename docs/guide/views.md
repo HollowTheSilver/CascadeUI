@@ -492,8 +492,9 @@ and for `get_nav_state()` when the state belongs to one view.
 
 `push()` and `replace()` accept either a view class (the default form
 shown above) or a pre-constructed view instance. The instance form
-pairs with async classmethod constructors (`PaginatedLayoutView.from_data`
-and `from_cursor`) where the view is built before the navigation call.
+pairs with the classmethod constructors (`PaginatedLayoutView.from_data`,
+which is awaited, and `from_cursor`, which is not) where the view is
+built before the navigation call.
 
 ```python
 class HubView(StatefulLayoutView):

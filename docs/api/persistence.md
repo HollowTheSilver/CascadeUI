@@ -150,7 +150,7 @@ backend = InMemoryBackend()
 
 ### `SQLiteBackend(db_path="cascadeui.db", *, table_prefix="")`
 
-Requires `pip install pycascadeui[sqlite]`. Declares all five capabilities (including `RAW_SQL`). Uses WAL mode and prepared statements, with `synchronous=NORMAL` and a 5-second busy timeout applied as connection PRAGMAs.
+Requires `pip install pycascadeui[sqlite]`. Declares `KV`, `RELATIONAL`, `TTL_INDEX`, `SCHEMA_META`, and `RAW_SQL`; its rows are fixed columns, so it does not declare `OPEN_ROWS` and a schema change needs a migrator. Uses WAL mode and prepared statements, with `synchronous=NORMAL` and a 5-second busy timeout applied as connection PRAGMAs.
 
 ```python
 from cascadeui.persistence import SQLiteBackend
@@ -158,11 +158,11 @@ from cascadeui.persistence import SQLiteBackend
 backend = SQLiteBackend("cascadeui.db")
 ```
 
-Importable from `cascadeui.persistence` only when `aiosqlite` is installed; the import is optional and silent otherwise. `table_prefix` moves every table and index the backend creates and queries under the prefix, which keeps two CascadeUI deployments sharing one database apart -- see [the table set](../guide/persistence.md#the-tables-a-sql-backend-creates).
+Importable from `cascadeui.persistence` only when `aiosqlite` is installed; the import is optional and silent otherwise. `table_prefix` moves every table and index the backend creates and queries under the prefix, which keeps two CascadeUI deployments sharing one database apart -- see [the table set](../guide/persistence.md#the-tables-a-sql-backend-creates). A non-empty prefix outside lower-case letters, digits, and underscores raises `ValueError` at construction; a non-`str` prefix raises `TypeError`.
 
 ### `PostgresBackend(dsn, *, pool_kwargs=None, table_prefix="")`
 
-Requires `pip install pycascadeui[postgres]`. Declares all five capabilities (including `RAW_SQL`). Backed by an `asyncpg` connection pool with JSONB storage, and adds `LISTEN`/`NOTIFY` for cross-process scoped-state invalidation: the right choice for a multi-process deployment.
+Requires `pip install pycascadeui[postgres]`. Declares the same five as `SQLiteBackend`, `OPEN_ROWS` excluded for the same reason. Backed by an `asyncpg` connection pool with JSONB storage, and adds `LISTEN`/`NOTIFY` for cross-process scoped-state invalidation: the right choice for a multi-process deployment.
 
 ```python
 from cascadeui.persistence import PostgresBackend

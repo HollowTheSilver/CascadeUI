@@ -18,11 +18,11 @@ import discord
 from discord import Interaction
 from discord.ui import Button, Container
 from discord.ui import File as UIFile
-from discord.ui import Item, MediaGallery, TextDisplay, Thumbnail
+from discord.ui import Item, MediaGallery, Separator, TextDisplay, Thumbnail
 from discord.ui.select import BaseSelect
 
 from ..components.base import StatefulButton
-from ..components.types import EmojiInput
+from ..components.types import MAX_MESSAGE_CHARACTERS, EmojiInput
 from ..exceptions import InstanceLimitError
 from ..state.actions import ActionCreators
 from ..state.singleton import get_store
@@ -484,6 +484,12 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
     # are checked at class-definition time rather than only the style.
     _STR_OR_NONE_ATTRS: ClassVar[tuple] = ("refresh_button_label",)
     _EMOJI_ATTRS: ClassVar[tuple] = ("refresh_button_emoji",)
+    # ``str.format`` templates, mapped to the keyword arguments the render
+    # site supplies. The values are test arguments of the render-time type,
+    # not bare placeholder names: a format spec can be valid for one type
+    # and not another (``{n:.2f}`` accepts a float and rejects a str), so
+    # only the real type proves the template renders.
+    _FORMAT_ATTRS: ClassVar[dict] = {}
     # Snowflake-domain instance data -- coerced via the init pipeline,
     # never settable through set_class_attribute (those have their own
     # mutation paths and live as instance state, not class-level policy).
@@ -580,6 +586,9 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         if name in cls._effective_table("_EMOJI_ATTRS"):
             cls._validate_emoji(name, value)
             return
+        if name in cls._effective_table("_FORMAT_ATTRS"):
+            cls._validate_format(name, value)
+            return
         if name == "nav_rebuild":
             if value is None:
                 return
@@ -667,6 +676,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             ("_BUTTON_STYLE_ATTRS", cls._validate_attribute_value),
             ("_STR_OR_NONE_ATTRS", cls._validate_str_or_none),
             ("_EMOJI_ATTRS", cls._validate_emoji),
+            ("_FORMAT_ATTRS", cls._validate_format),
         ):
             for attr in cls._effective_table(table):
                 if attr in own:
@@ -723,6 +733,34 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             raise TypeError(
                 f"{cls.__name__}.{name} must be a str or None, got {type(value).__name__}"
             )
+
+    @classmethod
+    def _validate_format(cls, name: str, value) -> None:
+        """Reject a format template that cannot render at its call site.
+
+        The template is rendered once against the keyword arguments the
+        render site supplies, so a typo'd or unbalanced placeholder fails
+        where the class is defined instead of inside a click callback,
+        where it surfaces as a bare ``KeyError`` naming neither the
+        attribute nor the fix. ``str.format`` reports four different
+        exception types for the four ways a template can be wrong, so the
+        catch is broad on purpose.
+        """
+        if value is None:
+            return
+        if not isinstance(value, str):
+            raise TypeError(
+                f"{cls.__name__}.{name} must be a str or None, got {type(value).__name__}"
+            )
+        test_kwargs = cls._effective_table("_FORMAT_ATTRS")[name] or {}
+        try:
+            value.format(**test_kwargs)
+        except Exception as exc:
+            allowed = ", ".join("{" + key + "}" for key in test_kwargs)
+            raise ValueError(
+                f"{cls.__name__}.{name} is not a valid format template "
+                f"({type(exc).__name__}: {exc}). Valid placeholders: {allowed}."
+            ) from exc
 
     @classmethod
     def _validate_emoji(cls, name: str, value) -> None:
@@ -1145,6 +1183,8 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         # to capture live references the constructor can't take.
         self._reopen_factory = None
         self._refresh_armed: bool = False
+        # One warning per view: the seams that check it run on every edit.
+        self._text_budget_warned: bool = False
         self._reopen_in_flight: bool = False
 
         # Get task manager
@@ -1712,14 +1752,23 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         # validation failures inside discord.py reject the payload before
         # the HTTP layer is reached, and the file objects opened by the
         # caller are otherwise leaked).
-        files_to_close = []
-        if send_kwargs.get("file") is not None:
-            files_to_close.append(send_kwargs["file"])
-        if send_kwargs.get("files"):
-            files_to_close.extend(send_kwargs["files"])
+        # Bound before the try because the handler below reads it: filling it
+        # is what can raise, so an empty list has to exist first or the
+        # rollback fails on an unbound name instead of running.
+        files_to_close: list = []
 
         class_name = type(self).__name__
         try:
+            # Filled inside the try because filling it can raise: a caller
+            # passing one File to files= reaches an iteration of a
+            # non-iterable, and outside the try that strands the view in
+            # both registries with no message and no teardown, which under
+            # instance_policy="reject" locks its own author out for the life
+            # of the process.
+            if send_kwargs.get("file") is not None:
+                files_to_close.append(send_kwargs["file"])
+            if send_kwargs.get("files"):
+                files_to_close.extend(send_kwargs["files"])
             # Pre-flight validation runs HERE, on the final tree -- after
             # seed_initial_state has built it -- so the check sees exactly what
             # ships to Discord. Catches duplicate custom_ids (V1/V2) and invalid
@@ -1729,6 +1778,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             self._apply_theme_defaults()
             self._sync_back_buttons()
             self._check_placement()
+            self._warn_unmatched_attachment_refs(send_kwargs)
             # The parent attach itself lands after the send, where a raise
             # would report a failure for a message Discord already has. The
             # chain is knowable now, so it is judged now.
@@ -2284,14 +2334,22 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         The digest captures only the fields Discord compares server-side
         when an edit is applied: ``custom_id``, ``label``, ``style``,
         ``disabled``, ``url``, ``placeholder``, emoji string form,
-        (for ``TextDisplay``/``Container`` items) the visible text, and
+        (for ``TextDisplay``/``Container`` items) the visible text,
         (for ``MediaGallery``/``Thumbnail``/``File`` items) the media
-        URL plus its description/spoiler flags.
+        URL plus its description/spoiler flags, (for ``Separator``)
+        spacing and visibility, and (for buttons and selects) the
+        cardinality, the premium ``sku_id``, the full option state, an
+        entity select's ``default_values``, and a ``ChannelSelect``'s
+        ``channel_types``.
         Anything else -- internal python ids, callback identity, ephemeral
         view back-references -- is deliberately excluded. Two views that
         would render identical bytes on the wire must produce the same
         digest, and two views that differ in any user-visible way must
-        not.
+        not. ``TestRenderDigestWireCoverage`` holds that second promise to
+        the serializer: it derives each type's field set from
+        ``to_component_dict`` rather than from this list, so a field
+        discord.py adds later fails there instead of silently skipping a
+        render.
 
         Used by :meth:`refresh` to short-circuit the REST ``message.edit``
         call when the tree has not changed since the last send or refresh.
@@ -2312,11 +2370,13 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             component_id = getattr(item, "id", None)
             if component_id is not None:
                 parts.append(("i", component_id))
-            # TextDisplay carries raw markdown and is checked first because
-            # discord.py injects a ``custom_id`` attribute on every item
-            # once it is attached to a parent view (for ViewStore tracking),
-            # so ``hasattr(item, "custom_id")`` is True for TextDisplay too.
-            # ``isinstance`` is the only reliable discriminator here.
+            # Every display branch below is typed, and the ``custom_id``
+            # test that follows them is the untyped catch-all for Buttons
+            # and Selects. Ordering the typed branches first keeps that
+            # catch-all from claiming an item it does not describe: which
+            # classes carry a ``custom_id`` is discord.py's to change, and
+            # a display item that gained one would otherwise be hashed as a
+            # button and lose the fields that actually render.
             if isinstance(item, TextDisplay):
                 parts.append(("t", item.content))
             # Container accents are wire-visible: a theme change that only
@@ -2343,6 +2403,13 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 parts.append(("th", item.media.url, item.description, item.spoiler))
             elif isinstance(item, UIFile):
                 parts.append(("f", item.media.url, item.spoiler))
+            # A Separator ships ``spacing`` and ``visible`` (the latter as the
+            # ``divider`` key), so a rule that appears, disappears, or changes
+            # height is a user-visible change. Without this branch an id-less
+            # Separator contributed nothing at all and removing one left the
+            # digest byte-identical.
+            elif isinstance(item, Separator):
+                parts.append(("s", getattr(item.spacing, "value", item.spacing), item.visible))
             # Buttons and selects: record the wire-visible attributes.
             elif hasattr(item, "custom_id"):
                 # A select's rendered selection lives in opt.default, which
@@ -2354,7 +2421,36 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 # returns None for them and for buttons).
                 options = getattr(item, "options", None)
                 option_state = (
-                    tuple((opt.value, opt.default) for opt in options) if options else None
+                    tuple(
+                        (
+                            opt.value,
+                            opt.default,
+                            opt.label,
+                            opt.description,
+                            str(opt.emoji) if opt.emoji else None,
+                        )
+                        for opt in options
+                    )
+                    if options
+                    else None
+                )
+                # An entity select carries its selection in default_values
+                # instead of an option list: the same state opt.default holds
+                # for a string select, one select family over. Each entry is a
+                # SelectDefaultValue whose id and type are what ship.
+                defaults = getattr(item, "default_values", None)
+                default_value_state = (
+                    tuple((dv.id, getattr(dv.type, "value", dv.type)) for dv in defaults)
+                    if defaults
+                    else None
+                )
+                # ChannelSelect only; the filter decides which channels the
+                # picker offers, so a rebuild that narrows it is visible.
+                channel_types = getattr(item, "channel_types", None)
+                channel_type_state = (
+                    tuple(getattr(ct, "value", ct) for ct in channel_types)
+                    if channel_types
+                    else None
                 )
                 parts.append(
                     (
@@ -2367,12 +2463,18 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                         getattr(item, "url", None),
                         getattr(item, "placeholder", None),
                         str(getattr(item, "emoji", None)) if getattr(item, "emoji", None) else None,
+                        # Cardinality is what makes a select clearable or
+                        # multi-pick; a premium button ships a sku_id and no
+                        # label. Both are None on the component families that
+                        # do not carry them.
+                        getattr(item, "min_values", None),
+                        getattr(item, "max_values", None),
+                        getattr(item, "sku_id", None),
                         option_state,
+                        default_value_state,
+                        channel_type_state,
                     )
                 )
-            # Separator carries no user-visible mutable state. If a
-            # future layout item gains one, extend here with a
-            # dedicated branch.
         return hash(tuple(parts))
 
     def _freeze_components(self) -> int:
@@ -3711,7 +3813,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
     def validate(self) -> None:
         """Raise if this view's tree is one Discord would reject.
 
-        Runs the same two checks the library runs before every send,
+        Runs the same checks the library runs before every send,
         refresh, and navigation edit: custom_id uniqueness and length on
         every interactive node, and, for V2 views, the structural
         placement walk. Passing means the tree ships.
@@ -3720,16 +3822,31 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         connection. Compose the tree first, since a view built by a
         pattern is empty until its data loads::
 
-            view = MyLeaderboard(user_id=1, guild_id=2)
+            from cascadeui import MAX_MESSAGE_COMPONENTS
+            from cascadeui.testing import stub_client
+
+            view = MyLeaderboard(user_id=1, guild_id=2, bot=stub_client())
             await view.on_load()          # composes the tree
             view.validate()               # raises if Discord would reject it
-
-            nodes = sum(1 for _ in view.walk_children())
-            assert nodes <= 40            # the per-message component cap
+            assert view.total_components <= MAX_MESSAGE_COMPONENTS
 
         ``on_load()`` is the render seam the library itself drives, so a
         tree built this way is the tree that would be sent. Views that
         build in ``build_ui()`` call that instead.
+
+        Bind a client to any pattern whose composition depends on one, or
+        the tree measured is not the tree that ships: a section-mode
+        leaderboard renders a four-node ``image_section`` per row with a
+        client bound and a one-node ``TextDisplay`` without, which is
+        fifteen components on a five-row page.
+        :func:`cascadeui.testing.stub_client` opens no connection and
+        reports the empty user cache a live bot reports for an unseen
+        member, so the composed tree matches. A persistent view takes its
+        client through ``on_bind`` rather than a kwarg.
+
+        ``validate()`` counts nothing, by design: a tree can never exist
+        over the per-message cap, because ``add_item`` refuses the node
+        that would cross it. :attr:`total_components` is the budget read.
 
         Raises:
             ValueError: The first violation found, naming the component,
@@ -3737,15 +3854,84 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         """
         self._check_placement()
 
+    @staticmethod
+    def _iter_send_embeds(send_kwargs: dict):
+        """Yield every embed a send carries, from either keyword."""
+        embed = send_kwargs.get("embed")
+        if embed is not None:
+            yield embed
+        for embed in send_kwargs.get("embeds") or ():
+            yield embed
+
+    def _warn_unmatched_attachment_refs(self, send_kwargs: dict) -> None:
+        """Warn when the tree names an attachment this send does not carry.
+
+        An ``attachment://<filename>`` reference is half of an upload: the
+        matching :class:`discord.File` travels through ``send(files=[...])``
+        and Discord resolves the two by name. With no matching file the
+        message ships and renders an unresolved placeholder, raising
+        nothing and returning no error, so the mistake is invisible to
+        every other seam. The initial send is the only place both halves
+        are in scope, which is what makes it decidable here and nowhere
+        else.
+
+        A warning rather than a raise: Discord's own filename matching is
+        the authority, and refusing a reference it would have resolved
+        would reject a working message to prevent a cosmetic one.
+        """
+        wanted = set()
+        # V1 carries its references in embeds rather than in the component
+        # tree, and the same unresolved placeholder renders there: Discord
+        # matches by filename and says nothing when it cannot.
+        for embed in self._iter_send_embeds(send_kwargs):
+            for url in (
+                getattr(getattr(embed, "image", None), "url", None),
+                getattr(getattr(embed, "thumbnail", None), "url", None),
+                getattr(getattr(embed, "author", None), "icon_url", None),
+                getattr(getattr(embed, "footer", None), "icon_url", None),
+            ):
+                if isinstance(url, str) and url.startswith("attachment://"):
+                    wanted.add(url)
+        for item in self.walk_children():
+            if isinstance(item, (Thumbnail, UIFile)):
+                url = getattr(getattr(item, "media", None), "url", None)
+                if isinstance(url, str) and url.startswith("attachment://"):
+                    wanted.add(url)
+            elif isinstance(item, MediaGallery):
+                for entry in item.items:
+                    url = getattr(getattr(entry, "media", None), "url", None)
+                    if isinstance(url, str) and url.startswith("attachment://"):
+                        wanted.add(url)
+        if not wanted:
+            return
+
+        supplied = []
+        if send_kwargs.get("file") is not None:
+            supplied.append(send_kwargs["file"])
+        supplied.extend(send_kwargs.get("files") or ())
+        # Compare against File.uri rather than filename: it is the string the
+        # media builders emit from a File, spoiler prefix included, so the two
+        # sides are built the same way.
+        carried = {f.uri for f in supplied if isinstance(f, discord.File)}
+
+        missing = sorted(wanted - carried)
+        if missing:
+            logger.warning(
+                f"{type(self).__name__}: {len(missing)} attachment reference(s) "
+                f"have no matching discord.File in this send: "
+                f"{', '.join(missing)}. Discord renders these as unresolved "
+                f"placeholders. Pass the matching files via send(files=[...])."
+            )
+
     def _check_placement(self) -> None:
         """Validate the component tree before shipping it to Discord.
 
         Single helper consumed by every seam that ships a tree to
         Discord: ``_send_pipeline`` (initial send), ``refresh`` (in-place
-        edits), and ``_apply_navigation_edit`` (push/pop edits). Two
-        checks run here. The custom_id-uniqueness pass runs for every
-        view (V1 and V2) because Discord rejects a duplicate custom_id on
-        either with HTTP 400. The structural placement walk is V2-only:
+        edits), and ``_apply_navigation_edit`` (push/pop edits). The
+        custom_id-uniqueness pass runs for every view (V1 and V2)
+        because Discord rejects a duplicate custom_id on either with
+        HTTP 400. The structural placement walk is V2-only:
         V1 views lack the ``validate_placement`` attribute so the
         ``getattr`` default of ``False`` skips it. Both imports are lazy
         to keep ``base.py``'s import graph thin. The checks fire often
@@ -3761,6 +3947,52 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             from ._placement import validate_placement
 
             validate_placement(self)
+        self._warn_over_text_budget()
+
+    def _warn_over_text_budget(self) -> None:
+        """Report a V2 tree whose summed display text is over Discord's cap.
+
+        The per-node check the placement validator runs cannot see this:
+        no single node has to be over its own cap for the sum to cross the
+        message's. Nothing enforces the total either, so the tree ships
+        and the refusal arrives at send -- for a persistent panel, long
+        after the code that composed it ran.
+
+        A warning rather than a rejection. Discord documents the cap and
+        discord.py counts it without raising, so the enforcing side is
+        unobserved from here; a raise would reject trees Discord takes.
+        Once per view, since the seams that call this run on every edit,
+        and re-armed once the tree drops back under, so a later excursion
+        is reported rather than swallowed by the first.
+
+        ``content_length`` sums ``TextDisplay`` content only, so silence
+        here is not proof a tree is under the cap: a screen carrying its
+        text in button labels and select placeholders reads as zero. The
+        warning catches the text-heavy shape and cannot see the
+        control-heavy one.
+        """
+        content_length = getattr(self, "content_length", None)
+        if content_length is None:
+            return
+        try:
+            total = content_length() if callable(content_length) else int(content_length)
+        except Exception:  # noqa: BLE001 -- a counter that raises is not a budget signal
+            return
+        if total <= MAX_MESSAGE_CHARACTERS:
+            # The total is measured before the latch is read, because the
+            # other order makes this reset unreachable and leaves the
+            # second excursion silent.
+            self._text_budget_warned = False
+            return
+        if self._text_budget_warned:
+            return
+        self._text_budget_warned = True
+        logger.warning(
+            f"{type(self).__name__} carries {total} display characters across its "
+            f"items, over Discord's {MAX_MESSAGE_CHARACTERS}-character message cap. "
+            f"Discord may refuse the send with no component named. Shorten the text, "
+            f"or move some of it to a second message."
+        )
 
     def _stamp_cooldown(self, *, acting: bool = False) -> None:
         """Arm the proactive cooldown window after a successful edit.

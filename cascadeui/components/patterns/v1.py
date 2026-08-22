@@ -7,14 +7,21 @@ import discord
 from discord import ButtonStyle, Interaction
 
 from ...utils.hooks import await_maybe
-from ..base import StatefulButton, StatefulComponent
+from ..base import StatefulButton, StatefulComponent, require_value_callback
 from ..v1_composition import CompositeComponent, register_component
 
 # // ========================================( Classes )======================================== // #
 
 
 class ConfirmationButtons(CompositeComponent):
-    """A yes/no button pair for confirmations."""
+    """A yes/no button pair for confirmations.
+
+    ``on_confirm`` and ``on_cancel`` each take ``(interaction)``, sync or
+    async. The buttons pass no second value.
+
+    Raises:
+        TypeError: A callback cannot be called with ``(interaction)``.
+    """
 
     def __init__(
         self,
@@ -44,7 +51,14 @@ register_component("confirmation_buttons", ConfirmationButtons)
 
 
 class PaginationControls(CompositeComponent):
-    """Navigation controls for paginated content."""
+    """Navigation controls for paginated content.
+
+    ``on_page_change`` takes ``(interaction, page)`` and receives the new
+    zero-based page after each move.
+
+    Raises:
+        TypeError: ``on_page_change`` cannot accept ``(interaction, page)``.
+    """
 
     def __init__(
         self, page_count: int, current_page: int = 0, on_page_change: Optional[Callable] = None
@@ -53,6 +67,7 @@ class PaginationControls(CompositeComponent):
         self.page_count = max(1, page_count)
         self.current_page = min(max(0, current_page), self.page_count - 1)
         self.on_page_change = on_page_change
+        require_value_callback(on_page_change, "PaginationControls", "on_page_change", "page")
 
         # Create buttons
         self.prev_button = StatefulButton(
@@ -125,8 +140,8 @@ class ToggleGroup(CompositeComponent):
     """Radio-button-like group where only one option can be active at a time.
 
     When a button is clicked, all others reset to secondary style and the
-    selected one becomes primary. The on_select callback receives the
-    selected value.
+    selected one becomes primary. ``on_select`` takes
+    ``(interaction, value)`` and receives the selected value.
 
     Usage:
         group = ToggleGroup(
@@ -135,6 +150,9 @@ class ToggleGroup(CompositeComponent):
             default="Medium",
         )
         group.add_to_view(my_view)
+
+    Raises:
+        TypeError: ``on_select`` cannot accept ``(interaction, value)``.
     """
 
     def __init__(
@@ -149,6 +167,7 @@ class ToggleGroup(CompositeComponent):
         self.key = key
         self.options = options
         self.on_select = on_select
+        require_value_callback(on_select, "ToggleGroup", "on_select", "value")
         self.selected = default or options[0] if options else None
         # Captured by add_to_view so callbacks can refresh the host view
         # after mutating button styles in place.

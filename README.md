@@ -793,7 +793,7 @@ All core features such as navigation, persistence, and undo/redo are supported.
 ```bash
 git clone https://github.com/HollowTheSilver/CascadeUI.git
 cd CascadeUI
-pip install -e ".[dev]"
+pip install -e ".[dev,sqlite,postgres]"
 
 pytest tests/ -v
 black cascadeui/

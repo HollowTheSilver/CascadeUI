@@ -1,10 +1,14 @@
 """Tests for component creation and callback wrapping."""
 
+import functools
+import inspect
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 import pytest
+from discord.ui import ActionRow
 from helpers import RenderableLayoutView
+from helpers import make_interaction as _make_interaction
 
 from cascadeui.components.base import StatefulButton, StatefulComponent, StatefulSelect
 from cascadeui.components.v1_composition import (
@@ -12,6 +16,7 @@ from cascadeui.components.v1_composition import (
     get_component,
     register_component,
 )
+from cascadeui.utils.hooks import accepts_second_positional
 
 
 class TestStatefulComponent:
@@ -38,6 +43,215 @@ class TestStatefulComponent:
     def test_button_passes_style_through(self):
         btn = StatefulButton(label="Danger", style=discord.ButtonStyle.danger)
         assert btn.style == discord.ButtonStyle.danger
+
+
+class TestCallbackArityRefusal:
+    """``create_stateful_callback`` refuses, at construction, a callback the
+    component cannot call. A wrong signature otherwise survives until the
+    first click and surfaces as a bare arity ``TypeError`` from inside the
+    wrapper -- "This interaction failed" with nothing naming the mistake.
+    """
+
+    def _make_view(self):
+        view = MagicMock()
+        view.user_id = 1
+        view.id = "view-under-test"
+        view.is_finished = MagicMock(return_value=False)
+        view.dispatch = AsyncMock()
+        return view
+
+    def test_button_refuses_two_param_callback(self):
+        async def cb(interaction, value):
+            pass
+
+        with pytest.raises(TypeError, match=r"cannot be called with \(interaction\)"):
+            StatefulButton(label="Test", callback=cb)
+
+    def test_unbound_method_refused_with_its_signature(self):
+        """The message prints the signature back, so the stray ``self`` of a
+        function pulled off a class body is visible in the refusal."""
+
+        class Cog:
+            async def on_click(self, interaction):
+                pass
+
+        with pytest.raises(TypeError, match=r"on_click\(self, interaction\)"):
+            StatefulButton(label="Test", callback=Cog.on_click)
+
+    def test_bound_method_accepted(self):
+        class Cog:
+            async def on_click(self, interaction):
+                pass
+
+        btn = StatefulButton(label="Test", callback=Cog().on_click)
+        assert btn.original_callback is not None
+
+    def test_star_args_callback_accepted(self):
+        def cb(*args):
+            pass
+
+        btn = StatefulButton(label="Test", callback=cb)
+        assert btn.original_callback is cb
+
+    async def test_star_args_callback_receives_one_argument(self):
+        """Variadic callbacks keep the one-argument contract: only a declared
+        second positional parameter opts into a value."""
+        received = []
+
+        def cb(*args):
+            received.append(args)
+
+        btn = StatefulButton(label="Test", callback=cb)
+        btn._view = self._make_view()
+
+        from helpers import make_interaction
+
+        await btn.callback(make_interaction())
+
+        assert [len(args) for args in received] == [1]
+
+    def test_unreadable_signature_accepted(self):
+        # ``min`` is a C builtin whose signature cannot be read. The premise
+        # is asserted first, so an interpreter that grows one fails here at
+        # the proxy rather than silently changing what this test measures.
+        with pytest.raises(ValueError):
+            inspect.signature(min)
+
+        btn = StatefulButton(label="Test", callback=min)
+        assert btn.original_callback is min
+
+    def test_select_accepts_two_param_callback(self):
+        async def cb(interaction, values):
+            pass
+
+        sel = StatefulSelect(options=[discord.SelectOption(label="A", value="a")], callback=cb)
+        assert sel.original_callback is cb
+
+    def test_select_refuses_zero_param_callback(self):
+        with pytest.raises(TypeError, match=r"\(interaction\) or \(interaction, values\)"):
+            StatefulSelect(
+                options=[discord.SelectOption(label="A", value="a")],
+                callback=lambda: None,
+            )
+
+    async def test_select_one_param_callback_receives_one_argument(self):
+        received = []
+
+        def cb(*args):
+            received.append(args)
+
+        sel = StatefulSelect(options=[discord.SelectOption(label="A", value="a")], callback=cb)
+        sel._view = self._make_view()
+
+        from helpers import make_interaction
+
+        await sel.callback(make_interaction())
+
+        assert [len(args) for args in received] == [1]
+
+    async def test_a_narrowing_wraps_adapter_is_not_handed_a_second_argument(self):
+        """The refusal and the dispatch have to read the same signature.
+
+        ``functools.wraps`` copies the wrapped function's signature onto the
+        wrapper, so an adapter that narrows two parameters to one advertises
+        a second positional it cannot accept. Deciding on the advertisement
+        elected the two-argument call and failed on the first click, from
+        inside the library, naming the wrapped function rather than the
+        wrapper that could not take the argument.
+        """
+        received = []
+
+        async def real_handler(interaction, values):
+            received.append(values)
+
+        @functools.wraps(real_handler)
+        async def narrowed(interaction):
+            received.append("one-arg")
+
+        view = RenderableLayoutView(user_id=1, guild_id=2)
+        select = StatefulSelect(
+            custom_id="narrowed",
+            options=[discord.SelectOption(label="L", value="v")],
+            callback=narrowed,
+        )
+        view.add_item(ActionRow(select))
+
+        await select.callback(_make_interaction())
+
+        assert received == ["one-arg"]
+
+    def test_a_transparent_wraps_adapter_still_receives_the_value(self):
+        """A wrapper that really can take both keeps the two-argument call.
+
+        The fix must not cost the shape it was protecting: an adapter
+        declared ``(*args, **kwargs)`` can honor the advertisement.
+        """
+
+        async def real_handler(interaction, values):
+            pass
+
+        @functools.wraps(real_handler)
+        async def transparent(*args, **kwargs):
+            await real_handler(*args, **kwargs)
+
+        assert accepts_second_positional(transparent) is True
+
+    async def test_a_transparent_wraps_adapter_receives_the_value_on_dispatch(self):
+        """The predicate answer above has to survive to the real call."""
+        received = []
+
+        async def real_handler(interaction, values):
+            received.append(values)
+
+        @functools.wraps(real_handler)
+        async def transparent(*args, **kwargs):
+            await real_handler(*args, **kwargs)
+
+        view = RenderableLayoutView(user_id=1, guild_id=2)
+        select = StatefulSelect(
+            custom_id="transparent",
+            options=[discord.SelectOption(label="L", value="v")],
+            callback=transparent,
+        )
+        view.add_item(ActionRow(select))
+
+        await select.callback(_make_interaction())
+
+        assert received == [select.values]
+
+    def test_a_widening_wraps_adapter_is_refused(self):
+        """The mirror of the narrowing adapter, and the harder direction.
+
+        A wrapper that requires ``(interaction, values)`` while advertising
+        the one-parameter function it wraps reads as one-argument to the
+        dispatch and passes a refusal that asks whether EITHER arity binds.
+        Refusing against the arity the dispatch actually chose is what
+        catches it: the select picks the one-argument call, and the callback
+        cannot take one.
+        """
+
+        async def declared(interaction):
+            pass
+
+        @functools.wraps(declared)
+        async def widening(interaction, values):
+            pass
+
+        with pytest.raises(TypeError, match=r"cannot be called with"):
+            StatefulSelect(
+                custom_id="widening",
+                options=[discord.SelectOption(label="L", value="v")],
+                callback=widening,
+            )
+
+    def test_an_unbound_method_is_not_handed_a_second_argument(self):
+        """Three declared positionals, and it cannot be called with two."""
+
+        class Holder:
+            async def handler(self, interaction, values):
+                pass
+
+        assert accepts_second_positional(Holder.handler) is False
 
 
 class TestStatefulSelectEmptyOptions:
@@ -192,6 +406,88 @@ class TestCompositeComponent:
         assert result is None
 
 
+class TestV1CompositeCallbackArity:
+    """The V1 composites hold the same callback contract as the builders:
+    value-carrying controls refuse a callback that cannot receive the value,
+    value-less buttons refuse one that demands a second argument."""
+
+    def _make_view(self):
+        view = MagicMock()
+        view.user_id = 1
+        view.id = "view-under-test"
+        view.is_finished = MagicMock(return_value=False)
+        view.dispatch = AsyncMock()
+        return view
+
+    def test_toggle_group_refuses_one_param_on_select(self):
+        from cascadeui.components.patterns.v1 import ToggleGroup
+
+        async def cb(interaction):
+            pass
+
+        with pytest.raises(
+            TypeError, match=r"ToggleGroup: on_select callback .* \(interaction, value\)"
+        ):
+            ToggleGroup(options=["A", "B"], on_select=cb)
+
+    def test_pagination_controls_refuses_one_param_on_page_change(self):
+        from cascadeui.components.patterns.v1 import PaginationControls
+
+        async def cb(interaction):
+            pass
+
+        with pytest.raises(
+            TypeError,
+            match=r"PaginationControls: on_page_change callback .* \(interaction, page\)",
+        ):
+            PaginationControls(page_count=3, on_page_change=cb)
+
+    def test_confirmation_buttons_refuse_two_param_callback(self):
+        from cascadeui.components.patterns.v1 import ConfirmationButtons
+
+        async def cb(interaction, value):
+            pass
+
+        with pytest.raises(TypeError, match=r"cannot be called with \(interaction\)"):
+            ConfirmationButtons(on_confirm=cb)
+
+    async def test_toggle_group_on_select_receives_the_value(self):
+        from helpers import make_interaction
+
+        from cascadeui.components.patterns.v1 import ToggleGroup
+
+        received = []
+
+        async def cb(interaction, value):
+            received.append(value)
+
+        group = ToggleGroup(options=["A", "B"], on_select=cb)
+        button = group._buttons[1]
+        button._view = self._make_view()
+
+        await button.callback(make_interaction())
+
+        assert received == ["B"]
+
+    async def test_pagination_controls_report_the_new_page(self):
+        from helpers import make_interaction
+
+        from cascadeui.components.patterns.v1 import PaginationControls
+
+        received = []
+
+        async def cb(interaction, page):
+            received.append(page)
+
+        controls = PaginationControls(page_count=3, on_page_change=cb)
+        button = controls.next_button
+        button._view = self._make_view()
+
+        await button.callback(make_interaction())
+
+        assert received == [1]
+
+
 class TestStatefulCallbackTokenDiscipline:
     """``_CURRENT_INTERACTION`` resets after ``stateful_callback`` returns,
     regardless of which exit path the wrapped callback takes.
@@ -282,6 +578,14 @@ class TestButtonOwnerOnly:
     above) -- the gate logic lives there, and bypassing ``StatefulButton``
     construction avoids mutating the discord.py ``view`` property at
     the class level.
+
+    The gate compares ``_button_owner_only is True``, which is what lets
+    any mock component reach a callback at all: ``getattr`` returns
+    another MagicMock for an unset attribute, truthy under ``bool()`` and
+    not ``True`` under identity. This class sets the attribute on every
+    component it builds, so the dependency is not visible here -- it is
+    the classes that build a mock component without setting it that the
+    identity check protects.
     """
 
     def _make_view(self, owner_id=1):
@@ -471,6 +775,58 @@ class TestToggleButton:
 
         view.dispatch.assert_not_awaited()
 
+    async def test_two_param_callback_receives_post_flip_state(self):
+        received = []
+
+        async def cb(interaction, toggled):
+            received.append(toggled)
+
+        button, _ = self._make_button(callback=cb)
+
+        await button.callback(self._interaction(user_id=1))
+        await button.callback(self._interaction(user_id=1))
+
+        assert received == [True, False]
+
+    async def test_two_param_callback_from_toggled_start(self):
+        received = []
+
+        async def cb(interaction, toggled):
+            received.append(toggled)
+
+        button, _ = self._make_button(callback=cb, toggled=True)
+
+        await button.callback(self._interaction(user_id=1))
+
+        assert received == [False]
+
+    async def test_one_param_callback_receives_one_argument(self):
+        received = []
+
+        async def cb(*args):
+            received.append(args)
+
+        button, _ = self._make_button(callback=cb)
+
+        await button.callback(self._interaction(user_id=1))
+
+        assert [len(args) for args in received] == [1]
+
+    def test_zero_param_callback_refused(self):
+        from cascadeui.components.buttons import ToggleButton
+
+        with pytest.raises(TypeError) as caught:
+            ToggleButton(label="Mode", callback=lambda: None)
+        message = str(caught.value)
+
+        assert "ToggleButton callback" in message
+        # Both supported shapes are named, and the second one especially:
+        # a message that omitted it would read as though this control
+        # passes no value, which is what the generic button message says
+        # and what this class does not do.
+        assert "(interaction, toggled)" in message
+        assert "passes no second value" not in message
+
     async def test_callback_is_the_shared_wrapper(self):
         """The toggle rides ``create_stateful_callback``; the raw
         ``_toggle`` coroutine is never installed as the callback."""
@@ -489,6 +845,10 @@ class TestBuilderCustomIdAndDisabled:
 
     @staticmethod
     async def _cb(interaction):
+        pass
+
+    @staticmethod
+    async def _cb_value(interaction, value):
         pass
 
     def test_button_row_suffixes_per_button(self):
@@ -518,8 +878,8 @@ class TestBuilderCustomIdAndDisabled:
     def test_cycle_and_toggle_buttons_take_custom_id(self):
         from cascadeui.components.patterns.v2 import cycle_button, toggle_button
 
-        cycler = cycle_button(values=["a", "b"], on_change=self._cb, custom_id="preset")
-        toggler = toggle_button(active=True, on_toggle=self._cb, custom_id="dark")
+        cycler = cycle_button(values=["a", "b"], on_change=self._cb_value, custom_id="preset")
+        toggler = toggle_button(active=True, on_toggle=self._cb_value, custom_id="dark")
         assert cycler.custom_id == "preset"
         assert toggler.custom_id == "dark"
 

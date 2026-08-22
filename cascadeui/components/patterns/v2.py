@@ -34,8 +34,21 @@ from discord.ui import (
 )
 
 from ...utils.guards import coerce_colour, normalize_mapping
-from ...utils.hooks import await_maybe, call_hook_safe, is_async_callable
-from ..base import StatefulButton, StatefulSelect
+from ...utils.hooks import (
+    accepts_second_positional,
+    await_maybe,
+    call_hook_safe,
+    can_accept_positional,
+    is_async_callable,
+)
+from ..base import (
+    StatefulButton,
+    StatefulSelect,
+    _describe_callback,
+    refuse_wrong_arity,
+    require_url,
+    require_value_callback,
+)
 from ..types import MAX_COMPONENT_ID, MAX_SELECT_OPTIONS, EmojiInput, MediaInput
 
 logger = logging.getLogger(__name__)
@@ -228,14 +241,28 @@ def _require_text(value: str, builder: str, param: str) -> str:
     return value
 
 
-def _coerce_media_ref(value: MediaInput, *, owner: str, param: str) -> str:
-    """Resolve a ``MediaInput`` to the URL string Discord's API consumes.
+def _media_ref_url(ref) -> Optional[str]:
+    """The URL string a resolved media reference carries, or ``None``.
 
-    Strings pass through unchanged. A :class:`discord.File` resolves to
-    its ``.uri`` (the ``"attachment://<filename>"`` reference built from
-    the normalized filename). The builder emits only the reference
-    string; the bytes travel separately through
-    ``view.send(files=[...])``.
+    A resolved reference is either the URL string itself or an
+    ``UnfurledMediaItem`` wrapping one. discord.py stores the item's
+    ``url`` unvalidated, so a non-string reads as carrying no URL.
+    """
+    if isinstance(ref, discord.UnfurledMediaItem):
+        ref = ref.url
+    return ref if isinstance(ref, str) else None
+
+
+def _resolve_media_ref(
+    value: MediaInput, *, owner: str, param: str
+) -> Union[str, discord.UnfurledMediaItem]:
+    """Resolve a ``MediaInput`` to the reference Discord's API consumes.
+
+    Strings and ``UnfurledMediaItem`` instances pass through unchanged. A
+    :class:`discord.File` resolves to its ``.uri`` (the
+    ``"attachment://<filename>"`` reference built from the normalized
+    filename). The builder emits only the reference string; the bytes
+    travel separately through ``view.send(files=[...])``.
 
     Only the ``.uri`` is extracted -- the ``description`` and ``spoiler``
     attributes of the source :class:`discord.File` are NOT forwarded.
@@ -243,6 +270,10 @@ def _coerce_media_ref(value: MediaInput, *, owner: str, param: str) -> str:
     fields (``image_section``, ``file_attachment``) accept them as
     explicit kwargs, so the metadata is never silently lost on the
     documented call paths.
+
+    Resolution only; ``_coerce_media_ref`` layers the empty-reference
+    check on top. The leaderboard's optional ``banner=`` resolves through
+    this function directly and maps an empty reference to absence.
     """
     if isinstance(value, discord.File):
         return value.uri
@@ -263,6 +294,31 @@ def _coerce_media_ref(value: MediaInput, *, owner: str, param: str) -> str:
         f"with a string .url attribute (e.g. discord.Asset); got "
         f"{type(value).__name__}: {value!r}"
     )
+
+
+def _coerce_media_ref(
+    value: MediaInput, *, owner: str, param: str
+) -> Union[str, discord.UnfurledMediaItem]:
+    """Resolve a ``MediaInput``, rejecting a reference with no URL.
+
+    The text builders reject an empty string at construction, but an
+    empty media reference shipped silently: discord.py stores the URL
+    unvalidated, so the failure surfaced as an HTTP 400 at send carrying
+    Discord's numeric component path and naming neither the builder nor
+    the parameter. Whitespace-only is rejected along with empty because a
+    URL is machine-consumed: no reading of Discord's contract can resolve
+    it, unlike an unusual scheme, which passes untouched.
+    """
+    resolved = _resolve_media_ref(value, owner=owner, param=param)
+    url = _media_ref_url(resolved)
+    if url is not None and not url.strip():
+        raise ValueError(
+            f"{owner}: {param} is empty. Discord cannot resolve a media item "
+            f"with no URL, and the whole message fails with it.\n"
+            f"  Fix: pass a non-empty URL or attachment:// reference, or skip "
+            f"the component when there is no media to show."
+        )
+    return resolved
 
 
 # Regional indicator emoji for alpha axis preset (🇦 through 🇿, 26 glyphs).
@@ -387,7 +443,7 @@ def action_section(
     Args:
         text: Display text for the section (supports markdown).
         label: Button label.
-        callback: Async callback ``(interaction) -> None``.
+        callback: Callback ``(interaction) -> None``, sync or async.
         style: Button style (default: secondary).
         emoji: Optional button emoji.
         disabled: Render the accessory button greyed out and
@@ -397,6 +453,10 @@ def action_section(
 
     Returns:
         A ``Section`` with a ``TextDisplay`` and ``StatefulButton`` accessory.
+
+    Raises:
+        TypeError: ``callback`` cannot be called with ``(interaction)``
+            alone; this button passes no second value.
 
     Example::
 
@@ -449,7 +509,10 @@ def toggle_section(
             emoji prefix -- include your own if desired.
         active: Current toggle state. ``True`` renders a green
             "Enabled" button, ``False`` renders a red "Disabled" button.
-        callback: Async callback ``(interaction) -> None``.
+        callback: Async callback ``(interaction) -> None``, or
+            ``(interaction, active) -> None`` to receive the state the
+            click asks for (the flip of the rendered ``active``), matching
+            ``toggle_button`` and ``cycle_button``.
         labels: ``(active_label, inactive_label)`` tuple. Defaults to
             ``("Enabled", "Disabled")``.
         disabled: Render the toggle button greyed out and non-interactive
@@ -458,6 +521,10 @@ def toggle_section(
 
     Returns:
         A ``Section`` with toggle button accessory.
+
+    Raises:
+        TypeError: ``callback`` can accept neither ``(interaction)`` nor
+            ``(interaction, active)``.
 
     Example::
 
@@ -468,11 +535,32 @@ def toggle_section(
         )
     """
     _check_label_pair(labels, "toggle_section")
+    # toggle_button and cycle_button deliver the control's new state to a
+    # two-parameter callback, so one here is adapted rather than refused.
+    # This builder is immediate-mode: the delivered value is the flip of
+    # the rendered ``active``, the same post-flip state toggle_button
+    # reports.
+    wants_state = accepts_second_positional(callback)
+    refuse_wrong_arity(
+        callback,
+        2 if wants_state else 1,
+        f"toggle_section: callback {_describe_callback(callback)} cannot be "
+        f"called with (interaction) or (interaction, active).\n"
+        f"  Fix: accept (interaction), or (interaction, active) to receive "
+        f"the new state.",
+    )
+    button_callback = callback
+    if wants_state:
+        requested = not active
+
+        async def button_callback(interaction):  # noqa: F811
+            await await_maybe(callback(interaction, requested))
+
     button_kwargs = {
         "label": labels[0] if active else labels[1],
         "style": discord.ButtonStyle.success if active else discord.ButtonStyle.danger,
         "emoji": emoji,
-        "callback": callback,
+        "callback": button_callback,
         "disabled": disabled,
     }
     _check_custom_id_length(custom_id, "toggle_section")
@@ -517,7 +605,7 @@ def image_section(
             :class:`discord.File` instance whose ``.uri`` is used.
             File-backed references require the same ``discord.File`` to
             be passed via ``view.send(files=[...])``.
-        description: Optional alt text for the thumbnail (up to 256 chars).
+        description: Optional alt text for the thumbnail (up to 1024 chars).
         spoiler: Whether the thumbnail is hidden behind a spoiler.
 
     Returns:
@@ -601,6 +689,7 @@ def link_section(
             url="https://hollowthesilver.github.io/CascadeUI/",
         )
     """
+    require_url(url, "link_section", label)
     return _with_id(
         Section(
             TextDisplay(_require_text(text, "link_section", "text")),
@@ -664,6 +753,10 @@ def confirm_section(
     Returns:
         A ``[TextDisplay, ActionRow]`` list ready to splat into
         ``card()`` or ``add_item`` loops.
+
+    Raises:
+        TypeError: ``on_confirm`` or ``on_cancel`` cannot be called with
+            ``(interaction)`` alone; these buttons pass no second value.
 
     Example::
 
@@ -738,6 +831,8 @@ def button_row(
     Raises:
         ValueError: If ``buttons`` is empty or exceeds Discord's 5
             buttons-per-ActionRow limit.
+        TypeError: A callback cannot be called with ``(interaction)``
+            alone; these buttons pass no second value.
 
     Example::
 
@@ -820,6 +915,8 @@ def cycle_button(
     Raises:
         ValueError: If ``values`` is empty, ``start`` is out of range,
             or ``labels`` length does not match ``values`` length.
+        TypeError: ``on_change`` cannot accept ``(interaction, value)``;
+            this control reports the new value on every click.
 
     Example::
 
@@ -833,6 +930,7 @@ def cycle_button(
     if not values:
         raise ValueError("cycle_button: values must not be empty.")
     _check_custom_id_length(custom_id, "cycle_button")
+    require_value_callback(on_change, "cycle_button", "on_change", "value")
     resolved_labels = list(labels) if labels is not None else [str(v) for v in values]
     if len(resolved_labels) != len(values):
         raise ValueError(
@@ -901,6 +999,10 @@ def toggle_button(
         A ``StatefulButton`` with ``_toggle_active`` attribute set
         for introspection.
 
+    Raises:
+        TypeError: ``on_toggle`` cannot accept ``(interaction, active)``;
+            this control reports the new state on every click.
+
     Example::
 
         button_row({}) + [toggle_button(
@@ -911,6 +1013,7 @@ def toggle_button(
     """
 
     _check_custom_id_length(custom_id, "toggle_button")
+    require_value_callback(on_toggle, "toggle_button", "on_toggle", "active")
     _check_label_pair(labels, "toggle_button")
 
     async def _toggle_callback(interaction):
@@ -1107,9 +1210,10 @@ def choice_row(
     Raises:
         ValueError: ``options`` is empty, exceeds Discord's 25-option limit
             for a single control, or ``button_threshold`` is out of ``0..5``.
-        TypeError: ``on_select`` is not callable, an option is neither a
-            ``Choice`` nor part of a dict, or a multi-select ``selected`` is
-            not a collection.
+        TypeError: ``on_select`` is not callable or cannot accept
+            ``(interaction, value)`` (this control reports the pick on
+            every click), an option is neither a ``Choice`` nor part of a
+            dict, or a multi-select ``selected`` is not a collection.
 
     Example::
 
@@ -1139,6 +1243,7 @@ def choice_row(
         )
     if not callable(on_select):
         raise TypeError(f"choice_row: on_select must be callable, got {type(on_select).__name__}")
+    require_value_callback(on_select, "choice_row", "on_select", "value")
 
     active = _selected_values(selected, multi)
     if len(choices) <= button_threshold:
@@ -1642,6 +1747,8 @@ def tab_nav(
     Raises:
         ValueError: If ``tabs`` is empty, exceeds 5 entries, or
             ``active`` is not a key in ``tabs``.
+        TypeError: A tab callback cannot be called with ``(interaction)``
+            alone; these buttons pass no second value.
 
     Example::
 
@@ -1837,7 +1944,8 @@ class PaginatedRegion:
     prev_button_emoji: ClassVar[EmojiInput] = None
     prev_button_style: ClassVar[discord.ButtonStyle] = discord.ButtonStyle.secondary
 
-    indicator_button_label: ClassVar[Optional[str]] = None  # default uses "Page {n}/{t}"
+    indicator_button_label: ClassVar[Optional[str]] = None  # a literal, frozen every page
+    indicator_button_format: ClassVar[Optional[str]] = None  # a template, e.g. "{page}/{total}"
     indicator_button_emoji: ClassVar[EmojiInput] = None
     indicator_button_style: ClassVar[discord.ButtonStyle] = discord.ButtonStyle.primary
 
@@ -1895,6 +2003,23 @@ class PaginatedRegion:
                     f"{cls.__name__}.{attr} must be a str, discord.Emoji, "
                     f"discord.PartialEmoji, or None, got {emoji!r}"
                 )
+        template = cls.__dict__.get("indicator_button_format")
+        if template is not None:
+            if not isinstance(template, str):
+                raise TypeError(
+                    f"{cls.__name__}.indicator_button_format must be a str or None, "
+                    f"got {type(template).__name__}"
+                )
+            # Rendered once with the render-time types, so a typo'd or
+            # unbalanced placeholder fails here rather than inside a click.
+            try:
+                template.format(page=1, total=1)
+            except Exception as exc:
+                raise ValueError(
+                    f"{cls.__name__}.indicator_button_format is not a valid format "
+                    f"template ({type(exc).__name__}: {exc}). "
+                    f"Valid placeholders: {{page}}, {{total}}."
+                ) from exc
 
     def __init__(
         self,
@@ -2203,11 +2328,15 @@ class PaginatedRegion:
     def _resolve_indicator_label(self) -> str:
         if self.indicator_button_label is not None:
             return self.indicator_button_label
+        if self.indicator_button_format is not None:
+            return self.indicator_button_format.format(page=self._page + 1, total=self.page_count)
         return f"Page {self._page + 1}/{self.page_count}"
 
     def _resolve_goto_label(self) -> str:
         if self.indicator_button_label is not None:
             return self.indicator_button_label
+        if self.indicator_button_format is not None:
+            return self.indicator_button_format.format(page=self._page + 1, total=self.page_count)
         return f"{self._page + 1}/{self.page_count}"
 
     # // ----( Callbacks )---- // #
@@ -2400,6 +2529,13 @@ class Collapsible:
             button under the region).
         key: Disambiguator baked into the trigger custom_id. Two
             collapsibles in one view need distinct keys.
+
+    Raises:
+        TypeError: ``reveal`` or ``summary`` is not callable, is async, or
+            requires arguments (both run bare on every render); or a
+            non-bool ``expanded`` / ``trigger_first`` / non-ButtonStyle
+            style.
+        ValueError: ``label``, ``expanded_label``, or ``key`` is empty.
     """
 
     def __init__(
@@ -2432,6 +2568,16 @@ class Collapsible:
                 "reveal must be synchronous; load async data in the host's "
                 "on_load() and have reveal read the result synchronously"
             )
+        # Left unchecked, a reveal that requires arguments constructs and
+        # renders collapsed cleanly, then dies on the first expand click with
+        # a bare arity TypeError naming neither the kwarg nor the class.
+        if can_accept_positional(reveal, 0) is False:
+            raise TypeError(
+                f"Collapsible: reveal callable {_describe_callback(reveal)} "
+                f"cannot be called with no arguments.\n"
+                f"  Fix: take no parameters and close over the host's data -- "
+                f"reveal() runs bare on every expanded render."
+            )
         if summary is not None:
             if not callable(summary):
                 raise TypeError(f"summary must be callable or None, got {type(summary).__name__}")
@@ -2439,6 +2585,13 @@ class Collapsible:
                 raise TypeError(
                     "summary must be synchronous; load async data in the host's "
                     "on_load() and have summary read the result synchronously"
+                )
+            if can_accept_positional(summary, 0) is False:
+                raise TypeError(
+                    f"Collapsible: summary callable {_describe_callback(summary)} "
+                    f"cannot be called with no arguments.\n"
+                    f"  Fix: take no parameters and close over the host's data -- "
+                    f"summary() runs bare on every render."
                 )
         if not isinstance(key, str) or not key:
             raise ValueError(f"key must be a non-empty str, got {key!r}")

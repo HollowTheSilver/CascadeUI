@@ -364,6 +364,10 @@ def with_cooldown(
             rounding away to nothing.
         message: Custom cooldown message. Use ``{remaining}`` as a
             placeholder for the time left (e.g. ``"Wait {remaining}s"``).
+            The value arrives already rounded to one decimal, so the
+            placeholder takes no format spec. The template is rendered
+            once at wrap time, so a typo fails at the call that supplied
+            it rather than on a click refused inside the cooldown window.
         scope: Cooldown scope -- ``"user"`` (per-user), ``"guild"``
             (per-guild, shared across all users in a server),
             ``"user_guild"`` (per-user-per-guild, independent cooldowns
@@ -380,7 +384,9 @@ def with_cooldown(
             that share a name share a deadline and throttle each other.
 
     Raises:
-        ValueError: If ``scope`` is not one of the valid cooldown scopes.
+        ValueError: If ``scope`` is not one of the valid cooldown scopes,
+            or if ``message`` cannot render with the ``{remaining}``
+            placeholder.
     """
     if scope not in _VALID_COOLDOWN_SCOPES:
         raise ValueError(
@@ -397,6 +403,20 @@ def with_cooldown(
     # what carries them across a rebuild.
     orphan_cooldowns: Dict[Any, float] = {}
     default_message = "This action is on cooldown. Try again in {remaining} seconds."
+    if message is not None:
+        # Rendered with the value the refusal branch really passes (a
+        # pre-formatted string, not the float it reads like), so a format
+        # spec such as {remaining:.0f} is refused here too, not only a
+        # typo'd placeholder.
+        try:
+            message.format(remaining=f"{0.0:.1f}")
+        except Exception as exc:
+            raise ValueError(
+                f"with_cooldown(message=...) cannot be rendered: "
+                f"{type(exc).__name__}: {exc}\n"
+                f"  Fix: the only placeholder is {{remaining}}, and it arrives "
+                f"already rounded to one decimal, so it takes no format spec."
+            ) from exc
     # Resolved once, at wrap time. A rebuild hands back a fresh component
     # object, so the key has to name something the render did not create.
     #

@@ -14,13 +14,16 @@ from .types import Action, StateData
 # and produce hard-to-trace breakage. The decorator raises ValueError at
 # decoration time when a user attempts the collision -- see
 # cascadeui/utils/decorators.py.
-# Prune actions (APPLICATION_SLOTS_PRUNED, REGISTRY_PRUNED) are
-# library-owned observability signals fired by the persistence manager
-# after deleting rows on disk. The library ships no reducer for them --
-# they are dispatch-only so subscribers and hooks can observe prunes.
-# They are listed here so @cascade_reducer raises on collision; users
-# who want to react to prunes should subscribe or use
-# store.on("application_slots_pruned", ...) rather than shadowing the name.
+# Prune actions are library-owned signals fired by the persistence manager
+# after deleting rows on disk. REGISTRY_PRUNED reduces, because the store
+# mirrors the registry in state["persistent_views"] and a prune that left
+# it stale sent the duplicate-key cleanup after a message the caller kept
+# on purpose. APPLICATION_SLOTS_PRUNED stays dispatch-only: the slot it
+# removes is still live in memory and re-upserts on the next write, so
+# reducing it would fight the namespace rather than reconcile it.
+# Reducing does not hide either from a listener; both notification passes
+# run after the chain. Both are listed here so @cascade_reducer raises on
+# collision.
 _BUILTIN_REDUCER_ACTIONS = frozenset(
     {
         "VIEW_CREATED",
@@ -341,6 +344,37 @@ async def reduce_persistent_view_registered(action: Action, state: StateData) ->
         "registered_at": action["timestamp"],
     }
     return {**state, "persistent_views": {**persistent_views, persistence_key: new_entry}}
+
+
+async def reduce_registry_pruned(action: Action, state: StateData) -> StateData:
+    """Handle REGISTRY_PRUNED actions.
+
+    A prune deletes stored rows, so the store's mirror of the registry is
+    stale until it drops the same keys. Leaving it stale is not inert: the
+    duplicate-key cleanup in ``_PersistentMixin._register_persistent`` reads
+    this mapping, and a pruned key still listed there sends it down the
+    orphan branch, which strips or deletes the very message a caller pruned
+    the row to leave standing.
+
+    Reducing does not stop a subscriber or hook from observing the prune.
+    Reducers run inside the middleware chain and both notification passes
+    run after it, so the payload reaches every listener either way.
+    """
+    payload = action["payload"]
+
+    keys = payload.get("keys") or []
+    if not keys:
+        return state
+
+    persistent_views = state.get("persistent_views", {})
+    pruned = set(keys)
+    if not pruned & set(persistent_views):
+        return state
+
+    return {
+        **state,
+        "persistent_views": {k: v for k, v in persistent_views.items() if k not in pruned},
+    }
 
 
 async def reduce_persistent_view_unregistered(action: Action, state: StateData) -> StateData:

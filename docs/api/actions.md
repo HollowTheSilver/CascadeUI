@@ -304,7 +304,10 @@ registry.
 
 Dispatched by `PersistenceManager.prune_registry()` after deleting rows from the
 `cascadeui_persistent_views` registry (reattach pruning a message deleted while the
-bot was offline, or an explicit clear). Dispatch-only: no reducer, no state change.
+bot was offline, or an explicit clear). A built-in reducer drops each pruned key
+from `state["persistent_views"]`, so the store's registry mirror matches the rows
+left on disk; re-registering a pruned key afterwards is a clean first registration
+rather than a duplicate-key cleanup against a stale entry.
 
 During startup reattach, `REGISTRY_PRUNED` fires synchronously inside `setup_middleware`.
 Under the canonical setup order (cogs loaded before `setup_middleware`), a subscription wired
@@ -321,7 +324,7 @@ only in `on_ready` or later misses it (dispatches once, no replay). For that cas
 | `keys` | `list[str]` | The `persistence_key`s actually pruned; a key passed in but absent on disk is not listed |
 | `reason` | `str` | Why the rows went: `"explicit"` for a targeted prune, `"clear_all"` for a full wipe, `"unreachable"` when `prune_unreachable` deleted them. `prune_registry(reason=)` passes any caller-supplied string through, so treat the value as open rather than a closed set |
 
-**State change:** None. The `keys` list lets a subscriber clear exactly the affected external records without sweeping its whole domain against the registry.
+**State change:** Deletes `state["persistent_views"][key]` for every key in `keys`. The `keys` list also lets a subscriber clear exactly the affected external records without sweeping its whole domain against the registry.
 
 ### `APPLICATION_SLOTS_PRUNED`
 

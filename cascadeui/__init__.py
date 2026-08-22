@@ -65,7 +65,14 @@ from .components.selects import (
     RoleSelect,
     UserSelect,
 )
-from .components.types import MAX_COMPONENT_ID, MAX_SELECT_OPTIONS, EmojiInput, MediaInput
+from .components.types import (
+    MAX_COMPONENT_ID,
+    MAX_MESSAGE_CHARACTERS,
+    MAX_MESSAGE_COMPONENTS,
+    MAX_SELECT_OPTIONS,
+    EmojiInput,
+    MediaInput,
+)
 from .components.v1_composition import CompositeComponent, get_component, register_component
 from .components.wrappers import with_confirmation, with_cooldown, with_loading_state
 from .devtools import DevToolsCog, InspectorView
@@ -133,7 +140,12 @@ from .validation import (
     validate_fields,
 )
 from .views.base import RenderOutcome
-from .views.layout import DisplayLayoutView, StatefulLayoutView
+from .views.layout import (
+    DisplayLayoutView,
+    StatefulLayoutView,
+    count_characters,
+    count_components,
+)
 from .views.patterns import (
     EntryList,
     FormLayoutView,
@@ -172,7 +184,7 @@ if "PostgresBackend" in _persistence_all:
 # // ========================================( Script )======================================== // #
 
 
-__version__ = "3.11.0"
+__version__ = "3.12.0"
 
 # Export public API
 __all__ = [
@@ -208,6 +220,8 @@ __all__ = [
     "RenderOutcome",
     "StatefulLayoutView",
     "DisplayLayoutView",
+    "count_characters",
+    "count_components",
     "PersistentLayoutView",
     "FormLayoutView",
     "LeaderboardLayoutView",
@@ -258,6 +272,8 @@ __all__ = [
     "MediaInput",
     "EntryList",
     "MAX_COMPONENT_ID",
+    "MAX_MESSAGE_CHARACTERS",
+    "MAX_MESSAGE_COMPONENTS",
     "MAX_SELECT_OPTIONS",
     # V2 Cards & Sections
     "card",

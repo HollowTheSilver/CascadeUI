@@ -2,7 +2,12 @@
 
 
 from .base import RenderOutcome
-from .layout import DisplayLayoutView, StatefulLayoutView
+from .layout import (
+    DisplayLayoutView,
+    StatefulLayoutView,
+    count_characters,
+    count_components,
+)
 from .patterns import (
     FormField,
     FormLayoutView,
@@ -31,6 +36,8 @@ from .view import StatefulView
 
 
 __all__ = [
+    "count_characters",
+    "count_components",
     "RenderOutcome",
     # V1
     "StatefulView",

@@ -470,6 +470,7 @@ class StateStore:
             reduce_persistent_view_registered,
             reduce_persistent_view_unregistered,
             reduce_redo,
+            reduce_registry_pruned,
             reduce_scoped_update,
             reduce_session_created,
             reduce_session_updated,
@@ -491,6 +492,7 @@ class StateStore:
             "MODAL_SUBMITTED": reduce_modal_submitted,
             "PERSISTENT_VIEW_REGISTERED": reduce_persistent_view_registered,
             "PERSISTENT_VIEW_UNREGISTERED": reduce_persistent_view_unregistered,
+            "REGISTRY_PRUNED": reduce_registry_pruned,
             "NAVIGATION_PUSH": reduce_navigation_push,
             "NAVIGATION_POP": reduce_navigation_pop,
             "SCOPED_UPDATE": reduce_scoped_update,
@@ -584,16 +586,31 @@ class StateStore:
                 except Exception as e:
                     logger.error(f"Error in reducer for {act['type']}: {e}", exc_info=True)
             else:
-                # Dispatch-only actions (no reducer) are a normal pattern for cross-view
-                # broadcasts. Only warn when nothing subscribes -- that's the real "typo" case.
+                # Lazy import, same cycle as _load_core_reducers: reducers.py
+                # reaches back into this module via the middleware package.
+                from .reducers import _BUILTIN_REDUCER_ACTIONS
+
                 action_type = act["type"]
-                has_listener = any(
-                    flt is None or action_type in flt for _, flt, _ in self.subscribers.values()
-                )
-                if has_listener:
-                    logger.debug(f"No reducer for {action_type} (broadcast-only)")
+                if action_type in _BUILTIN_REDUCER_ACTIONS:
+                    # The real property is "library-declared dispatch-only",
+                    # never a typo. "Has a listener" is a proxy that fails
+                    # here: subscriber filters default to an empty set, so the
+                    # manager's prune signals arrive listener-less by default.
+                    logger.debug(f"No reducer for {action_type} (dispatch-only built-in)")
                 else:
-                    logger.warning(f"No reducer found for action type {action_type}")
+                    # User broadcasts without a reducer are normal when
+                    # something is listening; an unknown type nobody listens
+                    # for is the typo case and keeps the warning. Both
+                    # registration routes count: on() takes a raw action type
+                    # and _fire_hooks dispatches on it, so a hook is a
+                    # listener even when no subscriber filters for the action.
+                    has_listener = action_type in self._hooks or any(
+                        flt is None or action_type in flt for _, flt, _ in self.subscribers.values()
+                    )
+                    if has_listener:
+                        logger.debug(f"No reducer for {action_type} (broadcast-only)")
+                    else:
+                        logger.warning(f"No reducer found for action type {action_type}")
             if perf:
                 reducer_slot[0] = (time.perf_counter() - r0) * 1000
             return self.state

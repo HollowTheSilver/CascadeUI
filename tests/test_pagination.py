@@ -586,6 +586,71 @@ class TestFromCursor:
                 interaction=_make_interaction(),
             )
 
+    async def test_wrong_arity_fetch_fn_raises_at_construction(self):
+        """A callable fetch_fn that cannot take (offset, limit) is refused
+        here, not from inside the page loader on the first fetch."""
+
+        async def one_param(offset):
+            return []
+
+        with pytest.raises(TypeError, match=r"cannot be called with \(offset, limit\)"):
+            PaginatedView.from_cursor(
+                one_param,
+                total=10,
+                per_page=5,
+                formatter=self._embed_formatter,
+                interaction=_make_interaction(),
+            )
+
+    async def test_wrong_arity_formatter_raises_at_construction(self):
+        """The formatter is stored and deferred exactly as fetch_fn is.
+
+        Cursor mode builds its pages lazily, so the formatter's first call
+        is ``_ensure_page_loaded`` -- one line below the fetch, inside the
+        same page loader. A guard on one of the two stored callables and
+        not the other leaves the identical failure on the identical seam.
+        """
+
+        async def fetch(offset, limit):
+            return list(range(offset, offset + limit))
+
+        with pytest.raises(TypeError, match=r"cannot be called with \(chunk\)"):
+            PaginatedView.from_cursor(
+                fetch,
+                total=10,
+                per_page=5,
+                formatter=lambda: "takes nothing",
+                interaction=_make_interaction(),
+            )
+
+    async def test_star_args_formatter_accepted(self):
+        """The guard must not cost the shapes that already worked."""
+
+        async def fetch(offset, limit):
+            return list(range(offset, offset + limit))
+
+        view = PaginatedView.from_cursor(
+            fetch,
+            total=10,
+            per_page=5,
+            formatter=lambda *args: {"content": str(args)},
+            interaction=_make_interaction(),
+        )
+        assert view is not None
+
+    async def test_star_args_fetch_fn_accepted(self):
+        async def flexible(*args):
+            return []
+
+        view = PaginatedView.from_cursor(
+            flexible,
+            total=10,
+            per_page=5,
+            formatter=self._embed_formatter,
+            interaction=_make_interaction(),
+        )
+        assert view._is_cursor_mode is True
+
     async def test_non_callable_formatter_raises(self):
         """TypeError when formatter is not callable."""
         with pytest.raises(TypeError, match="formatter must be callable"):
