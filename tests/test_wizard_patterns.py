@@ -9,6 +9,7 @@ from discord.ui import Container, TextDisplay
 from helpers import make_interaction as _make_interaction
 
 from cascadeui.views.patterns import WizardLayoutView, WizardView
+from cascadeui.views.patterns.types import WizardStep
 
 # // ========================================( Button style validation )======================================== // #
 
@@ -369,6 +370,63 @@ class TestWizardNavigationHooks:
 # // ========================================( Conditional steps )======================================== // #
 
 
+class TestConditionAritySteps:
+    """A condition the visibility check cannot call is refused at declaration.
+
+    ``_is_step_visible`` runs ``condition(view)`` inside a ``try`` whose
+    ``except Exception`` treats a raising predicate as visible, so an arity
+    mismatch does not surface as an error at all: the step the predicate
+    meant to hide renders, with a warning as the only trace. Both
+    declaration forms are checked, because a raw dict never passes through
+    ``WizardStep`` and neither form is the lenient one.
+    """
+
+    @staticmethod
+    def _builder():
+        async def builder():
+            return [Container(TextDisplay("s"))]
+
+        return builder
+
+    def test_zero_arg_condition_refused_in_a_raw_dict(self):
+        with pytest.raises(TypeError, match=r"cannot be called with \(view\)"):
+            WizardLayoutView(
+                steps=[{"name": "A", "builder": self._builder(), "condition": lambda: False}],
+                user_id=1,
+                guild_id=2,
+            )
+
+    def test_zero_arg_condition_refused_in_a_wizard_step(self):
+        with pytest.raises(TypeError, match=r"cannot be called with \(view\)"):
+            WizardStep(name="A", builder=self._builder(), condition=lambda: False)
+
+    def test_the_refusal_names_the_step_and_the_fix(self):
+        with pytest.raises(TypeError) as caught:
+            WizardStep(name="Payment", builder=self._builder(), condition=lambda: False)
+        message = str(caught.value)
+        assert "Payment" in message
+        assert "condition" in message
+        assert "Fix:" in message
+
+    def test_a_condition_taking_the_view_is_accepted(self):
+        """The guard must not cost the shape the contract asks for."""
+        view = WizardLayoutView(
+            steps=[{"name": "A", "builder": self._builder(), "condition": lambda v: False}],
+            user_id=1,
+            guild_id=2,
+        )
+        assert view._visible_step_indices() == []
+        view.stop()
+
+    def test_a_defaulted_second_parameter_is_accepted(self):
+        """One declared positional is the requirement, not exactly one."""
+
+        def condition(view, extra=None):
+            return True
+
+        WizardStep(name="A", builder=self._builder(), condition=condition)
+
+
 class TestConditionalSteps:
     """Steps with a ``condition`` callable are skipped when the predicate is False."""
 
@@ -678,9 +736,9 @@ class TestWizardStepDataclass:
     def test_to_dict_keeps_optionals_when_set(self):
         from cascadeui import WizardStep
 
-        builder = lambda v: None
-        validator = lambda v: (True, None)
-        condition = lambda: True
+        builder = lambda: None
+        validator = lambda: (True, None)
+        condition = lambda view: True
         s = WizardStep(name="Step", builder=builder, validator=validator, condition=condition)
         assert s.to_dict()["validator"] is validator
         assert s.to_dict()["condition"] is condition

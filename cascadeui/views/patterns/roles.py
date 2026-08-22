@@ -153,6 +153,24 @@ class _BaseRolesMixin:
     swap_message: ClassVar[str] = "Switched to **{role}** (removed {removed})."
     role_error_message: ClassVar[str] = "Could not update roles: {error}"
 
+    # Each message is rendered inside a click handler, where a typo'd
+    # placeholder surfaces as a bare KeyError naming neither the attribute
+    # nor the fix. Each test value carries the type its own render site
+    # passes, because a format spec valid for one type is not valid for
+    # another. Four of them are strings (a role name, a category name, a
+    # joined list). ``error`` is an exception on the paths that matter, and
+    # an exception accepts only the empty format spec, so testing with one
+    # admits exactly the templates that also work when a caller passes the
+    # string half of the union.
+    _FORMAT_ATTRS: ClassVar[dict] = {
+        **StatefulLayoutView._FORMAT_ATTRS,
+        "assigned_message": {"role": "r", "category": "c"},
+        "removed_message": {"role": "r", "category": "c"},
+        "required_message": {"role": "r", "category": "c"},
+        "swap_message": {"role": "r", "category": "c", "removed": "x"},
+        "role_error_message": {"error": RuntimeError("e")},
+    }
+
     # === Registration ===
 
     def __init_subclass__(cls, **kwargs):

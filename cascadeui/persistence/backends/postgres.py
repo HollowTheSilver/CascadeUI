@@ -41,7 +41,12 @@ from typing import Any, AsyncIterator, Callable, ClassVar, Optional
 import asyncpg  # hard import -- backends/__init__.py catches ImportError
 
 from ..protocols import Capability
-from ..schema import TABLE_KV, TABLE_SCHEMA_META, apply_table_prefix
+from ..schema import (
+    TABLE_KV,
+    TABLE_SCHEMA_META,
+    apply_table_prefix,
+    validate_table_prefix,
+)
 from ..schema_postgres import ALL_DDL_PG, JSONB_COLUMNS
 
 logger = logging.getLogger(__name__)
@@ -230,6 +235,7 @@ class PostgresBackend:
             raise TypeError(f"pool_kwargs must be dict, got {type(pool_kwargs).__name__}")
 
         self._dsn = dsn
+        validate_table_prefix(table_prefix, "PostgresBackend")
         self.table_prefix = table_prefix
         # The channel carries the prefix for the same reason the tables do.
         # Two deployments sharing a database write to separate tables, and on

@@ -51,8 +51,8 @@ Each dispatch records five timing fields:
 | `hooks_ms` | Registered `on()` hooks fired after notify |
 | `total_ms` | Sum of all phases, end-to-end |
 
-The split between `reducer_ms` and `middleware_ms` exists because
-slow middleware used to inflate `reducer_ms` and misdirect attention.
+The split between `reducer_ms` and `middleware_ms` exists so that
+slow middleware cannot inflate `reducer_ms` and misdirect attention.
 If `total_ms` is high, start with the largest phase:
 
 - **`reducer_ms` dominates** -- the reducer itself is slow. Check for
@@ -274,13 +274,12 @@ did not touch is the *same object* it was before, and `is` answers
 its own, so this is worth more than it looks: comparing a
 50,000-key dict to *itself* still walks every entry.
 
-Two things switch the shortcut off, and both are worth knowing before
-relying on it. A selector that builds a fresh container on every call
-(`dict(...)`, a comprehension, a manual snapshot) returns a new object
-whether or not the underlying data changed, so every comparison falls
-through to `==`. And a dispatch handled by a custom `@cascade_reducer`
-hands the reducer its own copy to mutate, which rebuilds every dict and
-list in the state. A slice that is a scalar or a tuple of scalars comes
+Two things switch the shortcut off. A selector that builds a fresh
+container on every call (`dict(...)`, a comprehension, a manual
+snapshot) returns a new object whether or not the underlying data
+changed, so every comparison falls through to `==`. And a dispatch
+handled by a custom `@cascade_reducer` hands the reducer its own copy to
+mutate, which rebuilds every dict and list in the state. A slice that is a scalar or a tuple of scalars comes
 back as the same object and still matches by identity. Every
 bucket-shaped slice is a new object and falls through to `==` for that
 dispatch, whether or not the reducer touched it. Equality is still the

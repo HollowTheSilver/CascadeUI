@@ -238,6 +238,15 @@ class TestActionSection:
         result = action_section("text", label="Go", callback=self._noop, disabled=True)
         assert result.accessory.disabled is True
 
+    def test_two_param_callback_refused(self):
+        # The button carries no value, so a handler shaped for one is a
+        # mistake caught at the builder line, not on the first click.
+        async def cb(interaction, value):
+            pass
+
+        with pytest.raises(TypeError, match=r"cannot be called with \(interaction\)"):
+            action_section("text", label="Go", callback=cb)
+
 
 # // ========================================( Toggle Section )======================================== // #
 
@@ -287,6 +296,44 @@ class TestToggleSection:
         result = toggle_section("Module", active=True, callback=self._noop, disabled=True)
         assert result.accessory.disabled is True
 
+    async def _click(self, section):
+        """Drive the accessory button's real (wrapped) callback."""
+        button = section.accessory
+        view = MagicMock()
+        view.user_id = 1
+        view.id = "view-under-test"
+        view.is_finished = MagicMock(return_value=False)
+        view.dispatch = AsyncMock()
+        button._view = view
+        await button.callback(make_interaction())
+
+    async def test_two_param_callback_receives_the_flip_of_active(self):
+        # The builder is immediate-mode: the click asks for the flip of the
+        # rendered state, the value toggle_button reports post-flip.
+        received = []
+
+        async def cb(interaction, active):
+            received.append(active)
+
+        await self._click(toggle_section("Module", active=True, callback=cb))
+        await self._click(toggle_section("Module", active=False, callback=cb))
+
+        assert received == [False, True]
+
+    async def test_one_param_callback_receives_one_argument(self):
+        received = []
+
+        async def cb(*args):
+            received.append(args)
+
+        await self._click(toggle_section("Module", active=True, callback=cb))
+
+        assert [len(args) for args in received] == [1]
+
+    def test_callback_accepting_neither_shape_refused(self):
+        with pytest.raises(TypeError, match=r"toggle_section: .*\(interaction, active\)"):
+            toggle_section("Module", active=True, callback=lambda: None)
+
 
 # // ========================================( Image Section )======================================== // #
 
@@ -313,6 +360,28 @@ class TestImageSection:
         result = image_section("text", url=photo)
         assert isinstance(result.accessory, Thumbnail)
         assert result.accessory.media.url == "attachment://avatar.png"
+
+    def test_unfurled_media_item_passes_through_unchanged(self):
+        item = discord.UnfurledMediaItem("https://example.com/img.png")
+        result = image_section("text", url=item)
+        assert result.accessory.media is item
+
+    def test_empty_url_rejected(self):
+        """An empty reference shipped silently and 400ed at send otherwise."""
+        with pytest.raises(ValueError, match="image_section: url is empty"):
+            image_section("text", url="")
+
+    def test_whitespace_url_rejected(self):
+        # One notch stricter than the text builders: a URL is machine-consumed,
+        # so whitespace-only is decidable garbage where whitespace text is not.
+        with pytest.raises(ValueError, match="image_section: url is empty"):
+            image_section("text", url="   ")
+
+    def test_empty_unfurled_media_item_rejected(self):
+        # The passthrough branch never read the wrapped url, so
+        # UnfurledMediaItem("") sailed through where "" is now caught.
+        with pytest.raises(ValueError, match="image_section: url is empty"):
+            image_section("text", url=discord.UnfurledMediaItem(""))
 
 
 # // ========================================( Key Value )======================================== // #
@@ -488,6 +557,11 @@ class TestGallery:
         with pytest.raises(ValueError, match="too many media references"):
             gallery(*urls)
 
+    def test_empty_item_rejected_naming_index(self):
+        """The per-item ``media[i]`` param name points at the blank reference."""
+        with pytest.raises(ValueError, match=r"gallery: media\[1\] is empty"):
+            gallery("https://example.com/a.png", "")
+
 
 class TestFileAttachment:
     """file_attachment() wraps the V2 File primitive for inline attachment cards."""
@@ -530,6 +604,10 @@ class TestFileAttachment:
         result = file_attachment(report)
         assert isinstance(result, File)
         assert result.media.url == "attachment://report.pdf"
+
+    def test_empty_url_rejected(self):
+        with pytest.raises(ValueError, match="file_attachment: url is empty"):
+            file_attachment("")
 
 
 # // ========================================( Additive helpers )======================================== // #
@@ -599,6 +677,10 @@ class TestConfirmSection:
         assert buttons[0].label == "Delete"
         assert buttons[1].label == "Keep"
 
+    def test_two_param_callback_refused(self):
+        with pytest.raises(TypeError, match=r"cannot be called with \(interaction\)"):
+            confirm_section("Sure?", on_confirm=_noop_with_value, on_cancel=_noop)
+
 
 class TestButtonRow:
     """dict shorthand for an ActionRow of same-style buttons."""
@@ -625,6 +707,10 @@ class TestButtonRow:
     def test_overflow_raises(self):
         with pytest.raises(ValueError, match="5-per-ActionRow"):
             button_row({str(i): _noop for i in range(6)})
+
+    def test_two_param_callback_refused(self):
+        with pytest.raises(TypeError, match=r"cannot be called with \(interaction\)"):
+            button_row({"Save": _noop_with_value})
 
 
 class TestCycleButton:
@@ -659,6 +745,14 @@ class TestCycleButton:
         with pytest.raises(ValueError, match="out of range"):
             cycle_button(values=[1, 2], on_change=_noop_with_value, start=5)
 
+    def test_one_param_on_change_refused(self):
+        # The value rides every click; a callback that cannot take it would
+        # otherwise die with a bare arity TypeError on the first advance.
+        with pytest.raises(
+            TypeError, match=r"cycle_button: on_change callback .*\(interaction, value\)"
+        ):
+            cycle_button(values=[1, 2], on_change=_noop)
+
 
 class TestToggleButton:
     """standalone boolean toggle, distinct from toggle_section."""
@@ -678,6 +772,12 @@ class TestToggleButton:
     def test_custom_labels(self):
         btn = toggle_button(active=True, on_toggle=_noop_with_value, labels=("Dark", "Light"))
         assert btn.label == "Dark"
+
+    def test_one_param_on_toggle_refused(self):
+        with pytest.raises(
+            TypeError, match=r"toggle_button: on_toggle callback .*\(interaction, active\)"
+        ):
+            toggle_button(active=True, on_toggle=_noop)
 
 
 class TestStatsCard:
@@ -799,6 +899,10 @@ class TestTabNav:
     def test_overflow_raises(self):
         with pytest.raises(ValueError, match="5-per-ActionRow"):
             tab_nav({str(i): _noop for i in range(6)})
+
+    def test_two_param_callback_refused(self):
+        with pytest.raises(TypeError, match=r"cannot be called with \(interaction\)"):
+            tab_nav({"Stats": _noop_with_value})
 
 
 # // ========================================( Paginated Region )======================================== // #
@@ -958,6 +1062,26 @@ class TestPaginatedRegionConstruction:
         assert region.page == 0
         assert region.items == []
         assert region.page_count == 1
+
+    def test_bad_indicator_format_placeholder_raises(self):
+        # PaginatedRegion validates its own copy of this check -- it does
+        # not inherit _StatefulMixin, so _FORMAT_ATTRS never runs here.
+        with pytest.raises(ValueError, match="indicator_button_format is not a valid"):
+
+            class _R(PaginatedRegion):
+                indicator_button_format = "{pagee}/{total}"
+
+    def test_non_str_indicator_format_raises(self):
+        with pytest.raises(TypeError, match="indicator_button_format must be a str or None"):
+
+            class _R(PaginatedRegion):
+                indicator_button_format = 5
+
+    def test_valid_indicator_format_accepted(self):
+        class _R(PaginatedRegion):
+            indicator_button_format = "{page} of {total}"
+
+        assert _R.indicator_button_format == "{page} of {total}"
 
 
 class TestPaginatedRegionSlicing:
@@ -1551,6 +1675,22 @@ class TestChoiceRowConstruction:
         with pytest.raises(TypeError, match="on_select must be callable"):
             choice_row({"a": 1}, on_select=None)
 
+    def test_one_param_on_select_refused(self):
+        with pytest.raises(
+            TypeError, match=r"choice_row: on_select callback .*\(interaction, value\)"
+        ):
+            choice_row({"a": 1}, on_select=_noop)
+
+    def test_star_args_on_select_accepted(self):
+        row = choice_row({"a": 1}, on_select=lambda *args: None)
+        assert row is not None
+
+    def test_unreadable_signature_on_select_accepted(self):
+        # ``min`` has no readable signature; the refusal fails open rather
+        # than rejecting what it cannot inspect.
+        row = choice_row({"a": 1}, on_select=min)
+        assert row is not None
+
     def test_non_choice_option_raises(self):
         """A two-item pair is now converted, so the rejection needs an entry
         that carries no label and value at all."""
@@ -1944,6 +2084,21 @@ class TestCollapsibleConstruction:
 
         with pytest.raises(TypeError, match="reveal must be synchronous"):
             Collapsible(label="Edit", reveal=_async_reveal)
+
+    def test_reveal_requiring_arguments_refused(self):
+        # Unchecked, this constructs and renders collapsed cleanly, then dies
+        # on the first expand click with a bare arity TypeError naming
+        # neither the kwarg nor the class.
+        with pytest.raises(
+            TypeError, match=r"reveal callable .* cannot be called with no arguments"
+        ):
+            Collapsible(label="Edit", reveal=lambda x: [])
+
+    def test_summary_requiring_arguments_refused(self):
+        with pytest.raises(
+            TypeError, match=r"summary callable .* cannot be called with no arguments"
+        ):
+            Collapsible(label="Edit", reveal=_reveal_one, summary=lambda x: "s")
 
     def test_bad_style_raises(self):
         with pytest.raises(TypeError, match="style must be a discord.ButtonStyle"):

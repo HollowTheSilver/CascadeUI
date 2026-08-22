@@ -12,11 +12,127 @@ from discord.ui import Item
 from ..state.actions import ActionCreators
 from ..state.store import _CURRENT_INTERACTION
 from ..utils.coercion import coerce_snowflake_match
-from ..utils.hooks import await_maybe
+from ..utils.hooks import accepts_second_positional, await_maybe, can_accept_positional
 from ..utils.responses import ack_backstop, open_modal_safe, respond_safe, trailing_ack
 from .types import MAX_SELECT_OPTIONS
 
 logger = logging.getLogger(__name__)
+
+
+# // ========================================( Functions )======================================== // #
+
+
+def _describe_callback(fn) -> str:
+    """Name a user callback and its signature for an error message.
+
+    A refusal that prints only "wrong number of arguments" leaves the
+    reader counting parameters; printing the signature back makes the
+    mistake self-diagnosing, and an unbound method pulled off a class body
+    shows its ``self`` immediately.
+    """
+    name = getattr(fn, "__name__", None) or repr(fn)
+    try:
+        return f"{name}{inspect.signature(fn, follow_wrapped=False)}"
+    except (ValueError, TypeError):
+        return name
+
+
+def require_url(url, owner: str, label: str = "") -> None:
+    """Refuse a link destination that cannot resolve.
+
+    A blank destination is not a degraded link: Discord answers it with a
+    form error naming no component. The pre-flight validator catches one
+    in a V2 tree, but a V1 view reaches no pre-flight, so the check
+    belongs where the button is built.
+
+    Takes the owner's name because two constructors reach it: refusing in
+    ``LinkButton``'s vocabulary from a ``link_section`` call would point
+    at a class the caller never wrote.
+    """
+    named = f"(label={label!r}) " if label else ""
+    # Checked before the emptiness test, because a truthy non-str answers
+    # ``strip`` by raising from inside this guard rather than reporting
+    # the input. A yarl.URL is the realistic one: aiohttp is a hard
+    # dependency, so every consumer holds the type, and discord.py stores
+    # whatever it is given and fails on it at serialization.
+    if not isinstance(url, str):
+        raise TypeError(
+            f"{owner}{named}needs a str url, got {type(url).__name__}.\n"
+            f"  Fix: pass the address as a string -- str(url) if you are "
+            f"holding a URL object."
+        )
+    if url.strip():
+        return
+    raise ValueError(
+        f"{owner}{named}needs a non-empty url.\n"
+        f"  Fix: supply the destination, or use an ordinary button with a "
+        f"callback if there is nowhere to link."
+    )
+
+
+def refuse_wrong_arity(fn, arity: int, message: str) -> None:
+    """Refuse a callback that cannot take the argument list it will be given.
+
+    Takes the arity the caller has ALREADY decided to use, rather than
+    deciding again. A seam that chooses the call shape from one reading of
+    the signature and refuses from another can disagree with itself: a
+    ``functools.wraps`` adapter advertises the signature it wraps, so a
+    narrowing one declares an argument it cannot take and a widening one
+    takes an argument it does not declare. Passing the chosen arity in
+    makes that class of disagreement unrepresentable.
+
+    An unreadable signature reports ``None`` and is allowed through,
+    matching every other introspection seam here.
+    """
+    if can_accept_positional(fn, arity) is False:
+        raise TypeError(message)
+
+
+def require_value_callback(fn, owner: str, param: str, value_name: str) -> None:
+    """Refuse a callback that cannot receive the value its control delivers.
+
+    The mirror of the button-side refusal. A control that reports what was
+    picked calls its callback with two arguments always, so a callback
+    declaring one is broken on the first click, with a bare arity
+    ``TypeError`` raised from inside the builder's own closure. Accepting
+    it instead and dropping the value would be worse: the callback cannot
+    know what was chosen, which is silent wrong behavior rather than a
+    loud failure.
+
+    An unreadable signature is allowed through, matching every other
+    introspection seam here.
+    """
+    if fn is None:
+        return
+    if can_accept_positional(fn, 2) is False:
+        # The parameter is sometimes itself named "callback", so the word is
+        # added only when it does not already read as one.
+        label = param if "callback" in param else f"{param} callback"
+        raise TypeError(
+            f"{owner}: {label} {_describe_callback(fn)} cannot be called "
+            f"with (interaction, {value_name}).\n"
+            f"  Fix: accept (interaction, {value_name}) -- this control reports "
+            f"{value_name} to its callback on every click."
+        )
+
+
+def _callback_arity_message(component, fn, is_select: bool) -> str:
+    """Build the refusal text for a callback the component cannot call."""
+    owner = type(component).__name__
+    if is_select:
+        return (
+            f"{owner} callback {_describe_callback(fn)} cannot be called with "
+            f"(interaction) or (interaction, values).\n"
+            f"  Fix: accept (interaction), or (interaction, values) to receive "
+            f"the selection."
+        )
+    return (
+        f"{owner} callback {_describe_callback(fn)} cannot be called with "
+        f"(interaction). This component passes no second value to its callback.\n"
+        f"  Fix: accept a single positional argument and close over any extra "
+        f"data, or use toggle_button / cycle_button / choice_row when the "
+        f"callback needs the control's value."
+    )
 
 
 # // ========================================( Classes )======================================== // #
@@ -26,7 +142,19 @@ class StatefulComponent:
     """Base mixin for components that interact with state."""
 
     def create_stateful_callback(self, component, original_callback=None):
-        """Create a callback that updates state."""
+        """Create a callback that updates state.
+
+        The wrapper enforces the callback contract: a callback receives
+        the interaction, plus the component's ``values`` as a second
+        argument when the component is a select and the callback declares
+        a second positional parameter.
+
+        Raises:
+            TypeError: ``original_callback`` cannot accept the arguments
+                the component will call it with -- ``(interaction)`` for a
+                button, ``(interaction)`` or ``(interaction, values)`` for
+                a select. An unreadable signature is allowed through.
+        """
         component_id = getattr(component, "custom_id", None) or str(id(component))
 
         # Keep the caller's own function reachable. Once this returns,
@@ -39,18 +167,23 @@ class StatefulComponent:
         # Pre-compute whether to pass select values to the callback.
         # When the component is a select and the callback accepts a second
         # positional parameter, component.values is passed automatically.
+        # The real property is "is this a select", which only a select's
+        # ``values`` attribute answers: discord.py injects ``custom_id`` onto
+        # every attached item, so that one cannot discriminate.
         _pass_values = False
-        if original_callback and hasattr(component, "values"):
-            try:
-                sig = inspect.signature(original_callback)
-                params = [
-                    p
-                    for p in sig.parameters.values()
-                    if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
-                ]
-                _pass_values = len(params) >= 2
-            except (ValueError, TypeError):
-                _pass_values = False
+        if original_callback:
+            is_select = hasattr(component, "values")
+            # Decide the call shape first, then refuse against that shape.
+            # A signature the component can never call is a mistake made
+            # here, at the builder line, and discovered on a click minutes
+            # later as a bare arity TypeError raised from inside the wrapper
+            # below. Refusing it names the component and the shape it wants.
+            _pass_values = is_select and accepts_second_positional(original_callback)
+            refuse_wrong_arity(
+                original_callback,
+                2 if _pass_values else 1,
+                _callback_arity_message(component, original_callback, is_select),
+            )
 
         async def stateful_callback(interaction):
             # Get view from the component itself
@@ -73,16 +206,9 @@ class StatefulComponent:
             # is a host-only button on an open-join view (lobby, ticket,
             # poll), where allowed_users would let participants through.
             #
-            # The ``is True`` check is deliberate: real buttons store
-            # exactly ``True`` or ``False`` via the ``owner_only=``
-            # kwarg, so the strict identity check is correct for
-            # production. It also keeps MagicMock-based tests clean --
-            # ``getattr`` on a MagicMock returns a MagicMock for unset
-            # attributes, which is truthy under ``bool()`` but is not
-            # ``True`` under identity comparison. Tests that explicitly
-            # exercise the gate set ``_button_owner_only = True`` on
-            # the mock; tests that don't set the attribute correctly
-            # bypass the gate.
+            # ``is True`` rather than truthiness: the kwarg stores exactly
+            # ``True`` or ``False``, so anything else reaching this
+            # attribute is not a caller opting in.
             if (
                 getattr(component, "_button_owner_only", False) is True
                 and getattr(view, "user_id", None) is not None
@@ -139,6 +265,11 @@ class StatefulComponent:
 class StatefulButton(discord.ui.Button, StatefulComponent):
     """A button that interacts with state.
 
+    The callback takes one positional argument, the interaction, sync or
+    async. A button carries no value, so a callback declaring a required
+    second parameter is refused at construction rather than raising a
+    bare arity error on the first click.
+
     Setting ``owner_only=True`` gates the callback on
     ``interaction.user.id == view.user_id``. Mismatches route through
     the view's ``on_unauthorized`` hook (with ``unauthorized_message``
@@ -146,6 +277,9 @@ class StatefulButton(discord.ui.Button, StatefulComponent):
     Pairs with view-level ``owner_only=False`` to express "open view,
     host-only button" -- the canonical shape for lobby Start/Disband
     buttons, ticket Close buttons, and poll End buttons.
+
+    Raises:
+        TypeError: ``callback`` cannot be called with ``(interaction)``.
     """
 
     def __init__(self, *args, callback=None, owner_only: bool = False, **kwargs):
@@ -174,12 +308,23 @@ _EMPTY_SELECT_OPTION = discord.SelectOption(label="\u2014", value=_EMPTY_SELECT_
 class StatefulSelect(discord.ui.Select, StatefulComponent):
     """A select menu that interacts with state.
 
+    The callback takes ``(interaction)`` or ``(interaction, values)``,
+    sync or async; the two-parameter form receives the selected values on
+    every pick. A callback that can accept neither shape is refused at
+    construction.
+
     When ``options=[]`` is passed, a disabled placeholder option is
     substituted automatically and the select is forced to ``disabled=True``.
     This absorbs the Discord error 50035 that otherwise fires for
     dynamically-filtered selects whose filter produces an empty list --
     callers can pass the filtered list directly without a bespoke
     "render a disabled fallback" branch at every usage site.
+
+    Raises:
+        TypeError: ``callback`` can accept neither ``(interaction)`` nor
+            ``(interaction, values)``; or ``options`` is a mapping or
+            holds a non-``SelectOption`` entry.
+        ValueError: More than 25 options.
     """
 
     def __init__(self, *args, callback=None, owner_only: bool = False, **kwargs):

@@ -64,6 +64,75 @@ class TestPaginatedLayoutCustomization:
         assert view._next_btn.style is discord.ButtonStyle.success
 
 
+# // ========================================( indicator_button_format )======================================== // #
+
+
+class TestIndicatorButtonFormat:
+    """``indicator_button_format`` renders a template instead of the "Page
+    n/t" default, on both the plain indicator and the go-to button it swaps
+    to once the page count crosses ``jump_threshold``."""
+
+    def test_invalid_placeholder_rejected_at_definition(self):
+        with pytest.raises(ValueError, match="indicator_button_format is not a valid"):
+
+            class BadFormat(PaginatedLayoutView):
+                indicator_button_format = "{pagee}/{total}"
+
+    def test_unbalanced_brace_rejected_at_definition(self):
+        with pytest.raises(ValueError, match="indicator_button_format is not a valid"):
+
+            class Unbalanced(PaginatedLayoutView):
+                indicator_button_format = "{page"
+
+    def test_non_str_rejected_at_definition(self):
+        with pytest.raises(TypeError, match="indicator_button_format must be a str or None"):
+
+            class NotAString(PaginatedLayoutView):
+                indicator_button_format = 5
+
+    def test_valid_template_accepted_at_definition(self):
+        class GoodFormat(PaginatedLayoutView):
+            indicator_button_format = "{page} of {total}"
+
+        assert GoodFormat.indicator_button_format == "{page} of {total}"
+
+    def test_format_renders_on_the_plain_indicator(self):
+        """Below jump_threshold, the indicator is a static (non-goto) button."""
+
+        class Templated(PaginatedLayoutView):
+            indicator_button_format = "{page} of {total}"
+
+        pages = [[Container(TextDisplay(chr(65 + i)))] for i in range(3)]
+        view = Templated(interaction=_make_interaction(), pages=pages)
+
+        assert view._indicator_btn.label == "1 of 3"
+
+    def test_format_renders_on_the_goto_indicator(self):
+        """At/above jump_threshold, the indicator becomes the go-to button
+        and resolves through ``_resolve_goto_label`` instead."""
+
+        class Templated(PaginatedLayoutView):
+            indicator_button_format = "{page} of {total}"
+
+        pages = [[Container(TextDisplay(chr(65 + i)))] for i in range(6)]
+        view = Templated(interaction=_make_interaction(), pages=pages)
+
+        assert view._indicator_btn.label == "1 of 6"
+
+    def test_literal_label_still_wins_over_format(self):
+        """``indicator_button_label`` is checked first in both resolvers, so
+        setting both keeps the frozen literal rather than the template."""
+
+        class Both(PaginatedLayoutView):
+            indicator_button_label = "Frozen"
+            indicator_button_format = "{page} of {total}"
+
+        pages = [[Container(TextDisplay(chr(65 + i)))] for i in range(3)]
+        view = Both(interaction=_make_interaction(), pages=pages)
+
+        assert view._indicator_btn.label == "Frozen"
+
+
 # // ========================================( on_page_changed hook )======================================== // #
 
 

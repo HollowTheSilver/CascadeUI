@@ -2,17 +2,19 @@
 
 
 import asyncio
+import contextvars
 import logging
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import discord
 from discord import CheckboxGroupOption, Interaction, RadioGroupOption, TextStyle
+from discord.ui.select import BaseSelect
 
 from ..utils.hooks import await_maybe
 from ..utils.responses import ack_backstop, respond_safe, trailing_ack
 from ..utils.strings import slugify
 from ..validation import validate_fields
-from .base import StatefulComponent
+from .base import StatefulComponent, require_value_callback
 
 logger = logging.getLogger(__name__)
 
@@ -462,6 +464,75 @@ def _unwrap_label(item):
     return item
 
 
+_SUBMIT_VERDICT: contextvars.ContextVar = contextvars.ContextVar(
+    "cascadeui_submit_verdict", default=None
+)
+"""What ``Modal.on_submit`` decided on this task: True accepted, False
+rejected by a validator, None never ran.
+
+Task-scoped rather than held on the modal, because a modal instance is
+shared by every submission it receives. A context is copied into a task
+at creation, so discord.py dispatching a real submission cannot overwrite
+the verdict an offline drive is waiting to read, while a write inside a
+coroutine awaited on the same task stays visible to its awaiter.
+"""
+
+
+def _label_text(item):
+    """Return the display name a modal input can be addressed by.
+
+    A ``ui.Label`` carries it as ``text``. A CascadeUI wrapper carries it
+    as a plain ``label`` attribute on the instance, which is read out of
+    the instance dictionary rather than through ``getattr``: a raw
+    discord.py component exposes ``label`` as a deprecated class property
+    whose getter forces a ``DeprecationWarning`` past any filter a caller
+    sets, so an ordinary attribute read would put a warning in every
+    consumer's test output for an attribute they never touched. Going
+    through ``__dict__`` cannot invoke a property at all, which makes the
+    distinction structural rather than a list of types to keep current.
+
+    A raw component with no ``ui.Label`` therefore has no alias, which
+    costs nothing: its custom_id is its identity and always resolves.
+    """
+    if isinstance(item, discord.ui.Label):
+        return getattr(item, "text", None)
+    return getattr(item, "__dict__", {}).get("label")
+
+
+def _assign_submitted_value(inner, key: str, value) -> None:
+    """Write a submitted value onto a discord.py modal component.
+
+    Discord delivers these from the gateway payload, so a modal component
+    exposes its value as a read-only property over a private attribute of
+    the same name. Writing that attribute is what ``_refresh_state`` does
+    upstream, and there is no public setter to prefer over it.
+
+    Which property carries the value is read off the component rather than
+    matched against a list of known types: a multi-select and a file
+    upload expose ``values`` where a text input exposes ``value``, and any
+    modal component discord.py adds later answers for itself.
+
+    The storage attribute is confirmed present before the write. Absent,
+    it means discord.py moved it, and a plain assignment would create a
+    fresh attribute nothing reads while the submission ran against
+    defaults and reported success. Reading the value back instead would
+    not answer this: a property that coerces its input (a text input
+    returns ``''`` for ``None``) reports no change for a write that
+    landed, and one holding a default reports no change for a write that
+    did not.
+    """
+    prop = "values" if hasattr(type(inner), "values") else "value"
+    storage = f"_{prop}"
+    if not hasattr(inner, storage):
+        raise RuntimeError(
+            f"Modal.submit could not set {key!r}: {type(inner).__name__} has no "
+            f"{storage!r} behind its {prop!r} property.\n"
+            f"  This means discord.py moved the attribute. The submission would "
+            f"otherwise run against default values and report success."
+        )
+    setattr(inner, storage, value)
+
+
 class Modal(discord.ui.Modal, StatefulComponent):
     """A modal dialog with stateful inputs and auto-collected validation.
 
@@ -495,6 +566,25 @@ class Modal(discord.ui.Modal, StatefulComponent):
         If provided, a ``MODAL_SUBMITTED`` action is dispatched to the store
         with ``source_id`` set to the same view id, so custom reducers and
         subscribers can distinguish per-view submissions.
+    custom_id:
+        Forwarded to ``discord.ui.Modal``. Omit it to let discord.py
+        generate one.
+
+    The signature is closed: an unrecognized keyword raises ``TypeError``
+    naming it. ``on_submit`` is the method discord.py subclasses override,
+    so it is the natural wrong guess for ``callback``, and a discarded
+    handler would leave the modal acknowledging every submission while
+    running nothing.
+
+    Raises:
+        TypeError: An unrecognized keyword, a non-``str`` title, ``inputs``
+            given as a single wrapper rather than a list, a ``callback``
+            that cannot receive ``(interaction, values)``, or an input
+            carrying no ``custom_id`` and therefore no value to collect.
+        ValueError: An empty title, or two inputs deriving the same
+            ``custom_id``. That id comes from the label, so two inputs
+            sharing a label collide on one key and the second would
+            silently replace the first.
     """
 
     # Ack backstop for discord.py's modal dispatch, which has no auto-defer
@@ -523,12 +613,19 @@ class Modal(discord.ui.Modal, StatefulComponent):
         inputs: list,
         callback: Optional[Callable] = None,
         timeout: Optional[float] = None,
-        **kwargs,
+        view_id: Optional[str] = None,
+        custom_id: Optional[str] = None,
     ):
         _validate_text("Modal", "title", title)
-        super().__init__(title=title, timeout=timeout)
+        # discord.py generates a custom_id when none is supplied, and its
+        # sentinel default is not None, so the caller's value is forwarded
+        # only when there is one.
+        if custom_id is None:
+            super().__init__(title=title, timeout=timeout)
+        else:
+            super().__init__(title=title, timeout=timeout, custom_id=custom_id)
 
-        self.view_id = kwargs.get("view_id")
+        self.view_id = view_id
         self.inputs: Dict[str, Any] = {}
         self.validators: Dict[str, List[Callable]] = {}
         # Pairs each wrapped CascadeUI input (TextInput, Checkbox, etc.)
@@ -564,9 +661,19 @@ class Modal(discord.ui.Modal, StatefulComponent):
                 # modal-compatible component the user constructed directly.
                 self.add_item(input_item)
                 inner = _unwrap_label(input_item)
+                if not hasattr(inner, "custom_id"):
+                    raise TypeError(
+                        f"Modal: {type(inner).__name__} carries no custom_id, so "
+                        f"its value cannot be collected on submission.\n"
+                        f"  Fix: pass an input component -- a CascadeUI wrapper, "
+                        f"or a raw discord.ui input, optionally inside a ui.Label."
+                    )
                 self._reject_duplicate_input(inner.custom_id)
                 self.inputs[inner.custom_id] = input_item
 
+        # on_submit calls this with the collected values on every submit,
+        # so a one-parameter callback is broken from the first one.
+        require_value_callback(callback, "Modal", "callback", "values")
         self.user_callback = callback
 
     def _reject_duplicate_input(self, custom_id: str) -> None:
@@ -652,6 +759,14 @@ class Modal(discord.ui.Modal, StatefulComponent):
                     values[inner.custom_id] = inner.value
                 elif isinstance(inner, (discord.ui.CheckboxGroup, discord.ui.FileUpload)):
                     values[inner.custom_id] = inner.values
+                elif isinstance(inner, BaseSelect):
+                    # Reached only through the raw-item escape hatch, since
+                    # no wrapper builds one -- but discord.py fills a modal
+                    # select on submission like any other child, and without
+                    # this branch the chosen option was dropped before the
+                    # callback, values_by_input, and the state dispatch, on
+                    # real submissions as well as offline drives.
+                    values[inner.custom_id] = inner.values
                 elif isinstance(inner, discord.ui.Checkbox):
                     values[inner.custom_id] = inner.value
 
@@ -678,6 +793,7 @@ class Modal(discord.ui.Modal, StatefulComponent):
                     # slow validator, so a bare send_message would raise
                     # InteractionResponded.
                     await self.respond(interaction, "\n".join(lines), ephemeral=True)
+                    _SUBMIT_VERDICT.set(False)
                     return
 
             # Write submitted values back onto the original CascadeUI wrapper
@@ -685,6 +801,7 @@ class Modal(discord.ui.Modal, StatefulComponent):
             # This runs after validation so a rejected value never appears on the
             # wrapper, matching the documented "populated after validation passes"
             # contract.
+            _SUBMIT_VERDICT.set(True)
             self.values_by_input = {}
             for wrapped, discord_input in self._wrapped_pairs:
                 if isinstance(wrapped, (CheckboxGroup, FileUpload)):
@@ -719,6 +836,173 @@ class Modal(discord.ui.Modal, StatefulComponent):
         finally:
             if not defer_task.done():
                 defer_task.cancel()
+
+    async def submit(self, interaction: Interaction, values: Dict[str, Any]) -> bool:
+        """Drive a submission offline, through the pipeline a real one takes.
+
+        The offline-testing surface for modals, alongside ``on_load()``,
+        ``validate()``, and ``cascadeui.testing.stub_client()``. Reaching
+        past it to call the stored callback directly skips everything
+        :meth:`on_submit` does first, and the validator pass is the one
+        that matters: a test written that way succeeds against input the
+        validators would have rejected, so its coverage reads wider than
+        the seam it crossed.
+
+        This assigns the supplied values onto the underlying components
+        and then calls :meth:`on_submit` itself, so there is no second
+        implementation to drift: whatever a real submission runs, this
+        runs.
+
+        Args:
+            interaction: The interaction to hand the pipeline. A test
+                double is expected here; nothing about this method
+                requires a live one.
+            values: Field values, keyed by either the input's ``label``
+                ("Emoji") or its derived ``custom_id`` ("input_emoji").
+                A custom_id is the identity and always resolves to its own
+                input; a label is an alias, and takes only a name no
+                custom_id has claimed. A field left out keeps whatever
+                value it holds, so a test supplies only the fields it
+                cares about.
+
+        Returns:
+            ``True`` when the submission was accepted and the callback
+            ran, ``False`` when a validator rejected it. A rejection is
+            not an error: it is the outcome under test.
+
+            The verdict is what :meth:`on_submit` records as it runs, so
+            a subclass overriding that method must call up to it. One that
+            does not leaves nothing recorded, and is refused rather than
+            reported as a rejection.
+
+            The verdict is scoped to the calling task, so a submission
+            arriving from Discord while this one is in flight cannot be
+            read as its answer. The submitted values are not: they live on
+            the components, as they do for a real submission, so drive one
+            modal one submission at a time.
+
+        Raises:
+            TypeError: ``values`` is not a mapping.
+            ValueError: A key matches no input on this modal, or two keys
+                name the same input (its label and its custom_id both).
+                Raised before any value is written, so a mapping carrying
+                one bad key leaves the modal untouched.
+            RuntimeError: The component has no storage behind its value
+                property, meaning discord.py moved the attribute; or the
+                submit pipeline did not run, leaving no verdict to return.
+                Both are raised rather than reported, since either would
+                otherwise pass as an ordinary result.
+        """
+        if not hasattr(values, "items"):
+            raise TypeError(
+                f"Modal.submit expects a mapping of field to value, got "
+                f"{type(values).__name__}.\n"
+                f"  Fix: pass {{'Field Label': value}} -- keys are an input's "
+                f"label or its custom_id."
+            )
+        targets = self._resolve_submit_keys()
+
+        # Resolved in full before anything is written, so a bad key leaves
+        # the modal untouched rather than half-populated up to whichever
+        # key the mapping happened to reach first.
+        resolved = []
+        claimed = {}
+        for key, value in values.items():
+            inner = targets.get(key)
+            if inner is None:
+                raise ValueError(
+                    f"Modal.submit: no input named {key!r} on {self.title!r}.\n"
+                    f"  Fix: key by an input's label or custom_id -- "
+                    f"{sorted(targets)}"
+                )
+            if id(inner) in claimed:
+                # An input answers to its label and its custom_id, so one
+                # mapping can name the same field twice. Assigning both
+                # would keep whichever came last and lose the other with
+                # nothing said, which is what the constructor already
+                # refuses two inputs for.
+                raise ValueError(
+                    f"Modal.submit: {claimed[id(inner)]!r} and {key!r} both name "
+                    f"the same input on {self.title!r}, so one value would be "
+                    f"lost.\n"
+                    f"  Fix: pass that field once."
+                )
+            claimed[id(inner)] = key
+            resolved.append((inner, key, value))
+        for inner, key, value in resolved:
+            _assign_submitted_value(inner, key, value)
+
+        # on_submit records its decision at both points where it decides,
+        # into a channel scoped to this task, so this call's recording is
+        # the only one it can read. Reading the outcome this way keeps the
+        # production path unaware that anything is driving it offline.
+        token = _SUBMIT_VERDICT.set(None)
+        try:
+            await self.on_submit(interaction)
+            verdict = _SUBMIT_VERDICT.get()
+        finally:
+            _SUBMIT_VERDICT.reset(token)
+        if verdict is None:
+            # Nothing recorded a decision, so the submit pipeline did not
+            # run. No comparison of classes can detect that up front: the
+            # call dispatches through the instance, and a subclass that
+            # calls up records its verdict exactly as this class does.
+            raise RuntimeError(
+                f"Modal.submit got no verdict from {type(self).__name__}: "
+                f"the submit pipeline did not run, so the validators never "
+                f"ran and nothing recorded whether the input was accepted.\n"
+                f"  Fix: an on_submit override must await "
+                f"super().on_submit(interaction), which runs the validators "
+                f"and the callback, before doing its own work."
+            )
+        return verdict
+
+    def _resolve_submit_keys(self):
+        """Map every name :meth:`submit` accepts to the component it sets.
+
+        ``self.inputs`` is the modal's identity map: keyed by custom_id,
+        carrying raw escape-hatch items alongside wrapped ones, and the
+        same key space as the ``values`` mapping the callback receives.
+        Building from it is what lets ``submit`` reach a raw input at all.
+
+        Identities register first, aliases second. A raw item carries
+        whatever custom_id its author chose, so a label can name an input
+        already spoken for; the identity wins and the alias is simply not
+        registered. Refusing the name instead would leave the input
+        holding it reachable by nothing, since that name is the only one
+        it has.
+
+        Returns:
+            Every accepted name mapped to the component it writes.
+        """
+        # For a wrapped input, self.inputs holds the CascadeUI wrapper,
+        # whose .value is a plain attribute written back after a submit.
+        # The component that CARRIES the submitted value is the discord.py
+        # one underneath, which _wrapped_pairs pairs it with.
+        inner_for = {wrapped: inner for wrapped, inner in self._wrapped_pairs}
+
+        targets = {}
+        for custom_id, item in self.inputs.items():
+            targets[custom_id] = inner_for.get(item) or _unwrap_label(item)
+
+        # Aliases in a second pass, so every identity is claimed before any
+        # label competes for a name. A label two inputs would claim is not
+        # a free name: registering the first silently sends a value to
+        # whichever happened to be listed earlier, and both inputs still
+        # answer to their own custom_id.
+        claimed_labels = {}
+        for custom_id, item in self.inputs.items():
+            label = _label_text(item)
+            if not label or label in targets:
+                continue
+            if label in claimed_labels:
+                claimed_labels[label] = None
+            else:
+                claimed_labels[label] = inner_for.get(item) or _unwrap_label(item)
+        for label, inner in claimed_labels.items():
+            if inner is not None:
+                targets[label] = inner
+        return targets
 
     async def _safe_post_submit_defer(self, interaction: Interaction) -> None:
         """Acknowledge the modal submission if the callback left it unanswered.

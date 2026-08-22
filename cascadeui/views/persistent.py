@@ -269,7 +269,14 @@ class _PersistentMixin:
         return message
 
     async def exit(self, delete_message: bool | None = None):
-        """Exit the view and remove it from the persistent registry."""
+        """Exit the view and remove it from the persistent registry.
+
+        Retiring a stored registration when no instance is live goes through
+        ``PersistenceManager.prune_registry(persistence_keys=[...])`` instead,
+        reachable as ``store.persistence_manager``. Both routes leave the
+        same state behind: the stored row is deleted and the key drops out
+        of ``state["persistent_views"]``.
+        """
         # Unregister before cleanup so the state dispatch still works
         payload = ActionCreators.persistent_view_unregistered(self.persistence_key)
         await self.dispatch("PERSISTENT_VIEW_UNREGISTERED", payload)

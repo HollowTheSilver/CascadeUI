@@ -569,6 +569,58 @@ class TestWrapperIdempotence:
         assert "with_cooldown" in second._cascadeui_wrapped
 
 
+class TestCooldownMessageTemplate:
+    """``message=`` is a ``str.format`` template, checked where it is given.
+
+    The refusal branch is the only place it renders, and that branch runs
+    on a second click inside the cooldown window -- so an unrenderable
+    template survives construction, survives the first click, and then
+    raises from inside the wrapper naming neither this parameter nor the
+    placeholder it accepts.
+    """
+
+    @staticmethod
+    def _button():
+        async def cb(interaction):
+            pass
+
+        return StatefulButton(label="B", custom_id="b", callback=cb)
+
+    def test_a_typo_in_the_placeholder_is_refused(self):
+        with pytest.raises(ValueError, match="cannot be rendered"):
+            with_cooldown(self._button(), seconds=60, message="Wait {remaning}s")
+
+    def test_a_format_spec_on_the_value_is_refused(self):
+        """The value arrives pre-formatted, so a spec is a type error.
+
+        The docstring advertises one-decimal rendering, which makes
+        ``{remaining:.0f}`` a natural thing to reach for, and it raised a
+        ValueError about a str at click time.
+        """
+        with pytest.raises(ValueError, match="cannot be rendered"):
+            with_cooldown(self._button(), seconds=60, message="Wait {remaining:.0f}s")
+
+    def test_the_refusal_names_the_parameter_and_the_placeholder(self):
+        with pytest.raises(ValueError) as caught:
+            with_cooldown(self._button(), seconds=60, message="{nope}")
+        message = str(caught.value)
+        assert "with_cooldown(message=" in message
+        assert "{remaining}" in message
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "Wait {remaining}s",
+            "on cooldown",
+            "{remaining} then {remaining}",
+            None,
+        ],
+    )
+    def test_renderable_templates_are_accepted(self, template):
+        """The guard must not cost a template that would have worked."""
+        with_cooldown(self._button(), seconds=60, message=template)
+
+
 class TestCooldownSurvivesRebuild:
     """Deadlines live on the owning view, so a rebuilt component keeps them.
 

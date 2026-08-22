@@ -53,6 +53,42 @@ ALL_TABLES: Final[tuple[str, ...]] = (
 _INDEX_PREFIX: Final[str] = "idx_"
 
 
+# fullmatch rather than an anchored match: "$" also matches just before a
+# trailing newline, so a prefix read from an env var or a config line
+# would pass here and split into two SQL tokens mid-DDL, failing with a
+# syntax error naming neither the prefix nor the newline.
+_SAFE_PREFIX = re.compile(r"[a-z_][a-z0-9_]*")
+
+
+def validate_table_prefix(prefix: str, owner: str) -> None:
+    """Reject a table prefix that cannot be interpolated as an identifier.
+
+    The prefix reaches SQL two ways that do not agree on quoting: the DDL
+    and the migrator resolve names by text substitution, unquoted, while a
+    backend's own row and key-value paths quote what they build. PostgreSQL
+    folds an unquoted identifier to lower case and preserves a quoted one,
+    so a prefix carrying a capital would create ``Bot_cascadeui_kv`` on one
+    path and address ``bot_cascadeui_kv`` on the other, splitting one
+    deployment's data across two tables that both look right in isolation.
+
+    Lower case, digits, and underscores are what survive both paths
+    identically. Everything else is refused here, where the deployment
+    names its prefix, rather than at a divergence discovered later.
+    """
+    if not isinstance(prefix, str):
+        raise TypeError(
+            f"{owner} table_prefix must be a str, got {type(prefix).__name__}: {prefix!r}"
+        )
+    if prefix and not _SAFE_PREFIX.fullmatch(prefix):
+        raise ValueError(
+            f"{owner} table_prefix {prefix!r} is not a usable identifier prefix.\n"
+            f"  Fix: use lower-case letters, digits, and underscores, starting "
+            f"with a letter or underscore (for example 'staging_'). A capital "
+            f"or a quote resolves differently in the DDL than in the row path, "
+            f"so one deployment would address two sets of tables."
+        )
+
+
 def apply_table_prefix(sql: str, prefix: str) -> str:
     """Rewrite every library table and index name in ``sql`` under ``prefix``.
 

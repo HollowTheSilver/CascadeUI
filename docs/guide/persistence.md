@@ -302,6 +302,17 @@ The prefix applies to all four tables and both indexes. It is empty by
 default. Changing it on a database that already holds rows points the
 backend at a fresh, empty set of tables; the old rows stay where they are.
 
+A prefix that is not lower-case letters, digits, and underscores (starting
+with a letter or underscore) raises `ValueError` at construction. The
+prefix reaches SQL through two paths that quote identifiers differently:
+the DDL and the migrator interpolate it as raw text, while a backend's own
+row and key-value paths quote what they build. PostgreSQL folds an unquoted
+identifier to lower case and preserves a quoted one, so a prefix carrying
+a capital would create one table and address another, splitting a
+deployment's data across two that both look right on their own. SQLite
+matches identifiers case-insensitively and is not affected, but the same
+prefix moved to PostgreSQL later is, so both backends refuse it.
+
 !!! note "Inspecting the database directly"
     CascadeUI partitions its state across dedicated tables, not one blob.
     `cascadeui_persistent_views` holds the `PersistentView` registry -- one
@@ -967,6 +978,20 @@ drives the reattach pipeline during startup:
    real users, members, and channels instead of cold defaults. Panels sharing
    a channel render one at a time (message edits rate-bucket per channel);
    panels in distinct channels render concurrently.
+
+### Retiring a registration
+
+`exit()` on a live instance removes the panel's registry row along with the
+usual teardown. When no instance is live (the message was deleted while the
+bot was offline, or the panel is being decommissioned from an admin task),
+retire the row directly through the manager:
+
+```python
+await store.persistence_manager.prune_registry(persistence_keys=["roles:panel:123"])
+```
+
+See [Pruning](#pruning) for the full prune surface, including the
+age-verified `prune_unreachable` sweep.
 
 ### Class identity: rows resolve by the name they recorded
 

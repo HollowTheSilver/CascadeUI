@@ -27,7 +27,8 @@ from typing import Any, Callable, Dict, FrozenSet, List, Optional
 
 import discord
 
-from ...utils.hooks import is_async_callable
+from ...components.base import _describe_callback
+from ...utils.hooks import can_accept_positional, is_async_callable
 
 # // ========================================( FormField )======================================== // #
 
@@ -132,6 +133,27 @@ class FormField:
 # // ========================================( WizardStep )======================================== // #
 
 
+def _validate_condition_arity(label: str, condition, name_note: str = "") -> None:
+    """Refuse a condition the visibility check cannot call.
+
+    ``_is_step_visible`` calls ``condition(view)`` inside a ``try`` whose
+    ``except Exception`` treats a raising predicate as visible, so an arity
+    mismatch is not an error the caller ever sees: the step the predicate
+    meant to hide renders, and a warning is the only trace. That makes it
+    the one member of this family worth refusing here, since every other
+    step callable dies at its own call with the callable in the traceback.
+    A zero-argument predicate is the specific shape this catches.
+    """
+    if condition is None or can_accept_positional(condition, 1) is not False:
+        return
+    raise TypeError(
+        f"{label}.condition {_describe_callback(condition)} cannot be called "
+        f"with (view){name_note}.\n"
+        f"  Fix: accept the view -- the wizard passes itself so the predicate "
+        f"can read step state."
+    )
+
+
 def _validate_step_callables(label: str, step: Dict[str, Any]) -> None:
     """Check the callables a raw step dict declares, if it declares them.
 
@@ -157,6 +179,7 @@ def _validate_step_callables(label: str, step: Dict[str, Any]) -> None:
             f"{label}.condition must be synchronous; load async data in the "
             f"view's on_load() and have the predicate read the result."
         )
+    _validate_condition_arity(label, condition)
 
 
 def _validate_step_values(label: str, name, builder, validator, condition) -> None:
@@ -191,6 +214,7 @@ def _validate_step_values(label: str, name, builder, validator, condition) -> No
             f"load async data in the view's on_load() and have the predicate "
             f"read the result."
         )
+    _validate_condition_arity(label, condition, f" (step name={name!r})")
 
 
 @dataclass

@@ -2,6 +2,7 @@
 
 import asyncio
 import inspect
+import io
 import logging
 import time
 from unittest.mock import AsyncMock, MagicMock
@@ -9,18 +10,26 @@ from unittest.mock import AsyncMock, MagicMock
 import aiohttp
 import discord
 import pytest
-from discord.ui import ActionRow, Container
+from discord.ui import ActionRow, Button, Container
 from discord.ui import File as UIFile
-from discord.ui import LayoutView, MediaGallery, Section, TextDisplay, Thumbnail
+from discord.ui import LayoutView, MediaGallery, Section, Separator, TextDisplay, Thumbnail
 from helpers import RenderableLayoutView
 from helpers import make_interaction as _make_interaction
 
 from cascadeui.components.base import StatefulButton, StatefulSelect
-from cascadeui.components.patterns.v2 import card
+from cascadeui.components.buttons import LinkButton
+from cascadeui.components.patterns.v2 import card, divider, gallery
+from cascadeui.components.types import MAX_MESSAGE_CHARACTERS
 from cascadeui.state.singleton import get_store
 from cascadeui.state.store import _CURRENT_INTERACTION
+from cascadeui.views._placement import validate_placement
 from cascadeui.views.base import RenderOutcome, _StatefulMixin, _view_class_registry
-from cascadeui.views.layout import DisplayLayoutView, StatefulLayoutView
+from cascadeui.views.layout import (
+    DisplayLayoutView,
+    StatefulLayoutView,
+    count_characters,
+    count_components,
+)
 
 
 class TestStatefulLayoutViewInit:
@@ -240,6 +249,327 @@ class TestStatefulLayoutViewSubclass:
         assert view._init_kwargs == {"label": "test"}
 
 
+class TestCountCharacters:
+    """The character budget's per-item counter, mirroring count_components.
+
+    Without it, measuring a subtree's characters means adding it to a
+    throwaway view, which borrows that view's component limit -- so a
+    subtree over the COMPONENT budget failed a CHARACTER measurement with
+    an error naming neither.
+    """
+
+    def test_it_counts_text_and_nothing_else(self):
+        assert count_characters(TextDisplay("x" * 100)) == 100
+        assert count_characters(Button(label="L" * 80, custom_id="b")) == 0
+
+    def test_it_reaches_every_depth(self):
+        tree = Container(
+            TextDisplay("a" * 30),
+            Section(TextDisplay("b" * 20), accessory=Button(label="Z", custom_id="z")),
+        )
+
+        assert count_characters(tree) == 50
+
+    @pytest.mark.parametrize(
+        "items",
+        [
+            [TextDisplay("a" * 40), TextDisplay("b" * 60)],
+            [Container(TextDisplay("c" * 30), TextDisplay("d" * 20))],
+            [Container(TextDisplay("e" * 15), ActionRow(Button(label="Q" * 60, custom_id="q")))],
+        ],
+    )
+    def test_it_agrees_with_discord_pys_own_counter(self, items):
+        """The parity that makes the two numbers comparable at all."""
+        view = RenderableLayoutView()
+        base = view.content_length()
+        for item in items:
+            view.add_item(item)
+
+        assert sum(count_characters(i) for i in items) == view.content_length() - base
+        view.stop()
+
+    def test_measuring_items_needs_no_view_and_so_no_component_limit(self):
+        """The asymmetry this closes.
+
+        Forty-five text nodes are over the component budget and trivially
+        under the character one. Measuring their characters through a
+        throwaway view raises about components instead.
+        """
+        items = [TextDisplay("x" * 10) for _ in range(45)]
+
+        assert sum(count_characters(i) for i in items) == 450
+
+    def test_a_view_is_refused_by_name(self):
+        view = RenderableLayoutView()
+
+        with pytest.raises(TypeError, match="which is a view"):
+            count_characters(view)
+
+        view.stop()
+
+
+class TestCountComponentsRejectsAView:
+    """The pairing exists to kill an off-by-one; it must not reproduce it.
+
+    ``count_components`` counts a node and its descendants, so handing it
+    a view counts the view itself and reports one more component than
+    Discord does. That is the transcription error the budget surface was
+    added to remove, so it is refused rather than answered wrongly.
+    """
+
+    def test_a_layout_view_is_refused_by_name(self):
+        view = RenderableLayoutView()
+        view.add_item(TextDisplay("a"))
+
+        with pytest.raises(TypeError, match="which is a view"):
+            count_components(view)
+
+        view.stop()
+
+    def test_a_v1_view_is_refused_too(self):
+        """V1 and V2 views are siblings, not parent and child."""
+        from cascadeui.views.view import StatefulView
+
+        view = StatefulView(user_id=1, guild_id=2)
+
+        with pytest.raises(TypeError, match="which is a view"):
+            count_components(view)
+
+        view.stop()
+
+    def test_a_bare_string_is_refused_by_both_counters(self):
+        """The realistic mistake, because the builders wrap one.
+
+        A caller measuring the text they are about to hand ``card()``
+        would read zero characters and one component for it, while the
+        composed card counts every character and its own node.
+        """
+        for bad in ("some text", None, 42):
+            with pytest.raises(TypeError, match="expects a component"):
+                count_characters(bad)
+            with pytest.raises(TypeError, match="expects a component"):
+                count_components(bad)
+
+    def test_a_component_still_counts(self):
+        """The refusal must not cost the shape the function is for."""
+        assert count_components(TextDisplay("a")) == 1
+        assert count_components(Container(TextDisplay("a"), TextDisplay("b"))) == 3
+
+
+class TestLinkButtonUrl:
+    """An empty link url is refused where it is written, for V1 too.
+
+    The pre-flight validator catches one in a V2 tree and a V1 view
+    reaches no pre-flight at all, so the same button shipped to a form
+    error depending only on which view held it.
+    """
+
+    def test_an_empty_url_is_refused(self):
+        with pytest.raises(ValueError, match="needs a non-empty url"):
+            LinkButton(label="Docs", url="")
+
+    def test_a_whitespace_url_is_refused(self):
+        with pytest.raises(ValueError, match="needs a non-empty url"):
+            LinkButton(label="Docs", url="   ")
+
+    def test_a_real_url_is_accepted(self):
+        button = LinkButton(label="Docs", url="https://example.com")
+
+        assert button.url == "https://example.com"
+
+    def test_a_non_string_url_is_refused_by_type(self):
+        """The type is established before a property of it is read.
+
+        A truthy non-str answers ``strip`` by raising from inside the
+        guard, naming neither the parameter nor the owner. A yarl.URL is
+        the realistic one: aiohttp is a hard dependency, so every
+        consumer holds the type.
+        """
+        import yarl
+
+        for bad in (123, True, yarl.URL("https://example.com")):
+            with pytest.raises(TypeError, match="needs a str url"):
+                LinkButton(label="Docs", url=bad)
+
+    def test_link_section_is_held_to_the_same_rule(self):
+        """The documented way to build one must not be the lenient way.
+
+        ``link_section`` composes a raw ``discord.ui.Button`` rather than a
+        ``LinkButton``, so a guard on the class alone left the same mistake
+        refused or accepted by which constructor a caller reached for.
+        """
+        from cascadeui.components.patterns.v2 import link_section
+
+        with pytest.raises(ValueError, match="needs a non-empty url"):
+            link_section("Docs", label="Open", url="")
+
+        assert link_section("Docs", label="Open", url="https://e.dev") is not None
+
+    def test_the_refusal_names_the_call_the_caller_wrote(self):
+        """Each owner reports in its own vocabulary."""
+        from cascadeui.components.patterns.v2 import link_section
+
+        with pytest.raises(ValueError, match="LinkButton"):
+            LinkButton(label="A", url="")
+        with pytest.raises(ValueError, match="link_section"):
+            link_section("B", label="C", url="")
+
+
+class TestMessageTextBudget:
+    """The summed display text is warned about, not enforced.
+
+    The placement validator's per-node cap cannot see this one: ten short
+    text nodes each pass it and can still cross the message total. Nothing
+    enforces the total either, so the tree ships and Discord refuses it at
+    send, naming no component.
+    """
+
+    @staticmethod
+    def _capture(caplog):
+        return [r.getMessage() for r in caplog.records if "display characters" in r.getMessage()]
+
+    def test_an_over_budget_tree_warns_with_the_measured_total(self, caplog):
+        view = RenderableLayoutView()
+        view.add_item(TextDisplay("a" * 1500))
+        view.add_item(Container(TextDisplay("b" * 1500), TextDisplay("c" * 1500)))
+        total = view.content_length()
+        assert total > MAX_MESSAGE_CHARACTERS
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui"):
+            view._check_placement()
+
+        warnings = self._capture(caplog)
+        assert len(warnings) == 1
+        # The measured number, not the cap restated: a caller trimming text
+        # needs to know how far over it is.
+        assert str(total) in warnings[0]
+        assert str(MAX_MESSAGE_CHARACTERS) in warnings[0]
+        view.stop()
+
+    def test_it_warns_once_per_view(self, caplog):
+        """The seams that call this run on every edit."""
+        view = RenderableLayoutView()
+        for _ in range(10):
+            view.add_item(TextDisplay("a" * 450))
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui"):
+            for _ in range(3):
+                view._check_placement()
+
+        assert len(self._capture(caplog)) == 1
+        view.stop()
+
+    def test_an_over_budget_tree_is_not_rejected(self, caplog):
+        """A warning, not a raise.
+
+        Discord documents the cap and discord.py counts it without
+        raising, so the enforcing side is unobserved from here. Refusing a
+        tree Discord would have accepted is the worse error.
+        """
+        view = RenderableLayoutView()
+        for _ in range(10):
+            view.add_item(TextDisplay("a" * 450))
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui"):
+            view._check_placement()  # must not raise
+
+        view.stop()
+
+    def test_the_counter_reaches_text_nodes_only(self, caplog):
+        """Silence is not proof a tree is under the cap.
+
+        ``content_length`` sums ``TextDisplay`` content and nothing else,
+        so a screen carrying its text in button labels, select
+        placeholders, and option labels reads as zero against it. The
+        documented reach is pinned here because a consumer trusting the
+        warning's silence on a control-heavy tree would be trusting a
+        fact about the counter rather than about the message.
+        """
+        view = RenderableLayoutView()
+        before = view.content_length()
+        view.add_item(ActionRow(StatefulButton(label="L" * 80, custom_id="b")))
+        view.add_item(
+            ActionRow(
+                StatefulSelect(
+                    custom_id="s",
+                    placeholder="P" * 150,
+                    options=[
+                        discord.SelectOption(label="O" * 100, value="v", description="D" * 100)
+                    ],
+                )
+            )
+        )
+
+        # 430 characters of text a reader can see, none of it in a
+        # TextDisplay, so the counter does not move at all.
+        assert view.content_length() == before
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui"):
+            view._check_placement()
+
+        assert self._capture(caplog) == []
+        view.stop()
+
+    def test_a_second_excursion_warns_again(self, caplog):
+        """The latch is per excursion, not per view lifetime.
+
+        Reading the latch before measuring would make the reset
+        unreachable: a view that warned once would never reach the
+        under-cap branch that re-arms it, and a panel regressing over
+        budget later would be silent about it.
+        """
+        view = RenderableLayoutView()
+        for _ in range(10):
+            view.add_item(TextDisplay("a" * 450))
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui"):
+            view._check_placement()
+            assert len(self._capture(caplog)) == 1
+
+            # Back under the cap: nothing to report, and the latch re-arms.
+            view.clear_items()
+            view.add_item(TextDisplay("small"))
+            view._check_placement()
+            assert len(self._capture(caplog)) == 1
+
+            # Over again, and it is reported rather than swallowed.
+            view.clear_items()
+            for _ in range(10):
+                view.add_item(TextDisplay("b" * 450))
+            view._check_placement()
+            assert len(self._capture(caplog)) == 2
+
+        view.stop()
+
+    def test_a_tree_under_the_cap_is_silent(self, caplog):
+        view = RenderableLayoutView()
+        view.add_item(TextDisplay("short"))
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui"):
+            view._check_placement()
+
+        assert self._capture(caplog) == []
+        view.stop()
+
+    def test_many_small_nodes_cross_a_cap_no_per_node_check_can_see(self, caplog):
+        """The gap this closes, stated as its own case.
+
+        Every node here is far under the per-node 4000 limit, so the
+        placement validator passes the tree and only the sum is wrong.
+        """
+        view = RenderableLayoutView()
+        for _ in range(10):
+            view.add_item(TextDisplay("x" * 450))
+
+        validate_placement(view)  # per-node checks all pass
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui"):
+            view._check_placement()
+
+        assert len(self._capture(caplog)) == 1
+        view.stop()
+
+
 class TestStatefulLayoutViewComponentBudget:
     """add_item re-messages discord.py's 40-component cap in the library's style."""
 
@@ -302,6 +632,51 @@ class TestStatefulLayoutViewComponentBudget:
         view = StatefulLayoutView()
         with pytest.raises(ValueError, match="some unrelated problem"):
             view.add_item(TextDisplay("hi"))
+
+    @pytest.mark.parametrize(
+        "label,factory",
+        [
+            ("leaf", lambda: TextDisplay("t")),
+            (
+                "section_with_accessory",
+                lambda: Section(
+                    TextDisplay("a"), TextDisplay("b"), accessory=Thumbnail("https://x/a.png")
+                ),
+            ),
+            (
+                "action_row",
+                lambda: ActionRow(discord.ui.Button(label="a"), discord.ui.Button(label="b")),
+            ),
+            (
+                "container_mixed",
+                lambda: Container(
+                    TextDisplay("t"),
+                    Separator(),
+                    ActionRow(discord.ui.Button(label="x")),
+                    Section(TextDisplay("s"), accessory=Thumbnail("https://x/b.png")),
+                ),
+            ),
+        ],
+    )
+    def test_count_components_matches_the_enforcement_count(self, label, factory):
+        """The public counter and discord.py's accounting read the same number.
+
+        ``count_components`` hand-walks ``walk_children`` while
+        ``total_components`` reads discord.py's ``_total_children``; the
+        budget idiom the docs teach adds the two, so a subtree shape either
+        counter miscounts (a Section's accessory is the historical one)
+        silently breaks every caller's pre-composition check.
+        """
+        from cascadeui import count_components
+
+        item = factory()
+        predicted = count_components(item)
+
+        view = StatefulLayoutView()
+        held = view.total_components
+        view.add_item(item)
+
+        assert view.total_components - held == predicted
 
 
 class TestStatefulLayoutViewDispatch:
@@ -438,6 +813,65 @@ class TestStatefulLayoutViewSend:
             await view.send(file=photo)
 
         photo.close.assert_called_once()
+
+    async def test_a_bare_file_passed_to_files_does_not_strand_the_view(self):
+        """``files=`` expects an iterable; a caller who passes one bare
+        ``discord.File`` there reaches an iteration of a non-iterable while
+        collecting handles to close. The population moved inside the
+        pipeline's own try/except so that failure rolls the view all the
+        way back instead of raising before registration cleanup ever runs.
+        """
+        store = get_store()
+        photo = discord.File(io.BytesIO(b"x"), filename="pic.png")
+        view = RenderableLayoutView(interaction=_make_interaction())
+
+        with pytest.raises(TypeError):
+            await view.send(files=photo)  # bare File, not a list -- misuse
+
+        assert view.id not in store._active_views
+        assert view.id not in store.state["views"]
+
+    async def test_unmatched_attachment_reference_warns(self, caplog):
+        """A reference with no matching file renders a placeholder, silently.
+
+        Discord resolves ``attachment://`` against the files travelling with
+        the same message. With no match the message ships and renders an
+        unresolved placeholder, returning no error, so the send seam is the
+        only place the mismatch is visible.
+        """
+        view = RenderableLayoutView(interaction=_make_interaction())
+        view.add_item(card(gallery("attachment://missing.png")))
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui.views.base"):
+            await view.send()
+
+        assert any("attachment://missing.png" in r.getMessage() for r in caplog.records)
+
+    async def test_a_matched_attachment_reference_is_quiet(self, caplog):
+        """The file the builder was handed carries the name it emitted.
+
+        A spoiler file is the case worth holding: discord.py prefixes the
+        filename, so comparing against anything other than ``File.uri``
+        reports a false mismatch on every spoilered attachment.
+        """
+        photo = discord.File(io.BytesIO(b"x"), filename="pic.png", spoiler=True)
+        view = RenderableLayoutView(interaction=_make_interaction())
+        view.add_item(card(gallery(photo)))
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui.views.base"):
+            await view.send(files=[photo])
+
+        assert not [r for r in caplog.records if "attachment reference" in r.getMessage()]
+
+    async def test_a_remote_url_needs_no_file(self, caplog):
+        """Only ``attachment://`` references are half of an upload."""
+        view = RenderableLayoutView(interaction=_make_interaction())
+        view.add_item(card(gallery("https://cdn.example/a.png")))
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui.views.base"):
+            await view.send()
+
+        assert not [r for r in caplog.records if "attachment reference" in r.getMessage()]
 
 
 class TestSeedInitialState:
@@ -2197,6 +2631,428 @@ class TestRenderHashShortCircuit:
         finally:
             store._perf_edit_stack.clear()
             store.disable_perf()
+
+
+class TestRenderDigestWireCoverage:
+    """The digest has to move whenever the serialized payload moves.
+
+    ``_compute_tree_digest`` hand-enumerates fields per component type,
+    which is a proxy for the payload and drifts from it independently:
+    every gap found so far was a wire-visible field the walk never read,
+    and each one made ``refresh()`` report ``SKIPPED`` over a tree that
+    differed from the one on screen. These tests derive the expected
+    field set from ``to_component_dict`` rather than from the walk, so a
+    field discord.py adds later fails here instead of silently skipping
+    a render.
+
+    The derivation reads top-level keys, which bounds what it can claim: a
+    key holding sub-objects (``items``, ``default_values``, ``options``,
+    and a custom ``emoji``'s id/animated dict) counts as covered once any
+    row mutates any part of it, so a regression inside one would pass. The
+    subfield tests below decompose those four by hand, and a fifth such
+    key would owe the same. ``media`` and ``file`` are also dicts but
+    carry a single wire subfield (``url``), which their whole-key rows
+    already mutate.
+    """
+
+    # Keys whose content reaches the digest through another entry rather
+    # than through a branch of their own. Child components are walked, so
+    # their own rows cover them; ``type`` is the discriminator and never
+    # varies for a given class.
+    STRUCTURAL_KEYS = {
+        "type": "component-type discriminator, fixed per class",
+        "components": "children are walked, so each child's own row covers it",
+        "accessory": "a Section's accessory is walked like any other child",
+        "id": "read once by the walk for every component, not per branch",
+        # Serialized on every select and read by Discord only inside a modal:
+        # "only available for String Selects in modals. It is ignored in
+        # messages." Every select this library builds lives in a view, so
+        # hashing it would ship an edit for a change Discord discards. This
+        # entry is where the rule stops being "present in the payload" and
+        # becomes "Discord compares it", which is what the digest promises.
+        "required": "modal-only; Discord ignores it on a message component",
+    }
+
+    # Buttons and every select class share one digest branch, so a row proving
+    # a field reaches the digest proves it for the whole family. Pooling keeps
+    # the corpus from demanding five near-identical rows for ``disabled``,
+    # which would read as coverage without adding any.
+    COVERAGE_POOL = {
+        "Button": "interactive",
+        "Select": "interactive",
+        "UserSelect": "interactive",
+        "ChannelSelect": "interactive",
+    }
+
+    # (component label, wire key, factory, mutation). The factory returns a
+    # fresh top-level child; the mutation changes exactly one wire field on
+    # it in place, so ``custom_id`` stays fixed and cannot supply the
+    # difference on its own.
+    MUTATIONS = [
+        (
+            "TextDisplay",
+            "content",
+            lambda: TextDisplay("before"),
+            lambda i: setattr(i, "content", "after"),
+        ),
+        ("TextDisplay", "id", lambda: TextDisplay("t", id=5), lambda i: setattr(i, "id", 6)),
+        (
+            "Container",
+            "accent_color",
+            lambda: Container(TextDisplay("t"), accent_colour=discord.Colour.red()),
+            lambda i: setattr(i, "accent_colour", discord.Colour.blue()),
+        ),
+        (
+            "Container",
+            "spoiler",
+            lambda: Container(TextDisplay("t"), spoiler=False),
+            lambda i: setattr(i, "spoiler", True),
+        ),
+        (
+            "Thumbnail",
+            "media",
+            lambda: Section(TextDisplay("t"), accessory=Thumbnail("https://x/a.png")),
+            lambda i: setattr(i.accessory, "media", "https://x/b.png"),
+        ),
+        (
+            "Thumbnail",
+            "description",
+            lambda: Section(
+                TextDisplay("t"), accessory=Thumbnail("https://x/a.png", description="a")
+            ),
+            lambda i: setattr(i.accessory, "description", "b"),
+        ),
+        (
+            "Thumbnail",
+            "spoiler",
+            lambda: Section(
+                TextDisplay("t"), accessory=Thumbnail("https://x/a.png", spoiler=False)
+            ),
+            lambda i: setattr(i.accessory, "spoiler", True),
+        ),
+        (
+            "MediaGallery",
+            "items",
+            lambda: MediaGallery(discord.MediaGalleryItem("https://x/a.png")),
+            lambda i: setattr(i, "items", [discord.MediaGalleryItem("https://x/b.png")]),
+        ),
+        (
+            "UIFile",
+            "file",
+            lambda: UIFile("attachment://a.txt"),
+            lambda i: setattr(i, "media", "attachment://b.txt"),
+        ),
+        (
+            "UIFile",
+            "spoiler",
+            lambda: UIFile("attachment://a.txt", spoiler=False),
+            lambda i: setattr(i, "spoiler", True),
+        ),
+        (
+            "Separator",
+            "spacing",
+            lambda: Separator(),
+            lambda i: setattr(i, "spacing", discord.SeparatorSpacing.large),
+        ),
+        (
+            "Separator",
+            "divider",
+            lambda: Separator(visible=True),
+            lambda i: setattr(i, "visible", False),
+        ),
+        (
+            "Button",
+            "label",
+            lambda: ActionRow(discord.ui.Button(label="a", custom_id="b1")),
+            lambda i: setattr(i.children[0], "label", "b"),
+        ),
+        (
+            "Button",
+            "custom_id",
+            lambda: ActionRow(discord.ui.Button(label="a", custom_id="b1")),
+            lambda i: setattr(i.children[0], "custom_id", "b2"),
+        ),
+        (
+            "Button",
+            "style",
+            lambda: ActionRow(discord.ui.Button(label="a", custom_id="b1")),
+            lambda i: setattr(i.children[0], "style", discord.ButtonStyle.danger),
+        ),
+        (
+            "Button",
+            "disabled",
+            lambda: ActionRow(discord.ui.Button(label="a", custom_id="b1")),
+            lambda i: setattr(i.children[0], "disabled", True),
+        ),
+        (
+            "Button",
+            "emoji",
+            lambda: ActionRow(discord.ui.Button(label="a", custom_id="b1", emoji="\N{FIRE}")),
+            lambda i: setattr(i.children[0], "emoji", "\N{SNOWFLAKE}"),
+        ),
+        (
+            "Button",
+            "url",
+            lambda: ActionRow(discord.ui.Button(label="a", url="https://x/a")),
+            lambda i: setattr(i.children[0], "url", "https://x/b"),
+        ),
+        (
+            "Button",
+            "sku_id",
+            lambda: ActionRow(discord.ui.Button(sku_id=111, style=discord.ButtonStyle.premium)),
+            lambda i: setattr(i.children[0], "sku_id", 222),
+        ),
+        (
+            "Select",
+            "placeholder",
+            lambda: ActionRow(
+                discord.ui.Select(
+                    custom_id="s",
+                    placeholder="a",
+                    options=[discord.SelectOption(label="L", value="v")],
+                )
+            ),
+            lambda i: setattr(i.children[0], "placeholder", "b"),
+        ),
+        (
+            "Select",
+            "min_values",
+            lambda: ActionRow(
+                discord.ui.Select(
+                    custom_id="s", options=[discord.SelectOption(label="L", value="v")]
+                )
+            ),
+            lambda i: setattr(i.children[0], "min_values", 0),
+        ),
+        (
+            "Select",
+            "max_values",
+            lambda: ActionRow(
+                discord.ui.Select(
+                    custom_id="s", options=[discord.SelectOption(label="L", value="v")]
+                )
+            ),
+            lambda i: setattr(i.children[0], "max_values", 2),
+        ),
+        (
+            "Select",
+            "options",
+            lambda: ActionRow(
+                discord.ui.Select(
+                    custom_id="s", options=[discord.SelectOption(label="L", value="v")]
+                )
+            ),
+            lambda i: setattr(i.children[0].options[0], "label", "Relabelled"),
+        ),
+        (
+            "UserSelect",
+            "default_values",
+            lambda: ActionRow(discord.ui.UserSelect(custom_id="u")),
+            lambda i: setattr(i.children[0], "default_values", [discord.Object(id=7)]),
+        ),
+        (
+            "ChannelSelect",
+            "channel_types",
+            lambda: ActionRow(
+                discord.ui.ChannelSelect(custom_id="c", channel_types=[discord.ChannelType.text])
+            ),
+            lambda i: setattr(i.children[0], "channel_types", [discord.ChannelType.voice]),
+        ),
+    ]
+
+    # Fully populated samples, so optional keys (``id``, ``placeholder``,
+    # ``emoji``, ``default_values``, ``channel_types``) appear in the key
+    # set. discord.py omits an unset optional entirely, so a bare sample
+    # would under-enumerate and the coverage test would pass by measuring
+    # a smaller surface than the one that ships.
+    @staticmethod
+    def _populated_samples():
+        return {
+            "TextDisplay": TextDisplay("t", id=1),
+            "Container": Container(
+                TextDisplay("t"), accent_colour=discord.Colour.red(), spoiler=True, id=2
+            ),
+            "Thumbnail": Thumbnail("https://x/a.png", description="d", spoiler=True, id=3),
+            "MediaGallery": MediaGallery(discord.MediaGalleryItem("https://x/a.png"), id=4),
+            "UIFile": UIFile("attachment://a.txt", spoiler=True, id=5),
+            "Separator": Separator(spacing=discord.SeparatorSpacing.large, visible=False, id=6),
+            "Button": discord.ui.Button(label="a", custom_id="b1", emoji="\N{FIRE}", disabled=True),
+            "Select": discord.ui.Select(
+                custom_id="s",
+                placeholder="p",
+                min_values=0,
+                max_values=2,
+                options=[discord.SelectOption(label="L", value="v", description="d", default=True)],
+            ),
+            "UserSelect": discord.ui.UserSelect(
+                custom_id="u", default_values=[discord.Object(id=7)]
+            ),
+            "ChannelSelect": discord.ui.ChannelSelect(
+                custom_id="c", channel_types=[discord.ChannelType.text]
+            ),
+            # Every key on these two is structural today (children are
+            # walked, ``id`` rides the walk), so they need no MUTATIONS
+            # rows -- they sit in the sample set so a field discord.py
+            # adds to either later fails the derivation instead of
+            # silently skipping a render.
+            "Section": Section(TextDisplay("t"), accessory=Thumbnail("https://x/a.png"), id=8),
+            "ActionRow": ActionRow(discord.ui.Button(label="a", custom_id="r1"), id=9),
+        }
+
+    def _digest_of(self, child):
+        view = RenderableLayoutView(user_id=1, guild_id=2)
+        view.add_item(child)
+        return view._compute_tree_digest()
+
+    @pytest.mark.parametrize(
+        "label,wire_key,factory,mutate",
+        MUTATIONS,
+        ids=[f"{c}.{k}" for c, k, _, _ in MUTATIONS],
+    )
+    def test_a_wire_field_change_moves_the_digest(self, label, wire_key, factory, mutate):
+        child = factory()
+        view = RenderableLayoutView(user_id=1, guild_id=2)
+        view.add_item(child)
+
+        before_payload = child.to_component_dict()
+        before_digest = view._compute_tree_digest()
+
+        mutate(child)
+
+        after_payload = child.to_component_dict()
+        after_digest = view._compute_tree_digest()
+
+        # Guard the guard: a mutation that does not move the payload would
+        # make the digest assertion below pass for the wrong reason.
+        assert before_payload != after_payload, (
+            f"{label}.{wire_key}: the mutation did not change the serialized "
+            f"payload, so this row proves nothing about the digest"
+        )
+        assert before_digest != after_digest, (
+            f"{label}.{wire_key} is wire-visible but does not reach "
+            f"_compute_tree_digest, so refresh() reports SKIPPED over a tree "
+            f"that differs from the one on screen"
+        )
+
+    def test_the_mutation_corpus_covers_every_serialized_field(self):
+        covered = {}
+        for label, wire_key, _, _ in self.MUTATIONS:
+            pool = self.COVERAGE_POOL.get(label, label)
+            covered.setdefault(pool, set()).add(wire_key)
+
+        missing = []
+        for label, sample in self._populated_samples().items():
+            pool = self.COVERAGE_POOL.get(label, label)
+            for key in sample.to_component_dict():
+                if key in self.STRUCTURAL_KEYS:
+                    continue
+                if key not in covered.get(pool, set()):
+                    missing.append(f"{label}.{key}")
+
+        assert not missing, (
+            f"these serialized fields have no mutation row, so nothing checks "
+            f"whether the digest sees them: {sorted(missing)}. Add a row to "
+            f"MUTATIONS, then extend _compute_tree_digest if it fails."
+        )
+
+    def test_option_subfields_each_reach_the_digest(self):
+        # SelectOption is not a walkable child, so the digest reads it inside
+        # the select branch. Only value and default were read before, which
+        # let a relabel keeping the same values skip its render.
+        for attr, new in (
+            ("label", "Relabelled"),
+            ("value", "v2"),
+            ("description", "described"),
+            ("emoji", "\N{FIRE}"),
+            ("default", True),
+        ):
+            row = ActionRow(
+                discord.ui.Select(
+                    custom_id="s",
+                    options=[discord.SelectOption(label="L", value="v")],
+                )
+            )
+            view = RenderableLayoutView(user_id=1, guild_id=2)
+            view.add_item(row)
+            before = view._compute_tree_digest()
+            setattr(row.children[0].options[0], attr, new)
+            assert (
+                view._compute_tree_digest() != before
+            ), f"SelectOption.{attr} does not reach the digest"
+
+    def test_media_gallery_item_subfields_each_reach_the_digest(self):
+        # A MediaGalleryItem is not a walkable child either, so the whole
+        # list arrives at the walk under one serialized key. The coverage
+        # derivation reads top-level keys only, so a row mutating the url
+        # marks "items" covered and nothing then checks the siblings.
+        for attr, new in (
+            ("description", "described"),
+            ("spoiler", True),
+        ):
+            gallery_node = MediaGallery(
+                discord.MediaGalleryItem("https://x/a.png", description="a", spoiler=False)
+            )
+            view = RenderableLayoutView(user_id=1, guild_id=2)
+            view.add_item(gallery_node)
+            before = view._compute_tree_digest()
+            setattr(gallery_node.items[0], attr, new)
+            assert (
+                view._compute_tree_digest() != before
+            ), f"MediaGalleryItem.{attr} does not reach the digest"
+
+    def test_default_value_subfields_each_reach_the_digest(self):
+        # Same shape one select family over: default_values is a single
+        # serialized key holding id and type, and only a row swapping the id
+        # exists above. Without the type, a user pick and a role pick of the
+        # same snowflake hash alike.
+        row = ActionRow(discord.ui.MentionableSelect(custom_id="m"))
+        view = RenderableLayoutView(user_id=1, guild_id=2)
+        view.add_item(row)
+        select = row.children[0]
+
+        select.default_values = [
+            discord.SelectDefaultValue(id=7, type=discord.SelectDefaultValueType.user)
+        ]
+        as_user = view._compute_tree_digest()
+        select.default_values = [
+            discord.SelectDefaultValue(id=7, type=discord.SelectDefaultValueType.role)
+        ]
+        as_role = view._compute_tree_digest()
+
+        assert as_user != as_role, "SelectDefaultValue.type does not reach the digest"
+
+    def test_emoji_subfields_each_reach_the_digest(self):
+        # A custom emoji serializes as a dict of name, id, and animated, and
+        # the corpus row above swaps two unicode glyphs, which only moves the
+        # name. The digest hashes str(emoji), whose <a:name:id> form carries
+        # all three -- this pins that, so a narrowing to emoji.name (under
+        # which both corpus glyphs still differ) cannot land silently.
+        row = ActionRow(
+            discord.ui.Button(
+                label="a",
+                custom_id="b1",
+                emoji=discord.PartialEmoji(name="x", id=123, animated=False),
+            )
+        )
+        view = RenderableLayoutView(user_id=1, guild_id=2)
+        view.add_item(row)
+
+        before = view._compute_tree_digest()
+        row.children[0].emoji = discord.PartialEmoji(name="x", id=123, animated=True)
+        assert view._compute_tree_digest() != before, "emoji.animated does not reach the digest"
+
+        before = view._compute_tree_digest()
+        row.children[0].emoji = discord.PartialEmoji(name="x", id=124, animated=True)
+        assert view._compute_tree_digest() != before, "emoji.id does not reach the digest"
+
+    def test_removing_a_separator_moves_the_digest(self):
+        # The walk records no structural signal (no child counts, no depth),
+        # so before the Separator branch existed an id-less rule contributed
+        # nothing and removing one left the digest byte-identical.
+        with_rule = self._digest_of(card(TextDisplay("a"), divider(), TextDisplay("b")))
+        without_rule = self._digest_of(card(TextDisplay("a"), TextDisplay("b")))
+
+        assert with_rule != without_rule
 
 
 class _FakeResponse:

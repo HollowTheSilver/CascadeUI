@@ -29,6 +29,14 @@ button = StatefulButton(
 )
 ```
 
+The callback takes one positional argument, the interaction, sync or async.
+A button carries no value, so a callback declaring a required second
+parameter (or an unbound method still carrying `self`) raises `TypeError`
+at construction, printing the signature it saw, instead of failing with a
+bare arity error on the first click. See
+[Callbacks and control values](#two-parameter-callbacks) for the rule the
+value-carrying controls follow.
+
 In V2 views, buttons must be wrapped in `ActionRow`:
 
 ```python
@@ -44,6 +52,9 @@ Convenience subclasses: `PrimaryButton`, `SecondaryButton`, `SuccessButton`,
 `DangerButton`, `ToggleButton`. `LinkButton` sits beside them but wraps
 `discord.ui.Button` directly, since Discord opens the URL client-side and no
 interaction is dispatched: it takes no `callback` and no `owner_only`.
+`ToggleButton` is the one value-carrying member: its callback may declare a
+second parameter (`(interaction, toggled)`) to receive the post-flip state,
+matching `toggle_button` and `toggle_section`.
 
 #### `owner_only=True` per-button host gate
 
@@ -124,8 +135,21 @@ async def on_select(interaction, values):
     ...
 ```
 
+This is one instance of a rule that holds across the whole component
+surface: **a callback receives the interaction, plus the control's value as
+a second argument when the control carries one and the callback declares a
+second parameter.** A select's value is `values`; `ToggleButton`,
+`toggle_button`, and `toggle_section` deliver the new toggle state;
+`cycle_button` and `choice_row` always report their value, so their
+callbacks must take both parameters. Value-less buttons
+(`StatefulButton`, `action_section`, `button_row`, `confirm_section`,
+`tab_nav`) pass the interaction alone.
+
 Detection happens at creation time via `inspect.signature`. Single-parameter
-callbacks still work unchanged.
+callbacks still work unchanged, and variadic (`*args`) callbacks keep the
+one-argument contract. A callback whose signature cannot accept what the
+control will call it with raises `TypeError` at the builder line, printing
+the signature back, rather than a bare arity error on the first click.
 
 #### Pre-populated defaults (specialized selects)
 
@@ -190,6 +214,12 @@ for i in range(9):
 ---
 
 ## Modal Inputs
+
+!!! tip "Testing a modal without Discord"
+    `await modal.submit(interaction, {"Name": "Ada"})` runs the real submit
+    pipeline offline and returns whether the validators accepted it. See the
+    [API reference](../api/components.md#await-modalsubmitinteraction-values-bool).
+
 
 These live inside `Modal` dialogs. They carry a `custom_id` but never fire
 `COMPONENT_INTERACTION` of their own; values are collected by the Modal on
@@ -349,6 +379,15 @@ slow async validator or callback does not drop the submission; `auto_defer_delay
 (default `2.5`s) tunes when that defer fires. A `Modal` subclass overriding
 `on_submit` sends replies through `self.respond(interaction, ...)`, which falls
 back to a followup when that backstop has already acked.
+
+`callback` takes `(interaction, values)`, sync or async; a callback that
+cannot accept both raises `TypeError` at construction, since every submission
+delivers the collected values. The constructor's signature is closed too: an
+unrecognized keyword raises `TypeError` naming it rather than discarding it
+silently. `on_submit=` is the name discord.py subclasses override and the
+natural wrong guess for `callback=`, and a modal with no handler set
+acknowledges every submission and runs nothing. `custom_id=` is forwarded
+to `discord.ui.Modal`; omit it to let discord.py generate one.
 
 After validators pass, each input's `.value` / `.values` is populated (a rejected submission leaves them untouched). `modal.values_by_input` provides a dict keyed by input instance, populated at the same point.
 
@@ -571,8 +610,10 @@ self.add_item(key_value({"Status": "Online", "Users": "42"}))
 
 ### `action_section(text, *, label, callback, ...)`
 
-A `Section` with text and a button accessory. Pass `disabled=True` to render
-the button greyed out and non-interactive:
+A `Section` with text and a button accessory. The callback takes the
+interaction alone (this button passes no second value; one that demands a
+second argument raises `TypeError` at construction). Pass `disabled=True` to
+render the button greyed out and non-interactive:
 
 ```python
 from cascadeui import action_section
@@ -608,10 +649,23 @@ One section, shown in both states:
   <img src="../../assets/surfaces/toggle_section.png" alt="A section reading Notifications with a green Enabled button, and the same section with a red Disabled one" width="380">
 </p>
 
+The callback takes `(interaction)` or `(interaction, active)`. The
+two-parameter form receives the state the click asks for (the flip of the
+rendered `active`), so the handler assigns it instead of re-deriving it:
+
+```python
+async def toggle_notify(self, interaction, active):
+    self.notify = active
+    self.build_ui()
+    await self.refresh()
+```
+
+A callback that can accept neither shape raises `TypeError` at construction.
+
 ### `image_section(text, *more_text, url, description=None, spoiler=False)`
 
 A `Section` with a `Thumbnail` image. `url` accepts a [`MediaInput`](../api/components.md#mediainput). `description` sets the thumbnail's alt text (up to
-256 chars); `spoiler=True` hides it behind a spoiler. See
+1024 chars); `spoiler=True` hides it behind a spoiler. See
 [Local file attachments](#local-file-attachments).
 
 <p align="center">
@@ -668,7 +722,8 @@ self.add_item(link_section(
 
 Returns a `[TextDisplay, ActionRow]` list rather than a single component so
 the caller can splat it into `card(...)`. The paired success/danger buttons
-run the supplied callbacks:
+run the supplied callbacks, each taking the interaction alone (one that
+demands a second argument raises `TypeError` at construction):
 
 ```python
 from cascadeui import card, confirm_section
@@ -835,8 +890,10 @@ self.add_item(button_row(
 </p>
 
 Raises `ValueError` if the mapping is empty or exceeds Discord's
-5-buttons-per-row limit. For per-button customization, build the `ActionRow`
-by hand.
+5-buttons-per-row limit, and `TypeError` when a callback demands a second
+argument (these buttons pass no value; use `choice_row` when the callback
+needs to know which option was picked). For per-button customization, build
+the `ActionRow` by hand.
 
 ### `choice_row(options, *, on_select, selected=None, multi=False, ...)`
 
@@ -870,6 +927,8 @@ The dropdown runs up to Discord's 25-option select limit (exported as
 `MAX_SELECT_OPTIONS`), past which `choice_row` raises. Discord requires select
 option values to be strings; the builder maps to and from that form, so
 `on_select` always receives the real Python value, never a stringified index.
+`on_select` takes `(interaction, value)` -- the pick rides every click, so a
+one-parameter callback raises `TypeError` at construction.
 
 Set `multi=True` to let several options be active at once. `selected` is
 then read as a collection of active values rather than one, the buttons
@@ -926,8 +985,10 @@ visible:
   <img src="../../assets/surfaces/cycle_button.png" alt="The same cycle button at three positions, reading Daily, then Weekly, then Monthly, with the card body tracking each" width="380">
 </p>
 
-The callback receives the *new* value (post-advance). Optional `labels=`
-customizes the display strings, `start=` picks the initial index.
+The callback receives the *new* value (post-advance), so it takes
+`(interaction, value)`; a one-parameter callback raises `TypeError` at
+construction. Optional `labels=` customizes the display strings, `start=`
+picks the initial index.
 
 ### `toggle_button(*, active, on_toggle, ...)`
 
@@ -957,7 +1018,8 @@ when not. Both states, side by side:
 </p>
 
 The button flips its own state (`button._toggle_active`) and calls
-`on_toggle(interaction, new_state)` with the post-flip value. Style and
+`on_toggle(interaction, new_state)` with the post-flip value; a
+one-parameter callback raises `TypeError` at construction. Style and
 label swap automatically between the active/inactive pair.
 
 ### `tab_nav(tabs, *, active=None, ...)`
@@ -989,8 +1051,10 @@ callback renders, which is the part your view owns:
 
 The tab matching `active` renders with `active_style` (primary by default);
 all others render with `inactive_style` (secondary). If `active` is
-omitted, the first tab is marked active. Capped at Discord's 5-per-row
-limit -- use `TabLayoutView` for views that need more tabs.
+omitted, the first tab is marked active. Each tab callback takes the
+interaction alone; one that demands a second argument raises `TypeError` at
+construction. Capped at Discord's 5-per-row limit -- use `TabLayoutView`
+for views that need more tabs.
 
 ---
 
@@ -1011,7 +1075,12 @@ input shapes, together typed as
   was meant
 
 Anything else raises `TypeError` where the builder is called, naming the
-builder and the argument that carried it.
+builder and the argument that carried it. An empty or whitespace-only
+reference raises `ValueError` at the same seam: Discord cannot resolve a
+media item with no URL, so the mistake would otherwise surface as an
+HTTP 400 at send naming neither the builder nor the argument. The one
+exception is `banner=`, where a blank value normalizes to `None` and
+renders no banner -- absence is a banner's documented meaning.
 
 The reference and the bytes are independent: the builder emits the
 reference into the component tree; the `discord.File` carries the bytes
@@ -1023,7 +1092,9 @@ to Discord.
     on its own. The matching `discord.File` must reach the same payload
     via `view.send(files=[...])` (initial send) or
     `view.refresh(attachments=[...])` (in-place edit), or Discord renders
-    the reference as an unresolved placeholder.
+    the reference as an unresolved placeholder. `send()` logs a WARNING
+    naming every unmatched reference, since the initial send is the only
+    seam where both halves are in scope to compare.
 
 ### Initial send
 
@@ -1272,10 +1343,14 @@ when you call `send()`.
 | `TextDisplay` content over 4000 characters | accepts | rejects |
 | `TextDisplay` content is empty | accepts | rejects |
 | `SelectOption` label or value is empty | accepts | rejects |
+| `Thumbnail` / `MediaGalleryItem` / `File` media URL is empty | accepts | rejects |
+| Link-button `url` is empty | accepts | rejects |
 | `custom_id` over 100 characters | accepts | rejects |
 | `Button` label over 80 characters | accepts | rejects |
+| `Button` url over 512 characters | accepts | rejects |
 | `Select` placeholder over 150 characters | accepts | rejects |
 | `SelectOption` label / value / description over 100 characters | accepts | rejects |
+| `Thumbnail` / `MediaGalleryItem` description over 1024 characters | accepts | rejects |
 | Two components share a `custom_id` | accepts | rejects (code 50035) |
 
 ### Builders are guardrails
@@ -1348,6 +1423,30 @@ twice with its default (`choice_row`, `PaginatedRegion`, `Collapsible`).
 `Modal` applies the same rule to its inputs at construction: two inputs
 whose labels derive the same `custom_id` raise immediately rather than
 silently overwriting each other at submit.
+
+### Checking the component budget
+
+The 40-component cap is discord.py's own enforcement at `add_item`, not
+the pre-flight validator's -- a tree can never exist over the limit, so
+there is nothing for the validator to catch. To check a budget before
+composing, read `view.total_components` (a live recursive count) and
+`count_components(item)` (what a subtree would add) against
+`MAX_MESSAGE_COMPONENTS`, all exported from the package root:
+
+```python
+from cascadeui import MAX_MESSAGE_COMPONENTS, count_components
+
+if view.total_components + count_components(card) > MAX_MESSAGE_COMPONENTS:
+    card = trimmed_card()
+view.add_item(card)
+```
+
+`from cascadeui.testing import stub_client` supplies an offline
+`discord.Client` for measuring a pattern whose composition depends on one
+-- a section-mode leaderboard row renders four components with a client
+bound and one without, so a test built with no client under-measures the
+real budget. See [`validate()`](../api/views.md#validate) for the full
+recipe.
 
 ### Opting out
 
@@ -1565,7 +1664,7 @@ class TaskListView(StatefulLayoutView):
   <img src="../../assets/motion/paginated_region.gif" alt="A paginated region turning pages inside its host view" width="520">
 </p>
 
-`controls(self)` captures the host and returns the nav row (empty on a single page). A page click re-runs the host's render path and re-slices. Each region keeps its own page index, so two regions can share a view if you give them distinct `key` values. Customization mirrors `PaginatedLayoutView` -- subclass and override the `{first,prev,indicator,next,last}_button_{label,emoji,style}` class attributes, `jump_threshold`, or the `on_page_changed` hook. See the API reference for the full surface.
+`controls(self)` captures the host and returns the nav row (empty on a single page). A page click re-runs the host's render path and re-slices. Each region keeps its own page index, so two regions can share a view if you give them distinct `key` values. Customization mirrors `PaginatedLayoutView` -- subclass and override the `{first,prev,indicator,next,last}_button_{label,emoji,style}` class attributes, `indicator_button_format`, `jump_threshold`, or the `on_page_changed` hook. See the API reference for the full surface.
 
 ### `Collapsible`
 
@@ -1602,7 +1701,7 @@ class FilterView(StatefulLayoutView):
   <img src="../../assets/motion/collapsible.gif" alt="A collapsible expanding and collapsing its revealed region" width="520">
 </p>
 
-`render(self)` returns the trigger alone while collapsed, or the trigger plus the `reveal()` content while expanded (order via `trigger_first`). The collapse policy is the caller's -- `collapse()` after a revealed action finishes, or leave it open for multi-step use. The trigger relabels and restyles between states via `expanded_label` / `expanded_style` / `expanded_emoji`, and two collapsibles in one view need distinct `key` values.
+`render(self)` returns the trigger alone while collapsed, or the trigger plus the `reveal()` content while expanded (order via `trigger_first`). `reveal` and `summary` run bare on every render, so a callable that is async or requires arguments raises `TypeError` at construction. Close over the host's data instead. The collapse policy is the caller's -- `collapse()` after a revealed action finishes, or leave it open for multi-step use. The trigger relabels and restyles between states via `expanded_label` / `expanded_style` / `expanded_emoji`, and two collapsibles in one view need distinct `key` values.
 
 `expand()` / `collapse()` set the state programmatically and `expanded` reads it; the `on_toggle(expanded)` hook fires after every open or close for async prefetch or logging.
 

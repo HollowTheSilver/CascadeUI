@@ -27,8 +27,9 @@ from ..components.types import MAX_COMPONENT_ID
 # Item types that belong inside a ``Modal``, never inside a ``LayoutView``
 # tree. discord.py accepts them at any tree position because every check
 # is ``isinstance(item, Item)``; Discord's API server rejects them at send
-# time. The validator catches them at top-level and Container-child
-# positions with a clear "this belongs in a Modal" message.
+# time. Every position a LayoutView tree can put an item in is covered
+# (top level, Container child, Section child, Section accessory, and
+# ActionRow child), each with a "this belongs in a Modal" message.
 _MODAL_ONLY_TYPES: Tuple[Type, ...] = (Label, RadioGroup, CheckboxGroup, Checkbox, FileUpload)
 
 # MediaGallery's documented item-count range. Discord's API docs at
@@ -57,6 +58,16 @@ _BUTTON_LABEL_MAX = 80
 # select's ``placeholder`` to 150 characters. discord.py stores it as a plain
 # string with no length check, so oversized placeholder text constructs
 # cleanly and only fails at HTTP send.
+# Link-button URL cap. Discord's component reference limits a button's
+# ``url`` to 512 characters, and discord.py stores it unchecked, same as
+# the label.
+_BUTTON_URL_MAX = 512
+
+# Media alt-text cap. Discord's component reference describes
+# ``description`` on both Thumbnail and MediaGalleryItem as alt text
+# capped at 1024 characters. discord.py stores it unchecked.
+_MEDIA_DESCRIPTION_MAX = 1024
+
 _SELECT_PLACEHOLDER_MAX = 150
 
 # SelectOption text cap. Discord's component reference limits each select
@@ -171,11 +182,17 @@ def _validate_top_level(item, path: List[str]) -> None:
         return
     if isinstance(item, MediaGallery):
         _check_media_gallery_size(item, path)
+        _check_media_gallery_items(item, path)
         return
     if isinstance(item, TextDisplay):
         _check_textdisplay_size(item, path)
         return
-    if isinstance(item, (File, Separator)):
+    # File carries a media reference and Separator does not, so the two no
+    # longer share an early return.
+    if isinstance(item, File):
+        _check_media(getattr(item, "media", None), path, "File")
+        return
+    if isinstance(item, Separator):
         return
     if isinstance(item, _MODAL_ONLY_TYPES):
         _raise_placement_error(
@@ -236,16 +253,20 @@ def _validate_container(container: Container, path: List[str]) -> None:
         if isinstance(child, Section):
             _validate_section(child, child_path)
             continue
-        if isinstance(child, ActionRow):
-            _validate_action_row(child, child_path)
-            continue
         if isinstance(child, MediaGallery):
             _check_media_gallery_size(child, child_path)
+            _check_media_gallery_items(child, child_path)
+            continue
+        if isinstance(child, ActionRow):
+            _validate_action_row(child, child_path)
             continue
         if isinstance(child, TextDisplay):
             _check_textdisplay_size(child, child_path)
             continue
-        if isinstance(child, (File, Separator)):
+        if isinstance(child, File):
+            _check_media(getattr(child, "media", None), child_path, "File")
+            continue
+        if isinstance(child, Separator):
             continue
         if isinstance(child, _MODAL_ONLY_TYPES):
             _raise_placement_error(
@@ -326,6 +347,11 @@ def _validate_section(section: Section, path: List[str]) -> None:
         _check_button_label(accessory, path + [f"accessory({type(accessory).__name__})"])
         return
     if isinstance(accessory, Thumbnail):
+        # After the children loop above, so a Section carrying both an empty
+        # text child and an empty thumbnail still reports the text first.
+        accessory_path = path + [f"accessory({type(accessory).__name__})"]
+        _check_media(getattr(accessory, "media", None), accessory_path, "Thumbnail")
+        _check_media_description(accessory, accessory_path, "Thumbnail")
         return
     # Known wrong-domain accessory types raise with a directed message.
     # Truly unknown Item subclasses pass through -- Discord may add a
@@ -456,6 +482,28 @@ def _check_button_label(button: Button, path: List[str]) -> None:
     visited: ActionRow children and Section accessories.
     """
     _check_custom_id(button, path)
+    url = getattr(button, "url", None)
+    if isinstance(url, str):
+        # Same reasoning as the media check: a URL is machine-consumed, so a
+        # blank one cannot resolve and ships to be rejected as a form error
+        # naming no component.
+        if not url.strip():
+            raise ValueError(
+                f"Invalid V2 placement: Button url is empty.\n"
+                f"  Path: {' -> '.join(path)}\n"
+                f"  Discord rejects this composition with HTTP 400.\n"
+                f"  Fix: Supply a non-empty URL, or drop the url to make it "
+                f"an ordinary button."
+            )
+        if len(url) > _BUTTON_URL_MAX:
+            raise ValueError(
+                f"Invalid V2 placement: Button url is {len(url)} characters, "
+                f"over Discord's {_BUTTON_URL_MAX}-character cap.\n"
+                f"  Path: {' -> '.join(path)}\n"
+                f"  Discord rejects this composition with HTTP 400.\n"
+                f"  Fix: Shorten the URL to {_BUTTON_URL_MAX} characters or "
+                f"fewer."
+            )
     label = getattr(button, "label", None)
     if not isinstance(label, str):
         return
@@ -534,6 +582,66 @@ def _check_select_text(select: BaseSelect, path: List[str]) -> None:
                 f"  Fix: Shorten the SelectOption description to {_SELECT_OPTION_TEXT_MAX} "
                 f"characters or fewer."
             )
+
+
+def _check_media(media, path: List[str], component: str) -> None:
+    """Reject a media reference Discord cannot resolve.
+
+    discord.py normalizes every media assignment to an
+    ``UnfurledMediaItem`` and stores its ``url`` unvalidated, so an empty
+    reference constructs cleanly from a raw primitive and from a
+    post-construction mutation the builders never see. Discord then
+    rejects the whole message with a form error naming a serialized index
+    rather than a component.
+
+    Whitespace-only is rejected alongside empty, which is one notch
+    stricter than the text checks: a text node renders whitespace, and a
+    URL is machine-consumed, so a blank one cannot resolve under any
+    reading of Discord's contract.
+
+    The type is established before the value: ``media`` is only a string
+    once discord.py has normalized it, and a ``_raw_construct`` path can
+    leave anything there.
+    """
+    url = getattr(media, "url", None)
+    if not isinstance(url, str) or url.strip():
+        return
+    raise ValueError(
+        f"Invalid V2 placement: {component} media URL is empty.\n"
+        f"  Path: {' -> '.join(path)}\n"
+        f"  Discord rejects this composition with HTTP 400.\n"
+        f"  Fix: Supply a non-empty URL or attachment:// reference, or drop "
+        f"the component when there is no media to show."
+    )
+
+
+def _check_media_description(obj, path: List[str], component: str) -> None:
+    """Reject media alt text over Discord's documented cap."""
+    description = getattr(obj, "description", None)
+    if not isinstance(description, str) or len(description) <= _MEDIA_DESCRIPTION_MAX:
+        return
+    raise ValueError(
+        f"Invalid V2 placement: {component} description is "
+        f"{len(description)} characters, over Discord's "
+        f"{_MEDIA_DESCRIPTION_MAX}-character cap.\n"
+        f"  Path: {' -> '.join(path)}\n"
+        f"  Discord rejects this composition with HTTP 400.\n"
+        f"  Fix: Shorten the description to {_MEDIA_DESCRIPTION_MAX} "
+        f"characters or fewer."
+    )
+
+
+def _check_media_gallery_items(gallery: MediaGallery, path: List[str]) -> None:
+    """Check every gallery item's media reference and alt text.
+
+    A MediaGalleryItem is not a walkable child, so nothing else in the walk
+    reaches it. The path names the index so a ten-image gallery reports
+    which one is wrong.
+    """
+    for index, item in enumerate(gallery.items):
+        item_path = path + [f"items[{index}]"]
+        _check_media(getattr(item, "media", None), item_path, "MediaGalleryItem")
+        _check_media_description(item, item_path, "MediaGalleryItem")
 
 
 def _check_media_gallery_size(gallery: MediaGallery, path: List[str]) -> None:

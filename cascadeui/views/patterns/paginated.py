@@ -10,9 +10,9 @@ import discord
 from discord import Interaction
 from discord.ui import ActionRow, Button, Container, TextDisplay
 
-from ...components.base import StatefulButton
+from ...components.base import StatefulButton, _describe_callback
 from ...components.types import EmojiInput
-from ...utils.hooks import await_maybe
+from ...utils.hooks import await_maybe, can_accept_positional
 from ..base import RenderOutcome, _StatefulMixin
 from ..layout import StatefulLayoutView
 from ..view import StatefulView
@@ -53,7 +53,8 @@ class _BasePaginatedMixin:
     prev_button_emoji: ClassVar[EmojiInput] = None
     prev_button_style: ClassVar[discord.ButtonStyle] = discord.ButtonStyle.secondary
 
-    indicator_button_label: ClassVar[Optional[str]] = None  # default uses "Page {n}/{t}"
+    indicator_button_label: ClassVar[Optional[str]] = None  # a literal, frozen every page
+    indicator_button_format: ClassVar[Optional[str]] = None  # a template, e.g. "{page}/{total}"
     indicator_button_emoji: ClassVar[EmojiInput] = None
     indicator_button_style: ClassVar[discord.ButtonStyle] = discord.ButtonStyle.primary
 
@@ -81,6 +82,13 @@ class _BasePaginatedMixin:
         "next_button_label",
         "last_button_label",
     )
+    # One-based to match the rendered defaults and the go-to modal's
+    # "Page number (1-N)" prompt. on_page_changed is zero-based, which is
+    # why the display placeholders are named rather than positional.
+    _FORMAT_ATTRS: ClassVar[dict] = {
+        **_StatefulMixin._FORMAT_ATTRS,
+        "indicator_button_format": {"page": 1, "total": 1},
+    }
     _EMOJI_ATTRS: ClassVar[tuple] = (
         *_StatefulMixin._EMOJI_ATTRS,
         "first_button_emoji",
@@ -121,6 +129,8 @@ class _BasePaginatedMixin:
         current = self.current_page + 1
         if self.indicator_button_label is not None:
             return self.indicator_button_label
+        if self.indicator_button_format is not None:
+            return self.indicator_button_format.format(page=current, total=total)
         return f"Page {current}/{total}"
 
     def _resolve_goto_label(self) -> str:
@@ -128,6 +138,8 @@ class _BasePaginatedMixin:
         current = self.current_page + 1
         if self.indicator_button_label is not None:
             return self.indicator_button_label
+        if self.indicator_button_format is not None:
+            return self.indicator_button_format.format(page=current, total=total)
         return f"{current}/{total}"
 
     # // ----( Nav state )---- // #
@@ -441,7 +453,8 @@ class _BasePaginatedMixin:
                 ``allowed_users``, subclass kwargs, etc.).
 
         Raises:
-            TypeError: ``fetch_fn`` or ``formatter`` is not callable.
+            TypeError: ``fetch_fn`` or ``formatter`` is not callable, or cannot
+                be called with the arguments cursor mode passes it.
             ValueError: ``total``, ``per_page``, or ``cache_size`` fails
                 range validation.
 
@@ -452,8 +465,27 @@ class _BasePaginatedMixin:
         """
         if not callable(fetch_fn):
             raise TypeError(f"fetch_fn must be callable, got {type(fetch_fn).__name__}")
+        # Cursor mode stores both callables and first calls them from inside
+        # the page loader, so a wrong signature surfaces there rather than
+        # here, where the mistake was made. from_data needs no equivalent
+        # check because it awaits its formatter during construction, which
+        # already fails on the caller's own line with the callable named.
+        if can_accept_positional(fetch_fn, 2) is False:
+            raise TypeError(
+                f"from_cursor: fetch_fn {_describe_callback(fetch_fn)} cannot be "
+                f"called with (offset, limit).\n"
+                f"  Fix: accept (offset, limit) -- cursor mode asks for one page "
+                f"at a time and passes both."
+            )
         if not callable(formatter):
             raise TypeError(f"formatter must be callable, got {type(formatter).__name__}")
+        if can_accept_positional(formatter, 1) is False:
+            raise TypeError(
+                f"from_cursor: formatter {_describe_callback(formatter)} cannot be "
+                f"called with (chunk).\n"
+                f"  Fix: accept (chunk) -- the formatter renders one page's "
+                f"items into page content."
+            )
         if not isinstance(total, int) or isinstance(total, bool) or total < 0:
             raise ValueError(f"total must be a non-negative int, got {total!r}")
         if not isinstance(per_page, int) or isinstance(per_page, bool) or per_page < 1:

@@ -59,6 +59,44 @@ rejects more than this at the API boundary. The V2 ``choice_row`` builder
 enforces it, raising ``ValueError`` past the cap.
 """
 
+MAX_MESSAGE_COMPONENTS = 40
+"""Discord's cap on the components in a single V2 message, counted recursively.
+
+Every node counts: each Container, Section, ActionRow, button, select, text
+node, and a Section's accessory. Exactly this many is legal and the next one
+is refused.
+
+discord.py owns the enforcement and raises from ``add_item`` while the tree is
+being built, so this constant is for a budget check a caller wants to run
+*before* composing. It is a transcription of discord.py's own literal rather
+than the source of it, which is why
+:meth:`cascadeui.StatefulLayoutView.add_item` still reports the count from the
+exception it catches instead of comparing against this number.
+"""
+
+MAX_MESSAGE_CHARACTERS = 4000
+"""Discord's cap on the display text in a single V2 message, summed.
+
+The per-node cap on one ``TextDisplay`` is also 4000, and the two are
+different limits: a tree of ten short text nodes passes every per-node
+check and can still cross this one. ``LayoutView.content_length`` supplies
+the running total.
+
+That counter reaches ``TextDisplay`` content and nothing else, so text in
+a button label, a select placeholder, or an option label counts zero
+toward it while still occupying the message. A screen built mostly of
+labelled controls can therefore approach the cap while the total reads
+well under it.
+
+Nothing enforces it. Discord documents the limit and discord.py exposes
+the counter without raising on it, so a tree over the cap builds cleanly,
+passes the placement validator, and may be refused at send. The library warns
+at its ship seams rather than raising, because the enforcing side of this
+one is unobserved: refusing a tree Discord would have accepted is the
+worse error. Compare ``content_length()`` against this constant to check a
+budget before composing.
+"""
+
 MAX_COMPONENT_ID = 2**31 - 1
 """Upper bound on a component's numeric ``id``.
 

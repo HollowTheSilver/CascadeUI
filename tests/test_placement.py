@@ -2,7 +2,7 @@
 
 
 import pytest
-from discord import SelectOption
+from discord import SelectOption, UnfurledMediaItem
 from discord.ui import (
     ActionRow,
     Button,
@@ -46,7 +46,11 @@ from cascadeui import (
     tab_nav,
     toggle_section,
 )
-from cascadeui.views._placement import validate_placement, validate_unique_custom_ids
+from cascadeui.views._placement import (
+    validate_placement,
+    validate_unique_custom_ids,
+    validate_unique_ids,
+)
 
 
 async def _noop(interaction):
@@ -303,6 +307,83 @@ class TestButtonLabelSize:
         validate_placement(v)
 
 
+class TestButtonUrlSize:
+    """Link-button url over Discord's 512-char cap is caught pre-flight.
+
+    discord.py stores ``url`` unchecked, same as the label, so an
+    oversized link URL constructs cleanly and 400s at send.
+    """
+
+    def test_oversized_url_rejected(self):
+        v = _view_with(ActionRow(Button(label="go", url="https://e.com/" + "x" * 500)))
+        with pytest.raises(ValueError, match="Button url is 514 characters"):
+            validate_placement(v)
+
+    def test_oversized_url_as_section_accessory_rejected(self):
+        s = Section(
+            TextDisplay("hi"), accessory=Button(label="go", url="https://e.com/" + "x" * 500)
+        )
+        v = _view_with(Container(s))
+        with pytest.raises(ValueError, match="512-character cap"):
+            validate_placement(v)
+
+    def test_exactly_at_cap_passes(self):
+        base = "https://e.com/"
+        v = _view_with(ActionRow(Button(label="go", url=base + "x" * (512 - len(base)))))
+        validate_placement(v)
+
+
+class TestEmptyButtonUrl:
+    """An empty link-button url is rejected on the media-reference reasoning.
+
+    A URL is machine-consumed, so a blank one cannot resolve and ships to
+    be refused as a form error naming no component. Whitespace-only counts
+    as empty, one notch stricter than the text checks.
+    """
+
+    def test_empty_url_rejected(self):
+        v = _view_with(ActionRow(Button(label="go", url="")))
+        with pytest.raises(ValueError, match="Button url is empty"):
+            validate_placement(v)
+
+    def test_whitespace_url_rejected_as_section_accessory(self):
+        s = Section(TextDisplay("hi"), accessory=Button(label="go", url="   "))
+        v = _view_with(s)
+        with pytest.raises(ValueError, match="Button url is empty"):
+            validate_placement(v)
+
+    def test_urlless_button_passes(self):
+        # An ordinary button stores url=None; only a present-but-blank
+        # string is the mistake this check exists for.
+        v = _view_with(ActionRow(Button(label="go", custom_id="ok")))
+        validate_placement(v)
+
+
+class TestCustomIdLengthCap:
+    """An oversized custom_id is caught at both seams that read one.
+
+    The per-node check rides the structural walk (V2 only); the
+    uniqueness walk carries its own length check because it is the only
+    walk that runs for V1 views and the only one that visits DynamicItem.
+    """
+
+    def test_pre_flight_walk_rejects_oversized_custom_id(self):
+        v = _view_with(ActionRow(Button(label="go", custom_id="x" * 101)))
+        with pytest.raises(ValueError, match="custom_id is 101 characters"):
+            validate_placement(v)
+
+    def test_uniqueness_walk_rejects_oversized_custom_id_on_v1(self):
+        view = View()
+        view.add_item(Button(label="go", custom_id="x" * 101))
+        with pytest.raises(ValueError, match="over Discord's 100-character cap"):
+            validate_unique_custom_ids(view)
+
+    def test_exactly_at_cap_passes_both_walks(self):
+        v = _view_with(ActionRow(Button(label="go", custom_id="x" * 100)))
+        validate_placement(v)
+        validate_unique_custom_ids(v)
+
+
 class TestSelectPlaceholderSize:
     """Select placeholder over Discord's 150-char cap is caught pre-flight."""
 
@@ -530,6 +611,43 @@ class TestMediaGallerySizeCap:
             validate_placement(v)
 
 
+class TestMediaDescriptionSize:
+    """Thumbnail / MediaGalleryItem description over Discord's 1024-char cap.
+
+    Discord's component reference documents ``description`` on both
+    structures as alt text capped at 1024 characters; discord.py stores
+    it unchecked, so oversized alt text constructs cleanly and 400s at
+    send.
+    """
+
+    def test_oversized_thumbnail_description_rejected(self):
+        s = Section(
+            TextDisplay("hi"),
+            accessory=Thumbnail("https://e.com/a.png", description="d" * 1025),
+        )
+        v = _view_with(Container(s))
+        with pytest.raises(ValueError, match="Thumbnail description is 1025 characters"):
+            validate_placement(v)
+
+    def test_oversized_gallery_item_description_rejected(self):
+        from discord.components import MediaGalleryItem
+
+        g = MediaGallery(MediaGalleryItem("https://e.com/a.png", description="d" * 1025))
+        v = _view_with(g)
+        with pytest.raises(ValueError, match="MediaGalleryItem description is 1025 characters"):
+            validate_placement(v)
+
+    def test_exactly_at_cap_passes(self):
+        from discord.components import MediaGalleryItem
+
+        s = Section(
+            TextDisplay("hi"),
+            accessory=Thumbnail("https://e.com/a.png", description="d" * 1024),
+        )
+        g = MediaGallery(MediaGalleryItem("https://e.com/a.png", description="d" * 1024))
+        validate_placement(_view_with(Container(s), g))
+
+
 # // ========================================( Container Size Bounds )======================================== // #
 
 
@@ -728,6 +846,56 @@ class TestUniqueCustomIds:
             validate_unique_custom_ids(_view_with(row1, row2))
 
 
+class TestUniqueComponentIds:
+    """validate_unique_ids rejects a duplicate or malformed component ``id``.
+
+    ``id`` is a per-component integer distinct from ``custom_id``: every
+    component carries one, not just interactive leaves, and discord.py
+    stores whatever it is handed. The walk runs ungated from
+    ``_check_placement`` for both V1 and V2 views.
+    """
+
+    def test_duplicate_int_id_raises(self):
+        v = _view_with(TextDisplay("a", id=5), TextDisplay("b", id=5))
+        with pytest.raises(ValueError, match="Duplicate component id: 5"):
+            validate_unique_ids(v)
+
+    def test_string_id_raises(self):
+        # discord.py's setter stores the string as-is; it would reach
+        # Discord unserializable and return an opaque 400.
+        t = TextDisplay("a")
+        v = _view_with(t)
+        t.id = "x7"
+        with pytest.raises(ValueError, match="Component id must be an int, got str"):
+            validate_unique_ids(v)
+
+    def test_bool_id_raises(self):
+        # bool is an int subclass, so it passes a bare isinstance check
+        # while serializing as true/false.
+        t = TextDisplay("a")
+        v = _view_with(t)
+        t.id = True
+        with pytest.raises(ValueError, match="Component id must be an int, got bool"):
+            validate_unique_ids(v)
+
+    def test_zero_id_raises(self):
+        # Discord treats 0 as absent, so a caller-supplied 0 never sticks.
+        v = _view_with(TextDisplay("a", id=0))
+        with pytest.raises(ValueError, match="outside Discord's range"):
+            validate_unique_ids(v)
+
+    def test_over_range_id_raises(self):
+        v = _view_with(TextDisplay("a", id=2**31))
+        with pytest.raises(ValueError, match="outside Discord's range"):
+            validate_unique_ids(v)
+
+    def test_distinct_ids_and_unset_ids_pass(self):
+        # A Separator with no id contributes nothing to the walk; distinct
+        # ints on the rest pass.
+        v = _view_with(TextDisplay("a", id=1), Separator(), TextDisplay("b", id=2))
+        validate_unique_ids(v)
+
+
 # // ========================================( custom_id Wiring )======================================== // #
 
 
@@ -809,6 +977,101 @@ class TestEmptySelectOptionText:
                 ActionRow(Select(custom_id="s", options=[SelectOption(label="L", value="v")]))
             )
         )
+
+
+class TestEmptyMediaUrl:
+    """An empty media URL fails the whole message, so it is caught pre-flight.
+
+    discord.py normalizes every media assignment to an ``UnfurledMediaItem``
+    and stores its ``url`` unvalidated, so an empty reference constructs
+    cleanly from a raw primitive or a post-construction mutation. The
+    builders reject the same input at construction; the validator is what
+    covers trees the builders never saw.
+    """
+
+    def test_empty_thumbnail_accessory_rejected(self):
+        s = Section(TextDisplay("hi"), accessory=Thumbnail(""))
+        v = _view_with(Container(s))
+        with pytest.raises(ValueError, match="Thumbnail media URL is empty"):
+            validate_placement(v)
+
+    def test_whitespace_thumbnail_accessory_rejected(self):
+        # Whitespace-only is rejected along with empty: a URL is
+        # machine-consumed, unlike TextDisplay content, where whitespace
+        # renders and is allowed.
+        s = Section(TextDisplay("hi"), accessory=Thumbnail("   "))
+        v = _view_with(s)
+        with pytest.raises(ValueError, match="Thumbnail media URL is empty"):
+            validate_placement(v)
+
+    def test_thumbnail_error_names_accessory_path(self):
+        s = Section(TextDisplay("hi"), accessory=Thumbnail(""))
+        v = _view_with(s)
+        with pytest.raises(ValueError, match=r"accessory\(Thumbnail\)"):
+            validate_placement(v)
+
+    def test_empty_gallery_item_rejected_naming_index(self):
+        from discord.components import MediaGalleryItem
+
+        g = MediaGallery(MediaGalleryItem("https://e.com/a.png"), MediaGalleryItem(""))
+        v = _view_with(g)
+        with pytest.raises(ValueError, match=r"MediaGalleryItem media URL is empty"):
+            validate_placement(v)
+
+    def test_empty_gallery_item_path_names_item_index(self):
+        from discord.components import MediaGalleryItem
+
+        g = MediaGallery(MediaGalleryItem("https://e.com/a.png"), MediaGalleryItem(""))
+        v = _view_with(Container(g))
+        with pytest.raises(ValueError, match=r"items\[1\]"):
+            validate_placement(v)
+
+    def test_empty_file_media_rejected_at_top_level(self):
+        v = _view_with(File(media=""))
+        with pytest.raises(ValueError, match="File media URL is empty"):
+            validate_placement(v)
+
+    def test_empty_file_media_rejected_in_container(self):
+        v = _view_with(Container(TextDisplay("t"), File(media="")))
+        with pytest.raises(ValueError, match="File media URL is empty"):
+            validate_placement(v)
+
+    def test_mutated_thumbnail_media_rejected(self):
+        """A ``media = ""`` mutation lands past every builder guard.
+
+        The setter re-normalizes the string to ``UnfurledMediaItem("")``,
+        so a validly built section carries an empty reference by the time
+        the ship-seam walk runs; the walk is the only check positioned to
+        catch it.
+        """
+        section = image_section("text", url="https://example.com/img.png")
+        section.accessory.media = ""
+        v = _view_with(section)
+        with pytest.raises(ValueError, match="Thumbnail media URL is empty"):
+            validate_placement(v)
+
+    def test_empty_text_child_reported_before_empty_accessory(self):
+        # The accessory checks run after the children loop, so a Section
+        # carrying both defects names the text first -- fixing violations
+        # in reading order instead of ping-ponging.
+        s = Section(TextDisplay(""), accessory=Thumbnail(""))
+        v = _view_with(s)
+        with pytest.raises(ValueError, match="TextDisplay content is empty"):
+            validate_placement(v)
+
+    def test_non_string_url_skipped(self):
+        # The type is established before the value: a non-string url is not
+        # this check's domain, and raising TypeError from a pre-flight check
+        # would be worse than the 400 it prevents.
+        s = Section(TextDisplay("hi"), accessory=Thumbnail(UnfurledMediaItem(None)))
+        validate_placement(_view_with(s))
+
+    def test_populated_media_passes(self):
+        from discord.components import MediaGalleryItem
+
+        s = Section(TextDisplay("hi"), accessory=Thumbnail("attachment://a.png"))
+        g = MediaGallery(MediaGalleryItem("https://e.com/a.png"))
+        validate_placement(_view_with(s, g, File(media="attachment://f.pdf")))
 
 
 class TestValidationTableMroUnion:

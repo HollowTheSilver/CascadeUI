@@ -474,11 +474,32 @@ sent.
 | Constraint | Limit |
 |---|---|
 | Button label | 80 characters |
+| Button url (link buttons) | 512 characters |
 | Select option label | 100 characters |
 | Select placeholder | 150 characters |
 | TextInput value | 4000 characters |
 | TextDisplay content (V2) | 4000 characters |
+| All display text in one message (V2) | 4000 characters |
+| Thumbnail / MediaGalleryItem description (V2) | 1024 characters |
 | Modal title | 45 characters |
+
+The TextDisplay and whole-message rows are different limits that share a number. The
+per-node one is pre-flighted and raises; the message total is not, because
+Discord documents the cap while discord.py counts it without enforcing it,
+and refusing outright would reject messages Discord accepts. A V2
+view over the total logs a warning naming the measured figure at every seam
+that ships a tree, and `LayoutView.content_length()` reports the running
+total if you want to check a budget while composing. Compare it against
+`MAX_MESSAGE_CHARACTERS`.
+
+Many small nodes are the shape to watch for: each passes its own check,
+and the total crosses anyway, with nothing about any single component
+looking wrong.
+
+Know what that counter reaches before trusting its silence: it sums
+`TextDisplay` content and nothing else. Button labels, select placeholders,
+and option labels are all display text it never sees, so on a control-heavy
+screen the counter reports only a fraction of the text the message carries.
 
 ### Embed Limits
 

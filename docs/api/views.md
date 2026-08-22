@@ -69,15 +69,74 @@ Dispatches an action through the store with `source=self.id`. Subscriber failure
 Raises `ValueError` if the view's component tree is one Discord would reject: `custom_id` uniqueness and length on every interactive node, and, for V2 views, the structural placement walk.
 
 ```python
-view = MyLeaderboard(user_id=1, guild_id=2)
+from cascadeui import MAX_MESSAGE_COMPONENTS
+from cascadeui.testing import stub_client
+
+view = MyLeaderboard(user_id=1, guild_id=2, bot=stub_client())
 await view.on_load()          # composes the tree
 view.validate()               # raises if Discord would reject it
-
-nodes = sum(1 for _ in view.walk_children())
-assert nodes <= 40            # the per-message component cap
+assert view.total_components <= MAX_MESSAGE_COMPONENTS
 ```
 
 These are the same checks the library runs itself at three seams: the initial send, every `refresh()`, and every push/pop edit. `validate()` adds no check of its own and enforces nothing at runtime that was not already enforced; it exists so a test can reach them without a Discord connection.
+
+Bind a client to any pattern whose composition depends on one, or the tree measured is not the tree that ships. A section-mode leaderboard renders a four-node `image_section` per row with a client bound and a one-node `TextDisplay` without, so a five-row page differs by fifteen components. [`stub_client()`](#stub_client) opens no connection and reports the empty user cache a live bot reports for a member it has not seen, so the composed tree matches the rendered one. A persistent view takes its client through `on_bind(stub_client())` rather than a `bot=` kwarg.
+
+`validate()` counts nothing, by design: a tree can never exist over the per-message cap, because `add_item` refuses the node that would cross it. `total_components` is the budget read, and `count_components(item)` reports what a subtree would add before you add it.
+
+#### `total_components` *(V2 property)* {#total_components}
+
+How many components the view currently holds, counted recursively: every Container, Section, ActionRow, button, select, and text node, a Section's accessory included, and never the view itself. This is the number Discord counts and discord.py enforces against.
+
+```python
+from cascadeui import MAX_MESSAGE_COMPONENTS, count_components
+
+if view.total_components + count_components(card) > MAX_MESSAGE_COMPONENTS:
+    card = trimmed_card()
+view.add_item(card)
+```
+
+A tree can never exist over the cap, since `add_item` refuses the node that would cross it, so this reports a live count rather than a violation to find later. Exactly `MAX_MESSAGE_COMPONENTS` is legal; the next node raises.
+
+#### `count_components(item)` {#count_components}
+
+Module-level function, exported from the package root. Counts `item` and everything under it the way Discord counts, so the two numbers in a budget check come from the same source the library's own enforcement message reports.
+
+#### `count_characters(item)` {#count_characters}
+
+Module-level function, exported from the package root. Sums the display text in `item` and everything under it. Only `TextDisplay` content counts, the same accounting `content_length()` uses, so a button label or a select placeholder occupies the message without reaching either total.
+
+The character counterpart of [`count_components`](#count_components), so both budgets read from one place. It also retires the workaround of adding a subtree to a throwaway view to reach `content_length()`, which borrows that view's component limit and raises about components when the subtree is over that budget.
+
+```python
+if view.content_length() + count_characters(card) > MAX_MESSAGE_CHARACTERS:
+    card = shorter_card()
+```
+
+Passing a view raises `TypeError`; read `view.content_length()` for a view's own total.
+
+#### `stub_client()` {#stub_client}
+
+`from cascadeui.testing import stub_client`
+
+Returns a `StubClient` (a `discord.Client` subclass importable from the same module) that never connects, for measuring a view offline. Composition that depends on a client differs without one: a section-mode leaderboard row resolves an avatar into a four-node `image_section` when a client is bound and renders a one-node `TextDisplay` when none is, so a five-row page differs by fifteen components between the tree a test builds and the tree that ships. The stub reports the empty user cache a live bot reports for a member it has not seen, so the composed tree matches.
+
+Construction opens no connection and needs no token. A persistent view takes its client through `on_bind(stub_client())` rather than a `bot=` kwarg.
+
+#### `stub_interaction()` {#stub_interaction}
+
+`from cascadeui.testing import stub_interaction`
+
+Returns a `StubInteraction` that records what is said through it instead of sending it: the double [`Modal.submit`](components.md#await-modalsubmitinteraction-values-bool) expects. It carries a response slot that tracks whether it is spent, a followup, and a user id, which is what the library reads off a real one.
+
+```python
+interaction = stub_interaction()
+
+assert await modal.submit(interaction, {"Name": "ab"}) is False
+assert "at least 5" in interaction.replies[0]
+```
+
+`replies` merges the response slot and the followup into one list. Which of the two carries a rejection depends on the ack backstop's timing, an ordering internal to the library, so a test asserts on the message without predicting it. `deferred` reports whether the submission was acknowledged, and `answered` is true when either happened.
 
 #### `refresh(**kwargs)`
 
@@ -222,7 +281,7 @@ Replaces the current view with another view. One-way (no stack history saved). `
 
 #### `push(view_or_class, interaction, *, rebuild=None, **kwargs)`
 
-Pushes the current view onto the navigation stack and navigates to the next view. `view_or_class` accepts either a view class (constructed internally with `**kwargs`; constructor kwargs auto-captured so `pop()` can reconstruct faithfully) or a pre-constructed view instance (used directly; `**kwargs` must be empty). The instance form pairs with async classmethod constructors like `PaginatedLayoutView.from_data` and `from_cursor`, where the view is built before the navigation call.
+Pushes the current view onto the navigation stack and navigates to the next view. `view_or_class` accepts either a view class (constructed internally with `**kwargs`; constructor kwargs auto-captured so `pop()` can reconstruct faithfully) or a pre-constructed view instance (used directly; `**kwargs` must be empty). The instance form pairs with the classmethod constructors, like `PaginatedLayoutView.from_data` (awaited) and `from_cursor` (called bare), where the view is built before the navigation call.
 
 Passing extra kwargs alongside an instance raises `TypeError` -- the instance is already initialized.
 
@@ -531,7 +590,7 @@ V2 views ARE the message content -- `send()` takes no `content` or `embed` param
 
 #### V2-Specific Class Attributes
 
-- `validate_placement` (bool): Run the V2 placement validator before every Discord round-trip. When `True` (default), the assembled component tree is walked at three seams -- the initial `send()`, every state-driven `refresh()` after the render-hash short-circuit, and the in-place edits from `push()` / `pop()` navigation -- and any composition Discord rejects with HTTP 400 raises `ValueError` with a path string identifying the violation node and a suggested fix. Type rejections cover Container nesting, Section nesting, Section accessory not in `{Button, Thumbnail}`, standalone `Button` / `Select` / `Thumbnail` at LayoutView or Container level, Modal-only types (`Label`, `RadioGroup`, `CheckboxGroup`, `Checkbox`, `FileUpload`) anywhere in the tree, and ActionRow children outside the Button/Select union. Size rejections cover empty Containers, empty Sections, empty ActionRows, MediaGallery items outside the 1-10 range, and text-length caps on TextDisplay content (4000 chars), Button label (80), Select placeholder (150), and SelectOption label / value / description (100). Set to `False` only when the validator's matrix lags a discord.py or Discord update; opting out otherwise signals an actual placement bug, prefer fixing the tree. See [V2 Placement Rules](../guide/components.md#v2-placement-rules) for the full matrix and the builders-as-guardrails framing.
+- `validate_placement` (bool): Run the V2 placement validator before every Discord round-trip. When `True` (default), the assembled component tree is walked at three seams (the initial `send()`, every state-driven `refresh()` after the render-hash short-circuit, and the in-place edits from `push()` / `pop()` navigation), and any composition Discord rejects with HTTP 400 raises `ValueError` with a path string identifying the violation node and a suggested fix. Type rejections cover Container nesting, Section nesting, Section accessory not in `{Button, Thumbnail}`, standalone `Button` / `Select` / `Thumbnail` at LayoutView or Container level, Modal-only types (`Label`, `RadioGroup`, `CheckboxGroup`, `Checkbox`, `FileUpload`) anywhere in the tree, and the Modal-only and display types in an ActionRow. An unknown `Item` subclass passes, so a component discord.py adds later is not rejected before the matrix learns it. Size rejections cover empty Containers, empty Sections, empty ActionRows, MediaGallery items outside the 1-10 range, empty text on a TextDisplay or a SelectOption label or value, empty media URLs on Thumbnail / MediaGalleryItem / File, an empty link-button `url`, and length caps on TextDisplay content (4000 chars), Button label (80), Button url (512), `custom_id` (100), Select placeholder (150), SelectOption label / value / description (100), and Thumbnail / MediaGalleryItem description (1024). Set to `False` only when the validator's matrix lags a discord.py or Discord update; opting out otherwise signals an actual placement bug, prefer fixing the tree. See [V2 Placement Rules](../guide/components.md#v2-placement-rules) for the full matrix and the builders-as-guardrails framing.
 
 #### V2-Specific Methods
 
@@ -624,10 +683,13 @@ WizardLayoutView(
   the shape it owes: a two-character string and a two-key dict both unpack
   without complaint and hand back a truthy first element, which would
   advance the wizard past the step the validator was rejecting.
-- `condition(view)` -- must be synchronous. An async predicate returns a
-  coroutine, which is always truthy, so the step would render regardless of
-  the answer; `WizardStep` rejects one at construction and a step written as
-  a dict warns at the visibility check.
+- `condition(view)` -- must be synchronous and able to accept the view. An
+  async predicate returns a coroutine, which is always truthy, so the step
+  would render regardless of the answer; both declaration forms reject one
+  with `TypeError` at construction. A predicate that cannot take the view
+  (a zero-argument lambda) is rejected the same way, because the visibility
+  check treats a raising predicate as visible: the step it meant to hide
+  would render, with a warning as the only trace.
 
 #### Methods
 
@@ -977,6 +1039,12 @@ RoleCategory(
 | `swap_message` | `"Switched to **{role}** (removed {removed})."` | Response after exclusive swap. |
 | `role_error_message` | `"Could not update roles: {error}"` | Response on role mutation failure. |
 | `categories` | `[]` | List of `RoleCategory`. Declared on the subclass. |
+
+Each `*_message` template is validated at class definition against its
+documented placeholders (`{role}`, `{category}`, `{removed}`, `{error}`)
+-- a typo'd or unbalanced placeholder raises `ValueError` naming the
+attribute and the placeholders it accepts, instead of a bare `KeyError`
+from inside the click that renders it.
 
 #### Override Hooks
 

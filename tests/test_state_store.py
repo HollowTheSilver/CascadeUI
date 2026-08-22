@@ -2,6 +2,7 @@
 
 import asyncio
 import copy
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -239,6 +240,123 @@ class TestDispatch:
             await store.dispatch("FILL_ACTION", {"i": i})
 
         assert len(store.history) == 5
+
+    async def test_dispatch_only_builtin_logs_debug_without_subscribers(self, caplog):
+        # APPLICATION_SLOTS_PRUNED is library-declared dispatch-only: the slot
+        # it removes is still live in memory and re-upserts on the next write.
+        # The old gate read "does anything subscribe" as a proxy for "is this a
+        # typo", and the subscriber filter defaults to an empty set, so the
+        # manager's own prune signal warned on every sweep of a default
+        # deployment.
+        store = get_store()
+        with caplog.at_level(logging.DEBUG, logger="cascadeui.state.store"):
+            await store.dispatch("APPLICATION_SLOTS_PRUNED", {})
+        recs = [r for r in caplog.records if "No reducer" in r.getMessage()]
+        assert len(recs) == 1
+        assert recs[0].levelno == logging.DEBUG
+
+    async def test_a_registry_prune_emits_no_missing_reducer_line(self, caplog):
+        # Its sibling reduces, because the store mirrors the registry, so it
+        # never reaches the no-reducer branch at all.
+        store = get_store()
+        with caplog.at_level(logging.DEBUG, logger="cascadeui.state.store"):
+            await store.dispatch("REGISTRY_PRUNED", {"deleted": 0, "keys": []})
+        assert not [r for r in caplog.records if "No reducer" in r.getMessage()]
+
+    async def test_unknown_action_without_subscribers_still_warns(self, caplog):
+        # The typo case the warning exists for: unknown type, no reducer,
+        # nothing listening. Must survive the dispatch-only carve-out.
+        store = get_store()
+        with caplog.at_level(logging.DEBUG, logger="cascadeui.state.store"):
+            await store.dispatch("REGISTRY_PRUNED_TYPO", {})
+        recs = [r for r in caplog.records if "No reducer" in r.getMessage()]
+        assert len(recs) == 1
+        assert recs[0].levelno == logging.WARNING
+        assert "REGISTRY_PRUNED_TYPO" in recs[0].getMessage()
+
+    async def test_a_registry_prune_drops_the_pruned_keys_from_state(self):
+        # The store mirrors the registry, and a prune that left the mirror
+        # stale sent _register_persistent's duplicate-key cleanup after a
+        # message the caller pruned the row in order to keep.
+        store = get_store()
+        for key in ("prune_a", "prune_b"):
+            await store.dispatch(
+                "PERSISTENT_VIEW_REGISTERED",
+                {
+                    "persistence_key": key,
+                    "view_class": "P",
+                    "message_id": 1,
+                    "channel_id": 2,
+                    "guild_id": 3,
+                    "init_kwargs": {},
+                },
+            )
+
+        await store.dispatch(
+            "REGISTRY_PRUNED", {"deleted": 1, "keys": ["prune_a"], "reason": "retired"}
+        )
+
+        registry = store.state.get("persistent_views", {})
+        assert "prune_a" not in registry
+        assert "prune_b" in registry
+
+    async def test_a_registry_prune_is_still_observable(self):
+        # Reducing it must not cost the observation the action exists for:
+        # the chain runs the reducer, then both notification passes.
+        store = get_store()
+        seen = []
+        store.on("REGISTRY_PRUNED", lambda action, state: seen.append(action["payload"]["keys"]))
+        try:
+            await store.dispatch(
+                "REGISTRY_PRUNED", {"deleted": 1, "keys": ["observed"], "reason": "retired"}
+            )
+        finally:
+            store._hooks.pop("REGISTRY_PRUNED", None)
+
+        assert seen == [["observed"]]
+
+    async def test_a_registry_prune_with_no_keys_changes_nothing(self):
+        store = get_store()
+        await store.dispatch(
+            "PERSISTENT_VIEW_REGISTERED",
+            {
+                "persistence_key": "untouched",
+                "view_class": "P",
+                "message_id": 1,
+                "channel_id": 2,
+                "guild_id": 3,
+                "init_kwargs": {},
+            },
+        )
+
+        await store.dispatch("REGISTRY_PRUNED", {"deleted": 0, "keys": [], "reason": "clear_all"})
+
+        assert "untouched" in store.state.get("persistent_views", {})
+
+    async def test_a_hook_counts_as_a_listener(self, caplog):
+        # store.on() takes a raw action type and _fire_hooks dispatches on
+        # it, so a hook is a listener by every route that matters. Reading
+        # only the subscriber registry warned about a broadcast something
+        # was demonstrably handling.
+        store = get_store()
+        fired = []
+        store.on("MY_HOOKED_BROADCAST", lambda action, state: fired.append(action["type"]))
+        try:
+            with caplog.at_level(logging.DEBUG, logger="cascadeui.state.store"):
+                await store.dispatch("MY_HOOKED_BROADCAST", {})
+        finally:
+            store._hooks.pop("MY_HOOKED_BROADCAST", None)
+
+        assert fired == ["MY_HOOKED_BROADCAST"]
+        recs = [r for r in caplog.records if "No reducer" in r.getMessage()]
+        assert len(recs) == 1
+        assert recs[0].levelno == logging.DEBUG
+
+    async def test_reducer_backed_action_emits_no_missing_reducer_line(self, caplog):
+        store = get_store()
+        with caplog.at_level(logging.DEBUG, logger="cascadeui.state.store"):
+            await store.dispatch("VIEW_CREATED", {"view_id": "log_level_probe"})
+        assert not [r for r in caplog.records if "No reducer" in r.getMessage()]
 
 
 class TestSubscribers:
@@ -649,7 +767,6 @@ class TestCascadeReducerCollision:
         dispatch_only = _BUILTIN_REDUCER_ACTIONS - set(store._core_reducers.keys())
         assert dispatch_only == {
             "APPLICATION_SLOTS_PRUNED",
-            "REGISTRY_PRUNED",
             "BATCH_COMPLETE",
         }
 

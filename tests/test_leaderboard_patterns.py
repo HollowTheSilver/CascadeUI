@@ -15,8 +15,11 @@ from discord.ui import (
 )
 from helpers import make_interaction as _make_interaction
 
+from cascadeui import MAX_MESSAGE_COMPONENTS
+from cascadeui.testing import stub_client
 from cascadeui.views.layout import StatefulLayoutView
 from cascadeui.views.patterns.leaderboard import (
+    _SECTIONS_SINGLE_PAGE_MAX,
     LeaderboardLayoutView,
     PersistentLeaderboardLayoutView,
     _BaseLeaderboardMixin,
@@ -1347,6 +1350,151 @@ class TestEntryLayoutValidation:
             class JustOverBoard(LeaderboardLayoutView):
                 entry_layout = "sections"
                 leaderboard_per_page = 6
+
+    async def test_sections_over_budget_names_the_leaderboard_attributes(self):
+        """A board that overflows reports it in leaderboard terms.
+
+        ``leaderboard_per_page=None`` collapses the board onto one page of
+        ``leaderboard_top_n``, which the paged cap above never reads. The
+        layout error the tree raises names components and suggests folding
+        text nodes, advice that does not apply to a board whose size is set
+        by how many entries a page carries.
+        """
+        entries = [(1000 + i, {"score": 1}) for i in range(10)]
+
+        class OverBudget(LeaderboardLayoutView):
+            entry_layout = "sections"
+            leaderboard_per_page = None
+            leaderboard_top_n = 10
+
+        view = OverBudget(entries=entries, user_id=1, guild_id=2, bot=stub_client())
+        with pytest.raises(ValueError, match="leaderboard_per_page") as caught:
+            await view.on_load()
+        # A None per_page has nothing to lower; the advice has to name the
+        # action that reaches a paged board from an unpaged one.
+        assert "lower leaderboard_per_page" not in str(caught.value)
+        assert "set leaderboard_per_page" in str(caught.value)
+
+    async def test_a_board_whose_avatars_do_not_resolve_is_not_priced_as_sections(self):
+        """A bound client lets an avatar resolve; it does not guarantee one did.
+
+        A ``get_avatar_url`` override returning nothing degrades every row
+        to a stacked text node costing one component, with the client still
+        bound. Pricing those rows at four blames them for a page whose
+        weight is in its frame, and points at two knobs that would not help.
+        """
+
+        class BlankAvatars(LeaderboardLayoutView):
+            entry_layout = "sections"
+            leaderboard_per_page = None
+            leaderboard_top_n = 30
+
+            async def get_entries(self):
+                return [(1000 + i, {"score": 1}) for i in range(30)]
+
+            def format_entry(self, rank, user_id, stats):
+                return f"{rank}. {user_id}"
+
+            def get_avatar_url(self, user_id, stats):
+                return "   "
+
+            def build_header(self, page):
+                return [TextDisplay(f"h{i}") for i in range(11)]
+
+        view = BlankAvatars(user_id=1, guild_id=2, bot=stub_client())
+        with pytest.raises(ValueError) as caught:
+            await view.on_load()
+        message = str(caught.value)
+
+        assert "1 component(s) per row" in message
+        # The two clauses that only make sense for a real Section row.
+        assert "resolves an avatar into a thumbnail" not in message
+        assert "entry_layout='lines'" not in message
+
+    async def test_the_budget_message_reaches_the_automatic_rebuild_path(self):
+        """A board grows through state changes, not only through on_load.
+
+        ``on_state_changed`` rebuilds via ``_update_page``, which the
+        leaderboard does not override, so wrapping the ``on_load`` call
+        site alone left the more common path reporting the overflow in the
+        vocabulary of a hand-composed view.
+        """
+
+        class Growing(LeaderboardLayoutView):
+            entry_layout = "sections"
+            leaderboard_per_page = None
+            leaderboard_top_n = 20
+            count = 5
+
+            def get_entries(self):
+                return [(1000 + i, {"score": i}) for i in range(self.count)]
+
+        view = Growing(user_id=1, guild_id=2, bot=stub_client())
+        await view.on_load()
+        view.count = 20
+
+        with pytest.raises(ValueError, match="leaderboard_per_page"):
+            await view.on_state_changed(view.state_store.state)
+
+    async def test_frame_over_budget_names_the_page_frame_hooks(self):
+        """When the entries are a minority of the overflow, the message
+        points at build_header/build_footer/_build_extra_items instead of
+        the rows -- the sibling branch of the "rows" message above, reached
+        only when rows_cost <= half the component budget."""
+        from discord.ui import TextDisplay
+
+        class FrameHeavy(LeaderboardLayoutView):
+            entry_layout = "lines"
+            leaderboard_per_page = None
+            leaderboard_top_n = 5
+
+            def build_header(self, page):
+                return [TextDisplay(f"x{i}") for i in range(40)]
+
+        entries = [(1000 + i, {"score": 1}) for i in range(5)]
+        view = FrameHeavy(entries=entries, user_id=1, guild_id=2)
+
+        with pytest.raises(ValueError, match="rest is page frame") as exc_info:
+            await view.on_load()
+        # Discriminates against the "rows" branch's message, which never
+        # mentions the frame hooks and instead opens with "composes N
+        # entries per page in entry_layout=..." -- both branches' Fix lines
+        # mention leaderboard_per_page, so that phrase alone cannot tell
+        # the branches apart.
+        assert "entries per page in entry_layout=" not in str(exc_info.value)
+
+    async def test_sections_at_the_budget_renders(self):
+        """Nine section rows land exactly on the cap, so nine still ships."""
+        entries = [(1000 + i, {"score": 1}) for i in range(_SECTIONS_SINGLE_PAGE_MAX)]
+
+        class AtBudget(LeaderboardLayoutView):
+            entry_layout = "sections"
+            leaderboard_per_page = None
+            leaderboard_top_n = _SECTIONS_SINGLE_PAGE_MAX
+
+        view = AtBudget(entries=entries, user_id=1, guild_id=2, bot=stub_client())
+        await view.on_load()
+
+        assert view.total_components == MAX_MESSAGE_COMPONENTS
+
+    async def test_sections_without_a_client_is_not_refused(self):
+        """An unbound board costs one component per row, so it is not over budget.
+
+        The budget depends on whether a client is bound, which no
+        class-definition check can see. A guard placed there would refuse
+        this board, which renders.
+        """
+        entries = [(1000 + i, {"score": 1}) for i in range(20)]
+
+        class Unbound(LeaderboardLayoutView):
+            entry_layout = "sections"
+            leaderboard_per_page = None
+            leaderboard_top_n = 20
+
+        view = Unbound(entries=entries, user_id=1, guild_id=2)
+        await view.on_load()
+
+        assert view.total_components <= MAX_MESSAGE_COMPONENTS
 
     def test_lines_mode_allows_larger_per_page(self):
         """The cap is a sections-only concern; lines mode is unconstrained."""

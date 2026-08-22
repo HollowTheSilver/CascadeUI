@@ -54,13 +54,14 @@ _MISSING: Any = _MissingSentinel()
 
 # Actions that should NOT create undo snapshots (internal lifecycle).
 #
-# Prune actions (APPLICATION_SLOTS_PRUNED, REGISTRY_PRUNED) are
-# observability signals fired after the persistence manager has already
-# deleted rows on disk; there is no user-meaningful in-memory change to
-# undo, and snapshotting every prune would waste memory on a routine
-# maintenance path. INSPECTOR_PURGED_STALE mutates transient
-# component/modal dispatch-log buffers (not ``application`` slots) and
-# is a devtools maintenance sweep that no user would want rewound.
+# Prune actions (APPLICATION_SLOTS_PRUNED, REGISTRY_PRUNED) report rows
+# the persistence manager has already deleted from disk. REGISTRY_PRUNED
+# does reduce, to drop the same keys from the store's mirror, but neither
+# is undoable: the rows are gone, so restoring the in-memory record would
+# describe a registry that no longer exists. INSPECTOR_PURGED_STALE
+# mutates transient component/modal dispatch-log buffers (not
+# ``application`` slots) and is a devtools maintenance sweep that no
+# user would want rewound.
 _SKIP_ACTIONS: Set[str] = {
     "VIEW_CREATED",
     "VIEW_UPDATED",

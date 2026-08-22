@@ -6,7 +6,8 @@ import logging
 from typing import Any, Dict, Optional, Sequence
 
 import discord
-from discord.ui import ActionRow, Item, LayoutView
+from discord.ui import ActionRow, Item, LayoutView, TextDisplay
+from discord.ui.view import BaseView
 
 from ..components.base import StatefulButton
 from ..components.types import EmojiInput
@@ -17,16 +18,96 @@ logger = logging.getLogger(__name__)
 # // ========================================( Helpers )======================================== // #
 
 
-def _count_nodes(item: Item) -> int:
+# The phrase that marks an over-capacity rejection. A pattern that wants to
+# restate the overflow in its own vocabulary matches on this rather than on a
+# copy of the sentence, so a reworded message cannot silently stop matching.
+_OVER_CAPACITY_MARKER = "40-component limit"
+
+
+def count_components(item: Item) -> int:
     """Count *item* and everything under it, the way Discord counts.
 
     Matches discord.py's own accounting: the node itself plus every
     descendant, including a Section's accessory. Leaf items report 1.
+
+    Pairs with :attr:`StatefulLayoutView.total_components` for a budget
+    check before composing: what the view already holds, plus what this
+    subtree would add, against
+    :data:`~cascadeui.MAX_MESSAGE_COMPONENTS`. Those are the same two
+    numbers the over-capacity message reports, so a caller's own check and
+    the library's enforcement cannot disagree by transcription.
+
+    Raises:
+        TypeError: *item* is a view rather than a component. A view is not
+            a node in its own tree, so counting one here reports a total
+            one higher than Discord's -- the transcription error this
+            pairing exists to remove. Read
+            :attr:`StatefulLayoutView.total_components` instead.
     """
+    if isinstance(item, BaseView):
+        raise TypeError(
+            f"count_components expects a component, got {type(item).__name__}, "
+            f"which is a view.\n"
+            f"  Fix: read view.total_components -- a view is not a node in "
+            f"its own tree, and counting it here would report one more "
+            f"component than Discord does."
+        )
+    if not isinstance(item, Item):
+        raise TypeError(
+            f"count_components expects a component, got {type(item).__name__}.\n"
+            f"  Fix: measure the component, not what it will be built from "
+            f"-- a builder wraps a bare string into a node, and this would "
+            f"report one for it either way."
+        )
     walk = getattr(item, "walk_children", None)
     if walk is None:
         return 1
     return 1 + sum(1 for _ in walk())
+
+
+def count_characters(item: Item) -> int:
+    """Sum the display text in *item* and everything under it.
+
+    The character counterpart of :func:`count_components`, and it counts
+    what discord.py counts: ``TextDisplay`` content, and nothing else.
+    Text in a button label, a select placeholder, or an option label
+    occupies the message without reaching this total, exactly as it does
+    not reach :meth:`discord.ui.LayoutView.content_length`.
+
+    Pairs with that method for a budget check before composing, the way
+    :func:`count_components` pairs with
+    :attr:`StatefulLayoutView.total_components`::
+
+        if view.content_length() + count_characters(card) > MAX_MESSAGE_CHARACTERS:
+            card = shorter_card()
+
+    Measuring a subtree by adding it to a throwaway view instead borrows
+    that view's component limit, so a subtree over the component budget
+    fails a character measurement with an error about components.
+
+    Raises:
+        TypeError: *item* is a view rather than a component. Read
+            ``view.content_length()`` for a view's own total.
+    """
+    if isinstance(item, BaseView):
+        raise TypeError(
+            f"count_characters expects a component, got {type(item).__name__}, "
+            f"which is a view.\n"
+            f"  Fix: call view.content_length() -- discord.py supplies a "
+            f"view's own total."
+        )
+    if not isinstance(item, Item):
+        raise TypeError(
+            f"count_characters expects a component, got {type(item).__name__}.\n"
+            f"  Fix: measure the component, not what it will be built from "
+            f"-- a builder wraps a bare string into a node, and this would "
+            f"report zero for it either way."
+        )
+    total = len(item.content) if isinstance(item, TextDisplay) else 0
+    walk = getattr(item, "walk_children", None)
+    if walk is None:
+        return total
+    return total + sum(len(child.content) for child in walk() if isinstance(child, TextDisplay))
 
 
 # // ========================================( Classes )======================================== // #
@@ -108,6 +189,27 @@ class StatefulLayoutView(_StatefulMixin, LayoutView):
             send_kwargs["allowed_mentions"] = mentions
         return await self._send_pipeline(send_kwargs, ephemeral=ephemeral)
 
+    @property
+    def total_components(self) -> int:
+        """How many components this view currently holds, counted recursively.
+
+        The number Discord counts and discord.py enforces against: every
+        Container, Section, ActionRow, button, select, and text node, a
+        Section's accessory included, and never the view itself.
+
+        Read it with :data:`~cascadeui.MAX_MESSAGE_COMPONENTS` and
+        :func:`count_components` for a budget check before adding a
+        subtree::
+
+            if view.total_components + count_components(card) > MAX_MESSAGE_COMPONENTS:
+                card = trimmed_card()
+
+        A tree can never exist over the cap, since ``add_item`` refuses the
+        node that would cross it, so this reports a live count rather than
+        a violation to discover later.
+        """
+        return getattr(self, "_total_children", 0) or 0
+
     def add_item(self, item: Item):
         """Add a top-level child, with a friendlier 40-component message.
 
@@ -136,11 +238,11 @@ class StatefulLayoutView(_StatefulMixin, LayoutView):
         genuinely holds zero components. The size of what is being added is
         the number that explains the rejection.
         """
-        held = getattr(self, "_total_children", 0) or 0
-        incoming = _count_nodes(item)
+        held = self.total_components
+        incoming = count_components(item)
         return (
             f"Invalid V2 layout: this LayoutView would exceed Discord's "
-            f"40-component limit for a single message. It holds {held} "
+            f"{_OVER_CAPACITY_MARKER} for a single message. It holds {held} "
             f"component(s) and {type(item).__name__} adds {incoming} more "
             f"({held + incoming} > 40), counted recursively across every "
             f"Container, Section, ActionRow, button, and text node "

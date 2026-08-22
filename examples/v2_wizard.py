@@ -7,7 +7,7 @@ handling the full range of wizard features in a single, richly composed
 flow:
 
     - A live character-sheet preview card, shown on every step, that fills
-      in as choices are made (with a name-seeded portrait via ``image_section``)
+      in as choices are made (portrait via ``image_section``, re-rollable)
     - Controls folded into titled cards (``action_section`` / ``choice_row`` /
       ``toggle_section``) rather than bare rows floating beneath a text card
     - ``choice_row`` segmented controls that highlight the active option and
@@ -39,6 +39,7 @@ Usage:
 
 
 import logging
+import uuid
 from urllib.parse import quote
 
 import discord
@@ -197,6 +198,10 @@ class CharacterCreatorView(WizardLayoutView):
         # these attributes; the preview and review compose them into cards.
         self._name: str = ""
         self._portrait: str = ""  # Uploaded portrait URL; falls back to DiceBear
+        # The generated portrait's seed. Held rather than derived from the
+        # name so editing a name does not silently redraw the face; the
+        # re-roll button on the sheet is what changes it.
+        self._portrait_seed: str = uuid.uuid4().hex[:8]
         self._race: str = ""
         self._class: str = ""
         self._subclass: str = ""
@@ -301,15 +306,27 @@ class CharacterCreatorView(WizardLayoutView):
     # // ========================================( Live character sheet )======================================== // #
 
     def _portrait_url(self) -> str:
-        """A deterministic character portrait seeded by the name.
+        """The generated portrait, from a seed this view holds.
 
-        Uses DiceBear's ``adventurer`` style, so the portrait is stable for
-        a given name and changes the moment the name does. A ``Section``
-        accessory cannot be null, so a race/class fallback seed keeps the
-        thumbnail present before a name is entered.
+        Uses DiceBear's ``adventurer`` style. The seed is per-character
+        rather than derived from any field, so the face stays put while
+        the sheet fills in and changes only when the user asks for it.
+        A ``Section`` accessory cannot be null, so a seed always exists.
         """
-        seed = self._name or f"{self._race or 'hero'}-{self._class or 'adventurer'}"
-        return f"https://api.dicebear.com/9.x/adventurer/png?seed={quote(seed)}&size=256"
+        return (
+            f"https://api.dicebear.com/9.x/adventurer/png"
+            f"?seed={quote(self._portrait_seed)}&size=256"
+        )
+
+    async def _reroll_portrait(self, interaction):
+        """Draw a new face, then rebuild the step that is on screen.
+
+        The whole pattern in one callback: mutate local state, re-run the
+        builder, ship one edit. ``refresh_content`` is the wizard's own
+        rebuild seam, so the sheet and the step's controls both re-render.
+        """
+        self._portrait_seed = uuid.uuid4().hex[:8]
+        await self.refresh_content()
 
     def _build_sheet_preview(self):
         """The live character sheet, shown on top of every step.
@@ -349,6 +366,18 @@ class CharacterCreatorView(WizardLayoutView):
         # the generated one the moment it lands.
         portrait = self._portrait or self._portrait_url()
         children: list = [image_section(f"### \N{SCROLL} {name}\n{summary}", url=portrait)]
+        # Only offered for the generated portrait: an uploaded one is the
+        # user's own image and re-rolling would discard it.
+        if not self._portrait:
+            children.append(
+                action_section(
+                    "Not the face you pictured?",
+                    label="Random",
+                    emoji="\N{GAME DIE}",
+                    custom_id="wiz_reroll_portrait",
+                    callback=self._reroll_portrait,
+                )
+            )
         if fields:
             children.append(divider())
             children.append(key_value(fields))
@@ -702,8 +731,10 @@ class CharacterCreatorView(WizardLayoutView):
         self._languages = sorted(values)
         await self.refresh_content()
 
-    async def _on_destiny_toggled(self, interaction):
-        self._heroic_destiny = not self._heroic_destiny
+    async def _on_destiny_toggled(self, interaction, active):
+        # toggle_section delivers the requested state when the callback
+        # declares a second parameter, so no manual flip is needed.
+        self._heroic_destiny = active
         await self.refresh_content()
 
     async def validate_background(self):

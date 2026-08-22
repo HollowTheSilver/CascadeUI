@@ -32,7 +32,10 @@ URL or the `attachment://name.ext` form. A `discord.File` resolves to its
 else carrying a string `.url` is read from that attribute, which is what
 makes `member.display_avatar` work where `member.display_avatar.url` was
 meant. Anything else raises `TypeError` at construction, naming the
-builder and the argument.
+builder and the argument. An empty or whitespace-only reference raises
+`ValueError` at the same seam; `LeaderboardLayoutView(banner=...)` alone
+normalizes a blank value to `None` (no banner), since absence is a
+banner's documented meaning.
 
 A `discord.File` supplies only the reference. The bytes travel separately
 through `view.send(files=[...])` or `view.refresh(attachments=[...])` --
@@ -57,6 +60,50 @@ MAX_COMPONENT_ID = 2**31 - 1
 Defined in `cascadeui.components.types`, exported from the package root.
 Discord's upper bound on a component `id`. See
 [Naming a component](#naming-a-component) below.
+
+### `MAX_MESSAGE_COMPONENTS`
+
+```python
+MAX_MESSAGE_COMPONENTS = 40
+```
+
+Defined in `cascadeui.components.types`, exported from the package root.
+Discord's cap on the components in a single V2 message, counted
+recursively: every Container, Section, ActionRow, button, select, and text
+node, a Section's accessory included. Exactly this many is legal and the
+next one is refused.
+
+discord.py owns the enforcement and raises from `add_item` while the tree
+is being built, so this constant is for a budget check a caller wants to
+run before composing. Pair it with
+[`total_components`](views.md#total_components) and
+[`count_components`](views.md#count_components).
+
+---
+
+### `MAX_MESSAGE_CHARACTERS`
+
+```python
+MAX_MESSAGE_CHARACTERS = 4000
+```
+
+Defined in `cascadeui.components.types`, exported from the package root.
+Discord's cap on the display text in a single V2 message, summed across
+every item. The per-node cap on one `TextDisplay` is also 4000, and the two
+are different limits: ten short text nodes pass every per-node check and
+can still cross this one.
+
+Nothing enforces it. Discord documents the limit and discord.py exposes the
+running total as `LayoutView.content_length()` without raising on it, so a
+tree over the cap builds cleanly, passes the placement validator, and is
+refused at send. That counter sums `TextDisplay` content only: text in a
+button label, a select placeholder, or an option label reads as zero
+against it, so a control-heavy screen can approach the cap while the total
+does not. A V2 view over the cap logs a warning naming the measured
+total at every seam that ships a tree; the library does not reject the
+send, because refusing a tree Discord would have accepted is the worse
+error. Compare `content_length()` against this constant to check a budget
+while composing.
 
 ---
 
@@ -116,8 +163,13 @@ one method:
 Wraps a callback so the component dispatches a `COMPONENT_INTERACTION` action
 around it, binds the live interaction so the acting view's refresh can take the
 one-request fast path, and passes the component's `values` as a second argument
-when the callback declares one. Subclass `StatefulComponent` alongside a
-`discord.ui` primitive to give a custom component the same behavior:
+when the callback declares one. A callback that cannot accept the arguments the
+component will call it with (`(interaction)` for a button, `(interaction)` or
+`(interaction, values)` for a select) raises `TypeError` at construction,
+printing the signature it saw, instead of a bare arity error on the first
+click. A callable whose signature cannot be read is allowed through. Subclass
+`StatefulComponent` alongside a `discord.ui` primitive to give a custom
+component the same behavior:
 
 ```python
 class TimeSelect(StatefulComponent, discord.ui.Select):
@@ -160,6 +212,12 @@ StatefulButton(
     for the few seams that genuinely require a synchronous function.
 
 Every click dispatches a `COMPONENT_INTERACTION` action. Skips dispatch when the parent view is finished.
+
+The callback takes one positional argument, the interaction. A button carries
+no value, so a callback declaring a required second parameter (or an unbound
+method still carrying `self`) raises `TypeError` at construction, naming the
+signature it saw. Close over any extra data, or reach for `toggle_button` /
+`cycle_button` / `choice_row` when the callback needs the control's value.
 
 ---
 
@@ -210,7 +268,14 @@ async def on_select(interaction, values):
     ...
 ```
 
-Detection happens at creation time via `inspect.signature`. Old single-parameter callbacks (`async def cb(interaction)`) still work -- only callbacks declaring 2+ positional parameters receive `values`.
+This is one instance of the library-wide callback grammar: a callback receives
+the interaction, plus the control's value as a second argument when the control
+carries one and the callback declares a second parameter. Detection happens at
+creation time via `inspect.signature`. Single-parameter callbacks (`async def
+cb(interaction)`) still work, and variadic (`*args`) callbacks keep the
+one-argument contract -- only callbacks declaring a second positional parameter
+receive `values`. A callback that can accept neither shape raises `TypeError`
+at construction.
 
 ### Select Variants
 
@@ -359,21 +424,74 @@ Wraps `discord.ui.Modal` with state integration and automatic validator collecti
 Modal(
     title=str,               # Required
     inputs=[...],            # TextInput, Checkbox, CheckboxGroup, RadioGroup, FileUpload
-    callback=async_fn,       # async def callback(interaction, values)
+    callback=async_fn,       # callback(interaction, values), sync or async
     timeout=None,
     view_id=None,            # If set, dispatches MODAL_SUBMITTED action
+    custom_id=None,          # Forwarded to discord.ui.Modal; omit to auto-generate
 )
 ```
 
 - `inputs` accepts any combination of CascadeUI input wrappers (`TextInput`, `Checkbox`, `CheckboxGroup`, `RadioGroup`, `FileUpload`) or raw `discord.ui.TextInput` instances. Discord caps a modal at 5 top-level inputs; labels must be distinct because each input's `custom_id` derives from its label (duplicates raise at construction).
 - Validators are read from each input's `validators` list and collected internally. On failure, an ephemeral error message is sent and the callback is skipped. Each validator receives whatever its input submits: `str` for text, `bool` for a checkbox, `list[str]` for a checkbox group, `list[discord.Attachment]` for an upload.
 - `view_id` -- links the modal to a view's state. A `MODAL_SUBMITTED` action is dispatched before the callback runs.
-- If no `callback` is provided, the interaction is deferred automatically.
+- If no `callback` is provided, the interaction is deferred automatically. A `callback` that cannot accept `(interaction, values)` raises `TypeError` at construction, since every submission delivers the collected values.
+- The constructor's signature is closed: an unrecognized keyword raises `TypeError` naming it, rather than being discarded silently. `on_submit=` is the method discord.py subclasses override and the natural wrong guess for `callback=`, and a modal with no handler set acknowledges every submission and runs nothing.
 - `auto_defer_delay` (class attribute, default `2.5`) -- the ack backstop in seconds. `Modal.on_submit` arms an auto-defer timer across the whole submission (the access check, the validators, and the callback), so a slow validator or a raising handler cannot leave the interaction unacknowledged. Raise it on a subclass with a slow async validator; it validates at class-definition time (positive number).
 
 **Responding from `on_submit`:** an override that sends its own reply should use `await self.respond(interaction, ...)` rather than `interaction.response.send_message()`. Like the view helper, `Modal.respond()` is `is_done()`-aware: it falls back to a followup when the ack backstop has already fired, so a reply sent after a slow validator does not raise `InteractionResponded`.
 
 **Opening modals from CascadeUI callbacks:** use [`self.open_modal(interaction, modal)`](views.md#open_modal) instead of `interaction.response.send_modal()`. It handles the case where auto-defer has already consumed the response slot by sending an ephemeral fallback.
+
+### `await modal.submit(interaction, values) -> bool`
+
+Drives a submission offline, through the pipeline a real one takes. The
+offline-testing surface for modals, alongside [`on_load()`](views.md#await-on_load-override),
+[`validate()`](views.md#validate), and [`stub_client()`](views.md#stub_client).
+
+`values` is keyed by either an input's `label` (`"Emoji"`) or its derived
+`custom_id` (`"input_emoji"`). The custom_id is the identity, since that is how
+`Modal.inputs` and the `values` mapping your callback receives are both keyed;
+the label is an alias on top of it. A field left out keeps whatever value it
+holds, so a test supplies only the fields it cares about.
+
+A key naming no input raises `ValueError` listing the ones that exist.
+
+A raw escape-hatch input carries whatever custom_id its author chose, so one can
+equal another input's label. The custom_id wins: it is that input's identity and
+often its only name, while the input whose label lost the alias still resolves by
+its own custom_id. An alias comes from a `ui.Label`'s text or a CascadeUI
+wrapper's own label, never from a raw component's deprecated `label` property.
+
+A `RuntimeError` means the component has no storage behind its value property,
+so discord.py moved the attribute; or the submit pipeline never ran, leaving no
+verdict to return. The verdict is what `on_submit` records as it runs, so an
+override must `await super().on_submit(interaction)`; one that does not is
+refused rather than reported as a rejection. Either is raised
+rather than submitted, since the submission would otherwise run against
+defaults and report success.
+
+Returns `True` when the submission was accepted and the callback ran, `False`
+when a validator rejected it. A rejection is not an error: it is usually the
+case under test.
+
+```python
+modal = screen.build_rename_modal()
+
+assert await modal.submit(interaction, {"Name": "ab"}) is False   # too short
+assert await modal.submit(interaction, {"Name": "Ada"}) is True
+```
+
+This assigns the values and then calls `on_submit` itself, so there is no
+second implementation to drift from the first: the validators, the
+`values_by_input` write-back, the `MODAL_SUBMITTED` dispatch, and the ack
+backstop all run exactly as they do for a real submission. Reaching past it to
+call the stored callback directly skips all of them, and the validator pass is
+the one that matters -- a test written that way succeeds against input the
+modal would have rejected.
+
+It starts at `on_submit`, so a subclass overriding `interaction_check` does not
+see it: that gate runs in discord.py's dispatch, above the pipeline this drives.
+Test an access gate by calling it directly.
 
 ---
 
@@ -493,7 +611,7 @@ key_value({"Status": "Online", "Users": "42"})
 
 ### `action_section(text, *, label, callback, emoji=None, style=secondary, custom_id=None, disabled=False)`
 
-Creates a `Section` with text and a `StatefulButton` accessory. Pass `disabled=True` to render the button greyed out and non-interactive. Pass `custom_id=` inside a `PersistentLayoutView`, where auto-generated ids do not survive a restart.
+Creates a `Section` with text and a `StatefulButton` accessory. The callback takes the interaction alone; a callback that demands a second argument raises `TypeError` at construction. Pass `disabled=True` to render the button greyed out and non-interactive. Pass `custom_id=` inside a `PersistentLayoutView`, where auto-generated ids do not survive a restart.
 
 ```python
 action_section(
@@ -507,6 +625,8 @@ action_section(
 ### `toggle_section(text, *, active, callback, labels=("Enabled", "Disabled"), emoji=None, custom_id=None, disabled=False)`
 
 Creates a `Section` with a green/red toggle button. `labels` sets the (active, inactive) button text -- pass `("On", "Off")` to relabel. `emoji` adds a button emoji. Pass `disabled=True` to render the button greyed out and non-interactive. Pass `custom_id=` inside a `PersistentLayoutView`, where auto-generated ids do not survive a restart.
+
+The callback takes `(interaction)` or `(interaction, active)`; the two-parameter form receives the state the click asks for (the flip of the rendered `active`), matching `toggle_button` and `cycle_button`. A callback that can accept neither shape raises `TypeError` at construction.
 
 ```python
 toggle_section(
@@ -534,7 +654,7 @@ A `Separator` without a visible line. `SeparatorSpacing.small` (default) or `Sep
 
 ### `image_section(text, *more_text, url, description=None, spoiler=False)`
 
-A `Section` with a `Thumbnail` image accessory. `description` sets the thumbnail's alt text (up to 256 chars); `spoiler=True` hides the thumbnail behind a spoiler. `url` accepts a [`MediaInput`](#mediainput): a URL string, a `discord.File`, or any object with a string `.url` such as `member.display_avatar`.
+A `Section` with a `Thumbnail` image accessory. `description` sets the thumbnail's alt text (up to 1024 chars); `spoiler=True` hides the thumbnail behind a spoiler. `url` accepts a [`MediaInput`](#mediainput): a URL string, a `discord.File`, or any object with a string `.url` such as `member.display_avatar`.
 
 ```python
 image_section("User avatar", url="https://example.com/avatar.png")
@@ -554,7 +674,7 @@ link_section(
 
 ### `confirm_section(text, *, on_confirm, on_cancel, confirm_label="Confirm", cancel_label="Cancel", confirm_emoji="✅", cancel_emoji="❌", confirm_style=ButtonStyle.success, cancel_style=ButtonStyle.danger, custom_id=None)`
 
-A confirm/cancel prompt. Returns a `[TextDisplay, ActionRow]` list rather than a single component: the prompt text plus the paired button row. Splat it into `card(...)` or add it directly to a view. Pass `custom_id=` inside a `PersistentLayoutView`, where auto-generated ids do not survive a restart.
+A confirm/cancel prompt. Returns a `[TextDisplay, ActionRow]` list rather than a single component: the prompt text plus the paired button row. Splat it into `card(...)` or add it directly to a view. Both callbacks take the interaction alone; one that demands a second argument raises `TypeError` at construction. Pass `custom_id=` inside a `PersistentLayoutView`, where auto-generated ids do not survive a restart.
 
 The style defaults suit a constructive prompt. A destructive one wants them swapped (`confirm_style=ButtonStyle.danger, cancel_style=ButtonStyle.secondary`), or the button that deletes renders green beside a red one that does nothing.
 
@@ -607,7 +727,7 @@ for row in rows:
 
 ### `choice_row(options, *, on_select, selected=None, multi=False, disabled=False, allow_reselect=False, button_threshold=5, active_style=primary, inactive_style=secondary, placeholder=None, custom_id="choice")`
 
-A single-select (or multi-select) "choose one/any" control. Renders a segmented button `ActionRow` at or below `button_threshold` options (active = highlighted, and disabled in single-select), or a `StatefulSelect` dropdown for 6-25 options. Raises `ValueError` past 25. `on_select` receives the picked value (single) or the list of selected values (multi); the builder handles the string round-trip Discord forces on select option values, so the callback always gets the real Python value. `disabled=True` greys out the whole control (every button, or the dropdown) for a read-only or locked state. `allow_reselect=True` keeps the active single-select option clickable so a re-pick fires `on_select` again (default `False` makes a re-pick a no-op in both button and dropdown forms); it is ignored in multi-select, where active options already toggle.
+A single-select (or multi-select) "choose one/any" control. Renders a segmented button `ActionRow` at or below `button_threshold` options (active = highlighted, and disabled in single-select), or a `StatefulSelect` dropdown for 6-25 options. Raises `ValueError` past 25. `on_select` takes `(interaction, value)` and receives the picked value (single) or the list of selected values (multi); a callback that cannot accept both raises `TypeError` at construction. The builder handles the string round-trip Discord forces on select option values, so the callback always gets the real Python value. `disabled=True` greys out the whole control (every button, or the dropdown) for a read-only or locked state. `allow_reselect=True` keeps the active single-select option clickable so a re-pick fires `on_select` again (default `False` makes a re-pick a no-op in both button and dropdown forms); it is ignored in multi-select, where active options already toggle.
 
 ```python
 choice_row(
@@ -631,7 +751,7 @@ Choice(label="Goals", value=Event.GOAL, emoji="⚽", description="Match goals")
 
 ### `toggle_button(*, active, on_toggle, labels=("Enabled", "Disabled"), emoji=None, custom_id=None)`
 
-A standalone boolean toggle button -- the `ActionRow` form of `toggle_section` (no accompanying text). Renders green when `active`, relabels between the two `labels` on each click, and calls `on_toggle` with the new state. Pass `custom_id=` inside a `PersistentLayoutView`, where auto-generated ids do not survive a restart.
+A standalone boolean toggle button -- the `ActionRow` form of `toggle_section` (no accompanying text). Renders green when `active`, relabels between the two `labels` on each click, and calls `on_toggle` with the new state. `on_toggle` takes `(interaction, active)`; a callback that cannot accept both raises `TypeError` at construction. Pass `custom_id=` inside a `PersistentLayoutView`, where auto-generated ids do not survive a restart.
 
 ```python
 ActionRow(toggle_button(active=self.notify, on_toggle=self._set_notify))
@@ -639,7 +759,7 @@ ActionRow(toggle_button(active=self.notify, on_toggle=self._set_notify))
 
 ### `button_row(buttons, *, style=secondary, emoji=None, custom_id=None)`
 
-An `ActionRow` built from a `{label: callback}` mapping: one `StatefulButton` per entry, sharing `style` and `emoji`. Raises `ValueError` on an empty mapping or more than Discord's five buttons per row. `custom_id` is a base suffixed per button (`{custom_id}_0`, `{custom_id}_1`, ...); pass it inside a `PersistentLayoutView`, where auto-generated ids do not survive a restart.
+An `ActionRow` built from a `{label: callback}` mapping: one `StatefulButton` per entry, sharing `style` and `emoji`. Each callback takes the interaction alone; one that demands a second argument raises `TypeError` at construction. Raises `ValueError` on an empty mapping or more than Discord's five buttons per row. `custom_id` is a base suffixed per button (`{custom_id}_0`, `{custom_id}_1`, ...); pass it inside a `PersistentLayoutView`, where auto-generated ids do not survive a restart.
 
 ```python
 button_row({"Save": self._save, "Reset": self._reset}, style=discord.ButtonStyle.primary)
@@ -647,7 +767,7 @@ button_row({"Save": self._save, "Reset": self._reset}, style=discord.ButtonStyle
 
 ### `cycle_button(*, values, on_change, labels=None, style=secondary, emoji=None, start=0, custom_id=None)`
 
-A button that cycles through a fixed list of `values` on each click, advancing (and wrapping) the index before calling `on_change` with the new value. Use it when a setting has three or more options but a full select is overkill -- a single "Preset" button cycling `["Low", "Medium", "High"]` instead of three toggles. `labels` defaults to `str(value)` per entry; `start` is the initial index. Pass `custom_id=` inside a `PersistentLayoutView`, where auto-generated ids do not survive a restart.
+A button that cycles through a fixed list of `values` on each click, advancing (and wrapping) the index before calling `on_change` with the new value. Use it when a setting has three or more options but a full select is overkill -- a single "Preset" button cycling `["Low", "Medium", "High"]` instead of three toggles. `on_change` takes `(interaction, value)`; a callback that cannot accept both raises `TypeError` at construction. `labels` defaults to `str(value)` per entry; `start` is the initial index. Pass `custom_id=` inside a `PersistentLayoutView`, where auto-generated ids do not survive a restart.
 
 ```python
 cycle_button(
@@ -658,7 +778,7 @@ cycle_button(
 
 ### `tab_nav(tabs, *, active=None, active_style=primary, inactive_style=secondary, custom_id=None)`
 
-An `ActionRow` of tab buttons for inner-view navigation -- a lighter alternative to `TabLayoutView`. `tabs` maps each label to a callback; the `active` tab renders in `active_style`, the rest in `inactive_style`. Pass `custom_id=` inside a `PersistentLayoutView`, where auto-generated ids do not survive a restart.
+An `ActionRow` of tab buttons for inner-view navigation -- a lighter alternative to `TabLayoutView`. `tabs` maps each label to a callback; each callback takes the interaction alone, and one that demands a second argument raises `TypeError` at construction. The `active` tab renders in `active_style`, the rest in `inactive_style`. Pass `custom_id=` inside a `PersistentLayoutView`, where auto-generated ids do not survive a restart.
 
 ```python
 tab_nav(
@@ -703,8 +823,16 @@ Preset-style buttons. All but `LinkButton` extend `StatefulButton`:
 - `DangerButton` -- `ButtonStyle.danger`
 - `LinkButton` -- `ButtonStyle.link`. Wraps `discord.ui.Button` directly,
   since Discord opens the URL client-side and no interaction is ever
-  dispatched. It takes no `callback` and no `owner_only`
-- `ToggleButton` -- Toggles between two states on click
+  dispatched. It takes no `callback` and no `owner_only`. An empty or
+  whitespace `url` raises `ValueError` and a non-string one raises
+  `TypeError` at construction: Discord would otherwise refuse the whole
+  message with a form error naming no component. `link_section` is held
+  to the same rule
+- `ToggleButton` -- Toggles between two states on click. The callback takes
+  `(interaction)` or `(interaction, toggled)`; the two-parameter form
+  receives the post-flip state, matching `toggle_button` and
+  `toggle_section`. A callback that can accept neither shape raises
+  `TypeError` at construction
 
 ---
 
@@ -736,7 +864,7 @@ def build_ui(self):
     self.add_item(card("## Tasks", *rows, *self.pager.controls(self)))
 ```
 
-`controls(view)` returns `[]` on a single page and one nav `ActionRow` otherwise. A click updates the index and re-runs whichever render path the host provides: its `build_ui()`, a `TabLayoutView`'s tab refresh, or `reload()`. The new slice renders before the refresh. First/last jump buttons and a go-to-page modal appear once the page count reaches `jump_threshold`. Customization mirrors `PaginatedLayoutView`: subclass and override the `{first,prev,indicator,next,last}_button_{label,emoji,style}` class attributes or `jump_threshold`.
+`controls(view)` returns `[]` on a single page and one nav `ActionRow` otherwise. A click updates the index and re-runs whichever render path the host provides: its `build_ui()`, a `TabLayoutView`'s tab refresh, or `reload()`. The new slice renders before the refresh. First/last jump buttons and a go-to-page modal appear once the page count reaches `jump_threshold`. Customization mirrors `PaginatedLayoutView`: subclass and override the `{first,prev,indicator,next,last}_button_{label,emoji,style}` class attributes, `indicator_button_format`, or `jump_threshold`.
 
 #### `control_buttons(view, *, compact=False) -> list`
 
@@ -769,7 +897,7 @@ Jumps to a zero-based page index, fires `on_page_changed`, and re-renders the ho
 
 ### `Collapsible(*, label, reveal, summary=None, expanded_label=None, style=secondary, expanded_style=secondary, emoji=None, expanded_emoji=None, expanded=False, trigger_first=True, key="collapsible")`
 
-A trigger button that toggles an inline region of revealed content (the disclosure/expander pattern). Holds its own collapsed/expanded state. `reveal` is a zero-argument synchronous callable returning the revealed component(s); the host loads any async data in `on_load()` and `reveal` reads it synchronously. `expanded_label` and `expanded_emoji` default to `label` and `emoji` -- the trigger keeps its collapsed text and icon while expanded unless you set them.
+A trigger button that toggles an inline region of revealed content (the disclosure/expander pattern). Holds its own collapsed/expanded state. `reveal` is a zero-argument synchronous callable returning the revealed component(s); the host loads any async data in `on_load()` and `reveal` reads it synchronously. A `reveal` (or `summary`) that is async or requires arguments raises `TypeError` at construction, since both run bare on every render. `expanded_label` and `expanded_emoji` default to `label` and `emoji` -- the trigger keeps its collapsed text and icon while expanded unless you set them.
 
 ```python
 self.picker = Collapsible(
@@ -823,6 +951,8 @@ ConfirmationButtons(on_confirm=async_fn, on_cancel=async_fn)
 buttons.add_to_view(view)
 ```
 
+Both callbacks take the interaction alone; one that demands a second argument raises `TypeError` at construction.
+
 ### `PaginationControls`
 
 ```python
@@ -830,12 +960,16 @@ PaginationControls(page_count=int, on_page_change=async_fn)
 controls.add_to_view(view)
 ```
 
+`on_page_change` takes `(interaction, page)` and receives the new zero-based page; a callback that cannot accept both raises `TypeError` at construction.
+
 ### `ToggleGroup`
 
 ```python
 ToggleGroup(options=["A", "B", "C"], on_select=async_fn, default="B")
 group.add_to_view(view)
 ```
+
+`on_select` takes `(interaction, value)` and receives the selected option; a callback that cannot accept both raises `TypeError` at construction.
 
 ### `ProgressBar`
 

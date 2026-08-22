@@ -10,17 +10,28 @@ import sys
 def main():
     import importlib.metadata
 
+    import cascadeui
+
+    # The imported code, not the installed distribution's metadata. An
+    # editable install keeps serving whatever version it recorded at
+    # install time, so metadata can trail the working tree by releases --
+    # and this block is a required field on the bug report template,
+    # where a stale number arrives stated as fact.
+    cascadeui_version = cascadeui.__version__
     try:
-        cascadeui_version = importlib.metadata.version("pycascadeui")
+        installed = importlib.metadata.version("pycascadeui")
     except importlib.metadata.PackageNotFoundError:
-        cascadeui_version = "unknown (not installed via pip)"
+        installed = None
 
     try:
         discord_version = importlib.metadata.version("discord.py")
     except importlib.metadata.PackageNotFoundError:
         discord_version = "not installed"
 
-    # Optional backends
+    # The drivers behind the two optional backends the library ships. A
+    # driver named here that no backend uses reads as a backend that
+    # exists, and one left out hides the only backend with a network
+    # surface from every report a Postgres user files.
     backends = []
     try:
         import aiosqlite
@@ -29,13 +40,16 @@ def main():
     except ImportError:
         pass
     try:
-        import redis
+        import asyncpg
 
-        backends.append(f"redis {redis.__version__}")
+        backends.append(f"asyncpg {asyncpg.__version__}")
     except ImportError:
         pass
 
-    print(f"- CascadeUI v{cascadeui_version}")
+    if installed is not None and installed != cascadeui_version:
+        print(f"- CascadeUI v{cascadeui_version} (installed distribution reports {installed})")
+    else:
+        print(f"- CascadeUI v{cascadeui_version}")
     print(f"- discord.py v{discord_version}")
     print(f"- Python {sys.version}")
     print(f"- OS: {platform.system()} {platform.release()} ({platform.machine()})")

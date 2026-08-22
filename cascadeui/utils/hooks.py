@@ -66,6 +66,77 @@ def is_async_callable(fn: Any) -> bool:
     )
 
 
+def accepts_second_positional(fn: Any) -> bool:
+    """Report whether a control should hand its value to ``fn`` as a second argument.
+
+    Two questions, and both have to answer yes. The callable has to DECLARE
+    a second positional parameter, which is how a caller opts in to
+    receiving the value, and it has to be callable WITH two arguments,
+    which is whether that opt-in can be honored.
+
+    The two can disagree, and the disagreement is not exotic: a
+    ``functools.wraps`` adapter advertises the signature of the function it
+    wraps, so one that narrows two parameters down to one declares a second
+    and cannot take it. Electing the two-argument call on the declaration
+    alone fails on the first click, from inside the library, naming the
+    wrapped function rather than the wrapper that could not take the
+    argument.
+
+    Keyword-only and variadic parameters do not count toward the
+    declaration, since neither is a second positional parameter a caller
+    can name. A signature that cannot be read reports False, so an
+    unintrospectable callable keeps the one-argument contract rather than
+    being handed an argument it may not accept.
+    """
+    if fn is None:
+        return False
+    try:
+        sig = inspect.signature(fn)
+    except (ValueError, TypeError):
+        return False
+    positional = [
+        p for p in sig.parameters.values() if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+    ]
+    if len(positional) < 2:
+        return False
+    # The declaration above is the advertisement; this is whether the
+    # callable that actually runs can honor it.
+    return can_accept_positional(fn, 2) is not False
+
+
+def can_accept_positional(fn: Any, count: int) -> Optional[bool]:
+    """Report whether ``fn`` can be called with ``count`` positional arguments.
+
+    ``None`` means the signature could not be read, and every caller
+    treats that as permission: refusing what cannot be inspected would
+    reject builtins and some mock objects, which is a worse trade than
+    letting a genuinely wrong signature fail at its call site.
+
+    Binding the argument list is the real question, where a parameter
+    count is only a proxy for it. Binding refuses a callable whose extra
+    parameter is required and accepts one whose extra parameter has a
+    default, it accounts for ``*args``, and it counts the bound ``self``
+    of a method correctly while catching the unbound function pulled off a
+    class body, which is the same mistake wearing a different arity.
+
+    ``follow_wrapped`` is off because the callable that runs is the one
+    that must accept the arguments. A ``functools.wraps`` adapter
+    advertises the signature of the function it wraps, and a refusal that
+    trusts the advertisement checks something other than what is called.
+    """
+    if fn is None:
+        return None
+    try:
+        sig = inspect.signature(fn, follow_wrapped=False)
+    except (ValueError, TypeError):
+        return None
+    try:
+        sig.bind(*([None] * count))
+    except TypeError:
+        return False
+    return True
+
+
 async def call_hook_safe(
     hook, *args, owner: str = "", log: Optional[logging.Logger] = None
 ) -> None:

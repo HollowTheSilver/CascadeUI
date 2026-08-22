@@ -23,6 +23,262 @@ preserved below for historical reference but are not the supported baseline.
 
 ---
 
+## [3.12.0] - 2026-08-21
+
+### Breaking
+
+- `SQLiteBackend` and `PostgresBackend` reject a `table_prefix` that is not
+  lower-case letters, digits, and underscores, starting with a letter or
+  underscore, with `ValueError` at construction; a non-`str` prefix raises
+  `TypeError`. The prefix reaches SQL through two paths that do not agree
+  on quoting: the DDL and the migrator interpolate it as raw text, while a
+  backend's row and key-value paths quote what they build. PostgreSQL
+  folds an unquoted identifier to lower case and preserves a quoted one,
+  so a prefix carrying a capital created one table and addressed another,
+  splitting a deployment across two that both looked right on their own.
+  **SQLite matches identifiers case-insensitively, so a prefix like
+  `Bot_` worked there in 3.11.0 and now refuses to construct.** Lower-case
+  the prefix to upgrade: SQLite resolves the new spelling to the existing
+  table, so the data is found in place and nothing needs migrating.
+
+### Added
+
+- `MAX_MESSAGE_COMPONENTS`, `count_components(item)`, and
+  `StatefulLayoutView.total_components` expose the per-message component
+  budget the library already enforced. `add_item` raises when a tree would
+  cross the cap, but the number and the recursive counter behind it were
+  both private, so a consumer wanting to check a budget before composing
+  had to transcribe the literal and rewrite the walk -- and a hand-rolled
+  walk that counts the view itself disagrees with Discord's own count by
+  one. A caller's check and the library's enforcement now read the same
+  two numbers.
+- `count_characters(item)` measures a subtree's display text the way
+  `count_components(item)` measures its nodes, so both budgets are read
+  from the same place while composing. Without it a caller holding items
+  had to add them to a throwaway view to reach `content_length()`, which
+  borrows that view's component limit: a subtree over the component
+  budget failed a character measurement with an error about components.
+- `MAX_MESSAGE_CHARACTERS` names the other budget a V2 message has, and a
+  view over it now warns at every seam that ships a tree. The per-node
+  4000-character cap on one `TextDisplay` was pre-flighted and the message
+  total was not, so ten short text nodes passed every check and were
+  refused at send with no component named -- on a persistent panel, hours
+  later, in a channel nobody is watching. It warns rather than raises:
+  Discord documents the cap while discord.py counts it without enforcing
+  it, so a hard refusal could reject a message Discord would have taken.
+  `LayoutView.content_length()` supplies the running total for a budget
+  check while composing, and reaches `TextDisplay` content only: text in
+  a button label or a select placeholder counts zero against it, so a
+  control-heavy screen can approach the cap without the warning firing.
+- `Modal.submit(interaction, values)` drives a submission offline through
+  the pipeline a real one takes, returning whether the validators accepted
+  it. A modal was the one interactive surface with no offline drive, so a
+  test reached past it to the stored callback, which runs neither the
+  validators, nor the write-back onto the input wrappers, nor the
+  `MODAL_SUBMITTED` dispatch. Such a test succeeds against input the modal
+  would have rejected, reporting coverage of a seam it never crossed.
+  Values key by an input's label or its derived `custom_id`, resolved
+  against the same map the modal itself uses, so a raw escape-hatch input
+  is reachable too. A custom_id is an input's identity and always wins a
+  contested name; a key naming no input raises. It assigns the values and
+  calls `on_submit` itself, so there is no second implementation to
+  drift. The verdict is what `on_submit` records as it runs, so an
+  override must call up to it; one that does not is told so rather than
+  having its submissions reported as rejected.
+- `cascadeui.testing.stub_interaction()` returns the double
+  `Modal.submit` asks for, recording what is said instead of sending it.
+  A rejection is then assertable without a connection, including the part
+  measurement cannot reach: whether the response slot or the followup
+  carried the message depends on whether the ack backstop had already
+  fired, so both record into one place.
+- `cascadeui.testing.stub_client()` returns a `discord.Client` that never
+  connects, for measuring a view with no Discord connection. It matters
+  where composition depends on a client: a section-mode leaderboard row
+  resolves an avatar into a four-node `image_section` with one bound and
+  renders a one-node `TextDisplay` without, so a five-row page differs by
+  fifteen components between the tree a test builds and the tree that
+  ships. The stub reports the empty user cache a live bot reports for an
+  unseen member, so the composed tree matches.
+- Component callbacks are checked against the arguments the control will
+  call them with, at construction rather than on the first click. A button
+  callback declaring `(interaction, value)` was invoked with one argument
+  and raised from inside the library wrapper, surfacing to the operator as
+  "This interaction failed" with a traceback pointing at library code
+  rather than at the wiring. The refusal names the callback's own
+  signature and the shape the control wants. The mirror is closed too:
+  `choice_row`, `cycle_button`, `toggle_button`, `ToggleGroup`,
+  `PaginationControls`, and `Modal` report a value to their callback every
+  time, so one that cannot receive it is refused where it is supplied.
+  `PaginatedView.from_cursor` refuses a `fetch_fn` that cannot take
+  `(offset, limit)` and a `formatter` that cannot take `(chunk)`. Cursor
+  mode stores both and first calls them from inside the page loader, one
+  line apart, so either arity error surfaced there rather than at the
+  constructor that accepted it.
+  `Collapsible` refuses a `reveal` or `summary` that requires an argument:
+  a wrong-arity `reveal` constructed and rendered cleanly, then failed on
+  the first expand click with the state already flipped and the screen
+  still showing the collapsed body. A wizard step's `condition` is refused
+  in both declaration forms, the raw dict and `WizardStep`, because it is
+  the one step callable whose arity error is never seen: the visibility
+  check calls it inside a guard that treats a raising predicate as
+  visible, so a predicate that could not be called rendered the step it
+  meant to hide and logged a warning as the only trace. The other step
+  callables are left as they are, since each already fails at its own
+  call with the callable named.
+- `toggle_section` and `ToggleButton` pass the new toggle state to a
+  callback that declares a second parameter, matching `toggle_button` and
+  `cycle_button`. A one-parameter callback is called exactly as before.
+  The library's own toggle-shaped controls delivered their value and these
+  two did not, which is the inconsistency behind the wrong-arity callbacks
+  the entry above refuses.
+- Empty and whitespace-only media references are rejected where they are
+  written. `image_section`, `gallery`, and `file_attachment` raise at
+  construction naming the builder and the parameter, and the pre-flight
+  validator rejects an empty media URL on a raw `Thumbnail`,
+  `MediaGalleryItem`, or `File`, including one mutated to empty after
+  construction. An empty reference previously shipped and failed the whole
+  message with a 400 that named no component: the same mistake an empty
+  text node has raised for since 3.8.0, one field over.
+  `LeaderboardLayoutView` keeps its degrade paths, so a blank `banner=`
+  still renders no banner and a whitespace `get_avatar_url` return still
+  takes the stacked-text fallback.
+- The pre-flight validator enforces two more documented Discord caps:
+  `Thumbnail` and `MediaGalleryItem` `description` at 1024 characters, and
+  link-button `url` at 512. The docs claimed 256 for the alt text and now
+  name the real limit. An empty link-button `url` is rejected on the same
+  reasoning as an empty media reference: a URL is machine-consumed, so a
+  blank one cannot resolve and ships to be refused as a form error naming
+  no component.
+- `send()` warns when a send names an `attachment://` reference it carries
+  no matching file for, across a V2 component tree and a V1 embed's image,
+  thumbnail, author, and footer alike. Discord resolves the two
+  by name and renders an unresolved placeholder when it cannot, raising
+  nothing, so the initial send is the only seam where both halves are in
+  scope.
+- `indicator_button_format` on `PaginatedView`, `PaginatedLayoutView`, and
+  `PaginatedRegion` templates the middle navigation button instead of
+  replacing it. `indicator_button_label` freezes one literal across every
+  page, which is worse than the default for a board that wants `1/12`
+  rather than `Page 1/12` on a narrow row. Placeholders are `{page}` and
+  `{total}`, one-based; the literal still wins when both are set, and a
+  template that cannot render is refused at class definition rather than
+  raising from inside a click. The roles panel's five `*_message`
+  templates are checked the same way: a typo'd placeholder there raised a
+  bare `KeyError` on the click that used it, naming neither the attribute
+  nor the placeholders it accepts. `with_cooldown(message=)` joins them,
+  and is the one that hid best: its template renders only when a click is
+  refused inside the cooldown window, so a typo survived construction and
+  the first click before raising. It is rendered once where it is
+  supplied, with the value the refusal really passes -- already rounded to
+  one decimal, so a spec like `{remaining:.0f}` is refused there too
+  rather than failing on a str at click time.
+
+### Changed
+
+- A toggle callback whose second parameter has a default now receives the
+  toggle state where it previously received that default. `toggle_section`
+  and `ToggleButton` decide by whether a second positional parameter is
+  declared, and a defaulted one is declared, so a callback written
+  `(interaction, extra=None)` starts seeing the state in `extra`. Selects
+  have read a defaulted second parameter the same way in every release, so
+  nothing changes for them. Callbacks taking exactly one parameter are
+  called as before.
+
+### Fixed
+
+- Several wire-visible fields did not reach the render digest, so `refresh()`
+  reported `SKIPPED` over a tree that differed from the one on screen and
+  shipped no edit. An entity select's `default_values` (the equivalent of
+  the `opt.default` fixed for string selects in 3.3.4), a `Separator`
+  appearing, disappearing, or changing spacing or visibility, a select
+  option's label, description, or emoji, `min_values` and `max_values`,
+  `channel_types`, and a premium button's `sku_id`. The relabel case is
+  the everyday one: a count badge moving from `Inbox` to `Inbox (3)` keeps
+  the option's value and so hashed identically. `SKIPPED` states that the
+  screen already shows this state, which is what made each of these a
+  wrong answer rather than a missed optimization. A test now derives the
+  expected field set from `to_component_dict` itself, so a field discord.py
+  adds later fails there instead of silently skipping a render.
+- `LinkButton` accepted an empty `url`. The pre-flight validator refuses
+  one in a V2 tree, and a V1 view reaches no pre-flight, so the same
+  button shipped to a form error naming no component depending only on
+  which view held it. It is refused at construction now, which covers
+  both.
+- A select inside a modal never delivered its value. `Modal.on_submit`
+  collects submitted values by walking its children and matching types,
+  and the select family was absent from that list, so a user's choice was
+  dropped before the callback, before `values_by_input`, and before the
+  `MODAL_SUBMITTED` dispatch. Reading it raised `KeyError`, or read `None`
+  from a `.get()`, on every submission. Reachable through the documented
+  raw-item escape hatch, which is the only way to put one in a modal.
+- `Modal` discarded every keyword it did not recognize. `on_submit=` is
+  the name discord.py subclasses override and the natural guess for
+  `callback=`, and passing it left the handler unset: the modal
+  acknowledged each submission, ran nothing, logged nothing, and saved no
+  input. A mistyped `view_id` dropped the `MODAL_SUBMITTED` dispatch the
+  same way, and `custom_id` (a real `discord.ui.Modal` parameter) was
+  replaced by a generated one. The signature is closed now, so an
+  unrecognized keyword raises naming it, and `custom_id` reaches
+  discord.py.
+- Pruning a stored registration left the key in the store's own registry
+  mirror. `prune_registry` deletes the row on disk and reports the prune,
+  but `state["persistent_views"]` kept the entry, so re-registering that
+  key afterwards found a stale record, matched no live view, and took the
+  orphan-cleanup branch against the message the prune existed to leave
+  standing. The prune now drops the keys it deleted, and still reaches
+  every subscriber and hook, since reducers run ahead of both notification
+  passes. `APPLICATION_SLOTS_PRUNED` stays reducer-less on purpose: the
+  slot it removes is still live in memory and re-upserts on the next
+  write.
+- A correct prune logged a warning. The store's missing-reducer check read
+  "something subscribes to this" as the signal for a mistyped action, and
+  subscriber filters default to an empty set, so `REGISTRY_PRUNED` and
+  `APPLICATION_SLOTS_PRUNED` warned on every prune: once per row dropped
+  at boot, and once per daily TTL sweep with no consumer involved at all.
+  Actions the library declares dispatch-only now log at debug, and an
+  unknown type with no reducer and no listener still warns.
+- On PostgreSQL the 3.11.0 table rename left each renamed table's
+  primary-key constraint and its backing index under the legacy name, so
+  an upgraded database and a fresh install diverged in the catalog
+  permanently and only an operator reading `pg_indexes` would see it.
+  Boot renames the constraint to match its table, reaching databases
+  already upgraded under 3.11.0 as well as those still on 3.10.0. A name
+  already taken by another relation warns and boots. SQLite is unaffected,
+  since its autoindex follows the table through a rename.
+- A leaderboard that outgrew the component budget reported it in the
+  vocabulary of a hand-composed view, suggesting folded text nodes and a
+  compacted pager. A board's size is set by how many entries a page
+  carries, and in section mode by whether a client is bound: the same
+  class fits with none and overflows with one, because each row grows from
+  one component to four. The message now names `leaderboard_per_page`,
+  and what the page it just built actually cost per row -- counted rather
+  than inferred from the client, since a
+  `get_avatar_url` override returning nothing degrades every row to a
+  stacked text node with a client still bound.
+- `python -m cascadeui` reported the installed distribution's version
+  rather than the version being imported. An editable install serves the
+  number it recorded at install time, so a checkout several releases ahead
+  still printed the old one, and the bug report form requires this block:
+  the wrong version arrived in the issue stated as fact, with nothing to
+  contradict it. It now reports the running version, and names the
+  installed one only when the two disagree, since that disagreement is
+  worth seeing. The backend probe also listed a driver for a backend the
+  library does not ship while omitting `asyncpg`, so no report a
+  `PostgresBackend` user filed named the one backend with a network
+  surface.
+- The persistence reference credited `SQLiteBackend` and `PostgresBackend`
+  with every capability flag, which stopped being true when `OPEN_ROWS`
+  was added in 3.10.0. Both store rows as fixed columns and declare five
+  of the six; a backend author reading the page could conclude an unknown
+  column would round-trip and skip the migrator that makes it.
+- The documented offline-testing recipe could not measure a section-mode
+  leaderboard's real budget. It builds the view with no client, which is
+  the branch that renders one component per row, so a board reported 25
+  components against a cap of 40 and shipped 40. The recipe binds a client
+  now and reads `total_components`.
+
+---
+
 ## [3.11.0] - 2026-08-13
 
 ### Breaking

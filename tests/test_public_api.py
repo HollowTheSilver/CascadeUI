@@ -157,6 +157,20 @@ _INTERNAL_NAMES = frozenset(
         "call_hook_safe",
         "await_maybe",
         "is_async_callable",
+        "can_accept_positional",
+        "accepts_second_positional",
+        "require_url",
+        "require_value_callback",
+        "refuse_wrong_arity",
+        # Offline test doubles. Public at cascadeui.testing, and kept off the
+        # root so a client that never connects cannot be reached by a
+        # production import that meant to reach a real one.
+        "StubClient",
+        "StubFollowup",
+        "StubInteraction",
+        "StubResponse",
+        "stub_client",
+        "stub_interaction",
         "normalize_mapping",
         "coerce_colour",
         "elapsed_since",
@@ -298,3 +312,82 @@ class TestInstallHintsNameTheDistribution:
             f"distribution -- a user copying one of these installs the wrong "
             f"package or nothing at all: {offenders}"
         )
+
+
+class TestDiagnosticBlock:
+    """``python -m cascadeui`` is a required field on the bug report form.
+
+    Whatever it prints arrives in an issue stated as fact, so a wrong
+    value here is worse than no value: it sends triage at the wrong
+    version or the wrong backend and nothing anywhere contradicts it.
+    """
+
+    @staticmethod
+    def _run():
+        import io as _io
+        from contextlib import redirect_stdout
+
+        from cascadeui.__main__ import main
+
+        buffer = _io.StringIO()
+        with redirect_stdout(buffer):
+            main()
+        return buffer.getvalue()
+
+    def test_the_version_is_the_imported_code_not_the_installed_metadata(self, monkeypatch):
+        """An editable install serves the version it recorded at install
+        time, which drifts from the working tree on every release."""
+        import importlib.metadata
+
+        import cascadeui
+
+        real = importlib.metadata.version
+
+        def stale(name):
+            return "0.0.1-stale" if name == "pycascadeui" else real(name)
+
+        monkeypatch.setattr(importlib.metadata, "version", stale)
+        output = self._run()
+
+        assert f"CascadeUI v{cascadeui.__version__}" in output
+        # The disagreement is itself diagnostic, so it is reported rather
+        # than hidden -- but never in place of the running version.
+        assert "0.0.1-stale" in output
+        assert not output.startswith("- CascadeUI v0.0.1-stale")
+
+    def test_a_matching_install_reports_the_version_once(self, monkeypatch):
+        import importlib.metadata
+
+        import cascadeui
+
+        real = importlib.metadata.version
+
+        def agreeing(name):
+            return cascadeui.__version__ if name == "pycascadeui" else real(name)
+
+        monkeypatch.setattr(importlib.metadata, "version", agreeing)
+        first = self._run().splitlines()[0]
+
+        assert first == f"- CascadeUI v{cascadeui.__version__}"
+
+    def test_the_drivers_probed_are_the_ones_the_shipped_backends_use(self, monkeypatch):
+        """A driver named here reads as a backend that exists.
+
+        ``PostgresBackend`` is the only backend with a network surface, so
+        omitting its driver hides it from every report a Postgres user
+        files, while naming a driver no backend uses invents one.
+        """
+        import sys
+        import types
+
+        for name in ("aiosqlite", "asyncpg"):
+            if name not in sys.modules:
+                stub = types.ModuleType(name)
+                stub.__version__ = "9.9.9"
+                monkeypatch.setitem(sys.modules, name, stub)
+
+        output = self._run()
+
+        assert "aiosqlite" in output
+        assert "asyncpg" in output
+        assert "redis" not in output

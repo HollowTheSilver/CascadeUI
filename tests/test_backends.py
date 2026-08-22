@@ -29,6 +29,7 @@ from cascadeui.persistence.schema import (
     TABLE_APPLICATION_SLOTS,
     TABLE_PERSISTENT_VIEWS,
     apply_table_prefix,
+    validate_table_prefix,
 )
 from cascadeui.state.singleton import get_store
 
@@ -602,6 +603,58 @@ class TestTablePrefix:
         assert kept == [("consumer row",)], "the consumer's own table was touched"
 
 
+class TestTablePrefixValidation:
+    """``validate_table_prefix`` rejects a prefix that resolves differently
+    across the DDL's unquoted substitution and a backend's quoted identifier
+    path, so a deployment cannot silently split its data across two casings
+    of the same table name."""
+
+    def test_empty_prefix_is_the_default_and_is_accepted(self):
+        validate_table_prefix("", "SQLiteBackend")
+
+    def test_lowercase_prefix_is_accepted(self):
+        validate_table_prefix("staging_", "SQLiteBackend")
+
+    def test_digits_and_underscores_are_accepted(self):
+        validate_table_prefix("_bot_2", "SQLiteBackend")
+
+    def test_uppercase_prefix_is_rejected(self):
+        with pytest.raises(ValueError, match="not a usable identifier prefix"):
+            validate_table_prefix("Bot_", "SQLiteBackend")
+
+    def test_leading_digit_is_rejected(self):
+        with pytest.raises(ValueError, match="not a usable identifier prefix"):
+            validate_table_prefix("2bot_", "SQLiteBackend")
+
+    def test_hyphen_is_rejected(self):
+        with pytest.raises(ValueError, match="not a usable identifier prefix"):
+            validate_table_prefix("bot-", "SQLiteBackend")
+
+    def test_quote_is_rejected(self):
+        with pytest.raises(ValueError, match="not a usable identifier prefix"):
+            validate_table_prefix('bot"_', "SQLiteBackend")
+
+    def test_non_str_raises_typeerror(self):
+        with pytest.raises(TypeError, match="table_prefix must be a str"):
+            validate_table_prefix(5, "SQLiteBackend")
+
+    def test_owner_name_reaches_the_message(self):
+        """The refusal names the constructing backend, not a generic label."""
+        with pytest.raises(ValueError, match="PostgresBackend table_prefix"):
+            validate_table_prefix("Bad!", "PostgresBackend")
+
+    @pytest.mark.skipif(not sqlite_available, reason="aiosqlite not installed")
+    def test_sqlite_backend_construction_rejects_a_bad_prefix(self):
+        with pytest.raises(ValueError, match="not a usable identifier prefix"):
+            SQLiteBackend("unused.db", table_prefix="Bad-Prefix")
+
+    @pytest.mark.skipif(not postgres_available, reason="asyncpg not installed")
+    def test_postgres_backend_construction_rejects_a_bad_prefix(self):
+        """Construction only -- no connection is opened before the raise."""
+        with pytest.raises(ValueError, match="not a usable identifier prefix"):
+            PostgresBackend("postgresql://localhost/db", table_prefix="Bad-Prefix")
+
+
 # // ========================================( Legacy table rename )======================================== // #
 
 
@@ -666,6 +719,25 @@ async def _index_names(backend):
             "SELECT indexname AS name FROM pg_indexes WHERE schemaname = current_schema()"
         )
     return {r["name"] for r in rows}
+
+
+async def _pg_pkey(backend, table):
+    """Primary-key (constraint name, backing index name) for ``table`` on
+    PostgreSQL, or ``(None, None)`` when the table has no primary key.
+    Resolves the backend's ``table_prefix``, so callers pass logical names.
+    """
+    row = await backend.fetch_one(
+        "SELECT c.conname AS conname, cls.relname AS index_name "
+        "FROM pg_constraint c "
+        "JOIN pg_class t ON t.oid = c.conrelid "
+        "JOIN pg_namespace n ON n.oid = t.relnamespace "
+        "JOIN pg_class cls ON cls.oid = c.conindid "
+        "WHERE c.contype = 'p' AND t.relname = $1 AND n.nspname = current_schema()",
+        physical_table(backend, table),
+    )
+    if row is None:
+        return (None, None)
+    return (row["conname"], row["index_name"])
 
 
 async def _rewind_to_legacy(backend):
@@ -965,6 +1037,133 @@ class TestLegacyTableRename:
 
         assert "does not carry the library's columns" not in caplog.text
         assert "went away between the existence check" in caplog.text
+
+    async def test_the_rename_normalizes_the_pkey_constraint_name(self, sql_backend):
+        """``ALTER TABLE ... RENAME TO`` keeps the auto-named primary-key
+        constraint under the legacy name on PostgreSQL, so the reconciliation
+        renames it (and its backing index) to the fresh-install name."""
+        if sql_backend.placeholder_style == "qmark":
+            pytest.skip("SQLite's autoindex follows the table rename")
+        await _rewind_to_legacy(sql_backend)
+        await _manager_for(sql_backend).apply_migrations()
+
+        for table in (TABLE_PERSISTENT_VIEWS, TABLE_APPLICATION_SLOTS):
+            expected = f"{physical_table(sql_backend, table)}_pkey"
+            assert await _pg_pkey(sql_backend, table) == (expected, expected)
+
+        rows = await sql_backend.fetch(
+            "SELECT relname AS name FROM pg_class r "
+            "JOIN pg_namespace n ON n.oid = r.relnamespace "
+            "WHERE n.nspname = current_schema()"
+        )
+        relnames = {r["name"] for r in rows}
+        assert "persistent_views_pkey" not in relnames
+        assert "application_slots_pkey" not in relnames
+
+    async def test_a_database_upgraded_under_the_previous_release_is_normalized(self, sql_backend):
+        """A database whose table rename already committed never re-enters the
+        rename path: its old_exists probe finds nothing. The constraint repair
+        runs outside that path, so it reaches this database too."""
+        if sql_backend.placeholder_style == "qmark":
+            pytest.skip("SQLite's autoindex follows the table rename")
+        # Reproduce what the earlier release left behind: renamed tables,
+        # legacy constraint names, no legacy table anywhere.
+        for table, legacy_pkey in (
+            (TABLE_PERSISTENT_VIEWS, "persistent_views_pkey"),
+            (TABLE_APPLICATION_SLOTS, "application_slots_pkey"),
+        ):
+            phys = physical_table(sql_backend, table)
+            await sql_backend.execute(
+                f"ALTER TABLE {phys} RENAME CONSTRAINT {phys}_pkey TO {legacy_pkey}"
+            )
+
+        await _manager_for(sql_backend).apply_migrations()
+
+        for table in (TABLE_PERSISTENT_VIEWS, TABLE_APPLICATION_SLOTS):
+            expected = f"{physical_table(sql_backend, table)}_pkey"
+            assert await _pg_pkey(sql_backend, table) == (expected, expected)
+
+    async def test_pkey_normalization_survives_a_uniquified_legacy_name(self, sql_backend):
+        """A decoy squatting ``persistent_views_pkey`` makes PostgreSQL
+        auto-name the legacy table's constraint ``persistent_views_pkey1``.
+        Discovery keys on the table's own relation, so the uniquified name
+        normalizes; a hardcoded legacy name would miss this table forever."""
+        if sql_backend.placeholder_style == "qmark":
+            pytest.skip("SQLite's autoindex follows the table rename")
+        await sql_backend.execute("CREATE TABLE decoy (x BIGINT)")
+        await sql_backend.execute("CREATE INDEX persistent_views_pkey ON decoy(x)")
+        await _rewind_to_legacy(sql_backend)
+        # Setup guard: the legacy table's pkey was born under the uniquified
+        # name, so the final assertion tests the repair, not the setup.
+        born, _ = await _pg_pkey(sql_backend, "persistent_views")
+        assert born == "persistent_views_pkey1"
+
+        await _manager_for(sql_backend).apply_migrations()
+
+        expected = f"{physical_table(sql_backend, TABLE_PERSISTENT_VIEWS)}_pkey"
+        assert await _pg_pkey(sql_backend, TABLE_PERSISTENT_VIEWS) == (expected, expected)
+        # The squatter was never the library's and stays untouched.
+        assert "persistent_views_pkey" in await _index_names(sql_backend)
+
+    async def test_pkey_normalization_is_idempotent_across_boots(self, sql_backend, caplog):
+        if sql_backend.placeholder_style == "qmark":
+            pytest.skip("SQLite's autoindex follows the table rename")
+        await _rewind_to_legacy(sql_backend)
+        await _manager_for(sql_backend).apply_migrations()
+
+        with caplog.at_level(logging.INFO, logger="cascadeui.persistence.manager"):
+            await _manager_for(sql_backend).apply_migrations()
+
+        for table in (TABLE_PERSISTENT_VIEWS, TABLE_APPLICATION_SLOTS):
+            expected = f"{physical_table(sql_backend, table)}_pkey"
+            assert await _pg_pkey(sql_backend, table) == (expected, expected)
+        # The second boot is the every-boot no-op: no repair, no complaint.
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert "Renamed primary-key constraint" not in caplog.text
+
+    @pytest.mark.skipif(not postgres_available, reason="asyncpg or testcontainers not installed")
+    async def test_pkey_normalization_composes_with_table_prefix(self, request):
+        from tests._pg_helpers import postgres_test_db
+
+        container = request.getfixturevalue("postgres_container")
+        async with postgres_test_db(container) as dsn:
+            backend = PostgresBackend(dsn, table_prefix="pfx_")
+            await backend.initialize()
+            try:
+                await _rewind_to_legacy(backend)
+                await _manager_for(backend).apply_migrations()
+
+                for table in (TABLE_PERSISTENT_VIEWS, TABLE_APPLICATION_SLOTS):
+                    expected = f"pfx_{table}_pkey"
+                    assert await _pg_pkey(backend, table) == (expected, expected)
+            finally:
+                await backend.close()
+
+    async def test_a_taken_pkey_target_warns_and_boots(self, sql_backend, caplog):
+        """A relation squatting the desired constraint name would fail the
+        rename, so the repair warns and leaves the legacy name in place."""
+        if sql_backend.placeholder_style == "qmark":
+            pytest.skip("SQLite's autoindex follows the table rename")
+        phys = physical_table(sql_backend, TABLE_PERSISTENT_VIEWS)
+        await sql_backend.execute(
+            f"ALTER TABLE {phys} RENAME CONSTRAINT {phys}_pkey TO persistent_views_pkey"
+        )
+        await sql_backend.execute("CREATE TABLE decoy (x BIGINT)")
+        await sql_backend.execute(f"CREATE INDEX {phys}_pkey ON decoy(x)")
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui.persistence.manager"):
+            await _manager_for(sql_backend).apply_migrations()
+
+        # Boot completed; the constraint keeps its legacy name until the
+        # squatter moves.
+        assert await _pg_pkey(sql_backend, TABLE_PERSISTENT_VIEWS) == (
+            "persistent_views_pkey",
+            "persistent_views_pkey",
+        )
+        warned = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        # Quoted, because the bare legacy name is a substring of the desired
+        # one: an unquoted assertion passes on a warning naming only the new.
+        assert any("'persistent_views_pkey'" in m and f"'{phys}_pkey'" in m for m in warned), warned
 
 
 @pytest.mark.skipif(not sqlite_available, reason="aiosqlite not installed")

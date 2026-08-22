@@ -5,8 +5,11 @@ input wrapper instances (TextInput, Checkbox, CheckboxGroup, RadioGroup,
 FileUpload) and are auto-collected by ``Modal`` at construction time.
 """
 
+import asyncio
+
 import discord
 import pytest
+from helpers import make_interaction
 
 from cascadeui.components.inputs import (
     Checkbox,
@@ -15,7 +18,10 @@ from cascadeui.components.inputs import (
     Modal,
     RadioGroup,
     TextInput,
+    _assign_submitted_value,
 )
+from cascadeui.state.singleton import get_store
+from cascadeui.testing import stub_interaction
 from cascadeui.validation import min_length, regex
 
 # // ========================================( TextInput._slug )======================================== // #
@@ -150,6 +156,42 @@ class TestModalViewIdWiring:
     def test_view_id_defaults_to_none(self):
         modal = Modal(title="Test", inputs=[TextInput(label="X")])
         assert modal.view_id is None
+
+    def test_an_unrecognized_keyword_is_refused(self):
+        """``on_submit`` is the method discord.py subclasses override.
+
+        Reaching for it as the constructor keyword left the handler unset,
+        and the modal then acknowledged every submission, ran nothing, and
+        logged nothing.
+        """
+        with pytest.raises(TypeError, match="on_submit"):
+            Modal(title="Test", inputs=[TextInput(label="X")], on_submit=lambda i, v: None)
+
+    def test_custom_id_reaches_discord_py(self):
+        """A real ``discord.ui.Modal`` parameter was discarded with the rest."""
+        modal = Modal(title="Test", inputs=[TextInput(label="X")], custom_id="settings_modal")
+        assert modal.custom_id == "settings_modal"
+
+    def test_a_one_parameter_callback_is_refused(self):
+        """``on_submit`` calls the handler with the collected values, always.
+
+        A one-parameter callback could only ever raise a bare arity error at
+        submit time, from inside the library.
+        """
+
+        async def handler(interaction):
+            pass
+
+        with pytest.raises(TypeError, match=r"cannot be called with \(interaction, values\)"):
+            Modal(title="Test", inputs=[TextInput(label="X")], callback=handler)
+
+    def test_a_two_parameter_callback_is_accepted(self):
+        async def handler(interaction, values):
+            pass
+
+        modal = Modal(title="Test", inputs=[TextInput(label="X")], callback=handler)
+
+        assert modal.user_callback is handler
 
 
 # // ========================================( TextInput.value + Modal.values_by_input )======================================== // #
@@ -913,6 +955,672 @@ class TestModalValidationErrorLabel:
 
         assert "**Emoji**" in sent["content"]
         assert "input_emoji" not in sent["content"]
+
+
+class TestStubInteraction:
+    """``submit()`` asks for a double; ``cascadeui.testing`` supplies it.
+
+    Left to build one, a consumer both over-builds and under-builds: the
+    surface actually read is three attributes, while the part that cannot
+    be reached by measurement is which half answers a rejection, since
+    that depends on whether an ack backstop had already fired.
+    """
+
+    @staticmethod
+    def _modal():
+        async def on_submitted(interaction, values):
+            pass
+
+        return Modal(
+            title="V",
+            inputs=[TextInput(label="Name", validators=[min_length(5)])],
+            callback=on_submitted,
+        )
+
+    async def test_a_rejection_is_assertable_without_a_connection(self):
+        interaction = stub_interaction()
+
+        assert await self._modal().submit(interaction, {"Name": "ab"}) is False
+        assert any("Name" in reply for reply in interaction.replies)
+        assert interaction.answered is True
+
+    async def test_an_acceptance_acknowledges_and_says_nothing(self):
+        interaction = stub_interaction()
+
+        assert await self._modal().submit(interaction, {"Name": "abcdef"}) is True
+        assert interaction.replies == []
+        assert interaction.deferred is True
+
+    async def test_a_second_answer_is_refused_as_the_real_slot_refuses_it(self):
+        """The double must not be more permissive than what it stands for.
+
+        Permitting a double-response offline would let a test pass over a
+        seam that raises in production, which is the failure the whole
+        offline surface exists to remove.
+        """
+        interaction = stub_interaction()
+        await interaction.response.send_message("first")
+
+        with pytest.raises(discord.InteractionResponded):
+            await interaction.response.send_message("second")
+
+    async def test_opening_a_modal_counts_as_answered(self):
+        """It spends the response slot, so the seam has answered."""
+        interaction = stub_interaction()
+        await interaction.response.send_modal(object())
+
+        assert interaction.response.is_done() is True
+        assert interaction.answered is True
+
+    async def test_the_response_slot_reports_itself_spent(self):
+        """A library path that checks before answering sees a real slot."""
+        interaction = stub_interaction()
+        assert interaction.response.is_done() is False
+
+        await self._modal().submit(interaction, {"Name": "ab"})
+
+        assert interaction.response.is_done() is True
+
+
+class TestModalSubmit:
+    """``submit()`` drives the pipeline a real submission takes.
+
+    The reason it exists is the validator pass. Reaching past it to the
+    stored callback runs neither the validators nor the state dispatch,
+    so a test written that way succeeds against input the modal would
+    have rejected and reports coverage of a seam it never crossed.
+    """
+
+    @staticmethod
+    def _modal(seen):
+        name = TextInput(label="Name", validators=[min_length(3)], required=True)
+
+        async def on_submitted(interaction, values):
+            seen.append(values)
+
+        return Modal(title="Profile", inputs=[name], callback=on_submitted)
+
+    async def test_a_rejected_value_reports_false_and_skips_the_callback(self):
+        """The case the direct-callback route could not see."""
+        seen = []
+        modal = self._modal(seen)
+
+        accepted = await modal.submit(make_interaction(), {"Name": "ab"})
+
+        assert accepted is False
+        assert seen == []
+
+    async def test_an_accepted_value_runs_the_whole_pipeline(self):
+        seen = []
+        modal = self._modal(seen)
+
+        accepted = await modal.submit(make_interaction(), {"Name": "Ada"})
+
+        assert accepted is True
+        # The callback ran, and with the values a real submit assembles.
+        assert seen == [{"input_name": "Ada"}]
+        # The wrapper write-back and the by-input mapping both landed.
+        assert modal.inputs["input_name"].value == "Ada"
+        assert len(modal.values_by_input) == 1
+
+    async def test_values_key_by_label_or_custom_id(self):
+        """A caller writes labels; the internal mapping uses custom_ids."""
+        by_label, by_id = [], []
+        await self._modal(by_label).submit(make_interaction(), {"Name": "Ada"})
+        await self._modal(by_id).submit(make_interaction(), {"input_name": "Ada"})
+
+        assert by_label == by_id == [{"input_name": "Ada"}]
+
+    async def test_an_unknown_key_is_refused_naming_the_valid_ones(self):
+        modal = self._modal([])
+
+        with pytest.raises(ValueError, match="no input named"):
+            await modal.submit(make_interaction(), {"Nmae": "typo"})
+
+    async def test_a_field_left_out_keeps_its_value(self):
+        """A test supplies only the fields it cares about."""
+        seen = []
+        first = TextInput(label="First", required=False)
+        second = TextInput(label="Second", required=False, default="kept")
+
+        async def on_submitted(interaction, values):
+            seen.append(values)
+
+        modal = Modal(title="Two", inputs=[first, second], callback=on_submitted)
+        await modal.submit(make_interaction(), {"First": "set"})
+
+        assert seen == [{"input_first": "set", "input_second": "kept"}]
+
+    async def test_the_state_dispatch_the_direct_route_skipped(self):
+        """``MODAL_SUBMITTED`` reaches the store, as it does on a real submit."""
+        store = get_store()
+        fired = []
+        store.on("MODAL_SUBMITTED", lambda action, state: fired.append(action))
+
+        modal = self._modal([])
+        modal.view_id = "view-under-test"
+        await modal.submit(make_interaction(), {"Name": "Ada"})
+
+        assert len(fired) == 1
+        assert fired[0]["payload"]["values"] == {"input_name": "Ada"}
+
+    async def test_a_raw_escape_hatch_input_is_reachable(self):
+        """Raw items live in ``inputs`` but never in ``_wrapped_pairs``.
+
+        Resolving from the pair list alone leaves a raw input unsettable
+        and silent about it, so the submission runs against its default
+        while the call reports success.
+        """
+        seen = []
+
+        async def on_submitted(interaction, values):
+            seen.append(values)
+
+        raw = discord.ui.TextInput(custom_id="raw_field")
+        modal = Modal(
+            title="Mixed",
+            inputs=[discord.ui.Label(text="Raw Field", component=raw)],
+            callback=on_submitted,
+        )
+
+        assert await modal.submit(make_interaction(), {"raw_field": "R"}) is True
+        assert raw.value == "R"
+
+    async def test_a_raw_input_resolves_by_its_label_text(self):
+        """A raw item's name is the text on the ``ui.Label`` wrapping it."""
+        raw = discord.ui.TextInput(custom_id="rf2")
+
+        async def on_submitted(interaction, values):
+            pass
+
+        modal = Modal(
+            title="Labelled",
+            inputs=[discord.ui.Label(text="Nice Name", component=raw)],
+            callback=on_submitted,
+        )
+        await modal.submit(make_interaction(), {"Nice Name": "via label"})
+
+        assert raw.value == "via label"
+
+    async def test_a_custom_id_outranks_a_label_claiming_the_same_name(self):
+        """A raw item carries any custom_id, so it can equal a label.
+
+        The custom_id is that input's identity and its only name. The
+        label is an alias, and one the wrapped input does not need, since
+        its own custom_id resolves. So the identity wins and the alias is
+        not registered: refusing the name instead would leave the raw
+        input reachable by nothing at all.
+        """
+        seen = []
+
+        async def on_submitted(interaction, values):
+            seen.append(values)
+
+        raw = discord.ui.TextInput(custom_id="Name")
+        wrapped = TextInput(label="Name")
+        modal = Modal(
+            title="Clash",
+            inputs=[
+                discord.ui.Label(text="Raw", component=raw),
+                wrapped,
+            ],
+            callback=on_submitted,
+        )
+
+        assert await modal.submit(make_interaction(), {"Name": "to the raw"}) is True
+        assert raw.value == "to the raw"
+
+        # And the input whose label lost the name is still reachable.
+        assert await modal.submit(make_interaction(), {"input_name": "to the wrapper"}) is True
+        assert wrapped.value == "to the wrapper"
+
+    async def test_a_raising_validator_propagates_as_itself(self):
+        """The validator's own exception reaches the caller, unconverted.
+
+        A validator raising is a programmer error, not a rejection, so it
+        must not arrive as the guard's "no verdict" RuntimeError, and
+        ``values_by_input`` must be left the dict it is from construction
+        onward rather than a ``None`` the class never otherwise exposes.
+
+        The validator takes the three arguments ``validate_field`` calls
+        it with. An earlier version took one, so the exception under test
+        never fired: the arity mismatch raised first, and a broad
+        ``pytest.raises`` could not tell the two apart.
+        """
+
+        def explode(value, field_def, all_values):
+            raise RuntimeError("validator exploded")
+
+        async def on_submitted(interaction, values):
+            pass
+
+        modal = Modal(
+            title="Boom",
+            inputs=[TextInput(label="Name", validators=[explode])],
+            callback=on_submitted,
+        )
+
+        with pytest.raises(RuntimeError, match="validator exploded"):
+            await modal.submit(make_interaction(), {"Name": "Ada"})
+
+        assert modal.values_by_input == {}
+
+    @staticmethod
+    def _validated(cls=Modal, seen=None):
+        async def on_submitted(interaction, values):
+            if seen is not None:
+                seen.append(values)
+
+        return cls(
+            title="V",
+            inputs=[TextInput(label="Name", validators=[min_length(5)])],
+            callback=on_submitted,
+        )
+
+    async def test_a_replacing_override_is_refused_rather_than_reported(self):
+        """No verdict is not a rejection, and must not be returned as one.
+
+        The verdict is what ``Modal.on_submit`` records as it runs. A
+        subclass that replaces the method without calling up records
+        nothing, so reporting ``False`` would call every submission
+        rejected, silently, on a documented seam.
+        """
+
+        class Replaced(Modal):
+            async def on_submit(self, interaction):
+                pass
+
+        with pytest.raises(RuntimeError, match="got no verdict"):
+            await self._validated(Replaced).submit(make_interaction(), {"Name": "abcdef"})
+
+    async def test_an_instance_assigned_handler_is_refused_too(self):
+        """The call dispatches through the instance, so the check must.
+
+        Comparing classes misses this shape entirely: nothing about the
+        class changed, yet the pipeline did not run.
+        """
+        modal = self._validated()
+
+        async def replacement(interaction):
+            pass
+
+        modal.on_submit = replacement
+
+        with pytest.raises(RuntimeError, match="got no verdict"):
+            await modal.submit(make_interaction(), {"Name": "abcdef"})
+
+    async def test_an_override_that_calls_up_reports_both_outcomes(self):
+        """The half the previous test never asked about.
+
+        A cooperative override was verified only on the accepting path,
+        so a rejection routed through one could raise unnoticed: the
+        validation-error branch returns before the acceptance is recorded,
+        and inferring the verdict from that made a correct override look
+        like a broken one.
+        """
+        seen = []
+
+        class Cooperative(Modal):
+            async def on_submit(self, interaction):
+                await super().on_submit(interaction)
+
+        assert (
+            await self._validated(Cooperative, seen).submit(make_interaction(), {"Name": "abcdef"})
+            is True
+        )
+        assert seen == [{"input_name": "abcdef"}]
+
+        seen.clear()
+        assert (
+            await self._validated(Cooperative, seen).submit(make_interaction(), {"Name": "ab"})
+            is False
+        )
+        assert seen == []
+
+    async def test_a_subclass_of_a_cooperative_override_reports_too(self):
+        """Depth is irrelevant once no class comparison is involved."""
+
+        class Cooperative(Modal):
+            async def on_submit(self, interaction):
+                await super().on_submit(interaction)
+
+        class Deeper(Cooperative):
+            pass
+
+        assert await self._validated(Deeper).submit(make_interaction(), {"Name": "ab"}) is False
+
+    async def test_a_dispatch_on_another_task_cannot_overwrite_the_verdict(self):
+        """The verdict belongs to the task that asked for it.
+
+        A modal instance is shared by every submission it receives, so a
+        real one arriving from Discord while an offline drive is parked in
+        its callback would, as instance state, overwrite what that drive
+        was waiting to read. It would then report a rejection for a
+        submission it had watched succeed.
+        """
+        parked, released = asyncio.Event(), asyncio.Event()
+
+        async def slow_callback(interaction, values):
+            parked.set()
+            await released.wait()
+
+        modal = Modal(
+            title="T",
+            inputs=[TextInput(label="Name", validators=[min_length(5)])],
+            callback=slow_callback,
+        )
+
+        offline = asyncio.create_task(modal.submit(make_interaction(), {"Name": "abcdef"}))
+        await parked.wait()
+
+        # What discord.py does: fill the components, await on_submit, in
+        # its own task. This submission is rejected by the validators.
+        async def gateway():
+            modal._resolve_submit_keys()["Name"]._value = "ab"
+            await modal.on_submit(make_interaction())
+
+        await asyncio.create_task(gateway())
+        released.set()
+
+        assert await offline is True
+
+    @staticmethod
+    def _with_select():
+        sel = discord.ui.Select(
+            custom_id="pick",
+            options=[
+                discord.SelectOption(label="A", value="a"),
+                discord.SelectOption(label="B", value="b"),
+            ],
+        )
+        seen = []
+
+        async def on_submitted(interaction, values):
+            seen.append(values)
+
+        modal = Modal(
+            title="Pick",
+            inputs=[
+                TextInput(label="Name"),
+                discord.ui.Label(text="Pick one", component=sel),
+            ],
+            callback=on_submitted,
+        )
+        return modal, sel, seen
+
+    async def test_a_modal_select_reaches_the_callback_offline(self):
+        """A select is writable and listed, so it must also be delivered.
+
+        Accepting the key, writing it, and returning True while dropping
+        the value before the callback is a silent value loss certified as
+        success, which is what this method exists to remove.
+        """
+        modal, sel, seen = self._with_select()
+
+        assert await modal.submit(make_interaction(), {"Name": "Ada", "pick": ["b"]}) is True
+
+        assert sel.values == ["b"]
+        assert seen == [{"input_name": "Ada", "pick": ["b"]}]
+
+    async def test_a_modal_select_reaches_the_callback_on_a_real_submission(self):
+        """The same gap on the path a user actually takes.
+
+        discord.py fills a modal select's storage on submission like any
+        other child; the collection loop is what decides whether the
+        callback ever sees it.
+        """
+        modal, sel, seen = self._with_select()
+        sel._values = ["b"]
+
+        await modal.on_submit(make_interaction())
+
+        assert seen == [{"input_name": "", "pick": ["b"]}]
+
+    def test_a_modal_child_with_no_custom_id_is_refused_by_name(self):
+        """A display item carries no value, so it cannot be an input."""
+
+        async def on_submitted(interaction, values):
+            pass
+
+        with pytest.raises(TypeError, match="carries no custom_id"):
+            Modal(
+                title="T",
+                inputs=[discord.ui.TextDisplay("Section header")],
+                callback=on_submitted,
+            )
+
+    async def test_a_label_two_inputs_claim_resolves_to_neither(self):
+        """A name two inputs answer to is not a free name.
+
+        Registering the first sends a value to whichever happened to be
+        listed earlier, silently. Both keep their own custom_id, which is
+        their identity and always resolves.
+        """
+        first = discord.ui.TextInput(custom_id="one")
+        second = discord.ui.TextInput(custom_id="two")
+
+        async def on_submitted(interaction, values):
+            pass
+
+        modal = Modal(
+            title="Dup",
+            inputs=[
+                discord.ui.Label(text="Amount", component=first),
+                discord.ui.Label(text="Amount", component=second),
+            ],
+            callback=on_submitted,
+        )
+        targets = modal._resolve_submit_keys()
+
+        assert "Amount" not in targets
+        assert targets["one"] is first
+        assert targets["two"] is second
+
+    async def test_an_uncontested_label_still_resolves(self):
+        """The refusal must not cost the ordinary single-label case."""
+        only = discord.ui.TextInput(custom_id="solo")
+
+        async def on_submitted(interaction, values):
+            pass
+
+        modal = Modal(
+            title="Solo",
+            inputs=[discord.ui.Label(text="Amount", component=only)],
+            callback=on_submitted,
+        )
+
+        assert modal._resolve_submit_keys()["Amount"] is only
+
+    async def test_naming_one_input_twice_is_refused(self):
+        """An input answers to two names, so one mapping can address it twice.
+
+        Assigning both keeps whichever came last and loses the other with
+        nothing said, which is the same silent overwrite the constructor
+        already refuses two inputs for.
+        """
+        modal = self._validated()
+
+        with pytest.raises(ValueError, match="both name the same input"):
+            await modal.submit(make_interaction(), {"Name": "alpha", "input_name": "beta"})
+
+    async def test_naming_two_different_inputs_is_fine(self):
+        """The refusal must not fire on an ordinary two-field mapping."""
+        seen = []
+
+        async def on_submitted(interaction, values):
+            seen.append(values)
+
+        modal = Modal(
+            title="Two",
+            inputs=[TextInput(label="First"), TextInput(label="Second")],
+            callback=on_submitted,
+        )
+
+        assert await modal.submit(make_interaction(), {"First": "a", "input_second": "b"}) is True
+        assert seen == [{"input_first": "a", "input_second": "b"}]
+
+    async def test_a_bad_key_writes_nothing_before_refusing(self):
+        """Rejection precedes state mutation, as everywhere else here.
+
+        Assigning as keys resolve leaves the modal half-populated up to
+        whichever key the mapping happened to reach first, so the residue
+        depended on dict order.
+        """
+        modal = self._validated()
+        inner = modal._resolve_submit_keys()["Name"]
+
+        with pytest.raises(ValueError, match="no input named"):
+            await modal.submit(make_interaction(), {"Name": "abcdef", "Typo": 1})
+
+        assert inner.value == ""
+
+    def test_a_moved_upstream_attribute_raises_instead_of_testing_nothing(self):
+        """A vanished storage attribute is refused, not written past.
+
+        A component's value is a read-only property over a private
+        attribute, which is what a real submission writes. If discord.py
+        moves that attribute, a plain setattr would create a fresh one
+        nothing reads, and the submission would run against defaults while
+        reporting success. The attribute's presence is checked instead of
+        the written value being read back, because a property that
+        coerces its input answers a readback wrongly in both directions.
+        """
+
+        class Moved:
+            """Exposes the property with nothing behind the old name."""
+
+            @property
+            def value(self):
+                return "frozen"
+
+        with pytest.raises(RuntimeError, match="has no '_value'"):
+            _assign_submitted_value(Moved(), "Name", "Ada")
+
+    def test_a_coercing_property_is_not_mistaken_for_a_moved_attribute(self):
+        """The write lands even when the property reports something else.
+
+        A text input returns ``''`` for a stored ``None``, so reading the
+        value back would report no change for a write that landed and
+        blame discord.py for the caller's own input.
+        """
+        inner = discord.ui.TextInput()
+
+        _assign_submitted_value(inner, "Name", None)
+
+        assert inner._value is None
+        assert inner.value == ""
+
+    def test_a_component_exposing_values_is_written_through_that_name(self):
+        """The property name is read off the component, not matched.
+
+        A select exposes ``values`` where a text input exposes ``value``,
+        and it is a legal modal component discord.py already ships, so a
+        fixed list of known types answers for it wrongly.
+        """
+        sel = discord.ui.Select(
+            custom_id="pick",
+            options=[discord.SelectOption(label="a", value="a")],
+        )
+
+        _assign_submitted_value(sel, "pick", ["a"])
+
+        assert sel.values == ["a"]
+
+    def test_writing_the_value_already_present_is_not_an_error(self):
+        """The readback guard must not fire when nothing needed to change."""
+        inner = discord.ui.TextInput(default="same")
+
+        _assign_submitted_value(inner, "Name", "same")
+
+        assert inner.value == "same"
+
+    async def test_every_input_type_is_settable_not_just_text(self):
+        """CheckboxGroup and FileUpload expose ``values``; the rest ``value``.
+
+        The plural branch of the write helper targets ``_values``, and no
+        other test reaches it. A discord.py rename on either private
+        attribute surfaces here as the readback RuntimeError instead of
+        in a consumer's suite.
+        """
+        seen = []
+
+        async def on_submitted(interaction, values):
+            seen.append(values)
+
+        modal = Modal(
+            title="All Types",
+            inputs=[
+                TextInput(label="T"),
+                Checkbox(label="C"),
+                CheckboxGroup(
+                    label="G",
+                    options=[{"label": "A", "value": "a"}, {"label": "B", "value": "b"}],
+                ),
+                RadioGroup(
+                    label="R",
+                    options=[{"label": "X", "value": "x"}, {"label": "Y", "value": "y"}],
+                ),
+                FileUpload(label="F"),
+            ],
+            callback=on_submitted,
+        )
+
+        accepted = await modal.submit(
+            make_interaction(),
+            {"T": "hi", "C": True, "G": ["b"], "R": "x", "F": ["upload.png"]},
+        )
+
+        assert accepted is True
+        assert seen == [
+            {
+                "input_t": "hi",
+                "input_c": True,
+                "input_g": ["b"],
+                "input_r": "x",
+                "input_f": ["upload.png"],
+            }
+        ]
+        # The plural write-back lands on the wrapper, as ``value`` does.
+        assert modal.inputs["input_g"].values == ["b"]
+
+    async def test_a_rejected_submit_leaves_values_by_input_a_dict(self):
+        """The accept-signal sentinel must not leak to callers on rejection."""
+        modal = self._modal([])
+
+        await modal.submit(make_interaction(), {"Name": "ab"})
+
+        assert modal.values_by_input == {}
+
+    async def test_a_modal_with_no_callback_still_accepts(self):
+        """``callback=`` is optional; ``submit`` reports the validator verdict."""
+        modal = Modal(title="Quiet", inputs=[TextInput(label="A")])
+
+        assert await modal.submit(make_interaction(), {"A": "x"}) is True
+        assert modal.inputs["input_a"].value == "x"
+
+    async def test_an_empty_mapping_submits_the_current_values(self):
+        """``submit({})`` is a submission of whatever the fields hold.
+
+        The required Name field still holds its default, which fails
+        min_length(3) exactly as an untouched real submission would.
+        """
+        modal = self._modal([])
+
+        assert await modal.submit(make_interaction(), {}) is False
+
+    async def test_a_raising_validator_propagates_instead_of_reporting_false(self):
+        """A validator that raises is a programmer error, not a rejection."""
+
+        def boom(value, field_def, all_values):
+            raise RuntimeError("validator exploded")
+
+        modal = Modal(
+            title="Boom",
+            inputs=[TextInput(label="A", validators=[boom], required=True)],
+        )
+
+        with pytest.raises(RuntimeError, match="validator exploded"):
+            await modal.submit(make_interaction(), {"A": "abc"})
 
 
 class TestModalDuplicateInputs:
