@@ -1470,6 +1470,31 @@ class TestPaginatedRegionNavigation:
         assert host.build_calls == 1
         assert host.refresh_calls == 1
 
+    async def test_show_page_still_renders_for_a_host_in_its_timeout_window(self):
+        """discord.py stops a view before calling ``on_timeout``.
+
+        ``show_page`` is the programmatic jump a host reaches for from
+        ``on_timeout`` ("land on the last page as this closes"), so the
+        render probe has to read teardown rather than the stopped future.
+        """
+        builds = []
+
+        class _Host(RenderableLayoutView):
+            def build_ui(self):
+                builds.append(1)
+
+        host = _Host(interaction=make_interaction(), user_id=1, guild_id=2)
+        host._message = AsyncMock()
+        region = PaginatedRegion(per_page=2, items=list(range(6)))
+        region.controls(host)
+        host.stop()
+        builds.clear()
+
+        await region.show_page(2)
+
+        assert region.page == 2
+        assert builds == [1]
+
     async def test_step_prev_clamps_at_zero(self):
         region = PaginatedRegion(per_page=2, items=list(range(6)))
         region.controls(_FakeHost())

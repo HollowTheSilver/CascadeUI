@@ -1823,7 +1823,13 @@ async def _rerender_host(view) -> None:
     Probed by duck typing rather than ``isinstance`` so the component layer
     stays free of a ``views`` import.
     """
-    if view is None or view.is_finished():
+    if view is None:
+        return
+    # A host inside its timeout window is intact and its message still
+    # editable, so this asks whether teardown has run rather than whether the
+    # view stopped. Duck-typed like the render probes below.
+    torn_down = getattr(view, "_torn_down", None)
+    if torn_down() if torn_down else view.is_finished():
         return
     build = getattr(view, "build_ui", None)
     if build is not None:

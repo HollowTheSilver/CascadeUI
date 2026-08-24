@@ -1120,6 +1120,12 @@ class _NavigationMixin:
                 # and is itself tearing down.
                 child._attached_to = None
                 if child.is_finished():
+                    # Quiesce it on the way past: this branch never reaches
+                    # exit(), which is what unsubscribes, so the child would
+                    # keep its subscription while its parent link reads None
+                    # and rebuild against a parent that is gone. Idempotent.
+                    self.state_store._unsubscribe(child.id)
+                    self.state_store._undo_enabled_views.pop(child.id, None)
                     continue
                 try:
                     await child.exit(delete_message=True)

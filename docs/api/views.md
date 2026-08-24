@@ -239,6 +239,12 @@ Registers a child view for automatic cleanup. When the parent exits or times out
 
 Read-only property holding the view this one is attached to, or `None` for a root. A child constructed with `parent=` reads it before the send that attaches it, and every child reads it after, so a child panel that needs its parent to read state or call `respond` has it without storing the same view a second time under its own name. Mutation goes through `attach_child` on the parent, which enforces the invariants above.
 
+#### `on_timeout()` *(async, override)*
+
+Called when the view's timeout elapses. The default is the full teardown: it exits attached children, cancels tasks, unsubscribes from the store, drops the registry entries, and then edits the message with every component disabled. Freezing is unconditional, since `exit_policy` governs close gestures and an expiry is not one.
+
+An override that neither delegates to `super().on_timeout()` nor calls `exit()` leaves the view subscribed and registered, still holding its instance-limit slot. Either one tears it down. Render before tearing down: both unsubscribe, so a dispatch issued afterwards no longer reaches the view that made it. See [Timeout](../guide/views.md#timeout).
+
 #### `on_message_delete()` *(async, override)*
 
 Called when the view's Discord message is deleted externally (admin delete, bulk purge, channel delete). Default calls `exit(delete_message=False)`. Override for custom behavior (logging, re-sending). If overriding without calling `exit()`, the view remains as a ghost in the state store.

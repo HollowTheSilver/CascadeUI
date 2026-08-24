@@ -23,6 +23,31 @@ preserved below for historical reference but are not the supported baseline.
 
 ---
 
+## [3.12.1] - 2026-08-24
+
+### Added
+
+- The API reference documents `on_timeout()`, the one lifecycle hook it had
+  never listed, including what an override inherits when it skips `super()`.
+
+### Fixed
+
+- An `on_timeout` override that dispatches instead of delegating to `super()`
+  now renders. discord.py marks a view finished before it calls `on_timeout`,
+  so the guard that stops a torn-down view from rebuilding also caught every
+  view inside its timeout window: the dispatch landed, other views saw it, and
+  the timing-out view silently kept its pre-timeout components. The guard now
+  reads whether teardown has run rather than whether the view has stopped, so
+  the final render ships and a notification arriving after teardown is still
+  dropped. The rate-limit retry and the deferred cooldown render carried the
+  same check and were swept with it.
+- `PaginatedRegion.show_page()` was declined on a host inside its timeout
+  window, so a host jumping to a closing page from `on_timeout` never
+  re-rendered. The render probe shared by the V2 composites reads whether
+  teardown has run, matching the view seams above.
+
+---
+
 ## [3.12.0] - 2026-08-21
 
 ### Breaking
