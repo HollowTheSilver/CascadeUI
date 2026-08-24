@@ -714,6 +714,40 @@ class TestNavigationAttachmentTransfer:
 
         assert rebuilds == []
 
+    async def test_a_finished_child_orphaned_by_the_cascade_does_not_rebuild(self):
+        """A child that stopped without tearing down is quiesced on the way past.
+
+        The cascade nulls the parent link and then skips a finished child,
+        and ``exit()`` is the only thing that unsubscribes. Left subscribed,
+        the child rebuilds on the next notification and reads a parent that
+        is no longer there, which is the same crash as the sibling above
+        reached by a different route.
+        """
+        rebuilds = []
+
+        class _Parent(StatefulView):
+            pass
+
+        class _Child(StatefulView):
+            def build_ui(self):
+                rebuilds.append(1)
+                assert self.parent is not None
+
+        parent = _Parent(interaction=_make_interaction(user_id=1, guild_id=100))
+        await parent.send()
+        child = _Child(interaction=_make_interaction(user_id=1, guild_id=100))
+        parent.attach_child(child)
+        # Finished on its own -- a bare stop(), or an on_timeout override that
+        # never delegated -- so the cascade skips it instead of exiting it.
+        child.stop()
+
+        await parent._cleanup_attached_children()
+        assert child.parent is None
+
+        await child._handle_state_notification(child.state_store.state, {"type": "BATCH_COMPLETE"})
+
+        assert rebuilds == []
+
     async def test_parent_follows_a_re_parent(self):
         class _First(StatefulView):
             pass

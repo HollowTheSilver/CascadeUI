@@ -3223,15 +3223,51 @@ class TestRefreshThrottling:
 
         view.on_state_changed.assert_awaited_once_with(view.state_store.state)
 
-    async def test_deferred_refresh_noop_on_finished_view(self):
+    async def test_deferred_refresh_noop_on_torn_down_view(self):
         view = self._make_view(self._build_simple, refresh_cooldown_ms=50)
         self._prime(view)
         view.on_state_changed = AsyncMock()
-        view.stop()  # mark view as finished
+        # Teardown, not a bare stop(): a stopped view is still intact, and
+        # discord.py stops a view before calling on_timeout, so a pending
+        # render belonging to the timeout window still has to ship.
+        await view.exit(delete_message=False)
 
         await view._deferred_refresh(0.01)
 
         view.on_state_changed.assert_not_awaited()
+
+    async def test_deferred_refresh_still_renders_for_a_stopped_view(self):
+        """A stopped view is the timeout window, and its render still owes an edit.
+
+        discord.py stops a view before calling ``on_timeout``, so a render
+        coalesced into the cooldown window belongs to a view that is intact.
+        """
+        view = self._make_view(self._build_simple, refresh_cooldown_ms=50)
+        self._prime(view)
+        view.on_state_changed = AsyncMock()
+        view.stop()
+
+        await view._deferred_refresh(0.01)
+
+        view.on_state_changed.assert_awaited_once_with(view.state_store.state)
+
+    async def test_a_stopped_view_requeues_a_reload_coalesced_mid_render(self):
+        """The tail that respawns a successor reads the same signal."""
+        view = self._make_view(self._build_simple, refresh_cooldown_ms=50)
+        self._prime(view)
+        view.stop()
+
+        async def _render(_state):
+            # A reload lands while this render is in flight, so the tail has
+            # something to hand to a successor.
+            view._reload_pending = True
+
+        view.on_state_changed = AsyncMock(side_effect=_render)
+
+        await view._deferred_refresh(0.01)
+
+        assert view._deferred_refresh_task is not None
+        view._deferred_refresh_task.cancel()
 
     async def test_deferred_render_does_not_inherit_the_spawning_interaction(self):
         """``asyncio.create_task`` copies the caller's context, so the
@@ -4188,10 +4224,11 @@ class TestRateLimitSchedulesARetry:
         assert view._message.edit.await_count == 3  # failed, failed, landed
         assert view._deferred_refresh_task is None  # settled, nothing left pending
 
-    async def test_no_retry_is_queued_for_a_finished_view(self):
+    async def test_no_retry_is_queued_for_a_torn_down_view(self):
         view = self._make_view()
+        view._message.edit = AsyncMock()
+        await view.exit(delete_message=False)
         view._message.edit = AsyncMock(side_effect=_FakeRateLimit(retry_after=0.2))
-        view.stop()
 
         await view.refresh()
 
@@ -5622,3 +5659,115 @@ class TestRebuiltTreeShipsOnTeardown:
         await view.on_timeout()
 
         message.edit.assert_awaited_once()
+
+
+class TestTimeoutWindowStillRenders:
+    """A view inside its timeout window is intact, so its render has to ship.
+
+    discord.py resolves the stopped future *before* it calls ``on_timeout``,
+    so ``is_finished()`` reports True for the whole window even though the
+    view still holds its subscription and its message is still editable. An
+    override that dispatches instead of delegating to ``super()`` expects the
+    resulting notification to rebuild and edit; guarding these seams on
+    ``is_finished()`` dropped that final render with nothing logged.
+    """
+
+    def _wire(self, view):
+        message = MagicMock()
+        message.id = 4242
+        message.edit = AsyncMock()
+        message.delete = AsyncMock()
+        view._message = message
+        return message
+
+    def _pull_view(self, rebuilds):
+        class _Pull(RenderableLayoutView):
+            subscribed_actions = {"CARDPULL_UPDATED"}
+
+            def build_ui(self):
+                self.clear_items()
+                self.add_item(TextDisplay("closed"))
+                rebuilds.append(1)
+
+        return _Pull(interaction=_make_interaction(), user_id=1, guild_id=2, timeout=60)
+
+    async def test_a_stopped_view_still_rebuilds_on_a_notification(self):
+        rebuilds = []
+        view = self._pull_view(rebuilds)
+        await view.send()
+        self._wire(view)
+        rebuilds.clear()
+
+        # What discord.py does immediately before calling on_timeout.
+        view.stop()
+        assert view.is_finished()
+
+        await view._handle_state_notification(
+            view.state_store.state, {"type": "CARDPULL_UPDATED", "payload": {}}
+        )
+
+        assert rebuilds == [1]
+
+    async def test_a_dispatch_from_an_on_timeout_override_reaches_the_message(self):
+        """The reported shape, driven through discord.py's own timeout path."""
+        done = asyncio.Event()
+
+        class _Pull(RenderableLayoutView):
+            subscribed_actions = {"CARDPULL_UPDATED"}
+
+            def build_ui(self):
+                self.clear_items()
+                self.add_item(TextDisplay("page " + str(getattr(self, "page", 0))))
+
+            async def on_timeout(self):
+                # No super() call, so the view keeps its subscription.
+                self.page = 3
+                await self.dispatch("CARDPULL_UPDATED", {"value": self.page})
+                done.set()
+
+        view = _Pull(interaction=_make_interaction(), user_id=1, guild_id=2, timeout=60)
+        await view.send()
+        message = self._wire(view)
+
+        view._dispatch_timeout()
+        await asyncio.wait_for(done.wait(), timeout=5)
+
+        message.edit.assert_awaited()
+
+    async def test_a_torn_down_view_still_skips_the_rebuild(self):
+        """The guard this replaces was added for a real bug; it has to hold."""
+        rebuilds = []
+        view = self._pull_view(rebuilds)
+        await view.send()
+        self._wire(view)
+        rebuilds.clear()
+
+        await view.exit(delete_message=False)
+        await view._handle_state_notification(
+            view.state_store.state, {"type": "CARDPULL_UPDATED", "payload": {}}
+        )
+
+        assert rebuilds == []
+
+    async def test_a_stopped_view_still_queues_a_rate_limit_retry(self):
+        view = RenderableLayoutView(interaction=_make_interaction(), user_id=1, guild_id=2)
+        await view.send()
+        self._wire(view)
+
+        view.stop()
+        view._ratelimit_not_before = time.monotonic() + 30
+        view._schedule_backoff_retry()
+
+        assert view._deferred_refresh_task is not None
+        view._deferred_refresh_task.cancel()
+
+    async def test_a_torn_down_view_queues_no_rate_limit_retry(self):
+        view = RenderableLayoutView(interaction=_make_interaction(), user_id=1, guild_id=2)
+        await view.send()
+        self._wire(view)
+
+        await view.exit(delete_message=False)
+        view._ratelimit_not_before = time.monotonic() + 30
+        view._schedule_backoff_retry()
+
+        assert view._deferred_refresh_task is None

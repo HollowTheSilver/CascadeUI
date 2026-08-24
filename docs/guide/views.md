@@ -183,6 +183,30 @@ super().__init__(*args, timeout=300, **kwargs)   # 5 minutes
 super().__init__(*args, timeout=None, **kwargs)  # Never timeout
 ```
 
+!!! note "Overriding `on_timeout`"
+    The default implementation is the teardown: it exits attached children,
+    cancels tasks, unsubscribes from the store, drops the registry entries,
+    and then ships the freeze edit. An override that neither delegates to
+    `super().on_timeout()` nor calls `exit()` leaves the view subscribed and
+    registered with its instance-limit slot still claimed. Either one tears
+    it down; composing a closing card and then calling
+    `exit(delete_message=False)` is the common shape.
+
+    A closing render works from either direction. Dispatching drives the
+    normal subscriber path, and `build_ui()` followed by `refresh()` edits the
+    message without touching state:
+
+    ```python
+    async def on_timeout(self):
+        self.show_buttons = False
+        await self.dispatch("ROUND_ENDED", {"view_id": self.id})
+        await super().on_timeout()
+    ```
+
+    Render first, then tear down. Both `super().on_timeout()` and `exit()`
+    unsubscribe, so a dispatch issued after either no longer reaches this
+    view (other subscribers still receive it).
+
 !!! note "Ephemeral timeout derivation"
     `send(ephemeral=True)` derives the refresh-handoff behavior from the
     declared `timeout`. Neither declaration is rewritten: `timeout` stays as

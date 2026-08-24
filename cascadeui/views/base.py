@@ -2606,6 +2606,20 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         """
         return
 
+    def _torn_down(self) -> bool:
+        """Whether teardown has run, as opposed to the view merely stopping.
+
+        ``is_finished()`` reads discord.py's stopped future, which resolves
+        *before* ``on_timeout`` is called and again on a bare ``stop()``. The
+        view is intact in both cases and its message still editable, so a
+        state-driven render is legitimate work. The property these seams need
+        is narrower: has the teardown that clears attributes and drops the
+        registry entries already run? Every teardown path unsubscribes before
+        destroying the view, so the subscriber registry answers that directly
+        rather than by proxy.
+        """
+        return self.id not in self.state_store.subscribers
+
     async def _handle_state_notification(self, state, action):
         """React to state changes with update coalescing.
 
@@ -2616,12 +2630,14 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         with the latest store state after completing, capturing both
         changes in a single rebuild + edit cycle.
 
-        Notifications that reach a finished view are dropped outright. The
+        Notifications that reach a torn-down view are dropped outright. The
         cross-view fan-out is fire-and-forget, so a task created ahead of a
         teardown can run after ``exit()`` completes; rebuilding then renders
         into a view that is no longer interactive, and reads attributes the
         teardown already cleared (an exited child's parent link, for
-        example).
+        example). A view inside its timeout window is not torn down: an
+        ``on_timeout`` override that dispatches instead of delegating to
+        ``super()`` keeps its subscription, and its final render ships.
 
         Once the ephemeral refresh button has been armed, subsequent
         notifications are dropped: the view is intentionally frozen on the
@@ -2632,7 +2648,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         """
         logger.debug(f"View '{self.id}' received state update for action '{action['type']}'")
 
-        if self.is_finished():
+        if self._torn_down():
             return
 
         if self._refresh_armed:
@@ -3622,7 +3638,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         minutes-scale (see ``_CLOUDFLARE_BAN_BACKOFF``): at a one-second
         backoff this would be a bot hammering a ban that 429s help sustain.
         """
-        if self.is_finished() or not self._message:
+        if self._torn_down() or not self._message:
             return
         wait = self._ratelimit_not_before - time.monotonic()
         if wait > 0:
@@ -4049,7 +4065,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         try:
             while True:
                 await asyncio.sleep(wait)
-                if self.is_finished() or not self._message:
+                if self._torn_down() or not self._message:
                     return
                 wait = self._throttle_until() - time.monotonic()
                 if wait <= 0:
@@ -4079,7 +4095,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             if (
                 self._reload_pending
                 and not self._refresh_armed
-                and not self.is_finished()
+                and not self._torn_down()
                 and self._message
             ):
                 # A reload was coalesced while the render above was in
