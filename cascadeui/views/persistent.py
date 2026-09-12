@@ -281,6 +281,10 @@ class _PersistentMixin:
         payload = ActionCreators.persistent_view_unregistered(self.persistence_key)
         await self.dispatch("PERSISTENT_VIEW_UNREGISTERED", payload)
 
+        # super().exit() -> stop() -> _redrive_dynamic_items() repairs
+        # discord.py's shared dynamic-item registry; the base implementation
+        # covers every view, persistent or not, so there is nothing
+        # persistent-specific left to do here.
         return await super().exit(delete_message=delete_message)
 
     async def on_bind(self, bot):

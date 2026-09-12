@@ -623,6 +623,7 @@ class _NavigationMixin:
                 await self._ack_bounded(
                     current_interaction.response.edit_message(view=new_view, **direct_kwargs)
                 )
+                new_view._redrive_dynamic_items()
                 return True
             except asyncio.TimeoutError:
                 # Ack window blown -- fall through to the deferred path (the
@@ -666,6 +667,7 @@ class _NavigationMixin:
             # channel endpoint, which the plain ref provides.
             if new_view._message is None:
                 new_view._message = msg
+            new_view._redrive_dynamic_items()
             return True
         except DISCORD_CALL_ERRORS:
             # Ordered above the timeout clause deliberately. aiohttp's connect

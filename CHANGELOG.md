@@ -23,6 +23,49 @@ preserved below for historical reference but are not the supported baseline.
 
 ---
 
+## [3.12.2] - 2026-09-12
+
+### Changed
+
+- Ephemeral acting refreshes now route through the same edit-as-ack fast
+  path non-ephemeral acting views use, cutting the round trip in half and
+  acknowledging the same click that renders it. The prior exclusion
+  assumed an ephemeral message could only be edited through the
+  interaction webhook (`self._message.edit()`, a slower call scoped to
+  the message's original send), but `interaction.response.edit_message()`
+  is a normal per-click response Discord treats identically regardless of
+  a message's ephemeral flag. A disqualified fast path still falls back
+  to the webhook edit exactly as before; a stalled or rate-limited fast
+  path still returns without a fallback attempt, exactly as it already
+  did for non-ephemeral views.
+
+### Fixed
+
+- A view carrying a `DynamicPersistentButton` no longer breaks that
+  button on every OTHER live message sharing the same button class.
+  discord.py's dynamic-item registry is keyed by compiled template,
+  shared across every message carrying a matching subclass, and not
+  refcounted, so two distinct discord.py mechanisms could each clear the
+  shared pattern for every button using it: any one view's teardown
+  (`exit()`, a natural timeout, `replace()`, a push/pop navigation
+  commit, or a caller's own direct `stop()` call, reachable for any view
+  CascadeUI sends that also carries at least one ordinary component
+  alongside the dynamic one), and, independently, a live view's OWN edit dropping a
+  dynamic-item class it used to carry (the ephemeral refresh-handoff
+  timer swapping a view down to a bare "Continue Session" button is the
+  concrete case). Every seam that reaches either mechanism now re-drives
+  the full dynamic-item registry with the bot immediately afterward: the
+  teardown seams close the gap before another view's teardown can widen
+  it further, and every successful render (`refresh()`, navigation's
+  destination edit) closes it before another view's edit can reopen it. A
+  natural timeout, which discord.py clears before any hook runs, carries
+  its own repair at the exact point discord.py calls it, unreachable by a
+  subclass overriding the public `on_timeout()` hook without `super()`.
+  The same recovery `PersistenceManager.reattach()` already performs on
+  every pass.
+
+---
+
 ## [3.12.1] - 2026-08-24
 
 ### Added
