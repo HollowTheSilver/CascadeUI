@@ -3939,17 +3939,19 @@ class TestActingViewFastPath:
 
 
 class TestEphemeralActingRefresh:
-    """Ephemeral acting views edit through the webhook without pre-deferring.
+    """Ephemeral acting views use the same edit-as-ack fast path as
+    non-ephemeral ones.
 
-    The edit ships through ``self._message.edit()`` -- the
-    ``InteractionMessage`` / ``WebhookMessage`` whose ``.edit()`` routes
-    through the webhook on the original send's token, independent of the
-    click's ack -- so it lands without first waiting on a deferred-update
-    round-trip. ``refresh()`` does not defer; the click is acknowledged
-    after the callback by the post-callback defer in ``_scheduled_task``
-    (or by the auto-defer timer when the edit is slow). The edit-as-ack
-    fast path stays in force for non-ephemeral views, where the edit is
-    fast enough to double as the ack.
+    ``interaction.response.edit_message()`` is an UPDATE_MESSAGE response
+    scoped to the CURRENT click's own interaction and token (independent
+    of the ephemeral message's original send token), so it works
+    identically regardless of ephemeral status. That is unlike
+    ``self._message.edit()``, a webhook PATCH bound to the ORIGINAL send's
+    token, which is the genuinely slower path (and the one a disqualified
+    or failed fast path still falls through to). ``acting``'s three
+    preconditions (component type, message present, message id match)
+    already establish everything the fast path needs; ephemeral status
+    is not a fourth precondition.
     """
 
     def _make_ephemeral_view(self):
@@ -3975,10 +3977,11 @@ class TestEphemeralActingRefresh:
         interaction.response.is_done.return_value = is_done
         return interaction
 
-    async def test_acting_ephemeral_edits_through_webhook_without_predefer(self):
-        """No pre-defer in refresh(): skip the edit-as-ack fast path and ship
-        the edit straight through the webhook handle (``self._message``). The
-        click's ack is delegated to _scheduled_task's post-callback defer.
+    async def test_acting_ephemeral_uses_the_fast_path(self):
+        """An open response slot on an acting ephemeral view ships the edit
+        through ``interaction.response.edit_message`` -- the same one
+        round-trip a non-ephemeral acting view gets. The webhook handle
+        (``self._message``) is never touched.
         """
         view = self._make_ephemeral_view()
         interaction = self._make_acting_interaction()
@@ -3989,17 +3992,32 @@ class TestEphemeralActingRefresh:
         finally:
             _CURRENT_INTERACTION.reset(token)
 
-        # refresh() does not ack -- no deferred update fires here.
-        interaction.response.defer.assert_not_called()
-        # The edit-as-ack fast path is reserved for non-ephemeral views.
+        interaction.response.edit_message.assert_awaited_once_with(view=view)
+        view._message.edit.assert_not_called()
+
+    async def test_already_deferred_ephemeral_falls_through_to_webhook(self):
+        """The response slot was already consumed (a queued interaction the
+        auto-defer timer beat) -- the fast path is disqualified and the edit
+        falls through to the webhook handle, exactly as a disqualified
+        non-ephemeral acting view does.
+        """
+        view = self._make_ephemeral_view()
+        interaction = self._make_acting_interaction(is_done=True)
+
+        token = _CURRENT_INTERACTION.set(interaction)
+        try:
+            await view.refresh()
+        finally:
+            _CURRENT_INTERACTION.reset(token)
+
         interaction.response.edit_message.assert_not_called()
-        # The edit shipped through the webhook handle.
         view._message.edit.assert_awaited_once_with(view=view)
 
     async def test_non_acting_ephemeral_edits_without_a_defer(self):
         """Background ephemeral refreshes (no bound interaction) edit straight
         through the webhook handle -- no deferred ack fires because there is
-        nothing to acknowledge.
+        nothing to acknowledge, and there is no acting click for the fast
+        path to piggyback onto.
         """
         view = self._make_ephemeral_view()
 

@@ -21,7 +21,7 @@ from discord.ui import File as UIFile
 from discord.ui import Item, MediaGallery, Separator, TextDisplay, Thumbnail
 from discord.ui.select import BaseSelect
 
-from ..components.base import StatefulButton
+from ..components.base import StatefulButton, _dynamic_button_classes
 from ..components.types import MAX_MESSAGE_CHARACTERS, EmojiInput
 from ..exceptions import InstanceLimitError
 from ..state.actions import ActionCreators
@@ -2496,6 +2496,24 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 frozen += 1
         return frozen
 
+    def _dispatch_timeout(self):
+        """Repair the dynamic-item registry at the actual discord.py choke point.
+
+        discord.py's internal timer calls this method directly (not
+        ``stop()``) to invoke the cancel callback and then schedule
+        ``on_timeout()`` as a separate task. ``on_timeout()`` is a
+        documented override point ("Override this method to delete the
+        message on timeout instead"), so a subclass overriding it without
+        calling ``super()`` would silently skip a repair placed there.
+        Overriding this method instead runs the repair unconditionally,
+        synchronously, right after ``super()._dispatch_timeout()`` returns
+        -- after discord.py's own pop and after ``on_timeout`` has been
+        scheduled as a task, but before that task gets a chance to run,
+        regardless of what any override of the public hook does.
+        """
+        super()._dispatch_timeout()
+        self._redrive_dynamic_items()
+
     async def on_timeout(self) -> None:
         """Called when the view times out. Disables all components and cleans up state.
 
@@ -3369,16 +3387,22 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             # value. Disqualified cases (modal interactions, cross-view
             # message mismatch, already-deferred response, missing message
             # ref) fall through to the existing webhook/channel paths.
-            # Ephemeral acting views take the ack-first branch instead: a
-            # webhook-only edit runs too slowly to double as the ack without
-            # risking the 3s deadline.
+            #
+            # Applies identically to an ephemeral acting view: this call is
+            # an UPDATE_MESSAGE response scoped to the CURRENT click's own
+            # interaction and token, independent of the ephemeral message's
+            # original send token -- unlike ``self._message.edit()``, which
+            # is a webhook PATCH against that original token and is the
+            # genuinely slower path a disqualified or failed fast path
+            # still falls through to below (the channel endpoint for a
+            # non-ephemeral view, the webhook for an ephemeral one).
             #
             # The fast path couples ack to edit in one HTTP call. A slow
             # edit response from Discord (latency spike, ephemeral backend
             # under load) would starve the ack past the 3s interaction
             # deadline. The ``wait_for`` guard caps the fast path below
-            # ``auto_defer_delay`` so a stall cancels the fast path and falls through
-            # to the channel endpoint -- the auto-defer timer then ships
+            # ``auto_defer_delay`` so a stall cancels the fast path and skips
+            # the fall-through below -- the auto-defer timer then ships
             # a standalone ack at ``auto_defer_delay`` seconds, well inside
             # the 3s window. ``_response_type`` is set only after the await
             # in discord.py, so cancellation leaves the interaction "not
@@ -3388,7 +3412,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             # needs one condition beyond it: the response slot must still be
             # open, since the edit rides the ack packet.
             slot_open = acting and not interaction.response.is_done()
-            if slot_open and not self._ephemeral:
+            if slot_open:
                 fast_path_timeout = max(0.5, self.auto_defer_delay - 1.0)
                 try:
                     await asyncio.wait_for(
@@ -3399,6 +3423,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     if perf_on:
                         store._record_edit()
                     self._stamp_cooldown(acting=acting)
+                    self._redrive_dynamic_items()
                     return RenderOutcome.RENDERED
                 except asyncio.TimeoutError as e:
                     if isinstance(e, aiohttp.ClientError):
@@ -3406,23 +3431,25 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                         return RenderOutcome.DROPPED
                     logger.debug(
                         f"Acting-view fast path exceeded {fast_path_timeout:.2f}s "
-                        f"in {type(self).__name__}; channel-endpoint fall-through "
-                        f"skipped, auto-defer timer handles ack"
+                        f"in {type(self).__name__}; fall-through skipped, "
+                        f"auto-defer timer handles ack"
                     )
-                    # Fast path was cancelled. Channel-endpoint fall-through
-                    # would ship a second edit attempt (~500ms) on top of
-                    # the cancelled fast path, draining the auto-defer
-                    # timer's budget for its own ack call -- under genuine
-                    # Discord-side latency the cumulative cost crosses the
-                    # 3s deadline and the user sees an interaction-failed
-                    # toast. Returning here lets the timer ack at
-                    # ``auto_defer_delay`` seconds with the full remaining
-                    # budget. Whether Discord processed the cancelled edit
-                    # server-side is indeterminate (cancellation race), so
-                    # invalidate the digest -- the next refresh ships
-                    # unconditionally, a redundant edit (when Discord did
-                    # process this one) is cheaper than a stuck UI (when
-                    # it did not).
+                    # Fast path was cancelled. Falling through would ship a
+                    # second edit attempt on top of the cancelled one:
+                    # a channel PATCH (~500ms) for a non-ephemeral view, or
+                    # the ``edit_timeout``-bounded webhook edit (default 60s)
+                    # for an ephemeral one, a far larger bite out of the
+                    # auto-defer timer's ack budget. Either way the
+                    # cumulative cost under genuine Discord-side latency can
+                    # cross the 3s deadline and the user sees an
+                    # interaction-failed toast. Returning here lets the
+                    # timer ack at ``auto_defer_delay`` seconds with the
+                    # full remaining budget. Whether Discord processed the
+                    # cancelled edit server-side is indeterminate
+                    # (cancellation race), so invalidate the digest: the
+                    # next refresh ships unconditionally, a redundant edit
+                    # (when Discord did process this one) is cheaper than a
+                    # stuck UI (when it did not).
                     self._last_tree_digest = None
                     return RenderOutcome.DROPPED
                 except discord.InteractionResponded:
@@ -3441,18 +3468,6 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     # Any other HTTP error falls through to the channel path
                     # so a transient failure on the interaction endpoint does
                     # not lose the edit entirely.
-            elif acting and self._ephemeral:
-                # Ephemeral acting refreshes are NOT pre-deferred here. The edit
-                # below ships through the webhook handle (self._message.edit()),
-                # which rides the original send's interaction token -- independent
-                # of this click's ack -- so it lands without first waiting on a
-                # deferred-update round-trip. The click is acknowledged after the
-                # callback by the post-callback defer in _scheduled_task, or at
-                # auto_defer_delay by the auto-defer timer (which runs outside the
-                # interaction lock) when the edit is slow. The edit-as-ack fast
-                # path stays gated to non-ephemeral views above, where the edit
-                # is fast enough to double as the ack.
-                pass
 
             # Interaction-response messages ignore embed edits via the channel
             # endpoint (PATCH /channels/{id}/messages/{id}).  When the caller
@@ -3466,6 +3481,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     if perf_on:
                         store._record_edit()
                     self._stamp_cooldown(acting=acting)
+                    self._redrive_dynamic_items()
                     return RenderOutcome.RENDERED
                 except asyncio.TimeoutError as e:
                     if isinstance(e, aiohttp.ClientError):
@@ -3498,6 +3514,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 if perf_on:
                     store._record_edit()
                 self._stamp_cooldown(acting=acting)
+                self._redrive_dynamic_items()
                 return RenderOutcome.RENDERED
             except discord.NotFound:
                 # The message was deleted out from under the view (admin
@@ -4647,6 +4664,83 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
 
     # // ========================================( Lifecycle )======================================== // #
 
+    def stop(self) -> None:
+        """Stop the view and repair discord.py's dynamic-item registry.
+
+        ``super().stop()`` reaches discord.py's ``ViewStore.remove_view``
+        via the cancel callback set in ``_start_listening_from_store``,
+        which pops every dynamic-item pattern THIS view contributed from a
+        dict keyed by compiled template, shared by every message carrying
+        a matching ``DynamicPersistentButton`` subclass, with no refcount
+        against other live views using the same pattern. Wrapping the one
+        choke point every teardown path reaches (``exit()``, ``replace()``,
+        ``_commit_source_teardown()``, or a caller's own direct ``stop()``
+        call) means no future teardown path can reintroduce the gap by
+        forgetting the repair. discord.py's own timeout dispatch bypasses
+        this method entirely (it invokes the cancel callback directly, not
+        ``stop()``), so :meth:`_dispatch_timeout` carries its own explicit
+        repair.
+        """
+        super().stop()
+        self._redrive_dynamic_items()
+
+    def _redrive_dynamic_items(self) -> None:
+        """Repair discord.py's dynamic-item registry.
+
+        Re-drives the full registry with the bot (the same recovery
+        ``PersistenceManager.reattach()`` already performs on every pass),
+        harmless and idempotent for a view that carries no dynamic item.
+        Two distinct discord.py mechanisms wipe the registry, and this
+        method is called from a seam covering each: :meth:`stop` and
+        :meth:`_dispatch_timeout` repair the teardown-time wipe
+        (``ViewStore.remove_view``, keyed on the stopping view's own
+        pattern set). ``refresh()``'s three successful-edit returns and
+        navigation's destination edit repair a SEPARATE, steady-state wipe:
+        every live-view edit re-runs ``ViewStore.add_view``, which diffs
+        the view's previous component snapshot against its new one and
+        pops any dynamic-item pattern no longer present. This is reachable
+        whenever a live view's tree stops carrying a
+        ``DynamicPersistentButton`` class it used to; the ephemeral
+        refresh-handoff timer swapping a view down to a single "Continue
+        Session" button is the concrete case. Both mechanisms corrupt the
+        same shared dict, and a fix for one is not a fix for the other.
+
+        No-op, at debug, when none of the four bot-resolution tiers below
+        yields a real ``discord.Client`` (a view with no interaction, no
+        bot-bearing context, no restored ``_bot``, and no persistence
+        manager) -- matching the no-op ``PersistenceManager`` already
+        documents on the same shape. Silent here would leave a repair the
+        rest of the codebase believes is in place quietly not running, and
+        the resulting symptom is indistinguishable from the original defect.
+        """
+        if not _dynamic_button_classes:
+            return
+        # ``_bot`` covers a restored persistent view, which has neither an
+        # interaction nor a context (see _resolve_allowed_mentions for the
+        # same gap). The persistence-manager fallback covers a non-persistent
+        # view sent through a bare channel context that carries no ``.bot``
+        # attribute at all -- reachable now that this repair is not limited
+        # to persistent views.
+        bot = (
+            getattr(self.interaction, "client", None)
+            or getattr(self.context, "bot", None)
+            or getattr(self, "_bot", None)
+            or getattr(getattr(self.state_store, "persistence_manager", None), "_bot", None)
+        )
+        # Type-checked, not truthiness-checked: ``context``/``_bot`` are read
+        # off whatever the caller supplied, and only a real Client exposes
+        # add_dynamic_items with the expected contract.
+        if isinstance(bot, discord.Client):
+            bot.add_dynamic_items(*_dynamic_button_classes.values())
+        else:
+            logger.debug(
+                f"{type(self).__name__} could not resolve a discord.Client to "
+                f"re-drive the dynamic-item registry (interaction, context, "
+                f"_bot, and the persistence manager each named no client, or "
+                f"named something that isn't one); a DynamicPersistentButton "
+                f"this view carried may stay unrouteable for other messages."
+            )
+
     async def exit(self, delete_message: bool | None = None):
         """Cleanly exit and clean up this view.
 
@@ -4671,7 +4765,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         # Cancel all tasks owned by this view
         self.task_manager.cancel_tasks(self.id)
 
-        # Stop this view
+        # Stop this view (also repairs the dynamic-item registry, see stop())
         self.stop()
 
         # Unsubscribe before tearing down so the view's own subscriber does
