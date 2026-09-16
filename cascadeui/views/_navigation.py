@@ -623,6 +623,7 @@ class _NavigationMixin:
                 await self._ack_bounded(
                     current_interaction.response.edit_message(view=new_view, **direct_kwargs)
                 )
+                new_view._has_rendered = True
                 new_view._redrive_dynamic_items()
                 return True
             except asyncio.TimeoutError:
@@ -661,6 +662,7 @@ class _NavigationMixin:
             msg = await self._bounded(
                 current_interaction.edit_original_response(view=new_view, **direct_kwargs)
             )
+            new_view._has_rendered = True
             # Preserve the parent's plain Message ref. The edit response
             # is an InteractionMessage / WebhookMessage bound to the
             # 15-minute interaction token; subsequent edits need the

@@ -1248,6 +1248,148 @@ class TestReattachOnBind:
         assert captured["view"].db == "POOL"
 
 
+class TestReattachBaselineDigest:
+    """``_reattach_one`` stamps ``_reattach_baseline_digest`` with the tree a
+    fresh ``__init__`` produced, so a teardown before ``on_restore`` ever
+    renders can tell "untouched since reattach" apart from "a teardown
+    override composed real content" -- the second case has to ship even
+    though the view itself was never rendered.
+    """
+
+    def _stub_seams(self, cls):
+        async def _fake_register(self):
+            pass
+
+        async def _fake_update(self, message):
+            pass
+
+        cls._register_state = _fake_register
+        cls._update_message_state = _fake_update
+        cls._validate_custom_ids = lambda self: None
+
+    async def _row(self, key, cls):
+        be = InMemoryBackend()
+        await be.initialize()
+        await be.row_upsert(
+            TABLE_PERSISTENT_VIEWS,
+            {
+                "persistence_key": key,
+                "view_class": cls.__qualname__,
+                "custom_id": None,
+                "message_id": 1,
+                "channel_id": 2,
+                "guild_id": None,
+                "user_id": None,
+                "session_id": None,
+                "init_kwargs": json.dumps({"persistence_key": key}),
+                "kwargs_schema_version": 1,
+                "schema_version": 1,
+                "created_at": 1,
+                "updated_at": 1,
+            },
+            ["persistence_key"],
+        )
+        mgr = PersistenceManager(store=get_store(), registry=RegistryPersistence(backend=be))
+        await mgr.rehydrate()
+        return mgr
+
+    async def _reattach(self, cls, key):
+        from cascadeui.views.persistent import PersistentLayoutView  # noqa: F401
+
+        self._stub_seams(cls)
+        mgr = await self._row(key, cls)
+
+        class _Msg:
+            id = 1
+
+            async def edit(self, **kwargs):
+                self.edited_with = kwargs
+
+            async def delete(self):
+                self.deleted = True
+
+        message = _Msg()
+
+        class _FakeBot:
+            def add_view(self, view, message_id):
+                pass
+
+        mgr._bot = _FakeBot()
+        restored_views = []
+        outcome = await mgr._reattach_one(
+            row=mgr._registry_rows[0],
+            view_cls=cls,
+            init_kwargs={"persistence_key": key},
+            message=message,
+            class_name=cls.__qualname__,
+            restored_views=restored_views,
+        )
+        assert outcome == "restored"
+        return restored_views[0], message
+
+    async def test_baseline_matches_a_fresh_non_empty_tree(self):
+        """The stamp is a fingerprint, not a sentinel: confirm it equals
+        the tree __init__ actually built, on the exact view instance
+        reattach constructed, and differs across two views whose trees
+        differ. Every empty V2 tree hashes to the same constant, so an
+        empty fixture here cannot tell a real computation from a
+        hardcoded one. __init__ has to build something.
+        """
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        class _EmptyPanel(PersistentLayoutView):
+            pass
+
+        class _BuiltPanel(PersistentLayoutView):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.add_item(discord.ui.TextDisplay("Loading..."))
+
+        empty_view, _ = await self._reattach(_EmptyPanel, "baseline:empty")
+        built_view, _ = await self._reattach(_BuiltPanel, "baseline:built")
+
+        assert built_view._reattach_baseline_digest is not None
+        assert built_view._reattach_baseline_digest == built_view._compute_tree_digest()
+        assert built_view._reattach_baseline_digest != empty_view._reattach_baseline_digest
+        assert built_view._has_rendered is False
+
+    async def test_untouched_restored_view_skips_the_teardown_edit(self):
+        """Nothing has changed the tree since reattach, so there is
+        nothing on screen for the teardown edit to correct -- the
+        original defect this stamp exists to keep fixed."""
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        class _EmptyPanel(PersistentLayoutView):
+            pass
+
+        view, message = await self._reattach(_EmptyPanel, "baseline:untouched")
+
+        await view.exit(delete_message=False)
+
+        assert not hasattr(message, "edited_with")
+
+    async def test_farewell_card_composed_before_teardown_still_ships(self):
+        """A teardown override that composes new content before delegating
+        to ``super()`` runs whether or not ``on_restore`` ever rendered --
+        its farewell card is not the empty tree the skip exists for, and
+        has to reach the message even though ``_has_rendered`` is still
+        False."""
+        from cascadeui.components.patterns.v2 import card
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        class _FarewellPanel(PersistentLayoutView):
+            async def exit(self, delete_message=None):
+                self.clear_items()
+                self.add_item(card("Session expired."))
+                return await super().exit(delete_message=delete_message)
+
+        view, message = await self._reattach(_FarewellPanel, "baseline:farewell")
+
+        await view.exit(delete_message=False)
+
+        assert hasattr(message, "edited_with")
+
+
 class TestSendTimeBind:
     """``_bind_from_context`` (the send-time seam) forwards ``on_bind`` when
     the construction context resolves a bot, and ``send()`` invokes it."""

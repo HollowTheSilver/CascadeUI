@@ -184,7 +184,7 @@ if "PostgresBackend" in _persistence_all:
 # // ========================================( Script )======================================== // #
 
 
-__version__ = "3.12.2"
+__version__ = "3.12.3"
 
 # Export public API
 __all__ = [

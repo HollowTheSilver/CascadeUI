@@ -5,7 +5,7 @@ import inspect
 import io
 import logging
 import time
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
 import discord
@@ -5677,6 +5677,114 @@ class TestRebuiltTreeShipsOnTeardown:
         await view.on_timeout()
 
         message.edit.assert_awaited_once()
+
+    async def test_exit_skips_the_edit_for_a_view_that_never_rendered(self):
+        """A view reattached from persistence but not yet rendered has no
+        baseline on screen for this edit to correct.
+
+        No ``send()`` and no ``refresh()`` runs here, so ``_has_rendered``
+        stays at its ``__init__`` default of ``False`` -- matching a view
+        between reattach and its deferred post-ready render.
+        """
+        view = RenderableLayoutView(interaction=_make_interaction(), user_id=1, guild_id=2)
+        message = self._wire(view)
+        assert view._has_rendered is False
+
+        await view.exit(delete_message=False)
+
+        message.edit.assert_not_called()
+
+    async def test_on_timeout_skips_the_edit_for_a_view_that_never_rendered(self):
+        view = RenderableLayoutView(interaction=_make_interaction(), user_id=1, guild_id=2)
+        message = self._wire(view)
+        assert view._has_rendered is False
+
+        await view.on_timeout()
+
+        message.edit.assert_not_called()
+
+    async def test_exit_still_ships_a_rebuild_when_the_digest_was_never_stamped(self):
+        """``_last_tree_digest`` is ``None`` for more than one reason, and
+        only "never rendered" means "skip".
+
+        A push/pop navigation landing never stamps the destination's digest,
+        so a pushed view carries ``_has_rendered = True`` (content is
+        genuinely on screen) alongside ``_last_tree_digest = None`` for its
+        whole life until some later refresh happens to land. Gating the
+        teardown skip on the digest alone would misread that combination as
+        "never rendered" and drop a farewell card composed just before
+        teardown -- the exact defect the digest comparison exists to catch.
+        """
+        view = RenderableLayoutView(interaction=_make_interaction(), user_id=1, guild_id=2)
+        view.add_item(ActionRow(StatefulButton(label="Accept")))
+        await view.send()
+        message = self._wire(view)
+
+        # Simulate the state a navigation landing leaves behind: rendered,
+        # but with no stamped digest.
+        view._last_tree_digest = None
+        view.clear_items()
+        view.add_item(card("Challenge expired."))
+
+        await view.exit(delete_message=False)
+
+        message.edit.assert_awaited_once()
+
+    async def test_on_timeout_still_ships_a_rebuild_when_the_digest_was_never_stamped(self):
+        view = RenderableLayoutView(interaction=_make_interaction(), user_id=1, guild_id=2)
+        view.add_item(ActionRow(StatefulButton(label="Accept")))
+        await view.send()
+        message = self._wire(view)
+
+        view._last_tree_digest = None
+        view.clear_items()
+        view.add_item(card("Challenge expired."))
+
+        await view.on_timeout()
+
+        message.edit.assert_awaited_once()
+
+    async def test_has_rendered_survives_a_raising_digest_after_send(self):
+        """``_has_rendered`` means "the send landed", stamped before the
+        digest computation that follows it.
+
+        A user subclass's tree can raise inside ``_compute_tree_digest``
+        (a property read on a live item) after the send already reached
+        Discord. ``_send_pipeline`` swallows that raise and drops the
+        digest to ``None``, but the flag must not depend on the digest
+        computation succeeding -- otherwise a view Discord is genuinely
+        showing would read as never rendered at its next teardown.
+        """
+        view = RenderableLayoutView(interaction=_make_interaction(), user_id=1, guild_id=2)
+
+        with patch.object(type(view), "_compute_tree_digest", side_effect=RuntimeError("boom")):
+            await view.send()
+
+        assert view._has_rendered is True
+        assert view._last_tree_digest is None
+
+        message = self._wire(view)
+        view.clear_items()
+        view.add_item(card("Challenge expired."))
+
+        await view.exit(delete_message=False)
+
+        message.edit.assert_awaited_once()
+
+    async def test_refresh_marks_the_view_as_rendered_without_a_prior_send(self):
+        """A view can land its first tree through ``refresh()`` rather than
+        ``send()`` -- a persistence-restored view's ``on_restore()`` calling
+        ``reload()``/``refresh()`` is the production shape this covers. The
+        flag has to flip there too, or a teardown right after would read a
+        genuinely rendered view as never rendered.
+        """
+        view = RenderableLayoutView(interaction=_make_interaction(), user_id=1, guild_id=2)
+        message = self._wire(view)
+        assert view._has_rendered is False
+
+        await view.refresh()
+
+        assert view._has_rendered is True
 
 
 class TestTimeoutWindowStillRenders:

@@ -23,6 +23,24 @@ preserved below for historical reference but are not the supported baseline.
 
 ---
 
+## [3.12.3] - 2026-09-16
+
+### Fixed
+
+- **`exit()` and `on_timeout()` no longer send an empty message for a view
+  reattached from persistence but not yet rendered.** A restored view is
+  registered and message-bound before its post-ready render runs, so
+  tearing it down in that window read the absent render baseline as
+  "always changed" and shipped whatever the constructor produced --
+  typically empty for a pattern that builds its tree in `on_load`, which
+  Discord rejects with error 50006. Both teardown paths now skip the
+  cosmetic edit when nothing froze and nothing has changed since restore,
+  leaving the message's existing content in place; a teardown override
+  that composes new content before delegating still ships it, restored
+  or not.
+
+---
+
 ## [3.12.2] - 2026-09-12
 
 ### Changed

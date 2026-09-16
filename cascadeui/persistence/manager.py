@@ -1396,6 +1396,14 @@ class PersistenceManager:
             # runs.
             view._message = message
 
+            # Fingerprint the tree the fresh __init__ just produced, before
+            # on_restore has had any chance to run. A teardown before that
+            # render reads this against the CURRENT tree: unchanged means
+            # nothing has touched it and there is nothing on screen to
+            # correct, changed means a teardown override composed real
+            # content (a farewell card) that has to ship regardless.
+            view._reattach_baseline_digest = view._compute_tree_digest()
+
             # ``is not None`` (not truthy) so a stored ``user_id=0`` still
             # restores -- Discord doesn't mint zero snowflakes, but tests
             # and edge-case fixtures do, and the cost of the explicit form
