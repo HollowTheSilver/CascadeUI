@@ -1097,11 +1097,14 @@ class TestNavigationFastPath:
         await root.send()
 
         nav = _make_interaction(user_id=1, guild_id=100, is_done=False)
-        await root.push(_Sub, interaction=nav)
+        dest = await root.push(_Sub, interaction=nav)
 
         # One round-trip: edit + ack together, no separate defer.
         nav.response.edit_message.assert_awaited_once()
         nav.response.defer.assert_not_called()
+        # The fast-path landing is a real render: a teardown right after
+        # must not read it as "never rendered" (see _freeze_edit_needed).
+        assert dest._has_rendered is True
 
     async def test_push_falls_back_to_deferred_edit_when_acked(self):
         class _Root(StatefulView):
@@ -1119,10 +1122,11 @@ class TestNavigationFastPath:
         nav.edit_original_response = AsyncMock(
             return_value=MagicMock(id=777, channel=MagicMock(id=666))
         )
-        await root.push(_Sub, interaction=nav)
+        dest = await root.push(_Sub, interaction=nav)
 
         nav.response.edit_message.assert_not_called()
         nav.edit_original_response.assert_awaited_once()
+        assert dest._has_rendered is True
 
     async def test_push_non_component_interaction_skips_fast_path(self):
         """A non-component interaction (e.g. a slash command) is ineligible for

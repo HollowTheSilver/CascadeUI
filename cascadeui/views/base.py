@@ -1143,6 +1143,23 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         # ``None`` means no baseline has been recorded yet, so the
         # next refresh always runs through to the REST call.
         self._last_tree_digest: Optional[int] = None
+        # Distinct from the digest above: this is never reset back to False
+        # once a tree has landed on Discord, even when a stall or a send
+        # failure clears the digest to force the next refresh through
+        # unconditionally. The teardown freeze-edit gate reads this rather
+        # than "digest is not None", since that comparison would otherwise
+        # misread every one of those deliberate baseline-drops as "never
+        # rendered" and skip an edit that has real content to correct.
+        self._has_rendered: bool = False
+        # Stamped once, by the persistence reattach path only, with the
+        # digest of the tree a fresh __init__ produced -- before on_restore
+        # has had any chance to run. Lets the teardown gate tell "restored,
+        # never rendered, and nothing has touched the tree since" (matches
+        # this baseline, safe to skip) apart from "restored, never rendered,
+        # but a teardown override composed real content before delegating"
+        # (differs from this baseline, has to ship). Left None for every
+        # view that was never reattached, where _has_rendered alone governs.
+        self._reattach_baseline_digest: Optional[int] = None
         # Set by ``refresh`` when it swallowed a transport failure, so a
         # caller that needs the edit to have LANDED can tell that apart from
         # a refresh that returned normally. A repaint is content to retry on
@@ -1857,6 +1874,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             # embed content is outside the digest, which is fine -- the
             # digest only certifies the component tree, and refresh() only
             # short-circuits when the caller passes no kwargs.
+            self._has_rendered = True
             self._last_tree_digest = self._compute_tree_digest()
 
             await self._update_message_state(self._message)
@@ -2496,6 +2514,48 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 frozen += 1
         return frozen
 
+    def _freeze_edit_needed(self, froze: bool) -> bool:
+        """Whether a teardown freeze edit has something new to ship.
+
+        ``froze`` alone answers "did disabling components change anything",
+        which misses a caller that rebuilt the tree (a farewell card) before
+        tearing down -- the digest comparison is what catches that case.
+
+        The comparison is gated on ``_has_rendered`` rather than on
+        ``_last_tree_digest is not None``, because the digest is ``None``
+        for two different reasons and only one of them means "nothing on
+        screen": a view that has never landed a tree (restored from
+        persistence, its post-ready render still pending: ``self.children``
+        is whatever ``__init__`` produced, typically empty for a pattern
+        that builds its tree in ``on_load``, which Discord rejects with
+        error 50006), and a view that HAS rendered but had its digest
+        deliberately dropped so the next refresh ships unconditionally (a
+        stalled edit, a swallowed transport failure, a navigation landing
+        that never stamps a digest at all). Gating on the digest alone
+        would read the second case as "never measured" and skip an edit
+        that has real, possibly stale content to correct, silently
+        dropping a farewell card composed just before teardown -- the
+        exact defect this guard exists to catch.
+
+        A never-rendered view can still have something to ship: a teardown
+        override (``exit()``, ``on_timeout()``) that composes new content
+        before delegating to ``super()`` runs whether or not ``on_restore``
+        ever rendered first, and its farewell card is not the empty tree
+        this guard exists to withhold. ``_reattach_baseline_digest``, stamped
+        once at reattach with the digest of whatever a fresh ``__init__``
+        produced, tells the two apart: a tree that still matches it has
+        nothing on screen to correct (the original defect this method
+        fixes), a tree that no longer matches it was composed by something
+        real and has to ship.
+        """
+        if froze:
+            return True
+        if self._has_rendered:
+            return self._compute_tree_digest() != self._last_tree_digest
+        if self._reattach_baseline_digest is None:
+            return False
+        return self._compute_tree_digest() != self._reattach_baseline_digest
+
     def _dispatch_timeout(self):
         """Repair the dynamic-item registry at the actual discord.py choke point.
 
@@ -2534,14 +2594,8 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         self.state_store._undo_enabled_views.pop(self.id, None)
         await self.state_store._destroy_view(self.id, source_id=self.id)
 
-        # Skip the edit only when it would ship what is already on screen: a
-        # component-less display view (or one already fully disabled) would
-        # otherwise send a no-op PATCH on every timeout. The tree is checked
-        # alongside the freeze because an override that rebuilds before
-        # delegating here has something to say even though nothing froze.
-        if self._message and (
-            self._freeze_components() or self._compute_tree_digest() != self._last_tree_digest
-        ):
+        # See _freeze_edit_needed for what "nothing to ship" covers here.
+        if self._message and self._freeze_edit_needed(self._freeze_components()):
             try:
                 await self._bounded(self._message.edit(**self._freeze_edit_kwargs()))
             except discord.NotFound:
@@ -3419,6 +3473,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                         interaction.response.edit_message(view=self, **kwargs),
                         timeout=fast_path_timeout,
                     )
+                    self._has_rendered = True
                     self._last_tree_digest = self._compute_tree_digest()
                     if perf_on:
                         store._record_edit()
@@ -3477,6 +3532,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             if ("embed" in kwargs or "embeds" in kwargs) and self._webhook_message:
                 try:
                     await self._bounded(self._webhook_message.edit(view=self, **kwargs))
+                    self._has_rendered = True
                     self._last_tree_digest = self._compute_tree_digest()
                     if perf_on:
                         store._record_edit()
@@ -3510,6 +3566,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
 
             try:
                 await self._bounded(self._message.edit(view=self, **kwargs))
+                self._has_rendered = True
                 self._last_tree_digest = self._compute_tree_digest()
                 if perf_on:
                     store._record_edit()
@@ -4790,15 +4847,8 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 elif self._is_layout():
                     # V2 messages ARE their components -- edit(view=None) would
                     # produce an empty message (error 50006). Freeze instead.
-                    # The edit is skipped only when it would ship what is
-                    # already on screen: nothing froze AND the tree still
-                    # matches the last render. Testing the freeze alone read
-                    # a caller who rebuilt the tree before exiting as having
-                    # nothing to say, so a farewell card composed in
-                    # on_timeout was dropped and the expired prompt kept its
-                    # live-looking buttons until someone pressed one.
-                    froze = self._freeze_components()
-                    if froze or self._compute_tree_digest() != self._last_tree_digest:
+                    # See _freeze_edit_needed for what "nothing to ship" covers.
+                    if self._freeze_edit_needed(self._freeze_components()):
                         await self._bounded(self._message.edit(**self._freeze_edit_kwargs()))
                 else:
                     await self._bounded(self._message.edit(view=None))
