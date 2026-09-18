@@ -306,7 +306,7 @@ def _build_form_modal(form, title: str) -> CascadeModal:
         view_id=form.id,
     )
     # Carry the form's configured backstop onto the modal instance; the value is
-    # validated on the form subclass via _POSITIVE_NUMBER_ATTRS before it lands here.
+    # validated on the form subclass via _ACK_DELAY_ATTRS before it lands here.
     modal.auto_defer_delay = form.text_edit_modal_auto_defer_delay
     return modal
 
@@ -332,7 +332,7 @@ class _BaseFormMixin:
     text_edit_button_style: ClassVar[discord.ButtonStyle] = discord.ButtonStyle.secondary
     # The pattern builds its text-edit modal internally, so this is the only
     # surface a subclass has to raise that modal's ack backstop for a slow
-    # async field validator.
+    # async field validator. Must stay under Discord's 3s ack deadline.
     text_edit_modal_auto_defer_delay: ClassVar[float] = 2.5
     _BUTTON_STYLE_ATTRS: ClassVar[tuple] = (
         *_StatefulMixin._BUTTON_STYLE_ATTRS,
@@ -346,8 +346,8 @@ class _BaseFormMixin:
         *_StatefulMixin._EMOJI_ATTRS,
         "text_edit_button_emoji",
     )
-    _POSITIVE_NUMBER_ATTRS: ClassVar[tuple] = (
-        *_StatefulMixin._POSITIVE_NUMBER_ATTRS,
+    _ACK_DELAY_ATTRS: ClassVar[tuple] = (
+        *_StatefulMixin._ACK_DELAY_ATTRS,
         "text_edit_modal_auto_defer_delay",
     )
 

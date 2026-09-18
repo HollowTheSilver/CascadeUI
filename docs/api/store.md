@@ -150,6 +150,39 @@ Used by `DevToolsCog` to avoid reaching into `store._active_views`
 directly. User code that needs to iterate or count live views can
 consume the same accessor.
 
+#### `get_active_view(*, persistence_key) -> Optional[Any]`
+
+Returns the live view holding `persistence_key`, or `None`. Use it to reach
+a panel's instance from outside the view (a scheduler refreshing a posted
+panel, a command retiring one) instead of keeping your own registry of
+instances.
+
+```python
+from cascadeui import get_store
+
+panel = get_store().get_active_view(persistence_key=f"roles:panel:{guild_id}")
+if panel is not None:
+    await panel.reload()
+```
+
+- Matches the `persistence_key=` the view was constructed with. A view given
+  no key holds none, so a view id never matches; the argument is keyword-only
+  for that reason.
+- A finished view (exited, or stopped without exiting) is never returned.
+- When several unfinished views hold the key, the one the stored registration
+  points at is returned, which is the panel on screen: during a swap under
+  [`retire_previous_on_send = False`](../guide/persistence.md#replacing-a-panel-under-its-own-key)
+  that is the old panel until the new one registers. With no registration
+  (a non-persistent view keyed for a slot), the most recently registered
+  holder is returned.
+- Works whether or not persistence is installed.
+- A persistent panel that has pushed a child view still holds its key, through
+  the view now on its message: navigation replaces the instance, so the
+  destination carries the registration's message id without the key, and that
+  view is what comes back. It is not always a persistent view. The same rule
+  decides whether [`prune_registry`](persistence.md#persistencemanager) warns,
+  so the pre-flight and the warning agree.
+
 #### `merge_scoped(state, scope, data, *, slot_name="scoped", subkey=None, **identifiers)`
 
 Reducer-side writer that merges `data` into the scope bucket and returns `state`. Completes the scoped family alongside `get_scoped_from` and `iter_scoped`. Used inside custom reducers to decode the canonical `{"scope", "identifiers", "data"}` payload emitted by `view.dispatch_scoped_as(...)`.

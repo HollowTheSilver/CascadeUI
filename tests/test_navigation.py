@@ -748,6 +748,32 @@ class TestNavigationAttachmentTransfer:
 
         assert rebuilds == []
 
+    async def test_a_finished_child_leaves_both_registries_with_the_cascade(self):
+        """Quiescing it is not enough: unsubscribing is what answers "torn
+        down", so a child left in the registries reads as torn down while
+        still holding its message, and every later cleanup path skips it.
+        """
+
+        class _Parent(StatefulView):
+            pass
+
+        class _Child(StatefulView):
+            pass
+
+        parent = _Parent(interaction=_make_interaction(user_id=1, guild_id=100))
+        await parent.send()
+        child = _Child(interaction=_make_interaction(user_id=1, guild_id=100))
+        await child.send()
+        parent.attach_child(child)
+        child.stop()
+        store = child.state_store
+        assert child.id in store._active_views
+
+        await parent._cleanup_attached_children()
+
+        assert child.id not in store._active_views
+        assert child.id not in store.state["views"]
+
     async def test_parent_follows_a_re_parent(self):
         class _First(StatefulView):
             pass
@@ -1103,7 +1129,7 @@ class TestNavigationFastPath:
         nav.response.edit_message.assert_awaited_once()
         nav.response.defer.assert_not_called()
         # The fast-path landing is a real render: a teardown right after
-        # must not read it as "never rendered" (see _freeze_edit_needed).
+        # must not read it as "never rendered" (see _teardown_edit_target).
         assert dest._has_rendered is True
 
     async def test_push_falls_back_to_deferred_edit_when_acked(self):
@@ -1475,6 +1501,31 @@ class TestNavigationEditFailureRecovery:
         assert root.id in store.state["views"]
         assert sub.id not in store._active_views
         assert sub.id not in store.state["views"]
+
+    async def test_rolled_back_destination_cannot_edit_the_source_message(self):
+        """push() still returns the destination after a rollback. It carried
+        the source's message in, so without unbinding it an exit() on the
+        returned view would overwrite the recovered source on screen."""
+
+        class _Root(RenderableLayoutView):
+            pass
+
+        class _Sub(RenderableLayoutView):
+            pass
+
+        root = _Root(interaction=_make_interaction(user_id=1, guild_id=100))
+        await root.send()
+        source_message = root._message
+
+        nav = _make_interaction(user_id=1, guild_id=100, is_done=False)
+        self._break_all_edits(nav, source_message)
+        sub = await root.push(_Sub, interaction=nav)
+        assert sub._message is None
+
+        source_message.edit = AsyncMock()
+        await sub.exit(delete_message=False)
+
+        source_message.edit.assert_not_called()
 
     async def test_pop_failed_edit_keeps_source_live(self):
         store = get_store()

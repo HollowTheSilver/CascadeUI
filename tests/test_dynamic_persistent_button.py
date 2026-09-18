@@ -437,8 +437,6 @@ class TestDynamicButtonAckBackstop:
             DynamicPersistentButton,
             template=r"fast:(?P<role_id>[0-9]+)",
         ):
-            auto_defer_delay = 10  # the timer would not fire on its own
-
             def __init__(self, *, role_id: int):
                 super().__init__(discord.ui.Button(label="x", custom_id=f"fast:{role_id}"))
                 self.role_id = role_id
@@ -447,10 +445,22 @@ class TestDynamicButtonAckBackstop:
                 pass
 
         button = _FastButton(role_id=1)
+        # Set on the instance so the timer cannot fire during the test; a
+        # class-level value this large is refused at definition time.
+        button.auto_defer_delay = 10
         interaction = self._mock_interaction()
         await button.callback(interaction)
 
         interaction.response.defer.assert_called_once()
+
+    def test_delay_at_the_3s_deadline_rejected_at_definition(self, clean_registry):
+        with pytest.raises(ValueError, match="auto_defer_delay"):
+
+            class _Bad(
+                DynamicPersistentButton,
+                template=r"baddelay:(?P<role_id>[0-9]+)",
+            ):
+                auto_defer_delay = 3.0
 
 
 # // ========================================( respond() helper )======================================== // #

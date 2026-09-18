@@ -247,11 +247,11 @@ An override that neither delegates to `super().on_timeout()` nor calls `exit()` 
 
 #### `on_message_delete()` *(async, override)*
 
-Called when the view's Discord message is deleted externally (admin delete, bulk purge, channel delete). Default calls `exit(delete_message=False)`. Override for custom behavior (logging, re-sending). If overriding without calling `exit()`, the view remains as a ghost in the state store.
+Called when the view's Discord message is deleted externally: by a delete or bulk purge (reported by the gateway to a bot holding the message intents), by deleting the channel or thread holding it, or by an edit that finds the message already gone (after `on_message_gone()`). A view already torn down is not called again. Default calls `exit(delete_message=False)`. Override for custom behavior (logging, re-sending). If overriding without calling `exit()` or `super().on_message_delete()`, the view remains as a ghost in the state store. See [Message Deletion Cleanup](../guide/views.md#message-deletion-cleanup).
 
 #### `on_message_gone()` *(async, override)*
 
-Called when `refresh()` issues an edit that returns `discord.NotFound` (the message was deleted out from under the view). The library nulls `self._message` and fires this hook so a consumer tracking the message in its own store can reconcile that reference; key the reconcile on the view's stable identity (`persistence_key`), since `self._message` is already nulled. Default is a no-op. Unlike `on_message_delete()`, this hook does not exit the view (the gateway event owns teardown), which keeps it safe to fire from the reactive refresh path. The edit-path counterpart to the gateway-driven `on_message_delete()`; both can fire for one deletion, so make the reconcile idempotent. It may run while the view's update lock is held, so an override may do I/O but should not dispatch a state change back into this view.
+Called when `refresh()` issues an edit that returns `discord.NotFound` (the message was deleted out from under the view). The library nulls `self._message` and fires this hook so a consumer tracking the message in its own store can reconcile that reference; key the reconcile on the view's stable identity (`persistence_key`), since `self._message` is already nulled. Default is a no-op. The hook itself does not exit the view: once it returns, the library tears the view down on its own task through `on_message_delete()`, so an override never needs to exit, and a bot without message intents still retires the view. A deletion the gateway also reports can reach a consumer through both hooks, so make the reconcile idempotent. It may run while the view's update lock is held, so an override may do I/O but should not dispatch a state change back into this view.
 
 #### `on_replaced()` *(async, override)*
 
@@ -526,7 +526,7 @@ Called before every component callback. Returns `True` to allow, `False` to bloc
 ### Shared Class Attributes
 
 !!! note "Validated at subclass-definition time"
-    Class attributes whose values are bounded -- string enums (`instance_policy`, `instance_scope`, `state_scope`, `replace_policy`, `exit_policy`), positive integers (`instance_limit`, `participant_limit`, `undo_limit`), positive floats (`auto_defer_delay`, `edit_timeout`), and booleans (`owner_only`, `auto_defer`, `auto_register_participants`, etc.) -- are validated by `_StatefulMixin.__init_subclass__` when a subclass is defined. A typo like `instance_policy = "rejct"` raises `ValueError` at module import with a message naming the class, the attribute, the bad value, and the valid options. Validation runs once per subclass at class-definition time and inspects only `cls.__dict__`, so per-subclass cost is `O(overrides-on-this-subclass)` -- inherited defaults pay zero cost. There is no per-instantiation overhead.
+    Class attributes whose values are bounded -- string enums (`instance_policy`, `instance_scope`, `state_scope`, `replace_policy`, `exit_policy`), positive integers (`instance_limit`, `participant_limit`, `undo_limit`), positive floats (`edit_timeout`, and `auto_defer_delay`, which must also stay under `3.0`), and booleans (`owner_only`, `auto_defer`, `auto_register_participants`, etc.) -- are validated by `_StatefulMixin.__init_subclass__` when a subclass is defined. A typo like `instance_policy = "rejct"` raises `ValueError` at module import with a message naming the class, the attribute, the bad value, and the valid options. Validation runs once per subclass at class-definition time and inspects only `cls.__dict__`, so per-subclass cost is `O(overrides-on-this-subclass)` -- inherited defaults pay zero cost. There is no per-instantiation overhead.
 
 - `subscribed_actions` (set[str] | None): Action types to listen for. Default is an empty set (no notifications). Set the actions your view needs to react to. Set to `None` to receive all actions (not recommended). Every matching dispatch fires the view's `on_state_changed()`, so subscribe only to actions the view reads.
 - `state_scope` (str | None): `"user"`, `"guild"`, `"user_guild"`, `"global"`, or `None`. Determines state scoping.
@@ -549,7 +549,7 @@ Called before every component callback. Returns `True` to allow, `False` to bloc
 - `replace_policy` (str): What `instance_policy="replace"` does to the old view's message. `"delete"` (default) removes it; `"disable"` freezes its components in place. Only governs the instance-replace transition.
 - `exit_policy` (str): What bare `exit()` calls do when no `delete_message` argument is supplied. `"disable"` (default) freezes the components in place; `"delete"` removes the message. Always overridden by an explicit `delete_message=` argument or by an `exit()` method override. Independent of `replace_policy`.
 - `auto_defer` (bool): Enable the auto-defer safety net (default: `True`).
-- `auto_defer_delay` (float): Seconds before auto-deferring (default: `2.5`).
+- `auto_defer_delay` (float): Seconds before auto-deferring (default: `2.5`). Must be under `3.0`, Discord's acknowledgment deadline; a value at or past it raises `ValueError` when the subclass is defined.
 - `ack_first` (bool): Acknowledge the interaction immediately, before the access checks and the callback run (default: `False`). An advanced escape hatch for callbacks that synchronously block the event loop past `auto_defer_delay`; it trades the acting-view one-request refresh for a guaranteed early ack. Do not combine with `open_modal()` in the same callback: a modal must be the first response, and the early ack has already consumed the slot.
 - `refresh_cooldown_ms` (int | None): Proactive minimum gap between successive **background** Discord edits, in milliseconds. State-driven refreshes arriving inside an active window are coalesced into one deferred re-render that fires at the window boundary. Edits made in direct answer to a click on this view's own message are exempt and ship immediately. This paces the re-renders the library starts, and is not a spam guard. To throttle one expensive control per clicker, wrap it with `with_cooldown`. `None` (default) disables the proactive cooldown; the reactive 429 backoff is always active regardless. Validated as a positive int (`0` is rejected).
 - `serialize_interactions` (bool): Serialize rapid button clicks with an `asyncio.Lock` (default: `True`). Set to `False` for views that handle parallel callbacks.
@@ -756,7 +756,7 @@ Three class attributes mirror the `refresh_button_*` grammar; a fourth (`text_ed
 | `text_edit_button_label` | `None` | `None` → smart default: `"Edit {label}"` for one text field, `"Edit Text Fields"` for multiple. |
 | `text_edit_button_emoji` | `"\u270f\ufe0f"` (✏️) | Emoji on the grouped button. Set `None` to disable. |
 | `text_edit_button_style` | `ButtonStyle.secondary` | Button style. |
-| `text_edit_modal_auto_defer_delay` | `2.5` | Ack backstop in seconds for the grouped text-edit modal. Raise for a slow async field validator. |
+| `text_edit_modal_auto_defer_delay` | `2.5` | Ack backstop in seconds for the grouped text-edit modal. Raise for a slow async field validator, keeping it under `3.0` (Discord's acknowledgment deadline). |
 
 `FormView` (V1) exposes the same four attributes and 5-field ceiling.
 
@@ -889,7 +889,7 @@ failing later inside the page build.
 
 #### Persistent Variant
 
-`PersistentLeaderboardLayoutView` composes `_PersistentMixin` with `LeaderboardLayoutView` for admin-posted permanent panels. Defaults: `owner_only = False`, `exit_policy = "disable"`, `timeout = None`. Requires `persistence_key=` at construction. `on_restore` calls `reload()` after a bot restart to re-fetch entries, recompose the tree, and edit the message, which re-stores the panel's components so clicks route immediately.
+`PersistentLeaderboardLayoutView` composes `_PersistentMixin` with `LeaderboardLayoutView` for admin-posted permanent panels. Defaults: `owner_only = False`, `exit_policy = "disable"`, `timeout = None`. Requires `persistence_key=` at construction. `on_restore` calls `reload()` after a bot restart to re-fetch entries, recompose the tree, and edit the message, which re-stores the panel's components so clicks route immediately. An override that does not call `super().on_restore(bot)` skips that refresh.
 
 See [`docs/guide/patterns.md`](../guide/patterns.md#leaderboardlayoutview-persistentleaderboardlayoutview) for cardinality model, customization tiers, and section-mode rendering details.
 
@@ -1074,7 +1074,7 @@ The five `format_*` hooks compose inside the synchronous `build_ui` and are refu
 
 #### Persistent Variant
 
-`PersistentRolesLayoutView` composes `_PersistentMixin` with `RolesLayoutView`. Defaults: `owner_only = False`, `exit_policy = "disable"`, `timeout = None`. Requires `persistence_key=` at construction. Role buttons survive restart independent of view re-attachment because each is a globally-registered `DynamicPersistentButton` subclass. The default `on_restore` re-renders the message from the current `categories` on every restart so source-code edits propagate to the displayed message; unchanged panels pay zero API cost via the render-hash short-circuit in `refresh()`.
+`PersistentRolesLayoutView` composes `_PersistentMixin` with `RolesLayoutView`. Defaults: `owner_only = False`, `exit_policy = "disable"`, `timeout = None`. Requires `persistence_key=` at construction. Role buttons survive restart independent of view re-attachment because each is a globally-registered `DynamicPersistentButton` subclass. The default `on_restore` re-renders the message from the current `categories` on every restart so source-code edits propagate to the displayed message; unchanged panels pay zero API cost via the render-hash short-circuit in `refresh()`. An override that does not call `super().on_restore(bot)` skips that re-render, so the pre-restart panel stays on screen.
 
 See [`docs/guide/patterns.md`](../guide/patterns.md#roleslayoutview-persistentroleslayoutview) for detailed cardinality behavior, customization tiers, and examples.
 
@@ -1145,7 +1145,12 @@ PersistentView(
 - `persistence_key` must be provided (raises `ValueError`)
 - All components must have explicit `custom_id` values
 - Cannot be sent as ephemeral (`send(ephemeral=True)` raises `ValueError`)
-- Duplicate `persistence_key` registration exits the previous view instance
+- A send under a `persistence_key` another panel holds retires that panel: every other live
+  instance under the key is exited along with any view it pushed onto its message, or a message
+  left from before a restart is cleaned up
+- `retire_previous_on_send` (bool, default `True`): set `False` to leave the previous panel for
+  the caller to retire; see
+  [Replacing a panel under its own key](../guide/persistence.md#replacing-a-panel-under-its-own-key)
 
 #### Methods
 

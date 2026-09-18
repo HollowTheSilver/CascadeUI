@@ -563,6 +563,11 @@ class InspectorView(TabLayoutView):
 
         # Exit live instances first
         for view_id, view in list(active.items()):
+            # One view's exit cascades to the children attached to it, so a
+            # snapshot taken before the first exit can name a view that is
+            # already gone by the time the loop reaches it.
+            if view._torn_down():
+                continue
             try:
                 await view.exit()
                 exited += 1
@@ -1429,6 +1434,9 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
         for view_id, view in list(active.items()):
             if gid is not None and getattr(view, "guild_id", None) != gid:
                 continue
+            # A view an earlier exit cascaded to is already gone.
+            if view._torn_down():
+                continue
             try:
                 await view.exit()
                 exited += 1
@@ -1525,6 +1533,9 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
         # state half-torn-down.
         failed = 0
         for view_id, view in list(store.get_active_views().items()):
+            # A view an earlier exit cascaded to is already gone.
+            if view._torn_down():
+                continue
             try:
                 await view.exit()
             except Exception as exc:
@@ -1534,6 +1545,13 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
         # Reset state via the canonical shape helper so new top-level keys
         # added to ``StateStore.__init__`` flow through here automatically.
         store.state = StateStore._build_initial_state()
+
+        # The registry mirror is rebuilt rather than left empty: rows the exit
+        # loop above did not delete are still on disk, and a mirror that has
+        # forgotten them retires nothing when their key is exited later.
+        manager = getattr(store, "persistence_manager", None)
+        if manager is not None:
+            manager.reseed_registry_mirror()
 
         # Observability: invalidate every @computed so cached aggregates
         # recompute against the empty state on next access, and clear the
@@ -1669,7 +1687,8 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
         live panel. The cost is that a channel the bot will never see
         again is re-fetched every startup. This surfaces how long each
         one has been that way, and hands the delete decision to whoever
-        runs the command.
+        runs the command, or to the daily sweep when the middleware sets
+        ``prune_unreachable_after_days``.
         """
         store = get_store()
         manager = getattr(store, "persistence_manager", None)

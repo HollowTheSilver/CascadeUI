@@ -386,7 +386,13 @@ async def reduce_persistent_view_unregistered(action: Action, state: StateData) 
         return state
 
     persistent_views = state.get("persistent_views", {})
-    if persistence_key not in persistent_views:
+    entry = persistent_views.get(persistence_key)
+    if entry is None:
+        return state
+    # A superseded panel exiting must not take its successor's registration
+    # with it: the key now points at a different message.
+    message_id = payload.get("message_id")
+    if message_id is not None and entry.get("message_id") not in (None, message_id):
         return state
 
     return {

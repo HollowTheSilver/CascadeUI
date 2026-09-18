@@ -311,6 +311,7 @@ class TestMiddlewareRoutesRegistry:
         # Stub a live view in _active_views matching the persistence_key.
         fake_view = SimpleNamespace(
             _persistence_key="TicketPanel:msg:42",
+            is_finished=lambda: False,
             _init_kwargs={"channel_id": 5},
             kwargs_schema_version=1,
             session_id="TicketPanel:global",
@@ -368,6 +369,7 @@ class TestMiddlewareRoutesRegistry:
         fake_theme = SimpleNamespace(name="dark", accent_colour=0x123456)
         fake_view = SimpleNamespace(
             _persistence_key="TicketPanel:msg:99",
+            is_finished=lambda: False,
             _init_kwargs={
                 "channel_id": 5,
                 "persistence_key": "TicketPanel:msg:99",
@@ -423,6 +425,7 @@ class TestMiddlewareRoutesRegistry:
 
         fake_view = SimpleNamespace(
             _persistence_key="TicketPanel:msg:50",
+            is_finished=lambda: False,
             _init_kwargs={"weird": _Unserializable()},
             kwargs_schema_version=1,
             session_id="TicketPanel:global",

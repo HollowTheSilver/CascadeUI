@@ -85,6 +85,14 @@ class TestPublicExportSurface:
         seen = sorted({n for n in cascadeui.__all__ if cascadeui.__all__.count(n) > 1})
         assert seen == [], f"duplicated in __all__: {seen}"
 
+    @pytest.mark.parametrize("module_name", ["cascadeui", *SUBPACKAGES])
+    def test_no_underscore_name_is_exported(self, module_name):
+        # The internal-name walk below skips underscore names before judging
+        # them, so it cannot see a private helper added to an __all__ by mistake.
+        module = importlib.import_module(module_name)
+        leaked = sorted(n for n in module.__all__ if n.startswith("_"))
+        assert leaked == [], f"{module_name}.__all__ exports private names: {leaked}"
+
 
 # // ========================================( Class )======================================== // #
 
@@ -177,6 +185,8 @@ _INTERNAL_NAMES = frozenset(
         "trailing_ack",
         "DISCORD_CALL_ERRORS",
         "describe_discord_error",
+        "ACK_DEADLINE_SECONDS",
+        "validate_ack_delay",
         # Persistence internals (register_* helpers ARE exported; these are not)
         "NAMESPACE_APPLICATION",
         "NAMESPACE_REGISTRY",

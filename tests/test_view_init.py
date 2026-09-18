@@ -373,6 +373,26 @@ class TestClassAttributeValidation:
             class _Bad(StatefulView):
                 auto_defer_delay = -1.0
 
+    def test_auto_defer_delay_at_the_3s_deadline_raises(self):
+        """The auto-defer timer exists to beat Discord's 3s ack deadline;
+        a value at or past it can never fire in time."""
+        with pytest.raises(ValueError, match="auto_defer_delay"):
+
+            class _Bad(StatefulView):
+                auto_defer_delay = 3.0
+
+    def test_auto_defer_delay_past_the_3s_deadline_raises(self):
+        with pytest.raises(ValueError, match="auto_defer_delay"):
+
+            class _Bad(StatefulView):
+                auto_defer_delay = 5.0
+
+    def test_auto_defer_delay_just_under_the_3s_deadline_is_accepted(self):
+        class _Ok(StatefulView):
+            auto_defer_delay = 2.9
+
+        assert _Ok.auto_defer_delay == 2.9
+
     def test_edit_timeout_default_is_sixty(self):
         assert StatefulView.edit_timeout == 60.0
 
@@ -471,6 +491,11 @@ class TestSetClassAttribute:
         view = StatefulView()
         with pytest.raises(ValueError, match="edit_timeout"):
             view.set_class_attribute("edit_timeout", 0)
+
+    def test_auto_defer_delay_override_past_the_3s_deadline_raises(self):
+        view = StatefulView()
+        with pytest.raises(ValueError, match="auto_defer_delay"):
+            view.set_class_attribute("auto_defer_delay", 4.0)
 
     def test_int_attr_string_raises(self):
         view = StatefulView()

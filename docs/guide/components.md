@@ -376,7 +376,8 @@ has already consumed the response slot. See
 
 `Modal` arms an ack backstop before its validators and submit handler run, so a
 slow async validator or callback does not drop the submission; `auto_defer_delay`
-(default `2.5`s) tunes when that defer fires. A `Modal` subclass overriding
+(default `2.5`s) tunes when that defer fires, and must stay under `3.0`, Discord's
+acknowledgment deadline. A `Modal` subclass overriding
 `on_submit` sends replies through `self.respond(interaction, ...)`, which falls
 back to a followup when that backstop has already acked.
 

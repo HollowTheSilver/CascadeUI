@@ -112,10 +112,17 @@ class ActionCreators:
         }
 
     @staticmethod
-    def persistent_view_unregistered(persistence_key: str) -> ActionPayload:
-        """Create a PERSISTENT_VIEW_UNREGISTERED action payload."""
+    def persistent_view_unregistered(
+        persistence_key: str, message_id: Optional[str] = None
+    ) -> ActionPayload:
+        """Create a PERSISTENT_VIEW_UNREGISTERED action payload.
+
+        ``message_id`` scopes the removal to the registration that message
+        holds; without it the key is removed whatever message it points at.
+        """
         return {
             "persistence_key": persistence_key,
+            "message_id": message_id,
         }
 
     @staticmethod

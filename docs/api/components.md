@@ -340,7 +340,9 @@ definition time; abstract intermediate bases are not supported.
 
 `auto_defer_delay` (default `2.5`s) sets when the built-in ack backstop
 defers a slow `on_click`. Dynamic items dispatch outside a view's
-auto-defer, so each button carries its own timer.
+auto-defer, so each button carries its own timer. The value must stay
+under `3.0`, Discord's acknowledgment deadline, and is checked when the
+subclass is defined.
 
 ### `on_click(interaction) -> None`
 
@@ -436,7 +438,7 @@ Modal(
 - `view_id` -- links the modal to a view's state. A `MODAL_SUBMITTED` action is dispatched before the callback runs.
 - If no `callback` is provided, the interaction is deferred automatically. A `callback` that cannot accept `(interaction, values)` raises `TypeError` at construction, since every submission delivers the collected values.
 - The constructor's signature is closed: an unrecognized keyword raises `TypeError` naming it, rather than being discarded silently. `on_submit=` is the method discord.py subclasses override and the natural wrong guess for `callback=`, and a modal with no handler set acknowledges every submission and runs nothing.
-- `auto_defer_delay` (class attribute, default `2.5`) -- the ack backstop in seconds. `Modal.on_submit` arms an auto-defer timer across the whole submission (the access check, the validators, and the callback), so a slow validator or a raising handler cannot leave the interaction unacknowledged. Raise it on a subclass with a slow async validator; it validates at class-definition time (positive number).
+- `auto_defer_delay` (class attribute, default `2.5`) -- the ack backstop in seconds. `Modal.on_submit` arms an auto-defer timer across the whole submission (the access check, the validators, and the callback), so a slow validator or a raising handler cannot leave the interaction unacknowledged. Raise it on a subclass with a slow async validator, but keep it under `3.0`: the timer defers after this delay, so a value at or past Discord's 3-second acknowledgment deadline can never land. It validates at class-definition time (a positive number under `3.0`).
 
 **Responding from `on_submit`:** an override that sends its own reply should use `await self.respond(interaction, ...)` rather than `interaction.response.send_message()`. Like the view helper, `Modal.respond()` is `is_done()`-aware: it falls back to a followup when the ack backstop has already fired, so a reply sent after a slow validator does not raise `InteractionResponded`.
 

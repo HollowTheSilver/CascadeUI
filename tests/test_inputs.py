@@ -397,6 +397,20 @@ class TestModalAckBackstop:
             class BadModal(Modal):
                 auto_defer_delay = -1
 
+    def test_auto_defer_delay_at_the_3s_deadline_rejected_at_definition(self):
+        """Raising the backstop for a slow validator only helps below Discord's
+        deadline; a value at or past it can never land in time."""
+        with pytest.raises(ValueError, match="acknowledgment deadline"):
+
+            class BadModal(Modal):
+                auto_defer_delay = 3.0
+
+    def test_auto_defer_delay_just_under_the_deadline_accepted(self):
+        class SlowValidatorModal(Modal):
+            auto_defer_delay = 2.9
+
+        assert SlowValidatorModal.auto_defer_delay == 2.9
+
 
 class TestModalPostSubmitDeferHardening:
     """The trailing post-submit ack mirrors the view's ``_scheduled_task``

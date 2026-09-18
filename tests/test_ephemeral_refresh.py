@@ -1178,6 +1178,64 @@ class TestReopenCarriesIdentity:
         assert getattr(new, "_auto_back_item", None) is None
 
 
+class TestReopenCleanupOfOldMessage:
+    """The old panel is deleted when the token still allows it; otherwise the
+    teardown freezes it through the same single edit every teardown uses."""
+
+    class _Refreshable(StatefulLayoutView):
+        auto_refresh_ephemeral = True
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.add_item(ActionRow(StatefulButton(label="Continue", custom_id="continue")))
+
+    def _old_and_new(self, delete_side_effect=None):
+        old = self._Refreshable(interaction=_make_interaction())
+        # The armed panel already rendered its Continue button.
+        old._has_rendered = True
+        old._last_tree_digest = old._compute_tree_digest()
+        message = MagicMock()
+        message.delete = AsyncMock(side_effect=delete_side_effect)
+        message.edit = AsyncMock()
+        old._message = message
+
+        new = self._Refreshable(interaction=_make_interaction())
+        old._reopen_factory = lambda: new
+        new.send = AsyncMock()
+        return old, message
+
+    async def test_deleted_old_message_is_not_edited_afterwards(self):
+        old, message = self._old_and_new()
+
+        await old._reopen_ephemeral(_make_interaction())
+
+        message.delete.assert_awaited_once()
+        message.edit.assert_not_called()
+
+    async def test_already_missing_old_message_is_not_edited(self):
+        old, message = self._old_and_new(
+            delete_side_effect=discord.NotFound(MagicMock(status=404), "gone")
+        )
+
+        await old._reopen_ephemeral(_make_interaction())
+
+        message.edit.assert_not_called()
+
+    async def test_undeletable_old_message_is_frozen_with_one_edit(self):
+        """Past the token window the delete fails. One edit ships, and it is
+        the frozen panel, not the live one followed by a second freeze."""
+        old, message = self._old_and_new(
+            delete_side_effect=discord.HTTPException(MagicMock(status=401), "expired")
+        )
+
+        await old._reopen_ephemeral(_make_interaction())
+
+        message.edit.assert_awaited_once()
+        shipped = message.edit.await_args.kwargs["view"]
+        buttons = [i for i in shipped.walk_children() if isinstance(i, discord.ui.Button)]
+        assert buttons and all(b.disabled for b in buttons)
+
+
 # // ========================================( Ephemeral Flag Reset On Send )======================================== // #
 
 

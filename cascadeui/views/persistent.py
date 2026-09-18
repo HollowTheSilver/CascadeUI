@@ -5,7 +5,7 @@ import asyncio
 import inspect
 import logging
 import re
-from typing import Dict
+from typing import ClassVar, Dict, Optional
 
 import discord
 
@@ -55,6 +55,19 @@ class _PersistentMixin:
     # the previous version. Rows whose stored version is lower than this
     # with no registered migrator are logged and skipped on rehydrate.
     kwargs_schema_version: int = 1
+
+    # A send under a persistence_key another panel still holds retires that
+    # panel: a live instance is exited, a message left from before a restart is
+    # cleaned up. False leaves the predecessor to the caller, for a swap that
+    # confirms the new panel before the old one comes down.
+    retire_previous_on_send: bool = True
+    _BOOL_ATTRS: ClassVar[tuple] = ("retire_previous_on_send",)
+
+    # The message id this instance registered or was restored under. exit()
+    # sends it with its unregister so a superseded panel cannot remove the row
+    # its successor now owns; _message is already None by the time a deleted
+    # message's cleanup calls exit(), so it cannot be read from there.
+    _registry_message_id: Optional[str] = None
 
     # discord.py auto-generates custom_ids as 32-char hex strings (os.urandom(16).hex())
     _AUTO_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
@@ -156,26 +169,65 @@ class _PersistentMixin:
         Called by subclass ``send()`` implementations after the message
         has been successfully sent through the View/LayoutView pipeline.
         """
-        # If this persistence_key already has a registered view/message, clean up the old
-        # one to prevent orphaned views and messages.
         registry = self.state_store.state.get("persistent_views", {})
         existing = registry.get(self.persistence_key)
-        if existing and existing.get("message_id") != str(message.id):
-            # Try to exit the old view instance if it's still alive in this process.
-            # exit() handles the full cleanup: unsubscribe, unregister, disable
-            # components on the message, and dispatch VIEW_DESTROYED.
+
+        # Record this view in the persistent registry
+        guild_id = None
+        if message.guild:
+            guild_id = str(message.guild.id)
+
+        payload = ActionCreators.persistent_view_registered(
+            persistence_key=self.persistence_key,
+            class_name=type(self)._class_session_key(),
+            message_id=str(message.id),
+            channel_id=str(message.channel.id),
+            guild_id=guild_id,
+            # is not None, not truthiness: id 0 is a value, and storing it as
+            # None would drop owner_only on the restored view.
+            user_id=str(self.user_id) if self.user_id is not None else None,
+        )
+        self._registry_message_id = str(message.id)
+        await self.dispatch("PERSISTENT_VIEW_REGISTERED", payload)
+
+        # Retired after this view owns the key, so each predecessor's exit()
+        # unregisters a message the entry no longer points at and removes
+        # nothing. Retiring first let that exit clear the key and hand it to
+        # the next live panel under it, which is this one, mid-registration.
+        if (
+            self.retire_previous_on_send
+            and existing
+            and existing.get("message_id") != str(message.id)
+        ):
+            # Exit every older instance still alive in this process. exit()
+            # handles the full cleanup: unsubscribe, disable components on the
+            # message, and dispatch VIEW_DESTROYED.
             old_view_exited = False
-            for vid, old_view in list(self.state_store._active_views.items()):
-                if (
-                    getattr(old_view, "_persistence_key", None) == self.persistence_key
-                    and old_view.id != self.id
-                ):
-                    await old_view.exit()
+            # The key's holders, plus any view showing the superseded panel's
+            # message without its key: a child the panel pushed carries the
+            # registration id, and would otherwise stay live on that message.
+            holders = self.state_store._views_for_key(self.persistence_key)
+            superseded_message = existing.get("message_id")
+            holders += [
+                view
+                for view in self.state_store.get_active_views().values()
+                if view not in holders
+                and superseded_message is not None
+                and getattr(view, "_registry_message_id", None) == superseded_message
+            ]
+            for old_view in holders:
+                if old_view is not self:
                     old_view_exited = True
+                    # Retiring one holder can retire another (a paired panel
+                    # exits its partner), and the list predates the first
+                    # exit. Counted as retired either way: it is gone, so the
+                    # orphan-message fallback below is not owed.
+                    if old_view._torn_down():
+                        continue
+                    await old_view.exit()
                     logger.info(
                         f"Exited previous view instance for persistence_key '{self.persistence_key}'"
                     )
-                    break
 
             # If the old view wasn't alive (e.g. from a previous bot session that
             # wasn't restored), fall back to message-only cleanup.
@@ -206,23 +258,6 @@ class _PersistentMixin:
                         logger.debug(
                             f"Could not clean up previous message for '{self.persistence_key}': {e}"
                         )
-
-        # Record this view in the persistent registry
-        guild_id = None
-        if message.guild:
-            guild_id = str(message.guild.id)
-
-        payload = ActionCreators.persistent_view_registered(
-            persistence_key=self.persistence_key,
-            class_name=type(self)._class_session_key(),
-            message_id=str(message.id),
-            channel_id=str(message.channel.id),
-            guild_id=guild_id,
-            # is not None, not truthiness: id 0 is a value, and storing it as
-            # None would drop owner_only on the restored view.
-            user_id=str(self.user_id) if self.user_id is not None else None,
-        )
-        await self.dispatch("PERSISTENT_VIEW_REGISTERED", payload)
 
     async def send(self, *args, ephemeral: bool = False, **kwargs):
         """Send the view and register it for persistence.
@@ -268,18 +303,74 @@ class _PersistentMixin:
             )
         return message
 
+    async def _reregister_live_predecessor(self, key: str) -> None:
+        """Register the most recent other live panel under ``key``, if any.
+
+        Called only for a panel with ``retire_previous_on_send = False``, the
+        setting under which an earlier panel stays live beside it. A finished
+        panel is skipped: a caller that stopped it has already retired it.
+        """
+        for view in self.state_store._views_for_key(key):
+            if view is not self and view._message is not None and not view.is_finished():
+                await view._register_persistent(view._message)
+                return
+
     async def exit(self, delete_message: bool | None = None):
         """Exit the view and remove it from the persistent registry.
 
         Retiring a stored registration when no instance is live goes through
         ``PersistenceManager.prune_registry(persistence_keys=[...])`` instead,
-        reachable as ``store.persistence_manager``. Both routes leave the
-        same state behind: the stored row is deleted and the key drops out
-        of ``state["persistent_views"]``.
+        reachable as ``store.persistence_manager``. The two are not
+        interchangeable: this route retires the registration only while the
+        view still owns it, while ``prune_registry`` matches by key and takes
+        whatever holds it. Retiring a panel that may have a live successor or
+        predecessor belongs here; a prune belongs after the exit, never
+        before, and only for a key no live panel holds.
+
+        A panel superseded under its key (see ``retire_previous_on_send``)
+        no longer owns the stored registration, so its ``exit()`` leaves the
+        successor's row in place. When the panel that owns the registration
+        exits while an earlier panel is still live under the same key, the
+        registration moves back to that panel, so a swap rolled back by
+        exiting the new panel leaves the old one restorable.
         """
-        # Unregister before cleanup so the state dispatch still works
-        payload = ActionCreators.persistent_view_unregistered(self.persistence_key)
-        await self.dispatch("PERSISTENT_VIEW_UNREGISTERED", payload)
+        key = self.persistence_key
+        entry = self.state_store.state.get("persistent_views", {}).get(key)
+        owned = entry is not None
+        # A view that never registered owns nothing, and a payload with no
+        # message id removes the key whatever holds it -- so exiting a panel
+        # whose send raised, or was refused by the instance limit, would
+        # retire the registration of the panel actually on screen.
+        registered_elsewhere = (
+            self._registry_message_id is None and owned and entry.get("message_id") is not None
+        )
+        if not registered_elsewhere:
+            # Unregister before cleanup so the state dispatch still works
+            payload = ActionCreators.persistent_view_unregistered(
+                key, message_id=self._registry_message_id
+            )
+            await self.dispatch("PERSISTENT_VIEW_UNREGISTERED", payload)
+        # Only a panel that opted out of retiring its predecessor can have one
+        # still live. Under the default, another holder of the key is a panel
+        # mid-send, which registers itself once its send completes.
+        if (
+            not self.retire_previous_on_send
+            and owned
+            and key not in self.state_store.state.get("persistent_views", {})
+        ):
+            try:
+                await self._reregister_live_predecessor(key)
+            except Exception as e:
+                # Reported rather than raised, like the registration in send():
+                # the teardown below still has to run, and a caller rolling a
+                # swap back would otherwise be left with both panels live.
+                logger.error(
+                    f"Handing {key!r} back to the live predecessor raised "
+                    f"{type(e).__name__}: {e}. The registration is removed and no "
+                    f"panel holds it, so none is restored after a restart; re-send "
+                    f"the panel to register it again.",
+                    exc_info=e,
+                )
 
         # super().exit() -> stop() -> _redrive_dynamic_items() repairs
         # discord.py's shared dynamic-item registry; the base implementation

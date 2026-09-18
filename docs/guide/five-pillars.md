@@ -152,14 +152,14 @@ dies with its last member.
 | Method Hook | When it fires |
 |-------------|---------------|
 | `on_reopen_failure(interaction, error)` | Ephemeral refresh factory failed or returned `None` |
-| `on_message_delete()` | External message deletion detected (admin delete, bulk purge) |
+| `on_message_delete()` | External message deletion detected (a delete, bulk purge, deleted channel or thread, or an edit finding the message gone) |
 
 ### Interaction machinery
 
 | Attribute | Default | Purpose |
 |-----------|---------|---------|
 | `auto_defer` | `True` | Auto-defer unacknowledged interactions |
-| `auto_defer_delay` | `2.5` | Seconds before auto-defer fires |
+| `auto_defer_delay` | `2.5` | Seconds before auto-defer fires (must be under `3.0`) |
 | `ack_first` | `False` | Ack before the checks/callback (advanced escape hatch) |
 | `serialize_interactions` | `True` | Process clicks sequentially via asyncio.Lock |
 | `edit_timeout` | `60.0` | Max seconds a Discord edit may stall before cancellation; `None` disables |

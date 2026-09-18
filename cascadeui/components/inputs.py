@@ -11,7 +11,7 @@ from discord import CheckboxGroupOption, Interaction, RadioGroupOption, TextStyl
 from discord.ui.select import BaseSelect
 
 from ..utils.hooks import await_maybe
-from ..utils.responses import ack_backstop, respond_safe, trailing_ack
+from ..utils.responses import ack_backstop, respond_safe, trailing_ack, validate_ack_delay
 from ..utils.strings import slugify
 from ..validation import validate_fields
 from .base import StatefulComponent, require_value_callback
@@ -593,19 +593,16 @@ class Modal(discord.ui.Modal, StatefulComponent):
     auto_defer_delay: float = 2.5
 
     def __init_subclass__(cls, **kwargs):
-        """Reject a non-positive ``auto_defer_delay`` at subclass-definition time.
+        """Reject an unusable ``auto_defer_delay`` at subclass-definition time.
 
-        A value at or below zero (or the wrong type) silently defeats the ack
-        backstop, so it fails when the subclass is defined rather than as a
-        dropped interaction at runtime. Mirrors the view side's
-        ``_POSITIVE_NUMBER_ATTRS`` check.
+        A value at or below zero, the wrong type, or one at or past Discord's
+        3s ack deadline silently defeats the ack backstop, so it fails when the
+        subclass is defined rather than as a dropped interaction at runtime.
+        Shares :func:`~cascadeui.utils.responses.validate_ack_delay` with the
+        view side's ``_ACK_DELAY_ATTRS`` check.
         """
         super().__init_subclass__(**kwargs)
-        delay = cls.auto_defer_delay
-        if not isinstance(delay, (int, float)) or isinstance(delay, bool) or delay <= 0:
-            raise ValueError(
-                f"{cls.__name__}.auto_defer_delay must be a positive number, got {delay!r}"
-            )
+        validate_ack_delay(cls.__name__, "auto_defer_delay", cls.auto_defer_delay)
 
     def __init__(
         self,

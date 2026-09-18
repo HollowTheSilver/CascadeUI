@@ -37,8 +37,19 @@ class TestStateStoreSingleton:
             "sessions": {},
             "views": {},
             "components": {},
+            "modals": {},
             "application": {},
+            "persistent_views": {},
         }
+
+    def test_the_canonical_shape_covers_every_slot_a_reducer_writes(self):
+        """A rebuild that drops a slot is how a reset leaves rows on disk that
+        nothing in the process knows about."""
+        shape = StateStore._build_initial_state()
+        store = get_store()
+        for slot in ("sessions", "views", "components", "modals", "persistent_views"):
+            assert slot in shape, slot
+            assert slot in store.state, slot
 
     def test_build_initial_state_returns_fresh_dict(self):
         a = StateStore._build_initial_state()
@@ -81,6 +92,181 @@ class TestGetActiveViews:
         mapping = store.get_active_views()
         with pytest.raises(TypeError):
             mapping["v1"] = object()
+
+
+class TestGetActiveView:
+    """The live view holding a ``persistence_key``: the registration owner
+    while several unfinished views share the key, never a finished one, and
+    available whether or not persistence is installed."""
+
+    @staticmethod
+    def _message(message_id):
+        from unittest.mock import AsyncMock, MagicMock
+
+        message = MagicMock()
+        message.id = message_id
+        message.guild = None
+        message.channel.id = 2
+        message.edit = AsyncMock()
+        message.delete = AsyncMock()
+        return message
+
+    @staticmethod
+    def _panel_class():
+        import discord
+
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        class _LookupPanel(PersistentLayoutView):
+            retire_previous_on_send = False
+
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.add_item(
+                    discord.ui.ActionRow(discord.ui.Button(label="Go", custom_id="lookup:go"))
+                )
+
+        return _LookupPanel
+
+    def test_an_unknown_key_returns_none(self):
+        assert get_store().get_active_view(persistence_key="nothing:here") is None
+
+    async def test_the_registration_owner_wins_over_a_panel_that_still_holds_the_key(self):
+        """Under `retire_previous_on_send = False` a superseded panel keeps the
+        key while the registration has moved on. The view on the registered
+        message is the answer; the superseded panel must not shadow it."""
+        from helpers import RenderableLayoutView
+
+        store = get_store()
+        cls = self._panel_class()
+        panels = []
+        for message_id in (111, 222):
+            panel = cls(user_id=1, guild_id=2, persistence_key="lookup:owner")
+            panel._message = self._message(message_id)
+            store._register_view(panel)
+            await panel._register_state()
+            await panel._register_persistent(panel._message)
+            panels.append(panel)
+        old, new = panels
+        child = await new.push(RenderableLayoutView)
+
+        assert not old.is_finished()  # the opt-out keeps it live
+        assert store.get_active_view(persistence_key="lookup:owner") is child
+
+    async def test_a_panel_that_pushed_is_found_through_the_view_on_its_message(self):
+        """Navigation replaces the instance, so the key is held by a view
+        carrying the registration id and no key. The prune pre-flight and the
+        swap idiom both want that view, and the store's own live-key rule
+        counts it, so this answers the same way."""
+        from helpers import RenderableLayoutView, make_interaction
+
+        store = get_store()
+        panel = self._panel_class()(interaction=make_interaction(), persistence_key="lookup:push")
+        await panel.send()
+        child = await panel.push(RenderableLayoutView)
+
+        assert panel.id not in store._active_views
+        assert store.get_active_view(persistence_key="lookup:push") is child
+        assert "lookup:push" in store._live_persistence_keys()
+
+    async def test_a_sent_panel_is_found_by_its_key_and_not_by_its_id(self):
+        from helpers import make_interaction
+
+        store = get_store()
+        view = self._panel_class()(interaction=make_interaction(), persistence_key="lookup:sent")
+        await view.send()
+
+        assert store.get_active_view(persistence_key="lookup:sent") is view
+        assert store.get_active_view(persistence_key=view.id) is None
+
+    async def test_a_stopped_holder_is_not_returned(self):
+        store = get_store()
+        view = self._panel_class()(persistence_key="lookup:stopped")
+        store._register_view(view)
+        view.stop()
+
+        assert store.get_active_view(persistence_key="lookup:stopped") is None
+
+    async def test_the_registration_owner_wins_through_a_swap(self):
+        store = get_store()
+        cls = self._panel_class()
+        old = cls(persistence_key="lookup:swap")
+        old._message = self._message(111)
+        store._register_view(old)
+        await old._register_persistent(old._message)
+
+        new = cls(persistence_key="lookup:swap")
+        new._message = self._message(999)
+        store._register_view(new)
+        # Registered but not yet recorded as the owner: the old panel is still on screen.
+        assert store.get_active_view(persistence_key="lookup:swap") is old
+
+        await new._register_persistent(new._message)
+        assert store.get_active_view(persistence_key="lookup:swap") is new
+
+        await new.exit(delete_message=True)
+        # The registration itself went back to the old panel, not only the lookup,
+        # which would return the sole remaining holder either way.
+        assert store.state["persistent_views"]["lookup:swap"]["message_id"] == "111"
+        assert store.get_active_view(persistence_key="lookup:swap") is old
+
+    def test_with_no_registration_the_newest_holder_wins(self):
+        from helpers import RenderableLayoutView
+
+        store = get_store()
+        older = RenderableLayoutView(persistence_key="slot:shared")
+        newer = RenderableLayoutView(persistence_key="slot:shared")
+        store._register_view(older)
+        store._register_view(newer)
+
+        assert store.get_active_view(persistence_key="slot:shared") is newer
+
+    def test_a_keyed_non_persistent_view_is_found(self):
+        from helpers import RenderableLayoutView
+
+        store = get_store()
+        view = RenderableLayoutView(persistence_key="slot:7")
+        store._register_view(view)
+
+        assert store.get_active_view(persistence_key="slot:7") is view
+
+    def test_the_key_is_keyword_only(self):
+        with pytest.raises(TypeError):
+            get_store().get_active_view("positional:key")
+
+
+class TestLivePersistenceKeys:
+    """The registry keys a live persistent panel owns, which reattach re-drives
+    and the unreachable prune must leave alone."""
+
+    def test_a_pushed_child_keeps_its_panels_key_live(self):
+        """The child shows the panel's message and carries its registration id,
+        but not its key, which the panel took with it."""
+        from helpers import RenderableLayoutView
+
+        store = get_store()
+        store.state["persistent_views"] = {"panel:pushed": {"message_id": "999"}}
+        child = RenderableLayoutView()
+        child._registry_message_id = "999"
+        store._register_view(child)
+
+        assert "panel:pushed" in store._live_persistence_keys()
+
+    def test_a_keyed_non_persistent_view_protects_no_row(self):
+        from helpers import RenderableLayoutView
+
+        store = get_store()
+        store._register_view(RenderableLayoutView(persistence_key="panel:coincidence"))
+
+        assert "panel:coincidence" not in store._live_persistence_keys()
+
+    async def test_a_stopped_panel_protects_no_row(self):
+        store = get_store()
+        view = TestGetActiveView._panel_class()(persistence_key="panel:stopped")
+        store._register_view(view)
+        view.stop()
+
+        assert "panel:stopped" not in store._live_persistence_keys()
 
 
 class TestDestroyView:
@@ -207,6 +393,37 @@ class TestDestroyView:
 
 class TestDispatch:
     """Dispatch routes actions through registered reducers and records history."""
+
+    async def test_a_declining_reducer_does_not_revert_a_commit_it_waited_through(self):
+        """A reducer that declines returns the state it was handed, which is
+        stale once the dispatch has waited in a middleware. Writing it back
+        erases whatever committed in the meantime.
+        """
+        store = get_store()
+
+        class _Slow:
+            async def __call__(self, action, state, next_fn):
+                if action["type"] == "PROBE_DECLINE":
+                    await asyncio.sleep(0.02)
+                return await next_fn(action, state)
+
+        async def _decline(action, state):
+            return state
+
+        async def _commit(action, state):
+            return {**state, "application": {**state.get("application", {}), "committed": True}}
+
+        store._add_middleware(_Slow())
+        store._register_reducer("PROBE_DECLINE", _decline)
+        store._register_reducer("PROBE_COMMIT_FAST", _commit)
+        store.state.get("application", {}).pop("committed", None)
+
+        await asyncio.gather(
+            store.dispatch("PROBE_DECLINE"),
+            store.dispatch("PROBE_COMMIT_FAST"),
+        )
+
+        assert store.state["application"].get("committed") is True
 
     async def test_dispatch_with_registered_reducer(self):
         store = get_store()

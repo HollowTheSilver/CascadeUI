@@ -15,7 +15,7 @@ import asyncio
 import json
 import logging
 import time
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import discord
 import pytest
@@ -479,6 +479,91 @@ class TestPruneRegistryKeys:
         assert captured[0]["keys"] == []
         assert captured[0]["deleted"] == 0
 
+    async def _mgr_holding(self, key):
+        be = InMemoryBackend()
+        await be.initialize()
+        await be.row_upsert(
+            TABLE_PERSISTENT_VIEWS,
+            {
+                "persistence_key": key,
+                "view_class": "MyPanel",
+                "custom_id": None,
+                "message_id": 1,
+                "channel_id": 2,
+                "guild_id": None,
+                "user_id": None,
+                "session_id": None,
+                "init_kwargs": "{}",
+                "kwargs_schema_version": 1,
+                "schema_version": 1,
+                "created_at": 1,
+                "updated_at": 1,
+                "first_unreachable_at": None,
+            },
+            ["persistence_key"],
+        )
+        store = get_store()
+        return store, PersistenceManager(store=store, registry=RegistryPersistence(backend=be))
+
+    async def test_pruning_a_key_a_live_panel_holds_is_reported(self, caplog):
+        """The deletion matches by key, so it takes a live panel's row too.
+
+        Nothing else reports that: the panel keeps answering clicks and is
+        simply absent after the next restart.
+        """
+
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        class _LivePanel(PersistentLayoutView):
+            pass
+
+        store, mgr = await self._mgr_holding("panel:live")
+        panel = _LivePanel(persistence_key="panel:live")
+        store._register_view(panel)
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui.persistence.manager"):
+            assert await mgr.prune_registry(persistence_keys=["panel:live"]) == 1
+
+        assert "panel:live" in caplog.text
+        assert "get_active_view" in caplog.text
+
+    async def test_a_panel_that_pushed_a_child_still_counts_as_holding_its_key(self, caplog):
+        """Navigation replaces the instance, so the panel's key is held by a
+        view that carries its message id without the key. That is the store's
+        own ownership rule, and the prune reads the same one."""
+        from helpers import RenderableLayoutView
+
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        class _PushingPanel(PersistentLayoutView):
+            pass
+
+        store, mgr = await self._mgr_holding("panel:pushed")
+        panel = _PushingPanel(persistence_key="panel:pushed", user_id=1, guild_id=2)
+        panel._message = MagicMock(id=999, guild=None)
+        panel._message.channel.id = 2
+        store._register_view(panel)
+        await panel._register_state()
+        await panel._register_persistent(panel._message)
+        child = await panel.push(RenderableLayoutView)
+        # The pre-flight the docs name and the rule the prune reads agree:
+        # both answer with the view now on the panel's message.
+        assert store.get_active_view(persistence_key="panel:pushed") is child
+        assert child.id in store._active_views
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui.persistence.manager"):
+            assert await mgr.prune_registry(persistence_keys=["panel:pushed"]) == 1
+
+        assert "panel:pushed" in caplog.text
+
+    async def test_pruning_a_key_no_panel_holds_is_silent(self, caplog):
+        store, mgr = await self._mgr_holding("panel:dead")
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui.persistence.manager"):
+            assert await mgr.prune_registry(persistence_keys=["panel:dead"]) == 1
+
+        assert caplog.text == ""
+
 
 class TestManagerRehydrate:
     """rehydrate restores each configured namespace into store state."""
@@ -868,6 +953,307 @@ class TestReattachIdempotent:
         assert "panel:a" not in all_keys
         # panel:b is processed (its class isn't registered, so it lands in skipped).
         assert "panel:b" in summary["skipped"]
+
+
+class TestBootMirrorForgetsDeletedRows:
+    """Every pass walks the mirror filled at rehydrate, so a row this process
+    deleted afterwards is still a reattach candidate until the mirror drops it.
+    """
+
+    async def _setup(self):
+        from cascadeui import setup_middleware
+        from cascadeui.state.middleware.persistence import PersistenceMiddleware
+
+        backend = InMemoryBackend()
+        await backend.initialize()
+        middleware = PersistenceMiddleware(backend=backend)
+        await setup_middleware(middleware)
+        return backend, middleware, get_store()
+
+    async def test_a_re_drive_does_not_restore_a_row_this_process_deleted(self):
+        from cascadeui.views.persistent import PersistentLayoutView, _persistent_view_classes
+
+        class _MirrorPanel(PersistentLayoutView):
+            pass
+
+        backend, middleware, store = await self._setup()
+        mgr = store.persistence_manager
+        class_name = next(k for k, v in _persistent_view_classes.items() if v is _MirrorPanel)
+        # A row left pending at boot: its class imported after the first pass.
+        mgr._registry_rows = [
+            {
+                "persistence_key": "pending",
+                "view_class": class_name,
+                "channel_id": 2,
+                "message_id": 111,
+                "init_kwargs": "{}",
+                "kwargs_schema_version": 1,
+            }
+        ]
+
+        # The cog re-posts the panel under that key, then retires it.
+        panel = _MirrorPanel(persistence_key="pending", user_id=1, guild_id=2)
+        panel._message = MagicMock(id=222, guild=None)
+        panel._message.channel.id = 2
+        panel._message.edit = AsyncMock()
+        store._register_view(panel)
+        await panel._register_state()
+        await panel._register_persistent(panel._message)
+        await panel.exit(delete_message=False)
+        await middleware.flush_all()
+
+        mgr._bot = MagicMock()
+        fetched = []
+
+        async def _fetch(row, removed, unreachable):
+            fetched.append(row["message_id"])
+            return (MagicMock(), MagicMock())
+
+        mgr._fetch_restore_message = _fetch
+
+        summary = await mgr.reattach()
+
+        assert summary["restored"] == []
+        assert fetched == []  # the dead row is not even fetched
+
+    async def test_a_refused_unregister_leaves_the_row_on_disk(self):
+        """A superseded panel's exit is refused by the reducer, which returns
+        the state object unchanged. The middleware routes registry writes only
+        on a changed state, and that is what keeps the successor's row.
+        """
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        class _SwapPanel(PersistentLayoutView):
+            retire_previous_on_send = False
+
+        backend, middleware, store = await self._setup()
+
+        def _msg(mid):
+            m = MagicMock(id=mid, guild=None)
+            m.channel.id = 2
+            m.edit = AsyncMock()
+            return m
+
+        old = _SwapPanel(persistence_key="swap", user_id=1, guild_id=2)
+        old._message = _msg(111)
+        store._register_view(old)
+        await old._register_state()
+        await old._register_persistent(old._message)
+
+        new = _SwapPanel(persistence_key="swap", user_id=1, guild_id=2)
+        new._message = _msg(222)
+        store._register_view(new)
+        await new._register_state()
+        await new._register_persistent(new._message)
+        await middleware.flush_all()
+
+        await old.exit(delete_message=False)
+        await middleware.flush_all()
+
+        rows = await backend.row_select(TABLE_PERSISTENT_VIEWS, {"persistence_key": "swap"})
+        # The row stores ids as ints for its BIGINT columns; the mirror keeps
+        # strings. Compare on the value, not the layer's spelling of it.
+        assert [str(r["message_id"]) for r in rows] == ["222"]
+        assert store.state["persistent_views"]["swap"]["message_id"] == "222"
+        # The boot mirror tracks what this process wrote, so it agrees with
+        # disk rather than forgetting the successor the refusal preserved.
+        boot = store.persistence_manager._registry_rows
+        assert [str(r["message_id"]) for r in boot] == ["222"]
+
+
+class TestRegistryRoutingUnderForeignMiddleware:
+    """The refusal a superseded panel's exit gets must survive any chain shape.
+
+    The reducer says "refused" by returning the state object it was handed,
+    which is invisible to a middleware that passes the next link a rebuilt
+    mapping -- the ordinary transform shape a consumer writes.
+    """
+
+    class _Rebuilding:
+        async def __call__(self, action, state, next_fn):
+            return await next_fn(action, {**state})
+
+    class _Passthrough:
+        async def __call__(self, action, state, next_fn):
+            return await next_fn(action, state)
+
+    class _SlowUnregister:
+        """A consumer middleware that awaits real work before the chain runs on."""
+
+        async def __call__(self, action, state, next_fn):
+            if action["type"] == "PERSISTENT_VIEW_UNREGISTERED":
+                await asyncio.sleep(0.02)
+            return await next_fn(action, state)
+
+    async def test_a_refusal_that_raced_a_commit_keeps_the_successors_row(self):
+        """The routing cannot read the refusal off the state object's identity:
+        an action committing while this dispatch waits changes it anyway."""
+        from cascadeui import setup_middleware
+        from cascadeui.state.middleware.persistence import PersistenceMiddleware
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        class _SwapPanel(PersistentLayoutView):
+            retire_previous_on_send = False
+
+        backend = InMemoryBackend()
+        await backend.initialize()
+        middleware = PersistenceMiddleware(backend=backend)
+        await setup_middleware(middleware)
+        store = get_store()
+        # Below the persistence middleware, so its state read spans the wait.
+        store._add_middleware(self._SlowUnregister())
+
+        async def _commit(action, state):
+            return {**state, "application": {**state.get("application", {}), "raced": True}}
+
+        store._register_reducer("PROBE_COMMIT", _commit)
+
+        def _msg(mid):
+            m = MagicMock(id=mid, guild=None)
+            m.channel.id = 2
+            m.edit = AsyncMock()
+            return m
+
+        panels = []
+        for mid in (111, 222):
+            panel = _SwapPanel(persistence_key="raced", user_id=1, guild_id=2)
+            panel._message = _msg(mid)
+            store._register_view(panel)
+            await panel._register_state()
+            await panel._register_persistent(panel._message)
+            panels.append(panel)
+        await middleware.flush_all()
+
+        # The superseded panel's refused unregister is in flight while an
+        # unrelated action commits.
+        await asyncio.gather(
+            panels[0].exit(delete_message=False),
+            store.dispatch("PROBE_COMMIT"),
+        )
+        await middleware.flush_all()
+
+        rows = await backend.row_select(TABLE_PERSISTENT_VIEWS, {"persistence_key": "raced"})
+        assert [str(r["message_id"]) for r in rows] == ["222"]
+        assert store.state["application"]["raced"] is True
+
+    @pytest.mark.parametrize("shape", ["bare", "rebuilding", "passthrough"])
+    async def test_a_superseded_exit_keeps_the_successors_row(self, shape):
+        from cascadeui import setup_middleware
+        from cascadeui.state.middleware.persistence import PersistenceMiddleware
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        class _SwapPanel(PersistentLayoutView):
+            retire_previous_on_send = False
+
+        backend = InMemoryBackend()
+        await backend.initialize()
+        middleware = PersistenceMiddleware(backend=backend)
+        await setup_middleware(middleware)
+        store = get_store()
+        if shape == "rebuilding":
+            store._add_middleware(self._Rebuilding())
+        elif shape == "passthrough":
+            store._add_middleware(self._Passthrough())
+
+        def _msg(mid):
+            m = MagicMock(id=mid, guild=None)
+            m.channel.id = 2
+            m.edit = AsyncMock()
+            return m
+
+        panels = []
+        for mid in (111, 222):
+            panel = _SwapPanel(persistence_key="swap", user_id=1, guild_id=2)
+            panel._message = _msg(mid)
+            store._register_view(panel)
+            await panel._register_state()
+            await panel._register_persistent(panel._message)
+            panels.append(panel)
+        await middleware.flush_all()
+
+        await panels[0].exit(delete_message=False)
+        await middleware.flush_all()
+
+        rows = await backend.row_select(TABLE_PERSISTENT_VIEWS, {"persistence_key": "swap"})
+        assert [str(r["message_id"]) for r in rows] == ["222"], shape
+        assert store.state["persistent_views"]["swap"]["message_id"] == "222"
+        assert not panels[1].is_finished()
+
+
+class TestTotalReattachSummary:
+    """A reconcile running after a re-drive reads every pass, not the last.
+
+    Only the pass that deletes a row reports it as ``removed``, so the summary
+    a later pass publishes says nothing about it.
+    """
+
+    def _mgr(self):
+        mgr = PersistenceManager(store=get_store())
+        mgr._bot = MagicMock()
+        return mgr
+
+    async def test_a_removal_from_an_earlier_pass_survives_a_re_drive(self):
+        from cascadeui.views.persistent import PersistentLayoutView, _persistent_view_classes
+
+        class _GonePanel(PersistentLayoutView):
+            pass
+
+        class_name = next(k for k, v in _persistent_view_classes.items() if v is _GonePanel)
+        mgr = self._mgr()
+        mgr._registry_rows = [
+            {
+                "persistence_key": "gone",
+                "view_class": class_name,
+                "channel_id": 1,
+                "message_id": 2,
+                "init_kwargs": "{}",
+                "kwargs_schema_version": 1,
+            }
+        ]
+
+        async def _fetch(row, removed, unreachable):
+            removed.append(row["persistence_key"])
+            return None
+
+        mgr._fetch_restore_message = _fetch
+        mgr.prune_registry = AsyncMock(return_value=1)
+        mgr._confirm_unchanged = AsyncMock(return_value=(["gone"], [], []))
+
+        first = await mgr.reattach_persistent_views()
+        assert first["removed"] == ["gone"]
+
+        # The re-drive the guide recommends after late cogs load. The row it
+        # would have re-verdicted is already deleted.
+        mgr._registry_rows = []
+        second = await mgr.reattach()
+
+        assert second["removed"] == []
+        assert mgr.last_reattach_summary["removed"] == []
+        assert mgr.total_reattach_summary["removed"] == ["gone"]
+
+    async def test_a_key_appears_under_its_most_recent_outcome_only(self):
+        mgr = self._mgr()
+        row = {"persistence_key": "late", "view_class": "Unregistered", "channel_id": 1}
+        mgr._registry_rows = [dict(row, message_id=2)]
+
+        await mgr.reattach_persistent_views()
+        assert mgr.total_reattach_summary["skipped"] == ["late"]
+
+        # The class imports and the next pass restores it.
+        mgr._reattach_pass = AsyncMock(
+            return_value={
+                "restored": ["late"],
+                "skipped": [],
+                "failed": [],
+                "removed": [],
+                "unreachable": [],
+            }
+        )
+        await mgr.reattach()
+
+        totals = mgr.total_reattach_summary
+        assert totals["restored"] == ["late"]
+        assert totals["skipped"] == []
 
 
 class TestManagerReattachInitKwargsDuplicate:
@@ -1293,7 +1679,70 @@ class TestReattachBaselineDigest:
         await mgr.rehydrate()
         return mgr
 
-    async def _reattach(self, cls, key):
+    @staticmethod
+    def _on_screen(button_enabled=True, media=False, image_path="pic.png"):
+        """The pre-restart render Discord still shows: a card with text and a
+        Join button, built as the component objects a fetched message carries.
+        ``media=True`` adds what a fetch returns for uploaded files (signed CDN
+        URLs carrying ``attachment_id``, with the filename as the last path
+        segment) beside an external thumbnail. ``image_path`` is that segment
+        for the gallery image, as the URL spells it."""
+        from discord.components import _component_factory
+
+        children = [{"type": 10, "id": 2, "content": "Live board"}]
+        if media:
+            children += [
+                {
+                    "type": 12,
+                    "id": 5,
+                    "items": [
+                        {
+                            "media": {
+                                "url": f"https://cdn.discordapp.com/attachments/10/21/{image_path}?ex=66",
+                                "attachment_id": "21",
+                            }
+                        }
+                    ],
+                },
+                {
+                    "type": 13,
+                    "id": 6,
+                    "file": {
+                        "url": "https://cdn.discordapp.com/attachments/10/20/report.txt?ex=66",
+                        "attachment_id": "20",
+                    },
+                },
+                {
+                    "type": 9,
+                    "id": 7,
+                    "components": [{"type": 10, "id": 8, "content": "Profile"}],
+                    "accessory": {
+                        "type": 11,
+                        "id": 9,
+                        "media": {"url": "https://example.com/avatar.png"},
+                    },
+                },
+            ]
+        if button_enabled is not None:
+            children.append(
+                {
+                    "type": 1,
+                    "id": 3,
+                    "components": [
+                        {
+                            "type": 2,
+                            "id": 4,
+                            "style": 1,
+                            "label": "Join",
+                            "custom_id": "join:1",
+                            "disabled": not button_enabled,
+                        }
+                    ],
+                }
+            )
+        return [_component_factory({"type": 17, "id": 1, "components": children})]
+
+    async def _reattach(self, cls, key, components=None):
         from cascadeui.views.persistent import PersistentLayoutView  # noqa: F401
 
         self._stub_seams(cls)
@@ -1309,6 +1758,10 @@ class TestReattachBaselineDigest:
                 self.deleted = True
 
         message = _Msg()
+        # A components message lists no attachments, even with uploads on it.
+        message.attachments = []
+        if components is not None:
+            message.components = components
 
         class _FakeBot:
             def add_view(self, view, message_id):
@@ -1349,20 +1802,222 @@ class TestReattachBaselineDigest:
         built_view, _ = await self._reattach(_BuiltPanel, "baseline:built")
 
         assert built_view._reattach_baseline_digest is not None
-        assert built_view._reattach_baseline_digest == built_view._compute_tree_digest()
+        assert built_view._reattach_baseline_digest == built_view._compute_tree_digest(
+            ignore_disabled=True
+        )
         assert built_view._reattach_baseline_digest != empty_view._reattach_baseline_digest
         assert built_view._has_rendered is False
 
-    async def test_untouched_restored_view_skips_the_teardown_edit(self):
-        """Nothing has changed the tree since reattach, so there is
-        nothing on screen for the teardown edit to correct -- the
-        original defect this stamp exists to keep fixed."""
+    @staticmethod
+    def _panel_with_close_button():
+        """A restored panel whose ``__init__`` builds only a Close row; its real
+        content would arrive in ``on_load``. Its own tree is NOT what the
+        message shows, so freezing it would overwrite the live panel."""
         from cascadeui.views.persistent import PersistentLayoutView
 
-        class _EmptyPanel(PersistentLayoutView):
-            pass
+        class _ClosePanel(PersistentLayoutView):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.add_item(
+                    discord.ui.ActionRow(discord.ui.Button(label="Close", custom_id="close:1"))
+                )
 
-        view, message = await self._reattach(_EmptyPanel, "baseline:untouched")
+        return _ClosePanel
+
+    @staticmethod
+    def _labels_and_states(view):
+        return [
+            (item.label, item.disabled)
+            for item in view.walk_children()
+            if isinstance(item, discord.ui.Button)
+        ]
+
+    async def test_untouched_restored_view_freezes_what_is_on_screen(self):
+        """Torn down before its first render, a restored view freezes the
+        pre-restart panel Discord still shows, not its own ``__init__`` tree."""
+        view, message = await self._reattach(
+            self._panel_with_close_button(), "baseline:onscreen", self._on_screen()
+        )
+
+        await view.exit(delete_message=False)
+
+        shipped = message.edited_with["view"]
+        assert self._labels_and_states(shipped) == [("Join", True)]
+        texts = [
+            i.content for i in shipped.walk_children() if isinstance(i, discord.ui.TextDisplay)
+        ]
+        assert texts == ["Live board"]
+        assert shipped is not view
+        # Stopped, so Message.edit does not register the copy with the view store.
+        assert shipped.is_finished()
+
+    async def test_untouched_restored_view_skips_when_nothing_on_screen_is_live(self):
+        """An on-screen panel with nothing left to disable owes no edit."""
+        view, message = await self._reattach(
+            self._panel_with_close_button(),
+            "baseline:alreadyfrozen",
+            self._on_screen(button_enabled=False),
+        )
+
+        await view.exit(delete_message=False)
+
+        assert not hasattr(message, "edited_with")
+
+    async def test_override_that_freezes_first_still_reads_as_untouched(self):
+        """Disabling components is not new content: an override that calls
+        ``_freeze_components()`` before delegating still freezes the on-screen
+        panel instead of shipping its own ``__init__`` tree."""
+        base = self._panel_with_close_button()
+
+        class _FreezesFirst(base):
+            async def exit(self, delete_message=None):
+                self._freeze_components()
+                return await super().exit(delete_message=delete_message)
+
+        view, message = await self._reattach(
+            _FreezesFirst, "baseline:freezefirst", self._on_screen()
+        )
+
+        await view.exit(delete_message=False)
+
+        assert self._labels_and_states(message.edited_with["view"]) == [("Join", True)]
+
+    async def test_on_screen_attachment_media_ships_as_attachment_references(self):
+        """A fetched message resolves uploaded files to signed CDN URLs, and
+        discord.py serializes only that URL. The frozen copy re-points them at
+        ``attachment://`` by the filename in each URL, since the message lists
+        no attachments; an external image is left alone."""
+        view, message = await self._reattach(
+            self._panel_with_close_button(),
+            "baseline:media",
+            self._on_screen(media=True),
+        )
+
+        await view.exit(delete_message=False)
+
+        shipped = message.edited_with["view"]
+        urls = {}
+        for item in shipped.walk_children():
+            if isinstance(item, discord.ui.MediaGallery):
+                urls["gallery"] = [entry.media.to_dict()["url"] for entry in item.items]
+            elif isinstance(item, discord.ui.File):
+                urls["file"] = item.media.to_dict()["url"]
+            elif isinstance(item, discord.ui.Thumbnail):
+                urls["thumbnail"] = item.media.to_dict()["url"]
+        assert urls == {
+            "gallery": ["attachment://pic.png"],
+            "file": "attachment://report.txt",
+            "thumbnail": "https://example.com/avatar.png",
+        }
+
+    async def test_on_screen_media_filename_is_decoded_from_its_url(self):
+        """The URL percent-encodes a filename outside plain ASCII; the
+        ``attachment://`` reference names the file itself."""
+        view, message = await self._reattach(
+            self._panel_with_close_button(),
+            "baseline:encoded",
+            self._on_screen(media=True, image_path="r%C3%A9sum%C3%A9.png"),
+        )
+
+        await view.exit(delete_message=False)
+
+        gallery = next(
+            item
+            for item in message.edited_with["view"].walk_children()
+            if isinstance(item, discord.ui.MediaGallery)
+        )
+        assert [entry.media.to_dict()["url"] for entry in gallery.items] == [
+            "attachment://r\N{LATIN SMALL LETTER E WITH ACUTE}sum\N{LATIN SMALL LETTER E WITH ACUTE}.png"
+        ]
+
+    async def test_override_that_empties_the_tree_freezes_the_panel_on_screen(self, caplog):
+        """A restored view that never rendered still has the pre-restart panel
+        up. An override that leaves nothing shippable gets that panel frozen,
+        not live-looking controls left behind, and the mistake is logged."""
+        base = self._panel_with_close_button()
+
+        class _EmptiesTree(base):
+            async def exit(self, delete_message=None):
+                self.clear_items()
+                return await super().exit(delete_message=delete_message)
+
+        view, message = await self._reattach(_EmptiesTree, "baseline:emptied", self._on_screen())
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui.views.base"):
+            await view.exit(delete_message=False)
+
+        assert self._labels_and_states(message.edited_with["view"]) == [("Join", True)]
+        assert "empty component tree" in caplog.text
+
+    @staticmethod
+    def _on_screen_with_a_container_emptied_by_an_unknown_type():
+        """discord.py drops a component type it does not recognize, so the
+        second container rebuilds with no children."""
+        from discord.components import _component_factory
+
+        return [
+            _component_factory(
+                {
+                    "type": 17,
+                    "id": 1,
+                    "components": [
+                        {
+                            "type": 1,
+                            "id": 3,
+                            "components": [
+                                {
+                                    "type": 2,
+                                    "id": 4,
+                                    "style": 1,
+                                    "label": "Join",
+                                    "custom_id": "join:1",
+                                }
+                            ],
+                        },
+                    ],
+                }
+            ),
+            _component_factory({"type": 17, "id": 5, "components": [{"type": 999, "id": 6}]}),
+        ]
+
+    async def test_on_screen_copy_that_fails_placement_skips_the_edit(self, caplog):
+        """A container left empty by a dropped component is a 400, so the copy
+        runs the same placement check the view's own tree does. The panel is
+        then left unfrozen, which is worth a warning."""
+        view, message = await self._reattach(
+            self._panel_with_close_button(),
+            "baseline:unknowntype",
+            self._on_screen_with_a_container_emptied_by_an_unknown_type(),
+        )
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui.views.base"):
+            await view.exit(delete_message=False)
+
+        assert not hasattr(message, "edited_with")
+        assert "could not freeze the panel" in caplog.text
+
+    async def test_on_screen_copy_honors_the_validate_placement_opt_out(self):
+        """``validate_placement = False`` trusts trees the validator has not
+        caught up to; a copy of what Discord already accepted is one."""
+        base = self._panel_with_close_button()
+
+        class _OptedOut(base):
+            validate_placement = False
+
+        view, message = await self._reattach(
+            _OptedOut,
+            "baseline:optout",
+            self._on_screen_with_a_container_emptied_by_an_unknown_type(),
+        )
+
+        await view.exit(delete_message=False)
+
+        assert hasattr(message, "edited_with")
+
+    async def test_unreadable_message_components_skip_rather_than_overwrite(self):
+        """If the on-screen components cannot be rebuilt, the edit is skipped:
+        shipping the view's own tree would overwrite the real panel."""
+        view, message = await self._reattach(self._panel_with_close_button(), "baseline:unreadable")
 
         await view.exit(delete_message=False)
 
@@ -1831,7 +2486,7 @@ class TestPostReadyRestore:
         done = MagicMock()
         done.cancelled.return_value = False
         done.exception.return_value = None
-        mgr._on_sweeper_done(done)
+        mgr._on_sweeper_done("TTL sweeper", "_ttl_sweeper_task", done)
 
         assert mgr._ttl_sweeper_task is None
         assert sentinel_task in mgr._post_ready_restore_tasks  # untouched
@@ -2925,6 +3580,53 @@ class TestPruneUnreachable:
         found = await backend.row_select(TABLE_PERSISTENT_VIEWS, {"persistence_key": "live"})
         assert found[0]["first_unreachable_at"] is None
 
+    async def test_candidates_are_verified_concurrently_under_the_restore_bound(self):
+        """The sweep holds the registry lock, so its fetches overlap the way
+        the reattach pass's do, bounded by the same setting."""
+        now = int(time.time())
+        mgr, _ = await self._mgr([self._row(f"k{i}", now - 40 * 86400) for i in range(10)])
+        mgr.restore_concurrency = 3
+        live = 0
+        peak = 0
+
+        async def _fetch(row, removed, unreachable):
+            nonlocal live, peak
+            live += 1
+            peak = max(peak, live)
+            await asyncio.sleep(0)
+            live -= 1
+            unreachable.append(row["persistence_key"])
+            return None
+
+        mgr._fetch_restore_message = _fetch
+
+        result = await mgr.prune_unreachable(older_than_days=30)
+
+        assert peak == 3
+        assert result["pruned"] == [f"k{i}" for i in range(10)]
+
+    async def test_a_verification_that_raises_keeps_its_row(self):
+        """An answer that never arrived is not evidence the panel is gone."""
+        now = int(time.time())
+        mgr, backend = await self._mgr(
+            [self._row("raises", now - 40 * 86400), self._row("gone", now - 40 * 86400)]
+        )
+
+        async def _fetch(row, removed, unreachable):
+            if row["persistence_key"] == "raises":
+                raise RuntimeError("gateway said no")
+            removed.append(row["persistence_key"])
+            return None
+
+        mgr._fetch_restore_message = _fetch
+
+        result = await mgr.prune_unreachable(older_than_days=30)
+
+        assert result["pruned"] == ["gone"]
+        assert result["kept"] == ["raises"]
+        left = [r["persistence_key"] for r in await backend.row_select(TABLE_PERSISTENT_VIEWS)]
+        assert left == ["raises"]
+
     async def test_pruning_drops_the_row_from_the_in_memory_mirror(self):
         now = int(time.time())
         mgr, _ = await self._mgr([self._row("old", now - 40 * 86400)])
@@ -2958,6 +3660,227 @@ class TestPruneUnreachable:
             "recovered": [],
             "kept": [],
         }
+
+    async def test_a_row_a_live_panel_holds_is_kept_without_a_fetch(self):
+        """A panel restored and then cut off from its channel still routes
+        interactions; a failed fetch is no reason to delete the row it owns."""
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        class _LivePanel(PersistentLayoutView):
+            pass
+
+        now = int(time.time())
+        mgr, backend = await self._mgr([self._row("live", now - 40 * 86400)])
+        store = get_store()
+        store._register_view(_LivePanel(persistence_key="live"))
+        fetched = []
+
+        async def _fetch(row, removed, unreachable):
+            fetched.append(row["persistence_key"])
+            unreachable.append(row["persistence_key"])
+            return None
+
+        mgr._fetch_restore_message = _fetch
+
+        result = await mgr.prune_unreachable(older_than_days=30)
+
+        assert result == {"pruned": [], "recovered": [], "kept": ["live"]}
+        assert fetched == []
+        assert await backend.row_select(TABLE_PERSISTENT_VIEWS, {"persistence_key": "live"})
+
+    async def test_a_stopped_panel_does_not_protect_its_row(self):
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        class _StoppedPanel(PersistentLayoutView):
+            pass
+
+        now = int(time.time())
+        mgr, backend = await self._mgr([self._row("stopped", now - 40 * 86400)])
+        view = _StoppedPanel(persistence_key="stopped")
+        get_store()._register_view(view)
+        view.stop()
+
+        async def _fetch(row, removed, unreachable):
+            unreachable.append(row["persistence_key"])
+            return None
+
+        mgr._fetch_restore_message = _fetch
+
+        result = await mgr.prune_unreachable(older_than_days=30)
+
+        assert result["pruned"] == ["stopped"]
+
+
+class TestUnreachableSweeper:
+    """``prune_unreachable_after_days`` runs the prune once the gateway is
+    ready and daily after, never overlapping a reattach pass."""
+
+    class _Bot(discord.Client):
+        def __init__(self):
+            self.ready = asyncio.Event()
+
+        async def wait_until_ready(self):
+            await self.ready.wait()
+
+    async def test_a_walk_re_entered_from_its_own_task_raises_instead_of_hanging(self):
+        """A REGISTRY_PRUNED hook runs inline, inside the walk that fired it,
+        so a second walk there would wait forever on its own caller."""
+        mgr = PersistenceManager(
+            store=get_store(),
+            registry=RegistryPersistence(backend=InMemoryBackend()),
+            bot=MagicMock(),
+        )
+
+        async def _nested():
+            return await mgr.prune_unreachable(older_than_days=30)
+
+        with pytest.raises(RuntimeError, match="in the same task"):
+            await asyncio.wait_for(mgr._serialized_walk("reattach_persistent_views", _nested), 2)
+        assert not mgr._registry_walk_lock.locked()
+
+    @pytest.mark.parametrize("bad", [0, -1, True, "30", 1.5])
+    def test_a_bad_cutoff_is_refused_at_construction(self, bad):
+        with pytest.raises(ValueError, match="prune_unreachable_after_days"):
+            PersistenceMiddleware(bot=self._Bot(), prune_unreachable_after_days=bad)
+        with pytest.raises(ValueError, match="prune_unreachable_after_days"):
+            PersistenceManager(store=get_store(), bot=MagicMock(), prune_unreachable_after_days=bad)
+
+    def test_the_sweep_is_refused_without_a_bot(self):
+        with pytest.raises(ValueError, match="needs bot="):
+            PersistenceMiddleware(backend=InMemoryBackend(), prune_unreachable_after_days=30)
+
+    async def test_nothing_starts_when_off_or_without_a_registry(self):
+        off = PersistenceManager(
+            store=get_store(),
+            registry=RegistryPersistence(backend=InMemoryBackend()),
+            bot=MagicMock(),
+        )
+        no_registry = PersistenceManager(
+            store=get_store(), bot=MagicMock(), prune_unreachable_after_days=30
+        )
+        for mgr in (off, no_registry):
+            mgr._start_sweepers()
+            assert mgr._unreachable_sweeper_task is None
+
+    async def _sweeping_manager(self, monkeypatch):
+        import cascadeui.persistence.manager as manager_module
+
+        bot = self._Bot()
+        mgr = PersistenceManager(
+            store=get_store(),
+            registry=RegistryPersistence(backend=InMemoryBackend()),
+            bot=bot,
+            prune_unreachable_after_days=30,
+        )
+        sleeps = []
+        release = asyncio.Event()
+        real_sleep = asyncio.sleep
+
+        # asyncio.sleep is one object process-wide, so only the sweeper's daily
+        # wait is intercepted; every other sleep keeps its real behavior.
+        async def _sleep(seconds):
+            if seconds != 86400:
+                return await real_sleep(seconds)
+            sleeps.append(seconds)
+            # One release lets one day pass; the next wait blocks again.
+            await release.wait()
+            release.clear()
+
+        monkeypatch.setattr(manager_module.asyncio, "sleep", _sleep)
+        return mgr, bot, sleeps, release
+
+    async def test_it_waits_for_ready_then_prunes_daily(self, monkeypatch):
+        mgr, bot, sleeps, _ = await self._sweeping_manager(monkeypatch)
+        mgr.prune_unreachable = AsyncMock(return_value={})
+
+        mgr._start_sweepers()
+        for _ in range(3):
+            await asyncio.sleep(0)
+        mgr.prune_unreachable.assert_not_awaited()
+
+        bot.ready.set()
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+        mgr.prune_unreachable.assert_awaited_once_with(older_than_days=30)
+        assert sleeps == [86400]
+        await mgr.close()
+
+    async def test_a_raising_pass_is_logged_and_the_loop_continues(self, monkeypatch, caplog):
+        mgr, bot, sleeps, release = await self._sweeping_manager(monkeypatch)
+        mgr.prune_unreachable = AsyncMock(side_effect=[RuntimeError("backend down"), {}])
+        bot.ready.set()
+
+        mgr._start_sweepers()
+        for _ in range(3):
+            await asyncio.sleep(0)
+        release.set()
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        assert mgr.prune_unreachable.await_count == 2
+        assert "Unreachable sweeper error: backend down" in caplog.text
+        await mgr.close()
+
+    async def test_close_cancels_the_sweeper(self, monkeypatch):
+        mgr, bot, _, _ = await self._sweeping_manager(monkeypatch)
+        mgr._start_sweepers()
+        task = mgr._unreachable_sweeper_task
+
+        await mgr.close()
+
+        assert task.cancelled() or task.done()
+        assert mgr._unreachable_sweeper_task is None
+
+    async def test_a_prune_waits_for_a_running_reattach_pass(self):
+        backend = InMemoryBackend()
+        await backend.initialize()
+        mgr = PersistenceManager(
+            store=get_store(), registry=RegistryPersistence(backend=backend), bot=MagicMock()
+        )
+        inside = asyncio.Event()
+        release = asyncio.Event()
+        reads = []
+
+        async def _slow_pass():
+            inside.set()
+            await release.wait()
+            return {}
+
+        real_select = backend.row_select
+
+        async def _select(*args, **kwargs):
+            reads.append(args)
+            return await real_select(*args, **kwargs)
+
+        mgr._reattach_pass = _slow_pass
+        backend.row_select = _select
+
+        reattach = asyncio.create_task(mgr.reattach_persistent_views())
+        await inside.wait()
+        prune = asyncio.create_task(mgr.prune_unreachable(older_than_days=30))
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert reads == []
+
+        release.set()
+        await reattach
+        await prune
+        assert reads
+
+    async def test_a_pre_built_manager_install_starts_its_sweepers(self):
+        from cascadeui import setup_middleware
+
+        mgr = PersistenceManager(
+            store=get_store(),
+            registry=RegistryPersistence(backend=InMemoryBackend()),
+            bot=self._Bot(),
+            prune_unreachable_after_days=30,
+        )
+        await setup_middleware(PersistenceMiddleware(manager=mgr))
+
+        assert mgr._unreachable_sweeper_task is not None
+        await mgr.close()
 
 
 class TestRegistrySchemaMigration:
@@ -3496,3 +4419,286 @@ class TestRewrittenRowRefreshesTheMirrorAndTheSummary:
         assert (
             mgr._registry_rows == []
         ), "a vanished row left in the mirror is re-fetched on every re-drive"
+
+
+class TestRestoredViewRegistryMirror:
+    """Rehydrate seeds ``state["persistent_views"]`` from the stored rows.
+
+    Only the send path dispatches ``PERSISTENT_VIEW_REGISTERED``, so without
+    the seed a restored view's key is missing from the mirror: ``exit()``'s
+    unregister changes no state, the middleware routes nothing, and the row
+    outlives the panel; a re-send under the same key also skips the
+    duplicate-key cleanup that retires the restored panel.
+    """
+
+    KEY = "panel:mirror"
+
+    class _Channel:
+        id = 2
+
+    def _message(self, message_id):
+        channel = self._Channel()
+
+        class _Msg:
+            id = message_id
+            attachments = []
+            components = []
+            guild = None
+
+            async def edit(self, **kwargs):
+                self.edited_with = kwargs
+
+            async def delete(self):
+                self.deleted = True
+
+        msg = _Msg()
+        msg.channel = channel
+        return msg
+
+    @staticmethod
+    def _panel_class():
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        class _MirrorPanel(PersistentLayoutView):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.add_item(
+                    discord.ui.ActionRow(discord.ui.Button(label="Join", custom_id="mirror:join"))
+                )
+
+        return _MirrorPanel
+
+    async def _restore(self):
+        from cascadeui.views.persistent import _persistent_view_classes
+
+        cls = self._panel_class()
+        qualname = next(k for k, v in _persistent_view_classes.items() if v is cls)
+        backend = InMemoryBackend()
+        await backend.initialize()
+        await backend.row_upsert(
+            TABLE_PERSISTENT_VIEWS,
+            {
+                "persistence_key": self.KEY,
+                "view_class": qualname,
+                "custom_id": None,
+                "message_id": 1,
+                "channel_id": 2,
+                "guild_id": 3,
+                "user_id": None,
+                "session_id": None,
+                "init_kwargs": json.dumps({}),
+                "kwargs_schema_version": 1,
+                "schema_version": 2,
+                "created_at": 7,
+                "updated_at": 7,
+            },
+            ["persistence_key"],
+        )
+        middleware = PersistenceMiddleware(backend=backend)
+        await setup_middleware(middleware)
+        store = get_store()
+        mgr = store.persistence_manager
+
+        class _Bot:
+            def add_view(self, view, message_id):
+                pass
+
+        mgr._bot = _Bot()
+        restored = []
+        outcome = await mgr._reattach_one(
+            row=mgr._registry_rows[0],
+            view_cls=cls,
+            init_kwargs={},
+            message=self._message(1),
+            class_name=cls.__name__,
+            restored_views=restored,
+        )
+        assert outcome == "restored"
+        return cls, backend, middleware, store, restored[0]
+
+    async def test_rehydrate_seeds_the_entry_a_send_would_have_written(self):
+        _, _, _, store, _ = await self._restore()
+
+        entry = store.state["persistent_views"][self.KEY]
+
+        assert entry["message_id"] == "1"
+        assert entry["channel_id"] == "2"
+        assert entry["guild_id"] == "3"
+        assert entry["user_id"] is None
+        assert entry["registered_at"] == "1970-01-01T00:00:07+00:00"
+
+    async def test_exit_on_a_restored_view_deletes_its_row(self):
+        _, backend, middleware, _, view = await self._restore()
+
+        await view.exit(delete_message=False)
+        await middleware.flush_all()
+
+        assert await backend.row_select(TABLE_PERSISTENT_VIEWS) == []
+
+    async def test_a_resend_under_the_same_key_retires_the_restored_panel(self):
+        cls, backend, middleware, store, restored = await self._restore()
+        fresh = cls(persistence_key=self.KEY)
+        # _send_pipeline registers the view before _register_persistent runs,
+        # and the middleware reads the registering view back to build its row.
+        store._register_view(fresh)
+
+        await fresh._register_persistent(self._message(99))
+        await middleware.flush_all()
+
+        assert restored.is_finished(), "the restored panel must be exited, not left live"
+        assert store.state["persistent_views"][self.KEY]["message_id"] == "99"
+        rows = await backend.row_select(TABLE_PERSISTENT_VIEWS)
+        assert [r["message_id"] for r in rows] == [99]
+
+    async def test_a_restored_panel_superseded_in_place_keeps_its_successors_row(self):
+        """With ``retire_previous_on_send`` off, the restored panel stays live
+        beside its successor; when its message is deleted and it exits, the
+        registration it restored under is no longer the stored one."""
+        cls, backend, middleware, store, restored = await self._restore()
+        fresh = cls(persistence_key=self.KEY)
+        fresh.set_class_attribute("retire_previous_on_send", False)
+        store._register_view(fresh)
+        await fresh._register_persistent(self._message(99))
+
+        await restored.on_message_delete()
+        await middleware.flush_all()
+
+        assert restored.is_finished()
+        assert store.state["persistent_views"][self.KEY]["message_id"] == "99"
+        rows = await backend.row_select(TABLE_PERSISTENT_VIEWS)
+        assert [r["message_id"] for r in rows] == [99]
+
+    async def test_a_key_registered_before_rehydrate_keeps_its_live_entry(self):
+        store = get_store()
+        live = {"persistence_key": "panel:live", "message_id": "55"}
+        store.state["persistent_views"] = {"panel:live": live}
+        backend = InMemoryBackend()
+        await backend.initialize()
+        await backend.row_upsert(
+            TABLE_PERSISTENT_VIEWS,
+            {
+                "persistence_key": "panel:live",
+                "view_class": "V",
+                "custom_id": None,
+                "message_id": 1,
+                "channel_id": 2,
+                "guild_id": None,
+                "user_id": None,
+                "session_id": None,
+                "init_kwargs": "{}",
+                "kwargs_schema_version": 1,
+                "schema_version": 2,
+                "created_at": 1,
+                "updated_at": 1,
+            },
+            ["persistence_key"],
+        )
+        mgr = PersistenceManager(store=store, registry=RegistryPersistence(backend=backend))
+
+        await mgr.rehydrate()
+
+        assert store.state["persistent_views"]["panel:live"] is live
+
+
+class TestRedriveSkipsKeysHeldByLivePanels:
+    """A reattach re-drive leaves alone a key a live panel in this process holds.
+
+    A panel sent under a key still pending from boot rewrites its row. Before
+    the skip, the first re-drive would 404 for the replaced message and adopt
+    the new coordinates, and the next one would attach a second instance to
+    the message the live panel already owns.
+    """
+
+    KEY = "redrive:panel"
+
+    async def test_a_send_under_a_pending_key_is_never_reattached_twice(self):
+        from unittest.mock import AsyncMock
+
+        from cascadeui.views.persistent import PersistentLayoutView, _persistent_view_classes
+
+        class _RedrivePanel(PersistentLayoutView):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.add_item(
+                    discord.ui.ActionRow(discord.ui.Button(label="Go", custom_id="redrive:go"))
+                )
+
+        def message(message_id):
+            m = MagicMock()
+            m.id = message_id
+            m.guild = None
+            m.channel.id = 2
+            m.attachments = []
+            m.components = []
+            m.edit = AsyncMock()
+            m.delete = AsyncMock()
+            return m
+
+        class _Bot:
+            def add_view(self, view, message_id):
+                pass
+
+            def add_dynamic_items(self, *items):
+                pass
+
+        qualname = next(k for k, v in _persistent_view_classes.items() if v is _RedrivePanel)
+        backend = InMemoryBackend()
+        await backend.initialize()
+        await backend.row_upsert(
+            TABLE_PERSISTENT_VIEWS,
+            {
+                "persistence_key": self.KEY,
+                "view_class": qualname,
+                "custom_id": None,
+                "message_id": 111,
+                "channel_id": 2,
+                "guild_id": None,
+                "user_id": None,
+                "session_id": None,
+                "init_kwargs": "{}",
+                "kwargs_schema_version": 1,
+                "schema_version": 2,
+                "created_at": 1,
+                "updated_at": 1,
+            },
+            ["persistence_key"],
+        )
+        middleware = PersistenceMiddleware(backend=backend)
+        await setup_middleware(middleware)
+        store = get_store()
+        mgr = store.persistence_manager
+        mgr._bot = _Bot()
+
+        async def unreachable_at_boot(row, removed, unreachable):
+            unreachable.append(row["persistence_key"])
+            return None
+
+        mgr._fetch_restore_message = unreachable_at_boot
+        await mgr.reattach()
+
+        live = _RedrivePanel(persistence_key=self.KEY)
+        live._message = message(999)
+        store._register_view(live)
+        await live._register_persistent(live._message)
+        await middleware.flush_all()
+
+        async def old_gone_new_present(row, removed, unreachable):
+            if int(row["message_id"]) == 111:
+                removed.append(row["persistence_key"])
+                return None
+            fetched = message(int(row["message_id"]))
+            return fetched.channel, fetched
+
+        mgr._fetch_restore_message = old_gone_new_present
+        for _ in range(2):
+            await mgr.reattach()
+            await middleware.flush_all()
+
+        holders = [
+            v
+            for v in store._active_views.values()
+            if getattr(v, "_persistence_key", None) == self.KEY
+        ]
+        assert holders == [live]
+        rows = await backend.row_select(TABLE_PERSISTENT_VIEWS)
+        assert [r["message_id"] for r in rows] == [999]

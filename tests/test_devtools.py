@@ -725,6 +725,7 @@ class TestDevToolsCogReset:
         store = get_store()
         failing_view = MagicMock()
         failing_view.exit = AsyncMock(side_effect=RuntimeError("boom"))
+        failing_view._torn_down.return_value = False
         store._active_views["failing_v"] = failing_view
 
         cog = DevToolsCog(bot=MagicMock())
@@ -733,6 +734,36 @@ class TestDevToolsCogReset:
 
         sent = ctx.send.call_args[0][0]
         assert "1 view exit(s) failed" in sent
+
+    async def test_reset_rebuilds_the_registry_mirror_from_surviving_rows(self):
+        """Rows the exit loop did not delete are still on disk, and a mirror
+        that forgot them retires nothing when their key is exited later."""
+        from cascadeui.persistence.manager import PersistenceManager
+
+        store = get_store()
+        store._active_views.clear()
+        manager = PersistenceManager(store=store)
+        manager._registry_rows = [
+            {
+                "persistence_key": "survivor",
+                "view_class": "Panel",
+                "message_id": 111,
+                "channel_id": 2,
+                "guild_id": None,
+                "user_id": None,
+                "created_at": 1,
+            }
+        ]
+        store.persistence_manager = manager
+
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = self._make_ctx()
+        try:
+            await cog.reset.callback(cog, ctx, confirm=True)
+        finally:
+            del store.persistence_manager
+
+        assert store.state["persistent_views"]["survivor"]["message_id"] == "111"
 
     async def test_reset_requires_confirm(self):
         cog = DevToolsCog(bot=MagicMock())
@@ -758,8 +789,10 @@ class TestDevToolsCogExitAll:
         store._active_views.clear()
         good = MagicMock()
         good.exit = AsyncMock()
+        good._torn_down.return_value = False
         bad = MagicMock()
         bad.exit = AsyncMock(side_effect=RuntimeError("nope"))
+        bad._torn_down.return_value = False
         store._active_views["good_v"] = good
         store._active_views["bad_v"] = bad
 
@@ -824,9 +857,11 @@ class TestDevToolsCogGuildScope:
         here = MagicMock()
         here.guild_id = 100
         here.exit = AsyncMock()
+        here._torn_down.return_value = False
         other = MagicMock()
         other.guild_id = 200
         other.exit = AsyncMock()
+        other._torn_down.return_value = False
         store._active_views["here"] = here
         store._active_views["other"] = other
 
@@ -836,6 +871,30 @@ class TestDevToolsCogGuildScope:
 
         here.exit.assert_awaited_once()
         other.exit.assert_not_called()
+
+    async def test_exitall_skips_a_view_an_earlier_exit_cascaded_to(self):
+        """The snapshot predates the first exit, and exiting a parent exits
+        the children attached to it."""
+        store = get_store()
+        store._active_views.clear()
+        store.state["views"] = {}
+        parent = MagicMock()
+        parent.guild_id = 100
+        parent.exit = AsyncMock()
+        parent._torn_down.return_value = False
+        child = MagicMock()
+        child.guild_id = 100
+        child.exit = AsyncMock()
+        # Torn down by the parent's cascade before the loop reaches it.
+        child._torn_down.return_value = True
+        store._active_views["parent"] = parent
+        store._active_views["child"] = child
+
+        cog = DevToolsCog(bot=MagicMock())
+        await cog.exit_all.callback(cog, self._ctx(100))
+
+        parent.exit.assert_awaited_once()
+        child.exit.assert_not_called()
 
 
 class TestDevToolsCogGroupListing:

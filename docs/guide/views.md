@@ -1046,8 +1046,8 @@ acknowledged, regardless of callback speed or response pattern:
    this and acknowledges it instantly.
 
 2. **Timed defer** -- if a callback takes longer than `auto_defer_delay` (default
-   2.5s) without responding, a background timer defers proactively. This covers
-   slow operations like database queries or API calls.
+   2.5s, and it must stay under `3.0`) without responding, a background timer
+   defers proactively. This covers slow operations like database queries or API calls.
 
 3. **Interaction serialization** -- when `serialize_interactions = True` (default),
    rapid button clicks are processed sequentially via `asyncio.Lock`. The timed
@@ -1377,22 +1377,39 @@ re-parenting detaches from the old parent cleanly.
 
 ## Message Deletion Cleanup
 
-When a view's Discord message is deleted externally (admin delete, bulk purge,
-channel delete), the library automatically cleans up the view's state, tasks,
-and store registration. The `on_message_delete()` hook fires by default and
-calls `exit(delete_message=False)`.
+When a view's Discord message is deleted externally, the library cleans up the
+view's state, tasks, and store registration (and, for a persistent view, its
+registry row). The `on_message_delete()` hook fires and, by default, calls
+`exit(delete_message=False)`. Three signals reach it:
 
-Override the hook for custom behavior:
+| The message went because | How the library learns | Intents needed |
+|---|---|---|
+| Someone deleted it, or purged it in bulk | The gateway's message-delete events | `guild_messages` (or `dm_messages` in a DM) |
+| Its channel or thread was deleted | The channel and thread delete events; Discord sends no message deletions for these | `guilds` |
+| Either of the above, while the bot missed the event | The view's next edit returns "Unknown Message" | none |
+
+The third row is why a bot that trims its intents still retires deleted panels:
+`refresh()` nulls the message, fires `on_message_gone()`, and then tears the view
+down through `on_message_delete()`. Without the message intents, a panel that is
+never edited again keeps its view until its next edit, its timeout, or a restart.
+
+Override the hooks for custom behavior:
 
 ```python
 class MyView(StatefulLayoutView):
+    async def on_message_gone(self):
+        # Reconcile your own record of the message. No exit needed: the
+        # library tears the view down right after this returns.
+        await forget_panel(self.persistence_key)
+
     async def on_message_delete(self):
         print(f"View {self.id} message was deleted")
-        await self.exit(delete_message=False)
+        await super().on_message_delete()
 ```
 
-The cleanup listener is installed automatically on first `send()` or when
-`PersistenceMiddleware(bot=self)` initializes. No manual setup is required.
+Once a view is torn down, a later signal for the same deletion finds nothing to
+do. The cleanup listeners are installed automatically on first `send()` or
+when `PersistenceMiddleware(bot=self)` initializes. No manual setup is required.
 
 ---
 

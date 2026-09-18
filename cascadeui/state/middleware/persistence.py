@@ -42,7 +42,10 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
-from ...persistence.manager import _NON_PERSISTABLE_KWARGS
+from ...persistence.manager import (
+    _NON_PERSISTABLE_KWARGS,
+    _validate_prune_unreachable_after_days,
+)
 from ...persistence.protocols import PersistenceBackend
 from ...persistence.schema import (
     CURRENT_SCHEMA_VERSIONS,
@@ -168,7 +171,14 @@ class PersistenceMiddleware:
         bot: Any = None,
         migrators: Optional[dict] = None,
         restore_concurrency: int = 8,
+        prune_unreachable_after_days: Optional[int] = None,
     ) -> None:
+        # Validated here as well as in the manager, so the kwargs path fails at
+        # construction rather than at initialize(). With manager= this, like
+        # every pipeline kwarg, is ignored: set it on the manager instead.
+        if manager is None:
+            _validate_prune_unreachable_after_days(prune_unreachable_after_days, bot)
+
         # Validate the restore-concurrency knob at the construction site so
         # a bad value fails here, not deep inside the reattach fan-out.
         if (
@@ -245,6 +255,7 @@ class PersistenceMiddleware:
                 "bot": bot,
                 "migrators": migrators,
                 "restore_concurrency": restore_concurrency,
+                "prune_unreachable_after_days": prune_unreachable_after_days,
             }
             self._initialized = False
             # Namespace state is built after the manager resolves in
@@ -305,6 +316,11 @@ class PersistenceMiddleware:
            ``bot`` is available).
         """
         if self._initialized:
+            # A pre-built manager ran its own pipeline, but the sweepers are
+            # the middleware's to start; without this a manager= install never
+            # swept anything. Idempotent on a re-invocation.
+            if self._manager is not None:
+                self._manager._start_sweepers()
             return
 
         cfg = self._pending_config or {}
@@ -340,8 +356,9 @@ class PersistenceMiddleware:
         store.persistence_manager = manager
 
         # Start the daily TTL sweeper when any persistent slot declares
-        # ttl_days. Nothing to sweep otherwise -- skip the task.
-        manager._start_ttl_sweeper()
+        # ttl_days, and the unreachable-row sweep when it is configured. Each
+        # is skipped when there is nothing for it to do.
+        manager._start_sweepers()
 
         if bot is not None:
             # The reattach pass also registers every DynamicPersistentButton
@@ -425,6 +442,7 @@ class PersistenceMiddleware:
             application=resolved_application,
             bot=bot,
             restore_concurrency=cfg.get("restore_concurrency", 8),
+            prune_unreachable_after_days=cfg.get("prune_unreachable_after_days"),
         )
 
     @staticmethod
@@ -506,7 +524,7 @@ class PersistenceMiddleware:
             return result
 
         if action_type in ("PERSISTENT_VIEW_REGISTERED", "PERSISTENT_VIEW_UNREGISTERED"):
-            self._route_registry(action)
+            self._route_registry(action, state_before, state_after)
         else:
             self._route_application(state_before, state_after)
 
@@ -514,7 +532,7 @@ class PersistenceMiddleware:
 
     # // ========================================( Routing )======================================== // #
 
-    def _route_registry(self, action: Action) -> None:
+    def _route_registry(self, action: Action, before: StateData, after: StateData) -> None:
         ns = self._ns_registry
         if ns.backend is None:
             return
@@ -524,20 +542,34 @@ class PersistenceMiddleware:
             return
 
         if action["type"] == "PERSISTENT_VIEW_UNREGISTERED":
+            # Read the removal the reducer actually made, not the dict's
+            # identity: it refuses when the key has moved to another message,
+            # and returns the state object untouched to say so, which any
+            # middleware that hands the chain a rebuilt mapping erases. Routing
+            # a delete on a refusal would take the live successor's row.
+            removed = persistence_key in before.get(
+                "persistent_views", {}
+            ) and persistence_key not in after.get("persistent_views", {})
+            if not removed:
+                return
             ns.deleted_keys.add(persistence_key)
             ns.dirty_rows.pop(persistence_key, None)
+            if self._manager is not None:
+                self._manager._forget_registry_row(persistence_key)
         else:
-            # Look up the registering view in _active_views to read
-            # _init_kwargs + kwargs_schema_version. The dispatch site
-            # (_register_persistent) runs after register_view(), so the
-            # view is guaranteed present when the middleware observes
-            # this action.
-            view = self._find_view_by_persistence_key(persistence_key)
+            # The registering view supplies _init_kwargs +
+            # kwargs_schema_version. It was registered before it dispatched,
+            # and it stamped the message id the reducer just recorded, so the
+            # store's lookup selects it over any superseded panel still live
+            # under the key.
+            view = self._store.get_active_view(persistence_key=persistence_key)
             row = self._build_registry_row(payload, view)
             if row is None:
                 return
             ns.dirty_rows[persistence_key] = row
             ns.deleted_keys.discard(persistence_key)
+            if self._manager is not None:
+                self._manager._remember_registry_row(persistence_key, row)
 
         self._schedule(ns)
 
@@ -760,13 +792,6 @@ class PersistenceMiddleware:
         if name == "application":
             return TABLE_APPLICATION_SLOTS, ["slot_name"], "slot_name"
         raise ValueError(f"unknown namespace: {name!r}")
-
-    def _find_view_by_persistence_key(self, persistence_key: str) -> Optional[Any]:
-        """Return the first active view whose ``_persistence_key`` matches."""
-        for view in self._store._active_views.values():
-            if getattr(view, "_persistence_key", None) == persistence_key:
-                return view
-        return None
 
     def _build_registry_row(self, payload: dict, view: Optional[Any]) -> Optional[dict[str, Any]]:
         """Assemble a registry row from the action payload and live view.

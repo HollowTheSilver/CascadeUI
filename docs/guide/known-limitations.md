@@ -55,7 +55,12 @@ Calling `message.edit(view=None)` on a V2 message produces an empty message
 (error 50006) because V2 views *are* the message content. CascadeUI handles
 this automatically: `exit()` and `on_timeout()` call `_freeze_components()` to
 disable all interactive items, preserving the visual content while making
-buttons and selects unclickable. Override `exit()` and call
+buttons and selects unclickable. When the tree is empty at teardown, or holds a
+shape Discord would reject, that tree is never sent: the message keeps its last
+render, or, for a restored panel that was never re-rendered, the panel already on
+screen is frozen instead. A warning names the view when something was already on
+screen or the tree was not empty; a view that never rendered anything exits
+quietly. Override `exit()` and call
 `_freeze_components()` for custom exit behavior.
 
 ### Auto-Defer and the Response Slot
@@ -248,8 +253,8 @@ error.
 **Mitigations** (per-view, all class-attribute overrides):
 
 - `auto_defer_delay = 2.8` -- gives the queue a wider window before
-  pre-acking. Stay under 3.0s; Discord's hard interaction timeout
-  is the ceiling.
+  pre-acking. Discord's 3-second interaction deadline is the ceiling,
+  so a value of `3.0` or more raises `ValueError` when the class is defined.
 - `serialize_interactions = False` -- skips the lock entirely on
   views where parallel rebuilds are safe (read-only displays, views
   that mutate independent state slices). Race-prone views (game
@@ -313,7 +318,7 @@ click refreshes the tree.
 
 - `auto_defer_delay = 2.8` -- widens both the fast-path budget
   (1.8s) and the timer fire window. Same trade-off as the
-  burst-click section above; stay under 3.0s.
+  burst-click section above, and the same `3.0` ceiling applies.
 - For callbacks where heavy work plus refresh routinely exceeds a
   second, follow the slow-callback pattern in
   [`concepts.md`](concepts.md#exception-callbacks-that-genuinely-take-more-than-two-seconds)
