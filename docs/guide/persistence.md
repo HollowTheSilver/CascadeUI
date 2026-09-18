@@ -185,10 +185,33 @@ month-old stamp from a single failure -- the second look is what turns it into
 evidence. Deletions route through `prune_registry`, so `REGISTRY_PRUNED` fires
 with `reason="unreachable"`.
 
-It raises `ValueError` for a negative or non-integer cutoff and `RuntimeError`
+A row whose key a live panel in this process holds is kept without a fetch: the
+panel owns the key, and a failed fetch says nothing about whether its row should
+go. It raises `ValueError` for a negative or non-integer cutoff and `RuntimeError`
 when the middleware was built without `bot=`, since there is nothing to
 re-verify against. `/cascadeui unreachable` lists the backlog with ages, and
 takes an optional `prune_older_than_days` to run the same prune from Discord.
+
+To run it without a caller, pass `prune_unreachable_after_days=`:
+
+```python
+await setup_middleware(
+    PersistenceMiddleware(
+        backend=SQLiteBackend("cascadeui.db"),
+        bot=self,
+        prune_unreachable_after_days=30,
+    ),
+)
+```
+
+The first prune runs once the gateway is ready, never during `setup_hook`, so
+every `reattach()` you issue there has finished, and a fetch that fails with the
+gateway up points at the channel rather than the host. It then repeats daily and
+stops when the manager closes. It never overlaps a reattach pass. The setting is
+off by default, takes a positive integer, and needs `bot=`; a zero cutoff is
+refused because an automatic run would then delete a row on a single failed
+fetch. Several processes sharing one registry each run their own prune, with no
+coordination between them.
 
 The clear is keyed on the *fetch* succeeding, not on the view reconstructing.
 A row whose class raises during construction lands in `failed`, but its
@@ -206,17 +229,20 @@ from cascadeui import get_store
 
 @bot.event
 async def on_ready():
-    summary = get_store().persistence_manager.last_reattach_summary
-    if summary:
-        for key in summary["removed"]:
-            ...  # clear your own row for this persistence_key
+    summary = get_store().persistence_manager.total_reattach_summary
+    for key in summary["removed"]:
+        ...  # clear your own row for this persistence_key
 ```
 
-`last_reattach_summary` holds the most recent reattach summary (`None` until the
-first reattach). Reconcile only from `removed` (a definitive 404); a key in
-`unreachable` may still exist and should be left alone. The `keys` list on the
-`REGISTRY_PRUNED` action carries the same `removed` data for a consumer that
-subscribes before `setup_middleware`.
+`total_reattach_summary` covers every pass, with each key under the outcome the
+most recent pass gave it. Read it rather than `last_reattach_summary`, which
+holds one pass: a [re-drive](#re-driving-reattach-after-a-runtime-cog-load)
+replaces it before `on_ready` runs, and it cannot re-report a removal, because
+the row the first pass deleted is no longer there to verdict. Reconcile only
+from `removed` (a definitive 404); a key in `unreachable` may still exist and
+should be left alone. The `keys` list on the `REGISTRY_PRUNED` action carries
+the same `removed` data for a consumer that subscribes before
+`setup_middleware`.
 
 ### Re-driving reattach after a runtime cog load
 
@@ -240,7 +266,10 @@ async def reload_feature(self):
 
 `reattach()` is idempotent: panels already attached on a prior pass are
 skipped (no re-fetch, no double registration), and transiently `unreachable` /
-`failed` rows are retried. It returns the same five-bucket summary as
+`failed` rows are retried. A key a live panel in this process already holds is
+skipped too, even when its row never attached at startup, since re-driving it
+would attach a second instance to the message that panel owns. It returns the
+same five-bucket summary as
 `reattach_persistent_views()`, covering only the rows it processed. Each pass
 also re-registers every `DynamicPersistentButton` subclass with the bot, so a
 dynamic button defined in the late-loaded cog routes clicks too.
@@ -960,7 +989,10 @@ async def setup_roles(ctx):
 After a restart, `setup_middleware(PersistenceMiddleware(bot=self, ...))`
 drives the reattach pipeline during startup:
 
-1. Reads the registry via `RegistryPersistence.backend.row_select()`.
+1. Reads the registry via `RegistryPersistence.backend.row_select()` and
+   records every row in `state["persistent_views"]`, so `exit()` on a restored
+   panel deletes its row and a re-send under its key retires it, the same as
+   for a panel sent in this process.
 2. Looks up each row's `view_class` in the class registry (see
    [Class identity](#class-identity-rows-resolve-by-the-name-they-recorded)).
 3. Walks the kwargs migrator chain from the stored `kwargs_schema_version`
@@ -981,14 +1013,25 @@ drives the reattach pipeline during startup:
 
 ### Retiring a registration
 
-`exit()` on a live instance removes the panel's registry row along with the
-usual teardown. When no instance is live (the message was deleted while the
+`exit()` on the instance that owns the registration removes the panel's
+registry row along with the usual teardown. A panel superseded under its key
+(see [Replacing a panel under its own key](#replacing-a-panel-under-its-own-key))
+no longer owns the row, so its `exit()` leaves it alone. When no instance is live (the message was deleted while the
 bot was offline, or the panel is being decommissioned from an admin task),
 retire the row directly through the manager:
 
 ```python
 await store.persistence_manager.prune_registry(persistence_keys=["roles:panel:123"])
 ```
+
+The two routes are not interchangeable. `exit()` retires the registration only
+while the view still owns it; `prune_registry` matches by key and deletes
+whatever holds it, so it is for a key no live panel holds. Pruning a key a
+panel is running under leaves that panel on screen and unrestorable after the
+next restart, which the library logs as a warning. Check first with
+`get_active_view(persistence_key=...)`, and when both are involved, prune after
+the exit rather than before: an exit can hand the registration back to a live
+predecessor, and a prune that ran first would delete the row it just restored.
 
 See [Pruning](#pruning) for the full prune surface, including the
 age-verified `prune_unreachable` sweep.
@@ -1172,6 +1215,53 @@ next step are skipped with a WARNING and left on disk for later recovery.
     the row. Design keys to be unique per intended panel instance (for
     example, `"roles:main"` for a single shared panel,
     `f"profile:{user_id}"` for a per-user panel).
+
+### Replacing a panel under its own key
+
+Re-sending a panel under a key another panel holds retires the old one during
+the send: a live instance is exited (its `exit_policy` decides whether the
+message is frozen or deleted), and so is a view it pushed onto that message; a
+message left from before a restart is cleaned up. That suits a plain re-post.
+It does not suit a swap that has to confirm the new panel before the old one
+comes down, because by the time `send()` returns the old panel is already gone.
+
+Set `retire_previous_on_send = False` to retire the predecessor yourself:
+
+```python
+from cascadeui import PersistentLayoutView, get_store
+
+class CardPanel(PersistentLayoutView):
+    retire_previous_on_send = False
+
+async def repost(key, context):
+    old_panel = get_store().get_active_view(persistence_key=key)
+    new_panel = CardPanel(context=context, persistence_key=key)
+    await new_panel.send()
+    if not await confirm_new_panel(new_panel):
+        await new_panel.exit(delete_message=True)  # the old panel is untouched
+        return
+    if old_panel is not None:
+        await old_panel.exit(delete_message=True)
+```
+
+`get_store().get_active_view(persistence_key=...)` finds the live panel for a
+key, so a caller never has to keep its own registry of panel instances. Read it
+before the send: once the new panel registers, the lookup returns the new one.
+
+The new panel owns the registration as soon as it is sent, so the old panel's
+`exit()` leaves the new row in place, and so does deleting the old message
+(which exits the old view through the message-deletion cleanup). When the new
+panel exits instead, as in the rollback above, the registration moves back to
+the old panel while it is still live, so a restart reattaches the panel that is
+actually on screen. A predecessor you have already stopped is treated as
+retired, and the new panel's `exit()` removes the row. The flag is per class;
+`set_class_attribute("retire_previous_on_send", False)` sets it for one
+instance.
+
+Retiring a panel this way never involves `prune_registry`. That call matches by
+key and would delete whichever row the key points at, including the one an
+`exit()` just handed back to a live predecessor, so a prune belongs after every
+exit and only for a key no live panel holds.
 
 ## Pattern 3: Click routing via `DynamicPersistentButton`
 

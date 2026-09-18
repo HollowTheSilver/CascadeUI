@@ -1893,31 +1893,40 @@ class TestTextEditModalBackstop:
 
     def test_override_reaches_modal_v1(self):
         class SlowForm(FormView):
-            text_edit_modal_auto_defer_delay = 5.0
+            text_edit_modal_auto_defer_delay = 2.8
 
         view = SlowForm(
             interaction=_make_interaction(),
             fields=[{"id": "u", "type": "text", "label": "Username"}],
         )
         modal = _build_form_modal(view, "Edit")
-        assert modal.auto_defer_delay == 5.0
+        assert modal.auto_defer_delay == 2.8
 
     def test_override_reaches_modal_v2(self):
         class SlowLayoutForm(FormLayoutView):
-            text_edit_modal_auto_defer_delay = 4.0
+            text_edit_modal_auto_defer_delay = 2.7
 
         view = SlowLayoutForm(
             interaction=_make_interaction(),
             fields=[{"id": "u", "type": "text", "label": "Username"}],
         )
         modal = _build_form_modal(view, "Edit")
-        assert modal.auto_defer_delay == 4.0
+        assert modal.auto_defer_delay == 2.7
 
     def test_non_positive_backstop_rejected_at_definition(self):
         with pytest.raises(ValueError, match="text_edit_modal_auto_defer_delay"):
 
             class BadForm(FormView):
                 text_edit_modal_auto_defer_delay = 0
+
+    def test_backstop_at_the_3s_deadline_rejected_at_definition(self):
+        """The modal backstop is assigned onto the modal instance, bypassing
+        Modal's own class check, so the form class is the only place a value
+        that can never beat the deadline gets caught."""
+        with pytest.raises(ValueError, match="text_edit_modal_auto_defer_delay"):
+
+            class BadForm(FormView):
+                text_edit_modal_auto_defer_delay = 3.0
 
 
 # // ========================================( Inline error setters )======================================== // #

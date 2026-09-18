@@ -585,15 +585,17 @@ class _InteractionMixin:
         self._carry_attachments_to(new_view)
 
         # Best-effort cleanup of the old message. Inside the original token
-        # window this succeeds; past 15:00 it fails silently and the stale
-        # panel becomes a harmless orphan the user can dismiss.
+        # window the delete succeeds; past 15:00 it fails and the teardown
+        # below freezes the stale panel instead, through the same edit every
+        # teardown uses. A message already gone is unbound so exit() does not
+        # edit it again.
         if self._message:
             try:
                 await self._bounded(self._message.delete())
-            except (discord.NotFound, *DISCORD_CALL_ERRORS, asyncio.TimeoutError):
-                try:
-                    await self._bounded(self._message.edit(**self._freeze_edit_kwargs()))
-                except (discord.NotFound, *DISCORD_CALL_ERRORS, asyncio.TimeoutError):
-                    pass
+                self._message = None
+            except discord.NotFound:
+                self._message = None
+            except (*DISCORD_CALL_ERRORS, asyncio.TimeoutError):
+                pass
 
-        await self.exit()
+        await self.exit(delete_message=False)

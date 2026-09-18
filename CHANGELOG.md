@@ -23,6 +23,201 @@ preserved below for historical reference but are not the supported baseline.
 
 ---
 
+## [3.13.0] - 2026-09-17
+
+### Breaking
+
+- **An ack backstop delay of `3.0` or more now raises `ValueError` when its
+  class is defined.** Lower it below `3.0` before upgrading. This covers
+  `auto_defer_delay` on views, `DynamicPersistentButton`, and `Modal`, and a
+  form's `text_edit_modal_auto_defer_delay`. The backstop defers after its
+  delay, so a value at or past Discord's 3-second deadline could never land,
+  and every handler slower than 3 seconds failed with nothing raised. The
+  guides already named 3.0 as the ceiling; nothing enforced it.
+
+### Added
+
+- **`retire_previous_on_send` for replacing a persistent panel under its own
+  key.** A send under a key another panel holds exits that panel during the
+  send, which leaves nothing to fall back on when the new panel still has to
+  be confirmed. Set `retire_previous_on_send = False` to retire the old panel
+  yourself once the swap succeeds. The superseded panel's `exit()`, or a
+  deletion of its message, leaves the new panel's registration alone, and
+  exiting the new panel to roll back hands the registration back to the old
+  one while it is still live.
+- **`StateStore.get_active_view(persistence_key=...)` finds the live panel for
+  a key.** Code outside a view (a scheduler refreshing a posted panel, a
+  command retiring one) no longer needs its own registry of panel instances.
+  A finished view is never returned, while two panels share a key the one on
+  screen is, and a panel that navigated away with `push()` answers with the
+  view now on its message, since navigation replaces the instance.
+- **`PersistenceManager.total_reattach_summary` covers every reattach pass.**
+  `last_reattach_summary` holds one pass, and the recommended `reattach()`
+  re-drive after late cogs load replaces it before `on_ready` runs. A removal
+  is the case that breaks: only the pass that deletes a row reports it, so a
+  reconcile reading the latest summary after a re-drive found an empty
+  `removed` list and cleared nothing, with no error to show for it. The new
+  property carries the same five buckets with each key under its most recent
+  outcome, and the guide's reconcile example reads it.
+- **`PersistenceMiddleware(prune_unreachable_after_days=...)` prunes
+  unreachable registry rows without a caller.** Rows that could not be
+  fetched were kept and retried at every boot until someone ran
+  `prune_unreachable()`. With the setting, the manager runs that prune once
+  the gateway is ready and daily after, with the same re-verification against
+  Discord. Off by default; it takes a positive number of days and needs
+  `bot=`.
+
+### Changed
+
+- **`prune_unreachable()` re-checks its candidates concurrently.** The sweep
+  verified one row at a time while holding the registry lock, so its cost was
+  serial in the number of stamped rows, which is largest exactly when an
+  outage or a permission change stamped many at once. Verification now runs
+  under the same `restore_concurrency` bound the reattach pass uses; the
+  verdicts are unchanged. A row whose re-check raises is kept rather than
+  aged out, since a check that never answered is not evidence its panel is
+  gone.
+- **`prune_registry()` warns when it deletes the row of a live panel.** It
+  matches by key, so it takes whatever holds the key, and a panel running
+  under that key stayed on screen while quietly losing the registration that
+  restores it. The deletion is unchanged (an operator decommissioning a panel
+  wants it) but it now says so, and the reference no longer presents the call
+  as interchangeable with `exit()`, which retires a registration only while
+  the view still owns it.
+
+### Fixed
+
+- **A teardown override's farewell card reaches the message again after a
+  push with no interaction.** 3.12.3 skipped the teardown edit for any view
+  that had never rendered, which reached past the restored views it was
+  meant for: a `push()` or `pop()` with no interaction binds the message
+  without an edit, so the destination's closing card from `exit()` or
+  `on_timeout()` was dropped and the source's controls stayed on screen.
+  Only a view restored from persistence is treated specially now; other
+  never-rendered views ship as they did before 3.12.3.
+- **A restored panel torn down before its first render is frozen again.**
+  3.12.3 avoided the empty-message error by skipping the edit, which left
+  the pre-restart panel on screen with live-looking controls that no
+  longer answered. Such a view never put its own tree on screen, so
+  freezing that tree would overwrite the real panel; the teardown now
+  rebuilds the components the message actually shows, disables them, and
+  ships that, with uploaded images and files still pointing at the
+  message's own attachments. A panel with nothing left to disable is not
+  edited, and a teardown override that composed new content still ships
+  its own tree.
+- **Teardown no longer sends a tree Discord rejects.** The teardown edit
+  was the one render path without placement validation, so an override
+  that cleared the tree and composed nothing, a destination whose
+  `on_load` never ran, or a card built from an empty list still reached
+  Discord and failed with a 400 (error 50006 for an empty message). The
+  edit is now skipped and the message keeps its last render; a view that
+  had already rendered logs a warning naming the problem, since the tree
+  its override left is the bug.
+- **A rolled-back navigation's destination can no longer edit the
+  source's message.** When every endpoint failed a `push()` or `pop()`
+  edit, the returned destination kept the source's message, so calling
+  `exit()` on it overwrote the recovered, still-live source on screen.
+- **A view whose message is deleted is torn down even when the bot never
+  hears about the deletion.** Teardown came only from the gateway's
+  message-delete events, which a bot without the message intents never
+  receives, and which could not match the view anyway once an edit had found
+  the message gone and cleared it. Such a view stayed registered, subscribed,
+  and running its tasks, and a persistent panel kept its registry row until
+  the next restart. An edit that finds the message gone now tears the view
+  down through `on_message_delete()` right after `on_message_gone()`, so
+  every view whose edit returns "Unknown Message" is retired, persistent rows
+  included. Deleting the channel or thread a view's message sits in, which
+  Discord never reports as message deletions, now does the same. One raising
+  `on_message_delete()` override no longer stops cleanup for the other views
+  in a bulk purge.
+- **`on_message_delete()` is no longer called on a view another view's hook
+  already tore down.** The hook documents that a view already torn down is
+  not called again, and the deletion sweep decided that once, before any hook
+  ran. One hook can retire another view first, which a purge catching a panel
+  and a view attached to it does with no override involved: the second view
+  was called anyway and exited twice, dispatching a second teardown and a
+  doomed message call. An override doing its own reconciliation saw the same
+  double call.
+- **A child view that stopped on its own no longer lingers in the registries
+  after its parent exits.** The cascade that exits attached children skips one
+  that has already finished, and unsubscribed it without tearing it down, so
+  it stayed in the active-view registry and in `state["views"]`: visible in
+  the inspector, counted against instance limits, and unreachable by every
+  cleanup path, since the same unsubscribe is what marks a view torn down.
+  The cascade now completes that teardown.
+- **`/cascadeui exitall` and `/cascadeui reset` no longer exit a view twice.**
+  Both walk a list of the live views taken before the first exit, and exiting
+  a parent exits the children attached to it, so a child already torn down was
+  exited again: a second teardown dispatch, a second Discord call for a
+  message the first exit had deleted, and an exit count that reported more
+  views than there were.
+- **`exit()` on a persistent view that never sent leaves the live panel's
+  registration alone.** A panel whose `send()` raised, or was refused by the
+  instance limit, owns no registration, but its `exit()` removed whatever the
+  key pointed at, retiring the panel actually on screen: that panel then went
+  unrestored after the next restart. Cleaning up a failed send is the ordinary
+  shape this reached.
+- **`exit()` on a persistent view restored after a restart deletes its
+  registry row.** Only a send recorded a panel in the store's copy of the
+  registry, so a restored panel was never in it: its `exit()` changed
+  nothing, the row stayed on disk, and the panel was restored again on every
+  boot. Rehydrate now records every stored row. The same gap let a panel
+  re-sent under a restored panel's key leave the restored one live; that
+  panel is now exited during the send, as it already was within one uptime.
+  Rows left behind by earlier versions are not removed automatically; retire
+  them with `prune_registry(persistence_keys=[...])`.
+- **A view a panel pushed to retires the panel's registration when it deletes
+  the message.** `push()` replaces the instance, so the panel is gone and its
+  registration rides the destination. Nothing retired that registration when
+  the destination was the view whose message went: the row kept claiming a
+  deleted message until a restart re-checked it, and a panel re-sent under the
+  key in the meantime ran its orphan cleanup against a message that was not
+  there. A view frozen in place still keeps the registration, since its
+  message is still up.
+- **Re-sending a persistent panel also retires a view the old panel pushed.**
+  `push()` hands the destination the panel's message, but a send under the
+  key exited only views holding the key, so the pushed view stayed live on the
+  superseded message and kept answering clicks. It is now exited along with
+  that panel.
+- **A `reattach()` re-drive no longer restores a panel whose registration this
+  process already deleted.** Every pass walks the registry rows read once at
+  startup, and an `exit()` that removed a row left it in that list. A key still
+  pending from boot, re-posted by a cog and later retired, was restored on the
+  next re-drive onto the message the startup row named: a live panel answering
+  clicks with no row behind it, gone again after the next restart. Rows are now
+  dropped from that list when their registration is removed, alongside the
+  prune that already did so.
+- **A `reattach()` re-drive no longer attaches a second instance to a live
+  panel.** A panel sent under a key whose row was still pending from boot
+  rewrote that row, and a later re-drive adopted the new message and
+  reattached it beside the panel already running on it. Re-drives now skip
+  every key a live panel in the process holds.
+- **`prune_unreachable()` no longer deletes the row of a panel that is live
+  in the process.** A panel whose channel the bot lost access to after it was
+  restored still routes interactions, but the prune read its failed fetch as
+  grounds to delete its row, so the panel was gone after the next restart.
+  Such a row is now kept, and the prune waits for any reattach pass already
+  running, so it cannot delete a row that pass just found reachable.
+- **`/cascadeui reset` no longer drops the registry mirror and the modal
+  rows.** The helper that rebuilds state from scratch listed four of the six
+  top-level keys, so a reset left `persistent_views` and `modals` absent:
+  stored rows stayed on disk while nothing in the process knew about them, and
+  the reattach re-drive and prune could no longer tell which keys a live panel
+  held. The reset also rebuilds that mirror from the rows its own teardown
+  left behind, rather than starting empty.
+- **A reducer that declines an action no longer reverts state committed while
+  its dispatch was waiting.** The store rebound whatever the reducer returned,
+  and a reducer that refuses returns the state it was handed, so a dispatch
+  that had paused in a middleware wrote that older state back over anything
+  committed in the meantime. Reached with middleware that awaits real work, an
+  audit log or a metrics push, on the paths where a refusal is routine.
+- **The persistence example's role panel re-renders on restart.**
+  `RoleSelectorPanel.on_restore` in `examples/v2_persistence.py` now calls
+  `super().on_restore(bot)`, so edits to the role categories reach a restored
+  panel instead of leaving the pre-restart render on screen.
+
+---
+
 ## [3.12.3] - 2026-09-16
 
 ### Fixed

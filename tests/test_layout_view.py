@@ -5678,30 +5678,112 @@ class TestRebuiltTreeShipsOnTeardown:
 
         message.edit.assert_awaited_once()
 
-    async def test_exit_skips_the_edit_for_a_view_that_never_rendered(self):
-        """A view reattached from persistence but not yet rendered has no
-        baseline on screen for this edit to correct.
+    class _BuildsInOnLoad(StatefulLayoutView):
+        async def on_load(self):
+            self.clear_items()
+            self.add_item(TextDisplay("loaded"))
 
-        No ``send()`` and no ``refresh()`` runs here, so ``_has_rendered``
-        stays at its ``__init__`` default of ``False`` -- matching a view
-        between reattach and its deferred post-ready render.
-        """
-        view = RenderableLayoutView(interaction=_make_interaction(), user_id=1, guild_id=2)
+    async def test_exit_skips_an_empty_tree_on_a_view_that_never_rendered(self):
+        """An empty V2 tree is error 50006 however the view got there."""
+        view = self._BuildsInOnLoad(interaction=_make_interaction(), user_id=1, guild_id=2)
         message = self._wire(view)
-        assert view._has_rendered is False
+        assert view._has_rendered is False and not view.children
 
         await view.exit(delete_message=False)
 
         message.edit.assert_not_called()
 
-    async def test_on_timeout_skips_the_edit_for_a_view_that_never_rendered(self):
-        view = RenderableLayoutView(interaction=_make_interaction(), user_id=1, guild_id=2)
+    async def test_on_timeout_skips_an_empty_tree_on_a_view_that_never_rendered(self):
+        view = self._BuildsInOnLoad(interaction=_make_interaction(), user_id=1, guild_id=2)
         message = self._wire(view)
-        assert view._has_rendered is False
 
         await view.on_timeout()
 
         message.edit.assert_not_called()
+
+    async def test_exit_skips_a_rendered_view_cleared_to_an_empty_tree(self, caplog):
+        """A rendered view torn down with nothing left is an override bug the
+        user needs to see, so the skip is logged rather than silent."""
+        view = RenderableLayoutView(interaction=_make_interaction(), user_id=1, guild_id=2)
+        await view.send()
+        message = self._wire(view)
+
+        view.clear_items()
+        with caplog.at_level(logging.WARNING, logger="cascadeui.views.base"):
+            await view.exit(delete_message=False)
+
+        message.edit.assert_not_called()
+        assert "empty component tree" in caplog.text
+
+    async def test_exit_skips_a_tree_that_fails_placement(self, caplog):
+        """Teardown runs the same placement check as the other render seams.
+        An empty Container is non-empty at the top level but still a 400."""
+        view = RenderableLayoutView(interaction=_make_interaction(), user_id=1, guild_id=2)
+        await view.send()
+        message = self._wire(view)
+
+        view.clear_items()
+        view.add_item(card())
+        with caplog.at_level(logging.WARNING, logger="cascadeui.views.base"):
+            await view.exit(delete_message=False)
+
+        message.edit.assert_not_called()
+        assert "Discord would reject" in caplog.text
+
+    async def test_programmatic_push_ships_a_farewell_card_from_the_destination(self):
+        """A push with no interaction binds the message without an edit, so
+        the destination has neither rendered nor a reattach baseline. Its
+        farewell card still has to ship."""
+
+        class _Farewell(RenderableLayoutView):
+            async def exit(self, delete_message=None):
+                self.clear_items()
+                self.add_item(card("Session closed."))
+                return await super().exit(delete_message=delete_message)
+
+        root = RenderableLayoutView(user_id=1, guild_id=2)
+        message = self._wire(root)
+        child = await root.push(_Farewell)
+        message.edit.reset_mock()
+        assert child._has_rendered is False
+        assert child._reattach_baseline_digest is None
+
+        await child.exit(delete_message=False)
+
+        message.edit.assert_awaited_once()
+
+    async def test_programmatic_push_skips_an_unloaded_destination(self):
+        """No interaction means on_load never ran, so the destination's tree
+        is still empty; shipping it would be 50006."""
+        root = RenderableLayoutView(user_id=1, guild_id=2)
+        message = self._wire(root)
+        child = await root.push(self._BuildsInOnLoad)
+        message.edit.reset_mock()
+        assert not child.children
+
+        await child.exit(delete_message=False)
+
+        message.edit.assert_not_called()
+
+    async def test_v1_programmatic_push_on_timeout_still_ships(self):
+        """V1 messages carry embed content, so an empty V1 view is a valid
+        edit that strips the buttons; the empty-tree refusal is V2-only."""
+        from cascadeui.views.view import StatefulView
+
+        class _Root(StatefulView):
+            pass
+
+        class _Child(StatefulView):
+            pass
+
+        root = _Root(user_id=1, guild_id=2)
+        message = self._wire(root)
+        child = await root.push(_Child)
+        message.edit.reset_mock()
+
+        await child.on_timeout()
+
+        message.edit.assert_awaited_once()
 
     async def test_exit_still_ships_a_rebuild_when_the_digest_was_never_stamped(self):
         """``_last_tree_digest`` is ``None`` for more than one reason, and

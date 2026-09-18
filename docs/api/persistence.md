@@ -4,7 +4,7 @@ Persistence in CascadeUI spans two isolated namespaces (registry, application), 
 
 ---
 
-## `PersistenceMiddleware(manager=None, *, backend=None, registry=None, application=None, bot=None, migrators=None, restore_concurrency=8)`
+## `PersistenceMiddleware(manager=None, *, backend=None, registry=None, application=None, bot=None, migrators=None, restore_concurrency=8, prune_unreachable_after_days=None)`
 
 Write-through middleware that owns the persistence pipeline. Construct once in `setup_hook`, after every cog that defines a `PersistentView` subclass has loaded, and pass it through `setup_middleware` to install it into the dispatch chain.
 
@@ -25,16 +25,17 @@ await setup_middleware(
 
 **Parameters**
 
-- `manager` -- optional pre-built `PersistenceManager`. When supplied, the pipeline kwargs (`backend`, `registry`, `application`, `bot`, `migrators`) are ignored and the middleware presumes the caller already ran `initialize_backends`, `apply_migrations`, and `rehydrate`. Reserved for advanced call sites that customize manager internals before install.
+- `manager` -- optional pre-built `PersistenceManager`. When supplied, the pipeline kwargs (`backend`, `registry`, `application`, `bot`, `migrators`, `restore_concurrency`, `prune_unreachable_after_days`) are ignored and the middleware presumes the caller already ran `initialize_backends`, `apply_migrations`, and `rehydrate`. Reserved for advanced call sites that customize manager internals before install.
 - `backend` -- shorthand: fills any namespace not configured via `registry=`/`application=`.
 - `registry`, `application` -- per-namespace overrides. Each accepts the matching config class from `cascadeui.persistence`. Explicit config wins over shorthand; passing the config with `backend=None` opts the namespace out entirely.
 - `bot` -- when supplied, enables the reattach pipeline for `PersistentView` subclasses and installs the message-deletion cleanup listener. When omitted, only state data is restored.
 - `migrators` -- optional dict with `"schema"` and/or `"kwargs"` keys, each mapping a `(name, from_version)` tuple to an async migrator callable. When omitted, no migrators are registered through this kwarg; the `@register_migrator` / `@register_kwargs_migrator` decorators are the canonical registration path, and this dict is the programmatic bulk alternative.
 - `restore_concurrency` -- positive int bounding concurrency in both restore phases: the channel and message fetches during startup reattach, and the post-ready `on_restore` repaint that follows once the gateway is ready (default `8`). The repaint additionally serializes panels that share a channel (message edits rate-bucket per channel), so same-channel repaints run one at a time regardless of this value, while panels in distinct channels fan out under it.
+- `prune_unreachable_after_days` -- `None` (the default) or a positive int. When set, the manager runs `prune_unreachable(older_than_days=...)` once the gateway is ready and daily after, until it closes. Requires `bot=`. A zero, negative, or non-int value, or a value without `bot=`, raises `ValueError` here. See [Rows that stay unreachable](../guide/persistence.md#rows-that-stay-unreachable).
 
 ### `async initialize(store)`
 
-Runs the async startup pipeline: build the manager from the stashed config, initialize unique backends, apply schema migrations, blocking rehydrate both namespaces, install the gateway message-cleanup listener (when `bot` is available), stash the manager on the store as `store.persistence_manager`, start the TTL sweeper if any slot declares `ttl_days`, and reattach persistent views (when `bot` is available). Idempotent: subsequent calls return immediately.
+Runs the async startup pipeline: build the manager from the stashed config, initialize unique backends, apply schema migrations, blocking rehydrate both namespaces, install the gateway message-cleanup listener (when `bot` is available), stash the manager on the store as `store.persistence_manager`, start the TTL sweeper if any slot declares `ttl_days` and the unreachable sweep if `prune_unreachable_after_days` is set, and reattach persistent views (when `bot` is available). Idempotent: subsequent calls return immediately. With a pre-built `manager=`, the pipeline itself is skipped, but the manager's configured sweeps are still started.
 
 Invoked automatically by `setup_middleware`. Direct invocation is supported for test fixtures that bypass the install helper.
 
@@ -192,9 +193,35 @@ await mgr.prune_registry(persistence_keys=["roles:main", "tickets:panel"])
 
 `slot=` and `older_than_days=` are mutually exclusive on `prune_application`.
 
+`prune_registry` matches by key alone, so it deletes whatever holds a key when
+it runs. It is for a key no live panel holds: a live one is retired through its
+own `exit()`, which removes the registration only while that view owns it, and
+`StateStore.get_active_view(persistence_key=...)` says whether there is one. A
+prune that does take a live panel's row logs a warning.
+
 `prune_registry` also takes `reason=`, which labels the `REGISTRY_PRUNED`
 dispatch so a subscriber can tell why a row went. Left unset it keeps the
 value the method has always computed.
+
+### `last_reattach_summary` and `total_reattach_summary`
+
+`last_reattach_summary` is the summary the most recent reattach pass returned
+(`None` before the first), and `total_reattach_summary` is a read-only
+`dict[str, list[str]]` covering every pass, with each `persistence_key` under
+the outcome its most recent pass gave it. Both carry the same five buckets:
+`restored`, `skipped`, `failed`, `removed`, `unreachable`.
+
+Reconcile records kept outside the registry from `total_reattach_summary`.
+`removed` is why: only the pass that deletes a row can report it, so after a
+[re-drive](../guide/persistence.md#re-driving-reattach-after-a-runtime-cog-load)
+the latest summary reports nothing removed and a reconcile keyed on it clears
+nothing. A key moves between buckets as
+later passes re-verdict it, and appears in exactly one.
+
+Both cover reattach passes only. A row deleted afterwards, by the unreachable
+sweep or by `prune_registry`, keeps the outcome its last pass gave it; those
+deletions arrive as `REGISTRY_PRUNED`, which a subscriber registered after
+startup receives. The two together cover every registration that goes away.
 
 ### `unreachable_since`
 
@@ -218,8 +245,16 @@ A candidate that fetches successfully is kept and its stamp cleared
 regardless of age. Everything still unreachable is deleted only when its
 stamp predates the cutoff, and reported as `kept` otherwise. A row rewritten
 mid-pass, or one whose pre-delete re-read failed at the backend, is `kept`
-too: neither verdict describes the row as it stands. Deletions route
-through `prune_registry` with `reason="unreachable"`.
+too: neither verdict describes the row as it stands. A row whose key a live
+panel in this process holds is `kept` without a fetch. Deletions route
+through `prune_registry` with `reason="unreachable"`. The call never runs
+alongside a reattach pass: whichever starts second waits. Calling either one
+from a hook that runs inside the other, such as a `REGISTRY_PRUNED` hook
+registered with `store.on()`, raises `RuntimeError` instead of waiting on
+itself forever; schedule the call with `asyncio.create_task(...)` from there.
+
+`PersistenceMiddleware(prune_unreachable_after_days=N)` runs this call
+automatically, first once the gateway is ready and then daily.
 
 Raises `ValueError` when `older_than_days` is negative or not an `int`
 (`bool` included), and `RuntimeError` when the middleware was constructed

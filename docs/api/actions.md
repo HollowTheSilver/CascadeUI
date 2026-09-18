@@ -295,8 +295,11 @@ registry.
 | Key | Type | Description |
 |-----|------|-------------|
 | `persistence_key` | `str` | The view's dedupe key |
+| `message_id` | `str \| None` | The message the exiting view registered under. `exit()` fills it in; `None` removes the key whatever message it points at |
 
-**State change:** Deletes `state["persistent_views"][persistence_key]`.
+**State change:** Deletes `state["persistent_views"][persistence_key]`, unless `message_id`
+is set and the entry points at a different message. That case is a panel superseded under its
+key, whose successor owns the registration now.
 
 `PersistenceMiddleware` flushes the registry namespace to disk immediately on this action.
 
@@ -313,7 +316,8 @@ During startup reattach, `REGISTRY_PRUNED` fires synchronously inside `setup_mid
 Under the canonical setup order (cogs loaded before `setup_middleware`), a subscription wired
 in a cog's `setup(bot)` is already registered and does observe the action. Code subscribing
 only in `on_ready` or later misses it (dispatches once, no replay). For that case read
-`store.persistence_manager.last_reattach_summary["removed"]` after startup instead; see the
+`store.persistence_manager.total_reattach_summary["removed"]` after startup instead, which
+covers every reattach pass rather than the latest one; see the
 [Persistence guide](../guide/persistence.md).
 
 **Payload:**

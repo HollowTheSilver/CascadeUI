@@ -29,7 +29,29 @@ logger = logging.getLogger(__name__)
 # is already done and at an edit it means to try another endpoint.
 DISCORD_CALL_ERRORS = (discord.HTTPException, discord.RateLimited, aiohttp.ClientError)
 
+# Discord drops an interaction left unacknowledged this long after creation.
+ACK_DEADLINE_SECONDS = 3.0
+
 # // ========================================( Functions )======================================== // #
+
+
+def validate_ack_delay(owner: str, name: str, value) -> None:
+    """Reject an ack-backstop delay that cannot beat Discord's deadline.
+
+    Every ``auto_defer_delay``-style attribute feeds :func:`ack_backstop`,
+    which sleeps for the delay and then defers. A value at or past
+    :data:`ACK_DEADLINE_SECONDS` sleeps past the moment Discord invalidates
+    the interaction, so the backstop can never land and every handler
+    slower than the deadline fails with nothing raised. Raising the delay
+    is only useful below the deadline.
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+        raise ValueError(f"{owner}.{name} must be a positive number, got {value!r}")
+    if value >= ACK_DEADLINE_SECONDS:
+        raise ValueError(
+            f"{owner}.{name} must be under {ACK_DEADLINE_SECONDS} (Discord's interaction "
+            f"acknowledgment deadline), got {value!r}"
+        )
 
 
 def describe_discord_error(exc: BaseException) -> str:

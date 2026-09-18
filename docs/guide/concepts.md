@@ -218,7 +218,7 @@ complete list with defaults.
 |-----------|---------|----------|
 | `timeout` | `180` | Seconds before `on_timeout()` fires (`None` = no timeout) |
 | `auto_defer` | `True` | Auto-defer unacknowledged interactions |
-| `auto_defer_delay` | `2.5` | Seconds before auto-defer fires |
+| `auto_defer_delay` | `2.5` | Seconds before auto-defer fires (must be under `3.0`) |
 | `ack_first` | `False` | Ack before the checks/callback run (advanced; for callbacks that block the loop) |
 | `serialize_interactions` | `True` | Process button clicks sequentially (prevents racing edits) |
 | `auto_refresh_ephemeral` | `None` | Engages the 15-min ephemeral refresh handoff. `None` derives from `timeout` (in-window declines, longer engages); set `True`/`False` to pin. |

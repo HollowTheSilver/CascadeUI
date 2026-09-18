@@ -209,6 +209,11 @@ class RoleSelectorPanel(PersistentRolesLayoutView):
         deleted while the bot is offline, so a real panel would reconcile
         its configured role IDs against the live guild here.
         """
+        # The pattern's own on_restore re-renders the panel from the current
+        # categories. Skipping super() would leave the pre-restart panel on
+        # screen, so an edit to ROLE_CATEGORIES would never reach the message.
+        await super().on_restore(bot)
+
         # ``self.bot`` (injected by on_bind) and the ``bot`` parameter are the
         # same object here. Reading self.bot mirrors how a button callback or
         # build_ui -- which never receive ``bot`` -- reach the dependency:

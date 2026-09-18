@@ -9,7 +9,7 @@ import logging
 import time
 from datetime import datetime, timezone
 from types import MappingProxyType
-from typing import Any, Dict, Iterator, List, Mapping, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Set, Tuple, Union
 
 from ..utils.errors import with_error_boundary
 from ..utils.hooks import await_maybe
@@ -291,6 +291,21 @@ class BatchContext:
         return False
 
 
+def _in_channel(message: Any, channel_id: int) -> bool:
+    """Whether ``message`` sits in the channel ``channel_id``, or in a thread under it.
+
+    Deleting a channel deletes its threads, and a thread message's channel
+    carries the parent as ``parent_id``. A text channel's category is
+    ``category_id`` instead, so a deleted category matches nothing, as the
+    channels inside it survive.
+    """
+    channel = getattr(message, "channel", None)
+    return (
+        getattr(channel, "id", None) == channel_id
+        or getattr(channel, "parent_id", None) == channel_id
+    )
+
+
 # // ========================================( Class )======================================== // #
 
 
@@ -318,7 +333,11 @@ class StateStore:
             "sessions": {},
             "views": {},
             "components": {},
+            "modals": {},
             "application": {},
+            # Mirrors every stored registry row, so a rebuild that dropped it
+            # would leave rows on disk that nothing in this process knows about.
+            "persistent_views": {},
         }
 
     def __init__(self):
@@ -581,7 +600,11 @@ class StateStore:
             if reducer_fn:
                 try:
                     new_state = await reducer_fn(act, state)
-                    self.state = new_state
+                    # A reducer that declines an action returns the object it
+                    # was handed. Rebinding it would revert whatever committed
+                    # while this dispatch was suspended in the chain above.
+                    if new_state is not state:
+                        self.state = new_state
                     logger.debug(f"State updated by reducer for {act['type']}")
                 except Exception as e:
                     logger.error(f"Error in reducer for {act['type']}: {e}", exc_info=True)
@@ -1127,6 +1150,102 @@ class StateStore:
         """
         return MappingProxyType(self._active_views)
 
+    def get_active_view(self, *, persistence_key: str) -> Optional[Any]:
+        """The live view holding ``persistence_key``, or ``None``.
+
+        Matches the ``persistence_key=`` a view was constructed with; a view
+        that was given none holds no key, even though its ``persistence_key``
+        property falls back to its id. A finished view is never returned.
+        When several unfinished views hold the key (a swap under
+        ``retire_previous_on_send = False``, or the moment inside a send
+        before the new panel registers), the one the stored registration
+        points at is returned, which is the panel on screen; with no
+        registration, the most recently registered holder is.
+
+        A panel that navigated away with ``push()`` holds its key through the
+        view now on its message: navigation replaces the instance, and the
+        destination carries the registration id without the key. That view is
+        returned, so this answers "what is live on this key's registration"
+        for every shape, which is the question a swap and a prune pre-flight
+        both ask. It is not always a persistent view.
+
+        The argument is keyword-only because ``get_active_views()`` is keyed
+        by view id, and a view id passed here would match nothing.
+        """
+        entry = self.state.get("persistent_views", {}).get(persistence_key)
+        owner_message = entry.get("message_id") if entry else None
+        newest = None
+        for view in self._views_for_key(persistence_key):
+            if view.is_finished():
+                continue
+            if (
+                owner_message is not None
+                and getattr(view, "_registry_message_id", None) == owner_message
+            ):
+                return view
+            if newest is None:
+                newest = view
+        # The owner is preferred over any key holder, so a panel superseded
+        # under the key does not shadow the view sitting on the registered
+        # message. Only reached when no key holder carried that id.
+        if owner_message is not None:
+            for view in reversed(list(self._active_views.values())):
+                if (
+                    not view.is_finished()
+                    and getattr(view, "_registry_message_id", None) == owner_message
+                ):
+                    return view
+        return newest
+
+    def _views_for_key(self, persistence_key: str) -> list:
+        """Every registered view holding ``persistence_key``, newest first, finished included."""
+        return [
+            view
+            for view in reversed(list(self._active_views.values()))
+            if getattr(view, "_persistence_key", None) == persistence_key
+        ]
+
+    def _persistence_key_for_message(self, message_id: str) -> Optional[str]:
+        """The registration whose message is ``message_id``, or ``None``.
+
+        The reverse of the usual lookup, for a view that carries a
+        registration's message id without its key: after a ``push()`` the
+        panel's key rides the destination that way.
+        """
+        for key, entry in self.state.get("persistent_views", {}).items():
+            if entry.get("message_id") == message_id:
+                return key
+        return None
+
+    def _live_persistence_keys(self) -> set:
+        """The registry keys a live persistent panel in this process owns.
+
+        Reattach re-drives and the unreachable prune skip these rows: a live
+        panel owns its key, so a row under it is never re-attached a second
+        time or deleted on the strength of a fetch that failed.
+
+        A key is owned by an unfinished persistent view that holds it, or by
+        any unfinished view carrying the message id the key's registration
+        points at. The second covers a panel that has pushed a child: the
+        child shows the panel's message and carries its registration id, but
+        not its key. A non-persistent view built with a matching key owns no
+        registry row, so it protects none.
+        """
+        keys = set()
+        owned_messages = set()
+        for view in self._active_views.values():
+            if view.is_finished():
+                continue
+            if getattr(view, "_persistent", False) and view._persistence_key is not None:
+                keys.add(view._persistence_key)
+            message_id = getattr(view, "_registry_message_id", None)
+            if message_id is not None:
+                owned_messages.add(message_id)
+        for key, entry in self.state.get("persistent_views", {}).items():
+            if entry.get("message_id") in owned_messages:
+                keys.add(key)
+        return keys
+
     def _register_participant(self, view, user_id: int) -> None:
         """Add a participant's scope key to the instance index for a view.
 
@@ -1179,6 +1298,15 @@ class StateStore:
     def _install_message_cleanup(self, bot) -> None:
         """Register gateway listeners that clean up views when their message is deleted.
 
+        A message goes with a delete or a bulk purge, which Discord reports
+        only to a bot holding the message intents, and with the channel or
+        thread it sits in, which Discord reports under the ``guilds`` intent
+        and never as message deletions. Each routes to
+        ``view.on_message_delete()`` for every view on a deleted message; one
+        view's raising override does not stop the others. A bot without
+        message intents is still covered for a lone delete by the next edit,
+        which finds the message gone and tears the view down itself.
+
         Idempotent -- safe to call multiple times. Called automatically from
         ``send()`` (on first successful send) and from
         :meth:`PersistenceMiddleware.initialize` when ``bot=`` is supplied.
@@ -1191,19 +1319,43 @@ class StateStore:
 
         @bot.listen("on_raw_message_delete")
         async def _cascadeui_message_cleanup(payload):
-            for view in list(store._active_views.values()):
-                if view._message and view._message.id == payload.message_id:
-                    await await_maybe(view.on_message_delete())
-                    break
+            await store._clean_up_deleted(lambda m: m.id == payload.message_id)
 
         @bot.listen("on_raw_bulk_message_delete")
         async def _cascadeui_bulk_message_cleanup(payload):
             deleted_ids = set(payload.message_ids)
-            for view in list(store._active_views.values()):
-                if view._message and view._message.id in deleted_ids:
-                    await await_maybe(view.on_message_delete())
+            await store._clean_up_deleted(lambda m: m.id in deleted_ids)
+
+        @bot.listen("on_guild_channel_delete")
+        async def _cascadeui_channel_cleanup(channel):
+            await store._clean_up_deleted(lambda m: _in_channel(m, channel.id))
+
+        @bot.listen("on_raw_thread_delete")
+        async def _cascadeui_thread_cleanup(payload):
+            await store._clean_up_deleted(lambda m: _in_channel(m, payload.thread_id))
 
         logger.debug("Message deletion cleanup listener installed")
+
+    async def _clean_up_deleted(self, message_matches: Callable[[Any], bool]) -> None:
+        """Run ``on_message_delete`` for every live view whose message matches."""
+        views = [
+            view
+            for view in list(self._active_views.values())
+            if view._message is not None and message_matches(view._message)
+        ]
+        for view in views:
+            # Re-checked per view, not at snapshot time: one view's hook can
+            # tear another down (a parent exits its attached children, a panel
+            # exits its sibling), and the snapshot predates every hook.
+            if view._torn_down():
+                continue
+            try:
+                await await_maybe(view.on_message_delete())
+            except Exception as exc:
+                logger.error(
+                    f"on_message_delete failed for {type(view).__name__}: {exc}",
+                    exc_info=exc,
+                )
 
     # // ========================================( Dispatch )======================================== // #
 

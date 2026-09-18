@@ -1,6 +1,7 @@
 """Tests for persistent views: class registry, custom_id validation, and reducers."""
 
 import asyncio
+import json
 import logging
 import types
 from datetime import datetime
@@ -23,6 +24,7 @@ from cascadeui.views.persistent import (
     _persistent_view_classes,
     _PersistentMixin,
 )
+from cascadeui.views.view import StatefulView
 
 
 def make_action(action_type, payload, source=None):
@@ -1038,3 +1040,422 @@ class TestRealViewStoreRepair:
         # Let the scheduled on_timeout() task run to completion so it
         # doesn't leak past the test as a pending task.
         await asyncio.sleep(0)
+
+
+class TestRetirePreviousOnSend:
+    """A send under a key another panel holds retires that panel by default.
+
+    ``retire_previous_on_send = False`` leaves the predecessor to the caller,
+    for a swap that confirms the new panel before the old one comes down. Two
+    things keep that safe: the registry row is built from the panel that
+    registered, and a superseded panel's ``exit()`` removes only the
+    registration its own message holds.
+    """
+
+    KEY = "swap:panel"
+
+    @staticmethod
+    def _message(message_id):
+        message = MagicMock()
+        message.id = message_id
+        message.guild = None
+        message.channel.id = 222
+        message.edit = AsyncMock()
+        message.delete = AsyncMock()
+        return message
+
+    @staticmethod
+    def _panel_class(retire):
+        class _SwapPanel(PersistentLayoutView):
+            retire_previous_on_send = retire
+
+            def __init__(self, *, label, **kwargs):
+                super().__init__(**kwargs)
+                self.add_item(
+                    discord.ui.ActionRow(discord.ui.Button(label=label, custom_id="swap:go"))
+                )
+
+        return _SwapPanel
+
+    async def _setup(self, retire):
+        from cascadeui import setup_middleware
+        from cascadeui.persistence import InMemoryBackend
+        from cascadeui.state.middleware.persistence import PersistenceMiddleware
+        from cascadeui.state.singleton import get_store
+
+        backend = InMemoryBackend()
+        await backend.initialize()
+        middleware = PersistenceMiddleware(backend=backend)
+        await setup_middleware(middleware)
+        store = get_store()
+        cls = self._panel_class(retire)
+
+        old = cls(label="old", persistence_key=self.KEY)
+        old._message = self._message(111)
+        store._register_view(old)
+        await old._register_persistent(old._message)
+
+        new = cls(label="new", persistence_key=self.KEY)
+        new._message = self._message(999)
+        # _send_pipeline registers the view before _register_persistent runs.
+        store._register_view(new)
+        return store, backend, middleware, old, new
+
+    async def _row(self, backend, middleware):
+        from cascadeui.persistence.schema import TABLE_PERSISTENT_VIEWS
+
+        await middleware.flush_all()
+        return await backend.row_select(TABLE_PERSISTENT_VIEWS, {"persistence_key": self.KEY})
+
+    async def test_default_still_exits_the_previous_panel(self):
+        store, backend, middleware, old, new = await self._setup(retire=True)
+
+        await new._register_persistent(new._message)
+
+        assert old.id not in store._active_views
+
+    async def test_default_retires_a_view_the_previous_panel_pushed(self):
+        from helpers import RenderableLayoutView
+
+        store, backend, middleware, old, new = await self._setup(retire=True)
+        child = await old.push(RenderableLayoutView)
+        assert old.id not in store._active_views
+
+        await new._register_persistent(new._message)
+
+        assert child.is_finished()
+        assert child.id not in store._active_views
+        assert store.get_active_view(persistence_key=self.KEY) is new
+
+    async def test_a_pushed_view_retires_the_registration_when_its_message_goes(self):
+        """After a push the panel is gone and its registration rides the
+        destination, so that view is the only one left to retire it."""
+        from helpers import RenderableLayoutView
+
+        store, backend, middleware, old, new = await self._setup(retire=True)
+        child = await old.push(RenderableLayoutView)
+        assert child._registry_message_id == "111"
+
+        await child.exit(delete_message=True)
+        await middleware.flush_all()
+
+        assert self.KEY not in store.state.get("persistent_views", {})
+        assert await self._row(backend, middleware) == []
+
+    async def test_a_persistent_destination_retires_the_carried_registration_too(self):
+        """A persistent view unregisters its OWN key, so one pushed under a
+        different key leaves the carried registration behind."""
+        store, backend, middleware, old, new = await self._setup(retire=True)
+        child_cls = self._panel_class(True)
+        child = await old.push(child_cls, label="child", persistence_key="other:key")
+        assert child._persistent and child._registry_message_id == "111"
+
+        await child.exit(delete_message=True)
+        await middleware.flush_all()
+
+        assert self.KEY not in store.state.get("persistent_views", {})
+        assert await self._row(backend, middleware) == []
+
+    async def test_a_deleted_message_does_not_rebuild_the_view_mid_teardown(self):
+        """The retirement dispatch runs after the teardown: before it, the view
+        is still subscribed and its own tree rebuilds against a nulled message.
+        """
+        from helpers import RenderableLayoutView
+
+        store, backend, middleware, old, new = await self._setup(retire=True)
+        rebuilds = []
+
+        class _Reactive(RenderableLayoutView):
+            subscribed_actions = None
+
+            def build_ui(self):
+                # Records rather than raises: a tree that read self.message.id
+                # here would raise inside the subscriber wrapper, and the
+                # append that proves the rebuild happened would never run.
+                rebuilds.append(self._message)
+
+        child = await old.push(_Reactive)
+        rebuilds.clear()
+
+        await child.on_message_delete()
+        await store._flush_notifications()
+
+        assert rebuilds == []
+        assert self.KEY not in store.state.get("persistent_views", {})
+
+    async def test_a_pushed_view_frozen_in_place_keeps_the_registration(self):
+        """The message is still up, so the row still describes something."""
+        from helpers import RenderableLayoutView
+
+        store, backend, middleware, old, new = await self._setup(retire=True)
+        child = await old.push(RenderableLayoutView)
+
+        await child.exit(delete_message=False)
+        await middleware.flush_all()
+
+        assert store.state["persistent_views"][self.KEY]["message_id"] == "111"
+        assert len(await self._row(backend, middleware)) == 1
+
+    async def test_a_raising_hand_back_does_not_escape_exit(self):
+        """The teardown still has to run: a caller rolling a swap back would
+        otherwise be left with both panels live and neither registered."""
+        store, backend, middleware, old, new = await self._setup(retire=False)
+        await new._register_persistent(new._message)
+
+        async def _boom(key):
+            raise RuntimeError("registry write blew up")
+
+        new._reregister_live_predecessor = _boom
+
+        await new.exit(delete_message=False)
+
+        assert new.is_finished()
+        assert new.id not in store._active_views
+
+    async def test_exiting_a_panel_that_never_sent_leaves_the_live_row(self):
+        """A panel whose send raised, or was refused, owns no registration.
+
+        Its unregister carries no message id, which is the remove-whatever-
+        holds-the-key contract, so it would retire the panel on screen.
+        """
+        store, backend, middleware, old, new = await self._setup(retire=True)
+        never_sent = self._panel_class(True)(label="never", persistence_key=self.KEY)
+
+        await never_sent.exit(delete_message=False)
+
+        assert store.state["persistent_views"][self.KEY]["message_id"] == "111"
+        assert store.get_active_view(persistence_key=self.KEY) is old
+        assert not old.is_finished()
+
+    async def test_a_holder_retired_by_another_holder_is_not_exited_twice(self):
+        """The holder list predates the first exit, and one panel's exit can
+        retire another (paired panels retire together)."""
+        store, backend, middleware, old, new = await self._setup(retire=True)
+        partner = self._panel_class(False)(label="partner", persistence_key=self.KEY)
+        partner._message = self._message(333)
+        store._register_view(partner)
+        exits = []
+
+        async def _old_exit(delete_message=None, _orig=old.exit):
+            exits.append("old")
+            await _orig(delete_message=delete_message)
+
+        old.exit = _old_exit
+
+        async def _partner_exit(delete_message=None, _orig=partner.exit):
+            exits.append("partner")
+            if not old.is_finished():
+                await old.exit(delete_message=False)
+            await _orig(delete_message=delete_message)
+
+        partner.exit = _partner_exit
+
+        await new._register_persistent(new._message)
+
+        assert exits == ["partner", "old"]
+        assert old.is_finished() and partner.is_finished()
+
+    async def test_opt_out_leaves_the_previous_panel_live(self):
+        store, backend, middleware, old, new = await self._setup(retire=False)
+
+        await new._register_persistent(new._message)
+
+        assert old.id in store._active_views
+        assert not old.is_finished()
+        old._message.edit.assert_not_called()
+        old._message.delete.assert_not_called()
+        assert store.state["persistent_views"][self.KEY]["message_id"] == "999"
+
+    async def test_opt_out_writes_the_row_from_the_panel_that_registered(self):
+        _, backend, middleware, old, new = await self._setup(retire=False)
+
+        await new._register_persistent(new._message)
+        rows = await self._row(backend, middleware)
+
+        assert [r["message_id"] for r in rows] == [999]
+        assert json.loads(rows[0]["init_kwargs"])["label"] == "new"
+
+    async def test_superseded_panel_exit_keeps_the_successors_registration(self):
+        store, backend, middleware, old, new = await self._setup(retire=False)
+        await new._register_persistent(new._message)
+
+        # The caller deletes the old message; the deletion listener nulls
+        # _message and exits the superseded view.
+        await old.on_message_delete()
+        rows = await self._row(backend, middleware)
+
+        assert old.is_finished()
+        assert store.state["persistent_views"][self.KEY]["message_id"] == "999"
+        assert [r["message_id"] for r in rows] == [999]
+
+    async def test_rolling_back_by_exiting_the_new_panel_restores_the_old_registration(self):
+        """A swap that fails its confirmation exits the new panel; the old one
+        is still live, so it must still be the panel a restart reattaches."""
+        store, backend, middleware, old, new = await self._setup(retire=False)
+        await new._register_persistent(new._message)
+
+        await new.exit(delete_message=True)
+        rows = await self._row(backend, middleware)
+
+        assert store.state["persistent_views"][self.KEY]["message_id"] == "111"
+        assert [r["message_id"] for r in rows] == [111]
+        assert json.loads(rows[0]["init_kwargs"])["label"] == "old"
+
+    async def test_exiting_the_new_panel_after_the_old_one_stood_down_removes_the_row(self):
+        """A predecessor the caller already stopped is retired, so the owner's
+        exit removes the registration as it would with no predecessor at all."""
+        store, backend, middleware, old, new = await self._setup(retire=False)
+        await new._register_persistent(new._message)
+        old.stop()
+
+        await new.exit(delete_message=False)
+        rows = await self._row(backend, middleware)
+
+        assert self.KEY not in store.state["persistent_views"]
+        assert rows == []
+
+    def test_a_non_bool_value_is_refused_at_class_definition(self):
+        with pytest.raises(ValueError, match="retire_previous_on_send must be a bool"):
+
+            class _Bad(PersistentLayoutView):
+                retire_previous_on_send = "no"
+
+
+class TestUnregisterReducerScope:
+    """The unregister reducer removes a key only when it still points at the
+    message that asked; a payload without a message id keeps the old meaning."""
+
+    @staticmethod
+    def _state(message_id):
+        return {"persistent_views": {"k": {"persistence_key": "k", "message_id": message_id}}}
+
+    async def test_matching_message_removes_the_key(self):
+        action = {"payload": {"persistence_key": "k", "message_id": "1"}}
+        state = await reduce_persistent_view_unregistered(action, self._state("1"))
+        assert state["persistent_views"] == {}
+
+    async def test_a_different_message_leaves_state_untouched(self):
+        before = self._state("2")
+        action = {"payload": {"persistence_key": "k", "message_id": "1"}}
+        assert await reduce_persistent_view_unregistered(action, before) is before
+
+    async def test_no_message_id_removes_the_key(self):
+        action = {"payload": {"persistence_key": "k"}}
+        state = await reduce_persistent_view_unregistered(action, self._state("2"))
+        assert state["persistent_views"] == {}
+
+
+class TestRegistrationOwnershipSeams:
+    """Where a persistent panel's registration changes hands: a default
+    replacement, several live predecessors, and a push/pop round trip that
+    rebuilds the panel."""
+
+    async def test_default_replacement_registers_once_without_a_fallback(self, monkeypatch):
+        """The new panel registers before the old one exits, so the old
+        panel's unregister removes nothing and no fallback re-enters the new
+        panel's own registration."""
+        from cascadeui.state.singleton import get_store
+
+        store = get_store()
+        registered = []
+        fallbacks = []
+        store.on("PERSISTENT_VIEW_REGISTERED", lambda action, state: registered.append(action))
+        original = _PersistentMixin._reregister_live_predecessor
+
+        async def spy(self, key):
+            fallbacks.append(self.id)
+            return await original(self, key)
+
+        monkeypatch.setattr(_PersistentMixin, "_reregister_live_predecessor", spy)
+        make = TestRetirePreviousOnSend._message
+
+        old = TestRetirePreviousOnSend._panel_class(True)(label="old", persistence_key="own:1")
+        old._message = make(111)
+        store._register_view(old)
+        await old._register_persistent(old._message)
+        registered.clear()
+
+        new = type(old)(label="new", persistence_key="own:1")
+        new._message = make(999)
+        store._register_view(new)
+        await new._register_persistent(new._message)
+
+        assert len(registered) == 1
+        assert fallbacks == []
+        assert old.is_finished()
+
+    async def test_default_replacement_exits_every_live_predecessor(self):
+        from cascadeui.state.singleton import get_store
+
+        store = get_store()
+        make = TestRetirePreviousOnSend._message
+        keeper = TestRetirePreviousOnSend._panel_class(False)
+        first = keeper(label="first", persistence_key="own:2")
+        first._message = make(111)
+        store._register_view(first)
+        await first._register_persistent(first._message)
+        second = keeper(label="second", persistence_key="own:2")
+        second._message = make(222)
+        store._register_view(second)
+        await second._register_persistent(second._message)
+
+        third = TestRetirePreviousOnSend._panel_class(True)(label="third", persistence_key="own:2")
+        third._message = make(333)
+        store._register_view(third)
+        await third._register_persistent(third._message)
+
+        assert first.is_finished() and second.is_finished()
+        assert store.state["persistent_views"]["own:2"]["message_id"] == "333"
+
+    async def test_pop_back_to_a_persistent_panel_keeps_its_registration_owner(self):
+        """pop() rebuilds the panel; the rebuilt instance still owns the
+        registration of the message it shows."""
+        from helpers import make_interaction
+
+        class _OwnedPanel(PersistentView):
+            pass
+
+        class _Child(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        panel = _OwnedPanel(interaction=make_interaction(), persistence_key="own:nav")
+        await panel.send()
+        owner = panel._registry_message_id
+        assert owner is not None
+
+        child = await panel.push(_Child)
+        restored = await child.pop()
+
+        assert restored is not panel
+        assert restored._registry_message_id == owner
+
+    @staticmethod
+    def _gone(view):
+        view._last_tree_digest = None
+        view._check_placement = lambda: None
+        view._message.edit = AsyncMock(
+            side_effect=discord.NotFound(MagicMock(status=404), "Unknown Message")
+        )
+        return view
+
+    async def test_an_edit_finding_the_message_gone_removes_the_panels_row(self):
+        setup = TestRetirePreviousOnSend()
+        store, backend, middleware, old, _ = await setup._setup(retire=True)
+
+        await self._gone(old).refresh()
+        await old._message_gone_task
+
+        assert old.is_finished()
+        assert await setup._row(backend, middleware) == []
+
+    async def test_a_superseded_panels_gone_message_leaves_the_successors_row(self):
+        setup = TestRetirePreviousOnSend()
+        store, backend, middleware, old, new = await setup._setup(retire=False)
+        await new._register_persistent(new._message)
+
+        await self._gone(old).refresh()
+        await old._message_gone_task
+
+        assert old.is_finished()
+        assert [r["message_id"] for r in await setup._row(backend, middleware)] == [999]

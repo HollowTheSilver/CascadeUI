@@ -228,6 +228,13 @@ class _NavigationMixin:
                 if action_type in ("NAVIGATION_PUSH", "NAVIGATION_POP") and self._message:
                     new_view._message = self._message
                     new_view._webhook_message = self._webhook_message
+                    # A persistent panel's registration is owned by the message it
+                    # registered under. Carried through non-persistent hops too, so
+                    # a panel popped back to still exits as that registration's
+                    # owner rather than removing whatever the key points at.
+                    registry_message_id = getattr(self, "_registry_message_id", None)
+                    if registry_message_id is not None:
+                        new_view._registry_message_id = registry_message_id
                     # Carry the ephemeral arming deadline, never recompute it: the
                     # webhook token belongs to the original send, so a mid-chain
                     # hop's handoff timer must sleep only the remainder of the
@@ -830,6 +837,11 @@ class _NavigationMixin:
             # strong reference to the view.
             self.state_store._unsubscribe(new_view.id)
             await self.state_store._destroy_view(new_view.id, source_id=new_view.id)
+            # push()/pop() still return the destination, which carries the
+            # source's message from the navigation batch. Unbound, a later
+            # exit() on it cannot edit the message the recovered source owns.
+            new_view._message = None
+            new_view._webhook_message = None
         if not self.is_finished():
             self.state_store.subscribe(
                 self.id,
@@ -837,6 +849,13 @@ class _NavigationMixin:
                 self.subscribed_actions,
                 self._build_selector(),
             )
+            # An edit that found the message gone while the source was
+            # unsubscribed for navigation skipped its teardown, since the
+            # source read as torn down; with the source recovered, that
+            # teardown is owed again. A missing message alone does not say so:
+            # a never-sent view has none either, and never scheduled one.
+            if self._message is None and self._message_gone_task is not None:
+                self._schedule_message_gone_teardown()
         # _navigate_to cancelled the source's tasks ahead of the (now-failed)
         # teardown. Re-arm the ephemeral refresh handoff so a recovered
         # long-lived ephemeral source still swaps in its refresh button before
@@ -1124,12 +1143,14 @@ class _NavigationMixin:
                 # and is itself tearing down.
                 child._attached_to = None
                 if child.is_finished():
-                    # Quiesce it on the way past: this branch never reaches
-                    # exit(), which is what unsubscribes, so the child would
-                    # keep its subscription while its parent link reads None
-                    # and rebuild against a parent that is gone. Idempotent.
+                    # Torn down, not just quiesced: this branch never reaches
+                    # exit(), and unsubscribing is what answers "torn down",
+                    # so a child left in the registries is one every later
+                    # cleanup path skips. Idempotent.
+                    self.task_manager.cancel_tasks(child.id)
                     self.state_store._unsubscribe(child.id)
                     self.state_store._undo_enabled_views.pop(child.id, None)
+                    await self.state_store._destroy_view(child.id, source_id=child.id)
                     continue
                 try:
                     await child.exit(delete_message=True)

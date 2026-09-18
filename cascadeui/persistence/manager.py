@@ -42,11 +42,13 @@ corresponding bookkeeping action (:data:`APPLICATION_SLOTS_PRUNED`,
 
 
 import asyncio
+import functools
 import inspect
 import json
 import logging
 import time
 from collections import Counter
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from ..exceptions import (
@@ -92,6 +94,27 @@ logger = logging.getLogger(__name__)
 _NON_PERSISTABLE_KWARGS: frozenset[str] = frozenset({"persistence_key", "theme", "bot"})
 
 
+def _validate_prune_unreachable_after_days(value: Any, bot: Any) -> None:
+    """Refuse a bad ``prune_unreachable_after_days`` where it is passed.
+
+    A zero cutoff is refused although ``prune_unreachable(older_than_days=0)``
+    accepts it: run automatically, it deletes a row on a single failed fetch.
+    A sweep without a bot has nothing to re-verify against, and no reattach
+    pass ever stamps a row for it to find.
+    """
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(
+            f"prune_unreachable_after_days= must be None or a positive int, got {value!r}."
+        )
+    if bot is None:
+        raise ValueError(
+            "prune_unreachable_after_days= needs bot=: the sweep re-verifies each "
+            "unreachable row against Discord before deleting it."
+        )
+
+
 # // ========================================( Manager )======================================== // #
 
 
@@ -105,13 +128,23 @@ class PersistenceManager:
         application: Optional[ApplicationPersistence] = None,
         bot: Any = None,
         restore_concurrency: int = 8,
+        prune_unreachable_after_days: Optional[int] = None,
     ) -> None:
+        _validate_prune_unreachable_after_days(prune_unreachable_after_days, bot)
         self._store = store
         self._bot = bot
         # Bounds per-row Discord round-trips across both restore phases; see
         # _run_post_ready_restore for the per-channel serialization the
         # repaint adds on top of this bound.
         self.restore_concurrency = restore_concurrency
+        # Cutoff the daily unreachable sweep passes to prune_unreachable();
+        # None leaves the sweep off.
+        self.prune_unreachable_after_days = prune_unreachable_after_days
+        # Held by every walk that can delete or re-attach registry rows
+        # (a reattach pass and prune_unreachable), so a sweep cannot delete a
+        # row a concurrent reattach just found reachable again.
+        self._registry_walk_lock = asyncio.Lock()
+        self._registry_walk_owner: Optional[asyncio.Task] = None
 
         # Default to opted-out configs so every namespace has a config
         # object. Avoids None-branching at every call site.
@@ -146,6 +179,10 @@ class PersistenceManager:
         # inside setup_middleware, so code that subscribes only after setup_hook
         # (e.g. on_ready) misses it. None until the first reattach.
         self.last_reattach_summary: Optional[dict[str, list[str]]] = None
+        # Every key a pass has reported, under its most recent outcome; read
+        # through total_reattach_summary. Outlives the attribute above across
+        # a re-drive, which is what keeps a removed key reconcilable.
+        self._reattach_outcomes: dict[str, str] = {}
 
         # Slot policy registry, seeded from ApplicationPersistence.slots
         # and extended at runtime by register_slot_policy.
@@ -164,6 +201,9 @@ class PersistenceManager:
         # TTL sweeper task. Started during PersistenceMiddleware.initialize()
         # only when at least one slot declares ttl_days > 0. Cancelled by close().
         self._ttl_sweeper_task: Optional[asyncio.Task] = None
+        # Daily unreachable-row sweep. Started with the TTL sweeper only when
+        # prune_unreachable_after_days is set. Cancelled by close().
+        self._unreachable_sweeper_task: Optional[asyncio.Task] = None
         # Post-ready on_restore render tasks. Each reattach call schedules its
         # own and tracks it here (mirrors PersistenceMiddleware._tasks), so a
         # second reattach never drops a batch. Cancelled by close().
@@ -758,6 +798,24 @@ class PersistenceManager:
         # the raw row list keeps the reattach step free of its own
         # backend read.
         self._registry_rows: list[dict[str, Any]] = list(rows)
+
+        # Seed the store's mirror of the registry, in the entry shape
+        # reduce_persistent_view_registered writes. Only the send path
+        # dispatches that action, so without this a restored view's key is
+        # absent: its exit() unregister changes no state and the row is never
+        # deleted, and a re-send under the same key skips the duplicate-key
+        # cleanup that retires the restored panel. Ids are strings there, and
+        # the cleanup compares message_id against str(message.id);
+        # registered_at is the ISO string an action timestamp carries. A key a
+        # send already registered in this process keeps its live entry.
+        state = self._store.state
+        seeded = self._mirror_entries(rows)
+        # Written in place rather than dispatched, the one such write in this
+        # subsystem: a dispatch would route these rows straight back to disk as
+        # if they were new registrations. Safe because rehydrate runs inside
+        # initialize(), before any view or subscriber holds a state reference.
+        # A live entry wins, so a send that raced the seed keeps its own row.
+        state["persistent_views"] = {**seeded, **state.get("persistent_views", {})}
         logger.info(f"Rehydrated {len(rows)} persistent view row(s)")
 
     # // ========================================( Reattach )======================================== // #
@@ -793,7 +851,147 @@ class PersistenceManager:
         ``DynamicPersistentButton`` registry with the bot via
         ``add_dynamic_items``, so dynamic-item dispatch stays current
         across re-drives.
+
+        Serialized with :meth:`prune_unreachable`, the other walk that acts
+        on registry rows. The return covers this pass;
+        :attr:`total_reattach_summary` carries every pass, which is what a
+        reconcile running after a re-drive needs.
         """
+        summary = await self._serialized_walk("reattach_persistent_views", self._reattach_pass)
+        for outcome, keys in summary.items():
+            for key in keys:
+                self._reattach_outcomes[key] = outcome
+        return summary
+
+    @staticmethod
+    def _mirror_entries(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        """Registry rows in the entry shape the store's mirror holds.
+
+        Ids are strings there and the row's are integers, and ``registered_at``
+        is the ISO string an action timestamp carries, so a row cannot be put
+        into the mirror as it comes off disk.
+        """
+
+        def snowflake(value):
+            return None if value is None else str(value)
+
+        def iso(epoch):
+            return (
+                None if epoch is None else datetime.fromtimestamp(epoch, timezone.utc).isoformat()
+            )
+
+        return {
+            row["persistence_key"]: {
+                "persistence_key": row["persistence_key"],
+                "class_name": row.get("view_class"),
+                "message_id": snowflake(row.get("message_id")),
+                "channel_id": snowflake(row.get("channel_id")),
+                "guild_id": snowflake(row.get("guild_id")),
+                "user_id": snowflake(row.get("user_id")),
+                "registered_at": iso(row.get("created_at")),
+            }
+            for row in rows
+        }
+
+    def reseed_registry_mirror(self) -> int:
+        """Rebuild the store's registry mirror from the rows this process knows.
+
+        For a caller that rebuilds state from scratch: the mirror is part of
+        that state, and dropping it leaves stored rows nothing in the process
+        knows about, so a later exit under one of those keys retires nothing
+        and a re-send skips its orphan cleanup. Returns the entry count.
+        """
+        entries = self._mirror_entries(self._registry_rows)
+        self._store.state["persistent_views"] = entries
+        return len(entries)
+
+    def _remember_registry_row(self, persistence_key: str, row: dict[str, Any]) -> None:
+        """Record a row this process wrote into the boot mirror.
+
+        The counterpart of ``_forget_registry_row``: without it the mirror only
+        ever shrinks, so a registration handed back to a live predecessor sits
+        on disk while this process's reattach candidates no longer name it, and
+        only the next boot finds it again.
+        """
+        for i, existing in enumerate(self._registry_rows):
+            if existing.get("persistence_key") == persistence_key:
+                self._registry_rows[i] = dict(row)
+                return
+        self._registry_rows.append(dict(row))
+
+    def _forget_registry_row(self, persistence_key: str) -> None:
+        """Drop a row this process deleted from the boot mirror.
+
+        The mirror is filled once at rehydrate and is what every reattach pass
+        walks, so a row deleted afterwards is still a reattach candidate: a key
+        left pending at boot, re-posted in this process and later retired, would
+        be restored onto the message the first row named, with no row behind it.
+        ``prune_registry`` already drops what it deletes; this is the other
+        deletion, an ``exit()`` that unregisters. The middleware calls it for a
+        removal the reducer accepted, so a superseded panel's exit, which the
+        reducer refuses, leaves the mirror alone.
+        """
+        self._registry_rows = [
+            r for r in self._registry_rows if r.get("persistence_key") != persistence_key
+        ]
+
+    @property
+    def total_reattach_summary(self) -> dict[str, list[str]]:
+        """Every key reattach has reported, under its most recent outcome.
+
+        The same five buckets :meth:`reattach_persistent_views` returns, across
+        every pass rather than the latest one. A key moves between buckets as
+        later passes re-verdict it (``skipped`` on the boot pass, ``restored``
+        once its class imports) and appears in exactly one.
+
+        This is the read for post-boot reconciliation. ``removed`` is the case
+        that needs it: only the pass that deletes a row can report it, so a
+        consumer reading ``last_reattach_summary`` after a :meth:`reattach`
+        re-drive sees an empty list and reconciles nothing.
+
+        Reattach passes only. A row deleted later, by the unreachable sweep or
+        by :meth:`prune_registry`, keeps whatever outcome its last pass gave
+        it; those deletions arrive as ``REGISTRY_PRUNED``, which a subscriber
+        registered after startup does receive. Between them the two cover every
+        registration that goes away: this property for the boot passes a late
+        subscriber missed, the action for everything after.
+        """
+        totals: dict[str, list[str]] = {
+            "restored": [],
+            "skipped": [],
+            "failed": [],
+            "removed": [],
+            "unreachable": [],
+        }
+        for key, outcome in self._reattach_outcomes.items():
+            totals.setdefault(outcome, []).append(key)
+        return totals
+
+    async def _serialized_walk(self, name: str, walk: Callable[[], Any]) -> Any:
+        """Run one registry walk at a time, refusing a re-entry that would deadlock.
+
+        Both walks dispatch ``REGISTRY_PRUNED`` while they hold the lock, and
+        store hooks run inline, so a hook that starts another walk in the
+        same task would wait forever on its own caller. It raises instead,
+        naming the fix; a walk started from any other task simply waits.
+        """
+        current = asyncio.current_task()
+        if current is not None and self._registry_walk_owner is current:
+            raise RuntimeError(
+                f"{name}() was called from inside a running reattach pass or "
+                f"prune_unreachable() in the same task (a REGISTRY_PRUNED hook, "
+                f"for example), where it would wait forever for the walk that "
+                f"called it. Schedule it on its own task instead: "
+                f"asyncio.create_task(...)."
+            )
+        async with self._registry_walk_lock:
+            self._registry_walk_owner = current
+            try:
+                return await walk()
+            finally:
+                self._registry_walk_owner = None
+
+    async def _reattach_pass(self) -> dict[str, list[str]]:
         summary: dict[str, list[str]] = {
             "restored": [],
             "skipped": [],
@@ -825,9 +1023,17 @@ class PersistenceManager:
 
         # Skip keys already restored on a prior pass so reattach() only
         # processes rows that are new (a class imported after the initial
-        # reattach) or still pending (skipped / unreachable / failed).
+        # reattach) or still pending (skipped / unreachable / failed). A key a
+        # live view in this process holds is skipped too: a send under a key
+        # still pending from boot rewrites its row, and re-driving that row
+        # would attach a second instance to the message the live panel owns,
+        # or prune the key on a 404 for the message it replaced.
+        live_keys = self._store._live_persistence_keys()
         rows = [
-            r for r in self._registry_rows if r.get("persistence_key") not in self._restored_keys
+            r
+            for r in self._registry_rows
+            if r.get("persistence_key") not in self._restored_keys
+            and r.get("persistence_key") not in live_keys
         ]
         if not rows:
             return summary
@@ -1037,7 +1243,9 @@ class PersistenceManager:
         also re-drives dynamic-item registration, so a late-imported
         ``DynamicPersistentButton`` subclass recovers the same way. Returns the
         same summary shape as :meth:`reattach_persistent_views`, covering only
-        the rows this pass processed.
+        the rows this pass processed. A post-boot reconcile reads
+        :attr:`total_reattach_summary` instead: this pass cannot re-report a
+        row the boot pass deleted, so its ``removed`` list is empty of them.
         """
         return await self.reattach_persistent_views()
 
@@ -1395,14 +1603,12 @@ class PersistenceManager:
             # avoid firing a VIEW_UPDATED dispatch before _register_state
             # runs.
             view._message = message
+            view._registry_message_id = str(message.id)
 
-            # Fingerprint the tree the fresh __init__ just produced, before
-            # on_restore has had any chance to run. A teardown before that
-            # render reads this against the CURRENT tree: unchanged means
-            # nothing has touched it and there is nothing on screen to
-            # correct, changed means a teardown override composed real
-            # content (a farewell card) that has to ship regardless.
-            view._reattach_baseline_digest = view._compute_tree_digest()
+            # The tree __init__ produced, before on_restore renders anything.
+            # A teardown ahead of that render compares against it; see
+            # _StatefulMixin._teardown_edit_target.
+            view._reattach_baseline_digest = view._compute_tree_digest(ignore_disabled=True)
 
             # ``is not None`` (not truthy) so a stored ``user_id=0`` still
             # restores -- Discord doesn't mint zero snowflakes, but tests
@@ -1511,6 +1717,11 @@ class PersistenceManager:
 
     # // ========================================( TTL sweeper )======================================== // #
 
+    def _start_sweepers(self) -> None:
+        """Start every background sweep this configuration asks for. Idempotent."""
+        self._start_ttl_sweeper()
+        self._start_unreachable_sweeper()
+
     def _start_ttl_sweeper(self) -> None:
         """Spawn the daily TTL sweeper task when at least one persistent
         slot declares ``ttl_days``. Idempotent: second call is a no-op
@@ -1524,16 +1735,35 @@ class PersistenceManager:
         if not any(p.ttl_days is not None and p.persistent for p in self._slot_policies.values()):
             return
         task = asyncio.create_task(self._ttl_sweeper_loop())
-        task.add_done_callback(self._on_sweeper_done)
+        task.add_done_callback(
+            functools.partial(self._on_sweeper_done, "TTL sweeper", "_ttl_sweeper_task")
+        )
         self._ttl_sweeper_task = task
 
-    def _on_sweeper_done(self, task: asyncio.Task) -> None:
+    def _start_unreachable_sweeper(self) -> None:
+        """Spawn the daily unreachable-row sweep when
+        ``prune_unreachable_after_days`` is set. Idempotent. No-op when the
+        registry backend is opted out.
+        """
+        if self._unreachable_sweeper_task is not None:
+            return
+        if self.prune_unreachable_after_days is None or self.registry.backend is None:
+            return
+        task = asyncio.create_task(self._unreachable_sweeper_loop())
+        task.add_done_callback(
+            functools.partial(
+                self._on_sweeper_done, "Unreachable sweeper", "_unreachable_sweeper_task"
+            )
+        )
+        self._unreachable_sweeper_task = task
+
+    def _on_sweeper_done(self, name: str, field: str, task: asyncio.Task) -> None:
         if task.cancelled():
             return
         exc = task.exception()
         if exc is not None:
-            logger.error(f"TTL sweeper crashed: {exc}", exc_info=exc)
-        self._ttl_sweeper_task = None
+            logger.error(f"{name} crashed: {exc}", exc_info=exc)
+        setattr(self, field, None)
 
     # // ========================================( Post-ready restore )======================================== // #
 
@@ -1671,6 +1901,33 @@ class PersistenceManager:
         except asyncio.CancelledError:
             return
 
+    async def _unreachable_sweeper_loop(self) -> None:
+        """Run :meth:`prune_unreachable` once the gateway is ready, then daily.
+
+        The first run waits for ready rather than running during
+        ``setup_hook``: a fetch that fails while the gateway is up says the
+        channel is unreachable, not the host, and every reattach re-drive a
+        consumer issues in ``setup_hook`` has finished by then. Errors are
+        logged and the loop continues, as the TTL sweeper does.
+        """
+        try:
+            try:
+                await self._bot.wait_until_ready()
+            except Exception as exc:
+                logger.warning(
+                    f"Unreachable sweeper could not wait for the gateway ({exc}); "
+                    f"no automatic prune runs this session."
+                )
+                return
+            while not self._closed:
+                try:
+                    await self.prune_unreachable(older_than_days=self.prune_unreachable_after_days)
+                except Exception as exc:
+                    logger.error(f"Unreachable sweeper error: {exc}", exc_info=True)
+                await asyncio.sleep(86400)
+        except asyncio.CancelledError:
+            return
+
     # // ========================================( Prune surface )======================================== // #
 
     async def prune_application(
@@ -1718,6 +1975,14 @@ class PersistenceManager:
         only those rows are removed; otherwise clears the whole
         registry (destructive, rarely wanted).
 
+        Rows are matched by key alone, so this deletes whatever holds a key
+        at the moment it runs, including the row of a panel still running.
+        It is meant for a key no live panel holds: retire a live one through
+        its own ``exit()``, which retires the registration only while that
+        panel owns it, and ask
+        ``StateStore.get_active_view(persistence_key=...)`` whether there is
+        one. A prune that does take a live panel's row logs a warning.
+
         ``reason`` labels the ``REGISTRY_PRUNED`` dispatch so a subscriber can
         tell why a row went. Left unset it defaults to ``"explicit"`` for a
         targeted prune and ``"clear_all"`` for a full wipe."""
@@ -1756,6 +2021,20 @@ class PersistenceManager:
             self._registry_rows = [
                 r for r in self._registry_rows if r.get("persistence_key") not in gone
             ]
+            # Matched by store ownership rather than by a lookup for the panel
+            # instance, since a pushed child holds its panel's key through
+            # _registry_message_id. Losing the row leaves the panel live now
+            # and absent after the next restart, which nothing else reports.
+            held = sorted(set(pruned) & self._store._live_persistence_keys())
+            if held:
+                logger.warning(
+                    f"prune_registry deleted the registration of {len(held)} live "
+                    f"panel(s) ({', '.join(map(repr, held))}); each stays on screen "
+                    f"now and is not restored after a restart. prune_registry matches "
+                    f"by key, so it is meant for a key no live panel holds: exit() "
+                    f"retires a live one, and get_active_view(persistence_key=...) "
+                    f"says whether there is one."
+                )
 
         await self._store.dispatch(
             "REGISTRY_PRUNED",
@@ -1794,6 +2073,11 @@ class PersistenceManager:
         persistence keys. Deletions route through :meth:`prune_registry`, so
         ``REGISTRY_PRUNED`` fires with ``reason="unreachable"``.
 
+        A row whose key a live panel in this process holds is kept: the panel
+        owns the key, so a failed fetch says nothing about whether its row
+        should go. Serialized with :meth:`reattach_persistent_views`, the other
+        walk that acts on registry rows.
+
         Raises ``ValueError`` for a negative or non-integer
         ``older_than_days`` and ``RuntimeError`` when the middleware was
         built without ``bot=``, since re-verification needs the client. A
@@ -1821,26 +2105,64 @@ class PersistenceManager:
                 "one no reattach pass runs, so no rows are ever stamped."
             )
 
+        return await self._serialized_walk(
+            "prune_unreachable",
+            lambda: self._prune_unreachable_pass(older_than_days, summary),
+        )
+
+    async def _prune_unreachable_pass(
+        self, older_than_days: int, summary: dict[str, list[str]]
+    ) -> dict[str, list[str]]:
+        backend = self.registry.backend
         # From disk, never the in-memory mirror: a re-send in this process
         # clears the stamp on disk without refreshing the copy, and the
         # destructive path has to read the authority.
         rows = await backend.row_select(TABLE_PERSISTENT_VIEWS)
-        candidates = [r for r in rows if r.get("first_unreachable_at") is not None]
+        stamped = [r for r in rows if r.get("first_unreachable_at") is not None]
+        live_keys = self._store._live_persistence_keys()
+        summary["kept"].extend(
+            r["persistence_key"] for r in stamped if r["persistence_key"] in live_keys
+        )
+        candidates = [r for r in stamped if r["persistence_key"] not in live_keys]
         if not candidates:
             return summary
 
         cutoff = int(time.time()) - older_than_days * 86400
         kill: list[str] = []
 
-        for row in candidates:
-            key = row.get("persistence_key")
-            removed_scratch: list[str] = []
-            unreachable_scratch: list[str] = []
-            fetched = await self._fetch_restore_message(row, removed_scratch, unreachable_scratch)
+        # Bounded fan-out, the same shape the reattach pass uses for the same
+        # two fetches: this walk holds the registry lock, and its candidate
+        # set is largest exactly when an outage or a permission change stamped
+        # rows in bulk. Verdicts stay serial below, in row order.
+        sem = asyncio.Semaphore(self.restore_concurrency)
 
-            if fetched is not None:
+        async def _verify(row: dict[str, Any]) -> tuple[Optional[Any], list[str], bool]:
+            removed_scratch: list[str] = []
+            try:
+                async with sem:
+                    fetched = await self._fetch_restore_message(row, removed_scratch, [])
+            except Exception as exc:
+                # Reported as unverified, not as a failed fetch: an aged row
+                # whose re-check never produced an answer would otherwise fall
+                # through to the cutoff below and be deleted on no evidence.
+                logger.warning(
+                    f"Re-verifying {row.get('persistence_key')!r} for the unreachable "
+                    f"sweep failed; keeping the row: {exc}",
+                    exc_info=exc,
+                )
+                return None, [], False
+            return fetched, removed_scratch, True
+
+        verified = await asyncio.gather(*(_verify(row) for row in candidates))
+
+        recovered: list[str] = []
+        for row, (fetched, removed_scratch, checked) in zip(candidates, verified):
+            key = row.get("persistence_key")
+            if not checked:
+                summary["kept"].append(key)
+            elif fetched is not None:
                 summary["recovered"].append(key)
-                await self._write_unreachable_stamps([key], None)
+                recovered.append(key)
             elif removed_scratch:
                 # A definitive 404. Age is irrelevant; the message is gone.
                 kill.append(key)
@@ -1848,6 +2170,11 @@ class PersistenceManager:
                 kill.append(key)
             else:
                 summary["kept"].append(key)
+
+        if recovered:
+            # One write for the batch: a recovered row's stamp is cleared so
+            # its next unreachable spell starts its own age window.
+            await self._write_unreachable_stamps(recovered, None)
 
         if kill:
             # Re-read before deleting -- see _confirm_unchanged for why. The
@@ -1900,15 +2227,19 @@ class PersistenceManager:
         if self._closed:
             return
 
-        # Cancel the TTL sweeper first. It only sleeps + one backend
-        # call per tick; cancellation is immediate and idempotent.
-        if self._ttl_sweeper_task is not None:
-            self._ttl_sweeper_task.cancel()
+        # Cancel the sweepers first. Each sleeps between runs and a cancelled
+        # prune loses nothing: it drains no buffer, and a partial prune leaves
+        # rows the next boot re-seeds the store from.
+        for field in ("_ttl_sweeper_task", "_unreachable_sweeper_task"):
+            task = getattr(self, field)
+            if task is None:
+                continue
+            task.cancel()
             try:
-                await self._ttl_sweeper_task
+                await task
             except (asyncio.CancelledError, Exception):
                 pass
-            self._ttl_sweeper_task = None
+            setattr(self, field, None)
 
         # Cancel any post-ready restore renders still waiting on the gateway
         # (or mid-render) when shutdown begins. Iterate a copy -- the done

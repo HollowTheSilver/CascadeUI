@@ -385,7 +385,7 @@ re-renders, so fixing one does not need a second submit to find the next.
 | `text_edit_button_label` | `None` (auto) | Label for the text-edit modal button |
 | `text_edit_button_emoji` | `"✏️"` | Emoji on the text-edit button |
 | `text_edit_button_style` | `secondary` | Style of the text-edit button |
-| `text_edit_modal_auto_defer_delay` | `2.5` | Ack backstop (seconds) for the internal text-edit modal; raise for a slow async field validator |
+| `text_edit_modal_auto_defer_delay` | `2.5` | Ack backstop (seconds) for the internal text-edit modal; raise for a slow async field validator, keeping it under `3.0` |
 
 ### `on_submit(interaction, values)`
 

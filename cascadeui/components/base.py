@@ -13,7 +13,13 @@ from ..state.actions import ActionCreators
 from ..state.store import _CURRENT_INTERACTION
 from ..utils.coercion import coerce_snowflake_match
 from ..utils.hooks import accepts_second_positional, await_maybe, can_accept_positional
-from ..utils.responses import ack_backstop, open_modal_safe, respond_safe, trailing_ack
+from ..utils.responses import (
+    ack_backstop,
+    open_modal_safe,
+    respond_safe,
+    trailing_ack,
+    validate_ack_delay,
+)
 from .types import MAX_SELECT_OPTIONS
 
 logger = logging.getLogger(__name__)
@@ -552,15 +558,11 @@ class DynamicPersistentButton(
         ``DynamicPersistentButton`` itself, because a class's
         ``__init_subclass__`` runs on its subclasses, not on itself.
 
-        Also validates ``auto_defer_delay`` (must be a positive number) at
-        definition time, mirroring ``Modal``.
+        Also validates ``auto_defer_delay`` (a positive number under Discord's
+        3s ack deadline) at definition time, sharing the check ``Modal`` uses.
         """
         super().__init_subclass__(**kwargs)
-        delay = cls.auto_defer_delay
-        if not isinstance(delay, (int, float)) or isinstance(delay, bool) or delay <= 0:
-            raise ValueError(
-                f"{cls.__name__}.auto_defer_delay must be a positive number, got {delay!r}"
-            )
+        validate_ack_delay(cls.__name__, "auto_defer_delay", cls.auto_defer_delay)
         _dynamic_button_classes[f"{cls.__module__}.{cls.__qualname__}"] = cls
 
     @classmethod

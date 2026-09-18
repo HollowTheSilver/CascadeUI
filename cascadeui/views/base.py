@@ -12,6 +12,7 @@ import uuid
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, ClassVar, Dict, Optional, Set
+from urllib.parse import unquote, urlsplit
 
 import aiohttp
 import discord
@@ -29,7 +30,12 @@ from ..state.singleton import get_store
 from ..state.store import _CURRENT_INTERACTION
 from ..utils.coercion import coerce_snowflake_id, coerce_snowflake_id_set, is_snowflake
 from ..utils.hooks import await_maybe, call_hook_safe, is_async_callable
-from ..utils.responses import DISCORD_CALL_ERRORS, ack_backstop, describe_discord_error
+from ..utils.responses import (
+    DISCORD_CALL_ERRORS,
+    ack_backstop,
+    describe_discord_error,
+    validate_ack_delay,
+)
 from ..utils.tasks import get_task_manager
 from ._interaction import _ARMING_RETRY_SECONDS, _InteractionMixin
 from ._navigation import _NavigationMixin
@@ -91,6 +97,10 @@ _NON_RECONSTRUCTIBLE_KWARGS = frozenset(
 # second can hold the door shut. Minutes-scale is the point; the only cost
 # is staying quiet a little past a ban that lifted early.
 _CLOUDFLARE_BAN_BACKOFF = 60.0
+
+# Task-manager owner for teardowns scheduled when an edit finds a view's
+# message deleted. Not the view's own id: exit() cancels that owner's tasks.
+_MESSAGE_GONE_TASK_OWNER = "view_message_gone"
 
 
 def _class_path(cls) -> str:
@@ -457,8 +467,8 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         "refresh_warning_seconds",
         "refresh_cooldown_ms",
     )
-    # Attributes that must be a positive float/int.
-    _POSITIVE_NUMBER_ATTRS: ClassVar[tuple] = ("auto_defer_delay",)
+    # Ack-backstop delays: a positive number under Discord's 3s ack deadline.
+    _ACK_DELAY_ATTRS: ClassVar[tuple] = ("auto_defer_delay",)
     # Attributes that must be a positive float/int or None (None = disabled).
     _OPTIONAL_POSITIVE_NUMBER_ATTRS: ClassVar[tuple] = ("edit_timeout",)
     # Attributes that must be a bool.
@@ -525,9 +535,8 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     f"{cls.__name__}.{name} must be a positive int or None, got {value!r}"
                 )
             return
-        if name in cls._effective_table("_POSITIVE_NUMBER_ATTRS"):
-            if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
-                raise ValueError(f"{cls.__name__}.{name} must be a positive number, got {value!r}")
+        if name in cls._effective_table("_ACK_DELAY_ATTRS"):
+            validate_ack_delay(cls.__name__, name, value)
             return
         if name in cls._effective_table("_OPTIONAL_POSITIVE_NUMBER_ATTRS"):
             if value is None:
@@ -669,7 +678,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         for table, check in (
             ("_ENUM_ATTRS", cls._validate_attribute_value),
             ("_POSITIVE_INT_ATTRS", cls._validate_attribute_value),
-            ("_POSITIVE_NUMBER_ATTRS", cls._validate_attribute_value),
+            ("_ACK_DELAY_ATTRS", cls._validate_attribute_value),
             ("_OPTIONAL_POSITIVE_NUMBER_ATTRS", cls._validate_attribute_value),
             ("_BOOL_ATTRS", cls._validate_attribute_value),
             ("_OPTIONAL_BOOL_ATTRS", cls._validate_attribute_value),
@@ -1143,22 +1152,11 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         # ``None`` means no baseline has been recorded yet, so the
         # next refresh always runs through to the REST call.
         self._last_tree_digest: Optional[int] = None
-        # Distinct from the digest above: this is never reset back to False
-        # once a tree has landed on Discord, even when a stall or a send
-        # failure clears the digest to force the next refresh through
-        # unconditionally. The teardown freeze-edit gate reads this rather
-        # than "digest is not None", since that comparison would otherwise
-        # misread every one of those deliberate baseline-drops as "never
-        # rendered" and skip an edit that has real content to correct.
+        # True once any tree has landed on Discord; never reset, unlike the
+        # digest above. Read by _teardown_edit_target.
         self._has_rendered: bool = False
-        # Stamped once, by the persistence reattach path only, with the
-        # digest of the tree a fresh __init__ produced -- before on_restore
-        # has had any chance to run. Lets the teardown gate tell "restored,
-        # never rendered, and nothing has touched the tree since" (matches
-        # this baseline, safe to skip) apart from "restored, never rendered,
-        # but a teardown override composed real content before delegating"
-        # (differs from this baseline, has to ship). Left None for every
-        # view that was never reattached, where _has_rendered alone governs.
+        # Digest of the tree __init__ produced, stamped only on persistence
+        # reattach. Read by _teardown_edit_target.
         self._reattach_baseline_digest: Optional[int] = None
         # Set by ``refresh`` when it swallowed a transport failure, so a
         # caller that needs the edit to have LANDED can tell that apart from
@@ -1231,6 +1229,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         self._cooldown_not_before: float = 0.0
         self._ratelimit_not_before: float = 0.0
         self._deferred_refresh_task: Optional[asyncio.Task] = None
+        self._message_gone_task: Optional[asyncio.Task] = None
         # Set when reload() is called inside a cooldown window so the single
         # deferred task re-fetches (via reload) at the boundary instead of a
         # plain on_state_changed re-render: coalescing a burst of out-of-band
@@ -2346,7 +2345,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 f"cls={type(self).__name__} :: " + "; ".join(assigned)
             )
 
-    def _compute_tree_digest(self) -> int:
+    def _compute_tree_digest(self, *, ignore_disabled: bool = False) -> int:
         """Return a structural hash of the rendered component tree.
 
         The digest captures only the fields Discord compares server-side
@@ -2378,6 +2377,11 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
 
         O(n) in number of walkable items. Cheap tuple hashing dominates,
         no ``repr`` calls, no string concatenation in the hot path.
+
+        ``ignore_disabled=True`` leaves ``disabled`` out, for the one caller
+        asking whether content changed rather than whether a render is
+        owed: the restore baseline in :meth:`_teardown_edit_target`, where a
+        freeze is not new content.
         """
         parts: list = []
         for item in self.walk_children():
@@ -2477,7 +2481,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                         getattr(item, "label", None),
                         # ButtonStyle is an IntEnum; its value is what ships.
                         getattr(getattr(item, "style", None), "value", None),
-                        getattr(item, "disabled", None),
+                        None if ignore_disabled else getattr(item, "disabled", None),
                         getattr(item, "url", None),
                         getattr(item, "placeholder", None),
                         str(getattr(item, "emoji", None)) if getattr(item, "emoji", None) else None,
@@ -2506,7 +2510,12 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         callers skip the cosmetic edit rather than ship a no-op PATCH that
         only re-sends an identical tree.
         """
-        items = self.walk_children() if self._is_layout() else self.children
+        return self._disable_items(self)
+
+    @staticmethod
+    def _disable_items(view) -> int:
+        """Disable every interactive item in ``view``; return how many changed."""
+        items = view.walk_children() if view._is_layout() else view.children
         frozen = 0
         for item in items:
             if hasattr(item, "disabled") and not item.disabled:
@@ -2514,47 +2523,133 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 frozen += 1
         return frozen
 
-    def _freeze_edit_needed(self, froze: bool) -> bool:
-        """Whether a teardown freeze edit has something new to ship.
+    def _teardown_edit_target(self):
+        """Pick what a teardown freeze edit ships: a view, or ``None`` to skip.
 
-        ``froze`` alone answers "did disabling components change anything",
-        which misses a caller that rebuilt the tree (a farewell card) before
-        tearing down -- the digest comparison is what catches that case.
+        Owns the freeze so each branch reads the tree at the right moment:
+        the restore check compares content before anything is disabled, and
+        step 4 compares the frozen tree against the last render.
 
-        The comparison is gated on ``_has_rendered`` rather than on
-        ``_last_tree_digest is not None``, because the digest is ``None``
-        for two different reasons and only one of them means "nothing on
-        screen": a view that has never landed a tree (restored from
-        persistence, its post-ready render still pending: ``self.children``
-        is whatever ``__init__`` produced, typically empty for a pattern
-        that builds its tree in ``on_load``, which Discord rejects with
-        error 50006), and a view that HAS rendered but had its digest
-        deliberately dropped so the next refresh ships unconditionally (a
-        stalled edit, a swallowed transport failure, a navigation landing
-        that never stamps a digest at all). Gating on the digest alone
-        would read the second case as "never measured" and skip an edit
-        that has real, possibly stale content to correct, silently
-        dropping a farewell card composed just before teardown -- the
-        exact defect this guard exists to catch.
-
-        A never-rendered view can still have something to ship: a teardown
-        override (``exit()``, ``on_timeout()``) that composes new content
-        before delegating to ``super()`` runs whether or not ``on_restore``
-        ever rendered first, and its farewell card is not the empty tree
-        this guard exists to withhold. ``_reattach_baseline_digest``, stamped
-        once at reattach with the digest of whatever a fresh ``__init__``
-        produced, tells the two apart: a tree that still matches it has
-        nothing on screen to correct (the original defect this method
-        fixes), a tree that no longer matches it was composed by something
-        real and has to ship.
+        1. A view restored from persistence that has not rendered and whose
+           content still matches ``_reattach_baseline_digest`` did not put
+           its own tree on screen. The message shows the render from before
+           the restart, so that is what gets frozen (see
+           :meth:`_frozen_on_screen_view`).
+        2. Otherwise the view's own tree is the candidate, frozen. A tree
+           Discord would reject never ships: an empty V2 tree is error
+           50006 whatever produced it, and anything ``_check_placement``
+           refuses is a 400. The other render seams raise on these;
+           teardown has already destroyed the view's state, so it logs
+           instead. The empty check runs even when placement validation is
+           turned off. A restored view that never rendered still has the
+           pre-restart panel on screen, so it freezes that rather than
+           leaving live-looking controls up; any other view skips.
+        3. A freeze that disabled something ships.
+        4. A view that has rendered ships when its tree differs from the
+           last render. ``_has_rendered`` is the gate, not
+           ``_last_tree_digest is not None``: the digest is also ``None``
+           after a deliberate drop (a stalled edit, a transport failure, a
+           navigation landing that never stamps one).
+        5. Any other view ships: a restored view whose teardown override
+           composed new content, or a view bound to a message without
+           rendering (a ``push()`` with no interaction, the ``message``
+           setter), whose farewell card has to reach the screen.
         """
+        restored_unrendered = not self._has_rendered and self._reattach_baseline_digest is not None
+        if (
+            restored_unrendered
+            and self._compute_tree_digest(ignore_disabled=True) == self._reattach_baseline_digest
+        ):
+            self._freeze_components()
+            return self._frozen_on_screen_view()
+
+        name = type(self).__name__
+        froze = self._freeze_components()
+        if self._is_layout() and not self.children:
+            rejected = "an empty component tree"
+        else:
+            try:
+                self._check_placement()
+                rejected = None
+            except ValueError as e:
+                rejected = f"a tree Discord would reject ({e})"
+        if rejected is not None:
+            if restored_unrendered:
+                logger.warning(
+                    f"{name} was torn down with {rejected}; freezing the panel "
+                    f"already on screen instead."
+                )
+                return self._frozen_on_screen_view()
+            if self._has_rendered or self.children:
+                logger.warning(
+                    f"{name} was torn down with {rejected}; the freeze edit was "
+                    f"skipped, so the message keeps its last render."
+                )
+            else:
+                logger.debug(f"{name} was torn down before rendering a tree; no edit sent.")
+            return None
         if froze:
-            return True
+            return self
         if self._has_rendered:
-            return self._compute_tree_digest() != self._last_tree_digest
-        if self._reattach_baseline_digest is None:
-            return False
-        return self._compute_tree_digest() != self._reattach_baseline_digest
+            return self if self._compute_tree_digest() != self._last_tree_digest else None
+        return self
+
+    def _frozen_on_screen_view(self):
+        """The message's current components, rebuilt and disabled, or ``None``.
+
+        Used when this view never put its own tree on screen, so freezing
+        ``self`` would overwrite the real panel. Three things keep the copy
+        shippable:
+
+        - Uploaded media (an item carrying ``attachment_id``) is re-pointed at
+          ``attachment://<filename>``. A fetched message resolves it to a
+          signed CDN URL, and discord.py serializes only that URL: a File
+          component refuses it, and a gallery or thumbnail image breaks
+          once the signature expires. The filename comes from that URL's
+          path, because a components message lists no attachments of its
+          own; Discord binds the reference back to the existing upload.
+        - The copy runs placement validation unless the class sets
+          ``validate_placement = False``, the same opt-out its own tree
+          honors. discord.py drops component types it does not recognize
+          while rebuilding, which can leave a container empty. A copy with
+          nothing interactive left needs no check: it has nothing to freeze,
+          so no edit ships.
+        - The copy is stopped, which keeps ``Message.edit`` from registering
+          it with the view store.
+
+        Rebuilding reads Discord's data rather than the view's own tree, so any failure
+        skips the cosmetic edit instead of breaking a teardown whose state
+        work has already run. It logs a warning, because the panel is then
+        left up with controls that look live and no longer answer.
+        """
+        try:
+            copy = type(self).from_message(self._message, timeout=None)
+
+            def pinned(media):
+                if getattr(media, "attachment_id", None) is None:
+                    return media
+                return f"attachment://{unquote(urlsplit(media.url).path.rsplit('/', 1)[-1])}"
+
+            for item in copy.walk_children():
+                if isinstance(item, (Thumbnail, UIFile)):
+                    item.media = pinned(item.media)
+                elif isinstance(item, MediaGallery):
+                    for entry in item.items:
+                        entry.media = pinned(entry.media)
+            if copy._is_layout() and getattr(self, "validate_placement", False):
+                from ._placement import validate_placement
+
+                validate_placement(copy)
+        except Exception as e:
+            logger.warning(
+                f"{type(self).__name__} could not freeze the panel on its message "
+                f"({type(e).__name__}: {e}); no edit sent, so the panel stays unfrozen."
+            )
+            return None
+        if not self._disable_items(copy):
+            return None
+        copy.stop()
+        return copy
 
     def _dispatch_timeout(self):
         """Repair the dynamic-item registry at the actual discord.py choke point.
@@ -2594,10 +2689,11 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         self.state_store._undo_enabled_views.pop(self.id, None)
         await self.state_store._destroy_view(self.id, source_id=self.id)
 
-        # See _freeze_edit_needed for what "nothing to ship" covers here.
-        if self._message and self._freeze_edit_needed(self._freeze_components()):
+        # _teardown_edit_target owns the freeze and decides what, if anything, ships.
+        target = self._teardown_edit_target() if self._message else None
+        if target is not None:
             try:
-                await self._bounded(self._message.edit(**self._freeze_edit_kwargs()))
+                await self._bounded(self._message.edit(**self._freeze_edit_kwargs(target)))
             except discord.NotFound:
                 pass  # Message was already deleted
             except asyncio.TimeoutError as e:
@@ -2635,10 +2731,13 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
     async def on_message_delete(self) -> None:
         """Called when the view's message is deleted externally.
 
-        Triggered by Discord's ``MESSAGE_DELETE`` gateway event when the
-        message this view is attached to is removed (admin delete, bulk
-        purge, etc.). The default implementation calls
-        ``exit(delete_message=False)`` since the message is already gone.
+        Triggered when the message this view is attached to is removed: by
+        the gateway's message-delete events (a delete or a bulk purge, which
+        Discord reports only to a bot holding the message intents), by the
+        deletion of the channel or thread holding it, or by an edit that
+        finds the message already gone, after ``on_message_gone`` has run. The
+        default implementation calls ``exit(delete_message=False)`` since the
+        message is already gone. A view already torn down is not called again.
 
         Override for custom behavior (logging, re-sending to a new
         message, notifying the owner). If you override without calling
@@ -2650,33 +2749,66 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         # skips the edit/delete block entirely (no stale NotFound error).
         self._message = None
         await self.exit(delete_message=False)
+        # After the teardown, not before: dispatching while the view is still
+        # subscribed hands its own notification back to it, and a tree that
+        # reads self.message rebuilds against the reference nulled above.
+        # exit()'s own call is a no-op here, since the message is already gone.
+        await self._retire_carried_registration()
 
     async def on_message_gone(self) -> None:
         """Called when an edit observes the view's message is already gone.
 
         ``refresh()`` issues the edit that fails with ``discord.NotFound``
-        when the message was deleted out from under the view (admin delete,
-        bulk purge, channel delete). The library nulls ``self._message`` and
-        calls this hook so a consumer that records the message elsewhere (its
-        own database row, an external index) can reconcile that reference.
-        Key the reconciliation on the view's stable identity, such as
-        ``persistence_key``, since ``self._message`` is already nulled.
+        when the message was deleted out from under the view. The library
+        nulls ``self._message`` and calls this hook so a consumer that records
+        the message elsewhere (its own database row, an external index) can
+        reconcile that reference. Key the reconciliation on the view's stable
+        identity, such as ``persistence_key``, since ``self._message`` is
+        already nulled.
 
-        Default is a no-op. This is the edit-path counterpart to two existing
-        deletion signals: ``on_message_delete`` fires from the gateway
-        ``MESSAGE_DELETE`` event for a message removed while the bot runs, and
-        the ``REGISTRY_PRUNED`` action fires when reattach finds a persistent
-        view's message gone after a restart. Unlike ``on_message_delete``,
-        this hook does not exit the view: the gateway event owns teardown, and
-        decoupling the signal keeps it safe to fire from the reactive refresh
-        path. Make the reconciliation idempotent, since this hook and
-        ``on_message_delete`` can both fire for the same deletion. The hook
-        may run while the view's update lock is held, so an override may
-        safely do I/O (reconcile a database row, call an external service)
-        but should not dispatch a state change back into this view, which
-        would re-enter the lock.
+        Default is a no-op. The hook itself does not exit the view: it may run
+        while the view's update lock is held, so an override may safely do
+        I/O (reconcile a database row, call an external service) but should
+        not dispatch a state change back into this view, which would re-enter
+        the lock. Once it returns, the library tears the view down on its own
+        task through ``on_message_delete``, the same path the gateway's
+        deletion events take, so an override never needs to exit and a bot
+        without message intents still retires the view. The ``REGISTRY_PRUNED``
+        action is the restart-time counterpart, fired when reattach finds a
+        persistent view's message gone. Make the reconciliation idempotent,
+        since a deletion the gateway also reports can reach a consumer twice.
         """
         return
+
+    def _schedule_message_gone_teardown(self) -> None:
+        """Tear the view down after an edit found its message deleted.
+
+        The gateway's message-delete event cannot do it once the edit has
+        nulled ``_message``, and a bot without message intents never receives
+        that event at all. The teardown runs as its own task so it never
+        executes inside the edit path's locks or a navigation still settling,
+        and the task is owned by the store rather than the view: ``exit()``
+        cancels every task the view owns, which would cancel the teardown
+        partway through its own dispatch.
+        """
+        current = self._message_gone_task
+        if current is None or current.done():
+            self._message_gone_task = self.task_manager.create_task(
+                _MESSAGE_GONE_TASK_OWNER, self._teardown_after_message_gone()
+            )
+
+    async def _teardown_after_message_gone(self) -> None:
+        # The gateway event may have torn the view down first.
+        if self._torn_down():
+            return
+        try:
+            await await_maybe(self.on_message_delete())
+        except Exception as exc:
+            logger.error(
+                f"on_message_delete failed for {type(self).__name__} after its message "
+                f"was found deleted: {exc}",
+                exc_info=exc,
+            )
 
     def _torn_down(self) -> bool:
         """Whether teardown has run, as opposed to the view merely stopping.
@@ -3574,14 +3706,13 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 self._redrive_dynamic_items()
                 return RenderOutcome.RENDERED
             except discord.NotFound:
-                # The message was deleted out from under the view (admin
-                # delete, purge, channel delete) and this edit just observed
-                # the 404. Null the ref so the top-of-method guard short-
-                # circuits later refreshes instead of re-issuing doomed edits,
-                # then fire the reconcile hook so a consumer tracking this
-                # message externally can clear it. The hook is guarded because
-                # refresh() must stay non-raising -- the navigation fallbacks
-                # rely on it absorbing NotFound.
+                # The message was deleted out from under the view and this
+                # edit just observed the 404. Null the ref so the top-of-method
+                # guard short-circuits later refreshes instead of re-issuing
+                # doomed edits, then fire the reconcile hook so a consumer
+                # tracking this message externally can clear it. The hook is
+                # guarded because refresh() must stay non-raising -- the
+                # navigation fallbacks rely on it absorbing NotFound.
                 self._message = None
                 try:
                     await await_maybe(self.on_message_gone())
@@ -3590,6 +3721,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                         f"on_message_gone failed for {type(self).__name__}: {exc}",
                         exc_info=exc,
                     )
+                self._schedule_message_gone_teardown()
                 return RenderOutcome.NO_MESSAGE
             except asyncio.TimeoutError as e:
                 if isinstance(e, aiohttp.ClientError):
@@ -3811,16 +3943,19 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             f"re-rendered, or drop the argument."
         )
 
-    def _freeze_edit_kwargs(self) -> Dict[str, Any]:
+    def _freeze_edit_kwargs(self, view=None) -> Dict[str, Any]:
         """Edit kwargs for a teardown edit that ships the frozen tree.
 
-        The freeze paths (``on_timeout``, ``exit()``'s V2 branch, the
-        empty-stack back clear, the reopen fallback) hand Discord the same
+        The teardown edits (``on_timeout``, ``exit()``'s V2 branch, which
+        the ephemeral reopen cleanup also reaches) hand Discord the same
         mention-bearing tree ``refresh()`` does, so they owe the same
         mention rules. Without them the last edit a view ever makes is the
-        one edit that ignores the view's own ``allowed_mentions``.
+        one edit that ignores the view's own ``allowed_mentions``. ``view``
+        defaults to this view; a restored view that never rendered passes
+        the frozen copy of its message instead, which still owes this
+        view's rules.
         """
-        kwargs: Dict[str, Any] = {"view": self}
+        kwargs: Dict[str, Any] = {"view": self if view is None else view}
         mentions = self._resolve_allowed_mentions(None)
         if mentions is not None:
             kwargs["allowed_mentions"] = mentions
@@ -4018,7 +4153,9 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
 
         Single helper consumed by every seam that ships a tree to
         Discord: ``_send_pipeline`` (initial send), ``refresh`` (in-place
-        edits), and ``_apply_navigation_edit`` (push/pop edits). The
+        edits), ``_apply_navigation_edit`` (push/pop edits), and
+        ``_teardown_edit_target`` (the freeze edit, which logs and skips on a
+        refusal instead of raising). The
         custom_id-uniqueness pass runs for every view (V1 and V2)
         because Discord rejects a duplicate custom_id on either with
         HTTP 400. The structural placement walk is V2-only:
@@ -4840,23 +4977,26 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
 
         # Clean up the message: freeze the V2 tree, strip V1 buttons, or delete
         # outright on Discord's side.
+        message_gone = False
         if self._message:
             try:
                 if delete_message:
                     await self._bounded(self._message.delete())
+                    message_gone = True
                 elif self._is_layout():
                     # V2 messages ARE their components -- edit(view=None) would
                     # produce an empty message (error 50006). Freeze instead.
-                    # See _freeze_edit_needed for what "nothing to ship" covers.
-                    if self._freeze_edit_needed(self._freeze_components()):
-                        await self._bounded(self._message.edit(**self._freeze_edit_kwargs()))
+                    # _teardown_edit_target owns the freeze and picks what ships.
+                    target = self._teardown_edit_target()
+                    if target is not None:
+                        await self._bounded(self._message.edit(**self._freeze_edit_kwargs(target)))
                 else:
                     await self._bounded(self._message.edit(view=None))
             except discord.NotFound:
                 # Expected lifecycle: user dismissed the ephemeral, an
                 # admin deleted the message, or the channel was deleted.
                 # Nothing left to clean up on Discord's side.
-                pass
+                message_gone = True
             except asyncio.TimeoutError as e:
                 # State teardown already ran above, so the view is gone either
                 # way and only the diagnostic differs. aiohttp's connect and
@@ -4890,7 +5030,32 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             except Exception as e:
                 logger.error(f"Error cleaning up message: {e}")
 
+        if message_gone:
+            await self._retire_carried_registration()
+
         return True
+
+    async def _retire_carried_registration(self) -> None:
+        """Remove a registration this view carries once its message is gone.
+
+        A view a persistent panel pushed to holds the panel's registration
+        message id without its key, because navigation replaces the instance.
+        When that view is the one whose message goes, nothing else retires the
+        registration: the panel it belonged to no longer exists, so the row
+        would claim a deleted message until a restart re-verdicted it.
+
+        Skipped only when the carried registration is the view's own, which
+        its ``exit()`` already retires: a persistent view pushed under a
+        different key unregisters that key and leaves this one behind.
+        """
+        carried = getattr(self, "_registry_message_id", None)
+        if carried is None:
+            return
+        key = self.state_store._persistence_key_for_message(carried)
+        if key is None or key == getattr(self, "_persistence_key", None):
+            return
+        payload = ActionCreators.persistent_view_unregistered(key, message_id=carried)
+        await self.dispatch("PERSISTENT_VIEW_UNREGISTERED", payload)
 
     def make_exit_button(
         self,
