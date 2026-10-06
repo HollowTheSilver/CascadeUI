@@ -6881,10 +6881,11 @@ class TestActingViewFastPath:
         async def click(interaction):
             await view.refresh(embed=discord.Embed(title="click render (older)"))
             view.interaction = slash
-            # A command sending the panel again while the click still runs.
-            await asyncio.create_task(
+            # A command sending the panel again while the click still runs, in a
+            # context of its own (create_task's context= needs Python 3.11).
+            await contextvars.Context().run(
+                asyncio.create_task,
                 view.send(embed=discord.Embed(title="sent again (newer)")),
-                context=contextvars.Context(),
             )
 
         button = StatefulButton(label="Go", custom_id="go", callback=click)
