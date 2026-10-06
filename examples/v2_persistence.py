@@ -8,7 +8,7 @@ both so the distinction is visible side-by-side.
     1. View persistence  -- the view object re-attaches to its message
        on bot restart, so users can keep clicking a panel that was
        posted days earlier. Demonstrated via ``PersistentRolesLayoutView``
-       (role selector panel) -- the pattern wraps a
+       (role selector panel), which wraps a
        ``PersistentLayoutView`` around cardinality-aware role buttons
        so the category and mode metadata survive restarts alongside
        the message.
@@ -30,9 +30,13 @@ Features demonstrated:
     - DynamicPersistentButton   (under the hood; used by the roles
                                  pattern for click routing without
                                  per-button instance tracking)
-    - on_bind                   (inject non-serializable runtime deps --
-                                 the bot, a database pool, a service
-                                 client -- into a restored persistent view)
+    - retire_previous_on_send   (a move that deletes the old panel itself
+                                 once the new one has posted, found with
+                                 get_store().get_active_view)
+    - on_bind                   (inject non-serializable runtime deps,
+                                 such as the bot, a database pool, or a
+                                 service client, into a restored
+                                 persistent view)
     - PersistenceMiddleware     (installed via setup_middleware in
                                  setup_hook)
     - persistent_slots          (declarative slot opt-in on the
@@ -42,11 +46,13 @@ Features demonstrated:
                                  the slot)
 
 Commands:
-    /v2roles      Post the role selector panel (requires Manage Roles)
-    /v2visits     Open a personal visit counter (per-user, persisted)
+    /v2roles             Post the role selector panel (requires Manage Roles)
+    /v2roles_move #chan  Move the panel to another channel (requires Manage Roles)
+    /v2visits            Open a personal visit counter (per-user, persisted)
 
 Usage:
-    Load this cog in your bot. Requires: pip install pycascadeui discord.py
+    Load this cog in your bot. Requires: pip install "pycascadeui[sqlite]" discord.py
+    (the extra installs the SQLite backend the setup snippet below uses)
 
     Before loading, configure ROLE_CATEGORIES below with your server's
     actual role IDs. The example IDs are placeholders.
@@ -62,11 +68,13 @@ import logging
 from datetime import datetime, timezone
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 from discord.ext.commands import Context
 from discord.ui import ActionRow
 
 from cascadeui import (
+    DISCORD_CALL_ERRORS,
     PersistentRolesLayoutView,
     RoleCategory,
     StatefulButton,
@@ -75,6 +83,7 @@ from cascadeui import (
     card,
     cascade_reducer,
     divider,
+    get_store,
     key_value,
     slot_property,
 )
@@ -157,8 +166,8 @@ class RoleSelectorPanel(PersistentRolesLayoutView):
     and restart re-attachment. Users only declare ``categories``; the
     rest is the pattern's responsibility.
 
-    The panel uses a stable ``persistence_key`` so re-running /v2roles
-    automatically cleans up the previous panel.
+    The panel uses a stable ``persistence_key``, so re-running /v2roles
+    freezes the previous panel and moves the registration to the new one.
     """
 
     categories = ROLE_CATEGORIES
@@ -168,36 +177,25 @@ class RoleSelectorPanel(PersistentRolesLayoutView):
     # own roles. Matches the PersistentRolesLayoutView default.
     owner_only = False
 
-    # ``instance_limit`` is deliberately not set on a
-    # PersistentRolesLayoutView. Persistent views already get
-    # deterministic single-panel-per-key enforcement from the built-in
-    # persistence_key dedup path, which actively cleans up old messages
-    # (even externally-deleted ones, via a NotFound-swallowing
-    # fetch_message call). Adding instance_limit on top is redundant
-    # protection with a worse failure mode -- if a panel message is
-    # deleted in Discord while the view is still live in
-    # _active_views, ``instance_limit = 1`` with ``"reject"`` would
-    # lock the guild out of re-posting until the next bot restart.
-    # persistence_key dedup handles this edge case; instance_limit
-    # does not.
+    # No instance_limit: the persistence_key already keeps one panel per
+    # server, retiring the previous panel on every re-post.
 
-    # ``exit_policy = "disable"`` is the PersistentRolesLayoutView
-    # default and the correct choice here -- a role panel is a product
-    # surface, not a session; when it times out the buttons should
-    # freeze in place rather than deleting the panel message.
+    # A re-post freezes the previous panel in place rather than deleting
+    # its message. The panel itself never times out.
     exit_policy = "disable"
 
     async def on_bind(self, bot):
         """Inject runtime dependencies that cannot ride the persistence round-trip.
 
-        The library calls ``on_bind`` at two seams it drives itself: once
-        before the first ``send()``, and again on every restart before
-        ``on_restore``. A panel posted days ago has no live ``bot``,
-        database pool, or service client as a constructor kwarg after a
-        restart -- those objects do not serialize. ``on_bind`` hands them
-        back. Stash them on ``self`` here and every method (``build_ui``,
-        button callbacks, ``on_load``, ``on_restore``) can reach them. The
-        bot stands in for a database pool or service client in a real app.
+        The library calls ``on_bind`` at the start of every ``send()``, and
+        again on every restart before ``on_restore``. A panel posted days
+        ago has no live ``bot``, database pool, or service client as a
+        constructor kwarg after a restart: those objects do not serialize.
+        ``on_bind`` hands them back. Stash them on ``self`` here and
+        ``on_load``, ``on_restore``, and later renders can reach them. The
+        panel's first ``build_ui`` runs at construction, before this hook,
+        and role clicks run with no view instance, so neither can. The bot
+        stands in for a database pool or service client in a real app.
         """
         self.bot = bot
 
@@ -215,9 +213,7 @@ class RoleSelectorPanel(PersistentRolesLayoutView):
         await super().on_restore(bot)
 
         # ``self.bot`` (injected by on_bind) and the ``bot`` parameter are the
-        # same object here. Reading self.bot mirrors how a button callback or
-        # build_ui -- which never receive ``bot`` -- reach the dependency:
-        # inject once in on_bind, read self.bot anywhere on the view.
+        # same object here; a later render reads the injected one the same way.
         guild = self.bot.get_guild(self.guild_id) if self.guild_id else None
         guild_label = guild.name if guild else self.guild_id
         logger.info(
@@ -232,12 +228,13 @@ class RoleSelectorPanel(PersistentRolesLayoutView):
 # The ``visits`` slot is declared persistent on the view class via
 # ``persistent_slots = ("visits",)``; every write from these reducers
 # to the same slot name inherits the persistence contract and is
-# flushed to disk by ``PersistenceMiddleware``. The reducers
-# themselves are namespace-agnostic -- they just mutate the slot.
+# flushed to disk by ``PersistenceMiddleware``. Entries are keyed by
+# ``str(user_id)``: JSON stores every dict key as a string, so an int
+# key would read back as a different key after a restart.
 @cascade_reducer("VISIT_RECORDED")
 async def reduce_visit_recorded(action, state):
     payload = action["payload"]
-    user_data = access_slot(state, "visits", payload["user_id"])
+    user_data = access_slot(state, "visits", str(payload["user_id"]))
     user_data["count"] = user_data.get("count", 0) + 1
     user_data["last_visit"] = payload["now"]
     return state
@@ -245,7 +242,7 @@ async def reduce_visit_recorded(action, state):
 
 @cascade_reducer("VISIT_RESET")
 async def reduce_visit_reset(action, state):
-    user_data = access_slot(state, "visits", action["payload"]["user_id"])
+    user_data = access_slot(state, "visits", str(action["payload"]["user_id"]))
     user_data["count"] = 0
     user_data["last_visit"] = None
     return state
@@ -305,9 +302,9 @@ class PersonalVisitsView(StatefulLayoutView):
     # ``self.last_visit`` resolve at attribute access against the live
     # store state, falling back to the declared defaults when the slot
     # has no entry for this user yet.
-    count = slot_property("count", slot="visits", key=lambda self: self.user_id, default=0)
+    count = slot_property("count", slot="visits", key=lambda self: str(self.user_id), default=0)
     last_visit = slot_property(
-        "last_visit", slot="visits", key=lambda self: self.user_id, default=None
+        "last_visit", slot="visits", key=lambda self: str(self.user_id), default=None
     )
 
     def __init__(self, *args, **kwargs):
@@ -381,8 +378,8 @@ class V2PersistenceExample(commands.Cog, name="v2_persistence_example"):
 
     A cog loaded after the middleware lands its panel in the reattach
     summary's ``skipped`` bucket for that boot, leaving a live message with
-    dead buttons. Call ``store.persistence_manager.reattach()`` once every
-    cog is loaded to pick up late arrivals.
+    dead buttons. Call ``await get_store().persistence_manager.reattach()``
+    once every cog is loaded to pick up late arrivals.
     """
 
     def __init__(self, bot) -> None:
@@ -397,7 +394,7 @@ class V2PersistenceExample(commands.Cog, name="v2_persistence_example"):
         """Post a role selector panel using V2 components.
 
         The panel stays interactive across bot restarts. Running
-        this command again replaces the previous panel automatically.
+        this command again freezes the previous panel and posts a new one.
 
         Configure ROLE_CATEGORIES in the source with your server's
         actual role IDs before using.
@@ -411,6 +408,50 @@ class V2PersistenceExample(commands.Cog, name="v2_persistence_example"):
             persistence_key=f"roles:panel:{context.guild.id}",
         )
         await view.send()
+
+    @commands.hybrid_command(
+        name="v2roles_move",
+        description="Move the role selector panel to another channel (admin only).",
+    )
+    @app_commands.describe(channel="The channel the panel should live in")
+    @commands.has_permissions(manage_roles=True)
+    async def v2roles_move(self, context: Context, channel: discord.TextChannel) -> None:
+        """Post the role panel in ``channel``, then delete the old one.
+
+        A re-post through /v2roles leaves the previous panel frozen where it
+        was (``exit_policy = "disable"``). A move deletes it instead, so this
+        command turns off retire-on-send for its one panel and retires the
+        old panel itself once the new one has posted.
+        """
+        if not context.guild:
+            await context.send("This command can only be used in a server.", ephemeral=True)
+            return
+
+        key = f"roles:panel:{context.guild.id}"
+        # Read before the send: once the new panel registers under the key,
+        # the lookup returns the new one.
+        old_panel = get_store().get_active_view(persistence_key=key)
+
+        new_panel = RoleSelectorPanel(context=channel, persistence_key=key)
+        # Left on, the send would freeze the old panel before the delete below.
+        new_panel.set_class_attribute("retire_previous_on_send", False)
+        # A bare channel carries no bot for the library to bind, so the
+        # command binds it before the send.
+        await new_panel.on_bind(self.bot)
+        try:
+            posted = await new_panel.send()
+        except DISCORD_CALL_ERRORS:
+            posted = None
+        if posted is None:
+            await context.send(
+                f"Could not post in {channel.mention}; the panel stays where it is.",
+                ephemeral=True,
+            )
+            return
+
+        if old_panel is not None:
+            await old_panel.exit(delete_message=True)
+        await context.send(f"Role panel moved to {channel.mention}.", ephemeral=True)
 
     @commands.hybrid_command(
         name="v2visits",

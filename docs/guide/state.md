@@ -38,7 +38,7 @@ await self.dispatch("MY_ACTION", {"key": "value"})
     logs exceptions. Post-dispatch logic runs regardless:
     ```python
     await self.dispatch("GAME_FINISHED", payload)
-    await self._cleanup_attached_children()  # Always runs
+    await self.exit_children()  # Always runs
     ```
 
 ### Built-in Actions
@@ -91,6 +91,28 @@ async def score_reducer(action, state):
 
 !!! tip "No `copy.deepcopy` needed"
     `@cascade_reducer` passes a deep copy. Mutate directly and return.
+
+!!! note "Reducers run one at a time"
+    A reducer may await, and nothing else commits while it does: the store
+    runs one reducer at a time, from reading the state to committing the
+    result. A reducer that awaits slow work, such as a database call, holds
+    up every other dispatch until it returns, and a dispatch kept waiting
+    30 seconds logs a warning naming it. Do slow work before dispatching
+    and pass the result in the payload.
+
+    A reducer cannot dispatch. Its result replaces the state, so an action
+    dispatched from inside it would be lost, and `dispatch()` there raises
+    `RuntimeError`. So does a dispatch from a task the reducer starts while
+    it runs, such as a `gather()` around one, which would wait for the
+    reducer while the reducer waits for it. Unless the reducer catches the
+    error, its own change is not applied either. Dispatch the follow-up
+    after the first dispatch returns, or from an [event hook](#event-hooks).
+
+    Only writes made through a dispatch, and `set_scoped()`, wait for a
+    reducer running in another task. A write made in place on
+    `store.state`, such as `access_slot(store.state, ...)` in
+    `seed_initial_state`, lands at once and is lost if that reducer commits
+    after it.
 
 !!! warning "Don't hold a reference to the snapshot across `await`"
     The dict passed to a reducer is a fresh deep copy that lives only for
@@ -246,6 +268,12 @@ Slots are in-memory by default. Passing `persistent=True` to `access_slot`
 registers the slot for write-through persistence -- every subsequent write
 to that name is fanned out to disk by `PersistenceMiddleware`. See the
 [persistence guide](persistence.md) for the full opt-in model.
+
+A persistent slot's keys must be strings. JSON stores every key as a
+string, so an `int` key such as the `user_id` above reads back as `"42"`
+after a restart and a lookup by `42` misses. Key a persistent slot by
+`str(user_id)`; `PersistenceMiddleware` logs an ERROR naming the key when
+it saves one that is not a string.
 
 For paths deeper than three levels, the `slot_property` descriptor caps
 out; declare a plain `@property` and call `read_slot` inside it:
@@ -600,7 +628,12 @@ regardless.
 !!! info "Batch and undo"
     With `UndoMiddleware` active, all actions in a batch produce a single
     undo entry. Reverting "reset all settings" restores every slice in one
-    `UNDO`.
+    `UNDO`. The entry sits in the view's history where the batch's first
+    change was made, so a change another task makes from the same view
+    while the batch is open is undone first, and the entry restores each key
+    to its value from before whichever of the two wrote it first. A batch
+    that pushes or pops leaves its entry on the screen the panel moved to, as
+    does a change that lands after the push.
 
 ---
 
@@ -714,6 +747,26 @@ This means `dispatch_scoped()` changes, `update_session()` changes, and custom
 reducer changes all round-trip through undo/redo. Internal lifecycle actions
 are excluded from undo tracking. New actions after an undo clear the redo
 stack (standard semantics).
+
+Undo puts back only what the action changed, key by key at any depth. Every
+user's scoped data shares one slot, so one user undoing a change leaves the
+writes other users, guilds, or features made in that slot as they are.
+
+A `batch()` joins the history as one step when it ends. An `undo()` or
+`redo()` called while another task's batch on the same view (or on the view
+that pushed or popped to it) is still open waits for that batch, for at most
+30 seconds, and then goes ahead with a warning. The wait is made again when
+the undo reaches its reducer, so a batch that opened while a middleware held
+the undo is waited for too. An undo whose state a middleware built before
+that batch's writes is skipped with a warning rather than applied, since
+reducing it would erase them. Undo again once the batch ends. An undo from
+inside the batch, or from a task it started, runs at once.
+
+One change is not recorded: replacing a value with an equal one of another
+type, such as `1` with `1.0` or `True`, when nothing else in the same
+dictionary changes. Undo compares each dictionary by equality before walking
+it, because walking every unchanged dictionary value by value makes each
+dispatch more than ten times slower once a slot holds a thousand users.
 
 ---
 

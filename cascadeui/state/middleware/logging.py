@@ -2,8 +2,9 @@
 
 
 import logging
-from typing import Callable
+from typing import Callable, Union
 
+from ...utils.logging import _resolve_level
 from ..types import Action, StateData
 
 # // ========================================( Middleware )======================================== // #
@@ -19,7 +20,8 @@ class LoggingMiddleware:
     include the stream in standard output. Visibility is governed by the
     handlers on the ``cascadeui.actions`` logger and its ``cascadeui`` parent,
     the same as every other library logger -- this middleware does not pin the
-    logger's threshold.
+    logger's threshold. A level name logging does not know raises
+    ``ValueError``; an int is used as given.
 
     Usage:
         from cascadeui import setup_middleware
@@ -29,9 +31,9 @@ class LoggingMiddleware:
         await setup_middleware(LoggingMiddleware(level="DEBUG"))
     """
 
-    def __init__(self, level: str = "INFO"):
+    def __init__(self, level: Union[int, str] = "INFO"):
         self._logger = logging.getLogger("cascadeui.actions")
-        self._level = getattr(logging, level.upper(), logging.INFO)
+        self._level = _resolve_level(level, "LoggingMiddleware")
 
     async def __call__(self, action: Action, state: StateData, next_fn: Callable) -> StateData:
         self._logger.log(

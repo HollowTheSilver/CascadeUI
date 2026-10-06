@@ -272,8 +272,10 @@ class TestMenuViewPush:
             await callback(_make_interaction())
 
             _, kwargs = mock_push.call_args
-            assert kwargs["rebuild"] is MenuView.nav_rebuild
-            assert kwargs["rebuild"](_PlainPage())["embed"].title == "Plain"
+            page = _PlainPage()
+            assert kwargs["rebuild"](page)["embed"].title == "Plain"
+            # Kept on the page, for the edits it makes after this push.
+            assert page.nav_rebuild is MenuView.nav_rebuild
 
 
 # // ========================================( V2: MenuLayoutView )======================================== // #
@@ -512,7 +514,9 @@ class TestMenuLayoutViewPush:
             await self._callback_for(view, "Plain")(_make_interaction())
 
             _, kwargs = mock_push.call_args
-            assert kwargs["rebuild"] is MenuLayoutView.nav_rebuild
+            page = _PlainPage()
+            kwargs["rebuild"](page)
+            assert page.nav_rebuild is MenuLayoutView.nav_rebuild
 
     async def test_push_callback_calls_push(self):
         view = MenuLayoutView(
@@ -596,3 +600,103 @@ class TestMenuViewInitialRender:
 
         embed = interaction.response.send_message.call_args.kwargs.get("embed")
         assert embed.title == "Caller"
+
+    async def test_explicit_embeds_win(self):
+        """The hub card was added beside them, and discord.py refuses ``embed``
+        and ``embeds`` together."""
+        interaction = _make_interaction()
+        view = MenuView(
+            interaction=interaction,
+            categories=[{"label": "One", "view": _DummySubView}],
+        )
+        mine = [discord.Embed(title="Caller")]
+
+        await view.send(embeds=mine)
+
+        sent = interaction.response.send_message.call_args.kwargs
+        assert sent["embeds"] is mine
+        assert "embed" not in sent
+
+
+# // ========================================( Menu fallback beyond the push )======================================== // #
+
+
+class TestMenuFallbackOutlivesThePush:
+    """A destination the menu renders with its own fallback keeps it.
+
+    The fallback reached only the push it was passed to, so a pop back to
+    the destination rebuilt it from its class, which names no render, and
+    shipped the child's content under the destination's buttons.
+    """
+
+    async def test_a_pop_back_to_a_plain_v1_destination_ships_its_embed(self):
+        class _Dest(StatefulView):
+            def build_embed(self):
+                return discord.Embed(title="Dest")
+
+        class _Child(StatefulView):
+            nav_rebuild = staticmethod(lambda v: {"embed": discord.Embed(title="Child")})
+
+        interaction = _make_interaction(user_id=1, guild_id=2)
+        menu = MenuView(interaction=interaction, categories=[{"label": "Dest", "view": _Dest}])
+        await menu.send()
+        # The views hand this message down the chain, so hold on to it.
+        message = menu._message
+        edits = (
+            message.edit,
+            interaction.response.edit_message,
+            interaction.edit_original_response,
+        )
+        await menu._category_buttons[0].original_callback(interaction)
+        child = await menu._successor.push(_Child)
+        for edit in edits:
+            edit.reset_mock()
+
+        restored = await child.pop()
+
+        assert isinstance(restored, _Dest)
+        shipped = [c.kwargs.get("embed") for edit in edits for c in edit.call_args_list]
+        assert [e.title for e in shipped if e is not None] == ["Dest"]
+
+    async def test_the_destination_gives_its_embed_to_its_own_redraws(self):
+        class _Dest(StatefulView):
+            def build_embed(self):
+                return discord.Embed(title="Dest")
+
+        interaction = _make_interaction(user_id=1, guild_id=2)
+        menu = MenuView(interaction=interaction, categories=[{"label": "Dest", "view": _Dest}])
+        await menu.send()
+        await menu._category_buttons[0].original_callback(interaction)
+        dest = menu._successor
+        # What a push from it that failed leaves owed.
+        dest._reclaim_pending = True
+
+        content, _ = await dest._reclaim_content()
+
+        assert content["embed"].title == "Dest"
+
+    async def test_a_pop_back_to_a_plain_v2_destination_rebuilds_its_tree(self):
+        class _Dest(StatefulLayoutView):
+            def build_ui(self):
+                self.clear_items()
+                self.add_item(Container(TextDisplay("dest")))
+
+        class _Child(StatefulLayoutView):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.add_item(Container(TextDisplay("child")))
+
+        interaction = _make_interaction(user_id=1, guild_id=2)
+        menu = MenuLayoutView(
+            interaction=interaction, categories=[{"label": "Dest", "view": _Dest}]
+        )
+        await menu.send()
+        button = next(c for c in menu.walk_children() if getattr(c, "label", None) == "Dest")
+        await button.original_callback(interaction)
+        child = await menu._successor.push(_Child)
+
+        restored = await child.pop()
+
+        assert isinstance(restored, _Dest)
+        texts = [c.content for c in restored.walk_children() if isinstance(c, TextDisplay)]
+        assert "dest" in texts

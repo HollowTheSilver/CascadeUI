@@ -5,7 +5,7 @@ import asyncio
 import functools
 import logging
 import traceback
-from typing import Any, Callable, Coroutine, Optional, Tuple, Type, TypeVar, Union, cast
+from typing import Any, Callable, Coroutine, Optional, Tuple, Type, TypeVar
 
 from .hooks import await_maybe
 

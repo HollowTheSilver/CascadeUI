@@ -6,22 +6,22 @@ import json as _json
 import logging
 import os
 import queue
+import re
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from logging import (
     CRITICAL,
     DEBUG,
     ERROR,
     INFO,
     WARNING,
-    FileHandler,
     Formatter,
     Handler,
     LogRecord,
     StreamHandler,
 )
-from logging.handlers import QueueHandler, QueueListener
+from logging.handlers import BaseRotatingHandler, QueueHandler, QueueListener
 from typing import Optional, Union
 
 # // ========================================( Color Schemes )======================================== // #
@@ -292,6 +292,95 @@ class JSONFormatter(Formatter):
         return _json.dumps(data, default=str, ensure_ascii=False, indent=self.indent)
 
 
+# // ========================================( Log Files )======================================== // #
+
+
+_LOG_DAY = r"\d{4}-\d{2}-\d{2}"
+
+
+def _log_file_name(prefix: Optional[str], day: date) -> str:
+    """The file name ``setup_logging`` writes a day's records to."""
+    return f"{prefix}-{day}.log" if prefix else f"{day}.log"
+
+
+def _purge_old_log_files(log_dir: str, prefix: Optional[str], max_files: int) -> None:
+    """Delete the oldest of this module's log files past ``max_files``.
+
+    Only names ``_log_file_name`` produces for ``prefix`` are counted or
+    deleted, oldest day first, so other files in the folder are never touched.
+    """
+    name = rf"{re.escape(prefix)}-({_LOG_DAY})\.log" if prefix else rf"({_LOG_DAY})\.log"
+    pattern = re.compile(name)
+    try:
+        names = os.listdir(log_dir)
+    except OSError:
+        return
+    dated = sorted((match.group(1), f) for f in names if (match := pattern.fullmatch(f)))
+    for _, f in dated[:-max_files]:
+        try:
+            os.unlink(os.path.join(log_dir, f))
+        except OSError:
+            pass
+
+
+class _DailyFileHandler(BaseRotatingHandler):
+    """File sink that writes each day's records to that day's file.
+
+    The first record after local midnight moves the handler to the new day's
+    file and deletes the oldest past ``max_files``, so a long-running process
+    keeps the same files a daily restart would.
+    """
+
+    def __init__(
+        self, path: str, prefix: Optional[str], max_files: int, mode: str, encoding: str
+    ) -> None:
+        self._dir = path
+        self._prefix = prefix
+        self._max_files = max_files
+        day = datetime.now().date()
+        super().__init__(os.path.join(path, _log_file_name(prefix, day)), mode, encoding=encoding)
+        self._rollover_at = self._midnight_after(day)
+
+    @staticmethod
+    def _midnight_after(day: date) -> float:
+        return datetime.combine(day + timedelta(days=1), datetime.min.time()).timestamp()
+
+    def shouldRollover(self, record: LogRecord) -> bool:
+        return record.created >= self._rollover_at
+
+    def doRollover(self) -> None:
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+        day = datetime.now().date()
+        self.baseFilename = os.path.abspath(
+            os.path.join(self._dir, _log_file_name(self._prefix, day))
+        )
+        self._rollover_at = self._midnight_after(day)
+        # Opened before the purge, which counts the new file among the kept ones.
+        self.stream = self._open()
+        if self._max_files > 0:
+            _purge_old_log_files(self._dir, self._prefix, self._max_files)
+
+
+def _resolve_level(level: Union[int, str], owner: str) -> int:
+    """The numeric level ``level`` names; a name logging does not know raises."""
+    if isinstance(level, int) and not isinstance(level, bool):
+        return level
+    if not isinstance(level, str):
+        raise TypeError(
+            f"{owner} level must be a level name such as 'DEBUG' or an int, "
+            f"got {type(level).__name__}."
+        )
+    value = logging.getLevelName(level.upper())
+    if not isinstance(value, int):
+        raise ValueError(
+            f"{owner} level {level!r} is not a logging level. Use one of "
+            f"'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL', or an int."
+        )
+    return value
+
+
 # // ========================================( Queue Machinery )======================================== // #
 
 
@@ -467,7 +556,8 @@ def setup_logging(
         setup_logging(level="DEBUG", actions="DEBUG")    # action stream only at DEBUG
 
     Args:
-        level:             Log level for the ``"cascadeui"`` logger.
+        level:             Log level for the ``"cascadeui"`` logger: a level
+                           name such as ``"DEBUG"``, or an int.
         actions:           Auto-install ``LoggingMiddleware`` so every
                            dispatched action is logged to
                            ``"cascadeui.actions"``. ``True`` (default)
@@ -475,7 +565,8 @@ def setup_logging(
                            (e.g. ``"DEBUG"``) to set the action stream's
                            emission level so it hides under INFO logging and
                            surfaces only at that level; ``False`` skips it.
-        file:              Whether to write to a date-stamped log file.
+        file:              Whether to write to a log file named for the day,
+                           moving to the next day's file at midnight.
         stream:            Whether to write colored output to the console.
         trace:             Install the ViewStore dispatch-miss tracer. Wraps
                            discord.py's ``ViewStore.dispatch_view`` to log
@@ -483,7 +574,11 @@ def setup_logging(
                            targets a stale item. Intended for debugging
                            "View interaction referencing unknown view" errors.
         path:              Directory for log files.
-        max_files:         Maximum log files before old ones are purged.
+        max_files:         How many of its own ``<prefix>-YYYY-MM-DD.log``
+                           files to keep. The oldest by the date in the name
+                           are deleted at startup and after each midnight;
+                           other files in ``path`` are never touched, and
+                           ``0`` keeps them all.
         prefix:            Filename prefix (e.g. ``"cascadeui"`` produces
                            ``cascadeui-2026-04-16.log``).
         mode:              File open mode (``"a"`` = append, ``"w"`` = overwrite).
@@ -506,13 +601,21 @@ def setup_logging(
                            because the caller owns its threading behavior;
                            pass a ``logging.handlers.QueueHandler`` for
                            off-thread handling.
+
+    Raises:
+        ValueError: ``level`` or an ``actions`` level is a name logging does
+            not know. The previous configuration stays in place.
+        TypeError: ``level`` is neither a level name nor an int.
     """
     global _direct_handler
 
     root_logger = logging.getLogger("cascadeui")
 
-    if isinstance(level, str):
-        level = getattr(logging, level.upper(), logging.INFO)
+    # Both checked before anything is torn down, so a misspelled level leaves
+    # the previous configuration in place.
+    level = _resolve_level(level, "setup_logging()")
+    if isinstance(actions, str):
+        _resolve_level(actions, "setup_logging() actions")
     root_logger.setLevel(level)
 
     # \\ reconfigure: release whatever a previous call installed
@@ -545,10 +648,8 @@ def setup_logging(
 
         if file:
             resolved_file_fmt = file_formatter or FileFormatter(template=template)
-            date = str(datetime.now().date())
-            filename = f"{prefix}-{date}.log" if prefix else f"{date}.log"
             os.makedirs(path, exist_ok=True)
-            fh = FileHandler(filename=f"{path}/{filename}", encoding=encoding, mode=mode)
+            fh = _DailyFileHandler(path, prefix, max_files, mode, encoding)
             fh.setFormatter(resolved_file_fmt)
             sinks.append(fh)
 
@@ -571,27 +672,3 @@ def setup_logging(
         if not store.has_middleware(LoggingMiddleware):
             action_level = actions if isinstance(actions, str) else "INFO"
             store._add_middleware(LoggingMiddleware(level=action_level))
-
-
-def _purge_old_log_files(log_dir: str, prefix: Optional[str], max_files: int) -> None:
-    """Remove oldest log files when count exceeds max_files."""
-    try:
-        all_files = os.listdir(log_dir)
-    except OSError:
-        return
-
-    if prefix:
-        matching = [f for f in all_files if f.startswith(prefix) and f.endswith(".log")]
-    else:
-        matching = [f for f in all_files if f.endswith(".log")]
-
-    if len(matching) <= max_files:
-        return
-
-    matching_paths = [os.path.join(log_dir, f) for f in matching]
-    matching_paths.sort(key=os.path.getctime)
-    for filepath in matching_paths[:-max_files]:
-        try:
-            os.unlink(filepath)
-        except (PermissionError, OSError):
-            pass

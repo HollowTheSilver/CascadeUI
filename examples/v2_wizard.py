@@ -9,7 +9,7 @@ flow:
     - A live character-sheet preview card, shown on every step, that fills
       in as choices are made (portrait via ``image_section``, re-rollable)
     - Controls folded into titled cards (``action_section`` / ``choice_row`` /
-      ``toggle_section``) rather than bare rows floating beneath a text card
+      ``toggle_section``)
     - ``choice_row`` segmented controls that highlight the active option and
       auto-fold to a dropdown once the option set outgrows a button row
     - Cascading choices where later options depend on earlier ones
@@ -23,10 +23,8 @@ flow:
     - Navigation-button customization via the
       ``back/next/finish_button_{label,emoji,style}`` triples
     - ``on_finish`` as a method hook that posts the finished sheet
-
-Emoji use Python's ``\\N{NAME}`` named escapes throughout: they read
-clearly in source, grep cleanly, and avoid the raw-glyph pitfalls that
-bite copy-paste and search-and-replace.
+    - A Cancel button added once through ``_build_extra_items``, kept on
+      every step
 
 Commands:
     /v2wizard   Start the character creator
@@ -56,6 +54,7 @@ from cascadeui import (
     RadioGroup,
     StatefulSelect,
     TextInput,
+    ValidationResult,
     WizardLayoutView,
     WizardStep,
     action_section,
@@ -108,8 +107,8 @@ ALIGNMENTS = [
     "Chaotic Evil",
 ]
 
-# Common is always known; racial languages are pre-selected as defaults
-# in the background step based on the chosen race.
+# Common is always known; racial languages are pre-selected when the
+# race is chosen.
 LANGUAGES = ["Common", "Elvish", "Dwarvish", "Halfling", "Draconic", "Infernal", "Celestial"]
 RACIAL_LANGUAGES = {
     "Human": [],
@@ -141,6 +140,14 @@ POINT_POOL = 6
 MAX_SCORE = 15
 
 
+def image_only(attachments, field, all_values):
+    """Refuse a portrait that is not an image, which would render as a broken one."""
+    for attachment in attachments or ():
+        if not (attachment.content_type or "").startswith("image/"):
+            return ValidationResult(valid=False, message=f"{attachment.filename} is not an image.")
+    return ValidationResult(valid=True)
+
+
 # // ========================================( Wizard )======================================== // #
 
 
@@ -167,12 +174,21 @@ class CharacterCreatorView(WizardLayoutView):
     # which only the reject path ever reads.
     instance_policy = "reject"
     exit_policy = "delete"
+    # Only clicks on the wizard extend its timeout, not a submitted modal,
+    # and a modal submitted after the timeout reaches a closed wizard. The
+    # backstory modal takes up to 1500 characters, so the default 180s is
+    # too short.
+    timeout = 900.0
     # state_scope = None because character sheet state lives on instance
     # attributes (_name, _race, etc.), not the Redux tree.
     state_scope = None
     instance_limit_message = (
-        "You already have a character creator open. Finish or exit it before starting another."
+        "You already have a character creator open. Finish it or press Cancel before "
+        "starting another."
     )
+    # A name or backstory modal submitted after the creator closed is answered
+    # with this instead of the default "This session has ended."
+    session_ended_message = "This character creator has closed. Run /v2wizard to start again."
 
     # // ----( Progress header )---- // #
     # ``show_progress_bar = True`` tells ``WizardLayoutView`` to render a
@@ -181,8 +197,8 @@ class CharacterCreatorView(WizardLayoutView):
 
     # // ----( Navigation-button customization )---- // #
     # Every navigation button on every wizard step is built from these
-    # class attributes. The back, next, and finish triples together form
-    # the full customization surface.
+    # class attributes. ``step_indicator_label`` renames the step counter
+    # between them.
     back_button_label = "Previous"
     back_button_emoji = "\N{LEFTWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}"
     back_button_style = discord.ButtonStyle.secondary
@@ -220,7 +236,8 @@ class CharacterCreatorView(WizardLayoutView):
         # step renders, reading whatever the instance attributes above hold
         # at that moment. An accidental trailing ``()`` raises ``ValueError``
         # at construction time rather than on the first click. Review has no
-        # validator because the finish button runs on the last step.
+        # validator: every field was checked on an earlier step, and one here
+        # would gate Finish.
         steps = [
             WizardStep(
                 name="Identity",
@@ -262,11 +279,11 @@ class CharacterCreatorView(WizardLayoutView):
     # // ========================================( Lifecycle hooks )======================================== // #
 
     async def on_step_entered(self, step_index: int):
-        """Fires after each step becomes active (initial send, next, back).
+        """Fires when Next or Back moves to a step, before its builder runs.
 
-        Fire-and-forget -- exceptions raised here are logged but do not
-        block navigation. Common uses: analytics, prefetch, per-step side
-        effects that do not belong in the builder itself.
+        It logs the step the user asked for: if that step's render fails,
+        the wizard stays where it was without calling this again.
+        Exceptions raised here are logged and do not block navigation.
         """
         logger.info(
             "Wizard step entered: user=%s step=%s/%s",
@@ -286,6 +303,10 @@ class CharacterCreatorView(WizardLayoutView):
         """
         self._validation_failures[step_index] = self._validation_failures.get(step_index, 0) + 1
         await super().on_validation_failed(step_index, error, interaction)
+
+    def _build_extra_items(self):
+        # Built once; the wizard keeps it below the navigation row on every step.
+        self.add_exit_button(label="Cancel")
 
     # // ========================================( Derived helpers )======================================== // #
 
@@ -331,10 +352,8 @@ class CharacterCreatorView(WizardLayoutView):
     def _build_sheet_preview(self):
         """The live character sheet, shown on top of every step.
 
-        This panel is what makes the wizard read like an app rather than a
-        form: every choice appears here immediately, so the character takes
-        shape as the user moves through the steps. Only fields that have
-        been filled render, so the card grows as the flow progresses.
+        Only fields that have been filled render, so the card grows as the
+        flow progresses.
         """
         name = self._name or "Unnamed Hero"
         lineage = f"{self._race} {self._class}".strip()
@@ -365,7 +384,7 @@ class CharacterCreatorView(WizardLayoutView):
         # An uploaded portrait (from the name modal's FileUpload) replaces
         # the generated one the moment it lands.
         portrait = self._portrait or self._portrait_url()
-        children: list = [image_section(f"### \N{SCROLL} {name}\n{summary}", url=portrait)]
+        children: list = [image_section(f"### \N{SCROLL} {name}", summary, url=portrait)]
         # Only offered for the generated portrait: an uploaded one is the
         # user's own image and re-rolling would discard it.
         if not self._portrait:
@@ -386,13 +405,7 @@ class CharacterCreatorView(WizardLayoutView):
     # // ========================================( Step 1 - Identity )======================================== // #
 
     async def build_identity(self):
-        """Name (modal, folded into a card) + race as a segmented choice_row.
-
-        The name opens a modal so a paragraph of free text does not have to
-        squeeze into a select option; the button that opens it is folded into
-        the card via ``action_section`` rather than left floating. Race is a
-        ``choice_row`` so all four options show at once as segmented buttons.
-        """
+        """Name (a modal, opened from an ``action_section``) + race as a choice_row."""
         name_summary = f"**Name:** {self._name}" if self._name else "**Name:** _not set_"
 
         controls = card(
@@ -413,7 +426,6 @@ class CharacterCreatorView(WizardLayoutView):
                 {race: race for race in RACES},
                 on_select=self._on_race_selected,
                 selected=self._race or None,
-                custom_id="wiz_race",
             ),
             color=discord.Color.blurple(),
         )
@@ -422,10 +434,8 @@ class CharacterCreatorView(WizardLayoutView):
     def _build_name_modal(self) -> Modal:
         """Compose the identity modal: name text plus an optional portrait.
 
-        ``FileUpload`` demonstrates a structured modal input beyond text:
-        the submitted attachment's URL replaces the generated portrait in
-        the live sheet preview. Attachment URLs are CDN links tied to the
-        upload, so the swap holds for the life of the session.
+        The uploaded attachment's URL replaces the generated portrait in the
+        sheet preview.
         """
         name_input = TextInput(
             label="Character Name",
@@ -440,6 +450,7 @@ class CharacterCreatorView(WizardLayoutView):
             description="Optional: upload an image to replace the generated portrait.",
             required=False,
             max_values=1,
+            validators=[image_only],
         )
 
         async def on_submitted(modal_interaction, values):
@@ -462,11 +473,12 @@ class CharacterCreatorView(WizardLayoutView):
 
     async def _on_race_selected(self, interaction, value):
         if value != self._race:
-            # Changing race invalidates any previous class and subclass
-            # because the class pool is gated by race.
+            # The class pool is gated by race, so a race change clears the
+            # class and subclass, and swaps in the new race's languages.
             self._race = value
             self._class = ""
             self._subclass = ""
+            self._languages = sorted({"Common"} | set(RACIAL_LANGUAGES[value]))
         await self.refresh_content()
 
     async def validate_identity(self):
@@ -495,7 +507,6 @@ class CharacterCreatorView(WizardLayoutView):
                 {c: c for c in self._available_classes()},
                 on_select=self._on_class_selected,
                 selected=self._class or None,
-                custom_id="wiz_class",
             ),
         ]
         if self._class:
@@ -505,7 +516,6 @@ class CharacterCreatorView(WizardLayoutView):
                     {s: s for s in self._available_subclasses()},
                     on_select=self._on_subclass_selected,
                     selected=self._subclass or None,
-                    custom_id="wiz_subclass",
                 )
             )
         controls = card(*children, color=discord.Color.dark_red())
@@ -611,19 +621,9 @@ class CharacterCreatorView(WizardLayoutView):
     async def build_background(self):
         """Alignment, languages, destiny, and a background modal, one card.
 
-        Alignment and languages are ``choice_row``s (both outgrow a button
-        row, so they fold to dropdowns); Heroic Destiny is a
-        ``toggle_section``. The backstory button opens the structured
-        background modal -- paragraph text, origin radio, tool checkboxes,
-        and a quirk flag in a single form (see ``_build_background_modal``).
+        Alignment and languages are ``choice_row``s past the button
+        threshold, so both render as dropdowns.
         """
-        # Common (always known) plus any racial languages are known by
-        # default. Seed them on first entry so the pre-selected options count
-        # as chosen; without this the validator sees an empty list even
-        # though the select shows them ticked.
-        if not self._languages:
-            self._languages = sorted({"Common"} | set(RACIAL_LANGUAGES.get(self._race, [])))
-
         if self._backstory:
             preview = self._backstory[:200] + ("..." if len(self._backstory) > 200 else "")
             backstory_summary = f"**Backstory:** {preview}"
@@ -649,7 +649,6 @@ class CharacterCreatorView(WizardLayoutView):
                 {a: a for a in ALIGNMENTS},
                 on_select=self._on_alignment_selected,
                 selected=self._alignment or None,
-                custom_id="wiz_alignment",
                 placeholder="Choose an alignment...",
             ),
             TextDisplay("**Languages**"),
@@ -658,7 +657,6 @@ class CharacterCreatorView(WizardLayoutView):
                 on_select=self._on_languages_selected,
                 selected=set(self._languages),
                 multi=True,
-                custom_id="wiz_languages",
                 placeholder="Select languages known...",
             ),
             toggle_section(
@@ -673,12 +671,8 @@ class CharacterCreatorView(WizardLayoutView):
     def _build_background_modal(self) -> Modal:
         """Compose the background modal: one form, four input types.
 
-        A paragraph ``TextInput``, a ``RadioGroup`` (pick-one origin), a
-        ``CheckboxGroup`` (up to two tool proficiencies), and a ``Checkbox``
-        flag share a single modal, so the step card stays compact while
-        the form carries the structured detail. Current selections
-        pre-fill via each option's ``default`` so re-opening the modal
-        shows the character as already built.
+        Each input pre-fills from the current sheet, so re-opening the
+        modal shows the character as already built.
         """
         backstory_input = TextInput(
             label="Backstory",
@@ -796,14 +790,11 @@ class CharacterCreatorView(WizardLayoutView):
     # // ========================================( Finish )======================================== // #
 
     async def on_finish(self, interaction):
-        """Post the finalized character sheet as an ephemeral card followup.
+        """Reply with the finished character sheet as an ephemeral card.
 
-        ``WizardLayoutView.on_finish`` fires when the user clicks the finish
-        button on the last step. Overriding it replaces the default exit-only
-        behavior with a custom flow that echoes the completed sheet back.
-
-        The trailing ``await self.exit()`` respects ``exit_policy = "delete"``,
-        so the wizard message is removed after the followup is sent.
+        Fires when the finish button is clicked on the last step. The
+        override replaces the default, which only exits. The closing
+        ``exit()`` deletes the wizard message under ``exit_policy``.
         """
         stats_line = " \N{MIDDLE DOT} ".join(f"{a} {self._scores[a]}" for a in ABILITIES)
         destiny_tag = " *(Hero of Destiny)*" if self._heroic_destiny else ""

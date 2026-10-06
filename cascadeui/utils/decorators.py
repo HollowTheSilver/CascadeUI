@@ -1,7 +1,6 @@
 # // ========================================( Modules )======================================== // #
 
 
-import asyncio
 import copy
 import logging
 from functools import wraps
@@ -71,7 +70,10 @@ def cascade_reducer(action_type: str):
     The decorated function receives ``(action, state)`` where ``state`` is
     already a deep copy -- mutate it freely and return it.  Do not cache
     ``state_store.state`` references across dispatches; the reducer's
-    snapshot is per-call and outside refs grow stale.
+    snapshot is per-call and outside refs grow stale. The reducer may be a
+    plain ``def`` or an ``async def``. One that returns anything but a dict
+    (a forgotten ``return``) raises ``TypeError`` at dispatch, which the
+    store logs while keeping the previous state.
 
     Raises ``ValueError`` at decoration time when ``action_type`` collides
     with a built-in action (VIEW_CREATED, NAVIGATION_PUSH, UNDO, etc.).
@@ -91,21 +93,10 @@ def cascade_reducer(action_type: str):
     def decorator(func: Callable):
         @wraps(func)
         async def wrapper(action: Dict[str, Any], state: Dict[str, Any]):
-            # A reducer is a pure transformation and has no reason to be
-            # async, so plenty are written with a plain ``def``. Awaiting
-            # unconditionally turned those into a swallowed no-op: the
-            # decoration succeeded, the dispatch succeeded, the returned
-            # dict failed on being awaited, and the store logged the
-            # TypeError and kept the old state. Same polarity as every
-            # other seam that runs a caller's function.
             result = await await_maybe(func(action, _copy_state(state)))
             if not isinstance(result, dict):
-                # The store assigns whatever comes back, so a reducer that
-                # forgot its ``return`` used to install ``None`` as the whole
-                # state and every later read failed somewhere else entirely.
-                # Raising here is caught by the store's own reducer guard,
-                # which logs and keeps the previous state, so the mistake
-                # names itself and costs one dispatch instead of the session.
+                # Assigned as the whole state otherwise, so every later read
+                # would fail somewhere else.
                 raise TypeError(
                     f"Reducer {func.__name__!r} for {action_type!r} returned "
                     f"{type(result).__name__}, not a state dict. "

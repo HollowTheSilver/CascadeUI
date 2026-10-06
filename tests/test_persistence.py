@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import discord
 import pytest
-from helpers import make_interaction
+from helpers import make_interaction, until
 
 from cascadeui import setup_middleware
 from cascadeui.exceptions import (
@@ -542,6 +542,7 @@ class TestPruneRegistryKeys:
         panel = _PushingPanel(persistence_key="panel:pushed", user_id=1, guild_id=2)
         panel._message = MagicMock(id=999, guild=None)
         panel._message.channel.id = 2
+        panel._message.edit = AsyncMock(return_value=panel._message)
         store._register_view(panel)
         await panel._register_state()
         await panel._register_persistent(panel._message)
@@ -1851,6 +1852,42 @@ class TestReattachBaselineDigest:
         # Stopped, so Message.edit does not register the copy with the view store.
         assert shipped.is_finished()
 
+    @pytest.mark.parametrize("built", ["a placeholder row", "nothing"])
+    async def test_a_restored_panel_sent_again_freezes_what_its_message_showed(self, built):
+        """The re-send froze the message it left from the panel's own tree,
+        which a restored panel has not rendered: the pre-restart board became
+        the constructor's placeholder or, from an empty tree, stayed up with a
+        Join button that no longer answered."""
+        from cascadeui.components.base import StatefulButton
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        class _Board(PersistentLayoutView):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                if built == "a placeholder row":
+                    self.add_item(
+                        discord.ui.ActionRow(discord.ui.Button(label="Close", custom_id="close:1"))
+                    )
+
+            async def on_load(self):
+                self.clear_items()
+                self.add_item(discord.ui.TextDisplay("Moved board"))
+                self.add_item(
+                    discord.ui.ActionRow(StatefulButton(label="Join", custom_id="join:1"))
+                )
+
+        view, message = await self._reattach(_Board, "resend:restored", self._on_screen())
+        view.interaction = make_interaction()
+
+        assert await view.send() is not None
+
+        shipped = message.edited_with["view"]
+        assert self._labels_and_states(shipped) == [("Join", True)]
+        texts = [
+            i.content for i in shipped.walk_children() if isinstance(i, discord.ui.TextDisplay)
+        ]
+        assert texts == ["Live board"]
+
     async def test_untouched_restored_view_skips_when_nothing_on_screen_is_live(self):
         """An on-screen panel with nothing left to disable owes no edit."""
         view, message = await self._reattach(
@@ -2049,26 +2086,32 @@ class TestSendTimeBind:
     """``_bind_from_context`` (the send-time seam) forwards ``on_bind`` when
     the construction context resolves a bot, and ``send()`` invokes it."""
 
-    async def test_send_invokes_bind_from_context(self):
-        # Covers the send() -> _bind_from_context wiring, so removing the call
-        # from send() fails here rather than silently skipping dep injection.
-        from unittest.mock import AsyncMock
+    async def test_send_binds_before_on_load(self):
+        # Driven through the real send, so removing the bind from it, or moving
+        # it after on_load, fails here rather than silently skipping injection.
+        from discord.ui import ActionRow
 
+        from cascadeui import StatefulButton
         from cascadeui.views.persistent import PersistentLayoutView
 
+        order = []
+
         class _Panel(PersistentLayoutView):
+            def __init__(self, **kw):
+                super().__init__(**kw)
+                self.add_item(ActionRow(StatefulButton(label="Go", custom_id="wire_go")))
+
             async def on_bind(self, bot):
-                pass
+                order.append("bind")
+
+            async def on_load(self):
+                order.append("load")
 
         inter = make_interaction()
         inter.client = type("B", (), {})()
         view = _Panel(interaction=inter, persistence_key="send:wire")
-        view._bind_from_context = AsyncMock()
-        # Instance-stub the pipeline below the mixin so the Discord send is
-        # skipped without patching the base class for every other subclass.
-        view._send_pipeline = AsyncMock(return_value=None)
         await view.send()
-        view._bind_from_context.assert_awaited_once()
+        assert order == ["bind", "load"]
 
     async def test_calls_on_bind_when_bot_derivable(self):
         from cascadeui.views.persistent import PersistentLayoutView
@@ -2291,6 +2334,35 @@ class TestPostReadyRestore:
 
         assert peak > 1, "a serial pass would never see two in flight"
         assert peak <= 3, "the semaphore bounds the burst against Discord"
+
+    async def test_a_panel_that_closes_while_it_waits_its_turn_is_skipped(self):
+        """The finished check ran before the wait for a repaint slot, so a panel
+        a user moved on from while it queued still got on_restore."""
+
+        class _FakeBot:
+            async def wait_until_ready(self):
+                return None
+
+        release = asyncio.Event()
+        ran = []
+
+        async def _held(bot):
+            ran.append("first")
+            await release.wait()
+
+        async def _second(bot):
+            ran.append("second")
+
+        mgr = PersistenceManager(store=get_store(), bot=_FakeBot(), restore_concurrency=1)
+        first = self._view("v-1", _held, channel_id=1)
+        second = self._view("v-2", _second, channel_id=2)
+        restoring = asyncio.create_task(mgr._run_post_ready_restore([first, second]))
+        await until(lambda: ran == ["first"])
+        second.is_finished.return_value = True
+        release.set()
+        await restoring
+
+        assert ran == ["first"]
 
     async def test_same_channel_repaints_serialize(self):
         """Panels sharing a channel repaint one at a time.
@@ -2931,6 +3003,39 @@ class TestPersistenceMiddlewareSetup:
         await setup_middleware(PersistenceMiddleware(backend=be))
         store = get_store()
         assert any(isinstance(mw, PersistenceMiddleware) for mw in store._middleware)
+
+    async def test_a_second_instance_initializes_the_installed_one(self):
+        # setup_hook runs on every login, so a bot started again in the same
+        # process passes a new instance. Initializing it would run a second
+        # pipeline beside the installed middleware, with a manager no
+        # dispatch reaches.
+        store = get_store()
+        installed = PersistenceMiddleware(backend=InMemoryBackend())
+        await setup_middleware(installed)
+        manager = store.persistence_manager
+
+        second = PersistenceMiddleware(backend=InMemoryBackend())
+        await setup_middleware(second)
+
+        assert [mw for mw in store._middleware if isinstance(mw, PersistenceMiddleware)] == [
+            installed
+        ]
+        assert store.persistence_manager is manager
+        assert second._manager is None
+
+    async def test_a_prebuilt_manager_is_stashed_on_the_store(self):
+        # The pipeline that stashes it is skipped on this path, and the
+        # guide's shutdown call reads it from the store.
+        store = get_store()
+        be = InMemoryBackend()
+        await be.initialize()
+        mgr = PersistenceManager(
+            store=store,
+            registry=RegistryPersistence(backend=be),
+            application=ApplicationPersistence(backend=be),
+        )
+        await setup_middleware(PersistenceMiddleware(manager=mgr))
+        assert store.persistence_manager is mgr
 
 
 # // ========================================( Migrator registries )======================================== // #
@@ -3718,6 +3823,8 @@ class TestUnreachableSweeper:
     class _Bot(discord.Client):
         def __init__(self):
             self.ready = asyncio.Event()
+            # What Client.__init__ sets and is_closed() reads.
+            self._closing_task = None
 
         async def wait_until_ready(self):
             await self.ready.wait()
@@ -3736,7 +3843,7 @@ class TestUnreachableSweeper:
 
         with pytest.raises(RuntimeError, match="in the same task"):
             await asyncio.wait_for(mgr._serialized_walk("reattach_persistent_views", _nested), 2)
-        assert not mgr._registry_walk_lock.locked()
+        assert not mgr._loop_lock("registry_walk").locked()
 
     @pytest.mark.parametrize("bad", [0, -1, True, "30", 1.5])
     def test_a_bad_cutoff_is_refused_at_construction(self, bad):
@@ -3819,7 +3926,11 @@ class TestUnreachableSweeper:
             await asyncio.sleep(0)
 
         assert mgr.prune_unreachable.await_count == 2
-        assert "Unreachable sweeper error: backend down" in caplog.text
+        assert any(
+            "Unreachable sweeper error: backend down" in r.getMessage()
+            for r in caplog.records
+            if r.name.startswith("cascadeui")
+        )
         await mgr.close()
 
     async def test_close_cancels_the_sweeper(self, monkeypatch):

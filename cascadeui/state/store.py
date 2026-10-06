@@ -2,63 +2,90 @@
 
 
 import asyncio
+import contextlib
 import contextvars
 import copy
-import inspect
 import logging
 import time
+import weakref
 from datetime import datetime, timezone
 from types import MappingProxyType
-from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Set, Tuple
 
 from ..utils.errors import with_error_boundary
 from ..utils.hooks import await_maybe
-from ..utils.tasks import get_task_manager
-from ._batching import _ACTIVE_BATCHES, current_batch, next_batch_sequence
+from ..utils.tasks import _bounded_wait, get_task_manager
+from ._batching import _ACTIVE_BATCHES, current_batch, next_commit_sequence
 from .actions import ActionCreators
 from .slots import access_slot, read_slot
 from .types import Action, HookFn, MiddlewareFn, ReducerFn, SelectorFn, StateData, SubscriberFn
 
 logger = logging.getLogger(__name__)
 
+# A wait for the state turn this long is logged, naming what holds it.
+_STATE_TURN_WAIT_WARN_SECONDS = 30.0
 
-# Contextvar holding the live edit counter for the current dispatch (or batch).
-# Subscriber tasks capture this at ``asyncio.create_task()`` time, so a slow
-# subscriber that calls ``refresh()`` after dispatch returns still bumps the
-# dispatch's own counter rather than whatever top-of-stack happens to be active.
-# Stored as a single-element list ``[int]`` so the reference can be shared and
-# mutated by the subscriber task even though the sample dict has already been
-# appended to ``_perf_samples``. Finalized to an int in ``_flush_notifications``.
+# How long an undo or redo waits for another task's batch holding steps for the view.
+_UNDO_BATCH_WAIT_SECONDS = 30.0
+
+
+# The edit counter of the dispatch (or batch) being profiled. A subscriber task
+# copies it at creation, so a refresh() it makes after the dispatch returns still
+# counts there. A one-element list shared by reference with the recorded sample;
+# ``_flush_notifications`` turns it into an int.
 _CURRENT_EDIT_COUNTER: contextvars.ContextVar[Optional[List[int]]] = contextvars.ContextVar(
     "_CURRENT_EDIT_COUNTER", default=None
 )
 
 
-# Contextvar holding the live component interaction for the current dispatch.
-# Set by ``StatefulComponent.create_stateful_callback`` around the callback +
-# dispatch sequence. Read by ``_StatefulMixin.refresh()`` to piggyback the
-# state-driven edit onto the interaction's own ack packet via
-# ``interaction.response.edit_message(...)`` instead of a separate channel
-# REST call -- saving one round-trip on the acting-view's visual refresh.
-# Falls through to the channel endpoint for every condition that disqualifies
-# the fast path (non-component interaction, response already acked, message
-# mismatch, or any HTTPException other than 429). ``None`` default is always
-# safe: dispatches outside a component callback (persistence rehydrate,
-# programmatic dispatch from a hook) never see the fast path.
+# The interaction being handled, bound around a click's or a modal submission's
+# callback and its dispatch. ``refresh()`` reads it to answer that interaction with
+# its edit in one request (``interaction.response.edit_message``). ``None``
+# outside a callback.
 _CURRENT_INTERACTION: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
     "_CURRENT_INTERACTION", default=None
 )
 
 
-# Contextvar holding the reducer-time slot for the current dispatch, so
-# ``run_reducer`` reports into the sample belonging to its own dispatch.
-# Sibling of the edit counter above and stored the same way, as a
-# single-element list the reducer writes in place. ``None`` means nothing is
-# collecting: profiling is off, or the action is batched and accounts for
-# itself under the batch's own sample.
+# The reducer-time slot of the dispatch being profiled, a one-element list like
+# the edit counter. ``None`` while profiling is off. A batched action times on a
+# slot of its own, read only if the batch refuses it.
 _CURRENT_REDUCER_MS: contextvars.ContextVar[Optional[List[float]]] = contextvars.ContextVar(
     "_CURRENT_REDUCER_MS", default=None
 )
+
+# Called at the commit of the dispatch whose chain is running, before anything
+# else can run, with the store's state just before the commit and the state the
+# reducer committed. A middleware that records what its action changed
+# registers one, since another dispatch can commit while the middlewares around
+# it await (see UndoMiddleware).
+_ON_COMMIT: contextvars.ContextVar[Optional[List[Callable[[StateData, StateData], None]]]] = (
+    contextvars.ContextVar("_ON_COMMIT", default=None)
+)
+
+# The view that dispatched the action whose chain is running, looked up when the
+# chain began: a middleware that awaits can hold the action until a push has
+# torn that view down and unregistered it (see UndoMiddleware).
+_SOURCE_VIEW: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
+    "_SOURCE_VIEW", default=None
+)
+
+# The store and state turn of the reducer running in this context. A task the
+# reducer starts copies it, which is how a dispatch from that task is known.
+_IN_REDUCER: contextvars.ContextVar[Optional[Tuple[Any, object]]] = contextvars.ContextVar(
+    "_IN_REDUCER", default=None
+)
+
+
+class _ChainRun:
+    """What one pass through a dispatch's middleware chain did."""
+
+    __slots__ = ("reduced", "stamp", "error")
+
+    def __init__(self) -> None:
+        self.reduced = False
+        self.stamp: Optional[int] = None
+        self.error: Optional[Exception] = None
 
 
 # // ========================================( Batch Context )======================================== // #
@@ -89,22 +116,32 @@ class BatchContext:
     def __init__(self, store: "StateStore", source_id: Optional[str] = None):
         self._store = store
         # This batch's own queued entries as ``(sequence, action)``. Per-batch
-        # rather than per-store, so an abort drops only what this batch queued
-        # and a concurrent batch's actions are untouchable from here.
+        # rather than per-store, so a concurrent batch's actions are
+        # untouchable from here.
         self._entries: List[Tuple[int, Action]] = []
         # Per-action undo records, accumulated by UndoMiddleware while this is
         # the innermost open batch and merged into one diff per view at flush.
         self._undo_records: List[
-            Tuple[int, str, Dict[str, Any], Optional[str], Optional[dict], Dict[str, Any]]
+            Tuple[int, str, Dict[str, Any], Optional[str], Optional[dict], Dict[str, Any], Any]
         ] = []
         self._token = None
         self._closed = False
-        # Propagated into ``BATCH_COMPLETE["source"]`` so _notify_subscribers
-        # can award the inline slot to the acting view even in batched regimes
-        # (push/pop, _send_pipeline, _cleanup_attached_children). ``None``
-        # keeps the pre-source-threading fan-out behavior. Exposed publicly
-        # and mutable so callers whose acting view is created mid-batch
-        # (e.g. ``_navigate_to``'s new_view) can rebind after construction:
+        # Set once this batch no longer holds undo steps (handed to its parent
+        # or written at its exit), for an undo waiting on it.
+        self._settled = asyncio.Event()
+        # Set once an undo has waited the whole bound for this batch, so no
+        # later wait on the same undo, or another, starts the bound again.
+        self._undo_wait_expired = False
+        # The records taken at the exit, until their step is placed: another
+        # batch placing its own, or an undo waiting, still has to see them.
+        self._placing: List = []
+        # Records of batches that placed their steps while this one was open,
+        # for its own placing: a batch whose step pruned to nothing leaves no
+        # entry on the stack to read them from.
+        self._handed: List[list] = []
+        # Becomes ``BATCH_COMPLETE["source"]``, so the acting view keeps its
+        # inline notification; ``None`` notifies every subscriber in the
+        # background. Mutable for an acting view created mid-batch:
         # ``async with store.batch() as batch: batch.source_id = new_view.id``
         self.source_id = source_id
 
@@ -113,7 +150,7 @@ class BatchContext:
         """Whether this batch has exited and stopped accepting entries."""
         return self._closed
 
-    def add_entry(self, action: Action) -> bool:
+    def add_entry(self, action: Action, stamp: Optional[int] = None) -> bool:
         """Queue an action, or report that this batch has already closed.
 
         A dispatch resolves its batch before running the middleware chain and
@@ -122,10 +159,13 @@ class BatchContext:
         a drained buffer would leave that change unannounced, which is the
         shape this batch redesign exists to remove. Refusing lets the caller
         notify immediately instead.
+
+        ``stamp`` is the sequence taken when the action's reducer committed,
+        so actions are announced in the order the store applied them.
         """
         if self._closed:
             return False
-        self._entries.append((next_batch_sequence(), action))
+        self._entries.append((next_commit_sequence() if stamp is None else stamp, action))
         return True
 
     def add_undo_record(
@@ -135,30 +175,36 @@ class BatchContext:
         session_id: Optional[str],
         shared: Optional[dict],
         post_application: Dict[str, Any],
-    ) -> bool:
-        """Record one action's undo diff, or report that this batch closed.
+        view: Any = None,
+    ) -> None:
+        """Record one action's undo diff.
 
-        Stamped on arrival rather than at queue time: undo runs inside the
-        middleware chain, before the action itself is queued, so its records
-        carry earlier stamps than the actions they describe. Only the order
-        among the records matters, and that is reduction order either way.
+        Called as the action's reducer commits, so the stamps follow the order
+        the store committed. That is earlier than the action itself is
+        queued, which is harmless: only the order among the records matters.
+        The caller reads this batch from ``current_batch()`` and records with
+        nothing awaited in between, so the batch is always still open here.
 
         ``post_application`` is the state this action left behind, kept so
-        the merge can drop slots the batch wrote and then restored. Refusal
-        mirrors :meth:`add_entry`: a chain that outlived its batch pushes
-        its own snapshot rather than losing it.
+        the merge can drop slots the batch wrote and then restored. ``view``
+        is the source view, kept so the entry can follow its panel when the
+        batch pushes or pops away from it.
         """
-        if self._closed:
-            return False
         self._undo_records.append(
-            (next_batch_sequence(), source_id, diff, session_id, shared, post_application)
+            (next_commit_sequence(), source_id, diff, session_id, shared, post_application, view)
         )
-        return True
+        self._store._note_undo_batch(self)
 
     def _absorb(self, child: "BatchContext") -> None:
         """Adopt a nested batch's entries and undo records on its exit."""
         self._entries.extend(child._entries)
         self._undo_records.extend(child._undo_records)
+        if child._undo_records:
+            self._store._note_undo_batch(self)
+
+    def _holds_steps_for(self, view_id: str) -> bool:
+        """Whether a step this batch adds at its exit goes on ``view_id``'s history."""
+        return self._store._records_step_on((*self._undo_records, *self._placing), view_id)
 
     async def __aenter__(self):
         # Both shapes are broken, and differently: re-entering while open
@@ -190,52 +236,60 @@ class BatchContext:
                 pass
             self._token = None
 
-        # An abort takes the same path as a clean exit, deliberately. An entry
-        # is queued only after its reducer has committed, so the queue is not a
-        # speculative sequence to discard -- it is exactly what already
-        # happened. Dropping it left state changed with no subscriber told and
-        # no undo entry to revert it, which is a silent desync rather than a
-        # rollback. The exception still propagates; what changes is that the
-        # committed prefix is announced and undoable.
-        #
-        # Nested batches absorb into the nearest ancestor still open in this
-        # task. Reading it after the reset above means this batch is already
-        # out of the lineage, so the scan cannot return self.
+        # An abort takes the clean exit's path: an entry is queued only after its
+        # reducer committed, and dropping it would leave state changed with no
+        # subscriber told. A nested batch joins the nearest ancestor still open;
+        # this one left the lineage above, so the scan cannot return it.
         parent = current_batch()
         if parent is not None:
             parent._absorb(self)
+            self._store._forget_undo_batch(self)
             return False
 
         entries = sorted(self._entries, key=lambda entry: entry[0])
         self._entries = []
         actions = [action for _, action in entries]
+        batch_action = None
+        if actions:
+            batch_action = {
+                "type": "BATCH_COMPLETE",
+                "payload": {"actions": actions},
+                "source": self.source_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
 
-        # Undo captures per action during a batch and pushes nothing until
-        # here, so one entry lands on each participating view's stack instead
-        # of N. Delegate the merge to the middleware so _SKIP_ACTIONS and the
-        # snapshot shape stay owned in one place.
-        #
-        # Runs BEFORE the empty-batch return: a dispatch whose chain suspends
-        # past its own batch has its action refused by ``add_entry`` and
-        # notified immediately, while ``UndoMiddleware`` re-resolves the
-        # lineage afterwards and lands its record on a still-open ancestor.
-        # That ancestor can hold records without holding a single action of
-        # its own, and returning first dropped the snapshot for a state change
-        # that had already committed.
+        # One undo entry per participating view, merged by the middleware. Runs
+        # before the empty-batch return: a dispatch whose chain outlived its own
+        # batch can leave its undo record on an ancestor holding no action.
         undo_mw = self._store._undo_middleware
-        if undo_mw is not None and self._undo_records:
-            undo_mw.finalize_batch(sorted(self._undo_records, key=lambda rec: rec[0]))
+        records = sorted(self._undo_records, key=lambda rec: rec[0])
         self._undo_records = []
+        self._placing = records
+        try:
+            if undo_mw is not None and records:
+                try:
+                    # Waits for a reducer running in another task, so the views
+                    # the batch notifies render with the entry in place.
+                    await self._store._write_in_turn(
+                        lambda: undo_mw.finalize_batch(records), "a batch's undo entry"
+                    )
+                except asyncio.CancelledError:
+                    # The entry lands at that reducer's commit; the actions have
+                    # committed, so subscribers are still told.
+                    if batch_action is not None:
+                        self._store.task_manager.create_task(
+                            "state_store_notify", self._store._notify_subscribers(batch_action)
+                        )
+                    raise
+        finally:
+            # A cut-off write is queued ahead of the next reducer, so an undo
+            # waiting on this batch still finds the entry in place.
+            self._placing = []
+            self._handed = []
+            self._store._forget_undo_batch(self)
 
-        if not actions:
+        if batch_action is None:
             return False
-
-        batch_action = {
-            "type": "BATCH_COMPLETE",
-            "payload": {"actions": actions},
-            "source": self.source_id,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
 
         logger.debug(f"Batch complete: {len(actions)} actions")
 
@@ -252,9 +306,7 @@ class BatchContext:
                 t0 = time.perf_counter()
                 await store._notify_subscribers(batch_action)
                 t1 = time.perf_counter()
-                for action in actions:
-                    await store._fire_hooks(action)
-                await store._fire_hooks(batch_action)
+                await store._fire_hooks(*actions, batch_action)
                 t2 = time.perf_counter()
             finally:
                 _CURRENT_EDIT_COUNTER.reset(token)
@@ -280,10 +332,7 @@ class BatchContext:
                 }
             )
         else:
-            await store._notify_subscribers(batch_action)
-            for action in actions:
-                await store._fire_hooks(action)
-            await store._fire_hooks(batch_action)
+            await store._announce(batch_action, *actions, batch_action)
 
         # Persistence for the batch is driven entirely by
         # PersistenceMiddleware (installed via setup_middleware). The store
@@ -307,6 +356,19 @@ def _in_channel(message: Any, channel_id: int) -> bool:
 
 
 # // ========================================( Class )======================================== // #
+
+
+class _Registration:
+    """One ``on()`` call's hook.
+
+    Two registrations of one callback stay distinct, and firing compares
+    registrations by identity, never by calling a callback's ``__eq__``.
+    """
+
+    __slots__ = ("callback",)
+
+    def __init__(self, callback: HookFn) -> None:
+        self.callback = callback
 
 
 class StateStore:
@@ -344,11 +406,8 @@ class StateStore:
         if self._initialized:
             return
 
-        # Core state data. Scoped slices live under application (at
-        # state["application"]["scoped"]) so the opt-in persistence seam
-        # at _route_application covers them uniformly -- declaring
-        # persistent_slots = ("scoped",) on a view persists scoped data
-        # through the same mechanism as any other application slot.
+        # Scoped slices live under ``state["application"]["scoped"]``, so
+        # ``persistent_slots = ("scoped",)`` persists them like any other slot.
         self.state: StateData = self._build_initial_state()
 
         # Callbacks for state changes: {id: (callback, action_filter, selector)}
@@ -363,6 +422,8 @@ class StateStore:
         # property of the selector rather than of any one action, so one
         # line says everything a flood would.
         self._selector_failed: Set[str] = set()
+        # The same, for a selected value that cannot be compared.
+        self._selector_uncomparable: Set[str] = set()
         self._SENTINEL = object()  # Marker for "no previous value"
 
         # Core reducers
@@ -383,7 +444,7 @@ class StateStore:
         self._undo_middleware = None
 
         # Event hooks registry: {hook_name: [callbacks]}
-        self._hooks: Dict[str, List[HookFn]] = {}
+        self._hooks: Dict[str, List[_Registration]] = {}
 
         # Computed values registry: {name: ComputedValue}
         # Seeded from the module-level @computed registry so decorators that
@@ -394,10 +455,8 @@ class StateStore:
         for _name, (_selector, _fn) in _COMPUTED_REGISTRY.items():
             self._computed[_name] = ComputedValue(_name, _selector, _fn)
 
-        # Batch membership is task-scoped and lives in ``_batching.py``, not
-        # on the store: two tasks batching at once must not share one depth
-        # counter and one buffer, which read as a single nested batch and let
-        # whichever exited last flush both.
+        # Batch membership lives in ``_batching.py``, per task: two tasks
+        # batching at once must not share one buffer.
 
         # Views that have undo enabled: {view_id: undo_limit}
         # Populated by StatefulView.__init__ when enable_undo = True
@@ -408,19 +467,49 @@ class StateStore:
 
         # Instance index: (view_type, scope_key) -> [view_id, ...] oldest-first
         self._instance_index: Dict[tuple, list] = {}
+        # view id -> the (view_type, scope_key) keys it is filed under, so it
+        # leaves the ones it was filed under even after its scope changes.
+        self._instance_keys: Dict[str, set] = {}
 
-        # Message deletion cleanup listener
-        self._cleanup_listener_installed = False
+        # Which registered views hold a persistence key, and which carry a
+        # registration's message id, oldest-first. The second is what a view
+        # pushed from a panel holds instead of the key.
+        self._views_by_key: Dict[str, list] = {}
+        self._views_by_message: Dict[str, list] = {}
+
+        # The bots the gateway listeners are installed on; a restart that
+        # builds a new bot object adds one (see _install_message_cleanup).
+        self._cleanup_listener_bots: "weakref.WeakSet" = weakref.WeakSet()
+        # The discord.py view stores that answer a click from an earlier
+        # render (see _answer_stale_clicks); a bot's clear() replaces its store.
+        self._stale_click_stores: "weakref.WeakSet" = weakref.WeakSet()
+        # Views a bot's close released that code may still hold, for linking
+        # to the panel restored in their place (see _release_views_of).
+        self._released_refs: "weakref.WeakSet" = weakref.WeakSet()
+        # Ids of every view a bot's close released (see _drop_released).
+        self._released_ids: set = set()
+        # Set when a release left persistent panels for a restart to restore.
+        self._restore_owed = False
+        # The state turn (see _state_turn): its lock, made for the running
+        # loop, and the task holding it with what it is doing.
+        self._state_lock: Optional[Tuple[asyncio.AbstractEventLoop, asyncio.Lock, List[int]]] = None
+        self._state_holder: Optional["asyncio.Task"] = None
+        self._state_holder_label: Optional[str] = None
+        self._state_holder_action: Optional[str] = None
+        # Identifies one turn, so a task a reducer started is known only
+        # while that reducer runs.
+        self._state_token: Optional[object] = None
+        # Writes outside a reducer held until the holder gives the turn back
+        # (see _write_when_free).
+        self._state_pending: List[Callable[[], None]] = []
+        # Open batches holding undo steps; an undo of a view whose history one
+        # of them adds to waits for it (see _wait_for_undo_batches).
+        self._undo_batches: List["BatchContext"] = []
 
         # Task management
         self.task_manager = get_task_manager()
 
-        # Per-dispatch profiling (opt-in; disabled by default so there is
-        # zero cost on the hot path when no one is looking). When enabled,
-        # every ``dispatch()`` records a sample into ``_perf_samples``
-        # with timing for the reducer + middleware chain, the subscriber
-        # notification fan-out, and total wall time. See ``enable_perf``
-        # / ``disable_perf`` / ``clear_perf``.
+        # Per-dispatch profiling, off by default (see ``enable_perf``).
         import collections as _collections
 
         self._perf_enabled: bool = False
@@ -430,18 +519,13 @@ class StateStore:
         # from ``_perf_samples`` because the record shape is different
         # (per-view Discord edit, not per-dispatch).
         self._refresh_samples: _collections.deque = _collections.deque(maxlen=100)
-        # Per-dispatch edit counter. Pushed at the start of a profiled
-        # dispatch, incremented by ``refresh()`` when an actual Discord
-        # edit fires (not when the render-hash short-circuit skips),
-        # popped at the end to record the tally. A list-stack handles
-        # nested dispatches (a subscriber's ``on_state_changed``
-        # dispatching its own action) without double-counting.
+        # Edit-count frames of profiled dispatches, pushed as one starts and
+        # removed by identity when it ends. ``_CURRENT_EDIT_COUNTER`` carries
+        # the attribution; ``_record_edit`` falls back to the top frame.
         self._perf_edit_stack: list = []
-        # Per-subscriber timing samples. Populated by ``_safe_notify``
-        # when profiling is on. Larger maxlen than ``_perf_samples``
-        # because a single dispatch can fan out to many subscribers,
-        # and the ring buffer needs to hold a useful window of them.
-        # Each sample: {subscriber_id, action, ms, timestamp}.
+        # Per-subscriber timings from ``_safe_notify`` while profiling, each
+        # {subscriber_id, action, ms, timestamp}; longer than ``_perf_samples``,
+        # since one dispatch fans out to many subscribers.
         self._notify_samples: _collections.deque = _collections.deque(maxlen=500)
 
         self._initialized = True
@@ -455,9 +539,9 @@ class StateStore:
         ``reducer_ms``, ``middleware_ms``, ``notify_ms``, ``hooks_ms``,
         ``subscribers``, ``edits``, ``timestamp``.  Per-subscriber
         callback timings accumulate separately in ``_notify_samples``
-        (capped at 500) -- one entry per subscriber per dispatch.
+        (capped at 500), one entry per subscriber per dispatch.
         Overhead while enabled is a handful of ``time.perf_counter()``
-        calls per dispatch -- negligible relative to a REST round-trip
+        calls per dispatch: negligible relative to a REST round-trip
         but non-zero, so the default is off.
         """
         self._perf_enabled = True
@@ -583,60 +667,365 @@ class StateStore:
         """
         return any(isinstance(m, middleware_cls) for m in self._middleware)
 
-    async def _run_middleware_chain(self, action: Action, reducer_fn) -> StateData:
-        """Build and execute the middleware chain ending at the reducer."""
+    async def _take_state_turn(
+        self, label: Optional[str] = None, action: Optional[str] = None
+    ) -> Optional[asyncio.Lock]:
+        """Take the store's state for one writer at a time; ``None`` if this task holds it.
+
+        A reducer runs inside the turn, from reading the state to committing
+        its result, so a reducer that awaits cannot return a state from before
+        its await over a change committed meanwhile. The other writers outside
+        a reducer, the undo entries a batch records and devtools' reset, take
+        it too. The taker is named by ``label``, or by the ``action`` whose
+        reducer runs. A wait of ``_STATE_TURN_WAIT_WARN_SECONDS`` is logged,
+        naming the holder. Give the lock back with :meth:`_give_state_turn`.
+        """
+        current = asyncio.current_task()
+        if current is not None and current is self._state_holder:
+            return None
+        loop = asyncio.get_running_loop()
+        if self._state_lock is None or self._state_lock[0] is not loop:
+            # A bot run twice through asyncio.run uses two loops, and a lock
+            # one loop waited on refuses the other.
+            self._state_lock = (loop, asyncio.Lock(), [0])
+        _, lock, waiting = self._state_lock
+        # Waiters are counted because a released lock reads free before the
+        # waiter it woke takes it, and acquire() still queues then.
+        if lock.locked() or waiting[0]:
+            waiting[0] += 1
+            watchdog = loop.call_later(
+                _STATE_TURN_WAIT_WARN_SECONDS, self._warn_long_state_wait, label, action
+            )
+            try:
+                await lock.acquire()
+            finally:
+                waiting[0] -= 1
+                watchdog.cancel()
+        else:
+            await lock.acquire()
+        self._state_holder = current
+        self._state_holder_label, self._state_holder_action = label, action
+        self._state_token = object()
+        return lock
+
+    def _give_state_turn(self, lock: Optional[asyncio.Lock]) -> None:
+        """Give back a turn :meth:`_take_state_turn` took, after the writes held for it."""
+        if lock is None or self._state_lock is None or lock is not self._state_lock[1]:
+            # A turn taken on a loop that has since closed: the store has a new
+            # lock, and whoever holds that turn is not this caller.
+            return
+        try:
+            while self._state_pending:
+                write = self._state_pending.pop(0)
+                try:
+                    write()
+                except Exception:
+                    logger.exception("A state write held for the state turn failed")
+        finally:
+            self._state_holder = self._state_holder_label = self._state_holder_action = None
+            self._state_token = None
+            lock.release()
+
+    def _held_elsewhere(self) -> bool:
+        """Whether a reducer in another task of the running loop holds the turn.
+
+        A holder from a loop that has since closed holds nothing.
+        """
+        holder = self._state_holder
+        if holder is None:
+            return False
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        return holder.get_loop() is loop and holder is not asyncio.current_task()
+
+    def _records_step_on(self, records, view_id: str) -> bool:
+        """Whether any of a batch's undo records puts a step on ``view_id``'s history.
+
+        The rule UndoMiddleware places the step by: on the source view, or on
+        the view it has since handed its panel on to.
+        """
+        for _seq, source_id, *_record, view in records:
+            if source_id in self._released_ids:
+                continue
+            if view is not None and view._successor is not None:
+                if view._last_successor().id == view_id:
+                    return True
+            elif source_id == view_id:
+                return True
+        return False
+
+    def _note_undo_batch(self, batch: "BatchContext") -> None:
+        """Record that ``batch`` holds undo steps."""
+        if not any(held is batch for held in self._undo_batches):
+            self._undo_batches.append(batch)
+
+    def _forget_undo_batch(self, batch: "BatchContext") -> None:
+        """Drop ``batch`` once its steps are placed, and release waiters."""
+        self._undo_batches = [held for held in self._undo_batches if held is not batch]
+        batch._settled.set()
+
+    def _pending_undo_batches(self, view_id: str) -> List["BatchContext"]:
+        """Other tasks' open batches holding undo steps for ``view_id``.
+
+        A batch in the caller's own lineage is left out, since it cannot exit
+        before the caller does.
+        """
+        lineage = _ACTIVE_BATCHES.get()
+        return [
+            batch
+            for batch in self._undo_batches
+            if not batch._undo_wait_expired
+            and not any(batch is own for own in lineage)
+            and batch._holds_steps_for(view_id)
+        ]
+
+    async def _wait_for_undo_batches(self, view_id: str) -> bool:
+        """Wait for other tasks' open batches holding undo steps for ``view_id``.
+
+        A batch's steps join the view's history only at its exit, so an undo
+        run meanwhile would undo an older step over the batch's writes and
+        leave the batch's step restoring an undone value. Past
+        ``_UNDO_BATCH_WAIT_SECONDS`` the undo goes ahead and says so, and this
+        returns ``False``.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _UNDO_BATCH_WAIT_SECONDS
+        while True:
+            pending = self._pending_undo_batches(view_id)
+            if not pending:
+                return True
+            remaining = deadline - loop.time()
+            try:
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                await _bounded_wait(pending[0]._settled.wait(), remaining)
+            except asyncio.TimeoutError:
+                for batch in pending:
+                    batch._undo_wait_expired = True
+                logger.warning(
+                    f"An undo or redo of view {view_id} waited {_UNDO_BATCH_WAIT_SECONDS:g}s "
+                    f"for a batch holding its steps to finish, and goes ahead without it."
+                )
+                return False
+
+    def _write_when_free(self, write: Callable[[], None]) -> None:
+        """Run ``write``, a synchronous state write, now or after the turn's holder commits.
+
+        For writers outside a reducer that cannot wait for the turn: while a
+        reducer in another task holds it, a write made now would be replaced
+        by that reducer's result, so it runs just before the turn is given
+        back instead.
+        """
+        if self._held_elsewhere():
+            self._state_pending.append(write)
+        else:
+            write()
+
+    async def _write_in_turn(self, write: Callable[[], None], label: str) -> None:
+        """Run ``write`` in the state turn, waiting while another task holds it.
+
+        For a write something reads right after, which :meth:`_write_when_free`
+        would leave waiting behind the holder. A cancel during the wait leaves
+        it to run as the holder gives the turn back.
+        """
+        if not self._held_elsewhere():
+            write()
+            return
+        try:
+            lock = await self._take_state_turn(label)
+        except asyncio.CancelledError:
+            self._write_when_free(write)
+            raise
+        try:
+            write()
+        finally:
+            self._give_state_turn(lock)
+
+    @contextlib.asynccontextmanager
+    async def _state_turn(self, label: str):
+        """Hold the state turn (see :meth:`_take_state_turn`) for a block."""
+        lock = await self._take_state_turn(label)
+        try:
+            yield
+        finally:
+            self._give_state_turn(lock)
+
+    @staticmethod
+    def _turn_taker(label: Optional[str], action: Optional[str]) -> str:
+        return label or f"the reducer for {action!r}"
+
+    def _state_holder_name(self) -> str:
+        return self._turn_taker(self._state_holder_label, self._state_holder_action)
+
+    def _warn_long_state_wait(self, label: Optional[str], action: Optional[str]) -> None:
+        """Log a state-turn wait that has lasted ``_STATE_TURN_WAIT_WARN_SECONDS``."""
+        holder = self._state_holder_name() if self._state_holder else "another reducer"
+        logger.warning(
+            f"{self._turn_taker(label, action)} has waited "
+            f"{_STATE_TURN_WAIT_WARN_SECONDS:g}s for {holder} to return. Reducers "
+            f"run one at a time, so a reducer that awaits holds up every dispatch "
+            f"until it returns, and one waiting on a dispatch of its own (from a "
+            f"task it created or awaits) never returns. Do slow work before "
+            f"dispatching and pass its result in the payload."
+        )
+
+    async def _run_middleware_chain(self, action: Action, reducer_fn, run: "_ChainRun") -> None:
+        """Build and execute the middleware chain ending at the reducer.
+
+        ``run`` records whether the reducer step ran, the batch sequence
+        taken then, and an exception a middleware raised after it, which the
+        caller re-raises once the action is announced.
+        """
+
+        # The state last handed down the chain. A middleware that awaits before
+        # next_fn passes on what the store held when it was called, and reducing
+        # that would undo a commit made since, so the live state replaces it. A
+        # mapping a middleware built is reduced as written.
+        handed = [self.state]
+        on_commit: List[Callable[[StateData, StateData], None]] = []
 
         async def run_reducer(act, state):
-            # When profiling is on, record the reducer-only wall time into the
-            # slot this dispatch bound, so the dispatch site can subtract it
-            # from the chain total to derive ``middleware_ms``. Reached through
-            # a contextvar rather than a shared stack: a batched action binds
-            # no slot, and writing to the top of a shared one overwrote the
-            # timing of whichever unbatched dispatch was running concurrently.
-            reducer_slot = _CURRENT_REDUCER_MS.get()
-            perf = self._perf_enabled and reducer_slot is not None
-            if perf:
-                r0 = time.perf_counter()
-            if reducer_fn:
-                try:
-                    new_state = await reducer_fn(act, state)
-                    # A reducer that declines an action returns the object it
-                    # was handed. Rebinding it would revert whatever committed
-                    # while this dispatch was suspended in the chain above.
-                    if new_state is not state:
-                        self.state = new_state
-                    logger.debug(f"State updated by reducer for {act['type']}")
-                except Exception as e:
-                    logger.error(f"Error in reducer for {act['type']}: {e}", exc_info=True)
-            else:
-                # Lazy import, same cycle as _load_core_reducers: reducers.py
-                # reaches back into this module via the middleware package.
-                from .reducers import _BUILTIN_REDUCER_ACTIONS
-
-                action_type = act["type"]
-                if action_type in _BUILTIN_REDUCER_ACTIONS:
-                    # The real property is "library-declared dispatch-only",
-                    # never a typo. "Has a listener" is a proxy that fails
-                    # here: subscriber filters default to an empty set, so the
-                    # manager's prune signals arrive listener-less by default.
-                    logger.debug(f"No reducer for {action_type} (dispatch-only built-in)")
+            if self._state_holder is not None and self._state_holder is asyncio.current_task():
+                # Waiting would never end: this task holds the turn.
+                raise RuntimeError(
+                    f"dispatch({act['type']!r}) was called from inside "
+                    f"{self._state_holder_name()}. A reducer's result replaces the "
+                    f"state, so an action dispatched from inside one is lost. "
+                    f"Dispatch it after the first dispatch returns."
+                )
+            inside = _IN_REDUCER.get()
+            if inside is not None and inside[0] is self and inside[1] is self._state_token:
+                # A task the running reducer started: the dispatch would wait
+                # for the reducer, which never returns if it awaits the task.
+                raise RuntimeError(
+                    f"dispatch({act['type']!r}) was called from a task started inside "
+                    f"{self._state_holder_name()} while it runs. The dispatch waits "
+                    f"for that reducer, so a reducer awaiting it never returns. "
+                    f"Dispatch it after the first dispatch returns, or from a "
+                    f"store.on() hook."
+                )
+            lock = await self._take_state_turn(action=act["type"])
+            skipped = False
+            try:
+                if act["type"] in ("UNDO", "REDO"):
+                    # undo() waits before dispatching, but a batch can open while
+                    # the middlewares above await, so the check is made again
+                    # here, holding the turn, where no batch records a step unseen.
+                    payload = act.get("payload")
+                    undone = payload.get("view_id") if isinstance(payload, dict) else None
+                    # A view that hands its panel on during a wait takes its
+                    # history along, so the undo follows it there.
+                    following = self._active_views.get(undone)
+                    if following is None:
+                        named = _SOURCE_VIEW.get()
+                        following = named if getattr(named, "id", None) == undone else None
+                    if following is not None and following._successor is not None:
+                        following = None
+                    while self._pending_undo_batches(undone):
+                        if state is not handed[0]:
+                            # A middleware built this state before the batch's
+                            # writes, and reducing it after the wait erases them.
+                            skipped = True
+                            logger.warning(
+                                f"Skipped {act['type']} for view {undone}: another task's batch "
+                                f"on the view is open, and a middleware passed on a state built "
+                                f"before its writes. Undo again once the batch has ended."
+                            )
+                            break
+                        self._give_state_turn(lock)
+                        lock = None
+                        clear = await self._wait_for_undo_batches(undone)
+                        lock = await self._take_state_turn(action=act["type"])
+                        if following is not None and following._successor is not None:
+                            following = following._last_successor()
+                            undone = following.id
+                            payload = {
+                                **payload,
+                                "view_id": undone,
+                                "session_id": following.session_id,
+                            }
+                            act = {**act, "payload": payload}
+                        if not clear:
+                            break
+                if state is handed[0]:
+                    state = self.state
+                # The reducer's own time goes to the slot this dispatch bound, so
+                # the dispatch can derive ``middleware_ms``. A contextvar, since a
+                # shared slot would take a concurrent dispatch's timing.
+                reducer_slot = _CURRENT_REDUCER_MS.get()
+                perf = self._perf_enabled and reducer_slot is not None
+                if perf:
+                    r0 = time.perf_counter()
+                if skipped:
+                    pass
+                elif reducer_fn:
+                    try:
+                        reducing = _IN_REDUCER.set((self, self._state_token))
+                        try:
+                            new_state = await reducer_fn(act, state)
+                        finally:
+                            try:
+                                _IN_REDUCER.reset(reducing)
+                            except ValueError:
+                                # Closed from another context, as collecting a
+                                # reducer left on a closed loop does.
+                                pass
+                            # The reducer alone: the commit callbacks below are
+                            # middleware work.
+                            if perf:
+                                reducer_slot[0] = (time.perf_counter() - r0) * 1000
+                                perf = False
+                        # A reducer that declines an action returns the object it
+                        # was handed. Rebinding it would revert whatever committed
+                        # while this dispatch was suspended in the chain above.
+                        if new_state is not state:
+                            prior = self.state
+                            self.state = new_state
+                            for callback in list(on_commit):
+                                try:
+                                    callback(prior, new_state)
+                                except Exception:
+                                    logger.exception(f"Commit callback failed for {act['type']}")
+                        logger.debug(f"State updated by reducer for {act['type']}")
+                    except Exception as e:
+                        logger.error(f"Error in reducer for {act['type']}: {e}", exc_info=True)
                 else:
-                    # User broadcasts without a reducer are normal when
-                    # something is listening; an unknown type nobody listens
-                    # for is the typo case and keeps the warning. Both
-                    # registration routes count: on() takes a raw action type
-                    # and _fire_hooks dispatches on it, so a hook is a
-                    # listener even when no subscriber filters for the action.
-                    has_listener = action_type in self._hooks or any(
-                        flt is None or action_type in flt for _, flt, _ in self.subscribers.values()
-                    )
-                    if has_listener:
-                        logger.debug(f"No reducer for {action_type} (broadcast-only)")
+                    # Lazy import, same cycle as _load_core_reducers: reducers.py
+                    # reaches back into this module via the middleware package.
+                    from .reducers import _BUILTIN_REDUCER_ACTIONS
+
+                    action_type = act["type"]
+                    if action_type in _BUILTIN_REDUCER_ACTIONS:
+                        # The real property is "library-declared dispatch-only",
+                        # never a typo. "Has a listener" is a proxy that fails
+                        # here: subscriber filters default to an empty set, so the
+                        # manager's prune signals arrive listener-less by default.
+                        logger.debug(f"No reducer for {action_type} (dispatch-only built-in)")
                     else:
-                        logger.warning(f"No reducer found for action type {action_type}")
-            if perf:
-                reducer_slot[0] = (time.perf_counter() - r0) * 1000
-            return self.state
+                        # With no reducer, an action something listens for (a hook
+                        # or a subscriber filter) is a broadcast; one nobody
+                        # listens for is likely a typo and keeps the warning.
+                        has_listener = action_type in self._hooks or any(
+                            flt is None or action_type in flt
+                            for _, flt, _ in self.subscribers.values()
+                        )
+                        if has_listener:
+                            logger.debug(f"No reducer for {action_type} (broadcast-only)")
+                        else:
+                            logger.warning(f"No reducer found for action type {action_type}")
+                if perf:
+                    reducer_slot[0] = (time.perf_counter() - r0) * 1000
+                # From here the action is announced whatever the chain does next.
+                # The stamp is taken whether or not the reducer committed, so a
+                # batch announces its actions in the order the store applied them.
+                run.reduced = True
+                if run.stamp is None:
+                    run.stamp = next_commit_sequence()
+                return self.state
+            finally:
+                self._give_state_turn(lock)
 
         # Build the chain from inside out: last middleware wraps the reducer,
         # second-to-last wraps that, etc. Default args capture loop variables.
@@ -645,13 +1034,70 @@ class StateStore:
 
             def wrap(middleware=mw, next_fn=chain):
                 async def step(act, state):
+                    if state is handed[0]:
+                        state = handed[0] = self.state
                     return await middleware(act, state, next_fn)
 
                 return step
 
             chain = wrap()
 
-        return await chain(action, self.state)
+        token = _ON_COMMIT.set(on_commit)
+        # A view a push or pop has torn down is gone from the registry, and its
+        # own dispatch() names it instead.
+        named = _SOURCE_VIEW.get()
+        source = _SOURCE_VIEW.set(
+            self._active_views.get(action.get("source"))
+            or (named if getattr(named, "id", None) == action.get("source") else None)
+        )
+        try:
+            await chain(action, self.state)
+        except asyncio.CancelledError:
+            # Cancelled after the reducer step: a change it committed stands,
+            # so the action is still announced, by the batch collecting it or
+            # from a task.
+            if run.reduced:
+                self._announce_later(action, run)
+            raise
+        except Exception as exc:
+            # Raised by a middleware after the reducer step: the action is
+            # announced before the error reaches the caller.
+            if not run.reduced:
+                raise
+            run.error = exc
+        finally:
+            _SOURCE_VIEW.reset(source)
+            _ON_COMMIT.reset(token)
+
+    def _announce_later(self, action: Action, run: "_ChainRun") -> None:
+        """Tell subscribers about an action whose dispatch was cancelled after its reducer step.
+
+        The batch collecting it announces it in full. Otherwise its
+        subscribers are told from a task, and its hooks, which had not
+        started, do not run.
+        """
+        batch = current_batch()
+        if batch is not None and batch.add_entry(action, run.stamp):
+            return
+        self.task_manager.create_task("state_store_notify", self._notify_subscribers(action))
+
+    async def _announce(self, action: Action, *hook_actions: Action) -> None:
+        """Tell subscribers about ``action``, then fire the hooks of ``hook_actions``.
+
+        ``hook_actions`` is ``action`` alone unless given; a batch passes its
+        actions followed by its ``BATCH_COMPLETE``.
+        """
+        await self._notify_subscribers(action)
+        await self._fire_hooks(*(hook_actions or (action,)))
+
+    @staticmethod
+    def _log_held_error(run: "_ChainRun", action_type: str) -> None:
+        """Log a middleware's error the announcement's own exception replaces."""
+        if run.error is not None:
+            logger.error(
+                f"A middleware raised after {action_type} was applied: {run.error}",
+                exc_info=run.error,
+            )
 
     # // ========================================( Batching )======================================== // #
 
@@ -724,27 +1170,37 @@ class StateStore:
         action_type = self._HOOK_ACTION_MAP.get(hook_name, hook_name)
         if action_type not in self._hooks:
             self._hooks[action_type] = []
-        self._hooks[action_type].append(callback)
+        self._hooks[action_type].append(_Registration(callback))
 
     def off(self, hook_name: str, callback: HookFn) -> None:
         """Remove a previously registered hook."""
         action_type = self._HOOK_ACTION_MAP.get(hook_name, hook_name)
         if action_type in self._hooks:
-            try:
-                self._hooks[action_type].remove(callback)
-            except ValueError:
-                pass
+            registrations = self._hooks[action_type]
+            for index, registration in enumerate(registrations):
+                if registration.callback is callback or registration.callback == callback:
+                    del registrations[index]
+                    break
             if not self._hooks[action_type]:
                 del self._hooks[action_type]
 
-    async def _fire_hooks(self, action: Action) -> None:
-        """Fire all hooks registered for this action type."""
-        hooks = self._hooks.get(action["type"], [])
-        for hook in hooks:
-            try:
-                await await_maybe(hook(action, self.state))
-            except Exception as e:
-                logger.error(f"Error in hook for {action['type']}: {e}", exc_info=True)
+    async def _fire_hooks(self, *actions: Action) -> None:
+        """Fire the hooks registered for each action, in order.
+
+        Each action's hooks are read when its turn comes, and a registration
+        ``off()`` removed before its call is skipped, so a batch calls the
+        hooks its actions dispatched one by one would. A hook added during an
+        action's turn is first called for the next action. A cancel ends the
+        firing: the hooks not yet started do not run.
+        """
+        for action in actions:
+            for hook in list(self._hooks.get(action["type"], ())):
+                if not any(entry is hook for entry in self._hooks.get(action["type"], ())):
+                    continue
+                try:
+                    await await_maybe(hook.callback(action, self.state))
+                except Exception as e:
+                    logger.error(f"Error in hook for {action['type']}: {e}", exc_info=True)
 
     # // ========================================( Computed State )======================================== // #
 
@@ -919,10 +1375,17 @@ class StateStore:
         slot_name: str = "scoped",
         **identifiers,
     ) -> None:
-        """Set scoped state directly (prefer dispatch for tracked changes)."""
+        """Set scoped state directly (prefer dispatch for tracked changes).
+
+        A reducer running in another task commits first, and this write lands
+        after it.
+        """
         scope_key = self._build_scope_key(scope, **identifiers)
-        bucket = access_slot(self.state, slot_name)
-        bucket[scope_key] = data
+
+        def write():
+            access_slot(self.state, slot_name)[scope_key] = data
+
+        self._write_when_free(write)
 
     @staticmethod
     def merge_scoped(
@@ -1029,19 +1492,67 @@ class StateStore:
 
     # // ========================================( View Registry )======================================== // #
 
-    def _add_to_instance_index(self, view_id: str, view_type: str, scope_key: str) -> None:
-        """Add a view ID to the instance index under the given type+scope key."""
-        key = (view_type, scope_key)
-        self._instance_index.setdefault(key, []).append(view_id)
+    @staticmethod
+    def _index_add(index: dict, key, view_id: str) -> None:
+        """Append a view id to one bucket of a view index."""
+        index.setdefault(key, []).append(view_id)
 
-    def _remove_from_instance_index(self, view_id: str, view_type: str, scope_key: str) -> None:
-        """Remove a view ID from the instance index for the given type+scope key."""
-        key = (view_type, scope_key)
-        ids = self._instance_index.get(key, [])
+    @staticmethod
+    def _index_remove(index: dict, key, view_id: str) -> None:
+        """Remove a view id from one bucket of a view index, dropping it when empty."""
+        ids = index.get(key, [])
         if view_id in ids:
             ids.remove(view_id)
             if not ids:
-                del self._instance_index[key]
+                del index[key]
+
+    def _indexed_views(self, index: dict, key) -> list:
+        """The registered views in one bucket of a view index, newest first."""
+        ids = index.get(key, ())
+        return [self._active_views[vid] for vid in reversed(ids) if vid in self._active_views]
+
+    def _add_to_instance_index(self, view_id: str, view_type: str, scope_key: str) -> None:
+        """Add a view ID to the instance index under the given type+scope key."""
+        self._index_add(self._instance_index, (view_type, scope_key), view_id)
+        self._instance_keys.setdefault(view_id, set()).add((view_type, scope_key))
+
+    def _remove_from_instance_index(self, view_id: str, view_type: str, scope_key: str) -> None:
+        """Remove a view ID from the instance index for the given type+scope key."""
+        self._index_remove(self._instance_index, (view_type, scope_key), view_id)
+        keys = self._instance_keys.get(view_id)
+        if keys is not None:
+            keys.discard((view_type, scope_key))
+            if not keys:
+                del self._instance_keys[view_id]
+
+    def _reindex_instance(self, view) -> None:
+        """File a registered view again under the keys its current scope gives."""
+        if view.id not in self._active_views:
+            return
+        for view_type, scope_key in list(self._instance_keys.get(view.id, ())):
+            self._remove_from_instance_index(view.id, view_type, scope_key)
+        scope_key = self._build_instance_scope_key(view)
+        if scope_key is not None:
+            view_type = (
+                getattr(view, "_instance_root_class", None) or view.__class__._class_session_key()
+            )
+            self._add_to_instance_index(view.id, view_type, scope_key)
+        for user_id in getattr(view, "_participants", set()):
+            self._register_participant(view, user_id)
+
+    def _reindex_registry_message(self, view, previous, current) -> None:
+        """Move a registered view between registration-message buckets.
+
+        A send stamps the id after the view registers, and a navigation's
+        commit or rollback clears it on a registered view, so the index is kept
+        current where the id is written rather than only at registration.
+        """
+        if view.id not in self._active_views:
+            return
+        if previous is not None:
+            self._index_remove(self._views_by_message, previous, view.id)
+        if current is not None:
+            self._index_add(self._views_by_message, current, view.id)
 
     def _register_view(self, view) -> None:
         """Register a live view instance. Internal plumbing. Idempotent.
@@ -1052,6 +1563,13 @@ class StateStore:
         """
         already_registered = view.id in self._active_views
         self._active_views[view.id] = view
+        if not already_registered:
+            key = getattr(view, "_persistence_key", None)
+            if key is not None:
+                self._index_add(self._views_by_key, key, view.id)
+            message_id = getattr(view, "_registry_message_id", None)
+            if message_id is not None:
+                self._index_add(self._views_by_message, message_id, view.id)
         scope_key = self._build_instance_scope_key(view)
         if scope_key is not None and not already_registered:
             view_type = (
@@ -1067,6 +1585,13 @@ class StateStore:
         """
         view = self._active_views.pop(view_id, None)
         if view is not None:
+            key = getattr(view, "_persistence_key", None)
+            if key is not None:
+                self._index_remove(self._views_by_key, key, view_id)
+            message_id = getattr(view, "_registry_message_id", None)
+            if message_id is not None:
+                self._index_remove(self._views_by_message, message_id, view_id)
+
             view_type = (
                 getattr(view, "_instance_root_class", None) or view.__class__._class_session_key()
             )
@@ -1102,12 +1627,26 @@ class StateStore:
 
         Idempotent and safe under double-teardown. Returns ``True`` when the
         view was fully removed, ``False`` when the state removal did not land
-        and the active-registry entry was retained.
+        and the active-registry entry was retained. A view a bot's close
+        released left without an action, and is removed the same way here.
         """
+        if view_id in self._released_ids:
+            self._drop_released({view_id})
+            return True
+        payload = ActionCreators.view_destroyed(view_id)
+        if view_id not in self.state.get("views", {}):
+            # A send rolled back before its VIEW_CREATED landed: the session
+            # its SESSION_CREATED made goes too, unless another registered view
+            # (a concurrent send not yet in it) names it.
+            view = self._active_views.get(view_id)
+            session_id = getattr(view, "session_id", None)
+            if session_id is not None and not any(
+                other is not view and getattr(other, "session_id", None) == session_id
+                for other in self._active_views.values()
+            ):
+                payload = ActionCreators.view_destroyed(view_id, session_id=session_id)
         try:
-            await self.dispatch(
-                "VIEW_DESTROYED", ActionCreators.view_destroyed(view_id), source_id=source_id
-            )
+            await self.dispatch("VIEW_DESTROYED", payload, source_id=source_id)
         except Exception:
             # Log and fall through to the post-dispatch state check below: if
             # the reducer ran before the exception (state already clean), the
@@ -1118,11 +1657,9 @@ class StateStore:
                 f"checking whether the state entry was removed."
             )
         finally:
-            # Clear the active entry only once state confirms the removal. The
-            # finally clause also covers a cancellation mid-dispatch: when the
-            # reducer already removed the state entry before the await was
-            # cancelled, the active entry still gets cleared, so a cancelled
-            # teardown cannot leave the view stranded in _active_views.
+            # The active entry clears only once state confirms the removal, and
+            # in the finally, so a cancel landing after the reducer removed the
+            # state entry still clears it.
             if view_id not in self.state.get("views", {}):
                 self._unregister_view(view_id)
         if view_id not in self.state.get("views", {}):
@@ -1134,10 +1671,22 @@ class StateStore:
         return False
 
     def _get_active_views(self, view_type: str, scope_key: str) -> list:
-        """Return active view instances for a type+scope, oldest-first. Internal plumbing."""
+        """Return active view instances for a type+scope, oldest-first. Internal plumbing.
+
+        Counts each panel once. A push or pop destination still arriving is
+        left out, since its source stands for the panel until the edit
+        lands, and so is a view already torn down (a source that handed its
+        message over, a discarded destination, an exiting view), whose slot
+        is free before its registration is removed.
+        """
         key = (view_type, scope_key)
         ids = self._instance_index.get(key, [])
-        return [self._active_views[vid] for vid in ids if vid in self._active_views]
+        views = [self._active_views[vid] for vid in ids if vid in self._active_views]
+        return [
+            view
+            for view in views
+            if getattr(view, "_arriving_from", None) is None and view.id in self.subscribers
+        ]
 
     def get_active_views(self) -> Mapping[str, Any]:
         """Read-only view of the active view registry (view_id -> view instance).
@@ -1167,7 +1716,9 @@ class StateStore:
         destination carries the registration id without the key. That view is
         returned, so this answers "what is live on this key's registration"
         for every shape, which is the question a swap and a prune pre-flight
-        both ask. It is not always a persistent view.
+        both ask. It is not always a persistent view. A view a ``push()`` or
+        ``pop()`` is still bringing in is not returned until its edit lands:
+        the view it would replace is still the one on screen.
 
         The argument is keyword-only because ``get_active_views()`` is keyed
         by view id, and a view id passed here would match nothing.
@@ -1176,7 +1727,7 @@ class StateStore:
         owner_message = entry.get("message_id") if entry else None
         newest = None
         for view in self._views_for_key(persistence_key):
-            if view.is_finished():
+            if view.is_finished() or getattr(view, "_arriving_from", None) is not None:
                 continue
             if (
                 owner_message is not None
@@ -1189,33 +1740,33 @@ class StateStore:
         # under the key does not shadow the view sitting on the registered
         # message. Only reached when no key holder carried that id.
         if owner_message is not None:
-            for view in reversed(list(self._active_views.values())):
-                if (
-                    not view.is_finished()
-                    and getattr(view, "_registry_message_id", None) == owner_message
-                ):
+            for view in self._views_for_message(owner_message):
+                if not view.is_finished() and getattr(view, "_arriving_from", None) is None:
                     return view
         return newest
 
     def _views_for_key(self, persistence_key: str) -> list:
         """Every registered view holding ``persistence_key``, newest first, finished included."""
-        return [
-            view
-            for view in reversed(list(self._active_views.values()))
-            if getattr(view, "_persistence_key", None) == persistence_key
-        ]
+        return self._indexed_views(self._views_by_key, persistence_key)
 
-    def _persistence_key_for_message(self, message_id: str) -> Optional[str]:
-        """The registration whose message is ``message_id``, or ``None``.
+    def _views_for_message(self, message_id: str) -> list:
+        """Every registered view carrying ``message_id`` as its registration, most
+        recently stamped first, finished included."""
+        return self._indexed_views(self._views_by_message, message_id)
+
+    def _persistence_keys_for_message(self, message_id: str) -> list:
+        """Every registration whose message is ``message_id``.
 
         The reverse of the usual lookup, for a view that carries a
         registration's message id without its key: after a ``push()`` the
-        panel's key rides the destination that way.
+        panel's key rides the destination that way. A key renamed in place
+        leaves the old row naming the same message, so there can be two.
         """
-        for key, entry in self.state.get("persistent_views", {}).items():
-            if entry.get("message_id") == message_id:
-                return key
-        return None
+        return [
+            key
+            for key, entry in self.state.get("persistent_views", {}).items()
+            if entry.get("message_id") == message_id
+        ]
 
     def _live_persistence_keys(self) -> set:
         """The registry keys a live persistent panel in this process owns.
@@ -1231,20 +1782,20 @@ class StateStore:
         not its key. A non-persistent view built with a matching key owns no
         registry row, so it protects none.
         """
-        keys = set()
-        owned_messages = set()
-        for view in self._active_views.values():
-            if view.is_finished():
-                continue
-            if getattr(view, "_persistent", False) and view._persistence_key is not None:
-                keys.add(view._persistence_key)
-            message_id = getattr(view, "_registry_message_id", None)
-            if message_id is not None:
-                owned_messages.add(message_id)
-        for key, entry in self.state.get("persistent_views", {}).items():
-            if entry.get("message_id") in owned_messages:
-                keys.add(key)
-        return keys
+        keys = set(self._views_by_key) | set(self.state.get("persistent_views", {}))
+        return {key for key in keys if self._holds_persistence_key(key)}
+
+    def _holds_persistence_key(self, key: str) -> bool:
+        """Whether a live panel owns ``key`` (see :meth:`_live_persistence_keys`)."""
+        if any(
+            getattr(view, "_persistent", False) and not view.is_finished()
+            for view in self._views_for_key(key)
+        ):
+            return True
+        message_id = self.state.get("persistent_views", {}).get(key, {}).get("message_id")
+        return message_id is not None and any(
+            not view.is_finished() for view in self._views_for_message(message_id)
+        )
 
     def _register_participant(self, view, user_id: int) -> None:
         """Add a participant's scope key to the instance index for a view.
@@ -1281,19 +1832,80 @@ class StateStore:
                 scope keys for participants (non-owner users tracked in the
                 instance index). Only affects "user" and "user_guild" scopes.
         """
-        # The instance index treats a falsy id as no id: an unindexed view
-        # is simply exempt from the limit, where a "user:0" bucket would
-        # silently pool every such view together. The scoped-state writer
-        # keeps the stricter is-None rule, since dropping a write is worse
-        # than skipping an index entry.
+        # A falsy id counts as no id: the view is exempt from the limit rather
+        # than pooled into one "user:0" bucket. The scoped-state writer keeps
+        # is-None, since a dropped write is worse than a skipped index entry.
         uid = user_id if user_id is not None else view.user_id
+        # A view pushed onto a chain is keyed by the root's scope, so the
+        # root's limit finds it.
         return StateStore.scope_key(
-            view.instance_scope,
+            getattr(view, "_instance_root_scope", None) or view.instance_scope,
             user_id=uid or None,
             guild_id=view.guild_id or None,
         )
 
     # // ========================================( Message Cleanup )======================================== // #
+
+    def _answer_stale_clicks(self, bot) -> None:
+        """Have the bot's view store answer a click sent from an earlier render.
+
+        A click carries the ``custom_id`` of the render its user saw. When a
+        re-render changes that id, as a generated id does when the button's
+        label counts something, discord.py finds no item for it and drops the
+        click unanswered, so the user sees "This interaction failed". On a
+        message a live view owns, such a click is acknowledged and logged as
+        dropped instead; nothing runs. Clicks on other messages, and dynamic
+        items, route as discord.py routes them. Once per view store.
+        """
+        from discord.ui.view import ViewStore
+
+        view_store = getattr(getattr(bot, "_connection", None), "_view_store", None)
+        if not isinstance(view_store, ViewStore) or view_store in self._stale_click_stores:
+            return
+        self._stale_click_stores.add(view_store)
+        store = self
+
+        def dispatch_view(component_type, custom_id, interaction):
+            try:
+                stale = store._stale_click_view(view_store, component_type, custom_id, interaction)
+            except Exception:
+                # The check reads discord.py's private tables; if a release
+                # changes them, clicks still route as discord.py routes them.
+                logger.exception("Could not check a click against the view on its message")
+                stale = None
+            # Through the class, so ViewStore tracing, which patches it there, still runs.
+            type(view_store).dispatch_view(view_store, component_type, custom_id, interaction)
+            if stale is not None:
+                stale._answer_stale_click(custom_id, interaction)
+
+        view_store.dispatch_view = dispatch_view
+
+    def _stale_click_view(self, view_store, component_type, custom_id, interaction):
+        """The live view on a click's message when nothing there takes the click, else ``None``.
+
+        Read before discord.py dispatches, with the same lookups: the
+        message's items, the items stored without a message, and the
+        dynamic item patterns. An item whose view is gone (``remove_item()``
+        detaches it at once, while the store keeps it until the edit lands)
+        takes nothing, and discord.py discards the click with a warning.
+        """
+        message = interaction.message
+        items = view_store._views.get(message.id) if message is not None else None
+        if not items:
+            return None
+        key = (component_type, custom_id)
+        item = items.get(key)
+        if item is None:
+            item = view_store._views.get(None, {}).get(key)
+        if item is not None and item.view is not None:
+            return None
+        if any(pattern.fullmatch(custom_id) for pattern in view_store._dynamic_items):
+            return None
+        for item in items.values():
+            view = item.view
+            if view is not None and self._active_views.get(getattr(view, "id", None)) is view:
+                return view
+        return None
 
     def _install_message_cleanup(self, bot) -> None:
         """Register gateway listeners that clean up views when their message is deleted.
@@ -1304,16 +1916,26 @@ class StateStore:
         and never as message deletions. Each routes to
         ``view.on_message_delete()`` for every view on a deleted message; one
         view's raising override does not stop the others. A bot without
-        message intents is still covered for a lone delete by the next edit,
-        which finds the message gone and tears the view down itself.
+        message intents, or a plain :class:`discord.Client`, which has no
+        listeners to add, is still covered for a lone delete by the next
+        edit, which finds the message gone and tears the view down itself.
 
-        Idempotent -- safe to call multiple times. Called automatically from
-        ``send()`` (on first successful send) and from
+        Once per bot object. Called automatically from ``send()`` and from
         :meth:`PersistenceMiddleware.initialize` when ``bot=`` is supplied.
+        The bot's views are also released when it closes (see
+        :meth:`_release_views_of`), and its view store answers a click sent
+        from an earlier render (see :meth:`_answer_stale_clicks`).
         """
-        if self._cleanup_listener_installed:
+        # Before the once-per-bot return: a bot's clear() replaces its store.
+        self._answer_stale_clicks(bot)
+        if bot in self._cleanup_listener_bots:
             return
-        self._cleanup_listener_installed = True
+        self._cleanup_listener_bots.add(bot)
+        # Before the new bot restores a panel or registers a send.
+        self._drop_released()
+        self._release_with(bot)
+        if not hasattr(bot, "listen"):
+            return
 
         store = self
 
@@ -1336,6 +1958,117 @@ class StateStore:
 
         logger.debug("Message deletion cleanup listener installed")
 
+    def _release_with(self, bot) -> None:
+        """Release the views sent through ``bot`` when it closes.
+
+        discord.py has no shutdown event, so ``close()`` is wrapped on the
+        instance, and the release runs after it, so a ``close()`` override
+        on the bot's class still acts on live views.
+        """
+        closes = bot.close
+        store = self
+
+        async def close(*args, **kwargs):
+            try:
+                return await closes(*args, **kwargs)
+            finally:
+                store._release_views_of(bot)
+
+        # Another wrapper's marker stays readable through this one.
+        close.__dict__.update(getattr(closes, "__dict__", {}))
+        bot.close = close
+
+    def _release_views_of(self, bot) -> None:
+        """Release, as a process restart would, the views sent through ``bot``.
+
+        A closed bot never routes a click again: discord.py cannot log it in
+        again, so a restart in the same process builds a new bot object. Each
+        view sent through it stops, with its timer and tasks, and nothing is
+        edited. Code awaiting a view's ``wait()`` ends as it does when the
+        process ends. The views leave the registry and the state, their
+        sessions with them, and nothing is dispatched: a process restart runs
+        no hook or middleware for the old process's views either, and one run
+        here would run at every shutdown or ahead of the next bot's boot. A
+        persistent panel keeps its registration, and is restored when a new
+        bot's ``setup_hook`` runs :func:`~cascadeui.setup_middleware` again.
+        """
+        if not bot.is_closed():
+            return
+        manager = getattr(self, "persistence_manager", None)
+        keys_by_message: Dict[Any, List[str]] = {}
+        for key, entry in self.state.get("persistent_views", {}).items():
+            keys_by_message.setdefault(entry.get("message_id"), []).append(key)
+        released = []
+        for view in list(self._active_views.values()):
+            if view._client() is not bot:
+                continue
+            keys = set()
+            if getattr(view, "persistence_key", None):
+                keys.add(view.persistence_key)
+            registered = getattr(view, "_registry_message_id", None)
+            if registered is not None:
+                keys.update(keys_by_message.get(registered, ()))
+            try:
+                view._release_for_restart()
+            except Exception as exc:
+                logger.error(
+                    f"{type(view).__name__} could not be released when "
+                    f"{type(bot).__name__} closed: {exc}",
+                    exc_info=exc,
+                )
+                continue
+            view._released_keys = keys
+            released.append(view)
+            self._released_refs.add(view)
+            if keys:
+                self._restore_owed = True
+            if manager is not None:
+                # Reattach skips a key it restored before.
+                manager._restored_keys.difference_update(keys)
+        if released:
+            ids = {view.id for view in released}
+            self._released_ids |= ids
+            for view in released:
+                self._unregister_view(view.id)
+            # A view whose VIEW_CREATED had not landed is no member of the
+            # session its send made; that session goes unless a view still
+            # registered names it.
+            named = {getattr(view, "session_id", None) for view in self._active_views.values()}
+            sessions = {view.session_id for view in released} - named
+            self._drop_released(ids, empty_sessions=sessions)
+
+    def _drop_released(self, view_ids=None, empty_sessions=()) -> None:
+        """Remove from the state the views a bot's close released, or ``view_ids``.
+
+        Work in flight at the close can write a released view back: a
+        dispatch suspended in the chain commits a state read before the
+        release, and a send registering the view reduces its ``VIEW_CREATED``
+        after it. Wiring a new bot drops them again, so the restart starts
+        without them. A reducer awaiting in another task commits first, and
+        the drop lands after it. Each of ``empty_sessions`` goes too when it
+        has no member.
+        """
+        ids = frozenset(self._released_ids if view_ids is None else view_ids)
+        if ids:
+            from .reducers import _without_empty_session, _without_views
+
+            def drop():
+                state = _without_views(self.state, ids)
+                for session_id in empty_sessions:
+                    state = _without_empty_session(state, session_id)
+                self.state = state
+
+            self._write_when_free(drop)
+
+    def _link_released(self) -> None:
+        """Point a released panel held by code at the panel restored in its place."""
+        for view in list(self._released_refs):
+            for key in getattr(view, "_released_keys", ()):
+                restored = self.get_active_view(persistence_key=key)
+                if restored is not None:
+                    view._successor = restored
+                    break
+
     async def _clean_up_deleted(self, message_matches: Callable[[Any], bool]) -> None:
         """Run ``on_message_delete`` for every live view whose message matches."""
         views = [
@@ -1343,11 +2076,16 @@ class StateStore:
             for view in list(self._active_views.values())
             if view._message is not None and message_matches(view._message)
         ]
+        # Views being sent go last, so one slow send holds up no other view.
+        views.sort(key=lambda view: view._lifecycle_sending)
         for view in views:
+            # A send of the view in flight may be moving it to a new message,
+            # and the deleted one is then a message it has left.
+            await view._send_finished()
             # Re-checked per view, not at snapshot time: one view's hook can
             # tear another down (a parent exits its attached children, a panel
-            # exits its sibling), and the snapshot predates every hook.
-            if view._torn_down():
+            # exits its sibling), and the snapshot predates every hook and wait.
+            if view._torn_down() or view._message is None or not message_matches(view._message):
                 continue
             try:
                 await await_maybe(view.on_message_delete())
@@ -1367,17 +2105,14 @@ class StateStore:
         Process an action by updating state and notifying subscribers.
 
         When called inside ``async with store.batch()``, the reducer runs
-        inline but notification, hooks, and persistence defer to the outer
-        batch exit. This is what makes ``batch()`` work transitively for
-        view-level helpers that route through ``store.dispatch()``.
+        inline but notification and hooks defer to the outer batch exit
+        (``PersistenceMiddleware`` queues its write at the commit). This is
+        what makes ``batch()`` work transitively for view-level helpers that
+        route through ``store.dispatch()``.
         """
-        # The Redux idiom most callers arrive with is ``dispatch(action)``,
-        # and reducers here receive exactly that dict, so handing one to this
-        # is the natural mistake. It reached the reducer lookup below and
-        # failed on "cannot use 'dict' as a dict key", which names neither
-        # the parameter nor the shape. A non-string type is quieter still:
-        # nothing raises, and an action nothing can route sits in state and
-        # history under a type no reducer or subscriber will ever match.
+        # ``dispatch(action)`` is the Redux idiom callers arrive with; it would
+        # fail in the reducer lookup naming neither the parameter nor the shape.
+        # Any other hashable non-string type raises nothing and matches nothing.
         if not isinstance(action_type, str):
             got = type(action_type).__name__
             hint = (
@@ -1423,16 +2158,35 @@ class StateStore:
         if reducer:
             logger.debug(f"Found reducer for action {action_type}")
 
-        # Batched path: run reducer inline, queue the action, return early.
-        # Notification, hooks, and persistence fire once at the outer
-        # ``BatchContext`` exit. Individual profiling samples are suppressed
-        # because notify_ms would be zero and hooks_ms is amortized across
-        # the batch -- per-action timings are misleading in this mode.
+        # Batched: the reducer runs inline, and notification and hooks wait
+        # for the outer batch exit (persistence queues at the commit). No
+        # per-action profiling sample, since its notify_ms would read zero.
         batch = current_batch()
         chain_ran = False
+        run = _ChainRun()
+        batched_slot: Optional[List[float]] = None
+        batched_chain_ms = 0.0
         if batch is not None:
-            await self._run_middleware_chain(action, reducer)
-            if batch.add_entry(action):
+            # Timed on a slot of its own, since one bound here belongs to the
+            # dispatch whose chain this one runs inside. The timing is used
+            # only when the batch refuses the action below.
+            if self._perf_enabled:
+                batched_slot = [0.0]
+            slot_token = _CURRENT_REDUCER_MS.set(batched_slot)
+            c0 = time.perf_counter() if self._perf_enabled else 0.0
+            try:
+                await self._run_middleware_chain(action, reducer, run)
+            finally:
+                _CURRENT_REDUCER_MS.reset(slot_token)
+            if self._perf_enabled:
+                batched_chain_ms = (time.perf_counter() - c0) * 1000
+            if not run.reduced:
+                # A middleware returned without calling next_fn: the action is
+                # blocked, and nothing is told about it.
+                return self.state
+            if batch.add_entry(action, run.stamp):
+                if run.error is not None:
+                    raise run.error
                 return self.state
             # The batch closed while this dispatch's chain was suspended, so
             # there is no longer a flush that will announce this action. The
@@ -1455,13 +2209,18 @@ class StateStore:
             try:
                 t0 = time.perf_counter()
                 if not chain_ran:
-                    await self._run_middleware_chain(action, reducer)
+                    await self._run_middleware_chain(action, reducer, run)
                 t1 = time.perf_counter()
-                logger.debug(f"Notifying subscribers about {action_type}")
-                await self._notify_subscribers(action)
+                if run.reduced:
+                    logger.debug(f"Notifying subscribers about {action_type}")
+                    await self._notify_subscribers(action)
                 t2 = time.perf_counter()
-                await self._fire_hooks(action)
+                if run.reduced:
+                    await self._fire_hooks(action)
                 t3 = time.perf_counter()
+            except BaseException:
+                self._log_held_error(run, action_type)
+                raise
             finally:
                 _CURRENT_EDIT_COUNTER.reset(token)
                 _CURRENT_REDUCER_MS.reset(reducer_token)
@@ -1471,8 +2230,12 @@ class StateStore:
                     self._perf_edit_stack.remove(edit_counter)
                 except ValueError:
                     pass
-            reducer_ms = reducer_slot[0]
-            chain_ms = (t1 - t0) * 1000
+            if chain_ran:
+                reducer_ms = batched_slot[0] if batched_slot is not None else 0.0
+                chain_ms = batched_chain_ms
+            else:
+                reducer_ms = reducer_slot[0]
+                chain_ms = (t1 - t0) * 1000
             # Middleware time is everything in the chain that wasn't the
             # reducer itself. Clamp to 0 to guard against clock drift on
             # trivial no-op reducers where the subtraction could go slightly
@@ -1485,7 +2248,7 @@ class StateStore:
                     "middleware_ms": middleware_ms,
                     "notify_ms": (t2 - t1) * 1000,
                     "hooks_ms": (t3 - t2) * 1000,
-                    "total_ms": (t3 - t0) * 1000,
+                    "total_ms": (t3 - t0) * 1000 + (batched_chain_ms if chain_ran else 0.0),
                     "subscribers": len(self.subscribers),
                     # Live reference -- a list that late subscriber refreshes may
                     # still mutate. ``_flush_notifications()`` finalizes this to an
@@ -1496,10 +2259,16 @@ class StateStore:
             )
         else:
             if not chain_ran:
-                await self._run_middleware_chain(action, reducer)
-            logger.debug(f"Notifying subscribers about {action_type}")
-            await self._notify_subscribers(action)
-            await self._fire_hooks(action)
+                await self._run_middleware_chain(action, reducer, run)
+            if run.reduced:
+                logger.debug(f"Notifying subscribers about {action_type}")
+                try:
+                    await self._announce(action)
+                except BaseException:
+                    self._log_held_error(run, action_type)
+                    raise
+        if run.error is not None:
+            raise run.error
 
         # Persistence is driven by PersistenceMiddleware (installed via
         # setup_middleware). The store has no fallback writer.
@@ -1522,15 +2291,9 @@ class StateStore:
         acting_id = action.get("source")
         acting_coro = None
 
-        # ``asyncio.create_task`` copies the current context at task-creation
-        # time, so cross-view subscriber tasks would otherwise inherit the
-        # live ``_CURRENT_INTERACTION`` set by the acting callback. Scope
-        # the contextvar to ``None`` while the fan-out loop schedules the
-        # background tasks, then restore the token before awaiting the
-        # acting coro so ``refresh()`` can still route its edit through
-        # the interaction-response fast path. Keeps the fast path naturally
-        # scoped to the acting subscriber even if the message-id guard in
-        # ``refresh()`` is later relaxed.
+        # A task copies the current context, so background subscribers would
+        # inherit the acting callback's interaction. It is unset while they are
+        # scheduled and restored before the acting subscriber runs.
         interaction_token = _CURRENT_INTERACTION.set(None)
         # Built once rather than per subscriber: the set is the same for every
         # one of them, and rebuilding it inside the loop made a batch commit
@@ -1544,17 +2307,20 @@ class StateStore:
             for subscriber_id, (callback, action_filter, selector) in list(
                 self.subscribers.items()
             ):
-                # For BATCH_COMPLETE, check subscriber's filter against any batched action
+                # For BATCH_COMPLETE, check subscriber's filter against any batched
+                # action. A batched UNDO/REDO bypasses it as an unbatched one does.
                 if action["type"] == "BATCH_COMPLETE":
                     if action_filter is not None:
                         if (
                             not (action_filter & batched_types)
                             and "BATCH_COMPLETE" not in action_filter
+                            and not (batched_types & {"UNDO", "REDO"})
                         ):
                             continue
                 else:
-                    # Normal action: skip if the subscriber has a filter and this action isn't in it.
-                    # UNDO/REDO bypass the filter so cross-view subscribers see restored state.
+                    # Normal action: skip if the subscriber has a filter and this
+                    # action isn't in it. UNDO/REDO bypass the filter so cross-view
+                    # subscribers see restored state.
                     if (
                         action_filter is not None
                         and action["type"] not in action_filter
@@ -1567,11 +2333,9 @@ class StateStore:
                     try:
                         new_value = selector(self.state)
                     except Exception as e:
-                        # Degrade to notify-always, which is the safe answer
-                        # for "cannot tell whether this changed". Report it
-                        # once: silence here left a permanently broken
-                        # selector looking exactly like a subscriber that
-                        # legitimately wants every action.
+                        # Notify-always is the safe answer when a change cannot
+                        # be judged. Reported once, or a broken selector reads as
+                        # a subscriber that wants every action.
                         if subscriber_id not in self._selector_failed:
                             self._selector_failed.add(subscriber_id)
                             logger.warning(
@@ -1581,20 +2345,25 @@ class StateStore:
                             )
                         new_value = self._SENTINEL
                     old_value = self._last_selected.get(subscriber_id, self._SENTINEL)
-                    # Identity first: a selector returning the same object is the
-                    # common case for a bare whole-bucket read, and dict/list
-                    # equality has no identity shortcut -- it walks every entry
-                    # to prove what `is` already answered. Views are immune
-                    # either way (``_build_selector`` returns a tuple, and tuple
-                    # comparison does shortcut identical elements), so this pays
-                    # for direct ``store.subscribe`` callers with fat selectors.
-                    # The one behavioral edge is a selector returning NaN, which
-                    # flips from notify-always to notify-never; pathological.
-                    if (
-                        new_value is not self._SENTINEL
-                        and old_value is not self._SENTINEL
-                        and (new_value is old_value or new_value == old_value)
-                    ):
+                    # Identity first: dict and list equality walk every entry to
+                    # prove what ``is`` answers at once for a selector returning
+                    # the same object. A selector returning the same NaN object
+                    # is notified only for the first action.
+                    unchanged = False
+                    if new_value is not self._SENTINEL and old_value is not self._SENTINEL:
+                        try:
+                            unchanged = bool(new_value is old_value or new_value == old_value)
+                        except Exception as e:
+                            # An array-like value compares elementwise and
+                            # refuses bool(); notify, as for a raising selector.
+                            if subscriber_id not in self._selector_uncomparable:
+                                self._selector_uncomparable.add(subscriber_id)
+                                logger.warning(
+                                    f"Selector value for subscriber {subscriber_id} could not "
+                                    f"be compared ({type(e).__name__}: {e}). Notifying on every "
+                                    f"action until it can."
+                                )
+                    if unchanged:
                         logger.debug(f"Skipping subscriber {subscriber_id}: selector unchanged")
                         continue
                     self._last_selected[subscriber_id] = new_value
@@ -1633,17 +2402,10 @@ class StateStore:
             # captured their context with ``None`` above.
             _CURRENT_INTERACTION.reset(interaction_token)
 
-        # Fire-and-forget for cross-view subscribers: they are scheduled and
-        # tracked under the "state_store_notify" owner but not awaited here,
-        # so a slow peer never stalls the store. Errors surface through
-        # ``_safe_notify`` + ``TaskManager._on_task_done`` logging.
-        #
-        # The acting view (if any) is awaited inline below so its refresh
-        # lands flush with the button re-enable -- preserving visual
-        # coherence without re-serializing the rest of the fan-out.
-        #
-        # Tests that assert on cross-view subscriber side effects must call
-        # ``await store._flush_notifications()`` to drain the background tasks.
+        # Other subscribers run as "state_store_notify" tasks, not awaited, so a
+        # slow one never stalls the store; the acting view is awaited so its
+        # refresh lands with the click. A test asserting on the background ones
+        # drains them with ``await store._flush_notifications()``.
         if acting_coro is not None:
             await acting_coro
 
@@ -1714,12 +2476,9 @@ class StateStore:
                     f"the state and returning the slice to watch; got "
                     f"{type(selector).__name__}: {selector!r}"
                 )
-            # The comparison that decides whether to notify runs inline in
-            # dispatch and cannot await. An async selector returns a fresh
-            # coroutine every time, which never equals the last one, so the
-            # subscriber is notified on every action, the exact opposite
-            # of what passing a selector asks for, and each unawaited
-            # coroutine warns from the user's console.
+            # The change check runs inline and cannot await: an async selector
+            # returns a new coroutine each time, never equal to the last, so the
+            # subscriber would be notified on every action.
             from ..utils.hooks import is_async_callable
 
             if is_async_callable(selector):
@@ -1741,6 +2500,7 @@ class StateStore:
             del self.subscribers[subscriber_id]
         self._last_selected.pop(subscriber_id, None)
         self._selector_failed.discard(subscriber_id)
+        self._selector_uncomparable.discard(subscriber_id)
 
     @property
     def perf_samples(self) -> List[Dict[str, Any]]:

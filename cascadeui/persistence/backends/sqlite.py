@@ -2,8 +2,8 @@
 
 Implements the full :class:`PersistenceBackend` Protocol against a local
 SQLite database via ``aiosqlite``. WAL journal mode is enabled at
-connection time for better concurrent-read behavior and to avoid
-Windows file-locking surprises when a second process reads the DB.
+connection time, so a second process can read the database while this
+one writes, without Windows file-locking surprises.
 
 Requires the ``aiosqlite`` extra::
 
@@ -12,20 +12,23 @@ Requires the ``aiosqlite`` extra::
 One physical database serves both namespaces plus the generic KV
 surface; shared table-name constants are the partitioning key. A single
 persistent connection is opened in :meth:`initialize` and reused; the
-:class:`~asyncio.Lock` on the connection guards SQLite's single-writer
-semantics.
+:class:`~asyncio.Lock` on it gives tasks turns on that one connection, for
+reads and writes alike.
 """
 
 # // ========================================( Modules )======================================== // #
 
 
 import asyncio
+import contextlib
 import logging
 import time
+from contextvars import ContextVar
 from typing import Any, AsyncIterator, ClassVar, Optional
 
 import aiosqlite  # hard import -- backends/__init__.py catches ImportError
 
+from ...utils.tasks import _bounded_wait
 from ..protocols import Capability
 from ..schema import (
     ALL_DDL,
@@ -36,6 +39,16 @@ from ..schema import (
 )
 
 logger = logging.getLogger(__name__)
+
+_CLOSE_WAIT_SECONDS: float = 5.0
+"""How long ``close()`` lets a transaction, read, or write already running on
+the connection finish before closing it anyway."""
+
+_CURRENT_TXN: ContextVar[tuple] = ContextVar("cascadeui_sqlite_txn", default=(None, None))
+"""The backend and innermost transaction the current task is inside, so a
+transaction belongs to the task that opened it. A read or write from another
+task waits for the write lock instead of joining it, and so does one from a
+task spawned inside a transaction that has since ended."""
 
 
 # // ========================================( Helpers )======================================== // #
@@ -73,6 +86,19 @@ def _escape_like(prefix: str) -> str:
     return out
 
 
+async def _roll_back(db: aiosqlite.Connection) -> None:
+    """Roll back what a write or BEGIN that raised or was cancelled left open.
+
+    Not gated on ``in_transaction``: a cancel can land while the statement is
+    still queued on aiosqlite's worker thread, which runs it anyway and runs
+    this rollback after it.
+    """
+    try:
+        await db.rollback()
+    except Exception as exc:
+        logger.debug(f"SQLiteBackend rollback after a failed write: {exc}")
+
+
 # // ========================================( Class )======================================== // #
 
 
@@ -80,14 +106,13 @@ class SQLiteBackend:
     """Persistent SQLite implementation of :class:`PersistenceBackend`.
 
     Opens one ``aiosqlite`` connection in :meth:`initialize` and holds
-    it for the backend lifetime. A shared :class:`asyncio.Lock`
-    serializes writes -- SQLite is single-writer anyway, but the lock
-    keeps the Python-side queue orderly under high contention and gives
-    deterministic error behavior when a transaction fails mid-flight.
+    it for the backend lifetime. A shared :class:`asyncio.Lock` gives
+    tasks turns on that connection for reads and writes alike, so a read
+    never sees another task's open transaction and writes queue in order.
 
-    Declares every capability -- relational rows, TTL index support,
-    schema metadata, KV surface -- so any namespace config works
-    against it without configuration.
+    Declares relational rows, TTL index support, schema metadata, the KV
+    surface, and raw SQL, so any namespace config works against it
+    without configuration.
     """
 
     capabilities: ClassVar[Capability] = (
@@ -106,7 +131,6 @@ class SQLiteBackend:
         self.table_prefix = table_prefix
         self._conn: aiosqlite.Connection | None = None
         self._write_lock = asyncio.Lock()
-        self._txn_depth: int = 0
 
     def _table(self, name: str) -> str:
         """Quote ``name`` under this backend's table prefix.
@@ -134,14 +158,10 @@ class SQLiteBackend:
         conn = await aiosqlite.connect(self.db_path)
         conn.row_factory = aiosqlite.Row  # dict-like access via column name
 
-        # Everything below runs against a connection this method owns and
-        # that ``close()`` cannot reach, because ``self._conn`` is assigned
-        # only once setup succeeds. aiosqlite backs each connection with a
-        # NON-daemon worker thread, so a connection dropped here outlives
-        # the failure, keeps the file handle, and blocks interpreter exit.
-        # Reachable from a corrupt or non-SQLite file at ``db_path``, a
-        # same-named consumer table whose columns fail the index DDL, a
-        # write lock held past ``busy_timeout``, and a full disk.
+        # ``close()`` cannot reach this connection until setup succeeds, and its
+        # aiosqlite worker thread is not a daemon, so a failure here closes it or
+        # it blocks interpreter exit (a non-SQLite file, a consumer table failing
+        # the index DDL, a lock held past busy_timeout, a full disk).
         try:
             # WAL mode requires SQLite 3.7.0+. The PRAGMA returns the new
             # journal mode as a string -- "wal" on success, the prior mode
@@ -178,16 +198,51 @@ class SQLiteBackend:
                 pass
             raise
 
+        # A lock a waiter touched is bound to that event loop, and a bot run
+        # twice through asyncio.run reopens on another one.
+        self._write_lock = asyncio.Lock()
         self._conn = conn
         logger.debug(f"SQLiteBackend initialized: {self.db_path}")
 
     async def close(self) -> None:
-        """Close the connection cleanly. Safe to call multiple times."""
-        if self._conn is None:
+        """Close the connection cleanly. Safe to call multiple times, and from two tasks at once.
+
+        A transaction, read, or write already running on the connection gets
+        five seconds to finish. One still running after that is cut off:
+        nothing it wrote is committed, and it raises on exit.
+        """
+        conn = self._conn
+        if conn is None:
             return
-        await self._conn.close()
-        self._conn = None
-        logger.debug(f"SQLiteBackend closed: {self.db_path}")
+        lock = self._write_lock
+        try:
+            await _bounded_wait(lock.acquire(), _CLOSE_WAIT_SECONDS)
+            held = True
+        except asyncio.TimeoutError:
+            held = False
+            logger.warning(
+                f"SQLiteBackend closed with a call still running after "
+                f"{_CLOSE_WAIT_SECONDS:g}s; what it had not committed was lost: "
+                f"{self.db_path}"
+            )
+        try:
+            # Claimed before the await: a second close() of an aiosqlite
+            # connection queues a stop its already-stopped worker never answers.
+            if self._conn is not conn:
+                return
+            self._conn = None
+            if not held:
+                # The transaction cut off still holds the lock; the next
+                # connection starts with one of its own.
+                self._write_lock = asyncio.Lock()
+                # A statement running on the worker thread would otherwise
+                # hold the close until it finished, however long.
+                await conn.interrupt()
+            await conn.close()
+            logger.debug(f"SQLiteBackend closed: {self.db_path}")
+        finally:
+            if held:
+                lock.release()
 
     # // ========================================( Connection accessor )======================================== // #
 
@@ -198,29 +253,98 @@ class SQLiteBackend:
         ``NoneType.execute``."""
         if self._conn is None:
             raise RuntimeError(
-                "SQLiteBackend used before initialize(). "
+                "SQLiteBackend used before initialize() or after close(). "
                 "Install PersistenceMiddleware via setup_middleware() or "
                 "await backend.initialize() first."
             )
         return self._conn
 
+    def _txn_conn(self) -> Optional[aiosqlite.Connection]:
+        """The connection this task's open transaction runs on, or ``None`` outside one."""
+        backend, txn = _CURRENT_TXN.get()
+        if backend is not self or txn is None or not txn._active:
+            return None
+        if txn._conn is not self._conn:
+            raise RuntimeError(
+                "SQLiteBackend closed while this transaction was open; nothing it "
+                "wrote was committed."
+            )
+        return txn._conn
+
+    async def _acquire_write_lock(self) -> asyncio.Lock:
+        """Take the open connection's write lock, which a close or reopen may
+        replace while this waits; returns the lock held."""
+        while True:
+            lock = self._write_lock
+            await lock.acquire()
+            if self._write_lock is lock:
+                return lock
+            lock.release()
+
+    @contextlib.asynccontextmanager
+    async def _writing(self, method: Optional[str] = None) -> AsyncIterator[aiosqlite.Connection]:
+        """Hold the write lock and yield the open connection.
+
+        ``method`` names a namespace call, which is refused inside this task's
+        own transaction: SQLite has one connection, so the call would wait
+        forever on the lock that transaction holds.
+
+        A write that raises or is cancelled before its commit is rolled back
+        here, so nothing it sent stays open on the connection for the next
+        commit to take along.
+        """
+        if method is not None and self._txn_conn() is not None:
+            raise RuntimeError(
+                f"SQLiteBackend.{method}() cannot run inside this task's transaction(): "
+                f"it takes the write lock the transaction holds. Use execute() inside "
+                f"the transaction, or call {method}() after it."
+            )
+        lock = await self._acquire_write_lock()
+        try:
+            db = self._db()
+            try:
+                yield db
+            except BaseException:
+                await _roll_back(db)
+                raise
+        finally:
+            lock.release()
+
+    @contextlib.asynccontextmanager
+    async def _reading(self) -> AsyncIterator[aiosqlite.Connection]:
+        """Yield the connection for a read.
+
+        Inside this task's transaction the read runs on it and sees its own
+        writes. Otherwise it waits for another task's open transaction to end:
+        SQLite has one connection, so a read beside that transaction would see
+        rows a rollback then discards.
+        """
+        conn = self._txn_conn()
+        if conn is not None:
+            yield conn
+            return
+        lock = await self._acquire_write_lock()
+        try:
+            yield self._db()
+        finally:
+            lock.release()
+
     # // ========================================( Key-value surface )======================================== // #
 
     async def kv_read(self, namespace: str, key: str) -> bytes | None:
-        db = self._db()
         table = self._table(TABLE_KV)
-        cursor = await db.execute(
-            f"SELECT value FROM {table} WHERE namespace = ? AND key = ?",
-            (namespace, key),
-        )
-        row = await cursor.fetchone()
-        await cursor.close()
+        async with self._reading() as db:
+            cursor = await db.execute(
+                f"SELECT value FROM {table} WHERE namespace = ? AND key = ?",
+                (namespace, key),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
         return bytes(row[0]) if row is not None else None
 
     async def kv_write(self, namespace: str, key: str, value: bytes) -> None:
-        db = self._db()
         table = self._table(TABLE_KV)
-        async with self._write_lock:
+        async with self._writing("kv_write") as db:
             await db.execute(
                 f"""
                 INSERT INTO {table} (namespace, key, value)
@@ -232,9 +356,8 @@ class SQLiteBackend:
             await db.commit()
 
     async def kv_delete(self, namespace: str, key: str) -> None:
-        db = self._db()
         table = self._table(TABLE_KV)
-        async with self._write_lock:
+        async with self._writing("kv_delete") as db:
             await db.execute(
                 f"DELETE FROM {table} WHERE namespace = ? AND key = ?",
                 (namespace, key),
@@ -242,29 +365,26 @@ class SQLiteBackend:
             await db.commit()
 
     async def kv_scan(self, namespace: str, prefix: str = "") -> AsyncIterator[tuple[str, bytes]]:
-        db = self._db()
         table = self._table(TABLE_KV)
         if prefix:
             # LIKE with ESCAPE so a caller-supplied prefix containing %
             # or _ is treated literally. Paired with _escape_like above.
-            pattern = _escape_like(prefix) + "%"
-            cursor = await db.execute(
-                f"""
+            sql = f"""
                 SELECT key, value FROM {table}
                 WHERE namespace = ? AND key LIKE ? ESCAPE '\\'
-                """,
-                (namespace, pattern),
-            )
+                """
+            params: tuple[Any, ...] = (namespace, _escape_like(prefix) + "%")
         else:
-            cursor = await db.execute(
-                f"SELECT key, value FROM {table} WHERE namespace = ?",
-                (namespace,),
-            )
+            sql = f"SELECT key, value FROM {table} WHERE namespace = ?"
+            params = (namespace,)
 
         # Snapshot before yielding so caller mutation during iteration
-        # is safe (Protocol contract: scan-snapshot safety).
-        rows = await cursor.fetchall()
-        await cursor.close()
+        # is safe (Protocol contract: scan-snapshot safety), and so the
+        # lock is not held while the caller runs.
+        async with self._reading() as db:
+            cursor = await db.execute(sql, params)
+            rows = await cursor.fetchall()
+            await cursor.close()
 
         for row in rows:
             yield row[0], bytes(row[1])
@@ -313,8 +433,7 @@ class SQLiteBackend:
         cols = list(row.keys())
         sql = self._build_upsert_sql(namespace, cols, key_columns)
 
-        db = self._db()
-        async with self._write_lock:
+        async with self._writing("row_upsert") as db:
             await db.execute(sql, tuple(row[c] for c in cols))
             await db.commit()
 
@@ -338,27 +457,21 @@ class SQLiteBackend:
                 raise ValueError("row_upsert_many requires at least one column per row")
             groups.setdefault(tuple(row.keys()), []).append(row)
 
-        db = self._db()
         # One write lock and one commit for the whole batch -- the commit is
-        # a single fsync instead of one per row. The rollback on failure
-        # keeps the batch atomic: a raise in any group (or in any row inside
-        # one executemany) leaves the database unchanged.
-        async with self._write_lock:
-            try:
-                for cols, group in groups.items():
-                    sql = self._build_upsert_sql(namespace, list(cols), key_columns)
-                    await db.executemany(sql, [tuple(r[c] for c in cols) for r in group])
-                await db.commit()
-            except Exception:
-                await db.rollback()
-                raise
+        # a single fsync instead of one per row. _writing() rolls back on a
+        # raise or a cancel, which keeps the batch atomic: it commits whole or
+        # not at all, whichever group (or row inside one executemany) failed.
+        async with self._writing("row_upsert_many") as db:
+            for cols, group in groups.items():
+                sql = self._build_upsert_sql(namespace, list(cols), key_columns)
+                await db.executemany(sql, [tuple(r[c] for c in cols) for r in group])
+            await db.commit()
 
     async def row_select(
         self,
         namespace: str,
         where: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        db = self._db()
         table = self._table(namespace)
         if where:
             clause = " AND ".join(f"{_quote_ident(c)} = ?" for c in where.keys())
@@ -368,9 +481,10 @@ class SQLiteBackend:
             sql = f"SELECT * FROM {table}"
             params = ()
 
-        cursor = await db.execute(sql, params)
-        rows = await cursor.fetchall()
-        await cursor.close()
+        async with self._reading() as db:
+            cursor = await db.execute(sql, params)
+            rows = await cursor.fetchall()
+            await cursor.close()
         # aiosqlite.Row -> plain dict so callers can mutate freely without
         # touching the cursor's backing buffer. Matches InMemoryBackend's
         # copy-on-return contract.
@@ -384,11 +498,10 @@ class SQLiteBackend:
         if not where:
             raise ValueError("row_delete requires a non-empty where clause")
 
-        db = self._db()
         table = self._table(namespace)
         clause = " AND ".join(f"{_quote_ident(c)} = ?" for c in where.keys())
         sql = f"DELETE FROM {table} WHERE {clause}"
-        async with self._write_lock:
+        async with self._writing("row_delete") as db:
             cursor = await db.execute(sql, tuple(where.values()))
             deleted = cursor.rowcount
             await cursor.close()
@@ -404,11 +517,10 @@ class SQLiteBackend:
         # NULL-safe natively: SQLite treats ``NULL < anything`` as NULL
         # (never true), so rows without a timestamp are preserved. No
         # explicit null handling needed.
-        db = self._db()
         table = self._table(namespace)
         col = _quote_ident(column)
         sql = f"DELETE FROM {table} WHERE {col} < ?"
-        async with self._write_lock:
+        async with self._writing("row_delete_where_lt") as db:
             cursor = await db.execute(sql, (value,))
             deleted = cursor.rowcount
             await cursor.close()
@@ -418,21 +530,20 @@ class SQLiteBackend:
     # // ========================================( Schema metadata surface )======================================== // #
 
     async def get_schema_version(self, table: str) -> int:
-        db = self._db()
         meta = self._table(TABLE_SCHEMA_META)
-        cursor = await db.execute(
-            f"SELECT schema_version FROM {meta} WHERE table_name = ?",
-            (table,),
-        )
-        row = await cursor.fetchone()
-        await cursor.close()
+        async with self._reading() as db:
+            cursor = await db.execute(
+                f"SELECT schema_version FROM {meta} WHERE table_name = ?",
+                (table,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
         return int(row[0]) if row is not None else 0
 
     async def set_schema_version(self, table: str, version: int) -> None:
-        db = self._db()
         meta = self._table(TABLE_SCHEMA_META)
         applied_at = int(time.time())
-        async with self._write_lock:
+        async with self._writing("set_schema_version") as db:
             await db.execute(
                 f"""
                 INSERT INTO {meta} (table_name, schema_version, applied_at)
@@ -460,13 +571,13 @@ class SQLiteBackend:
         """
         if not sql:
             raise ValueError("execute requires a non-empty sql string")
-        db = self._db()
-        if self._txn_depth > 0:
-            cursor = await db.execute(sql, params)
+        txn = self._txn_conn()
+        if txn is not None:
+            cursor = await txn.execute(sql, params)
             rowcount = cursor.rowcount
             await cursor.close()
         else:
-            async with self._write_lock:
+            async with self._writing() as db:
                 cursor = await db.execute(sql, params)
                 rowcount = cursor.rowcount
                 await cursor.close()
@@ -481,10 +592,10 @@ class SQLiteBackend:
         """
         if not sql:
             raise ValueError("fetch requires a non-empty sql string")
-        db = self._db()
-        cursor = await db.execute(sql, params)
-        rows = await cursor.fetchall()
-        await cursor.close()
+        async with self._reading() as db:
+            cursor = await db.execute(sql, params)
+            rows = await cursor.fetchall()
+            await cursor.close()
         return [dict(r) for r in rows]
 
     async def executemany(self, sql: str, params_list: list[tuple]) -> int:
@@ -504,12 +615,12 @@ class SQLiteBackend:
             raise ValueError("executemany requires a non-empty sql string")
         if not params_list:
             return 0
-        db = self._db()
-        if self._txn_depth > 0:
-            cursor = await db.executemany(sql, params_list)
+        txn = self._txn_conn()
+        if txn is not None:
+            cursor = await txn.executemany(sql, params_list)
             await cursor.close()
         else:
-            async with self._write_lock:
+            async with self._writing() as db:
                 cursor = await db.executemany(sql, params_list)
                 await cursor.close()
                 await db.commit()
@@ -522,10 +633,10 @@ class SQLiteBackend:
         """
         if not sql:
             raise ValueError("fetch_one requires a non-empty sql string")
-        db = self._db()
-        cursor = await db.execute(sql, params)
-        row = await cursor.fetchone()
-        await cursor.close()
+        async with self._reading() as db:
+            cursor = await db.execute(sql, params)
+            row = await cursor.fetchone()
+            await cursor.close()
         return dict(row) if row is not None else None
 
     def transaction(self) -> "_SQLiteTransaction":
@@ -534,10 +645,12 @@ class SQLiteBackend:
         lock; nested entries issue ``SAVEPOINT``/``RELEASE
         SAVEPOINT``/``ROLLBACK TO SAVEPOINT``.
 
-        Only the raw-SQL methods (``execute``, ``fetch``, ``executemany``,
-        ``fetch_one``) participate in the transaction. Namespace API
-        methods (``row_upsert``, ``row_select``, ``kv_*``) auto-commit
-        per call regardless of transaction state.
+        The raw-SQL methods (``execute``, ``fetch``, ``executemany``,
+        ``fetch_one``) participate in the transaction. A namespace write
+        (``row_upsert``, ``kv_write``, ...) inside it raises
+        ``RuntimeError``, since it takes the write lock the transaction
+        holds. Namespace reads inside it see its writes. From another task,
+        reads and writes wait for it to end.
         """
         return _SQLiteTransaction(self)
 
@@ -551,34 +664,62 @@ class _SQLiteTransaction:
     statements that compose with asyncpg-style nesting (rollback to
     savepoint isolates inner failures from the outer transaction).
 
-    Depth tracking lives on ``backend._txn_depth`` (the connection is a
-    singleton on SQLiteBackend, so per-instance state is correct). The
-    write lock is held for the lifetime of the outermost transaction --
-    long-running transactions starve concurrent writes; keep transaction
-    bodies short.
+    A transaction belongs to the task that opened it (``_CURRENT_TXN``):
+    nesting counts only within that task, and another task's reads and
+    writes wait for the lock rather than joining it. A task spawned inside
+    the block writes as part of it while it is open, and on its own once it
+    ends. The spawned task cannot open a transaction of its own while the
+    block is open. The write lock is held for the lifetime of the outermost
+    transaction, so a long one holds up every other task's database calls.
+    Keep transaction bodies short.
     """
 
     def __init__(self, backend: "SQLiteBackend") -> None:
         self._backend = backend
         self._savepoint_name: str | None = None
-        self._holds_lock: bool = False
+        self._lock: Optional[asyncio.Lock] = None
+        self._conn: Optional[aiosqlite.Connection] = None
+        self._depth: int = 0
+        self._active: bool = False
+        self._task: Optional[asyncio.Task] = None
+        self._token = None
 
     async def __aenter__(self) -> "_SQLiteTransaction":
-        depth = self._backend._txn_depth
-        db = self._backend._db()
+        backend = self._backend
+        outer_conn = backend._txn_conn()
+        outer = _CURRENT_TXN.get()[1] if outer_conn is not None else None
+        task = asyncio.current_task()
+        if outer is not None and outer._task is not task:
+            # A savepoint on another task's transaction commits with it, and
+            # its release fails once that transaction has moved on.
+            raise RuntimeError(
+                "A task spawned inside an SQLiteBackend transaction cannot open one "
+                "of its own while the outer one is open. Open it after the outer "
+                "transaction ends, or run its statements as part of the outer one."
+            )
+        depth = outer._depth if outer is not None else 0
         if depth == 0:
-            await self._backend._write_lock.acquire()
-            self._holds_lock = True
+            lock = await backend._acquire_write_lock()
             try:
-                await db.execute("BEGIN")
-            except Exception:
-                self._backend._write_lock.release()
-                self._holds_lock = False
+                db = backend._db()
+                try:
+                    await db.execute("BEGIN")
+                except BaseException:
+                    await _roll_back(db)
+                    raise
+            except BaseException:
+                lock.release()
                 raise
+            self._lock = lock
         else:
+            db = outer_conn
             self._savepoint_name = f"cascadeui_sp_{depth}"
             await db.execute(f"SAVEPOINT {self._savepoint_name}")
-        self._backend._txn_depth = depth + 1
+        self._conn = db
+        self._depth = depth + 1
+        self._task = task
+        self._active = True
+        self._token = _CURRENT_TXN.set((backend, self))
         return self
 
     async def __aexit__(
@@ -587,8 +728,33 @@ class _SQLiteTransaction:
         exc_val: Optional[BaseException],
         exc_tb: Optional[Any],
     ) -> None:
-        self._backend._txn_depth -= 1
-        db = self._backend._db()
+        # A task spawned inside the block still holds this transaction in its
+        # copied context; once it ends, that task writes on its own.
+        self._active = False
+        try:
+            await self._finish(exc_type)
+        finally:
+            try:
+                _CURRENT_TXN.reset(self._token)
+            except ValueError:
+                # Exited from another context, as when the loop finalizes an
+                # abandoned async generator; that context never set the marker.
+                pass
+
+    async def _finish(self, exc_type: Optional[type]) -> None:
+        if self._backend._conn is not self._conn:
+            # close() cut this transaction off: there is nothing left to
+            # commit to, and the lock it held is not the open connection's.
+            if self._lock is not None:
+                self._lock.release()
+                self._lock = None
+            if exc_type is None:
+                raise RuntimeError(
+                    "SQLiteBackend closed while this transaction was open; nothing it "
+                    "wrote was committed."
+                )
+            return
+        db = self._conn
         try:
             if exc_type is None:
                 if self._savepoint_name is None:
@@ -602,6 +768,6 @@ class _SQLiteTransaction:
                     await db.execute(f"ROLLBACK TO SAVEPOINT {self._savepoint_name}")
                     await db.execute(f"RELEASE SAVEPOINT {self._savepoint_name}")
         finally:
-            if self._holds_lock:
-                self._backend._write_lock.release()
-                self._holds_lock = False
+            if self._lock is not None:
+                self._lock.release()
+                self._lock = None

@@ -29,12 +29,12 @@ from cascadeui.persistence.schema import (
 postgres_available = False
 try:
     import asyncpg
-    from testcontainers.postgres import PostgresContainer  # noqa: F401
 
     from cascadeui.persistence.backends.postgres import (
         CHANNEL_INVALIDATION,
         PostgresBackend,
     )
+    from tests._pg_helpers import PostgresContainer  # noqa: F401
 
     postgres_available = True
 except ImportError:

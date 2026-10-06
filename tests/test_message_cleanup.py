@@ -1,11 +1,15 @@
 """Tests for automatic view cleanup on message deletion."""
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import discord
 import pytest
+from discord.ui import ActionRow
+from helpers import RenderableLayoutView, make_interaction, until
 
+from cascadeui.components.base import StatefulButton
 from cascadeui.state.store import StateStore
 from cascadeui.views.view import StatefulView
 
@@ -46,14 +50,14 @@ def _make_view(store, *, message_id=12345, user_id=100, guild_id=200):
 class TestInstallMessageCleanup:
     """_install_message_cleanup registers gateway listeners idempotently."""
 
-    def test_sets_flag(self):
+    def test_records_the_bot(self):
         store = StateStore()
         bot = _make_bot()
-        assert not store._cleanup_listener_installed
+        assert bot not in store._cleanup_listener_bots
 
         store._install_message_cleanup(bot)
 
-        assert store._cleanup_listener_installed
+        assert bot in store._cleanup_listener_bots
 
     def test_registers_every_deletion_listener(self):
         store = StateStore()
@@ -66,6 +70,15 @@ class TestInstallMessageCleanup:
             "on_guild_channel_delete",
             "on_raw_thread_delete",
         }
+
+    async def test_a_plain_client_is_wired_without_listeners(self):
+        # discord.Client has no listen(): the install raised, and a send
+        # through one skipped the rest of its last stage.
+        store = StateStore()
+        client = discord.Client(intents=discord.Intents.none())
+        store._install_message_cleanup(client)
+
+        assert client in store._cleanup_listener_bots
 
     def test_idempotent(self):
         store = StateStore()
@@ -226,12 +239,13 @@ class TestOnMessageGoneHook:
         )
         view.on_message_gone = AsyncMock()
 
-        await view.refresh()
+        assert await view.refresh() == "no_message"
+        assert view._message is None
+        await view._message_gone_task
 
         view.on_message_gone.assert_awaited_once()
-        assert view._message is None
 
-    async def test_refresh_404_swallows_hook_error(self):
+    async def test_a_raising_hook_is_logged_and_the_view_still_torn_down(self, caplog):
         store = StateStore()
         view = _make_view(store)
         view._last_tree_digest = None
@@ -241,10 +255,88 @@ class TestOnMessageGoneHook:
         )
         view.on_message_gone = AsyncMock(side_effect=RuntimeError("boom"))
 
-        # A raising hook must not break refresh()'s non-raising contract.
-        await view.refresh()
+        with caplog.at_level(logging.ERROR, logger="cascadeui"):
+            assert await view.refresh() == "no_message"
+            await view._message_gone_task
 
         assert view._message is None
+        assert view._torn_down()
+        assert any("on_message_gone failed" in r.getMessage() for r in caplog.records)
+
+    async def test_a_render_in_flight_when_the_views_own_exit_deletes_the_message(self):
+        """The render's 404 answered the view's own delete, and the hook ran
+        on the closed view: a hook that sends the view again logged an ERROR
+        on an ordinary Exit."""
+        store = StateStore()
+        view = _make_view(store)
+        view._last_tree_digest = None
+        deleted = asyncio.Event()
+
+        async def edit(**kwargs):
+            await deleted.wait()
+            raise discord.NotFound(MagicMock(status=404), "Unknown Message")
+
+        async def delete():
+            deleted.set()
+
+        view._message.edit = AsyncMock(side_effect=edit)
+        view._message.delete = AsyncMock(side_effect=delete)
+        view.on_message_gone = AsyncMock()
+
+        render = asyncio.create_task(view.refresh())
+        await until(lambda: view._message.edit.await_count == 1)
+        await view.exit(delete_message=True)
+
+        assert await asyncio.wait_for(render, timeout=5) == "no_message"
+        view.on_message_gone.assert_not_awaited()
+        assert view._message_gone_task is None
+
+    async def test_an_on_message_gone_that_exits_the_view_finishes(self):
+        """The exit's freeze waits for the view's renders in flight, so a hook
+        called from inside the render that found the message gone never
+        finished."""
+        store = StateStore()
+        view = _make_view(store)
+        view._last_tree_digest = None
+        view._message.edit = AsyncMock(
+            side_effect=discord.NotFound(MagicMock(status=404), "Unknown Message")
+        )
+
+        async def on_message_gone():
+            await view.exit()
+
+        view.on_message_gone = on_message_gone
+
+        assert await asyncio.wait_for(view.refresh(), timeout=5) == "no_message"
+        await asyncio.wait_for(view._message_gone_task, timeout=5)
+        assert view.is_finished()
+        assert not view._edits_pending
+
+    async def test_a_webhook_edit_that_falls_through_after_a_concurrent_404(self):
+        """The webhook edit awaited, a concurrent refresh found the message
+        deleted and cleared it, and the fall-through to the channel endpoint
+        then raised AttributeError on the cleared reference."""
+        store = StateStore()
+        view = _make_view(store)
+        view._check_placement = lambda: None
+        gate = asyncio.Event()
+
+        async def webhook_edit(**kwargs):
+            await gate.wait()
+            raise discord.HTTPException(MagicMock(status=401), "token expired")
+
+        view._webhook_message = MagicMock()
+        view._webhook_message.edit = AsyncMock(side_effect=webhook_edit)
+        view._message.edit = AsyncMock(
+            side_effect=discord.NotFound(MagicMock(status=404), "Not Found")
+        )
+
+        embed_refresh = asyncio.create_task(view.refresh(embed=discord.Embed(title="a")))
+        await asyncio.sleep(0)
+        assert await view.refresh(content="b") == "no_message"
+        gate.set()
+
+        assert await asyncio.wait_for(embed_refresh, timeout=2) == "no_message"
 
 
 # // ========================================( Channel and Thread Delete )======================================== // #
@@ -372,6 +464,42 @@ class TestTeardownAfterAnEditFindsTheMessageGone:
     """An edit that 404s tears the view down through ``on_message_delete``,
     with no gateway event needed."""
 
+    async def test_a_push_landing_during_the_teardown_closes_the_new_view(self, caplog):
+        """The teardown exited the view the push started from; its exit waited
+        out the push, found the panel handed on, and did nothing but warn,
+        leaving the new view live with no message."""
+
+        class _Dst(RenderableLayoutView):
+            async def on_load(self):
+                await asyncio.sleep(0.05)
+
+        class _Src(RenderableLayoutView):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.go = StatefulButton(label="Go", custom_id="go", callback=self._go)
+                self.add_item(ActionRow(self.go))
+
+            async def _go(self, interaction):
+                self.pushed = await self.push(_Dst, interaction=interaction)
+
+        view = _Src(interaction=make_interaction(user_id=1, guild_id=100))
+        await view.send()
+        view._message.edit = AsyncMock(
+            side_effect=discord.NotFound(MagicMock(status=404), "Unknown Message")
+        )
+        view._last_tree_digest = None
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui"):
+            pushing = asyncio.create_task(
+                view._scheduled_task(view.go, make_interaction(user_id=1, guild_id=100))
+            )
+            await view.refresh()
+            await pushing
+            await view._message_gone_task
+
+        assert view.pushed._torn_down()
+        assert not [r for r in caplog.records if "handed its panel on" in r.getMessage()]
+
     async def test_the_view_is_fully_torn_down(self):
         store = StateStore()
         view = _deleted_under(_make_view(store))
@@ -464,26 +592,40 @@ class TestTeardownAfterAnEditFindsTheMessageGone:
 
         assert calls == [1]
 
-    async def test_a_rolled_back_source_whose_message_went_is_still_torn_down(self):
-        """Navigation unsubscribes its source before the edit, so a 404 landing
-        then reads the source as torn down and skips the teardown. When the
-        navigation rolls back and recovers the source, the teardown is owed."""
+    async def test_a_source_whose_message_went_mid_push_is_torn_down_after_it_fails(self):
+        """A push waits for an edit its source already started. That edit
+        finding the message deleted tears the source down, and the teardown
+        waits for the push to fail before it runs."""
+        from helpers import make_interaction
+
         store = StateStore()
         source = _deleted_under(_make_view(store))
         await source._register_state()
-        store._unsubscribe(source.id)
+        gate = asyncio.Event()
+        deleted = discord.NotFound(MagicMock(status=404), "Unknown Message")
 
-        await source.refresh()
-        skipped = source._message_gone_task
-        await skipped
-        assert not source.is_finished()
+        async def in_flight(**kwargs):
+            await gate.wait()
+            raise deleted
 
-        await source._rollback_navigation(None)
-        assert source._message_gone_task is not skipped
+        source._message.edit = AsyncMock(side_effect=in_flight)
+        started = asyncio.create_task(source.refresh())
+        await asyncio.sleep(0)
+
+        class _Destination(StatefulView):
+            pass
+
+        nav = make_interaction(user_id=100, guild_id=200, is_done=True)
+        nav.edit_original_response = AsyncMock(side_effect=deleted)
+        push = asyncio.create_task(source.push(_Destination, interaction=nav))
+        await asyncio.sleep(0)
+        gate.set()
+        await started
+        await push
         await source._message_gone_task
 
-        assert source.id not in store._active_views
         assert source.is_finished()
+        assert source.id not in store._active_views
 
     async def test_a_never_sent_source_survives_a_failed_navigation(self):
         store = StateStore()
@@ -519,3 +661,227 @@ class TestTeardownAfterAnEditFindsTheMessageGone:
 
         assert view._message_gone_task is None
         assert view.id in store._active_views
+
+
+class TestAMessageTheViewHasLeft:
+    """A deletion of the message a view is leaving does not close the view.
+
+    A view sent again moves to a new message. The old message's deletion,
+    reported by the gateway or found by an edit still in flight, closed the
+    view on its new message: frozen, or left with buttons that answered nothing.
+    """
+
+    @staticmethod
+    def _interaction(message_id):
+        interaction = make_interaction()
+        message = MagicMock(id=message_id, channel=MagicMock(id=888))
+        message.edit = AsyncMock(return_value=message)
+        message.delete = AsyncMock()
+        interaction.original_response = AsyncMock(return_value=message)
+        return interaction, message
+
+    @staticmethod
+    def _panel(interaction, cls=RenderableLayoutView):
+        view = cls(interaction=interaction, timeout=None)
+        view.add_item(ActionRow(StatefulButton(label="Go", custom_id="go")))
+        return view
+
+    @staticmethod
+    def _not_found():
+        return discord.NotFound(MagicMock(status=404, reason="Not Found"), "Unknown Message")
+
+    async def test_a_gateway_delete_of_the_old_message_during_a_resend_leaves_the_view_live(self):
+        first, old = self._interaction(1)
+        view = self._panel(first)
+        await view.send()
+        second, new = self._interaction(2)
+        posting, gate = asyncio.Event(), asyncio.Event()
+        real_send = second.response.send_message
+
+        async def send_slowly(*args, **kwargs):
+            posting.set()
+            await gate.wait()
+            return await real_send(*args, **kwargs)
+
+        second.response.send_message = send_slowly
+        view.interaction = second
+        sending = asyncio.create_task(view.send())
+        await asyncio.wait_for(posting.wait(), 1)
+        # The gateway reports each event on a task of its own.
+        cleanup = asyncio.create_task(
+            view.state_store._clean_up_deleted(lambda message: message.id == 1)
+        )
+        for _ in range(5):
+            await asyncio.sleep(0)
+        gate.set()
+        await asyncio.wait_for(cleanup, 1)
+
+        assert await sending is not None
+        assert view._message is new
+        assert not view._torn_down()
+        new.edit.assert_not_awaited()
+
+    async def test_an_edit_that_finds_the_old_message_gone_during_a_resend_leaves_the_view_live(
+        self,
+    ):
+        first, old = self._interaction(1)
+        view = self._panel(first)
+        await view.send()
+        view._message = old
+        editing, fail = asyncio.Event(), asyncio.Event()
+
+        async def edit_then_404(**kwargs):
+            editing.set()
+            await fail.wait()
+            raise self._not_found()
+
+        old.edit = edit_then_404
+        view._last_tree_digest = None
+        refreshing = asyncio.create_task(view.refresh())
+        await asyncio.wait_for(editing.wait(), 1)
+        second, new = self._interaction(2)
+        view.interaction = second
+        # The send posts the new message, then waits for the edit in flight on
+        # the old one before closing it; the 404 comes back meanwhile.
+        sending = asyncio.create_task(view.send())
+        for _ in range(50):
+            if view._message is new:
+                break
+            await asyncio.sleep(0)
+        assert view._message is new
+        fail.set()
+        await refreshing
+        await asyncio.wait_for(sending, 1)
+
+        assert view._message is new
+        assert not view._torn_down()
+
+    @pytest.mark.parametrize("render", ["refresh", "reload"])
+    async def test_an_on_message_gone_that_sends_the_view_again_keeps_it_live(self, render):
+        """Called from inside the render, the hook's send waited on that
+        render's own turn: from reload() it raised, was logged, and the view
+        was torn down."""
+        first, old = self._interaction(1)
+        second, new = self._interaction(2)
+
+        class Reposts(RenderableLayoutView):
+            async def on_message_gone(self):
+                self.interaction = second
+                await self.send()
+
+        view = self._panel(first, Reposts)
+        await view.send()
+        view._message = old
+        old.edit = AsyncMock(side_effect=self._not_found())
+        view._last_tree_digest = None
+        await getattr(view, render)()
+        await asyncio.wait_for(view._message_gone_task, 5)
+
+        assert view._message is new
+        assert not view._torn_down()
+
+    async def test_an_on_message_gone_that_sends_a_tab_view_again_keeps_it_live(self):
+        from discord.ui import TextDisplay
+
+        from cascadeui import TabLayoutView
+
+        first, old = self._interaction(1)
+        second, new = self._interaction(2)
+
+        class Reposts(TabLayoutView):
+            async def on_message_gone(self):
+                self.interaction = second
+                await self.send()
+
+        view = Reposts(
+            interaction=first,
+            tabs={"A": lambda: [TextDisplay("a")], "B": lambda: [TextDisplay("b")]},
+        )
+        await view.send()
+        view._message = old
+        old.edit = AsyncMock(side_effect=self._not_found())
+        await view.switch_tab("B")
+        await asyncio.wait_for(view._message_gone_task, 5)
+
+        assert view._message is new
+        assert not view._torn_down()
+
+    async def test_a_view_a_send_moved_meanwhile_is_not_reported_gone(self):
+        """The edit's 404 landed while a send was posting the view anew: the
+        hook reported a live view's message as gone."""
+        first, old = self._interaction(1)
+        view = self._panel(first)
+        await view.send()
+        view._message = old
+        view.on_message_gone = AsyncMock()
+        editing, fail = asyncio.Event(), asyncio.Event()
+
+        async def edit_then_404(**kwargs):
+            editing.set()
+            await fail.wait()
+            raise self._not_found()
+
+        old.edit = edit_then_404
+        view._last_tree_digest = None
+        refreshing = asyncio.create_task(view.refresh())
+        await asyncio.wait_for(editing.wait(), 1)
+        second, new = self._interaction(2)
+        posting, gate = asyncio.Event(), asyncio.Event()
+        real_send = second.response.send_message
+
+        async def send_slowly(*args, **kwargs):
+            posting.set()
+            await gate.wait()
+            return await real_send(*args, **kwargs)
+
+        second.response.send_message = send_slowly
+        view.interaction = second
+        sending = asyncio.create_task(view.send())
+        await asyncio.wait_for(posting.wait(), 1)
+        fail.set()
+        assert await asyncio.wait_for(refreshing, 1) == "no_message"
+        gate.set()
+        await asyncio.wait_for(sending, 1)
+        await asyncio.wait_for(view._message_gone_task, 1)
+
+        assert view._message is new
+        assert not view._torn_down()
+        view.on_message_gone.assert_not_awaited()
+
+
+class TestCleanupDoesNotWaitOnOneSend:
+    async def test_a_view_being_sent_does_not_hold_up_another_views_teardown(self):
+        # The cleanup waits out a send in flight; waiting in snapshot order
+        # held every later view in the same purge behind a slow send.
+        first, _ = TestAMessageTheViewHasLeft._interaction(1)
+        sending_view = TestAMessageTheViewHasLeft._panel(first)
+        await sending_view.send()
+        other_interaction, _ = TestAMessageTheViewHasLeft._interaction(2)
+        other = TestAMessageTheViewHasLeft._panel(other_interaction)
+        await other.send()
+
+        resend, _ = TestAMessageTheViewHasLeft._interaction(3)
+        posting, gate = asyncio.Event(), asyncio.Event()
+        real_send = resend.response.send_message
+
+        async def send_slowly(*args, **kwargs):
+            posting.set()
+            await gate.wait()
+            return await real_send(*args, **kwargs)
+
+        resend.response.send_message = send_slowly
+        sending_view.interaction = resend
+        sending = asyncio.create_task(sending_view.send())
+        await asyncio.wait_for(posting.wait(), 1)
+        cleanup = asyncio.create_task(
+            other.state_store._clean_up_deleted(lambda message: message.channel.id == 888)
+        )
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+        try:
+            assert other._torn_down()
+        finally:
+            gate.set()
+            await sending
+            await asyncio.wait_for(cleanup, 1)

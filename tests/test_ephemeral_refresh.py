@@ -9,15 +9,21 @@ Covers the v2.2.0 fixes:
 """
 
 import asyncio
+import importlib
+import logging
+import sys
 import time
+import warnings
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
 import discord
 import pytest
-from discord.ui import ActionRow, TextDisplay
+from discord.ui import ActionRow, Button, TextDisplay
 from helpers import RenderableLayoutView
 from helpers import make_interaction as _make_interaction
+from helpers import refresh_timers, until, wait_for_timer
 
 from cascadeui import InstanceLimitError
 from cascadeui.components.base import StatefulButton
@@ -72,6 +78,220 @@ def _make_emoji_error() -> discord.HTTPException:
     )
     err.code = 50035
     return err
+
+
+async def _tab():
+    return [TextDisplay("tab")]
+
+
+class TestRefreshButtonHook:
+    """build_refresh_button() builds the Continue button; the guide taught the
+    private _build_refresh_button(), which keeps working with a warning."""
+
+    @staticmethod
+    async def _armed_labels(view):
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+        await view._arm_refresh_button()
+        return [c.label for c in view.walk_children() if isinstance(c, Button)]
+
+    async def test_an_override_builds_the_armed_button(self):
+        # The new name raises no DeprecationWarning, at definition or when armed.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+
+            class _View(StatefulLayoutView):
+                auto_refresh_ephemeral = True
+
+                def build_refresh_button(self):
+                    button = super().build_refresh_button()
+                    button.label = "Keep going"
+                    return button
+
+            labels = await self._armed_labels(_View(interaction=_make_interaction()))
+
+        assert labels == ["Keep going"]
+
+    @pytest.mark.parametrize("base_name", ["StatefulLayoutView", "TabLayoutView"])
+    async def test_an_override_of_the_old_name_still_builds_it_and_warns(self, base_name):
+        import cascadeui
+
+        base = getattr(cascadeui, base_name)
+        kwargs = {"tabs": {"A": _tab}} if base_name == "TabLayoutView" else {}
+
+        with pytest.warns(DeprecationWarning, match="rename it build_refresh_button") as caught:
+
+            class _Legacy(base):
+                auto_refresh_ephemeral = True
+
+                def _build_refresh_button(self):
+                    return StatefulButton(label="Legacy", callback=self._reopen_ephemeral)
+
+        # Attributed to the module defining the class, which is what Python's
+        # default filters decide by; a tab view's own class hook calls the
+        # one that warns, so a fixed stacklevel would name library code there.
+        assert caught[0].filename == __file__
+        view = _Legacy(interaction=_make_interaction(), **kwargs)
+        assert await self._armed_labels(view) == ["Legacy"]
+
+    async def test_super_of_the_old_name_returns_the_default_button(self):
+        with pytest.warns(DeprecationWarning):
+
+            class _Legacy(StatefulLayoutView):
+                auto_refresh_ephemeral = True
+
+                def _build_refresh_button(self):
+                    button = super()._build_refresh_button()
+                    button.label = f"{button.label}!"
+                    return button
+
+        with pytest.warns(DeprecationWarning, match="call build_refresh_button"):
+            labels = await self._armed_labels(_Legacy(interaction=_make_interaction()))
+
+        assert labels == [f"{StatefulLayoutView.refresh_button_label}!"]
+
+    async def test_a_class_defining_both_names_uses_the_new_one(self):
+        with pytest.warns(DeprecationWarning, match="is the one called"):
+
+            class _Both(StatefulLayoutView):
+                auto_refresh_ephemeral = True
+
+                def build_refresh_button(self):
+                    return StatefulButton(label="New", callback=self._reopen_ephemeral)
+
+                def _build_refresh_button(self):
+                    return StatefulButton(label="Old", callback=self._reopen_ephemeral)
+
+        assert await self._armed_labels(_Both(interaction=_make_interaction())) == ["New"]
+
+    async def test_an_old_name_override_on_a_plain_mixin_is_used(self):
+        """The mapping read only the new class's own body, so an override on a
+        mixin shared by V1 and V2 views was skipped: the default button went up,
+        with no warning, where the old name had always been honoured."""
+
+        class _ContinueMixin:
+            def _build_refresh_button(self):
+                return StatefulButton(label="Resume", callback=self._reopen_ephemeral)
+
+        with pytest.warns(
+            DeprecationWarning, match="_ContinueMixin overrides _build_refresh_button"
+        ):
+
+            class _View(_ContinueMixin, StatefulLayoutView):
+                auto_refresh_ephemeral = True
+
+        assert await self._armed_labels(_View(interaction=_make_interaction())) == ["Resume"]
+
+    async def test_a_subclass_of_a_mapped_view_does_not_warn_again(self):
+        with pytest.warns(DeprecationWarning):
+
+            class _Legacy(StatefulLayoutView):
+                auto_refresh_ephemeral = True
+
+                def _build_refresh_button(self):
+                    return StatefulButton(label="Legacy", callback=self._reopen_ephemeral)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+
+            class _Child(_Legacy):
+                pass
+
+        assert await self._armed_labels(_Child(interaction=_make_interaction())) == ["Legacy"]
+
+    async def test_an_override_that_raises_leaves_the_view_live_and_says_so(self, caplog):
+        """The flag was set and the tree cleared before the button was built,
+        so a raising override froze the panel and logged only at DEBUG."""
+
+        class _View(StatefulLayoutView):
+            auto_refresh_ephemeral = True
+
+            def build_ui(self):
+                self.clear_items()
+                self.add_item(TextDisplay("live"))
+
+            def build_refresh_button(self):
+                raise KeyError("refresh_label")
+
+        view = _View(interaction=_make_interaction())
+        view.build_ui()
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui"):
+            await view._arm_refresh_button()
+
+        assert view._refresh_armed is False
+        assert [c.content for c in view.children] == ["live"]
+        record = next(r for r in caplog.records if "not armed" in r.getMessage())
+        assert isinstance(record.exc_info[1], KeyError)
+
+    @pytest.mark.parametrize("shape", ["row", "long_label"])
+    async def test_a_button_that_cannot_be_placed_leaves_the_view_live(self, shape, caplog):
+        """Only a raising override was caught before arming: a button Discord
+        would refuse (a row where a button belongs, a label past 80
+        characters) armed the view over an empty tree, logged at DEBUG."""
+
+        class _View(StatefulLayoutView):
+            auto_refresh_ephemeral = True
+            refresh_button_label = "x" * 89 if shape == "long_label" else "Continue"
+
+            def build_ui(self):
+                self.clear_items()
+                self.add_item(TextDisplay("live"))
+
+            def build_refresh_button(self):
+                button = super().build_refresh_button()
+                return ActionRow(button) if shape == "row" else button
+
+        view = _View(interaction=_make_interaction())
+        view.build_ui()
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui"):
+            await view._arm_refresh_button()
+
+        assert view._refresh_armed is False
+        assert [c.content for c in view.children] == ["live"]
+        view._message.edit.assert_not_awaited()
+        assert any("not armed" in r.getMessage() for r in caplog.records)
+
+    async def test_an_async_override_builds_the_armed_button(self):
+        class _View(StatefulLayoutView):
+            auto_refresh_ephemeral = True
+
+            async def build_refresh_button(self):
+                button = super().build_refresh_button()
+                button.label = "Keep going"
+                return button
+
+        assert await self._armed_labels(_View(interaction=_make_interaction())) == ["Keep going"]
+
+    def test_a_user_package_named_like_the_library_is_named_in_the_warning(self, tmp_path):
+        """Frames were skipped by prefix, so a package called ``cascadeui_panels``
+        read as library code and the warning named whatever imported it."""
+        module = tmp_path / "cascadeui_panels.py"
+        module.write_text(
+            "\n".join(
+                [
+                    "from cascadeui import StatefulLayoutView",
+                    "class Panel(StatefulLayoutView):",
+                    "    def _build_refresh_button(self):",
+                    "        return super()._build_refresh_button()",
+                    "",
+                ]
+            )
+        )
+        sys.path.insert(0, str(tmp_path))
+        try:
+            with pytest.warns(DeprecationWarning) as caught:
+                importlib.import_module("cascadeui_panels")
+        finally:
+            sys.path.remove(str(tmp_path))
+            sys.modules.pop("cascadeui_panels", None)
+
+        assert Path(caught[0].filename) == module
 
 
 class TestArmRefreshButton:
@@ -141,7 +361,7 @@ class TestArmRefreshButton:
         view._message = MagicMock()
         view._message.edit = AsyncMock()
         view._refresh_armed = True
-        view._install_refresh_button(view._build_refresh_button())
+        view._install_refresh_button(view.build_refresh_button())
         armed_tree = list(view.children)
         rebuilds.clear()
 
@@ -369,6 +589,19 @@ class TestExitPolicy:
         assert "3" in err.default_message
         assert "MyView" not in err.default_message
 
+    @pytest.mark.parametrize(
+        "kwargs, singular, plural",
+        [
+            ({"scope": "guild"}, "already open in this server", "This server can only have 3"),
+            ({"scope": "global"}, "One of these is already open.", "Only 3 of these"),
+            ({"blocked_user_id": 7}, "already taking part", "only take part in 3"),
+            ({"scope": "user_guild"}, "already have one", "only have 3"),
+        ],
+    )
+    def test_default_message_is_worded_for_who_the_limit_counts(self, kwargs, singular, plural):
+        assert singular in InstanceLimitError("MyView", 1, **kwargs).default_message
+        assert plural in InstanceLimitError("MyView", 3, **kwargs).default_message
+
     async def test_explicit_argument_overrides_policy(self):
         """An explicit delete_message argument to exit() must override
         whatever exit_policy says.
@@ -429,7 +662,9 @@ class TestExitPolicy:
         with caplog.at_level(logging.DEBUG, logger="cascadeui.views.base"):
             await view.exit()
 
-        error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+        error_records = [
+            r for r in caplog.records if r.levelname == "ERROR" and r.name.startswith("cascadeui")
+        ]
         debug_records = [r for r in caplog.records if r.levelname == "DEBUG"]
         assert not error_records
         assert any("webhook token expired" in r.message for r in debug_records)
@@ -792,10 +1027,10 @@ class TestAttachChildRefreshHandoff:
 
         parent.attach_child(old_child)
 
-        # _reopen_factory lets us hand a pre-built replacement to the
-        # refresh path without exercising __init__ kwarg snapshotting.
+        # build_reopen_view hands a pre-built replacement to the refresh
+        # path without exercising __init__ kwarg snapshotting.
         new_child = _Refreshable(interaction=_make_interaction())
-        old_child._reopen_factory = lambda: new_child
+        old_child.build_reopen_view = lambda interaction: new_child
 
         # Mock send -- no working channel/webhook in test context.
         new_child.send = AsyncMock()
@@ -810,6 +1045,66 @@ class TestAttachChildRefreshHandoff:
         assert old_child not in parent._attached_children
         assert new_child._attached_to is parent
         assert old_child._attached_to is None
+
+    async def test_reopen_rebuilds_a_child_that_reads_its_parent_while_built(self):
+        """The kwargs path strips parent= with the other framework-managed
+        kwargs, so a child that read its parent in __init__ raised on every
+        Continue and the user got the reopen-failure message.
+        """
+
+        class _Parent(RenderableLayoutView):
+            ships = "fleet"
+
+        class _Child(StatefulLayoutView):
+            auto_refresh_ephemeral = True
+
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.label = self.parent.ships
+                self.add_item(TextDisplay(self.label))
+
+        parent = _Parent(interaction=_make_interaction())
+        await parent.send()
+        child = _Child(interaction=_make_interaction(), parent=parent)
+        await child.send(ephemeral=True)
+
+        await child._reopen_ephemeral(_make_interaction())
+
+        assert child._torn_down(), "the reopen went through"
+        (replacement,) = parent._attached_children
+        assert isinstance(replacement, _Child) and replacement is not child
+        assert replacement.label == "fleet"
+        assert replacement.parent is parent
+
+    async def test_reopen_under_a_closed_parent_still_continues(self):
+        """A parent stopped without closing its children leaves the child
+        live. Handing that parent to the replacement made its send close the
+        replacement straight away, and the old panel stayed on a Continue
+        button that could never go anywhere.
+        """
+
+        class _Child(StatefulLayoutView):
+            auto_refresh_ephemeral = True
+
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.add_item(TextDisplay("fleet"))
+
+        parent = RenderableLayoutView(interaction=_make_interaction())
+        await parent.send()
+        child = _Child(interaction=_make_interaction(), parent=parent)
+        await child.send(ephemeral=True)
+        parent.stop()
+
+        await child._reopen_ephemeral(_make_interaction())
+
+        assert child._torn_down(), "the reopen went through"
+        replacements = [
+            v
+            for v in child.state_store._active_views.values()
+            if type(v) is _Child and v is not child
+        ]
+        assert len(replacements) == 1 and not replacements[0]._torn_down()
 
     async def test_reopen_skips_migration_when_parent_finished(self):
         """If the parent already exited while the child was waiting on
@@ -829,7 +1124,7 @@ class TestAttachChildRefreshHandoff:
         parent.stop()  # parent ends before child refresh fires
 
         new_child = _Refreshable(interaction=_make_interaction())
-        old_child._reopen_factory = lambda: new_child
+        old_child.build_reopen_view = lambda interaction: new_child
         new_child.send = AsyncMock()
         old_child.exit = AsyncMock()
 
@@ -863,7 +1158,7 @@ class TestAttachChildRefreshHandoff:
         old_parent.attach_child(child)
 
         new_parent = _Refreshable(interaction=_make_interaction())
-        old_parent._reopen_factory = lambda: new_parent
+        old_parent.build_reopen_view = lambda interaction: new_parent
         new_parent.send = AsyncMock()
 
         # exit() runs for real so the cascade is exercised; only the
@@ -897,7 +1192,7 @@ class TestOnReopenFailure:
         view = _View(interaction=_make_interaction())
         view._message = MagicMock()
         view._message.delete = AsyncMock()
-        view._reopen_factory = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        view.build_reopen_view = lambda interaction: (_ for _ in ()).throw(RuntimeError("boom"))
 
         refresh_interaction = _make_interaction()
         await view._reopen_ephemeral(refresh_interaction)
@@ -918,7 +1213,7 @@ class TestOnReopenFailure:
         view = _View(interaction=_make_interaction())
         view._message = MagicMock()
         view._message.delete = AsyncMock()
-        view._reopen_factory = lambda: None
+        view.build_reopen_view = lambda interaction: None
         view.exit = AsyncMock()
 
         refresh_interaction = _make_interaction()
@@ -927,6 +1222,46 @@ class TestOnReopenFailure:
         refresh_interaction.response.send_message.assert_called_once_with(
             "This session has ended.", ephemeral=True
         )
+        view.exit.assert_awaited_once()
+
+    async def test_factory_none_runs_on_session_ended(self):
+        seen = []
+
+        class _View(StatefulLayoutView):
+            auto_refresh_ephemeral = True
+
+            async def on_session_ended(self, interaction):
+                seen.append(interaction)
+
+        view = _View(interaction=_make_interaction())
+        view._message = MagicMock()
+        view._message.delete = AsyncMock()
+        view.build_reopen_view = lambda interaction: None
+        view.exit = AsyncMock()
+
+        refresh_interaction = _make_interaction()
+        await view._reopen_ephemeral(refresh_interaction)
+
+        assert seen == [refresh_interaction]
+        refresh_interaction.response.send_message.assert_not_called()
+        view.exit.assert_awaited_once()
+
+    async def test_factory_none_with_no_session_ended_message_sends_nothing(self):
+        class _View(StatefulLayoutView):
+            auto_refresh_ephemeral = True
+            session_ended_message = None
+
+        view = _View(interaction=_make_interaction())
+        view._message = MagicMock()
+        view._message.delete = AsyncMock()
+        view.build_reopen_view = lambda interaction: None
+        view.exit = AsyncMock()
+
+        refresh_interaction = _make_interaction()
+        await view._reopen_ephemeral(refresh_interaction)
+
+        refresh_interaction.response.send_message.assert_not_called()
+        refresh_interaction.followup.send.assert_not_called()
         view.exit.assert_awaited_once()
 
     async def test_custom_message_attribute(self):
@@ -941,7 +1276,7 @@ class TestOnReopenFailure:
         view = _View(interaction=_make_interaction())
         view._message = MagicMock()
         view._message.delete = AsyncMock()
-        view._reopen_factory = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        view.build_reopen_view = lambda interaction: (_ for _ in ()).throw(RuntimeError("boom"))
 
         refresh_interaction = _make_interaction()
         await view._reopen_ephemeral(refresh_interaction)
@@ -965,7 +1300,7 @@ class TestOnReopenFailure:
         view = _View(interaction=_make_interaction())
         view._message = MagicMock()
         view._message.delete = AsyncMock()
-        view._reopen_factory = lambda: (_ for _ in ()).throw(ValueError("test"))
+        view.build_reopen_view = lambda interaction: (_ for _ in ()).throw(ValueError("test"))
 
         refresh_interaction = _make_interaction()
         await view._reopen_ephemeral(refresh_interaction)
@@ -974,6 +1309,58 @@ class TestOnReopenFailure:
         assert captured[0][0] == "factory_error"
         # The default send_message should NOT have been called
         refresh_interaction.response.send_message.assert_not_called()
+
+    async def test_a_refused_replacement_leaves_the_current_view_and_its_children(self):
+        # The replacement's send returned None; the old view exited anyway,
+        # after handing its children to a replacement that never went live.
+        refuse = [False]
+
+        class _View(RenderableLayoutView):
+            timeout = None
+
+            async def on_pre_send(self, interaction):
+                return not refuse[0]
+
+        view = _View(interaction=_make_interaction())
+        await view.send(ephemeral=True)
+        child = RenderableLayoutView(interaction=_make_interaction(), parent=view)
+        await child.send()
+        refuse[0] = True
+
+        await view._reopen_ephemeral(_make_interaction())
+
+        assert not view._torn_down()
+        assert child._attached_to is view
+        assert not view._reopen_in_flight
+
+    async def test_a_second_continue_during_a_reopen_is_logged(self, caplog):
+        caplog.set_level(logging.DEBUG, logger="cascadeui")
+        gate = asyncio.Event()
+
+        class _View(RenderableLayoutView):
+            timeout = None
+
+            async def build_reopen_view(self, interaction):
+                await gate.wait()
+                return _View(interaction=interaction)
+
+        view = _View(interaction=_make_interaction())
+        await view.send(ephemeral=True)
+        first = asyncio.create_task(view._reopen_ephemeral(_make_interaction()))
+        await asyncio.sleep(0)
+        second = _make_interaction()
+        second.data = {"custom_id": "refresh"}
+
+        await view._reopen_ephemeral(second)
+
+        second.response.defer.assert_awaited_once()
+        assert any(
+            "Dropped a click" in r.getMessage() and "'refresh'" in r.getMessage()
+            for r in caplog.records
+            if r.name.startswith("cascadeui")
+        )
+        gate.set()
+        await asyncio.wait_for(first, 5)
 
 
 # // ========================================( Reopen Carries Identity )======================================== // #
@@ -1015,9 +1402,10 @@ class TestReopenCarriesIdentity:
         old._sel = "chosen"
         old._nav_stack = [entry]
         old._instance_root_class = "RootView"
+        old._instance_root_scope = "user"
 
         new = _NavCarry(interaction=_make_interaction())
-        old._reopen_factory = lambda: new
+        old.build_reopen_view = lambda interaction: new
         new.send = AsyncMock()
         old.exit = AsyncMock()
 
@@ -1026,6 +1414,7 @@ class TestReopenCarriesIdentity:
         assert new._sel == "chosen"
         assert new._nav_stack == [entry]
         assert new._instance_root_class == "RootView"
+        assert new._instance_root_scope == "user"
 
     async def test_reopen_carries_session_for_continuity(self):
         """The replacement rejoins the old view's session so shared_data
@@ -1042,7 +1431,7 @@ class TestReopenCarriesIdentity:
         old.session_id = "session-continuity-1"
 
         new = _Refreshable(interaction=_make_interaction())
-        old._reopen_factory = lambda: new
+        old.build_reopen_view = lambda interaction: new
         new.send = AsyncMock()
         old.exit = AsyncMock()
 
@@ -1064,7 +1453,7 @@ class TestReopenCarriesIdentity:
         old._participants.add(99)
 
         new = _Refreshable(interaction=_make_interaction())
-        old._reopen_factory = lambda: new
+        old.build_reopen_view = lambda interaction: new
         new.send = AsyncMock()
         old.exit = AsyncMock()
 
@@ -1073,28 +1462,47 @@ class TestReopenCarriesIdentity:
         assert 42 in new._participants
         assert 99 in new._participants
 
-    async def test_reopen_carries_factory_for_next_cycle(self):
-        """The replacement inherits the reopen factory so a second reopen
-        does not fall back to the _init_kwargs path the factory replaced.
-        """
+    async def test_an_overridden_build_reopen_view_builds_every_continue(self):
+        """The override lives on the class, so the replacement it built
+        uses it on the next Continue as well."""
+        built = []
 
-        class _Refreshable(StatefulLayoutView):
+        class _Panel(RenderableLayoutView):
+            timeout = None
             auto_refresh_ephemeral = True
 
-        old = _Refreshable(interaction=_make_interaction())
-        old._message = MagicMock()
-        old._message.delete = AsyncMock()
-        old._message.edit = AsyncMock()
+            async def build_reopen_view(self, interaction):
+                view = _Panel(interaction=interaction, user_id=self.user_id)
+                built.append(view)
+                return view
 
-        new = _Refreshable(interaction=_make_interaction())
-        factory = lambda: new
-        old._reopen_factory = factory
-        new.send = AsyncMock()
-        old.exit = AsyncMock()
+        first = _Panel(interaction=_make_interaction(user_id=1, guild_id=100))
+        await first.send(ephemeral=True)
 
-        await old._reopen_ephemeral(_make_interaction())
+        await first._reopen_ephemeral(_make_interaction(user_id=1, guild_id=100))
+        await built[0]._reopen_ephemeral(_make_interaction(user_id=1, guild_id=100))
 
-        assert new._reopen_factory is factory
+        assert len(built) == 2
+        assert first.current_view is built[1]
+        assert not built[1].is_finished()
+
+    async def test_build_reopen_view_returning_none_ends_the_session(self):
+        class _Panel(RenderableLayoutView):
+            timeout = None
+            auto_refresh_ephemeral = True
+
+            def build_reopen_view(self, interaction):
+                return None
+
+        view = _Panel(interaction=_make_interaction(user_id=1, guild_id=100))
+        await view.send(ephemeral=True)
+        click = _make_interaction(user_id=1, guild_id=100)
+
+        await view._reopen_ephemeral(click)
+
+        assert view._torn_down()
+        click.response.send_message.assert_awaited_once()
+        assert "session has ended" in click.response.send_message.await_args.args[0]
 
     async def test_reopen_transfers_undo_redo_timeline(self):
         """The old view's undo/redo stacks dispatch onto the replacement's
@@ -1118,7 +1526,7 @@ class TestReopenCarriesIdentity:
         }
         try:
             new = _Refreshable(interaction=_make_interaction())
-            old._reopen_factory = lambda: new
+            old.build_reopen_view = lambda interaction: new
             new.send = AsyncMock()
             new.dispatch = AsyncMock()
             old.exit = AsyncMock()
@@ -1148,7 +1556,7 @@ class TestReopenCarriesIdentity:
         old._nav_stack = [{"class_name": "Parent", "module": "m", "kwargs": {}, "view_state": {}}]
 
         new = _Refreshable(interaction=_make_interaction())
-        old._reopen_factory = lambda: new
+        old.build_reopen_view = lambda interaction: new
         new.send = AsyncMock()
         old.exit = AsyncMock()
 
@@ -1169,13 +1577,465 @@ class TestReopenCarriesIdentity:
         old._message.edit = AsyncMock()
 
         new = _Refreshable(interaction=_make_interaction())
-        old._reopen_factory = lambda: new
+        old.build_reopen_view = lambda interaction: new
         new.send = AsyncMock()
         old.exit = AsyncMock()
 
         await old._reopen_ephemeral(_make_interaction())
 
         assert getattr(new, "_auto_back_item", None) is None
+
+
+class TestReopenHandsThePanelOn:
+    """Code that kept an ephemeral panel reaches its replacement."""
+
+    async def test_current_view_follows_the_continue_button(self, caplog):
+        """The kept reference could not reach the view Continue replaced it
+        with, and its exit() did nothing, with nothing said."""
+
+        class _Panel(RenderableLayoutView):
+            timeout = None
+            auto_refresh_ephemeral = True
+
+        old = _Panel(interaction=_make_interaction(user_id=1, guild_id=100))
+        await old.send(ephemeral=True)
+        with caplog.at_level(logging.WARNING, logger="cascadeui"):
+            await old._reopen_ephemeral(_make_interaction(user_id=1, guild_id=100))
+            new = old.current_view
+            assert new is not old and isinstance(new, _Panel) and not new.is_finished()
+            # The reopen's own close of the old view is not a kept reference.
+            assert not [r for r in caplog.records if "handed its panel on" in r.getMessage()]
+
+            await old.exit()
+            assert any("handed its panel on" in r.getMessage() for r in caplog.records)
+        assert not new.is_finished()
+
+        await old.current_view.exit()
+        assert new._torn_down()
+
+    @pytest.mark.parametrize("close", ["exit", "on_timeout"])
+    async def test_a_close_during_the_continue_leaves_the_replacement_whole(self, close):
+        """A close from another task landing while the replacement was sent
+        closed this view and its attached view, and the replacement went live
+        without them."""
+        loading = None
+
+        class _Panel(RenderableLayoutView):
+            timeout = None
+            auto_refresh_ephemeral = True
+
+            async def on_load(self):
+                if loading is not None:
+                    await loading.wait()
+
+        old = _Panel(interaction=_make_interaction(user_id=1, guild_id=100))
+        await old.send(ephemeral=True)
+        child = RenderableLayoutView(
+            interaction=_make_interaction(user_id=1, guild_id=100), parent=old
+        )
+        await child.send(ephemeral=True)
+        loading = asyncio.Event()
+        click = _make_interaction(user_id=1, guild_id=100)
+        continuing = asyncio.create_task(old._reopen_ephemeral(click))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        closing = asyncio.create_task(getattr(old, close)())
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert not closing.done(), "the close did not wait for the Continue"
+        loading.set()
+        await asyncio.wait_for(asyncio.gather(continuing, closing), 5)
+
+        new = old.current_view
+        assert new is not old and not new.is_finished()
+        assert not child.is_finished()
+        assert child in new._attached_children
+
+    async def test_a_push_from_code_during_the_continue_waits_and_refuses(self):
+        """A push() from code landing while the replacement was sent committed
+        too: two live panels, current_view on the replacement while the pushed
+        screen held the attached view, on an ephemeral message about to lose
+        its token."""
+        loading = None
+
+        class _Panel(RenderableLayoutView):
+            timeout = None
+            auto_refresh_ephemeral = True
+
+            async def on_load(self):
+                if loading is not None:
+                    await loading.wait()
+
+        old = _Panel(interaction=_make_interaction(user_id=1, guild_id=100))
+        await old.send(ephemeral=True)
+        child = RenderableLayoutView(
+            interaction=_make_interaction(user_id=1, guild_id=100), parent=old
+        )
+        await child.send(ephemeral=True)
+        loading = asyncio.Event()
+        continuing = asyncio.create_task(old._reopen_ephemeral(_make_interaction(user_id=1)))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        pushing = asyncio.create_task(old.push(RenderableLayoutView))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert not pushing.done(), "the push did not wait for the Continue"
+        loading.set()
+        await asyncio.wait_for(continuing, 5)
+        with pytest.raises(RuntimeError, match="handed its panel on"):
+            await asyncio.wait_for(pushing, 5)
+
+        new = old.current_view
+        assert new is not old and not new.is_finished()
+        assert child in new._attached_children
+        live = [v for v in old.state_store._active_views.values() if not v.is_finished()]
+        assert set(live) == {new, child}
+
+    async def test_navigation_from_inside_the_continue_does_not_wait_on_itself(self):
+        """build_reopen_view() runs in the Continue's own task, so a push or pop
+        it starts must not wait for the Continue to finish."""
+        waited = []
+
+        class _Panel(RenderableLayoutView):
+            timeout = None
+            auto_refresh_ephemeral = True
+
+            async def build_reopen_view(self, interaction):
+                # Awaited directly: before 3.12 a wait_for here would run the
+                # call in a task of its own, which is not the Continue's.
+                await self._wait_to_navigate("push()")
+                waited.append(True)
+                return await super().build_reopen_view(interaction)
+
+        old = _Panel(interaction=_make_interaction(user_id=1, guild_id=100))
+        await old.send(ephemeral=True)
+        # The bound for a regression, which would wait on the Continue for good.
+        await asyncio.wait_for(old._reopen_ephemeral(_make_interaction(user_id=1)), 5)
+
+        assert waited == [True], "the navigation waited on the Continue it runs in"
+
+    async def test_a_close_held_by_a_stuck_continue_is_logged(self, monkeypatch, caplog):
+        """A close waiting on a Continue whose replacement never finished
+        loading waited in silence, with the panel refusing every click."""
+        from cascadeui.views import _navigation
+
+        monkeypatch.setattr(_navigation, "_NAVIGATION_WAIT_WARN_SECONDS", 0.01)
+        caplog.set_level(logging.WARNING, logger="cascadeui")
+        loading = None
+
+        class _Panel(RenderableLayoutView):
+            timeout = None
+            auto_refresh_ephemeral = True
+
+            async def on_load(self):
+                if loading is not None:
+                    await loading.wait()
+
+        old = _Panel(interaction=_make_interaction(user_id=1, guild_id=100))
+        await old.send(ephemeral=True)
+        loading = asyncio.Event()
+        continuing = asyncio.create_task(old._reopen_ephemeral(_make_interaction(user_id=1)))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        closing = asyncio.create_task(old.exit())
+        try:
+            await until(
+                lambda: any(
+                    "waited" in r.getMessage() and "Continue" in r.getMessage()
+                    for r in caplog.records
+                    if r.name.startswith("cascadeui")
+                ),
+                timeout=2,
+            )
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            loading.set()
+        await asyncio.wait_for(asyncio.gather(continuing, closing), 5)
+
+        assert any(
+            "waited" in r.getMessage() and "Continue" in r.getMessage()
+            for r in caplog.records
+            if r.name.startswith("cascadeui")
+        ), "the close waited on the Continue without a word"
+
+    async def test_a_navigation_held_by_a_stuck_continue_is_logged_as_itself(
+        self, monkeypatch, caplog
+    ):
+        """A push() waiting on a Continue was logged as a close, naming neither
+        the call nor the cycle that hangs it."""
+        from cascadeui.views import _navigation
+
+        monkeypatch.setattr(_navigation, "_NAVIGATION_WAIT_WARN_SECONDS", 0.01)
+        caplog.set_level(logging.WARNING, logger="cascadeui")
+        loading = None
+
+        class _Panel(RenderableLayoutView):
+            timeout = None
+            auto_refresh_ephemeral = True
+
+            async def on_load(self):
+                if loading is not None:
+                    await loading.wait()
+
+        old = _Panel(interaction=_make_interaction(user_id=1, guild_id=100))
+        await old.send(ephemeral=True)
+        loading = asyncio.Event()
+        continuing = asyncio.create_task(old._reopen_ephemeral(_make_interaction(user_id=1)))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        pushing = asyncio.create_task(old.push(RenderableLayoutView))
+
+        def waited():
+            return [
+                r.getMessage()
+                for r in caplog.records
+                if r.name.startswith("cascadeui") and "for the view's Continue" in r.getMessage()
+            ]
+
+        try:
+            await until(lambda: waited(), timeout=2)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            loading.set()
+        await asyncio.wait_for(continuing, 5)
+        with pytest.raises(RuntimeError, match="handed its panel on"):
+            await asyncio.wait_for(pushing, 5)
+
+        assert waited() and waited()[0].startswith(
+            "push() on _Panel has waited"
+        ), f"the push's wait was not logged as the push: {waited()}"
+
+    async def test_a_library_exit_waiting_on_the_continue_is_not_warned_about(self, caplog):
+        """The Continue cleared the library-exit mark in its finally, so an
+        instance-limit replacement already waiting on the Continue logged the
+        handed-over warning for the library's own exit."""
+        from discord.ui import TextDisplay
+
+        caplog.set_level(logging.WARNING, logger="cascadeui")
+        loading = None
+
+        def _sent_on(message_id):
+            interaction = _make_interaction(user_id=1, guild_id=100)
+            message = MagicMock(id=message_id, channel=MagicMock(id=888))
+            message.edit = AsyncMock(return_value=message)
+            message.delete = AsyncMock()
+            interaction.original_response = AsyncMock(return_value=message)
+            return interaction
+
+        class _Limited(StatefulLayoutView):
+            auto_refresh_ephemeral = True
+            auto_defer_delay = 0.05
+            instance_limit = 1
+            instance_policy = "replace"
+            instance_scope = "user"
+
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.add_item(TextDisplay("panel"))
+
+            async def on_load(self):
+                nonlocal loading
+                if loading is not None:
+                    gate, loading = loading, None
+                    await gate.wait()
+
+        old = _Limited(interaction=_sent_on(1000), timeout=3000)
+        await old.send(ephemeral=True)
+        gate = loading = asyncio.Event()
+        continuing = asyncio.create_task(old._reopen_ephemeral(_sent_on(1002)))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        fresh = _Limited(interaction=_sent_on(1003), timeout=3000)
+        opening = asyncio.create_task(fresh.send(ephemeral=True))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        gate.set()
+        await asyncio.wait_for(asyncio.gather(continuing, opening), 5)
+
+        assert not fresh.is_finished() and old.is_finished()
+        handed = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name.startswith("cascadeui") and "handed its panel on" in r.getMessage()
+        ]
+        assert handed == [], f"the library's own exit was warned about: {handed}"
+
+
+class TestReopenLinkSurvivesARaisingExit:
+    async def test_the_link_holds_when_the_old_views_exit_raises(self):
+        """The link was set after the old view's exit(), so an override that
+        raised left code holding the old view no way to reach the live one."""
+
+        class _Panel(RenderableLayoutView):
+            timeout = None
+            auto_refresh_ephemeral = True
+            fail_exit = False
+
+            async def exit(self, delete_message=None):
+                if self.fail_exit:
+                    raise RuntimeError("exit failed")
+                return await super().exit(delete_message=delete_message)
+
+        old = _Panel(interaction=_make_interaction(user_id=1, guild_id=100))
+        await old.send(ephemeral=True)
+        old.fail_exit = True
+
+        with pytest.raises(RuntimeError, match="exit failed"):
+            await old._reopen_ephemeral(_make_interaction(user_id=1, guild_id=100))
+
+        new = old.current_view
+        assert new is not old and not new.is_finished()
+
+
+class TestReopenFactoryReturningTheViewItself:
+    async def test_the_second_continue_is_refused(self):
+        """The factory rides onto the replacement, so one returning a fixed
+        instance hands back the view itself on the next Continue: the view
+        became its own successor, and every reader of the link spun forever."""
+
+        class _Panel(RenderableLayoutView):
+            timeout = None
+            auto_refresh_ephemeral = True
+
+        old = _Panel(interaction=_make_interaction(user_id=1, guild_id=100))
+        await old.send(ephemeral=True)
+        new = _Panel(interaction=_make_interaction(user_id=1, guild_id=100))
+        old.build_reopen_view = lambda interaction: new
+        await old._reopen_ephemeral(_make_interaction(user_id=1, guild_id=100))
+        failures = []
+
+        async def on_reopen_failure(interaction, error=None):
+            failures.append(error)
+
+        new.on_reopen_failure = on_reopen_failure
+        new.build_reopen_view = lambda interaction: new
+        await new._reopen_ephemeral(_make_interaction(user_id=1, guild_id=100))
+
+        # Read before anything follows the link, so a cycle fails here rather
+        # than hanging the suite.
+        assert new._successor is None
+        assert isinstance(failures[0], RuntimeError)
+        assert not new.is_finished()
+        assert old.current_view is new
+
+
+class TestReopenRefusesWhatItCannotSend:
+    """build_reopen_view() returning something other than a new CascadeUI view
+    crashed inside the library naming neither the hook nor the fix, left every
+    later Continue click unanswered, or took over another live view."""
+
+    async def _reopen_with(self, make_result):
+        class _Panel(RenderableLayoutView):
+            timeout = None
+            auto_refresh_ephemeral = True
+
+        view = _Panel(interaction=_make_interaction(user_id=1, guild_id=100))
+        await view.send(ephemeral=True)
+        failures = []
+
+        async def on_reopen_failure(interaction, error=None):
+            failures.append(error)
+
+        view.on_reopen_failure = on_reopen_failure
+        view.build_reopen_view = lambda interaction: make_result(_Panel)
+        await view._reopen_ephemeral(_make_interaction(user_id=1, guild_id=100))
+        return view, failures
+
+    @pytest.mark.parametrize(
+        "make_result, match",
+        [
+            (lambda cls: cls, "returned the class _Panel, not a CascadeUI view"),
+            (lambda cls: discord.ui.LayoutView(), "returned a LayoutView, not a CascadeUI view"),
+        ],
+        ids=["the-class", "a-plain-discord-view"],
+    )
+    async def test_a_result_that_is_not_a_view_instance_is_refused(self, make_result, match):
+        view, failures = await self._reopen_with(make_result)
+
+        assert len(failures) == 1 and match in str(failures[0])
+        assert view._reopen_in_flight is False
+        assert not view.is_finished()
+
+    async def test_a_live_view_is_refused_and_left_as_it_was(self):
+        live = {}
+
+        def make_result(cls):
+            return live["hub"]
+
+        hub = RenderableLayoutView(interaction=_make_interaction(user_id=1, guild_id=100))
+        await hub.send()
+        live["hub"] = hub
+        session_before = hub.session_id
+
+        view, failures = await self._reopen_with(make_result)
+
+        assert len(failures) == 1 and "already sent, pushed, or closed" in str(failures[0])
+        assert hub.session_id == session_before
+        assert hub._nav_stack == []
+        assert view._reopen_in_flight is False
+
+
+class TestReopenShowsTheDataOnScreen:
+    """The rebuild replays the constructor's kwargs, which held the data the
+    view was built with, not the data a refresh swapped in since."""
+
+    @staticmethod
+    def _texts(view):
+        return [c.content for c in view.walk_children() if isinstance(c, TextDisplay)]
+
+    async def test_continue_after_refresh_data_keeps_the_new_items(self):
+        from cascadeui import PaginatedLayoutView
+
+        class _Pages(PaginatedLayoutView):
+            timeout = None
+            auto_refresh_ephemeral = True
+
+        def fmt(chunk):
+            return [TextDisplay(", ".join(chunk))]
+
+        view = await _Pages.from_data(
+            ["old-a", "old-b"], 1, fmt, interaction=_make_interaction(user_id=1, guild_id=100)
+        )
+        await view.send(ephemeral=True)
+        await view.refresh_data(["new-a", "new-b", "new-c"])
+
+        await view._reopen_ephemeral(_make_interaction(user_id=1, guild_id=100))
+
+        new = view.current_view
+        assert new is not view
+        assert len(new.pages) == 3
+        assert self._texts(new)[0] == "new-a"
+
+    async def test_continue_after_refresh_pages_keeps_the_new_total(self):
+        from cascadeui import PaginatedLayoutView
+
+        class _Pages(PaginatedLayoutView):
+            timeout = None
+            auto_refresh_ephemeral = True
+
+        async def fetch(offset, limit):
+            return [f"row-{i}" for i in range(offset, offset + limit)]
+
+        def fmt(chunk):
+            return [TextDisplay(", ".join(chunk))]
+
+        view = _Pages.from_cursor(
+            fetch,
+            total=2,
+            per_page=1,
+            formatter=fmt,
+            interaction=_make_interaction(user_id=1, guild_id=100),
+        )
+        await view.send(ephemeral=True)
+        await view.refresh_pages(new_total=5)
+
+        await view._reopen_ephemeral(_make_interaction(user_id=1, guild_id=100))
+
+        new = view.current_view
+        assert new is not view
+        assert len(new.pages) == 5
 
 
 class TestReopenCleanupOfOldMessage:
@@ -1200,7 +2060,7 @@ class TestReopenCleanupOfOldMessage:
         old._message = message
 
         new = self._Refreshable(interaction=_make_interaction())
-        old._reopen_factory = lambda: new
+        old.build_reopen_view = lambda interaction: new
         new.send = AsyncMock()
         return old, message
 
@@ -1236,6 +2096,42 @@ class TestReopenCleanupOfOldMessage:
         assert buttons and all(b.disabled for b in buttons)
 
 
+# // ========================================( Refresh Timer )======================================== // #
+
+
+class TestTheRefreshTimerWaitsWithoutATask:
+    """The timer that arms the refresh button waited in a task asleep until
+    its deadline. A send finishing after its cancel while the program ended
+    scheduled one during asyncio's shutdown, which then reported the task
+    destroyed while still pending."""
+
+    async def test_a_scheduled_timer_leaves_no_task_waiting(self):
+        class _View(RenderableLayoutView):
+            timeout = None
+
+        view = _View(interaction=_make_interaction())
+        await view.send(ephemeral=True)
+        try:
+            assert len(refresh_timers(view)) == 1
+            assert view.task_manager.get_task_count(view.id) == 0
+        finally:
+            view.task_manager.cancel_tasks(view.id)
+
+    async def test_exit_cancels_the_timer(self):
+        class _View(RenderableLayoutView):
+            timeout = None
+
+        view = _View(interaction=_make_interaction())
+        await view.send(ephemeral=True)
+        await until(lambda: refresh_timers(view))
+        [timer] = refresh_timers(view)
+
+        await view.exit()
+
+        assert timer.cancelled()
+        assert refresh_timers(view) == []
+
+
 # // ========================================( Ephemeral Flag Reset On Send )======================================== // #
 
 
@@ -1267,20 +2163,17 @@ class TestEphemeralFlagResetOnSend:
 
         assert view._ephemeral is True
 
-    async def test_public_re_send_stops_a_sleeping_timer_from_arming(self):
-        """A timer asleep when the same instance is re-sent publicly must not
-        arm when it wakes. The public re-send cancels nothing and clears
-        nothing: the stale deadline stays (the non-ephemeral branch stamps
-        nothing) and the stale True resolution keeps the effective handoff
-        True, so the policy backstop would arm the reopen button over the
-        live public panel. Only the flag (reassigned at every send) records
-        that the managed message changed.
+    async def test_public_re_send_stops_a_waiting_timer_from_arming(self):
+        """A timer waiting when the same instance is re-sent publicly must not
+        arm when it fires. The public re-send cancels no timer, and the stale
+        True resolution keeps the effective handoff True, so the policy
+        backstop would arm the reopen button over the live public panel. The
+        send clears the pending deadline and reassigns the flag, and either
+        records that the managed message changed.
 
-        The drain between the sends is load-bearing: it lets the timer take
-        its first step and commit to its sleep while the instance still
-        manages the ephemeral send. Without it, none of the second send's
-        mocked awaits yields to the event loop, the timer first runs after
-        the flag flipped, and the interleaving under test is never reached.
+        The timer is registered during the first send, while the instance
+        still manages the ephemeral send, so at its deadline the flag check
+        is the gate that must decline.
         """
 
         class _View(RenderableLayoutView):
@@ -1289,27 +2182,25 @@ class TestEphemeralFlagResetOnSend:
 
         view = _View(interaction=_make_interaction())
         captured = []
-        real_create = view.create_task
+        real_schedule = view._schedule_ephemeral_refresh
 
-        def _capture(coro):
-            task = real_create(coro)
-            captured.append(task)
-            return task
+        def _capture():
+            captured.append(True)
+            real_schedule()
 
-        with patch.object(view, "create_task", side_effect=_capture):
+        with patch.object(view, "_schedule_ephemeral_refresh", side_effect=_capture):
             await view.send(ephemeral=True)
 
         try:
             assert view._ephemeral is True
             assert view._refresh_handoff is True
             assert len(captured) == 1
-            timer = captured[0]
 
-            # First step: the timer passes the entry backstop (the policy is
-            # engaged, the flag is True) and suspends inside its sleep.
-            for _ in range(3):
-                await asyncio.sleep(0)
-            assert not timer.done(), "the entry backstop declined a timer the send engaged"
+            # The send's schedule passed the entry backstop (the policy is
+            # engaged, the flag is True) and the timer waits for its deadline.
+            timers = refresh_timers(view)
+            assert len(timers) == 1, "the entry backstop declined a timer the send engaged"
+            timer = timers[0]
 
             view.interaction = _make_interaction()
             await view.send(ephemeral=False)
@@ -1320,33 +2211,95 @@ class TestEphemeralFlagResetOnSend:
             assert view._ephemeral is False
             assert view._refresh_handoff_resolved is True
             assert view._refresh_handoff is True
-            assert view._ephemeral_arm_deadline is not None
+            assert view._ephemeral_arm_deadline is None
 
             # The second send neither cancelled nor replaced the first
-            # timer; it is still asleep with ~1s left on the original
-            # deadline. A done timer here means the interleaving under test
+            # timer; it is still waiting with ~1s left on the original
+            # deadline. A fired timer here means the interleaving under test
             # was never reached.
             assert not timer.cancelled()
-            assert not timer.done(), "harness: the timer woke before the second send finished"
+            assert timer in refresh_timers(
+                view
+            ), "harness: the timer fired before the second send finished"
 
             # Every guard other than the flag check is clear going into the
-            # wake, so the flag check is the deciding gate.
+            # deadline, so the flag check is the deciding gate.
             assert not view.is_finished()
             assert view._refresh_armed is False
             assert view._message is not None
 
             public_message = view._message
             try:
-                await asyncio.wait_for(timer, timeout=30)
+                await wait_for_timer(view, timer)
             except asyncio.TimeoutError:
-                pytest.fail("the ephemeral refresh timer never woke from its sleep")
+                pytest.fail("the ephemeral refresh timer never reached its deadline")
 
-            # Still clear after the wake: nothing but the flag check could
-            # have declined the arm, and no edit reached the public message.
+            # Still clear after it fired, and no edit reached the public message.
             assert not view.is_finished()
             assert view._message is not None
             assert view._refresh_armed is False
             public_message.edit.assert_not_awaited()
+        finally:
+            view.task_manager.cancel_tasks(view.id)
+
+    @staticmethod
+    def _gated_view():
+        """A view that arms ~1s after an ephemeral send, and whose on_load
+        waits on ``gate`` once one is set."""
+
+        class _View(RenderableLayoutView):
+            timeout = None
+            refresh_warning_seconds = 899
+            auto_refresh_ephemeral = True
+            gate = None
+
+            async def on_load(self):
+                if type(self).gate is not None:
+                    await type(self).gate.wait()
+
+        return _View
+
+    async def test_an_ephemeral_re_send_stops_a_timer_that_fires_during_it(self):
+        """The timer fired while the re-send was loading, and the re-send's new
+        deadline is stamped only after its message exists, so the old one
+        still matched. The timer armed while the send delivered, and the
+        brand-new message shipped as nothing but a refresh button."""
+        view_cls = self._gated_view()
+        view = view_cls(interaction=_make_interaction())
+        await view.send(ephemeral=True)
+        view_cls.gate = asyncio.Event()
+        view.interaction = _make_interaction()
+        resend = asyncio.create_task(view.send(ephemeral=True))
+        try:
+            await asyncio.sleep(1.3)  # the first send's timer fires mid re-send
+            view_cls.gate.set()
+            await asyncio.wait_for(resend, timeout=2)
+            await asyncio.sleep(0.05)
+
+            assert view._refresh_armed is False
+        finally:
+            view.task_manager.cancel_tasks(view.id)
+
+    @pytest.mark.parametrize("ephemeral", [False, True], ids=["public", "ephemeral"])
+    async def test_a_timer_queued_for_the_turn_stands_down_for_a_re_send(self, ephemeral):
+        """The timer passed its checks and then waited for the reload turn, and
+        a re-send began meanwhile. Checked only before the wait, it armed
+        over the view the re-send was about to ship."""
+        view_cls = self._gated_view()
+        view = view_cls(interaction=_make_interaction())
+        await view.send(ephemeral=True)
+        view_cls.gate = asyncio.Event()
+        reload = asyncio.create_task(view.reload())  # holds the turn past the deadline
+        try:
+            await asyncio.sleep(1.3)  # the timer fired and queued for the turn
+            view.interaction = _make_interaction()
+            resend = asyncio.create_task(view.send(ephemeral=ephemeral))
+            await asyncio.sleep(0)
+            view_cls.gate.set()
+            await asyncio.wait_for(asyncio.gather(reload, resend), timeout=2)
+            await asyncio.sleep(0.05)
+
+            assert view._refresh_armed is False
         finally:
             view.task_manager.cancel_tasks(view.id)
 
@@ -1364,7 +2317,7 @@ class TestArmDeadlineStampedOnEveryEphemeralSend:
         class _Declined(RenderableLayoutView):
             auto_refresh_ephemeral = False
 
-            async def _schedule_ephemeral_refresh(self):
+            def _schedule_ephemeral_refresh(self):
                 runs.append(True)
 
         view = _Declined(interaction=_make_interaction())
@@ -1386,7 +2339,7 @@ class TestArmDeadlineStampedOnEveryEphemeralSend:
         class _Engaged(RenderableLayoutView):
             auto_refresh_ephemeral = True
 
-            async def _schedule_ephemeral_refresh(self):
+            def _schedule_ephemeral_refresh(self):
                 runs.append(True)
 
         view = _Engaged(interaction=_make_interaction())
@@ -1403,22 +2356,12 @@ class TestArmDeadlineStampedOnEveryEphemeralSend:
 
         assert view._ephemeral_arm_deadline is None
 
-    async def test_ephemeral_re_send_retires_the_first_sends_sleeping_timer(self):
-        """A timer asleep across a same-instance ephemeral re-send must not
-        arm against the first send's deadline: the re-send stamped a new
-        token's clock and scheduled its own timer, so the first timer waking
-        early would clear the new panel's children minutes before the new
-        token needs the handoff and freeze state notifications from that
-        moment. The liveness, flag, and policy gates are all clear here (the
-        second send is ephemeral and engaged), so only the deadline
-        comparison can retire the stale timer, and the second send's own
-        timer must still arm on the new deadline.
-
-        The drain between the sends is load-bearing: it lets the first timer
-        capture the first deadline and commit to its sleep before the
-        re-send stamps the new one. The two windows differ by construction
-        (899 vs 898 warning seconds), so the mismatch does not depend on
-        clock resolution.
+    async def test_ephemeral_re_send_cancels_the_first_sends_waiting_timer(self):
+        """A same-instance ephemeral re-send stamps a new token's clock and
+        schedules its own timer. The first send's timer was left waiting,
+        holding the view until the old deadline, where only the deadline
+        comparison kept it from arming; the re-send now cancels it, and its
+        own timer arms on the new deadline.
         """
 
         class _View(RenderableLayoutView):
@@ -1426,79 +2369,90 @@ class TestArmDeadlineStampedOnEveryEphemeralSend:
             refresh_warning_seconds = 899  # first arm deadline = send + ~1s
 
         view = _View(interaction=_make_interaction())
-        captured = []
-        real_create = view.create_task
-
-        def _capture(coro):
-            task = real_create(coro)
-            captured.append(task)
-            return task
-
-        with patch.object(view, "create_task", side_effect=_capture):
-            await view.send(ephemeral=True)
-            first_deadline = view._ephemeral_arm_deadline
-
-            # First step: the timer captures the first deadline and commits
-            # to its sleep while it is still the current send's timer.
-            for _ in range(3):
-                await asyncio.sleep(0)
-            assert len(captured) == 1
-            assert not captured[0].done(), "the entry backstop declined a timer the send engaged"
-
-            # Second ephemeral send on the same instance. The wider warning
-            # window makes the re-stamped deadline structurally different
-            # (send + ~2s), so timer identity is decided by construction.
-            view.set_class_attribute("refresh_warning_seconds", 898)
-            view.interaction = _make_interaction()
-            await view.send(ephemeral=True)
+        await view.send(ephemeral=True)
+        [timer1] = refresh_timers(view)
+        first_deadline = view._ephemeral_arm_deadline
+        view.set_class_attribute("refresh_warning_seconds", 898)
+        view.interaction = _make_interaction()
+        await view.send(ephemeral=True)
 
         try:
-            assert len(captured) == 2
-            timer1, timer2 = captured
-
-            second_deadline = view._ephemeral_arm_deadline
-            assert first_deadline is not None
-            assert second_deadline is not None
-            assert second_deadline != first_deadline
-
-            # The re-send neither cancelled nor woke the first timer.
-            assert not timer1.cancelled()
-            assert (
-                not timer1.done()
-            ), "harness: the first timer woke before the second send finished"
-
-            # Liveness, flag, and policy are all clear going into the first
-            # wake -- the second send is ephemeral with the handoff engaged --
-            # so the deadline comparison is the deciding gate.
-            assert not view.is_finished()
-            assert view._refresh_armed is False
-            assert view._message is not None
-            assert view._ephemeral is True
-            assert view._refresh_handoff is True
+            [timer2] = refresh_timers(view)
+            assert timer2 is not timer1
+            assert timer1.cancelled()
+            assert view._ephemeral_arm_deadline != first_deadline
 
             second_message = view._message
             try:
-                await asyncio.wait_for(timer1, timeout=30)
+                await wait_for_timer(view, timer2)
             except asyncio.TimeoutError:
-                pytest.fail("the first send's timer never woke from its sleep")
-
-            # Still clear after the wake: nothing but the deadline
-            # comparison could have declined, and no early arm reached the
-            # second send's message.
-            assert not view.is_finished()
-            assert view._ephemeral is True
-            assert view._refresh_handoff is True
-            assert view._refresh_armed is False
-            second_message.edit.assert_not_awaited()
-
-            # The second send's own timer still arms on the new deadline --
-            # retiring the stale timer must not orphan the engaged handoff.
-            try:
-                await asyncio.wait_for(timer2, timeout=30)
-            except asyncio.TimeoutError:
-                pytest.fail("the second send's timer never woke from its sleep")
+                pytest.fail("the second send's timer never reached its deadline")
             assert view._refresh_armed is True
             assert second_message.edit.await_count == 1
+        finally:
+            view.task_manager.cancel_tasks(view.id)
+
+    async def test_a_refused_re_send_restarts_a_timer_that_came_due_during_it(self):
+        """The re-send clears the deadline, so a timer due while it ran stood
+        down. Refused, the send put the deadline back and started nothing, and
+        the live panel reached its token's end with no Continue button."""
+        due = []
+
+        class _View(RenderableLayoutView):
+            timeout = None
+            refresh_warning_seconds = 899  # arm deadline = send + ~1s
+
+            async def on_pre_send(self, interaction):
+                if not due:
+                    return True
+                await wait_for_timer(self, due[0])
+                return False
+
+        view = _View(interaction=_make_interaction())
+        await view.send(ephemeral=True)
+        [timer] = refresh_timers(view)
+        due.append(timer)
+        view.interaction = _make_interaction()
+
+        try:
+            assert await view.send(ephemeral=True) is None
+            timers = refresh_timers(view)
+            assert len(timers) == 1, "the refused re-send left the panel with no refresh timer"
+            await wait_for_timer(view, timers[0])
+            assert view._refresh_armed is True
+        finally:
+            view.task_manager.cancel_tasks(view.id)
+
+    async def test_a_view_kept_after_its_message_went_is_not_armed(self):
+        """The timer armed a view whose message had gone and whose
+        on_message_delete() kept it to post again: the Continue button took
+        its tree for good, and an armed view takes no renders, so the panel
+        posted again showed only that button."""
+        kept = []
+
+        class _View(RenderableLayoutView):
+            timeout = None
+            refresh_warning_seconds = 899  # arm deadline = send + ~1s
+
+            async def on_message_delete(self):
+                kept.append(self)
+
+        view = _View(interaction=_make_interaction())
+        await view.send(ephemeral=True)
+        timers = refresh_timers(view)
+        assert len(timers) == 1
+        children = list(view.children)
+        response = MagicMock(status=404, reason="Not Found")
+        view._message.edit = AsyncMock(side_effect=discord.NotFound(response, "Unknown Message"))
+        view._last_tree_digest = None
+
+        try:
+            await view.refresh()
+            await until(lambda: kept)
+            assert view._message is None and not view.is_finished()
+            await wait_for_timer(view, timers[0])
+            assert view._refresh_armed is False
+            assert view.children == children
         finally:
             view.task_manager.cancel_tasks(view.id)
 
@@ -1520,7 +2474,7 @@ class TestDeclarationSeparateFromResolution:
         class _View(RenderableLayoutView):
             timeout = None
 
-            async def _schedule_ephemeral_refresh(self):
+            def _schedule_ephemeral_refresh(self):
                 runs.append(True)
 
         view = _View(interaction=_make_interaction())
@@ -1538,7 +2492,7 @@ class TestDeclarationSeparateFromResolution:
         class _View(RenderableLayoutView):
             timeout = 300
 
-            async def _schedule_ephemeral_refresh(self):
+            def _schedule_ephemeral_refresh(self):
                 runs.append(True)
 
         view = _View(interaction=_make_interaction())
@@ -1598,7 +2552,7 @@ class TestDeclarationSeparateFromResolution:
         class _View(RenderableLayoutView):
             timeout = None
 
-            async def _schedule_ephemeral_refresh(self):
+            def _schedule_ephemeral_refresh(self):
                 runs.append(True)
 
         view = _View(interaction=_make_interaction())
@@ -1615,20 +2569,18 @@ class TestDeclarationSeparateFromResolution:
         assert view.auto_refresh_ephemeral is None
         assert runs == [True]  # only the first send engaged
 
-    async def test_second_send_decline_stops_a_sleeping_timer_from_arming(self):
-        """A timer already asleep when a second send re-derives the handoff
-        to False must not arm when it wakes. The declaration is still None
-        at that point (only the resolution flipped), so a post-sleep check
+    async def test_second_send_decline_stops_a_waiting_timer_from_arming(self):
+        """A timer already waiting when a second send re-derives the handoff
+        to False must not arm when it fires. The declaration is still None
+        at that point (only the resolution flipped), so a check at the deadline
         that reads ``auto_refresh_ephemeral`` finds None and arms a view
         whose effective policy is False; the check must read
         ``_refresh_handoff``.
 
-        The drain between the sends is load-bearing: it lets the timer take
-        its first step and commit to its sleep while the policy is still
-        engaged. Without it, none of the second send's mocked awaits yields
-        to the event loop, the timer first runs after the re-derivation, and
-        the entry backstop (not the post-sleep one) decides, which turns
-        this test into a false green for the branch it names.
+        The timer is registered during the first send, while the policy is
+        still engaged, so the check at the deadline decides rather than the
+        schedule's entry backstop. A timer scheduled after the re-derivation
+        would be declined at entry, a false green for the branch this names.
         """
 
         class _View(RenderableLayoutView):
@@ -1637,59 +2589,59 @@ class TestDeclarationSeparateFromResolution:
 
         view = _View(interaction=_make_interaction())
         captured = []
-        real_create = view.create_task
+        real_schedule = view._schedule_ephemeral_refresh
 
-        def _capture(coro):
-            task = real_create(coro)
-            captured.append(task)
-            return task
+        def _capture():
+            captured.append(True)
+            real_schedule()
 
-        with patch.object(view, "create_task", side_effect=_capture):
+        with patch.object(view, "_schedule_ephemeral_refresh", side_effect=_capture):
             await view.send(ephemeral=True)
 
         try:
             assert view._refresh_handoff_resolved is True
             assert view._refresh_handoff is True
             assert len(captured) == 1
-            timer = captured[0]
 
-            # First step: the timer passes the entry backstop (the policy is
-            # engaged) and suspends inside its sleep. A completed task here
+            # The send's schedule passed the entry backstop (the policy is
+            # engaged) and the timer waits for its deadline. No timer here
             # would mean the entry backstop declined -- the wrong gate.
-            for _ in range(3):
-                await asyncio.sleep(0)
-            assert not timer.done(), "the entry backstop declined a timer the send engaged"
+            timers = refresh_timers(view)
+            assert len(timers) == 1, "the entry backstop declined a timer the send engaged"
+            timer = timers[0]
 
             view.timeout = 300
             view.interaction = _make_interaction()
             await view.send(ephemeral=True)
 
             # The re-derivation flipped only the resolution. The unset
-            # declaration is the exact value the pre-fix post-sleep check
+            # declaration is the exact value the pre-fix check at the deadline
             # read: None is not False, so it armed.
             assert view.auto_refresh_ephemeral is None
             assert view._refresh_handoff_resolved is False
             assert view._refresh_handoff is False
 
             # The second send neither cancelled nor replaced the first
-            # timer; it is still asleep with ~1s left on the original
-            # deadline. A done timer here means the interleaving under test
+            # timer; it is still waiting with ~1s left on the original
+            # deadline. A fired timer here means the interleaving under test
             # was never reached.
             assert not timer.cancelled()
-            assert not timer.done(), "harness: the timer woke before the second send finished"
+            assert timer in refresh_timers(
+                view
+            ), "harness: the timer fired before the second send finished"
 
             # Every guard ahead of the policy check is clear going into the
-            # wake, so the policy check is the deciding gate.
+            # deadline, so the policy check is the deciding gate.
             assert not view.is_finished()
             assert view._refresh_armed is False
             assert view._message is not None
 
             try:
-                await asyncio.wait_for(timer, timeout=30)
+                await wait_for_timer(view, timer)
             except asyncio.TimeoutError:
-                pytest.fail("the ephemeral refresh timer never woke from its sleep")
+                pytest.fail("the ephemeral refresh timer never reached its deadline")
 
-            # Still clear after the wake: every gate ahead of the policy
+            # Still clear after it fired: every gate ahead of the policy
             # check passed, so the policy check declined first. The re-send
             # also restamped the deadline, so the identity comparison after
             # it would have declined too -- these assertions establish
@@ -1721,7 +2673,7 @@ class TestDeclarationSeparateFromResolution:
         assert view._refresh_handoff is False
         assert view._refresh_handoff_resolved is True  # record intact
         view._ephemeral_arm_deadline = time.monotonic() + 500
-        await view._schedule_ephemeral_refresh()  # entry backstop returns
+        view._schedule_ephemeral_refresh()  # entry backstop returns
 
         assert view._refresh_armed is False
 
@@ -1762,21 +2714,21 @@ class TestDeclarationSeparateFromResolution:
 
 class TestEphemeralRearmOnNavRollback:
     """A failed-navigation rollback re-arms the source's ephemeral refresh
-    handoff (cancelled in _navigate_to ahead of the deferred teardown), so a
-    recovered long-lived ephemeral source still swaps in its refresh button
-    before the 900s token cliff. The re-schedule uses the original deadline, so
-    it sleeps the remaining time rather than a fresh window.
+    handoff when its timer came due while the push was in flight and stood
+    down (``_arm_after_rollback``), so a recovered long-lived ephemeral source
+    still swaps in its refresh button before the 900s token cliff. The
+    re-schedule uses the original deadline, so it sleeps the remaining time
+    rather than a fresh window. Every case sets that precondition, so the
+    refusals below are refused for their own reason.
     """
 
     @staticmethod
-    def _capture_tasks(view):
+    def _capture_schedules(view):
         scheduled: list = []
-
-        def _spy(coro):
-            scheduled.append(coro)
-            coro.close()  # discard without "never awaited" warning
-
-        return scheduled, patch.object(view, "create_task", side_effect=_spy)
+        spy = patch.object(
+            view, "_schedule_ephemeral_refresh", side_effect=lambda: scheduled.append(True)
+        )
+        return scheduled, spy
 
     async def test_rollback_reschedules_ephemeral_handoff(self):
         import time as _time
@@ -1791,12 +2743,62 @@ class TestEphemeralRearmOnNavRollback:
         source._ephemeral_arm_deadline = _time.monotonic() + 500
         source._refresh_armed = False
 
+        source._arm_after_rollback = True  # its timer came due mid-push
         new_view = _Source(interaction=_make_interaction(user_id=1, guild_id=100))
-        scheduled, spy = self._capture_tasks(source)
+        scheduled, spy = self._capture_schedules(source)
         with spy:
-            await source._rollback_navigation(new_view)
+            source._roll_back_navigation(new_view, reclaim=False)
 
         assert len(scheduled) == 1  # the ephemeral handoff was re-scheduled
+
+    async def test_a_timer_due_during_a_failed_push_arms_after_the_rollback(self):
+        """The timer runs on through a push. Coming due mid-push it stands
+        down rather than edit the message the push may hand over, and the
+        rollback arms in its place."""
+
+        class _Source(RenderableLayoutView):
+            auto_refresh_ephemeral = True
+
+        class _Sub(RenderableLayoutView):
+            pass
+
+        source = _Source(interaction=_make_interaction(user_id=1, guild_id=100))
+        await source.send(ephemeral=True)
+        source.task_manager.cancel_tasks(source.id)
+        await asyncio.sleep(0)
+        # Due at the timer's one-second floor.
+        source._ephemeral_arm_deadline = time.monotonic()
+        source._schedule_ephemeral_refresh()
+
+        message = source._message
+        gate = asyncio.Event()
+        error = discord.HTTPException(MagicMock(status=503), "boom")
+
+        async def deferred_edit(**kwargs):
+            await gate.wait()
+            raise error
+
+        async def channel_edit(**kwargs):
+            if isinstance(kwargs.get("view"), _Sub):
+                raise error
+            return message
+
+        nav = _make_interaction(user_id=1, guild_id=100, is_done=True)
+        nav.edit_original_response = AsyncMock(side_effect=deferred_edit)
+        message.edit = AsyncMock(side_effect=channel_edit)
+        push = asyncio.create_task(source.push(_Sub, interaction=nav))
+        try:
+            await asyncio.sleep(1.3)  # the timer comes due while away
+            assert not source._refresh_armed
+            message.edit.assert_not_called()
+            gate.set()
+            await push
+            await until(lambda: source._refresh_armed, interval=0.01)
+
+            assert source._refresh_armed
+        finally:
+            gate.set()
+            source.task_manager.cancel_tasks(source.id)
 
     async def test_rollback_skips_reschedule_without_handoff(self):
         # A source that never engaged the handoff (no deadline stamped) gets no
@@ -1806,11 +2808,12 @@ class TestEphemeralRearmOnNavRollback:
 
         source = _Source(interaction=_make_interaction(user_id=1, guild_id=100))
         await source.send()
+        source._arm_after_rollback = True  # its timer came due mid-push
         new_view = _Source(interaction=_make_interaction(user_id=1, guild_id=100))
 
-        scheduled, spy = self._capture_tasks(source)
+        scheduled, spy = self._capture_schedules(source)
         with spy:
-            await source._rollback_navigation(new_view)
+            source._roll_back_navigation(new_view, reclaim=False)
 
         assert scheduled == []
 
@@ -1826,10 +2829,11 @@ class TestEphemeralRearmOnNavRollback:
         source._ephemeral_arm_deadline = _time.monotonic() + 500
         source._refresh_armed = True  # already armed -> nothing to re-arm
 
+        source._arm_after_rollback = True  # its timer came due mid-push
         new_view = _Source(interaction=_make_interaction(user_id=1, guild_id=100))
-        scheduled, spy = self._capture_tasks(source)
+        scheduled, spy = self._capture_schedules(source)
         with spy:
-            await source._rollback_navigation(new_view)
+            source._roll_back_navigation(new_view, reclaim=False)
 
         assert scheduled == []
 
@@ -1847,10 +2851,11 @@ class TestEphemeralRearmOnNavRollback:
         assert source._ephemeral_arm_deadline is not None
         assert source._refresh_armed is False
 
+        source._arm_after_rollback = True  # its timer came due mid-push
         new_view = _Source(interaction=_make_interaction(user_id=1, guild_id=100))
-        scheduled, spy = self._capture_tasks(source)
+        scheduled, spy = self._capture_schedules(source)
         with spy:
-            await source._rollback_navigation(new_view)
+            source._roll_back_navigation(new_view, reclaim=False)
 
         assert scheduled == []
 
@@ -1865,14 +2870,15 @@ class TestEphemeralRearmOnNavRollback:
 
         source = _Source(interaction=_make_interaction(user_id=1, guild_id=100))
         await source.send(ephemeral=True)
-        # Mirror _navigate_to's pre-teardown cancel of the send-scheduled timer.
+        # The send-scheduled timer came due mid-push and stood down.
         source.task_manager.cancel_tasks(source.id)
         assert source.auto_refresh_ephemeral is None
 
+        source._arm_after_rollback = True  # its timer came due mid-push
         new_view = _Source(interaction=_make_interaction(user_id=1, guild_id=100))
-        scheduled, spy = self._capture_tasks(source)
+        scheduled, spy = self._capture_schedules(source)
         with spy:
-            await source._rollback_navigation(new_view)
+            source._roll_back_navigation(new_view, reclaim=False)
 
         assert len(scheduled) == 1
 
@@ -1891,10 +2897,11 @@ class TestEphemeralRearmOnNavRollback:
         assert source._ephemeral_arm_deadline is not None
         assert source._refresh_armed is False
 
+        source._arm_after_rollback = True  # its timer came due mid-push
         new_view = _Source(interaction=_make_interaction(user_id=1, guild_id=100))
-        scheduled, spy = self._capture_tasks(source)
+        scheduled, spy = self._capture_schedules(source)
         with spy:
-            await source._rollback_navigation(new_view)
+            source._roll_back_navigation(new_view, reclaim=False)
 
         assert scheduled == []
 
@@ -1902,10 +2909,10 @@ class TestEphemeralRearmOnNavRollback:
 class TestEphemeralHandoffOnNavSuccess:
     """A successful push carries the ephemeral arming deadline onto the
     destination and schedules its handoff timer at the post-commit seam in
-    _settle_navigation -- the same guard shape as the rollback re-arm, but on
+    _commit_navigation -- the same guard shape as the rollback re-arm, but on
     the new view. The carried deadline (stamped once at the original send)
     means a mid-chain hop sleeps only the remaining time to the 900s token
-    cliff, and the next hop's cancel_tasks reaps the prior destination's
+    cliff, and the next hop's commit reaps the prior destination's
     timer so the chain holds one live timer.
     """
 
@@ -1931,7 +2938,7 @@ class TestEphemeralHandoffOnNavSuccess:
         try:
             # Carried, not recomputed: the token belongs to the original send.
             assert dest._ephemeral_arm_deadline == deadline
-            assert dest.task_manager.get_task_count(dest.id) == 1
+            await until(lambda: len(refresh_timers(dest)) == 1)
         finally:
             dest.task_manager.cancel_tasks(dest.id)
 
@@ -1953,7 +2960,8 @@ class TestEphemeralHandoffOnNavSuccess:
         source._ephemeral_arm_deadline = time.monotonic() + 500
 
         mid = await source.push(_Mid)
-        mid_timer = next(iter(mid.task_manager._tasks[mid.id]))
+        await until(lambda: refresh_timers(mid))
+        [mid_timer] = refresh_timers(mid)
 
         deep = await mid.push(_Deep)
         try:
@@ -1961,9 +2969,9 @@ class TestEphemeralHandoffOnNavSuccess:
             # destination's timer; only the new destination holds one.
             for _ in range(3):
                 await asyncio.sleep(0)
-            assert mid_timer.done()
-            assert mid.task_manager.get_task_count(mid.id) == 0
-            assert deep.task_manager.get_task_count(deep.id) == 1
+            assert mid_timer.cancelled()
+            assert refresh_timers(mid) == []
+            assert len(refresh_timers(deep)) == 1
         finally:
             deep.task_manager.cancel_tasks(deep.id)
 
@@ -1976,11 +2984,12 @@ class TestEphemeralHandoffOnNavSuccess:
                 pass
 
         source = _Source(interaction=_make_interaction(user_id=1, guild_id=100))
-        await source.send()
-        source._ephemeral = True
-        source._ephemeral_arm_deadline = time.monotonic() + 500
+        await source.send(ephemeral=True)
 
-        # Every edit endpoint fails -> _rollback_navigation.
+        await until(lambda: refresh_timers(source))
+        [timer] = refresh_timers(source)
+
+        # Every edit endpoint fails -> _roll_back_navigation.
         nav = _make_interaction(user_id=1, guild_id=100, is_done=False)
         nav.response.edit_message = AsyncMock(side_effect=self._http_error())
         nav.response.defer = AsyncMock(side_effect=self._http_error())
@@ -1991,10 +3000,13 @@ class TestEphemeralHandoffOnNavSuccess:
         try:
             # The deadline carried in the navigation batch, but the timer
             # never armed: scheduling is post-commit and the edit never
-            # confirmed. The rollback re-armed the recovered source instead.
+            # confirmed. The source's own timer ran on through the push, so
+            # it is still the only one, neither cancelled nor duplicated.
             assert dest._ephemeral_arm_deadline is not None
             assert dest.task_manager.get_task_count(dest.id) == 0
-            assert source.task_manager.get_task_count(source.id) == 1
+            assert refresh_timers(dest) == []
+            assert refresh_timers(source) == [timer]
+            assert not timer.cancelled()
         finally:
             source.task_manager.cancel_tasks(source.id)
 
@@ -2183,7 +3195,7 @@ class TestHandoffPolicyAcrossNavigation:
                 armed.append(True)
 
         await self._push_to(_ArmedSource, _PinnedOn)
-        await asyncio.sleep(1.3)
+        await until(lambda: armed, interval=0.01)
 
         assert armed == [True]
 
@@ -2201,7 +3213,7 @@ class TestHandoffPolicyAcrossNavigation:
         # presence. The declaration is the author's and stays untouched.
         assert dest.auto_refresh_ephemeral is None
         assert dest._refresh_handoff_resolved is True
-        await asyncio.sleep(1.3)
+        await until(lambda: armed, interval=0.01)
 
         assert armed == [True]
 
@@ -2220,7 +3232,7 @@ class TestHandoffPolicyAcrossNavigation:
 
         dest = await self._push_to(_DeclinedSource, _PinnedOn)
         assert dest._ephemeral_arm_deadline is not None
-        await asyncio.sleep(1.3)
+        await until(lambda: armed, interval=0.01)
 
         assert armed == [True]
 
@@ -2309,7 +3321,7 @@ class TestHandoffPolicyAcrossNavigation:
             assert mid._refresh_handoff_resolved is True
             assert deep._refresh_handoff_resolved is True
             # The carried decision holds a live timer on the deepest hop.
-            assert deep.task_manager.get_task_count(deep.id) == 1
+            await until(lambda: len(refresh_timers(deep)) == 1)
         finally:
             deep.task_manager.cancel_tasks(deep.id)
 
@@ -2335,7 +3347,7 @@ class TestHandoffPolicyAcrossNavigation:
         dest = await source.push(_Derived, interaction=_make_interaction(user_id=1, guild_id=2))
         dest._message = MagicMock()
         dest._message.edit = AsyncMock()
-        await asyncio.sleep(1.3)
+        await until(lambda: armed, interval=0.01)
 
         assert armed == [True]
 
@@ -2397,9 +3409,9 @@ class TestHandoffPolicyOnPop:
             assert popped.auto_refresh_ephemeral is None
             assert popped._refresh_handoff_resolved is True
             assert popped._refresh_handoff is True
-            assert popped.task_manager.get_task_count(popped.id) == 1
+            await until(lambda: len(refresh_timers(popped)) == 1)
 
-            await asyncio.sleep(1.3)
+            await until(lambda: armed, interval=0.01)
             assert armed == [True]
         finally:
             popped.task_manager.cancel_tasks(popped.id)
@@ -2425,9 +3437,9 @@ class TestHandoffPolicyOnPop:
         try:
             assert child._refresh_handoff_resolved is True  # inherited on push
             assert popped._refresh_handoff_resolved is True  # resumed on pop
-            assert popped.task_manager.get_task_count(popped.id) == 1
+            await until(lambda: len(refresh_timers(popped)) == 1)
 
-            await asyncio.sleep(1.3)
+            await until(lambda: armed, interval=0.01)
             assert armed == [True]
         finally:
             popped.task_manager.cancel_tasks(popped.id)
@@ -2454,9 +3466,9 @@ class TestHandoffPolicyOnPop:
         try:
             assert popped._refresh_handoff is True  # the declaration decides
             assert popped._refresh_handoff_resolved is None
-            assert popped.task_manager.get_task_count(popped.id) == 1
+            await until(lambda: len(refresh_timers(popped)) == 1)
 
-            await asyncio.sleep(1.3)
+            await until(lambda: armed, interval=0.01)
             assert armed == [True]
         finally:
             popped.task_manager.cancel_tasks(popped.id)
@@ -2478,7 +3490,10 @@ class TestHandoffPolicyOnPop:
         try:
             assert popped._refresh_handoff is False
             assert popped._refresh_handoff_resolved is None
+            for _ in range(3):
+                await asyncio.sleep(0)
             assert popped.task_manager.get_task_count(popped.id) == 0
+            assert refresh_timers(popped) == []
         finally:
             popped.task_manager.cancel_tasks(popped.id)
 
@@ -2516,9 +3531,9 @@ class TestHandoffPolicyOnPop:
         try:
             assert popped.auto_refresh_ephemeral is None
             assert popped._refresh_handoff_resolved is None
-            assert popped.task_manager.get_task_count(popped.id) == 1
+            await until(lambda: len(refresh_timers(popped)) == 1)
 
-            await asyncio.sleep(1.3)
+            await until(lambda: armed, interval=0.01)
             assert armed == [True]
         finally:
             popped.task_manager.cancel_tasks(popped.id)

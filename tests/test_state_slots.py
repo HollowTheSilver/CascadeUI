@@ -508,8 +508,8 @@ class TestStateSelectorMustBeSynchronous:
     The store's guard sees only what ``subscribe`` is handed, and
     ``_build_selector`` hands it a lambda wrapping this method -- a lambda
     is never a coroutine function whatever it closes over, so the override
-    slipped through and the view stopped receiving state updates while
-    looking correctly wired.
+    slipped through: its coroutine never equalled the last one, and the view
+    was notified on every action while looking correctly wired.
     """
 
     def test_async_override_rejected_at_class_definition(self):

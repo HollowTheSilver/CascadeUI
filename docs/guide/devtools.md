@@ -52,6 +52,15 @@ DevBot().run("YOUR_BOT_TOKEN")
 Swap `InMemoryBackend` for `SQLiteBackend("cascadeui.db")` when you need
 persistence across restarts.
 
+At `DEBUG`, a click the library answers without running its callback logs
+one line naming the view, the control's `custom_id`, and the reason: the view
+has closed, the control is disabled on screen or is no longer on the message
+(the click came from an earlier render), the click repeats one still being
+handled (a double-click, a second Finish or Submit, a role button still
+toggling, a second Continue), or the view's access check or the control's own
+`owner_only` refused the user who clicked. That is the line to look for when a
+button seems to do nothing.
+
 ### When to enable tracing
 
 `setup_logging()` accepts a `trace=True` flag that installs a wrapper
@@ -322,7 +331,7 @@ count, for any dashboard that watches a set it does not own.
 directly without the cog:
 
 ```python
-from cascadeui.devtools import InspectorView
+from cascadeui import InspectorView
 
 view = InspectorView(context=ctx)
 await view.send()

@@ -47,7 +47,8 @@ The library handles most of them automatically.
 `IS_COMPONENTS_V2` flag is a one-way switch per message - once set, the message
 cannot revert to V1. Since push/pop reuse the same message, mixing versions
 would produce an invalid state. Use `replace()` for one-way transitions between
-V1 and V2 (creates a new message, no back button).
+V1 and V2: the new view sends a message of its own, the old one closes as its
+`exit()` would, and there is no back button.
 
 ### V2 Views Cannot Be Stripped From Messages
 
@@ -169,7 +170,7 @@ derivation.
 See `auto_refresh_ephemeral` in
 [`api/views.md`](../api/views.md) for the customization knobs
 (`refresh_warning_seconds`, `refresh_button_label`, `refresh_button_emoji`,
-`refresh_button_style`, and the `_build_refresh_button` hook). Set
+`refresh_button_style`, and the `build_refresh_button()` hook). Set
 `auto_refresh_ephemeral = False` to disable the handoff for short-lived
 display ephemerals that should expire naturally.
 
@@ -196,11 +197,11 @@ cannot receive live updates.
 
 - Session registry consistency -- exactly one entry per live view, zero
   orphans, zero duplicates.
-- No crashes -- failed delete calls are caught at `base.py` with a logged
-  hint about token expiry; state updates that reach stale views fail
+- No crashes -- a failed delete is caught and logged with a hint about
+  token expiry; state updates that reach stale views fail
   silently via `refresh()`'s `NotFound` guard and the store's subscriber
   try/except wrapper.
-- Correct parent/child accounting -- `_cleanup_attached_children` prunes finished
+- Correct parent/child accounting -- the attachment cascade prunes finished
   entries on every pass, so long-lived parents that spawn many refreshed
   children (e.g. a game view across many rounds) do not accumulate stale
   references.
@@ -291,28 +292,24 @@ should drive any per-view tuning.
 ## Fast-Path Stall Under Discord Edit Latency
 
 The acting-view fast path normally combines the message edit and
-the interaction ack into one HTTP round trip in tens of milliseconds.
+the interaction ack into one HTTP round trip in tens of milliseconds,
+for a click and for a modal opened from one.
 Under genuine Discord-side latency on the interaction-edit endpoint
 (latency spike, ephemeral backend under load, geographic routing
 pressure), the same call can take longer than
-`auto_defer_delay - 1.0` seconds. When that happens, the `wait_for`
-guard cancels the stalled edit and `refresh()` returns immediately.
+`auto_defer_delay - 1.0` seconds. When that happens, the bound
+cancels the stalled edit and `refresh()` returns immediately.
 The auto-defer timer then fires the standalone ack at
 `auto_defer_delay` seconds with the full remaining budget, so the
 click is acked normally and no *"interaction failed"* toast appears.
 
-**The cost is one missed visible UI update for that click.** The
-rebuilt component tree is NOT re-shipped through the channel
-endpoint after the stall, because a second edit attempt on top of
-the cancelled fast path would consume the timer's ack budget and
-reintroduce the very toast the design exists to prevent. The next
-state-change refresh ships the up-to-date tree, so users see the
-cumulative effect of any clicks that landed during stalls.
-
-In practice this matters only on the rare clicks where Discord
-itself is slow. Views that mutate visible state on every click
-(toggles, game boards, settings panels) rarely notice -- the next
-click refreshes the tree.
+**The cost is a late update, not a lost one.** The stalled edit is
+abandoned rather than retried at once, because a second edit on top
+of it would consume the timer's ack budget and bring back the toast
+the design exists to prevent. Once the interaction is acknowledged,
+nothing races that clock, so the render is sent again through the
+view's message. Whether Discord applied the abandoned edit cannot be
+known, so that second send may repeat an update already on screen.
 
 **Mitigations** (per-view, all class-attribute overrides):
 
@@ -351,13 +348,13 @@ latency.
 **Distinct from a hung connection, and from a dropped one.** Everything
 above concerns slow *responses* -- Discord eventually replies. A
 connection that opens but never responds (a TCP-level hang) is a
-different failure, and
-discord.py issues edits with no total HTTP timeout. `edit_timeout`
-(default `60.0` seconds) bounds every refresh, navigation, and
-teardown edit so a hung socket is cancelled and the view recovers on
-the next interaction rather than pinning indefinitely. It does not
-change the fast path, which keeps its own sub-`auto_defer_delay`
-bound. Set `edit_timeout = None` to restore unbounded awaits, or
+different failure. discord.py passes no timeout of its own, so such an
+edit would hold the view for aiohttp's default total of five minutes.
+`edit_timeout` (default `60.0` seconds) bounds every refresh,
+navigation, and teardown edit so a hung socket is cancelled sooner and
+the view recovers on the next interaction. It does not change the fast
+path, which keeps its own sub-`auto_defer_delay` bound. Set
+`edit_timeout = None` to leave only aiohttp's five-minute default, or
 raise it (e.g. `120.0`) for views that routinely upload large
 attachments.
 
@@ -383,10 +380,12 @@ A request can fail before Discord ever sees it: a reset connection, a
 dropped keep-alive, a DNS blip. These raise from aiohttp rather than
 discord.py, so they carry no HTTP status and are not `HTTPException`.
 CascadeUI treats them as a third sibling alongside `HTTPException` and
-`RateLimited`, and the response is always the same shape: **log a
-warning naming the cause, and carry on**. The alternative is raising
-out of a component callback, where the exception reaches `on_error`
-and renders a failure card over content that is perfectly fine.
+`RateLimited` (the three are exported together as `DISCORD_CALL_ERRORS`,
+for an override that wants the same tolerance), and the response is always
+the same shape: **log a warning naming the cause, and carry on**. The
+alternative is raising out of a component callback, where the exception
+reaches `on_error` and renders a failure card over content that is perfectly
+fine.
 
 What that means per surface:
 
@@ -404,18 +403,24 @@ is attempted, so the next interaction renders from correct state.
 
 **Paging patterns rewind their own cursor.** A page, wizard step, or
 active tab moves before the repaint, so a dropped edit would otherwise
-leave the reader where they were with the cursor already moved, and the
+leave the user where they were with the cursor already moved, and the
 next press would skip past content they never saw. `PaginatedView`,
 `PaginatedLayoutView`, `WizardView`, `WizardLayoutView`, `TabView`,
 `TabLayoutView`, `PaginatedRegion`, and `Collapsible` all put the cursor
-back when the edit never landed, so the recovery press moves one step.
-The `on_*` hook is not re-fired: it reports the navigation the user asked
-for, which did happen; only the render did not.
+back when the edit never landed, so the recovery press moves one step. The
+V1 `PaginationControls` hands its render to `on_page_change`, so it goes
+back when that callback raises.
+The rewind covers a dropped edit, an edit Discord refused, and a render that
+raised before its edit (a page fetch or a tab builder failing); the
+exception still reaches the caller. A render cancelled part way keeps the
+cursor, since its edit may already have landed. The `on_*` hook is not
+re-fired: it reports the navigation the user asked for, which did happen;
+only the render did not.
 
-This covers cursor moves the reader drove. A data rebuild
+This covers cursor moves the user drove. A data rebuild
 (`refresh_data`, `refresh_pages`, `rebuild_pages`) that shrinks the page
 count still clamps the cursor into the new range even if its edit is
-dropped, because the page the reader was on no longer exists. The render
+dropped, because the page the user was on no longer exists. The render
 baseline is cleared either way, so the next refresh ships the corrected
 view.
 
@@ -449,6 +454,61 @@ degradation above logs at `WARNING` through the `cascadeui` logger and
 names the underlying error, so `setup_logging()` surfaces them without
 any per-call-site handling. A burst of them means the host lost its
 connection to Discord, not that anything in the view is wrong.
+
+---
+
+## Renders That Run Late
+
+A render can be asked for while the view is busy: during another task's
+`reload()`, while its message is being sent, or while a `push()` or `pop()`
+from it is in flight. CascadeUI holds the render and runs it once the view is
+free, and treats its edits as made when the render was asked for, so a held
+render never covers an edit made in the meantime. Three cases follow from that
+rule.
+
+### Refreshes Handed to Other Tasks
+
+Inside a late render, `await self.refresh()` always takes the render's place in
+that order. A refresh the render hands to another task does not always: one
+passed to `asyncio.gather()` or a `TaskGroup` while the render runs counts as
+part of it, and one in a task that runs after the render returns counts as new.
+In rare timings either can show older content until the view's next render.
+asyncio gives the library no reliable way to tell which task started another,
+so it cannot sort these out itself. Await
+[`refresh()`](../api/views.md#refresh) directly, as the guides show.
+
+### A Partial `nav_rebuild` After a Stalled Push
+
+When a push or pop's edit stalls, whether the new screen reached the message
+cannot be known, so CascadeUI redraws the view it left with that view's
+[`nav_rebuild`](../api/views.md#nav_rebuild) content. A close that lands first carries the redraw, and a state
+render asked for before the redraw is then skipped as older. Two shapes lose
+part of that render: a `nav_rebuild` that rebuilds only part of a V2 tree (a
+change the render made elsewhere is dropped), and a late V2 render that passes
+`attachments=`, which ships its file together with its older tree, since a V2
+edit cannot carry a file without the tree. A `nav_rebuild` that rebuilds the
+whole tree avoids the first.
+
+### A Close During Another Task's Reload
+
+A state change that arrives while another task's
+[`reload()`](../api/views.md#reload) holds the view waits for that reload. An `exit()` or a timeout that lands first freezes the
+message without the change, since the panel is closing anyway. Making the close
+wait would run your `on_load()` and `on_state_changed()` inside the close,
+where they can hang it or raise out of it.
+
+---
+
+## A Program That Ends Without Closing Its Bot
+
+Batched persistence writes reach the database when persistence closes, which
+happens when the bot closes (see [Shutdown](persistence.md#shutdown)). A
+program that ends without closing its bot, or without closing persistence when
+it has no `bot=`, loses the changes still waiting in the batch, and a close
+still running as `asyncio.run()` finishes can print asyncio's "Task was
+destroyed but it is pending!". asyncio tells the library nothing when the loop
+is about to end, so the close has to come from the program: `bot.run()` and
+`async with bot:` both make it.
 
 ---
 

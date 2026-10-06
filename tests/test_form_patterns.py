@@ -8,6 +8,8 @@ round-trip (values wiring through ``form.values``), and the rebuild path
 on V2.
 """
 
+import asyncio
+import logging
 from unittest.mock import AsyncMock
 
 import discord
@@ -18,7 +20,7 @@ from helpers import make_interaction as _make_interaction
 from cascadeui.components.base import StatefulButton, StatefulSelect
 from cascadeui.components.inputs import Modal as CascadeModal
 from cascadeui.state.store import _CURRENT_INTERACTION
-from cascadeui.validation import min_length, regex
+from cascadeui.validation import ValidationResult, min_length, regex
 from cascadeui.views.patterns.form import (
     MAX_TEXT_FIELDS,
     FormLayoutView,
@@ -115,6 +117,30 @@ class TestTextFieldCeiling:
             {"id": "b2", "type": "boolean", "label": "B2"},
         ]
         with pytest.raises(ValueError, match="does not fit"):
+            FormView(interaction=_make_interaction(), fields=fields)
+
+    @pytest.mark.parametrize("text_first", [False, True], ids=["text_last", "text_first"])
+    def test_v1_field_order_does_not_decide_whether_a_form_fits(self, text_first):
+        # Five boolean rows leave room beside the last for the Edit and Submit
+        # buttons. The budget was checked before each field, text ones
+        # included, so listing the text field last refused a form that fit.
+        booleans = [{"id": f"b{i}", "type": "boolean", "label": f"B{i}"} for i in range(5)]
+        text = [{"id": "t", "type": "text", "label": "T"}]
+        fields = text + booleans if text_first else booleans + text
+
+        view = FormView(interaction=_make_interaction(), fields=fields)
+
+        last_row = [c.custom_id for c in view.children if c.row == 4]
+        assert last_row == ["form_b4_yes", "form_b4_no", "form_edit_text", "form_submit"]
+
+    def test_v1_selects_filling_every_row_name_the_button_that_does_not_fit(self):
+        # A select fills its row, so five of them leave Submit nowhere to go.
+        # That surfaced as discord.py's "item would not fit at row 4".
+        opts = [{"label": "A", "value": "a"}]
+        fields = [
+            {"id": f"s{i}", "type": "select", "label": f"S{i}", "options": opts} for i in range(5)
+        ]
+        with pytest.raises(ValueError, match="FormView's Submit button does not fit"):
             FormView(interaction=_make_interaction(), fields=fields)
 
     @pytest.mark.parametrize("form_cls", [FormView, FormLayoutView], ids=lambda c: c.__name__)
@@ -1408,6 +1434,216 @@ class TestSubmitAlwaysRevalidates:
         validate_spy.assert_called_once()
 
 
+class TestFormDoubleSubmit:
+    """A second Submit from one double-click does not run ``on_submit`` again.
+
+    A form that ``on_submit`` refuses stays open, so the second click of a
+    double-click re-ran the refusal, and anything ``on_submit`` did first.
+    """
+
+    @staticmethod
+    def _form(cls, *, serialize=True, validators=None):
+        calls = []
+
+        class _Form(cls):
+            serialize_interactions = serialize
+
+            async def on_submit(self, interaction, values):
+                calls.append(1)
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                await self.set_form_error("That name is taken.")
+
+        field = {"id": "n", "type": "text", "label": "Name"}
+        if validators is not None:
+            field["validators"] = validators
+        view = _Form(interaction=_make_interaction(), fields=[field])
+        view.values["n"] = "Kael"
+        view.refresh = AsyncMock()
+        submit = next(
+            c
+            for c in view.walk_children()
+            if isinstance(c, StatefulButton) and c.custom_id == "form_submit"
+        )
+        return view, submit, calls
+
+    @pytest.mark.parametrize("cls", [FormLayoutView, FormView])
+    async def test_a_double_click_runs_on_submit_once(self, cls, caplog):
+        caplog.set_level(logging.DEBUG, logger="cascadeui")
+        view, submit, calls = self._form(cls)
+
+        await asyncio.gather(
+            view._scheduled_task(submit, _make_interaction()),
+            view._scheduled_task(submit, _make_interaction()),
+        )
+
+        assert len(calls) == 1
+        assert any(
+            "Dropped a click" in r.getMessage() and "a second Submit" in r.getMessage()
+            for r in caplog.records
+            if r.name.startswith("cascadeui")
+        )
+
+    async def test_the_dropped_submit_is_answered_without_auto_defer(self):
+        # No callback of the user's ran for it, so nothing else could answer it.
+        view, submit, calls = self._form(FormLayoutView)
+        view.auto_defer = False
+        first, second = _make_interaction(), _make_interaction()
+
+        await asyncio.gather(
+            view._scheduled_task(submit, first),
+            view._scheduled_task(submit, second),
+        )
+
+        assert len(calls) == 1
+        second.response.defer.assert_awaited()
+
+    async def test_a_click_sent_after_the_refusal_runs_again(self):
+        view, submit, calls = self._form(FormLayoutView)
+        await view._scheduled_task(submit, _make_interaction())
+
+        await view._scheduled_task(submit, _make_interaction())
+
+        assert len(calls) == 2
+
+    async def test_unserialized_clicks_with_an_async_validator_run_on_submit_once(self):
+        """The mark was taken after validation's await, so a second Submit
+        arriving while an async validator ran passed the guard."""
+
+        async def slow_valid(value, field, values):
+            await asyncio.sleep(0)
+            return ValidationResult(True)
+
+        view, submit, calls = self._form(FormLayoutView, serialize=False, validators=[slow_valid])
+
+        await asyncio.gather(
+            view._scheduled_task(submit, _make_interaction()),
+            view._scheduled_task(submit, _make_interaction()),
+        )
+
+        assert len(calls) == 1
+
+    async def test_a_submit_queued_after_a_fixing_click_runs(self):
+        """A refused Submit is not a result the next one repeats: the field was
+        fixed while the first check ran, and the Submit after it was dropped
+        as a double-click."""
+
+        async def long_enough(value, field, values):
+            await asyncio.sleep(0)
+            return ValidationResult(len(value or "") >= 4, "Too short.")
+
+        view, submit, calls = self._form(FormLayoutView, validators=[long_enough])
+        view.values["n"] = "Kae"
+
+        async def fix(interaction):
+            view.values["n"] = "Kaelen"
+
+        fixer = StatefulButton(label="Fix", callback=fix)
+        view.add_item(ActionRow(fixer))
+
+        await asyncio.gather(
+            view._scheduled_task(submit, _make_interaction()),
+            view._scheduled_task(fixer, _make_interaction()),
+            view._scheduled_task(submit, _make_interaction()),
+        )
+
+        assert len(calls) == 1
+
+    async def test_a_submit_after_a_failed_validation_runs(self):
+        answers = [ValidationResult(False, "Too short."), ValidationResult(True)]
+
+        async def validator(value, field, values):
+            return answers.pop(0)
+
+        view, submit, calls = self._form(FormLayoutView, validators=[validator])
+        await view._scheduled_task(submit, _make_interaction())
+
+        await view._scheduled_task(submit, _make_interaction())
+
+        assert len(calls) == 1
+
+    async def test_a_double_click_of_an_invalid_submit_shows_the_errors_once(self):
+        async def long_enough(value, field, values):
+            await asyncio.sleep(0)
+            return ValidationResult(len(value or "") >= 4, "Too short.")
+
+        view, submit, _ = self._form(FormLayoutView, validators=[long_enough])
+        view.values["n"] = "Kae"
+        shown = []
+        update = view._update_form_display
+
+        async def counted():
+            shown.append(1)
+            await update()
+
+        view._update_form_display = counted
+
+        await asyncio.gather(
+            view._scheduled_task(submit, _make_interaction()),
+            view._scheduled_task(submit, _make_interaction()),
+        )
+
+        assert len(shown) == 1
+
+    async def test_a_submit_queued_after_fixing_what_on_submit_refused_runs(self):
+        """A refusal from on_submit is a refusal too: the Submit after the
+        fixing click was dropped as a double-click."""
+        taken = {"Kael"}
+        calls = []
+
+        class _Form(FormLayoutView):
+            async def on_submit(self, interaction, values):
+                calls.append(values["n"])
+                await asyncio.sleep(0)
+                if values["n"] in taken:
+                    await self.set_form_error("That name is taken.")
+
+        view = _Form(
+            interaction=_make_interaction(), fields=[{"id": "n", "type": "text", "label": "Name"}]
+        )
+        view.values["n"] = "Kael"
+        view.refresh = AsyncMock()
+        submit = next(
+            c
+            for c in view.walk_children()
+            if isinstance(c, StatefulButton) and c.custom_id == "form_submit"
+        )
+
+        async def fix(interaction):
+            view.values["n"] = "Kaelen"
+
+        fixer = StatefulButton(label="Fix", callback=fix)
+        view.add_item(ActionRow(fixer))
+
+        await asyncio.gather(
+            view._scheduled_task(submit, _make_interaction()),
+            view._scheduled_task(fixer, _make_interaction()),
+            view._scheduled_task(submit, _make_interaction()),
+        )
+
+        assert calls == ["Kael", "Kaelen"]
+
+    async def test_a_refused_call_from_code_beside_a_click_leaves_submit_working(self):
+        """Each put back the mark it found, and the call from code found the
+        click's hold: every Submit after that was dropped for good."""
+
+        async def long_enough(value, field, values):
+            await asyncio.sleep(0.01)
+            return ValidationResult(len(value or "") >= 4, "Too short.")
+
+        view, submit, calls = self._form(FormLayoutView, validators=[long_enough])
+        view.values["n"] = "Kae"
+        await asyncio.gather(
+            view._scheduled_task(submit, _make_interaction()),
+            submit.callback(_make_interaction()),
+        )
+        view.values["n"] = "Kaelen"
+
+        await view._scheduled_task(submit, _make_interaction())
+
+        assert len(calls) == 1
+
+
 # // ========================================( multi_select field type )======================================== // #
 
 
@@ -1554,6 +1790,29 @@ class TestMultiSelect:
         )
         defaulted = {opt.value for opt in select.options if opt.default}
         assert defaulted == {"a", "c"}
+
+    def test_a_single_value_default_marks_its_option(self):
+        """A default given as one value rather than a list was read letter by
+        letter, so its option did not show as chosen."""
+        view = FormView(
+            interaction=_make_interaction(),
+            fields=[
+                {
+                    "id": "tags",
+                    "type": "multi_select",
+                    "default": "red",
+                    "options": [
+                        {"label": "Red", "value": "red"},
+                        {"label": "Blue", "value": "blue"},
+                    ],
+                }
+            ],
+        )
+
+        select = next(
+            c for c in view.children if isinstance(c, StatefulSelect) and c.custom_id == "form_tags"
+        )
+        assert [opt.value for opt in select.options if opt.default] == ["red"]
 
     async def test_multi_select_callback_writes_list(self):
         view = FormView(
@@ -1883,6 +2142,23 @@ class TestFormViewInitialRender:
 
         embed = interaction.response.send_message.call_args.kwargs.get("embed")
         assert embed.title == "Caller"
+
+    async def test_explicit_embeds_win(self):
+        """The form's embed was added beside them, and discord.py refuses
+        ``embed`` and ``embeds`` together."""
+        interaction = _make_interaction()
+        view = FormView(
+            interaction=interaction,
+            title="Signup",
+            fields=[{"id": "name", "label": "Name", "type": "text"}],
+        )
+        mine = [discord.Embed(title="Caller")]
+
+        await view.send(embeds=mine)
+
+        sent = interaction.response.send_message.call_args.kwargs
+        assert sent["embeds"] is mine
+        assert "embed" not in sent
 
 
 # // ========================================( Text-edit modal ack backstop )======================================== // #

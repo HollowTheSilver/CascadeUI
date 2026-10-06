@@ -10,8 +10,17 @@ import discord
 from discord import CheckboxGroupOption, Interaction, RadioGroupOption, TextStyle
 from discord.ui.select import BaseSelect
 
+from ..state.store import _CURRENT_INTERACTION
 from ..utils.hooks import await_maybe
-from ..utils.responses import ack_backstop, respond_safe, trailing_ack, validate_ack_delay
+from ..utils.responses import (
+    _collect_replies,
+    _collect_stalled_renders,
+    ack_backstop,
+    respond_safe,
+    ship_stalled_renders,
+    trailing_ack,
+    validate_ack_delay,
+)
 from ..utils.strings import slugify
 from ..validation import validate_fields
 from .base import StatefulComponent, require_value_callback
@@ -27,13 +36,13 @@ def _validate_range(owner: str, name: str, value: Optional[int], lo: int, hi: in
 
     Discord accepts these bounds only within ``[lo, hi]`` and 400s the modal
     open otherwise; raising here surfaces the mistake where the value is set.
-    ``None`` (Discord's server default) is always allowed.
+    ``None`` (Discord's server default) is always allowed. A non-int raises
+    ``TypeError``, a ``bool`` or ``float`` included, since Discord rejects
+    both as they serialize.
     """
-    # The type check precedes the range check because the comparison below is
-    # what fails otherwise, and it fails as a bare operand TypeError naming
-    # neither the field nor the bound. A bool passes ``isinstance(int)`` and
-    # serializes as true/false, and a float serializes with a decimal point;
-    # Discord rejects both, so neither reaches the range test.
+    # Before the comparison: a bool or float would pass it and be rejected by
+    # Discord, and a non-number would fail inside it naming neither the field
+    # nor the bound.
     if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
         raise TypeError(
             f"{owner} {name} must be an int or None, got {type(value).__name__}: {value!r}"
@@ -49,12 +58,11 @@ _MODAL_TEXT_MAX = 45
 
 
 def _validate_text(owner: str, name: str, value: str) -> None:
-    """Reject a modal title or label Discord will not accept."""
-    # Checked before the emptiness and length tests, which are the operations
-    # that would otherwise fail: a value with no ``__len__`` raises a bare
-    # TypeError from inside the guard, and one that has a length (a list, a
-    # bytestring) passes both tests and reaches Discord as a label it cannot
-    # render.
+    """Reject a modal title or label Discord will not accept.
+
+    A non-string raises ``TypeError``: a list or bytestring would otherwise
+    pass the length tests and reach Discord as a label it cannot render.
+    """
     if not isinstance(value, str):
         raise TypeError(f"{owner} {name} must be a str, got {type(value).__name__}: {value!r}")
     if not value:
@@ -265,14 +273,14 @@ class CheckboxGroup(StatefulComponent):
     def _process_options(raw, option_cls):
         """Convert dicts to option instances, rejecting anything else.
 
-        The pass-through branch used to accept whatever it was handed, so a
-        list of plain strings became a list of plain strings and reached
-        Discord as options with no label and no value. A single option dict
-        passed without its list is worse: iterating a mapping yields its
-        keys, so ``{"label": "A", "value": "a"}`` produced two options named
-        ``"label"`` and ``"value"``, which the count check then counted and
-        approved. Both failed at modal-open with an attribute error from
-        inside discord.py, and the user saw "This interaction failed".
+        A pass-through branch would accept whatever it was handed, so a list
+        of plain strings would reach Discord as options with no label and no
+        value. A single option dict passed without its list is worse:
+        iterating a mapping yields its keys, so ``{"label": "A", "value":
+        "a"}`` would produce two options named ``"label"`` and ``"value"``,
+        which the count check would then count and approve. Both would fail
+        at modal-open with an attribute error from inside discord.py, and
+        the user would see "This interaction failed".
         """
         if hasattr(raw, "items"):
             raise TypeError(
@@ -438,16 +446,9 @@ class FileUpload(StatefulComponent):
 
 # // ========================================( Wrapper Base )======================================== // #
 
-# All CascadeUI modal input wrappers (TextInput, Checkbox, CheckboxGroup,
-# RadioGroup, FileUpload) share the same contract:
-#   - ``.custom_id`` derived from label via ``TextInput._slug()``
-#   - ``.validators`` list auto-collected by ``Modal.__init__``
-#   - ``.create_discord_component()`` produces a ``ui.Label`` wrapping
-#     the inner discord.py item
-#   - ``.value`` or ``.values`` populated by ``Modal.on_submit`` write-back
-#
-# The tuple below is used by ``Modal.__init__`` to recognize any wrapped
-# input type without hardcoding isinstance checks for each class.
+# The five modal input wrappers, which share one contract (label-derived
+# custom_id, validators, a ui.Label render, value write-back on submit);
+# Modal.__init__ recognizes any of them through this tuple.
 _WRAPPED_INPUT_TYPES = (TextInput, Checkbox, CheckboxGroup, RadioGroup, FileUpload)
 
 
@@ -476,6 +477,13 @@ at creation, so discord.py dispatching a real submission cannot overwrite
 the verdict an offline drive is waiting to read, while a write inside a
 coroutine awaited on the same task stays visible to its awaiter.
 """
+
+_DISPATCH_BACKSTOP: contextvars.ContextVar = contextvars.ContextVar(
+    "cascadeui_modal_backstop", default=None
+)
+"""``(interaction, task)``: the ack backstop ``Modal._scheduled_task`` armed
+for the submission it is dispatching, which ``on_submit`` runs on the same
+task and reads instead of arming a second one."""
 
 
 def _label_text(item):
@@ -623,6 +631,8 @@ class Modal(discord.ui.Modal, StatefulComponent):
             super().__init__(title=title, timeout=timeout, custom_id=custom_id)
 
         self.view_id = view_id
+        # The view that opened this modal through open_modal(), if one did.
+        self._opened_by = None
         self.inputs: Dict[str, Any] = {}
         self.validators: Dict[str, List[Callable]] = {}
         # Pairs each wrapped CascadeUI input (TextInput, Checkbox, etc.)
@@ -656,14 +666,18 @@ class Modal(discord.ui.Modal, StatefulComponent):
             else:
                 # Raw items: ui.Label, ui.TextInput, or any other discord.py
                 # modal-compatible component the user constructed directly.
-                self.add_item(input_item)
                 inner = _unwrap_label(input_item)
+                self.add_item(input_item)
+                if isinstance(input_item, discord.ui.TextDisplay):
+                    # Shown as text; it submits nothing to collect.
+                    continue
                 if not hasattr(inner, "custom_id"):
                     raise TypeError(
                         f"Modal: {type(inner).__name__} carries no custom_id, so "
                         f"its value cannot be collected on submission.\n"
-                        f"  Fix: pass an input component -- a CascadeUI wrapper, "
-                        f"or a raw discord.ui input, optionally inside a ui.Label."
+                        f"  Fix: pass an input component (a CascadeUI wrapper, "
+                        f"or a raw discord.ui input, optionally inside a ui.Label), "
+                        f"or a discord.ui.TextDisplay for text."
                     )
                 self._reject_duplicate_input(inner.custom_id)
                 self.inputs[inner.custom_id] = input_item
@@ -672,6 +686,28 @@ class Modal(discord.ui.Modal, StatefulComponent):
         # so a one-parameter callback is broken from the first one.
         require_value_callback(callback, "Modal", "callback", "values")
         self.user_callback = callback
+
+    def add_item(self, item):
+        """Add a component, refusing a button or a bare select: Discord rejects both in a modal."""
+        if isinstance(_unwrap_label(item), discord.ui.Button):
+            # It carries a custom_id, so the constructor's own check would
+            # accept it, and Discord rejects the modal when it opens.
+            raise TypeError(
+                f"Modal: a Button is a message component, and Discord rejects "
+                f"a modal that contains one.\n"
+                f"  Fix: keep the button on the view that opens the modal, and "
+                f"pass the modal input components only."
+            )
+        if isinstance(item, BaseSelect):
+            # discord.py sends it in an action row, which a modal accepts
+            # only around a text input.
+            raise TypeError(
+                f"Modal: a {type(item).__name__} passed on its own is sent "
+                f"in an action row, and Discord accepts a select in a modal "
+                f"only inside a ui.Label.\n"
+                f"  Fix: pass discord.ui.Label(text=..., component=select)."
+            )
+        return super().add_item(item)
 
     def _reject_duplicate_input(self, custom_id: str) -> None:
         """Raise before a duplicate input custom_id silently overwrites.
@@ -690,14 +726,14 @@ class Modal(discord.ui.Modal, StatefulComponent):
                 f"  Fix: Give the colliding inputs distinct labels."
             )
 
-    async def _auto_defer_timer(self, interaction: Interaction) -> None:
+    async def _auto_defer_timer(self, interaction: Interaction) -> bool:
         """Defer the submission if ``on_submit`` has not responded in time.
 
         discord.py's modal dispatch has no auto-defer; a slow async validator
         or the ``MODAL_SUBMITTED`` fan-out runs on the 3s interaction clock.
         Without this timer a slow validator drops the submit (10062).
         """
-        await ack_backstop(
+        return await ack_backstop(
             interaction, self.auto_defer_delay, owner=self.__class__.__name__, log=logger
         )
 
@@ -710,14 +746,16 @@ class Modal(discord.ui.Modal, StatefulComponent):
         override or a fast raise from a validator or callback. This override
         arms a backstop for the whole dispatch and, in the ``finally``, acks any
         interaction the dispatch left unanswered (the raise path). ``on_submit``
-        keeps its own timer as a second layer for the submission body.
+        uses this backstop and arms its own only when called without it.
         """
         defer_task = None
         if not interaction.response.is_done():
             defer_task = asyncio.create_task(self._auto_defer_timer(interaction))
+        armed = _DISPATCH_BACKSTOP.set((interaction, defer_task))
         try:
             await super()._scheduled_task(interaction, components, resolved)
         finally:
+            _DISPATCH_BACKSTOP.reset(armed)
             if defer_task is not None and not defer_task.done():
                 defer_task.cancel()
             # Ack anything the dispatch left unanswered (the raise path: discord.py's
@@ -741,10 +779,15 @@ class Modal(discord.ui.Modal, StatefulComponent):
 
     async def on_submit(self, interaction: Interaction):
         """Handle modal submission with optional validation."""
-        # discord.py's modal dispatch has no auto-defer timer, so arm one
-        # before the validators and state dispatch (both potentially slow and
-        # I/O-bound) run on the 3s interaction clock.
-        defer_task = asyncio.create_task(self._auto_defer_timer(interaction))
+        # discord.py's modal dispatch arms no ack timer. A real submission's was
+        # armed earlier by _scheduled_task with the same delay, so it fires
+        # first; submit() and a direct call arm one here.
+        dispatched = _DISPATCH_BACKSTOP.get()
+        if dispatched is not None and dispatched[0] is interaction and dispatched[1] is not None:
+            backstop, defer_task = dispatched[1], None
+        else:
+            backstop = defer_task = asyncio.create_task(self._auto_defer_timer(interaction))
+        stalled: dict = {}
         try:
             # Collect values from the underlying discord.py components,
             # unwrapping ``ui.Label`` to reach the actual input carrying
@@ -757,17 +800,28 @@ class Modal(discord.ui.Modal, StatefulComponent):
                 elif isinstance(inner, (discord.ui.CheckboxGroup, discord.ui.FileUpload)):
                     values[inner.custom_id] = inner.values
                 elif isinstance(inner, BaseSelect):
-                    # Reached only through the raw-item escape hatch, since
-                    # no wrapper builds one -- but discord.py fills a modal
-                    # select on submission like any other child, and without
-                    # this branch the chosen option was dropped before the
-                    # callback, values_by_input, and the state dispatch, on
-                    # real submissions as well as offline drives.
+                    # Only a raw item reaches here (no wrapper builds a select),
+                    # but discord.py fills it on submission like any other child.
                     values[inner.custom_id] = inner.values
                 elif isinstance(inner, discord.ui.Checkbox):
                     values[inner.custom_id] = inner.value
 
-            # Run validation if validators were provided
+            # Discord accepts a required input holding only spaces, so it is
+            # refused here. An empty value is left alone: a real submission
+            # cannot carry one, and submit() leaves an unsupplied field as it was.
+            blank = {
+                inner.custom_id: (
+                    getattr(self.inputs.get(inner.custom_id), "label", None)
+                    or getattr(inner, "label", None)
+                    or inner.custom_id
+                )
+                for inner in map(_unwrap_label, self.children)
+                if isinstance(inner, discord.ui.TextInput)
+                and inner.required
+                and inner.value
+                and not inner.value.strip()
+            }
+            errors = {}
             if self.validators:
                 field_defs = [
                     {
@@ -776,28 +830,32 @@ class Modal(discord.ui.Modal, StatefulComponent):
                         "required": getattr(self.inputs.get(field_id), "required", False),
                     }
                     for field_id, field_validators in self.validators.items()
+                    if field_id not in blank
                 ]
                 errors = await validate_fields(values, field_defs)
-                if errors:
-                    lines = []
-                    for field_id, field_errors in errors.items():
-                        # Field label ("Emoji"), not the derived custom_id slug ("input_emoji").
-                        field = self.inputs.get(field_id)
-                        name = getattr(field, "label", field_id)
-                        for err in field_errors:
-                            lines.append(f"**{name}**: {err.message}")
-                    # is_done-aware: the auto-defer timer may have acked during a
-                    # slow validator, so a bare send_message would raise
-                    # InteractionResponded.
-                    await self.respond(interaction, "\n".join(lines), ephemeral=True)
+            if blank or errors:
+                # The form cannot be reopened from a view that has closed, so
+                # the notice replaces a list of fields to fix.
+                if self._opened_by is not None and await self._opened_by._answer_if_closed(
+                    interaction
+                ):
                     _SUBMIT_VERDICT.set(False)
                     return
+                lines = [f"**{label}**: This field is required." for label in blank.values()]
+                for field_id, field_errors in errors.items():
+                    # Field label ("Emoji"), not the derived custom_id slug ("input_emoji").
+                    field = self.inputs.get(field_id)
+                    name = getattr(field, "label", field_id)
+                    for err in field_errors:
+                        lines.append(f"**{name}**: {err.message}")
+                # is_done-aware: the auto-defer timer may have acked during a
+                # slow validator, so a bare send_message would raise
+                # InteractionResponded.
+                await self.respond(interaction, "\n".join(lines), ephemeral=True)
+                _SUBMIT_VERDICT.set(False)
+                return
 
-            # Write submitted values back onto the original CascadeUI wrapper
-            # instances so callers can read ``.value`` / ``.values`` directly.
-            # This runs after validation so a rejected value never appears on the
-            # wrapper, matching the documented "populated after validation passes"
-            # contract.
+            # After validation, so a rejected value never reaches the wrappers.
             _SUBMIT_VERDICT.set(True)
             self.values_by_input = {}
             for wrapped, discord_input in self._wrapped_pairs:
@@ -808,31 +866,58 @@ class Modal(discord.ui.Modal, StatefulComponent):
                     wrapped.value = discord_input.value
                     self.values_by_input[wrapped] = discord_input.value
 
-            # Dispatch state update
-            if self.view_id:
-                from ..state.singleton import get_store
+            with _collect_stalled_renders() as stalled:
+                # Dispatch state update
+                if self.view_id:
+                    from ..state.singleton import get_store
 
-                store = get_store()
+                    store = get_store()
 
-                payload = {
-                    "view_id": self.view_id,
-                    "values": values,
-                    "user_id": interaction.user.id,
-                }
+                    payload = {
+                        "view_id": self.view_id,
+                        "values": values,
+                        "user_id": interaction.user.id,
+                    }
 
-                await store.dispatch("MODAL_SUBMITTED", payload, source_id=self.view_id)
+                    await store.dispatch("MODAL_SUBMITTED", payload, source_id=self.view_id)
 
-            # Call user callback if provided
-            if self.user_callback:
-                await await_maybe(self.user_callback(interaction, values))
+                # Read before the callback, which may close or move the view itself.
+                closed_before = self._opened_by is not None and self._opened_by._closed()
+                # A re-render inside the callback answers the submission with
+                # its edit, as it answers a click. Not a render the dispatch
+                # above drove, which would take the answer from a callback
+                # that replies or defers first; and not once the view has
+                # closed, when the notice below is the answer.
+                acting = None if closed_before else _CURRENT_INTERACTION.set(interaction)
+                try:
+                    with _collect_replies() as replied:
+                        if self.user_callback:
+                            await await_maybe(self.user_callback(interaction, values))
+                finally:
+                    if acting is not None:
+                        _CURRENT_INTERACTION.reset(acting)
 
+            # The closed-view notice, unless the callback replied or deferred
+            # the submission itself (the prelude to a raw followup, which
+            # respond_safe does not see); a defer the backstop made does not count.
+            backstop_acked = (
+                backstop.done() and not backstop.cancelled() and backstop.result() is True
+            )
+            deferred_itself = interaction.response.is_done() and not backstop_acked
+            if closed_before and id(interaction) not in replied and not deferred_itself:
+                await self._opened_by._answer_if_closed(interaction)
             # Ack the submission if nothing above responded. The validation-error
             # path already responded via respond() and returned; a fast callback
             # here may have edited via the channel endpoint without acking.
             await self._safe_post_submit_defer(interaction)
         finally:
-            if not defer_task.done():
+            # Only the timer armed here: the dispatch's also covers on_error.
+            if defer_task is not None and not defer_task.done():
                 defer_task.cancel()
+            # After a raise too, as a render that landed would have stayed. The
+            # raise path is answered by on_error, so the response slot is left
+            # to it: this edit goes through the view's message.
+            await ship_stalled_renders(stalled)
 
     async def submit(self, interaction: Interaction, values: Dict[str, Any]) -> bool:
         """Drive a submission offline, through the pipeline a real one takes.
@@ -913,11 +998,8 @@ class Modal(discord.ui.Modal, StatefulComponent):
                     f"{sorted(targets)}"
                 )
             if id(inner) in claimed:
-                # An input answers to its label and its custom_id, so one
-                # mapping can name the same field twice. Assigning both
-                # would keep whichever came last and lose the other with
-                # nothing said, which is what the constructor already
-                # refuses two inputs for.
+                # Its label and its custom_id both name this input, and
+                # assigning both would silently keep only the last.
                 raise ValueError(
                     f"Modal.submit: {claimed[id(inner)]!r} and {key!r} both name "
                     f"the same input on {self.title!r}, so one value would be "
@@ -967,7 +1049,9 @@ class Modal(discord.ui.Modal, StatefulComponent):
         already spoken for; the identity wins and the alias is simply not
         registered. Refusing the name instead would leave the input
         holding it reachable by nothing, since that name is the only one
-        it has.
+        it has. A label two inputs share names neither of them: registering
+        it would send the value to whichever was listed first, and both
+        still answer to their own custom_id.
 
         Returns:
             Every accepted name mapped to the component it writes.
@@ -982,11 +1066,7 @@ class Modal(discord.ui.Modal, StatefulComponent):
         for custom_id, item in self.inputs.items():
             targets[custom_id] = inner_for.get(item) or _unwrap_label(item)
 
-        # Aliases in a second pass, so every identity is claimed before any
-        # label competes for a name. A label two inputs would claim is not
-        # a free name: registering the first silently sends a value to
-        # whichever happened to be listed earlier, and both inputs still
-        # answer to their own custom_id.
+        # Aliases second, once every identity is claimed.
         claimed_labels = {}
         for custom_id, item in self.inputs.items():
             label = _label_text(item)

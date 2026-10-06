@@ -13,6 +13,7 @@ must not sweep rows whose column is missing/None), and scan-snapshot
 safety (kv_scan must not RuntimeError when the caller writes mid-iter).
 """
 
+import asyncio
 import logging
 import os
 
@@ -27,7 +28,9 @@ from cascadeui.persistence.schema import (
     ALL_DDL,
     CURRENT_SCHEMA_VERSIONS,
     TABLE_APPLICATION_SLOTS,
+    TABLE_KV,
     TABLE_PERSISTENT_VIEWS,
+    TABLE_SCHEMA_META,
     apply_table_prefix,
     validate_table_prefix,
 )
@@ -50,9 +53,9 @@ except ImportError:
 postgres_available = False
 try:
     import asyncpg  # noqa: F401
-    from testcontainers.postgres import PostgresContainer  # noqa: F401
 
     from cascadeui.persistence.backends.postgres import PostgresBackend
+    from tests._pg_helpers import PostgresContainer  # noqa: F401
 
     postgres_available = True
 except ImportError:
@@ -122,6 +125,50 @@ class TestBackendProtocolConformance:
         await backend.kv_write("testns", "k1", b"payload")
         value = await backend.kv_read("testns", "k1")
         assert value == b"payload"
+
+    async def test_a_closed_backend_opens_again(self, backend):
+        # A bot closed and started again in the same process reopens
+        # persistence on the same backend objects.
+        await backend.kv_write("testns", "before", b"1")
+        await backend.close()
+        await backend.initialize()
+        await backend.kv_write("testns", "after", b"2")
+        assert await backend.kv_read("testns", "before") == b"1"
+        assert await backend.kv_read("testns", "after") == b"2"
+
+    async def test_a_reopened_postgres_backend_keeps_its_listener(self, backend):
+        if not (postgres_available and isinstance(backend, PostgresBackend)):
+            pytest.skip("the invalidation listener is PostgresBackend's")
+        await backend.close()
+        await backend.initialize()
+        await asyncio.sleep(0.05)
+        # The loop reconnects a dropped listener; one that exits at once
+        # leaves invalidation dead after the first drop.
+        assert [task for task in backend._tasks if not task.done()]
+
+    async def test_close_does_not_wait_forever_on_a_stuck_postgres_transaction(
+        self, backend, monkeypatch
+    ):
+        if not (postgres_available and isinstance(backend, PostgresBackend)):
+            pytest.skip("asyncpg's pool close waits for every acquired connection")
+        import cascadeui.persistence.backends.postgres as postgres_module
+
+        monkeypatch.setattr(postgres_module, "_CLOSE_WAIT_SECONDS", 0.2, raising=False)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def stuck():
+            async with backend.transaction():
+                entered.set()
+                await release.wait()
+
+        task = asyncio.create_task(stuck())
+        await entered.wait()
+        try:
+            await asyncio.wait_for(backend.close(), 5)
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
 
     async def test_kv_read_missing_returns_none(self, backend):
         assert await backend.kv_read("testns", "absent") is None
@@ -432,6 +479,326 @@ class TestBackendScanSnapshotSafety:
 @pytest.mark.skipif(not sqlite_available, reason="aiosqlite not installed")
 class TestSQLiteBackendPersistence:
     """SQLiteBackend persists across instances for the same file."""
+
+    async def test_two_closes_at_once_both_return(self, tmp_path):
+        # A second aiosqlite close() queues a stop its stopped worker thread
+        # never answers, which hung a bot closed twice at once.
+        backend = SQLiteBackend(str(tmp_path / "twice.db"))
+        await backend.initialize()
+        await asyncio.wait_for(asyncio.gather(backend.close(), backend.close()), 5)
+
+    async def test_close_waits_for_a_transaction_in_flight(self, tmp_path):
+        path = str(tmp_path / "inflight.db")
+        backend = SQLiteBackend(path)
+        await backend.initialize()
+        await backend.execute("CREATE TABLE t (x INTEGER)")
+        entered = asyncio.Event()
+
+        async def writer():
+            async with backend.transaction():
+                entered.set()
+                await asyncio.sleep(0.1)
+                await backend.execute("INSERT INTO t VALUES (?)", 1)
+
+        task = asyncio.create_task(writer())
+        await entered.wait()
+        await backend.close()
+        await task
+
+        reader = SQLiteBackend(path)
+        await reader.initialize()
+        try:
+            assert await reader.fetch("SELECT x FROM t") == [{"x": 1}]
+        finally:
+            await reader.close()
+
+    async def test_a_transaction_close_cut_off_leaves_the_reopened_backend_alone(
+        self, tmp_path, monkeypatch
+    ):
+        import cascadeui.persistence.backends.sqlite as sqlite_module
+
+        monkeypatch.setattr(sqlite_module, "_CLOSE_WAIT_SECONDS", 0.05, raising=False)
+        backend = SQLiteBackend(str(tmp_path / "stuck.db"))
+        await backend.initialize()
+        await backend.execute("CREATE TABLE t (x INTEGER)")
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def stuck():
+            async with backend.transaction():
+                entered.set()
+                await release.wait()
+
+        task = asyncio.create_task(stuck())
+        await entered.wait()
+        await backend.close()
+        await backend.initialize()
+        try:
+            # Neither the old transaction's write lock nor its depth carries over.
+            await asyncio.wait_for(backend.execute("INSERT INTO t VALUES (?)", 2), 1)
+            release.set()
+            with pytest.raises(RuntimeError, match="closed while this transaction was open"):
+                await task
+            async with backend.transaction():
+                await backend.execute("INSERT INTO t VALUES (?)", 3)
+            assert await backend.fetch("SELECT x FROM t ORDER BY x") == [{"x": 2}, {"x": 3}]
+        finally:
+            release.set()
+            await backend.close()
+
+    async def test_a_statement_still_running_at_the_close_is_interrupted(
+        self, tmp_path, monkeypatch
+    ):
+        """The close waited for a statement running on the worker thread, so one
+        long query held the close, and a bot's shutdown, for as long as it ran."""
+        import sqlite3
+
+        import cascadeui.persistence.backends.sqlite as sqlite_module
+
+        monkeypatch.setattr(sqlite_module, "_CLOSE_WAIT_SECONDS", 0.05, raising=False)
+        backend = SQLiteBackend(str(tmp_path / "running.db"))
+        await backend.initialize()
+        conn = backend._db()
+        loop = asyncio.get_running_loop()
+        running = asyncio.Event()
+
+        def progress():
+            loop.call_soon_threadsafe(running.set)
+            return 0  # anything truthy aborts the statement
+
+        await conn.set_progress_handler(progress, 1000)
+        endless = (
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c"
+        )
+        query = asyncio.create_task(backend.fetch(endless))
+        close = None
+        try:
+            await asyncio.wait_for(running.wait(), 5)
+            close = asyncio.create_task(backend.close())
+            done, _ = await asyncio.wait({close}, timeout=30)
+            assert close in done
+            with pytest.raises(sqlite3.OperationalError, match="interrupted"):
+                await query
+        finally:
+            if close is None or not close.done():
+                await conn.interrupt()
+                await asyncio.wait({query}, timeout=5)
+                if close is not None:
+                    await close
+                else:
+                    await backend.close()
+
+    async def test_a_task_spawned_inside_a_transaction_writes_on_its_own_after_it(self, tmp_path):
+        # The child copies the parent's context, transaction marker included.
+        # Once that transaction has ended, the child's write must not join the
+        # next one another task opens and roll back with it.
+        backend = SQLiteBackend(str(tmp_path / "child.db"))
+        await backend.initialize()
+        await backend.execute("CREATE TABLE t (x INTEGER)")
+        other_open = asyncio.Event()
+
+        async def child():
+            await other_open.wait()
+            await backend.execute("INSERT INTO t VALUES (?)", 1)
+
+        async with backend.transaction():
+            spawned = asyncio.create_task(child())
+
+        async def failing():
+            with pytest.raises(RuntimeError):
+                async with backend.transaction():
+                    await backend.execute("INSERT INTO t VALUES (?)", 2)
+                    other_open.set()
+                    await asyncio.sleep(0.05)
+                    raise RuntimeError("rolled back")
+
+        try:
+            await asyncio.wait_for(asyncio.gather(failing(), spawned), 5)
+            assert await backend.fetch("SELECT x FROM t") == [{"x": 1}]
+        finally:
+            await backend.close()
+
+    async def test_a_namespace_call_inside_its_own_transaction_is_refused(self, tmp_path):
+        # SQLite has one connection: kv_write would wait forever on the write
+        # lock the task's own transaction holds.
+        backend = SQLiteBackend(str(tmp_path / "ns.db"))
+        await backend.initialize()
+        try:
+            async with backend.transaction():
+                with pytest.raises(RuntimeError, match=r"kv_write\(\) cannot run inside"):
+                    await asyncio.wait_for(backend.kv_write("ns", "k", b"v"), 1)
+            await backend.kv_write("ns", "k", b"v")
+            assert await backend.kv_read("ns", "k") == b"v"
+        finally:
+            await backend.close()
+
+    async def test_a_child_cannot_open_a_transaction_inside_its_parents(self, tmp_path):
+        # A savepoint on the parent's transaction from another task commits
+        # with the parent and fails to release once the parent moved on.
+        backend = SQLiteBackend(str(tmp_path / "nested.db"))
+        await backend.initialize()
+        try:
+
+            async def child():
+                async with backend.transaction():
+                    pass
+
+            async with backend.transaction():
+                with pytest.raises(RuntimeError, match="cannot open one of its own"):
+                    await asyncio.wait_for(asyncio.create_task(child()), 1)
+        finally:
+            await backend.close()
+
+    @pytest.mark.parametrize(
+        "read",
+        ["kv_read", "kv_scan", "row_select", "get_schema_version", "fetch", "fetch_one"],
+    )
+    async def test_a_read_waits_out_another_tasks_transaction(self, tmp_path, read):
+        # SQLite has one connection: a read beside another task's open
+        # transaction would see rows its rollback then discards. Inside the
+        # task's own transaction the same read sees them.
+        backend = SQLiteBackend(str(tmp_path / "reads.db"))
+        await backend.initialize()
+        kv = physical_table(backend, TABLE_KV)
+        meta = physical_table(backend, TABLE_SCHEMA_META)
+        empty = {
+            "kv_read": None,
+            "kv_scan": [],
+            "row_select": [],
+            "get_schema_version": 0,
+            "fetch": [],
+            "fetch_one": None,
+        }[read]
+
+        async def do_read():
+            if read == "kv_read":
+                return await backend.kv_read("ns", "k")
+            if read == "kv_scan":
+                return [pair async for pair in backend.kv_scan("ns")]
+            if read == "row_select":
+                return await backend.row_select(TABLE_KV)
+            if read == "get_schema_version":
+                return await backend.get_schema_version("t")
+            if read == "fetch":
+                return await backend.fetch(f"SELECT key FROM {kv}")
+            return await backend.fetch_one(f"SELECT key FROM {kv}")
+
+        own = []
+        wrote = asyncio.Event()
+        release = asyncio.Event()
+
+        async def failing():
+            with pytest.raises(RuntimeError, match="the command fails"):
+                async with backend.transaction():
+                    await backend.execute(
+                        f"INSERT INTO {kv} (namespace, key, value) VALUES ('ns', 'k', x'00')"
+                    )
+                    await backend.execute(
+                        f"INSERT INTO {meta} (table_name, schema_version, applied_at) "
+                        "VALUES ('t', 5, 0)"
+                    )
+                    own.append(await asyncio.wait_for(do_read(), 1))
+                    wrote.set()
+                    await release.wait()
+                    raise RuntimeError("the command fails")
+
+        try:
+            command = asyncio.create_task(failing())
+            await asyncio.wait_for(wrote.wait(), 2)
+            assert own[0] != empty
+            reading = asyncio.create_task(do_read())
+            await asyncio.sleep(0.05)
+            assert not reading.done()
+            release.set()
+            await command
+            assert await asyncio.wait_for(reading, 2) == empty
+        finally:
+            release.set()
+            await backend.close()
+
+    async def test_a_write_inside_a_cut_off_transaction_is_refused_after_reopen(
+        self, tmp_path, monkeypatch
+    ):
+        # Written on the reopened connection, it would commit on its own,
+        # outside the transaction that failed.
+        import cascadeui.persistence.backends.sqlite as sqlite_module
+
+        monkeypatch.setattr(sqlite_module, "_CLOSE_WAIT_SECONDS", 0.05)
+        backend = SQLiteBackend(str(tmp_path / "orphan.db"))
+        await backend.initialize()
+        await backend.execute("CREATE TABLE t (x INTEGER)")
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def stuck():
+            async with backend.transaction():
+                entered.set()
+                await release.wait()
+                await backend.execute("INSERT INTO t VALUES (?)", 1)
+
+        task = asyncio.create_task(stuck())
+        await entered.wait()
+        await backend.close()
+        await backend.initialize()
+        try:
+            release.set()
+            with pytest.raises(RuntimeError, match="closed while this transaction was open"):
+                await task
+            assert await backend.fetch("SELECT x FROM t") == []
+        finally:
+            await backend.close()
+
+    async def test_a_transaction_queued_across_a_cut_off_close_takes_the_new_lock(
+        self, tmp_path, monkeypatch
+    ):
+        # Queued behind the transaction the close cut off, it wakes holding the
+        # old lock; beginning on the reopened connection with it would run
+        # beside a transaction that holds the new one.
+        import cascadeui.persistence.backends.sqlite as sqlite_module
+
+        monkeypatch.setattr(sqlite_module, "_CLOSE_WAIT_SECONDS", 0.05)
+        backend = SQLiteBackend(str(tmp_path / "queued.db"))
+        await backend.initialize()
+        await backend.execute("CREATE TABLE t (x INTEGER)")
+        stuck_in = asyncio.Event()
+        stuck_out = asyncio.Event()
+        current_in = asyncio.Event()
+        current_out = asyncio.Event()
+
+        async def stuck():
+            async with backend.transaction():
+                stuck_in.set()
+                await stuck_out.wait()
+
+        async def queued():
+            async with backend.transaction():
+                await backend.execute("INSERT INTO t VALUES (?)", 1)
+
+        async def current():
+            async with backend.transaction():
+                current_in.set()
+                await current_out.wait()
+                await backend.execute("INSERT INTO t VALUES (?)", 2)
+
+        first = asyncio.create_task(stuck())
+        await stuck_in.wait()
+        waiting = asyncio.create_task(queued())
+        await asyncio.sleep(0.01)
+        await backend.close()
+        await backend.initialize()
+        try:
+            holder = asyncio.create_task(current())
+            await asyncio.wait_for(current_in.wait(), 2)
+            stuck_out.set()
+            await asyncio.gather(first, return_exceptions=True)
+            await asyncio.sleep(0.05)
+            current_out.set()
+            await asyncio.wait_for(asyncio.gather(holder, waiting), 2)
+            assert await backend.fetch("SELECT x FROM t ORDER BY x") == [{"x": 1}, {"x": 2}]
+        finally:
+            stuck_out.set()
+            current_out.set()
+            await backend.close()
 
     async def test_data_survives_reopen(self, tmp_path):
         path = str(tmp_path / "survive.db")
@@ -822,8 +1189,8 @@ class TestLegacyTableRename:
     """``apply_migrations`` renames a pre-prefix database to the current names.
 
     The registry and slots tables shipped as ``persistent_views`` and
-    ``application_slots``. The reconciliation renames them -- version rows
-    and indexes included -- exactly when the old table carries the library's
+    ``application_slots``. The reconciliation renames them (version rows
+    and indexes included) exactly when the old table carries the library's
     columns and the current name holds no rows, and refuses everything else.
     """
 
@@ -1118,7 +1485,11 @@ class TestLegacyTableRename:
             expected = f"{physical_table(sql_backend, table)}_pkey"
             assert await _pg_pkey(sql_backend, table) == (expected, expected)
         # The second boot is the every-boot no-op: no repair, no complaint.
-        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert not [
+            r
+            for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name.startswith("cascadeui")
+        ]
         assert "Renamed primary-key constraint" not in caplog.text
 
     @pytest.mark.skipif(not postgres_available, reason="asyncpg or testcontainers not installed")
@@ -1166,9 +1537,47 @@ class TestLegacyTableRename:
         assert any("'persistent_views_pkey'" in m and f"'{phys}_pkey'" in m for m in warned), warned
 
 
+@pytest.mark.skipif(not postgres_available, reason="asyncpg not installed")
+class TestPostgresTransactionReleasesItsConnection:
+    """The pooled connection goes back however the transaction ends."""
+
+    async def test_a_cancel_during_begin_returns_the_connection(self):
+        from cascadeui.persistence.backends.postgres import _PostgresTransaction
+
+        released = []
+
+        class _Acquire:
+            async def __aenter__(self):
+                return _Conn()
+
+            async def __aexit__(self, *exc):
+                released.append(True)
+
+        class _Begin:
+            async def __aenter__(self):
+                raise asyncio.CancelledError()
+
+        class _Conn:
+            def transaction(self):
+                return _Begin()
+
+        class _Pool:
+            def acquire(self):
+                return _Acquire()
+
+        class _Backend:
+            def _pool_or_raise(self):
+                return _Pool()
+
+        with pytest.raises(asyncio.CancelledError):
+            async with _PostgresTransaction(_Backend()):
+                pass
+        assert released == [True]
+
+
 @pytest.mark.skipif(not sqlite_available, reason="aiosqlite not installed")
 class TestSQLiteBatchAtomicity:
-    """row_upsert_many rolls back the whole batch on a mid-batch failure."""
+    """A SQLite write that fails or is cancelled before its commit leaves nothing behind."""
 
     async def test_partial_batch_does_not_leak(self, tmp_path):
         backend = SQLiteBackend(str(tmp_path / "atomic.db"))
@@ -1205,6 +1614,154 @@ class TestSQLiteBatchAtomicity:
         v = await b.get_schema_version(TABLE_PERSISTENT_VIEWS)
         await b.close()
         assert v == 2
+
+    _SLOT = {
+        "slot_name": "cancelled",
+        "payload": "{}",
+        "schema_version": 1,
+        "updated_at": 1,
+        "expires_at": None,
+    }
+
+    WRITES = {
+        "execute": lambda b: b.execute("INSERT INTO t VALUES (1)"),
+        "executemany": lambda b: b.executemany("INSERT INTO t VALUES (?)", [(1,), (2,)]),
+        "kv_write": lambda b: b.kv_write("ns", "cancelled", b"v"),
+        "row_upsert": lambda b: b.row_upsert(
+            TABLE_APPLICATION_SLOTS, TestSQLiteBatchAtomicity._SLOT, ["slot_name"]
+        ),
+        "row_upsert_many": lambda b: b.row_upsert_many(
+            TABLE_APPLICATION_SLOTS, [TestSQLiteBatchAtomicity._SLOT], ["slot_name"]
+        ),
+    }
+
+    @staticmethod
+    async def _cancelled_write_left(backend):
+        """What the cancelled write left: rows in ``t``, the kv key, the slot."""
+        rows = await backend.fetch("SELECT x FROM t WHERE x < 90")
+        kv = await backend.kv_read("ns", "cancelled")
+        slots = await backend.row_select(TABLE_APPLICATION_SLOTS, {"slot_name": "cancelled"})
+        return rows, kv, slots
+
+    @pytest.mark.parametrize("write", list(WRITES))
+    async def test_a_write_cancelled_before_its_commit_leaves_nothing(
+        self, tmp_path, monkeypatch, write
+    ):
+        """Cut off between its statement and its commit, a write stayed open
+        on the one connection: the next write's commit took it along, and a
+        transaction() failed to begin until then."""
+        import aiosqlite
+
+        backend = SQLiteBackend(str(tmp_path / "cancel.db"))
+        await backend.initialize()
+        try:
+            await backend.execute("CREATE TABLE t (x INTEGER)")
+            real_commit = aiosqlite.Connection.commit
+            reached = asyncio.Event()
+
+            async def commit(conn):
+                if not reached.is_set():
+                    reached.set()
+                    await asyncio.Event().wait()
+                return await real_commit(conn)
+
+            monkeypatch.setattr(aiosqlite.Connection, "commit", commit)
+            task = asyncio.create_task(self.WRITES[write](backend))
+            await asyncio.wait_for(reached.wait(), 5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            async with backend.transaction():
+                await backend.execute("INSERT INTO t VALUES (99)")
+
+            assert await self._cancelled_write_left(backend) == ([], None, [])
+        finally:
+            await backend.close()
+
+    async def test_a_write_cancelled_while_still_queued_leaves_nothing(self, tmp_path):
+        """aiosqlite runs a queued statement even when the call awaiting it is
+        cancelled, so the rollback has to follow it rather than depend on a
+        transaction being open at the cancel."""
+        import threading
+
+        backend = SQLiteBackend(str(tmp_path / "queued.db"))
+        await backend.initialize()
+        worker_free = threading.Event()
+        try:
+            await backend.execute("CREATE TABLE t (x INTEGER)")
+            db = backend._db()
+            # aiosqlite offers no public way to hold its worker thread. If its
+            # private _execute changes, the queued wait below fails loudly.
+            blocker = asyncio.ensure_future(db._execute(worker_free.wait, 5))
+            queued = asyncio.Event()
+            real_execute = db._execute
+
+            async def execute(fn, *args, **kwargs):
+                queued.set()
+                return await real_execute(fn, *args, **kwargs)
+
+            db._execute = execute
+            task = asyncio.create_task(backend.execute("INSERT INTO t VALUES (1)"))
+            await asyncio.wait_for(queued.wait(), 5)
+            del db._execute
+            assert not db.in_transaction
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            worker_free.set()
+            await blocker
+
+            await backend.execute("INSERT INTO t VALUES (98)")
+
+            assert await backend.fetch("SELECT x FROM t WHERE x < 90") == []
+        finally:
+            worker_free.set()
+            await backend.close()
+
+    async def test_a_transaction_cancelled_while_its_begin_is_queued_leaves_nothing(self, tmp_path):
+        """BEGIN runs even when the transaction waiting for it is cancelled, and
+        the lock was released with no rollback behind it, so the next
+        transaction() failed to begin."""
+        import threading
+
+        backend = SQLiteBackend(str(tmp_path / "begin.db"))
+        await backend.initialize()
+        worker_free = threading.Event()
+        try:
+            await backend.execute("CREATE TABLE t (x INTEGER)")
+            db = backend._db()
+            # aiosqlite offers no public way to hold its worker thread. If its
+            # private _execute changes, the queued wait below fails loudly.
+            blocker = asyncio.ensure_future(db._execute(worker_free.wait, 5))
+            queued = asyncio.Event()
+            real_execute = db._execute
+
+            async def execute(fn, *args, **kwargs):
+                queued.set()
+                return await real_execute(fn, *args, **kwargs)
+
+            async def opens():
+                async with backend.transaction():
+                    await backend.execute("INSERT INTO t VALUES (1)")
+
+            db._execute = execute
+            task = asyncio.create_task(opens())
+            await asyncio.wait_for(queued.wait(), 5)
+            del db._execute
+            task.cancel()
+            worker_free.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await blocker
+
+            assert not db.in_transaction
+            async with backend.transaction():
+                await backend.execute("INSERT INTO t VALUES (2)")
+            assert await backend.fetch("SELECT x FROM t") == [{"x": 2}]
+        finally:
+            worker_free.set()
+            await backend.close()
 
 
 class TestInMemoryBatchAtomicity:

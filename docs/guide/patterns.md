@@ -14,7 +14,9 @@ All patterns follow the same customization grammar:
   `on_page_changed`, `on_category_selected`) run at lifecycle points.
   Override to customize behavior.
 - **`_build_extra_items()`** is a hook called once during init to
-  register components that persist across content changes.
+  register components that persist across content changes. The V1 menu
+  is the exception: it rebuilds its buttons, and calls the hook again on
+  every rebuild.
 
 Every pattern renders its own first message, so `await view.send()` is the
 whole call. A V2 pattern *is* its component tree and needs nothing further,
@@ -122,7 +124,8 @@ parameter:
     click (see
     [V1 and V2 Views Cannot Push/Pop Between Each Other](known-limitations.md#v1-and-v2-views-cannot-pushpop-between-each-other)),
     so validating the category list up front keeps the dead button away from
-    the user.
+    the user. A `"view"` that is not a view class, such as an instance of
+    one, raises the same way: every click pushes a new view built from it.
 
 ### Default Rebuild Behavior
 
@@ -168,10 +171,10 @@ async def on_category_selected(self, category, index, interaction):
 ```
 
 **`build_header()` / `build_footer()`** (V2 only) -- return V2
-components for areas above and below the category list. The former
-underscore-prefixed names (`_build_header()` / `_build_footer()`) were
-removed; rename any remaining override to the public name, which takes
-the same arguments and returns the same shape.
+components for areas above and below the category list. An override
+named `_build_header()` or `_build_footer()` is never called, and nothing
+warns: give it the public name, which takes the same arguments and returns
+the same shape.
 
 ```python
 def build_header(self):
@@ -186,7 +189,8 @@ def build_footer(self):
 single category is rendered. Override to customize layout per category.
 
 **`_build_extra_items()`** (V1 only) -- add components alongside
-category buttons (e.g. a Reset All button on a later row).
+category buttons (e.g. a Reset All button on a later row). Called on every
+rebuild, so build the items fresh each time.
 
 **`build_embed()`** (V1 only) -- the embed displayed alongside category
 buttons. Default returns a minimal "Menu" embed. Override to show a
@@ -328,7 +332,10 @@ async def on_submit(self, interaction, values):
 The form reaches `on_submit` only once validation passes (every required
 field filled, every value parsed, every validator satisfied), so cross-field
 checks belong there. Setting an error and returning keeps the form open with
-the message shown, and the next submit re-runs the check.
+the message shown, and the next submit re-runs the check. The second click of
+a double-click on Submit is dropped, so the check runs once per submit the
+user meant. A refusal does not hold off the next Submit, whether validation or
+`on_submit` made it, so one sent after fixing the field runs.
 
 A field change clears only that field's own error; the others stay until
 they change or the next submit re-checks them.
@@ -386,6 +393,7 @@ re-renders, so fixing one does not need a second submit to find the next.
 | `text_edit_button_emoji` | `"✏️"` | Emoji on the text-edit button |
 | `text_edit_button_style` | `secondary` | Style of the text-edit button |
 | `text_edit_modal_auto_defer_delay` | `2.5` | Ack backstop (seconds) for the internal text-edit modal; raise for a slow async field validator, keeping it under `3.0` |
+| `auto_exit_button` | `False` | Adds the library's Exit button and keeps it through every re-render |
 
 ### `on_submit(interaction, values)`
 
@@ -412,9 +420,11 @@ called `exit()`, `push()`, or `replace()`.
 - **V1 (`FormView`):** Displays field status in an embed. Controls use
   row-based layout, capped at Discord's five action rows; each `select` or
   `boolean` field consumes one row (a `boolean` field's Yes/No pair shares a
-  row). A field that does not fit raises `ValueError` at construction, naming
-  the field. Use `FormLayoutView` for forms with more non-text fields than
-  V1's five rows hold.
+  row). The Edit and Submit buttons take the rows after, and share the last
+  row once all five are used, which a `boolean` row has room for and a
+  `select` row does not. A field or button that does not fit raises
+  `ValueError` at construction, naming it. Use `FormLayoutView` for forms
+  with more non-text fields than V1's five rows hold.
 - **V2 (`FormLayoutView`):** Displays field status in a `Container` with
   `TextDisplay`. Controls wrapped in `ActionRow`. Full immediate-mode
   rebuild on every value change -- select `default` states are preserved
@@ -527,6 +537,7 @@ Per-step values live on the view as they always have.
 | `finish_button_style` | `success` | Style of the Finish button |
 | `step_indicator_label` | `None` | `Callable(current, total) -> str` for custom indicator. Must be synchronous; an `async def` is refused at class definition. |
 | `show_progress_bar` | `True` | V2 only -- renders a progress header above the step content whenever more than one step is visible |
+| `auto_exit_button` | `False` | Adds the library's Exit button and keeps it through every step change |
 
 The step indicator defaults to `"Step {n}/{total}"`. Pass a callable
 for custom formatting:
@@ -570,7 +581,7 @@ reacting to step transitions and validation outcomes:
 
 | Hook | Fires |
 |------|-------|
-| `on_step_entered(step_index)` | After a step becomes active via Next or Back. Does not fire for the first step on the initial render |
+| `on_step_entered(step_index)` | When Next or Back moves to a step, before its builder runs. Does not fire for the first step on the initial render, or again when a step's render does not land and the wizard stays where it was |
 | `on_step_exited(step_index)` | Before leaving a step (next or back) |
 | `on_validation_failed(step_index, error, interaction=None)` | When the current step's validator returns `(False, error)` |
 
@@ -594,7 +605,10 @@ but do not block navigation.
 
 Called when the user clicks Finish (or Next on the last step). The
 default implementation defers and exits. Override to persist wizard
-state or transition:
+state or transition. An override may leave the wizard open (to refuse, or
+to show a result in place); of the Finish clicks sent before `on_finish`
+returns, only the first runs it (a Finish the step's validator refused does
+not count):
 
 ```python
 async def on_finish(self, interaction):
@@ -608,7 +622,7 @@ async def on_finish(self, interaction):
 |----------|------|-------------|
 | `current_step` | `int` | Zero-based index of the active step |
 | `step_count` | `int` | Total number of steps |
-| `refresh_content()` | async method | Re-render the current step in place after a subclass callback mutated data (V1 rebuilds the embed, V2 recomposes the tree). Distinct from `reload()`, which re-runs `on_load()` first. |
+| `refresh_content()` | async method | Re-render the current step in place after a subclass callback mutated data (V1 rebuilds the embed, V2 recomposes the tree). Distinct from `reload()`, which re-runs `on_load()` first; it waits for a `reload()` already running. |
 
 ### V1 vs V2
 
@@ -685,6 +699,7 @@ class DashboardView(TabLayoutView):
 | `active_tab_style` | `primary` | Style of the currently selected tab button |
 | `inactive_tab_style` | `secondary` | Style of unselected tab buttons |
 | `tab_overflow_policy` | `"fill"` | How tab buttons distribute across ActionRows when more than five tabs are present. Accepts `"fill"` (pack greedily, five-per-row), `"balance"` (spread evenly), `"pin_first"` (first tab always alone on row 0), `"pin_last"` (last tab always alone on the final row), or a `tuple[int, ...]` naming the button count per row. Validated at class-definition time. Tuple-vs-button-count drift produces a runtime warning and auto-adjusts. |
+| `auto_exit_button` | `False` | Adds the library's Exit button and keeps it through every tab switch |
 
 ### `on_tab_switched(index)`
 
@@ -702,8 +717,8 @@ async def on_tab_switched(self, index):
 | Member | Type | Description |
 |--------|------|-------------|
 | `active_tab` | `str` (property) | Name of the currently active tab |
-| `switch_tab(name)` | async method | Switch to a tab by name programmatically |
-| `refresh_content()` | async method | Re-render the active tab in place after a subclass callback mutated data (V1 rebuilds the embed, V2 recomposes the tree). Distinct from `reload()`, which re-runs `on_load()` first. |
+| `switch_tab(name, *, notify=True)` | async method | Switch to a tab by name programmatically; `notify=False` skips `on_tab_switched` for a switch the view makes on its own |
+| `refresh_content()` | async method | Re-render the active tab in place after a subclass callback mutated data (V1 rebuilds the embed, V2 recomposes the tree). Distinct from `reload()`, which re-runs `on_load()` first; it waits for a `reload()` already running. |
 
 `switch_tab()` raises `ValueError` if the tab name is not found.
 
@@ -871,6 +886,7 @@ Each navigation button exposes a `{label, emoji, style}` triple:
 | `last_button_emoji` | `None` | |
 | `last_button_style` | `secondary` | |
 | `jump_threshold` | `5` | Minimum page count at which first/last and go-to appear |
+| `auto_exit_button` | `False` | Adds the library's Exit button and keeps it through every page turn |
 
 When the page count reaches `jump_threshold` or above, three extra
 controls appear: first-page and last-page jump buttons, and a
@@ -920,6 +936,10 @@ async def _jump_to_last(self, interaction):
     await self.set_page(self.page_count - 1)
 ```
 
+Pass `notify=False` for a jump the view makes on its own rather than one
+the user asked for, such as a return to the first page after a period
+of inactivity. `on_page_changed` is skipped; the render is the same.
+
 ### `on_page_changed(page)`
 
 Called after `current_page` updates, before the refresh. Default is a
@@ -931,10 +951,11 @@ async def on_page_changed(self, page):
 ```
 
 !!! warning "Fires before the repaint"
-    This reports the move the reader asked for. If that repaint's edit never
-    reaches Discord the cursor is rewound and the hook is *not* called again,
-    so an override that counts moves or writes state records one the reader
-    never saw. Read `refresh_degraded` after the move if that matters. See
+    This reports the move the user asked for. If that repaint's edit never
+    lands (dropped, refused, or its render raised) the cursor is rewound and
+    the hook is *not* called again, so an override that counts moves or
+    writes state records one the user never saw. Read `refresh_degraded`
+    after the move if that matters. See
     [Transport Failures Degrade Quietly](known-limitations.md#transport-failures-degrade-quietly).
 
 ### `_build_extra_items()`
@@ -1143,9 +1164,9 @@ change (multi-line, different separator).
 | `get_avatar_url(user_id, stats)` | Async hook returning an avatar URL for the section's `Thumbnail` accessory. The default resolves from the bot's user cache when a `bot=` kwarg is passed (member avatar on a hit, Discord default avatar on a miss); without a bot it returns `None`, triggering the stacked `TextDisplay` fallback. |
 | `resolve_avatar_urls(user_ids)` *(async)* | Section-mode avatar backfill, used when `avatar_backfill = True`. Receives a list of user ids and returns a `{user_id: url}` dict, resolved off the render path. Default resolves per user; override for a CDN or warmed cache. |
 | `build_title(page)` | Optional components replacing the rankings card's masthead (the `banner` image + `## title` heading) inside the Container. `None` (default) composes the masthead from the declarative `banner` / `title` pair. Same return shapes and `page` semantics as `build_header`. |
-| `build_header(page)` | Content above the rankings card. The value is prepended as-is: a `Container` renders as its own card (an Overview `stats_card`, a banner), anything else floats as a bare top-level item (no return-type branching, unlike `build_footer`). Read `ranked_entries` for aggregate stats. Return a component, a list, or `None` (default). `page` is the zero-based page index, so a frame can target only some pages. |
+| `build_header(page)` | Content above the rankings card. The value is prepended as-is: a `Container` renders as its own card (an Overview `stats_card`, a banner), anything else floats as a bare top-level item (no return-type branching, unlike `build_footer`). Read `ranked_entries` for stats over the ranked rows, and the full list `get_entries()` returns for totals across every entry. Return a component, a list, or `None` (default). `page` is the zero-based page index, so a frame can target only some pages. |
 | `build_footer(page)` | Optional footer components, placed by return type: a raw component (caption, link row, image) folds inside the rankings card; a `Container` (`card(...)`) renders as its own card below it. Same return shapes and `page` semantics as `build_header`. |
-| `ranked_entries` *(property)* | The loaded top-N `(user_id, stats)` slice; read it in `build_header` / `build_footer` / `build_title` to compute aggregate stats without re-fetching. |
+| `ranked_entries` *(property)* | The loaded top-N `(user_id, stats)` slice; read it in `build_header` / `build_footer` / `build_title` for stats over the rows shown. It holds only the top `leaderboard_top_n`, so totals across every entry come from `get_entries()`. |
 | `on_leaderboard_empty()` | Returns the V2 component list shown when `entries` is empty. Default wraps `leaderboard_empty_message` in a single card. The masthead composes above this return, so a board keeps its `banner` / `title` while empty and an override inherits it; `build_title` returning `[]` renders no masthead on that page. `ranked_entries` is empty here. `build_header` and `build_footer` run on this page too: header content renders above the masthead, footer content below the empty-state card, each in the order returned. |
 | `on_state_changed(state)` | Runs `rebuild_pages()` before the paginated refresh -- lets live-data subclasses re-fetch on every subscribed action. The rebuild short-circuits when the entries signature (user ids + stats) is unchanged, so identical re-fetches cost one comparison instead of a full page rebuild. |
 
@@ -1177,12 +1198,18 @@ class MmrBoard(LeaderboardLayoutView):
 - `banner` (default `None`) -- full-width image at the top of the rankings card, above the title heading when both are set. Accepts a URL string, a `discord.File`, or anything with a string `.url` (`guild.icon` works directly). Constructor `banner=` kwarg overrides the class attribute; the `build_title` hook overrides both.
 - `subtitle` (default `"Rankings"`) -- H3 above the ranked rows. Set to `None` or empty string (or pass `subtitle=None` at construction) to skip the H3 entirely, which pairs naturally with an Overview `build_header` card that already carries its own heading.
 - `leaderboard_empty_message` -- static text when no entries exist.
-- `entry_layout` (default `"lines"`) -- controls row rendering. `"lines"` stacks entries as `TextDisplay` rows inside a single card; `"sections"` renders each entry as a `Section` with a `Thumbnail` accessory and a two-line body (`format_primary` + `format_secondary`). Section mode caps `leaderboard_per_page` at `5` -- setting a larger value with `entry_layout = "sections"` raises at class-definition time via `_validate_class_attributes`.
+- `entry_layout` (default `"lines"`) -- controls row rendering. `"lines"` stacks entries as `TextDisplay` rows inside a single card; `"sections"` renders each entry as a `Section` with a `Thumbnail` accessory and a two-line body (`format_primary` + `format_secondary`). Section mode caps `leaderboard_per_page` at `5`: setting a larger value with `entry_layout = "sections"` raises at class-definition time via `_validate_class_attributes`.
 - `podium_emojis` (default gold/silver/bronze medals) -- dict keyed by rank number. `format_rank` reads this for ranks 1-3; ranks beyond fall back to `f"**{rank}.**"`. Override the dict on a subclass to change the podium glyphs (or extend it past rank 3) without overriding `format_rank` itself.
 - `entry_separator` (default `" -- "`) -- string rendered between the name and stat columns inside `format_entry` (`"lines"` mode). Override on a subclass for visual variety (`" | "`, `" • "`, etc.) without rewriting `format_entry`.
 - `card_color` (default `None`) -- optional accent color for the rankings card. `None` falls through to the active theme's accent. Set to a `discord.Color` on a subclass to give the rankings card its own accent (useful when a `build_header` Overview card carries its own color and a deliberate two-color layout is wanted).
 - `show_title_divider` (default `True`) -- whether to render a horizontal divider below the title and above the rest of the card content. Set to `False` for a more compact card.
 - `avatar_backfill` (default `False`) -- section render mode only. Paints Discord default avatars immediately, then resolves the real avatars off the render path (via the `resolve_avatar_urls` hook) and reloads once they arrive. Avoids a first render that blocks on avatar resolution and a per-row fetch on the render path. See [Avatar backfill on large guilds](#avatar-backfill).
+
+`title`, `subtitle`, `entry_separator`, `leaderboard_empty_message`, and
+`podium_emojis` are checked when the class is defined: a value of the wrong
+type raises `TypeError` naming the attribute, so a `podium_emojis` keyed by
+strings (which never matches a rank) fails at import instead of rendering
+plain numbers.
 
 ### Section render mode {#section-render-mode}
 
@@ -1370,7 +1397,9 @@ response without any per-role callback boilerplate.
 Underneath, each role button is a `DynamicPersistentButton` subclass
 declared once at module import. Clicks route by `custom_id` template
 match, so a panel with 50 roles across 6 categories tracks zero
-per-button state and survives bot restarts cleanly.
+per-button state and survives bot restarts cleanly. A member's second click
+on a role while their first is still being applied is dropped, so a
+double-click changes the role once.
 
 ### Minimal example
 
@@ -1443,8 +1472,9 @@ produce valid cardinality behavior:
   rather than mixing an emoji glyph with a text character.
 
 Each hint attribute accepts any string (including emoji), or `None`
-to suppress the hint entirely. Per-category dynamic hints override
-`format_category_hint(category)` at Tier 2.
+to suppress the hint entirely; anything else raises `TypeError` when the
+class is defined, as do `title` and `subtitle`. Per-category dynamic hints
+override `format_category_hint(category)` at Tier 2.
 
 **Response messages** (Python `str.format` placeholders: `{role}`,
 `{category}`, `{removed}`, `{error}`):
@@ -1609,6 +1639,11 @@ async def _on_insert(self, interaction):
     new_total = await db.fetchval("SELECT count(*) FROM users")
     await self.refresh_pages(new_total=new_total)
 ```
+
+`refresh_pages()` fetches the page on screen again and re-renders it at
+once; other pages are fetched as they are visited. It waits for a
+`reload()` already fetching rather than rendering beside it (see
+[Navigating database-backed views](views.md#navigating-database-backed-views)).
 
 Do not name these `reload`. `reload()` is the library's own seam
 (`on_load()` then `refresh()`), it takes no positional argument, and it is

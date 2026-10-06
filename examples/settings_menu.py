@@ -16,6 +16,9 @@ features in a single, cohesive example:
     - ``with_confirmation`` wrapper on the Reset All danger button
     - Exit button         (clean teardown with component removal)
 
+Commands:
+    /settings   Open the server settings panel
+
 Usage:
     Load this cog in your bot, then run ``/settings`` in any server.
     Invoking ``/settings`` a second time while the first panel is still
@@ -143,9 +146,8 @@ class SettingsHubView(MenuView):
     auto_exit_button = False
 
     def __init__(self, *args, **kwargs):
-        # Each category dict wires a push callback automatically.
-        # ``rebuild=lambda v: {"embed": v.build_embed()}`` is the default
-        # for V1 and does not need to be specified explicitly.
+        # Each category dict wires a push callback automatically. Every page
+        # names its own nav_rebuild, which the push renders it with.
         categories = [
             {
                 "label": "Appearance",
@@ -262,7 +264,8 @@ class SettingsHubView(MenuView):
         #
         # ``self.batch()`` groups multiple dispatches into a single subscriber
         # notification -- reducers still run for each action, but subscribers
-        # are only notified once at the end. Six dispatches, one rebuild.
+        # are only notified once at the end. One dispatch per setting, one
+        # rebuild.
         async with self.batch():
             for key, value in DEFAULT_SETTINGS.items():
                 await self.dispatch_scoped_as("SETTINGS_UPDATED", {key: value}, scope="user")
@@ -287,6 +290,8 @@ class AppearanceView(StatefulView):
     auto_defer = True
     state_scope = "user"
     exit_policy = "disable"
+    # The hub gives the panel 10 minutes; a page opened from it gets the same.
+    timeout = 600.0
     subscribed_actions = {"SETTINGS_UPDATED"}
     # The menu pushes here without its own rebuild=, so this names the edit.
     # Routing it through build_ui is what marks the saved theme on the select
@@ -312,15 +317,8 @@ class AppearanceView(StatefulView):
             callback=self.on_theme_select,
         )
         self.add_item(self._theme_select)
-        self.add_item(
-            StatefulButton(
-                label="Back",
-                style=discord.ButtonStyle.secondary,
-                emoji="\N{LEFTWARDS ARROW WITH HOOK}",
-                row=1,
-                callback=self.go_back,
-            )
-        )
+        # Back pops to the hub, which names its own nav_rebuild.
+        self.add_item(self.make_back_button(row=1))
 
     def get_theme(self):
         """Per-user theme from scoped state, same idiom as the hub."""
@@ -357,9 +355,6 @@ class AppearanceView(StatefulView):
         # auto_defer handles acknowledgment.
         await self.dispatch_scoped_as("SETTINGS_UPDATED", {"theme": values[0]}, scope="user")
 
-    async def go_back(self, interaction):
-        await self.pop(interaction, rebuild=lambda v: {"embed": v.build_embed()})
-
 
 # // ========================================( Notifications )======================================== // #
 
@@ -369,7 +364,6 @@ class NotificationsView(StatefulView):
 
     Features demonstrated:
         - Undo/redo (revert notification toggles)
-        - Batched dispatch (multiple toggles in one state update)
         - Toggle buttons that reflect current state
     """
 
@@ -377,13 +371,17 @@ class NotificationsView(StatefulView):
     auto_defer = True
     state_scope = "user"
     exit_policy = "disable"
+    timeout = 600.0
     enable_undo = True
     undo_limit = 10
-    subscribed_actions = {"SETTINGS_UPDATED", "UNDO", "REDO"}
+    # Undo and Redo re-render every view whose selection changed, so they
+    # need no entry here.
+    subscribed_actions = {"SETTINGS_UPDATED"}
+    # A push or pop into this page renders it through build_ui, like its
+    # siblings; without it a redraw after a stalled edit carries no embed.
+    nav_rebuild = staticmethod(lambda v: v.build_ui())
 
-    # Declarative toggle list -- mirrors V2NotificationsView's _TOGGLES so
-    # both variants of the example read the same way. Each entry is a
-    # (setting_key, button_label) pair.
+    # Declarative toggle list: each entry is a (setting_key, button_label) pair.
     _TOGGLES = [
         ("notifications_dm", "DMs"),
         ("notifications_mentions", "Mentions"),
@@ -400,8 +398,6 @@ class NotificationsView(StatefulView):
         Captures ``key`` in a closure so a single definition can produce
         distinct callbacks per toggle -- otherwise a plain ``for`` loop
         over ``_TOGGLES`` would alias every callback to the last key.
-        Mirrors the V2 factories in ``v2_settings.py`` so the three
-        settings views read the same way.
         """
 
         async def toggle(interaction):
@@ -448,15 +444,7 @@ class NotificationsView(StatefulView):
                 callback=self.do_redo,
             )
         )
-        self.add_item(
-            StatefulButton(
-                label="Back",
-                style=discord.ButtonStyle.secondary,
-                emoji="\N{BLACK LEFT-POINTING TRIANGLE}",
-                row=1,
-                callback=self.go_back,
-            )
-        )
+        self.add_item(self.make_back_button(row=1))
 
     def get_theme(self):
         """Per-user theme from scoped state, same idiom as the hub."""
@@ -476,7 +464,7 @@ class NotificationsView(StatefulView):
                 f"Mentions: {_bool_icon(s['notifications_mentions'])}  "
                 f"Events: {_bool_icon(s['notifications_events'])}\n\n"
                 "Toggle each notification type. Use **Undo/Redo** to\n"
-                "revert changes -- the state snapshots are per-view."
+                "revert the changes made on this page."
             ),
         )
         theme.apply_to_embed(embed)
@@ -490,9 +478,6 @@ class NotificationsView(StatefulView):
 
     async def do_redo(self, interaction):
         await self.redo()
-
-    async def go_back(self, interaction):
-        await self.pop(interaction, rebuild=lambda v: {"embed": v.build_embed()})
 
     def state_selector(self, state):
         settings = StateStore.get_scoped_from(state, "user", user_id=self.user_id).get(
@@ -518,7 +503,6 @@ class LocaleView(StatefulView):
 
     Features demonstrated:
         - Multiple select menus on one view
-        - Batched dispatch (language + timezone in one update)
         - Push/pop navigation
     """
 
@@ -526,6 +510,7 @@ class LocaleView(StatefulView):
     auto_defer = True
     state_scope = "user"
     exit_policy = "disable"
+    timeout = 600.0
     subscribed_actions = {"SETTINGS_UPDATED"}
     # Same reason as AppearanceView: build_ui marks the saved language and
     # timezone on their selects, and an embed-only rebuild would leave both
@@ -560,15 +545,7 @@ class LocaleView(StatefulView):
         )
         self.add_item(self._language_select)
         self.add_item(self._timezone_select)
-        self.add_item(
-            StatefulButton(
-                label="Back",
-                style=discord.ButtonStyle.secondary,
-                emoji="\N{LEFTWARDS ARROW WITH HOOK}",
-                row=2,
-                callback=self.go_back,
-            )
-        )
+        self.add_item(self.make_back_button(row=2))
 
     def get_theme(self):
         """Per-user theme from scoped state, same idiom as the hub."""
@@ -583,8 +560,8 @@ class LocaleView(StatefulView):
             description=(
                 f"Language: **{s['language']}**\n"
                 f"Timezone: **{s['timezone']}**\n\n"
-                "Changes are saved to your user-scoped state and\n"
-                "update the hub live via dispatch."
+                "Changes are saved to your user-scoped state, so your\n"
+                "settings panels in other servers update too."
             ),
         )
         theme.apply_to_embed(embed)
@@ -609,9 +586,6 @@ class LocaleView(StatefulView):
     async def on_timezone(self, interaction, values):
         await self.dispatch_scoped_as("SETTINGS_UPDATED", {"timezone": values[0]}, scope="user")
 
-    async def go_back(self, interaction):
-        await self.pop(interaction, rebuild=lambda v: {"embed": v.build_embed()})
-
 
 # // ========================================( Cog )======================================== // #
 
@@ -633,8 +607,9 @@ class SettingsMenuExample(commands.Cog, name="settings_menu_example"):
         # Flipping it to "reject" routes rejection through on_instance_limit,
         # which sends an ephemeral default message without a try/except.
         view = SettingsHubView(context=context)
-        # send() returns None when blocked by instance limiting. No-op here
-        # under replace policy, but the guard is the canonical pattern.
+        # send() returns None when no live panel came of it: a rejection, or
+        # a close during the send, such as a second /settings replacing this
+        # one while Discord is slow.
         if await view.send() is None:
             return
 

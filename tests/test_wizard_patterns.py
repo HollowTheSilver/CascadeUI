@@ -1,13 +1,16 @@
 """Tests for WizardView / WizardLayoutView customization and parity."""
 
+import asyncio
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import aiohttp
 import discord
 import pytest
-from discord.ui import Container, TextDisplay
+from discord.ui import ActionRow, Container, TextDisplay
 from helpers import make_interaction as _make_interaction
 
+from cascadeui.components.base import StatefulButton
 from cascadeui.views.patterns import WizardLayoutView, WizardView
 from cascadeui.views.patterns.types import WizardStep
 
@@ -220,7 +223,324 @@ class TestWizardLayoutViewButtonIdentity:
         assert id(view._nav_row) == nav_row_id
 
 
+class TestWizardNavClicksAreBoundToTheirStep:
+    """A Back or Next click acts only on the step it was drawn for.
+
+    A client sends the custom_id it rendered, and a second click queued
+    behind the first reached the same button after the first had moved the
+    wizard on, so a double-click on Next skipped a step and its validator.
+    """
+
+    def _wizard(self, cls=WizardLayoutView, validator=None):
+        async def builder():
+            return [Container(TextDisplay("s"))]
+
+        steps = [{"name": f"S{i}", "builder": builder} for i in range(3)]
+        if validator is not None:
+            steps[0]["validator"] = validator
+        view = cls(interaction=_make_interaction(), steps=steps)
+
+        async def render(**kwargs):
+            view._sync_wizard_nav()
+
+        view._refresh_wizard = render
+        return view
+
+    def _click(self, button):
+        interaction = _make_interaction()
+        interaction.data = {"custom_id": button.custom_id}
+        return interaction
+
+    @pytest.mark.parametrize("cls", [WizardLayoutView, WizardView])
+    async def test_a_second_next_queued_behind_the_first_is_ignored(self, cls):
+        view = self._wizard(cls)
+        first, second = self._click(view._next_btn), self._click(view._next_btn)
+
+        await view._next_btn.original_callback(first)
+        await view._next_btn.original_callback(second)
+
+        assert view.current_step == 1
+        await view._next_btn.original_callback(self._click(view._next_btn))
+        assert view.current_step == 2
+
+    async def test_a_second_back_queued_behind_the_first_is_ignored(self):
+        view = self._wizard()
+        view._current_step = 2
+        view._sync_wizard_nav()
+        first, second = self._click(view._back_btn), self._click(view._back_btn)
+
+        await view._back_btn.original_callback(first)
+        await view._back_btn.original_callback(second)
+
+        assert view.current_step == 1
+
+    async def test_the_validator_runs_once_for_a_double_click(self):
+        calls = []
+
+        def validator():
+            calls.append(1)
+            return True
+
+        view = self._wizard(validator=validator)
+        first, second = self._click(view._next_btn), self._click(view._next_btn)
+
+        await view._next_btn.original_callback(first)
+        await view._next_btn.original_callback(second)
+
+        assert calls == [1]
+
+    async def test_go_next_called_from_another_button_still_advances(self):
+        view = self._wizard()
+        interaction = _make_interaction()
+        interaction.data = {"custom_id": "continue"}
+
+        await view._go_next(interaction)
+
+        assert view.current_step == 1
+
+
 # // ========================================( Navigation hooks )======================================== // #
+
+
+class TestWizardDoubleFinish:
+    """A second Finish from one double-click does not run ``on_finish`` again.
+
+    The step-stamped ids cannot catch it: both clicks come from the last
+    step, so they carry the same id. An ``on_finish`` that leaves the view
+    open (a refusal, or a result shown in place) ran once per click.
+    """
+
+    def _wizard(self, cls, *, serialize=True, validator=None):
+        calls = []
+
+        class _Wizard(cls):
+            serialize_interactions = serialize
+
+            async def on_finish(self, interaction):
+                calls.append(interaction)
+                # Stays open, and yields so a second click can arrive while
+                # this one is still being handled.
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+
+        async def builder():
+            return [Container(TextDisplay("s"))]
+
+        step = {"name": "Only", "builder": builder}
+        if validator is not None:
+            step["validator"] = validator
+        view = _Wizard(interaction=_make_interaction(), steps=[step])
+
+        async def render(**kwargs):
+            view._sync_wizard_nav()
+
+        view._refresh_wizard = render
+        return view, calls
+
+    @pytest.mark.parametrize("cls", [WizardLayoutView, WizardView])
+    async def test_a_double_click_runs_on_finish_once(self, cls, caplog):
+        caplog.set_level(logging.DEBUG, logger="cascadeui")
+        view, calls = self._wizard(cls)
+        finish = view._next_btn
+
+        await asyncio.gather(
+            view._scheduled_task(finish, _make_interaction()),
+            view._scheduled_task(finish, _make_interaction()),
+        )
+
+        assert len(calls) == 1
+        assert any(
+            "Dropped a click" in r.getMessage() and "a second Finish" in r.getMessage()
+            for r in caplog.records
+            if r.name.startswith("cascadeui")
+        )
+
+    async def test_the_dropped_finish_is_answered_without_auto_defer(self):
+        # No callback of the user's ran for it, so nothing else could answer it.
+        view, calls = self._wizard(WizardLayoutView)
+        view.auto_defer = False
+        first, second = _make_interaction(), _make_interaction()
+
+        await asyncio.gather(
+            view._scheduled_task(view._next_btn, first),
+            view._scheduled_task(view._next_btn, second),
+        )
+
+        assert len(calls) == 1
+        second.response.defer.assert_awaited()
+
+    async def test_a_click_sent_after_the_result_runs_again(self):
+        view, calls = self._wizard(WizardLayoutView)
+        finish = view._next_btn
+        await view._scheduled_task(finish, _make_interaction())
+
+        await view._scheduled_task(finish, _make_interaction())
+
+        assert len(calls) == 2
+
+    async def test_a_finish_called_from_code_after_a_click_still_runs(self):
+        """The click's number ends with the click, so later code is not taken
+        for part of it."""
+        view, calls = self._wizard(WizardLayoutView)
+        await view._scheduled_task(view._next_btn, _make_interaction())
+
+        await view._go_next(_make_interaction())
+
+        assert len(calls) == 2
+
+    async def test_a_next_that_finishes_runs_on_finish_once_for_a_double_click(self):
+        """A Next whose validator hid every later step finished the wizard
+        without the Finish hold, so the double-click's second click, now a
+        Finish, ran on_finish again."""
+        skipped = {}
+        calls = []
+
+        async def choose_express():
+            await asyncio.sleep(0)
+            skipped["details"] = True
+            return True, None
+
+        class _Wizard(WizardLayoutView):
+            async def on_finish(self, interaction):
+                calls.append(interaction)
+                await asyncio.sleep(0)
+
+        async def builder():
+            return [Container(TextDisplay("s"))]
+
+        view = _Wizard(
+            interaction=_make_interaction(),
+            steps=[
+                {"name": "Plan", "builder": builder, "validator": choose_express},
+                {"name": "Details", "builder": builder, "condition": lambda v: not skipped},
+            ],
+        )
+
+        async def render(**kwargs):
+            view._sync_wizard_nav()
+
+        view._refresh_wizard = render
+        next_button = view._next_btn
+
+        await asyncio.gather(
+            view._scheduled_task(next_button, _make_interaction()),
+            view._scheduled_task(next_button, _make_interaction()),
+        )
+
+        assert len(calls) == 1
+
+    async def test_unserialized_clicks_run_on_finish_once(self):
+        """Without the lock the two run side by side instead of queueing."""
+        view, calls = self._wizard(WizardLayoutView, serialize=False)
+        finish = view._next_btn
+
+        await asyncio.gather(
+            view._scheduled_task(finish, _make_interaction()),
+            view._scheduled_task(finish, _make_interaction()),
+        )
+
+        assert len(calls) == 1
+
+    async def test_unserialized_clicks_with_an_async_validator_run_on_finish_once(self):
+        """The mark was taken after the validator's await, so a second
+        Finish arriving while it ran passed the guard."""
+
+        async def slow_valid():
+            await asyncio.sleep(0)
+            return True, None
+
+        view, calls = self._wizard(WizardLayoutView, serialize=False, validator=slow_valid)
+        finish = view._next_btn
+
+        await asyncio.gather(
+            view._scheduled_task(finish, _make_interaction()),
+            view._scheduled_task(finish, _make_interaction()),
+        )
+
+        assert len(calls) == 1
+
+    async def test_a_finish_queued_after_a_fixing_click_runs(self):
+        """A refused Finish is not a result the next one repeats: a class was
+        picked while the first check ran, and the Finish after it was dropped
+        as a double-click."""
+        chosen = {}
+
+        async def needs_a_class():
+            await asyncio.sleep(0)
+            return (True, None) if chosen else (False, "Pick a class.")
+
+        view, calls = self._wizard(WizardLayoutView, validator=needs_a_class)
+
+        async def pick(interaction):
+            chosen["class"] = "Warrior"
+
+        picker = StatefulButton(label="Warrior", callback=pick)
+        view.add_item(ActionRow(picker))
+        finish = view._next_btn
+
+        await asyncio.gather(
+            view._scheduled_task(finish, _make_interaction()),
+            view._scheduled_task(picker, _make_interaction()),
+            view._scheduled_task(finish, _make_interaction()),
+        )
+
+        assert len(calls) == 1
+
+    async def test_a_finish_after_a_failed_validation_runs(self):
+        answers = [(False, "Pick a class."), (True, None)]
+
+        async def validator():
+            return answers.pop(0)
+
+        view, calls = self._wizard(WizardLayoutView, validator=validator)
+        finish = view._next_btn
+        await view._scheduled_task(finish, _make_interaction())
+
+        await view._scheduled_task(finish, _make_interaction())
+
+        assert len(calls) == 1
+
+    async def test_a_double_click_of_a_refused_finish_reports_the_error_once(self):
+        async def needs_a_class():
+            await asyncio.sleep(0)
+            return False, "Pick a class."
+
+        view, _ = self._wizard(WizardLayoutView, validator=needs_a_class)
+        reported = []
+
+        async def on_validation_failed(step_index, error, interaction=None):
+            reported.append(error)
+
+        view.on_validation_failed = on_validation_failed
+        finish = view._next_btn
+
+        await asyncio.gather(
+            view._scheduled_task(finish, _make_interaction()),
+            view._scheduled_task(finish, _make_interaction()),
+        )
+
+        assert reported == ["Pick a class."]
+
+    async def test_a_refused_call_from_code_beside_a_click_leaves_finish_working(self):
+        """Each put back the mark it found, and the call from code found the
+        click's hold: every Finish after that was dropped for good."""
+        chosen = {}
+
+        async def needs_a_class():
+            await asyncio.sleep(0.01)
+            return (True, None) if chosen else (False, "Pick a class.")
+
+        view, calls = self._wizard(WizardLayoutView, validator=needs_a_class)
+        view.on_validation_failed = AsyncMock()
+        clicked = asyncio.create_task(view._scheduled_task(view._next_btn, _make_interaction()))
+        await asyncio.sleep(0)
+        from_code = asyncio.create_task(view._go_next(_make_interaction()))
+        await asyncio.gather(clicked, from_code)
+        chosen["class"] = "Warrior"
+
+        await view._scheduled_task(view._next_btn, _make_interaction())
+
+        assert len(calls) == 1
 
 
 class TestWizardNavigationHooks:
@@ -930,6 +1250,124 @@ class TestWizardRefreshContent:
         embed = view.refresh.call_args.kwargs.get("embed")
         assert embed is not None
 
+    async def test_a_step_render_waits_for_a_reload_already_rebuilding(self):
+        """Both clear and refill the tree around an awaited step builder, so
+        running side by side they shipped the nav row twice."""
+        builds = {"n": 0}
+
+        async def step_one():
+            builds["n"] += 1
+            await asyncio.sleep(0.05 if builds["n"] == 2 else 0.01)
+            return TextDisplay(f"one {builds['n']}")
+
+        async def step_two():
+            return TextDisplay("two")
+
+        view = WizardLayoutView(
+            interaction=_make_interaction(),
+            steps=[{"name": "One", "builder": step_one}, {"name": "Two", "builder": step_two}],
+        )
+        await view.on_load()
+        message = MagicMock(id=1)
+        message.edit = AsyncMock(return_value=message)
+        view._message = message
+
+        reloading = asyncio.create_task(view.reload())
+        await asyncio.sleep(0)
+        rendering = asyncio.create_task(view.refresh_content())
+        await asyncio.wait_for(asyncio.gather(reloading, rendering), timeout=3)
+
+        ids = [c.custom_id for c in view.walk_children() if getattr(c, "custom_id", None)]
+        assert len(ids) == len(set(ids))
+        assert sum(isinstance(c, TextDisplay) for c in view.children) == 1
+
+    async def test_a_step_render_leaves_an_armed_view_on_its_refresh_button(self):
+        """A background update that re-rendered the current step rebuilt the
+        tree over the refresh button, and an armed view drops every
+        notification that could put it back."""
+
+        async def step():
+            return TextDisplay("content")
+
+        class Wizard(WizardLayoutView):
+            auto_refresh_ephemeral = True
+
+        view = Wizard(
+            interaction=_make_interaction(),
+            steps=[{"name": "One", "builder": step}, {"name": "Two", "builder": step}],
+            timeout=None,
+        )
+        await view.send(ephemeral=True)
+        await view._arm_refresh_button()
+        armed_tree = [c.label for c in view.walk_children() if isinstance(c, discord.ui.Button)]
+
+        await view.refresh_content()
+
+        assert [c.label for c in view.walk_children() if isinstance(c, discord.ui.Button)] == (
+            armed_tree
+        )
+
+    async def test_explicit_embeds_are_sent_in_place_of_the_current_step(self):
+        """The current step's embed was added beside them, and discord.py
+        refuses ``embed`` and ``embeds`` together."""
+
+        async def step_one():
+            return discord.Embed(title="step")
+
+        interaction = _make_interaction()
+        view = WizardView(interaction=interaction, steps=[{"name": "One", "builder": step_one}])
+        mine = [discord.Embed(title="mine")]
+
+        await view.send(embeds=mine)
+
+        sent = interaction.response.send_message.call_args.kwargs
+        assert sent["embeds"] is mine
+        assert "embed" not in sent
+
+    @pytest.mark.parametrize(
+        "cls, content",
+        [
+            (WizardView, lambda text: discord.Embed(title=text)),
+            (WizardLayoutView, TextDisplay),
+        ],
+        ids=["v1", "v2"],
+    )
+    async def test_step_renders_that_outlive_an_exit_leave_the_frozen_panel_alone(
+        self, cls, content
+    ):
+        """A render whose builder was running when exit() froze the panel, and
+        one queued behind it, both shipped live controls onto it afterwards."""
+        gate = asyncio.Event()
+        builds = {"n": 0}
+
+        async def step_one():
+            builds["n"] += 1
+            if builds["n"] > 1:
+                await gate.wait()
+            return content(f"one {builds['n']}")
+
+        async def step_two():
+            return content("two")
+
+        view = cls(
+            interaction=_make_interaction(),
+            steps=[{"name": "One", "builder": step_one}, {"name": "Two", "builder": step_two}],
+        )
+        await view.send()
+        message = view._message
+        in_flight = asyncio.create_task(view.refresh_content())
+        await asyncio.sleep(0)
+        queued = asyncio.create_task(view.refresh_content())
+        await asyncio.sleep(0)
+        await view.exit()
+        edits = message.edit.await_count
+
+        gate.set()
+        await asyncio.wait_for(asyncio.gather(in_flight, queued), timeout=2)
+
+        assert message.edit.await_count == edits
+        assert builds["n"] == 2  # the queued render never built on the dead view
+
 
 class TestStepCursorRewindsWhenTheEditNeverLanded:
     """The step advances before the repaint, so a dropped edit desyncs them.
@@ -983,6 +1421,65 @@ class TestStepCursorRewindsWhenTheEditNeverLanded:
         message.edit = AsyncMock()
         await view._go_next(_make_interaction())
         assert view._current_step == 1, "the recovery press advances one step, not two"
+
+    @pytest.mark.parametrize(
+        "cls,steps",
+        [
+            (
+                WizardLayoutView,
+                [
+                    {"name": "a", "builder": lambda: [TextDisplay("a")]},
+                    {"name": "b", "builder": lambda: [TextDisplay("b")]},
+                    {"name": "c", "builder": lambda: [TextDisplay("c")]},
+                ],
+            ),
+            (
+                WizardView,
+                [
+                    {"name": "a", "builder": lambda: discord.Embed(title="a")},
+                    {"name": "b", "builder": lambda: discord.Embed(title="b")},
+                ],
+            ),
+        ],
+        ids=["v2", "v1"],
+    )
+    async def test_a_refused_next_does_not_skip_a_step(self, cls, steps):
+        view = cls(steps=steps)
+        message = self._wire(view)
+
+        message.edit = AsyncMock(
+            side_effect=discord.HTTPException(
+                MagicMock(status=400, reason="Bad Request"), "Invalid Form Body"
+            )
+        )
+        with pytest.raises(discord.HTTPException):
+            await view._go_next(_make_interaction())
+        assert view._current_step == 0, "the cursor must stay on the step still shown"
+        assert view._back_btn.disabled, "the nav row must describe the first step again"
+
+        message.edit = AsyncMock()
+        await view._go_next(_make_interaction())
+        assert view._current_step == 1, "the recovery press advances one step, not two"
+
+    async def test_a_step_whose_builder_raises_leaves_the_cursor(self):
+        def broken():
+            raise RuntimeError("database unavailable")
+
+        view = WizardLayoutView(
+            steps=[
+                {"name": "a", "builder": lambda: [TextDisplay("a")]},
+                {"name": "b", "builder": broken},
+            ]
+        )
+        message = self._wire(view)
+
+        with pytest.raises(RuntimeError, match="database unavailable"):
+            await view._go_next(_make_interaction())
+
+        assert view._current_step == 0
+        message.edit.assert_not_awaited()
+        shown = [c.content for c in view.walk_children() if isinstance(c, TextDisplay)]
+        assert "a" in shown
 
 
 # // ========================================( Indicator Label Shape )======================================== // #

@@ -87,9 +87,9 @@ class TestBackButtonSurvivesRebuild:
         assert back_row in list(view.children)
 
     async def test_tab_layout_view_send(self):
-        """send() recomposes the tree (it builds the first tab's content),
-        so -- like _refresh_tabs -- it must restore the back button when a
-        pushed tab view uses send() as its rebuild target."""
+        """send() recomposes the tree through on_load() (it builds the first
+        tab's content), the seam a push's edit also runs, so, like
+        _refresh_tabs, it must restore the back button."""
 
         async def build_a():
             return TextDisplay("Tab A content")

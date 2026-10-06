@@ -3,6 +3,7 @@
 
 import inspect
 import logging
+import math
 from typing import Any, Callable, ClassVar, Dict, List, Optional
 
 import discord
@@ -74,6 +75,10 @@ class _BaseWizardMixin:
     # Callable(current, total) -> str. When None, defaults to "Step {n}/{total}".
     step_indicator_label: ClassVar[Optional[Callable[[int, int], str]]] = None
 
+    # _clicks_received when the last Finish settled, and how many are running.
+    _finish_mark: int = 0
+    _finishing: int = 0
+
     # V2-only: render a progress bar above the current step's content.
     # Hidden automatically when only one visible step exists (no progress
     # to show). Override ``_build_progress_header`` to customize the
@@ -98,9 +103,13 @@ class _BaseWizardMixin:
         "next_button_emoji",
         "finish_button_emoji",
     )
+    # Adds the library's Exit button, kept through every re-render.
+    auto_exit_button: ClassVar[bool] = False
+
     _BOOL_ATTRS: ClassVar[tuple] = (
         *_StatefulMixin._BOOL_ATTRS,
         "show_progress_bar",
+        "auto_exit_button",
     )
 
     @classmethod
@@ -143,6 +152,13 @@ class _BaseWizardMixin:
         step's builder runs. Default is a no-op. Override to reset
         per-step state, log analytics, or refresh external data.
 
+        It reports the step the user asked for. When the step's render
+        does not land (its edit never reaches Discord, or the builder
+        raises) the wizard stays on the step it showed, and neither this
+        hook nor :meth:`on_step_exited` is called again. Data prepared here
+        for the builder is best keyed by step, so a step that never
+        rendered leaves nothing behind for the one still on screen.
+
         Fire-and-forget: exceptions raised by an override are logged
         and swallowed so navigation always completes. Errors that must
         block the user belong in a ``validator`` on the step definition
@@ -156,7 +172,8 @@ class _BaseWizardMixin:
         Fires on forward (Next) and backward (Back) navigation while
         ``self._current_step`` still points at the step being left.
         Default is a no-op. Override to commit per-step values, confirm
-        discards, or log analytics.
+        discards, or log analytics. See :meth:`on_step_entered` for a step
+        change whose render does not land.
 
         Fire-and-forget: exceptions raised by an override are logged
         and swallowed so navigation always completes.
@@ -201,23 +218,21 @@ class _BaseWizardMixin:
         variables. An exception inside the predicate is logged and the
         step is treated as visible (conservative fallback -- the user is
         more likely to want the step shown than silently skipped).
+
+        The predicate must answer synchronously. An ``async def``
+        predicate, or one whose ``__call__`` is async, is refused when the
+        step is declared. A plain callable that returns an awaitable or an
+        async generator is logged as a warning here and the step is shown,
+        since either result is truthy and would otherwise show the step
+        with nothing reported.
         """
         condition = step.get("condition")
         if condition is None:
             return True
         try:
             answer = condition(self)
-            # An awaitable answer is not an answer. ``WizardStep`` rejects a
-            # coroutine function at construction, but a step declared as a raw
-            # dict never passes through it, and neither path catches an object
-            # whose ``__call__`` is async. Every coroutine is truthy, so
-            # without this the step renders regardless of what the predicate
-            # would have decided, and nothing anywhere reports it.
-            # An async generator is the third shape and the quietest: it is
-            # not awaitable, so the check below misses it, and it is truthy,
-            # so the step shows. A stray ``yield`` in an ``async def``
-            # predicate is all it takes. It cannot be closed from here
-            # (``aclose`` is itself a coroutine), so it is only reported.
+            # An async generator is not awaitable, so it needs its own check,
+            # and it cannot be closed here (aclose is a coroutine).
             if inspect.isasyncgen(answer):
                 logger.warning(
                     f"Step condition in {type(self).__name__} is an async "
@@ -283,6 +298,11 @@ class _BaseWizardMixin:
         that agree with the content beside them.
         """
         self._back_btn.disabled = self._prev_visible_index(self._current_step) is None
+        self._back_btn.custom_id = self._nav_id("back")
+        self._back_btn.label = self.back_button_label or "Back"
+        self._back_btn.emoji = self.back_button_emoji
+        self._back_btn.style = self.back_button_style
+        self._next_btn.custom_id = self._nav_id("next")
         self._step_indicator.label = self._resolve_step_label()
 
         is_last = self._next_visible_index(self._current_step) is None
@@ -334,6 +354,28 @@ class _BaseWizardMixin:
 
     # // ----( Navigation callbacks )---- // #
 
+    def _nav_id(self, name: str) -> str:
+        """The custom_id of a nav button drawn for the current step."""
+        return f"wizard_{name}:{self._current_step}"
+
+    def _drawn_for_this_step(self, interaction: Interaction, button) -> bool:
+        """Whether a nav click came from the step on screen now.
+
+        A client sends the id it rendered, so a second click queued behind
+        the first names the step the first click left; acting on it would
+        skip a step the user never saw, and its validator with it.
+        """
+        clicked = (interaction.data or {}).get("custom_id")
+        return not isinstance(clicked, str) or clicked == button.custom_id
+
+    async def _back_clicked(self, interaction: Interaction):
+        if self._drawn_for_this_step(interaction, self._back_btn):
+            await self._go_back(interaction)
+
+    async def _next_clicked(self, interaction: Interaction):
+        if self._drawn_for_this_step(interaction, self._next_btn):
+            await self._go_next(interaction)
+
     async def _go_back(self, interaction: Interaction):
         prev = self._prev_visible_index(self._current_step)
         if prev is not None:
@@ -345,33 +387,60 @@ class _BaseWizardMixin:
             await self._refresh_wizard(previous_step=previous)
 
     async def _go_next(self, interaction: Interaction):
-        step = self._steps[self._current_step] if self._steps else None
-        if step and "validator" in step:
-            valid, error = _normalize_validation(
-                await await_maybe(step["validator"]()),
-                type(self).__name__,
-                self._current_step,
-            )
-            if not valid:
-                await self._call_hook_safe(
-                    self.on_validation_failed,
-                    self._current_step,
-                    error,
-                    interaction,
+        held = self._next_visible_index(self._current_step) is None
+        if held:
+            if not self._arrived_after(math.inf if self._finishing else self._finish_mark):
+                # Sent while a Finish runs, or before the last one settled: the
+                # second Finish of one double-click, which would run
+                # on_finish() again.
+                self._log_dropped_click(
+                    (interaction.data or {}).get("custom_id"), "a second Finish"
                 )
                 return
+            # Counted before the validator's first await, so a Finish arriving
+            # while it runs is refused too.
+            self._finishing += 1
+        refused = False
+        try:
+            step = self._steps[self._current_step] if self._steps else None
+            if step and "validator" in step:
+                valid, error = _normalize_validation(
+                    await await_maybe(step["validator"]()),
+                    type(self).__name__,
+                    self._current_step,
+                )
+                if not valid:
+                    refused = True
+                    await self._call_hook_safe(
+                        self.on_validation_failed,
+                        self._current_step,
+                        error,
+                        interaction,
+                    )
+                    return
 
-        next_visible = self._next_visible_index(self._current_step)
-        if next_visible is None:
-            await await_maybe(self.on_finish(interaction))
-            return
+            next_visible = self._next_visible_index(self._current_step)
+            if next_visible is None:
+                if not held:
+                    held = True
+                    self._finishing += 1
+                await await_maybe(self.on_finish(interaction))
+                return
 
-        old_index = self._current_step
-        await self._call_hook_safe(self.on_step_exited, old_index)
-        previous = self._current_step
-        self._current_step = next_visible
-        await self._call_hook_safe(self.on_step_entered, self._current_step)
-        await self._refresh_wizard(previous_step=previous)
+            old_index = self._current_step
+            await self._call_hook_safe(self.on_step_exited, old_index)
+            previous = self._current_step
+            self._current_step = next_visible
+            await self._call_hook_safe(self.on_step_entered, self._current_step)
+            await self._refresh_wizard(previous_step=previous)
+        finally:
+            if held:
+                self._finishing -= 1
+                self._finish_mark = (
+                    self._mark_after_refusal(self._finish_mark)
+                    if refused
+                    else self._clicks_received
+                )
 
     # // ----( Properties )---- // #
 
@@ -392,6 +461,43 @@ class _BaseWizardMixin:
         re-fetch) before re-rendering.
         """
         await self._refresh_wizard()
+
+    async def _refresh_wizard(self, *, previous_step: Optional[int] = None):
+        """Render the current step under the view's reload turn.
+
+        A step builder is awaited while the view's content is being rebuilt,
+        so a reload running at the same time would interleave its own
+        rebuild and ship duplicated components.
+        """
+        async with self._within_reload_turn("a wizard render"):
+            declined = self._declined_render()
+            if declined is not None:
+                return declined
+            try:
+                return await self._render_wizard(previous_step=previous_step)
+            except Exception:
+                await self._rewind_step(previous_step, raised=True)
+                raise
+
+    async def _rewind_step(self, previous: Optional[int], *, raised: bool = False) -> None:
+        """Put the step back when a step change's edit did not land.
+
+        Covers a dropped edit and a render that raised (``raised``): the
+        screen still shows the previous step, so the cursor returns to it and
+        the tree is matched to it. No second edit is sent.
+        """
+        if not self._edit_never_landed(previous, self._current_step, cursor="Step", raised=raised):
+            return
+        self._current_step = previous
+        await self._match_step_tree()
+
+    async def _match_step_tree(self) -> None:
+        """Re-derive the tree for the current step after a rewind.
+
+        Nav state is the only tree-resident step artifact in V1 (the body
+        rides the embed kwarg).
+        """
+        self._sync_wizard_nav()
 
 
 # // ========================================( V1: WizardView )======================================== // #
@@ -444,6 +550,8 @@ class WizardView(_BaseWizardMixin, StatefulView):
         self._current_step: int = 0
 
         self._build_nav_buttons()
+        if self.auto_exit_button:
+            self._add_auto_exit_button("wizard_exit", row=4)
 
     def _build_nav_buttons(self):
         """Create back, step-indicator, and next buttons once at init.
@@ -456,10 +564,10 @@ class WizardView(_BaseWizardMixin, StatefulView):
             label=self.back_button_label or "Back",
             emoji=self.back_button_emoji,
             style=self.back_button_style,
-            custom_id="wizard_back",
+            custom_id=self._nav_id("back"),
             row=4,
             disabled=self._prev_visible_index(self._current_step) is None,
-            callback=self._go_back,
+            callback=self._back_clicked,
         )
         self.add_item(self._back_btn)
 
@@ -477,16 +585,16 @@ class WizardView(_BaseWizardMixin, StatefulView):
             label=self._resolve_next_label(is_last),
             emoji=self.finish_button_emoji if is_last else self.next_button_emoji,
             style=self.finish_button_style if is_last else self.next_button_style,
-            custom_id="wizard_next",
+            custom_id=self._nav_id("next"),
             row=4,
-            callback=self._go_next,
+            callback=self._next_clicked,
         )
         self.add_item(self._next_btn)
 
     async def _reload_render(self) -> Optional[RenderOutcome]:
         return await self._refresh_wizard()
 
-    async def _refresh_wizard(
+    async def _render_wizard(
         self, *, previous_step: Optional[int] = None
     ) -> Optional[RenderOutcome]:
         """Update navigation state and rebuild current step content.
@@ -500,40 +608,41 @@ class WizardView(_BaseWizardMixin, StatefulView):
         keeps the previous step. ``refresh`` short-circuits on its render
         hash, so a genuinely unchanged tree costs nothing.
         """
-        self._sync_wizard_nav()
+        self._match_controls()
 
         kwargs = await self._nav_edit_kwargs()
+        declined = self._declined_render()
+        if declined is not None:
+            # The view changed while this awaited: torn down, or armed.
+            return declined
         outcome = await self.refresh(**kwargs)
-        if self._edit_never_landed(previous_step, self._current_step, cursor="Step"):
-            # Nav state is the only tree-resident step artifact in V1 (the body
-            # rides the embed kwarg), so re-deriving it is the whole rollback.
-            # No second edit: the connection is still down.
-            self._current_step = previous_step
-            self._sync_wizard_nav()
+        await self._rewind_step(previous_step)
         return outcome
 
-    async def send(
-        self,
-        content: Optional[str] = None,
-        *,
-        embed: Optional[discord.Embed] = None,
-        **kwargs,
-    ):
-        """Send the view, using the current step's content when none is given.
+    async def _preload_send_content(self, send_kwargs: dict) -> None:
+        """Send the current step's content when the caller gives none.
 
         Step builders are async and cannot run in ``__init__``, so the first
         message would otherwise ship the nav row over an empty body. This is
         the same render ``_nav_edit_kwargs`` supplies on a ``pop``. A step
         with no builder contributes nothing and the nav ships alone; an
-        explicit ``embed`` or ``content`` wins.
+        explicit ``content``, ``embed``, or ``embeds`` wins.
         """
-        if embed is None and content is None:
-            embed = (await self._nav_edit_kwargs()).get("embed")
-        return await super().send(
-            content=content,
-            embed=embed,
-            **kwargs,
-        )
+        self._match_controls()
+        if {"content", "embed", "embeds"} & send_kwargs.keys():
+            return
+        embed = (await self._nav_edit_kwargs()).get("embed")
+        if embed is not None:
+            send_kwargs["embed"] = embed
+
+    def _match_controls(self) -> None:
+        """Point the nav at the current step and match the auto Exit, at a render.
+
+        Both read their attributes here, so an instance override takes effect
+        at the next render.
+        """
+        self._sync_wizard_nav()
+        self._match_auto_exit("wizard_exit", row=4)
 
     nav_rebuild = staticmethod(lambda v: v._nav_edit_kwargs())
 
@@ -548,6 +657,7 @@ class WizardView(_BaseWizardMixin, StatefulView):
         """
         if not self._steps:
             return {}
+        self._match_controls()
         builder = self._steps[self._current_step].get("builder")
         if not builder:
             return {}
@@ -604,6 +714,8 @@ class WizardLayoutView(_BaseWizardMixin, StatefulLayoutView):
         # _build_extra_items() is preserved through step changes.
         pre_extra = list(self.children)
         self._build_extra_items()
+        if self.auto_exit_button:
+            self._add_auto_exit_button("wizard_exit")
         self._extra_items = [c for c in self.children if c not in pre_extra]
 
     def _build_extra_items(self):
@@ -627,9 +739,9 @@ class WizardLayoutView(_BaseWizardMixin, StatefulLayoutView):
             label=self.back_button_label or "Back",
             emoji=self.back_button_emoji,
             style=self.back_button_style,
-            custom_id="wizard_back",
+            custom_id=self._nav_id("back"),
             disabled=self._prev_visible_index(self._current_step) is None,
-            callback=self._go_back,
+            callback=self._back_clicked,
         )
 
         self._step_indicator = Button(
@@ -644,8 +756,8 @@ class WizardLayoutView(_BaseWizardMixin, StatefulLayoutView):
             label=self._resolve_next_label(is_last),
             emoji=self.finish_button_emoji if is_last else self.next_button_emoji,
             style=self.finish_button_style if is_last else self.next_button_style,
-            custom_id="wizard_next",
-            callback=self._go_next,
+            custom_id=self._nav_id("next"),
+            callback=self._next_clicked,
         )
 
         self._nav_row = ActionRow(self._back_btn, self._step_indicator, self._next_btn)
@@ -681,6 +793,7 @@ class WizardLayoutView(_BaseWizardMixin, StatefulLayoutView):
         """
         from ...theming.context import theme_context
 
+        self._match_auto_exit("wizard_exit", extras=self._extra_items)
         with theme_context(self.get_theme()):
             self.clear_items()
 
@@ -710,7 +823,9 @@ class WizardLayoutView(_BaseWizardMixin, StatefulLayoutView):
             # Restore the navigation back button if push() added one.
             self._restore_navigation_artifacts()
 
-    async def _refresh_wizard(self, *, previous_step: Optional[int] = None):
+    async def _render_wizard(
+        self, *, previous_step: Optional[int] = None
+    ) -> Optional[RenderOutcome]:
         """Update step content and mutate nav buttons in place.
 
         ``previous_step`` is the cursor the caller moved away from, so a step
@@ -718,13 +833,19 @@ class WizardLayoutView(_BaseWizardMixin, StatefulLayoutView):
         """
         self._sync_wizard_nav()
         await self._rebuild_step_content()
-        await self.refresh()
-        if self._edit_never_landed(previous_step, self._current_step, cursor="Step"):
-            # A V2 tree IS the content, so the rollback rebuilds it or the next
-            # refresh ships the step the cursor no longer names.
-            self._current_step = previous_step
-            self._sync_wizard_nav()
-            await self._rebuild_step_content()
+        declined = self._declined_render()
+        if declined is not None:
+            # The view changed while this awaited: torn down, or armed.
+            return declined
+        outcome = await self.refresh()
+        await self._rewind_step(previous_step)
+        return outcome
+
+    async def _match_step_tree(self) -> None:
+        # A V2 tree IS the content, so the restore rebuilds it or the next
+        # refresh ships the step the cursor no longer names.
+        self._sync_wizard_nav()
+        await self._rebuild_step_content()
 
     async def on_load(self) -> None:
         """Build the current step's content before the view is displayed.

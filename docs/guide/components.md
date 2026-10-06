@@ -156,10 +156,9 @@ the signature back, rather than a bare arity error on the first click.
 `RoleSelect`, `UserSelect`, `ChannelSelect`, and `MentionableSelect`
 each accept a `default_values=` constructor kwarg that pre-marks
 entries as selected when the message first renders. CascadeUI accepts
-a permissive input shape -- raw `int` IDs, Discord objects (Role,
-Member, User, GuildChannel), or pre-built `discord.SelectDefaultValue`
-instances -- and wraps each entry with the right type for the select
-class.
+raw `int` IDs, Discord objects (Role, Member, User, GuildChannel), or
+pre-built `discord.SelectDefaultValue` instances, and wraps each entry
+with the right type for the select class.
 
 ```python
 from cascadeui import RoleSelect, UserSelect, MentionableSelect
@@ -363,7 +362,8 @@ agree = Checkbox(label="Agree to terms")
 
 async def handle(interaction, values):
     print(name.value, agree.value)
-    await interaction.response.send_message("Done!", ephemeral=True)
+    # respond() also works after a re-render has answered the submission.
+    await self.respond(interaction, "Done!", ephemeral=True)
 
 modal = Modal(title="Registration", inputs=[name, agree], callback=handle)
 await self.open_modal(interaction, modal)
@@ -389,6 +389,10 @@ silently. `on_submit=` is the name discord.py subclasses override and the
 natural wrong guess for `callback=`, and a modal with no handler set
 acknowledges every submission and runs nothing. `custom_id=` is forwarded
 to `discord.ui.Modal`; omit it to let discord.py generate one.
+
+A required `TextInput` answered with only spaces is refused before its
+validators run, naming the field the way a validator failure does: Discord
+refuses an empty required box but accepts one of spaces.
 
 After validators pass, each input's `.value` / `.values` is populated (a rejected submission leaves them untouched). `modal.values_by_input` provides a dict keyed by input instance, populated at the same point.
 
@@ -632,7 +636,7 @@ self.add_item(action_section(
 ### `toggle_section(text, *, active, callback, labels=("Enabled", "Disabled"), ...)`
 
 A `Section` with a green/red toggle button. `labels` sets the (active, inactive)
-button text -- pass `("On", "Off")` to relabel -- and `emoji` adds a button emoji.
+button text (pass `("On", "Off")` to relabel), and `emoji` adds a button emoji.
 Pass `disabled=True` to render the button greyed out and non-interactive:
 
 ```python
@@ -936,8 +940,10 @@ then read as a collection of active values rather than one, the buttons
 become toggles (no disabled state, since an active option must be
 clickable to turn it off), and `on_select` receives the full list of
 selected values. A `Choice.value` may be any Python object, including an
-unhashable one like a list or a dict. Two `choice_row` controls in one view need
-distinct `custom_id=` values so their components do not collide.
+unhashable one like a list or a dict. Ids are derived from what each option
+does, so two `choice_row` controls in one ordinary view need no `custom_id=`;
+inside a `PersistentLayoutView`, where ids must survive a restart, give each
+control a distinct one.
 
 Single-select disables the active option because re-picking it is normally a
 no-op. When re-picking *is* a real action (the callback reopens the active
@@ -1071,8 +1077,8 @@ input shapes, together typed as
   with the message as a `discord.File`
 - A `discord.File` instance directly -- the builder reads its `.uri`
   property and emits the same `attachment://<filename>` reference
-- Any object carrying a string `.url`, which covers every `discord.Asset`
-  -- so `member.display_avatar` works where `member.display_avatar.url`
+- Any object carrying a string `.url`, which covers every `discord.Asset`,
+  so `member.display_avatar` works where `member.display_avatar.url`
   was meant
 
 Anything else raises `TypeError` where the builder is called, naming the
@@ -1149,6 +1155,14 @@ async with aiohttp.ClientSession() as session:
 await view.send(files=[photo_a, photo_b])
 ```
 
+A URL that answers with an error status raises
+`aiohttp.ClientResponseError` instead of handing back the error page as the
+file. A body larger than `max_bytes` (100 MiB by default, the most Discord
+accepts from a bot) raises `ValueError`, and the read stops once the count
+passes the limit, so such a body is never read in full; pass
+`max_bytes=interaction.guild.filesize_limit` to refuse anything the current
+server would reject.
+
 `fetch_as_file` forwards `spoiler=` and `description=` to the
 `discord.File` constructor, so attachment metadata travels through the
 helper without an extra wrapper. See `examples/v2_attachments.py` for a
@@ -1191,7 +1205,10 @@ That is the bound: the list belongs to the
 message, so it needs a file for every `attachment://` reference the tree
 currently holds, not only the one that changed. A view showing four
 images passes four; pass one and the other three render as permanent
-loading placeholders, with no exception raised anywhere.
+loading placeholders, with no exception raised anywhere. The files sent
+earlier can be passed again: every send and edit the library makes reads
+a file from its start. A direct discord.py call such as
+`channel.send(file=...)` does not, so pass it a new `discord.File` each time.
 
 Paged or tabbed content is where this bites, because the reference that
 breaks is the one you are navigating *to*. Under Discord's ten-attachment
@@ -1318,7 +1335,9 @@ validator catches violations in any tree built outside the builders.
 - V1 `View` rejects V2 items (`TextDisplay`, `Container`, `Section`, etc).
 - `Section` allows at most 3 children.
 - `Section` requires an `accessory=` kwarg.
-- `ActionRow` width budget = 5 (Button = 1 unit, Select = 5 units).
+- `ActionRow` rejects a sixth child, and a select added after a button. A
+  select added first counts as one unit, so buttons after it still fit; see
+  the send-time table below.
 - `add_item` rejects non-Item, non-str types.
 
 Everything else passes construction silently. Discord rejects the message
@@ -1336,10 +1355,11 @@ when you call `send()`.
 | Standalone `Button` / `Select` / `Thumbnail` at LayoutView top level | accepts | rejects |
 | `ActionRow` children must be `Button` or `Select` | accepts | rejects |
 | `Thumbnail` outside a `Section` accessory slot | accepts | rejects |
-| `Label` / `RadioGroup` / `CheckboxGroup` / `Checkbox` / `FileUpload` at any LayoutView position | accepts | rejects (Modal-only) |
+| `Label` / `TextInput` / `RadioGroup` / `CheckboxGroup` / `Checkbox` / `FileUpload` at any LayoutView position | accepts | rejects (Modal-only) |
 | `Container` must hold at least 1 child (empty) | accepts | rejects |
 | `Section` must hold 1-3 children (empty) | accepts (empty) | rejects |
 | `ActionRow` must hold at least 1 child (empty) | accepts | rejects |
+| `ActionRow` holds a `Select` beside anything else | accepts when the select comes first | rejects |
 | `MediaGallery` must hold 1-10 items | accepts | rejects |
 | `TextDisplay` content over 4000 characters | accepts | rejects |
 | `TextDisplay` content is empty | accepts | rejects |
@@ -1412,15 +1432,22 @@ The same three seams walk the tree and raise a directed `ValueError`
 naming the repeated id:
 
 ```
-ValueError: Duplicate component custom_id: 'choice' appears more than once in ConfigView.
+ValueError: Duplicate component custom_id: 'region_page_next' appears more than once in ConfigView.
   Discord rejects this message with HTTP 400 (code 50035: component custom id cannot be duplicated).
-  Fix: Give each component a distinct custom_id. A builder used more than once
-       (choice_row, PaginatedRegion, Collapsible) needs a distinct custom_id=/key= per call.
+  Fix: Give each component a distinct custom_id. A builder used more than once needs a distinct
+       key= (PaginatedRegion, Collapsible), or in a persistent view a distinct custom_id=
+       (choice_row, button_row, tab_nav).
 ```
 
-Auto-generated ids never collide here: CascadeUI position-anchors them
-before send. Only caller-supplied ids repeat, most often a builder called
-twice with its default (`choice_row`, `PaginatedRegion`, `Collapsible`).
+Auto-generated ids never collide here: CascadeUI derives them before
+send from what each button does, so a click sent from a screen that has
+since changed reaches a button only if it would still do the same thing,
+and is otherwise acknowledged and dropped. The label is part of what a
+button does, so a label that changes between renders (a vote count) gives
+the button a new id, and a click from the render before is dropped too; a
+`custom_id=` keeps those clicks. Only caller-supplied ids repeat, most often a
+builder called twice with its default `key` (`PaginatedRegion`,
+`Collapsible`).
 `Modal` applies the same rule to its inputs at construction: two inputs
 whose labels derive the same `custom_id` raise immediately rather than
 silently overwriting each other at submit.
@@ -1702,13 +1729,13 @@ class FilterView(StatefulLayoutView):
   <img src="../../assets/motion/collapsible.gif" alt="A collapsible expanding and collapsing its revealed region" width="520">
 </p>
 
-`render(self)` returns the trigger alone while collapsed, or the trigger plus the `reveal()` content while expanded (order via `trigger_first`). `reveal` and `summary` run bare on every render, so a callable that is async or requires arguments raises `TypeError` at construction. Close over the host's data instead. The collapse policy is the caller's -- `collapse()` after a revealed action finishes, or leave it open for multi-step use. The trigger relabels and restyles between states via `expanded_label` / `expanded_style` / `expanded_emoji`, and two collapsibles in one view need distinct `key` values.
+`render(self)` returns the trigger alone while collapsed, or the trigger plus the `reveal()` content while expanded (order via `trigger_first`). `reveal` and `summary` run bare on every render, so a callable that is async or requires arguments raises `TypeError` at construction. Close over the host's data instead. `summary` also takes a plain string, for text that never changes. The collapse policy is the caller's -- `collapse()` after a revealed action finishes, or leave it open for multi-step use. The trigger relabels and restyles between states via `expanded_label` / `expanded_style` / `expanded_emoji`, and two collapsibles in one view need distinct `key` values.
 
 `expand()` / `collapse()` set the state programmatically and `expanded` reads it; the `on_toggle(expanded)` hook fires after every open or close for async prefetch or logging.
 
 ### In-card disclosure with `summary`
 
-By default the trigger is a button on its own row. When the disclosure belongs *inside* a card -- the Edit button sitting beside a line of summary text rather than in a row of its own -- pass a `summary` callable (zero-argument, synchronous, read on every render like `reveal`). The trigger then renders as an `action_section`: a Section carrying the summary text with the trigger button as its accessory, so the whole disclosure splats into one `card(...)`.
+By default the trigger is a button on its own row. When the disclosure belongs *inside* a card (the Edit button sitting beside a line of summary text rather than in a row of its own), pass a `summary` callable (zero-argument, synchronous, read on every render like `reveal`). The trigger then renders as an `action_section`: a Section carrying the summary text with the trigger button as its accessory, so the whole disclosure splats into one `card(...)`.
 
 ```python
 self.representation = Collapsible(

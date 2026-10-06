@@ -4,6 +4,7 @@ import asyncio
 import copy
 
 import pytest
+from helpers import until
 
 from cascadeui.state.singleton import get_store
 from cascadeui.state.store import StateStore
@@ -345,9 +346,9 @@ class TestLibraryInternalBatching:
     async def test_navigate_to_batches_construction_then_commits_teardown(self):
         """push() batches its construction dispatches (NAVIGATION_PUSH +
         SESSION_CREATED + VIEW_CREATED) into one BATCH_COMPLETE. The source's
-        VIEW_DESTROYED commits separately afterward, in _commit_source_teardown,
-        once the destination edit confirms -- the deferral that lets a failed
-        edit roll back to a live source.
+        VIEW_DESTROYED commits separately afterward, when _navigate_in_place
+        commits once the destination edit confirms -- the deferral that lets
+        a failed edit roll back to a live source.
         """
         from helpers import RenderableLayoutView, make_interaction
 
@@ -567,3 +568,87 @@ class TestConcurrentBatchesAreIndependent:
 
         assert ("B", ("early",)) in seen
         assert ("LATE", "late") in seen
+
+
+class TestBatchAnnouncesInCommitOrder:
+    """A batch announced its actions in the order their chains returned, so
+    one whose middleware awaited after the reducer was announced after a
+    later action, and hooks saw them out of the order the store applied."""
+
+    async def test_actions_are_announced_in_the_order_they_committed(self):
+        store = get_store()
+        gate = asyncio.Event()
+        committed, hooked, announced = [], [], []
+
+        async def hold_after(action, state, next_fn):
+            result = await next_fn(action, state)
+            if action["payload"].get("hold"):
+                await gate.wait()
+            return result
+
+        async def set_key(action, state):
+            committed.append(action["payload"]["key"])
+            application = {**state.get("application", {}), action["payload"]["key"]: 1}
+            return {**state, "application": application}
+
+        store._add_middleware(hold_after)
+        store._register_reducer("SET_KEY", set_key)
+        store.on("SET_KEY", lambda action, *rest: hooked.append(action["payload"]["key"]))
+        store.on(
+            "BATCH_COMPLETE",
+            lambda action, *rest: announced.append(
+                [a["payload"]["key"] for a in action["payload"]["actions"]]
+            ),
+        )
+        async with store.batch():
+            first = asyncio.ensure_future(store.dispatch("SET_KEY", {"key": "A", "hold": True}))
+            try:
+                await until(lambda: committed)
+                await store.dispatch("SET_KEY", {"key": "B"})
+            finally:
+                gate.set()
+                await first
+        assert committed == ["A", "B"]
+        assert announced == [["A", "B"]]
+        assert hooked == ["A", "B"]
+
+    async def test_an_action_its_reducer_declined_keeps_its_place(self):
+        # A declined action took its place when its chain returned, after an
+        # action whose reducer ran later.
+        store = get_store()
+        gate = asyncio.Event()
+        reduced, announced = [], []
+
+        async def hold_after(action, state, next_fn):
+            result = await next_fn(action, state)
+            if action["payload"].get("hold"):
+                await gate.wait()
+            return result
+
+        async def decline(action, state):
+            reduced.append("X")
+            return state
+
+        async def change(action, state):
+            reduced.append("Y")
+            return {**state, "application": {**state.get("application", {}), "y": 1}}
+
+        store._add_middleware(hold_after)
+        store._register_reducer("DECLINE", decline)
+        store._register_reducer("CHANGE", change)
+        store.on(
+            "BATCH_COMPLETE",
+            lambda action, *rest: announced.append(
+                [a["type"] for a in action["payload"]["actions"]]
+            ),
+        )
+        async with store.batch():
+            first = asyncio.ensure_future(store.dispatch("DECLINE", {"hold": True}))
+            try:
+                await until(lambda: reduced)
+                await store.dispatch("CHANGE", {})
+            finally:
+                gate.set()
+                await first
+        assert reduced == ["X", "Y"]
+        assert announced == [["DECLINE", "CHANGE"]]

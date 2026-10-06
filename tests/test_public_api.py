@@ -68,12 +68,18 @@ class TestPublicExportSurface:
         # Without this, `from cascadeui.utils import slugify` works while
         # `from cascadeui.utils import setup_logging` raises ImportError, for
         # two names that are equally public and live in the same package.
+        # "Defined" is read from the source: a constant's __module__ says
+        # builtins and a type alias's says typing, which hid five names.
         module = importlib.import_module(module_name)
+        defined = _names_defined_under(module_name)
         missing = sorted(
             name
             for name in cascadeui.__all__
-            if getattr(getattr(cascadeui, name, None), "__module__", "").startswith(
-                f"{module_name}."
+            if (
+                name in defined
+                or getattr(getattr(cascadeui, name, None), "__module__", "").startswith(
+                    f"{module_name}."
+                )
             )
             and name not in module.__all__
         )
@@ -161,6 +167,10 @@ _INTERNAL_NAMES = frozenset(
         # Ack and hook plumbing the library drives itself (respond_safe IS
         # exported; these are not)
         "ack_backstop",
+        "ship_stalled_renders",
+        # The deprecation helper library code calls when it retires a name
+        "REMOVED_IN",
+        "warn_deprecated",
         "open_modal_safe",
         "call_hook_safe",
         "await_maybe",
@@ -170,6 +180,7 @@ _INTERNAL_NAMES = frozenset(
         "require_url",
         "require_value_callback",
         "refuse_wrong_arity",
+        "run_unless_repeat",
         # Offline test doubles. Public at cascadeui.testing, and kept off the
         # root so a client that never connects cannot be reached by a
         # production import that meant to reach a real one.
@@ -183,7 +194,6 @@ _INTERNAL_NAMES = frozenset(
         "coerce_colour",
         "elapsed_since",
         "trailing_ack",
-        "DISCORD_CALL_ERRORS",
         "describe_discord_error",
         "ACK_DEADLINE_SECONDS",
         "validate_ack_delay",
@@ -240,6 +250,22 @@ def _defined_public_names(source: str) -> set:
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
             defined.add(node.target.id)
     return {n for n in defined if not n.startswith("_") and n not in imported}
+
+
+def _names_defined_under(package_name: str) -> set:
+    """Public names any module in ``package_name``'s tree defines, read from source."""
+    package = importlib.import_module(package_name)
+    defined: set = set()
+    for info in pkgutil.walk_packages(package.__path__, package_name + "."):
+        try:
+            module = importlib.import_module(info.name)
+        except Exception:
+            continue  # an optional extra that is not installed
+        path = getattr(module, "__file__", None)
+        if path and os.path.exists(path):
+            with open(path, encoding="utf-8") as handle:
+                defined |= _defined_public_names(handle.read())
+    return defined
 
 
 class TestNoAccidentalInternalPublic:

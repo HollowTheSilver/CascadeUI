@@ -2,7 +2,7 @@
 
 
 import copy
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Tuple
 
 from ..utils.hooks import is_async_callable
 from .singleton import get_store
@@ -10,11 +10,8 @@ from .types import SelectorFn, StateData
 
 _SENTINEL = object()
 
-# Module-level registry of @computed-decorated functions. Populated at decoration
-# time (module import) so registrations survive store resets: every fresh
-# StateStore seeds its own _computed dict from this registry during __init__.
-# Keyed by function name -> (selector, compute_fn). ComputedValue instances are
-# created per-store (cache is per-store), but the recipe lives here.
+# @computed recipes by function name, filled at import, so a store built later
+# (a reset) seeds its own ComputedValue instances and caches from them.
 _COMPUTED_REGISTRY: Dict[str, Tuple[SelectorFn, Callable[[Any], Any]]] = {}
 
 
@@ -42,16 +39,10 @@ class ComputedValue:
         current_input = self._selector(state)
         if self._last_input is not _SENTINEL and current_input == self._last_input:
             return self._cached
-        # Keep an independent copy of the input, not a reference to it. A
-        # selector returns a slice of live state, and a slice mutated in
-        # place carries the stored reference with it, so the comparison
-        # above becomes the slice against itself and the stale result is
-        # returned forever -- including after a later, correct replacement,
-        # because the aliased reference already matches the new value while
-        # the cached result predates it. ``access_slot`` mutates in place by
-        # design, and ``seed_initial_state`` hands it live state, so the
-        # aliasing is reachable through a sanctioned path. Copying costs
-        # only on a miss, where the recompute is happening anyway.
+        # An independent copy: a slice mutated in place (``access_slot`` does,
+        # on the live state ``seed_initial_state`` hands it) would carry a stored
+        # reference along, and the check above would match forever. Copied only
+        # on a miss, where the recompute runs anyway.
         try:
             self._last_input = copy.deepcopy(current_input)
         except Exception:

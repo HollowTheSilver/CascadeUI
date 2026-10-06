@@ -241,6 +241,84 @@ class TestCallbackContextVar:
         finally:
             _CURRENT_INTERACTION.reset(reset_token)
 
+    async def test_a_stalled_render_ships_once_the_click_is_answered(self, clean_registry):
+        """A render abandoned on a stall waited for the view's next render."""
+        import asyncio
+
+        from helpers import RenderableLayoutView, make_interaction
+
+        class _Slow(RenderableLayoutView):
+            auto_defer_delay = 1.5
+
+        view = _Slow(interaction=make_interaction())
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+
+        class _RenderingButton(
+            DynamicPersistentButton,
+            template=r"render:(?P<role_id>[0-9]+)",
+        ):
+            def __init__(self, *, role_id: int):
+                super().__init__(
+                    discord.ui.Button(
+                        label="g", custom_id=f"render:{role_id}", style=discord.ButtonStyle.primary
+                    )
+                )
+                self.role_id = role_id
+
+            async def on_click(self, interaction):
+                await view.refresh()
+
+        async def _stall_forever(*args, **kwargs):
+            await asyncio.sleep(60)
+
+        interaction = make_interaction(message=view._message)
+        interaction.response.edit_message = AsyncMock(side_effect=_stall_forever)
+
+        await _RenderingButton(role_id=1).callback(interaction)
+
+        interaction.response.defer.assert_awaited_once()
+        view._message.edit.assert_awaited_once()
+
+    async def test_a_stalled_render_ships_when_on_click_raises_after_it(self, clean_registry):
+        import asyncio
+
+        from helpers import RenderableLayoutView, make_interaction
+
+        class _Slow(RenderableLayoutView):
+            auto_defer_delay = 1.5
+
+        view = _Slow(interaction=make_interaction())
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+
+        class _RaisingAfterRender(
+            DynamicPersistentButton,
+            template=r"after:(?P<role_id>[0-9]+)",
+        ):
+            def __init__(self, *, role_id: int):
+                super().__init__(
+                    discord.ui.Button(
+                        label="a", custom_id=f"after:{role_id}", style=discord.ButtonStyle.primary
+                    )
+                )
+                self.role_id = role_id
+
+            async def on_click(self, interaction):
+                await view.refresh()
+                raise RuntimeError("after the render")
+
+        async def _stall_forever(*args, **kwargs):
+            await asyncio.sleep(60)
+
+        interaction = make_interaction(message=view._message)
+        interaction.response.edit_message = AsyncMock(side_effect=_stall_forever)
+
+        with pytest.raises(RuntimeError, match="after the render"):
+            await _RaisingAfterRender(role_id=1).callback(interaction)
+
+        view._message.edit.assert_awaited_once()
+
     async def test_context_resets_even_on_on_click_exception(self, clean_registry):
         class _RaisingButton(
             DynamicPersistentButton,
@@ -309,7 +387,7 @@ class TestBotRegistration:
         # Client, and would raise AttributeError on the spec'd mock).
         bot = MagicMock(spec=discord.Client)
         store = get_store()
-        store._cleanup_listener_installed = True
+        store._cleanup_listener_bots.add(bot)
 
         middleware = PersistenceMiddleware(backend=InMemoryBackend(), bot=bot)
         await middleware.initialize(store)
@@ -330,7 +408,7 @@ class TestBotRegistration:
 
         bot = MagicMock(spec=discord.Client)
         store = get_store()
-        store._cleanup_listener_installed = True
+        store._cleanup_listener_bots.add(bot)
 
         middleware = PersistenceMiddleware(backend=InMemoryBackend(), bot=bot)
         await middleware.initialize(store)

@@ -67,8 +67,11 @@ CHOICES = {
 
 
 @cascade_reducer("POLL_VOTE")
-async def poll_vote_reducer(action, state):
+def poll_vote_reducer(action, state):
     """Record a vote in the voting guild's own bucket of application state.
+
+    A plain ``def``: this reducer awaits nothing, and ``@cascade_reducer``
+    takes either form.
 
     Each user gets one vote per guild. Changing your vote removes the
     old one. The ``@cascade_reducer`` decorator auto-deepcopies state,
@@ -120,7 +123,7 @@ async def poll_vote_reducer(action, state):
 # reading the same computed value share one cached result.
 
 
-@computed(selector=lambda s: s.get("application", {}).get("poll", {}))
+@computed(selector=lambda s: read_slot(s, "poll", default={}))
 def vote_totals(poll_by_guild):
     """Derive per-choice vote counts for every guild's poll.
 
@@ -138,7 +141,7 @@ def vote_totals(poll_by_guild):
     }
 
 
-@computed(selector=lambda s: s.get("application", {}).get("poll", {}))
+@computed(selector=lambda s: read_slot(s, "poll", default={}))
 def poll_leader(poll_by_guild):
     """Derive the current leader (or None for a tie/empty) per guild.
 
@@ -180,9 +183,13 @@ class PollView(StatefulLayoutView):
     owner_only = False
     instance_limit = 1
     instance_scope = "guild"
+    # Replace takes only the opener's own poll. While another member's poll
+    # is open, a second /poll is refused with "One of these is already open
+    # in this server."
     instance_policy = "replace"
     replace_policy = "delete"
-    exit_policy = "delete"
+    # Every vote resets the timer, so an active poll stays open.
+    timeout = 600.0
     auto_defer = True
     serialize_interactions = True
 
@@ -209,8 +216,8 @@ class PollView(StatefulLayoutView):
         leader = store.computed["poll_leader"].get(self.guild_id)
         total_voters = read_slot(store.state, "poll", self.guild_id, "total_voters", default=0)
 
-        # Header card -- theme accent applied automatically via
-        # the contextvars-based theme context set by build_ui wrapping
+        # Header card -- card() picks up the view's theme accent inside
+        # build_ui(), with no color= passed
         self.add_item(card("## \N{BAR CHART} Quick Poll", "Vote for your favorite language!"))
         self.add_item(gap())
 

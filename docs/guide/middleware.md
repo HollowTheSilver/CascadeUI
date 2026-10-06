@@ -24,11 +24,36 @@ async def my_middleware(action, state, next_fn):
     return result
 ```
 
+`result` is the state after the reducer ran. What a middleware returns goes
+back up the chain and is not stored, so returning a different mapping changes
+nothing; to change the state, dispatch an action a reducer handles. A
+middleware that raises after `next_fn` returns leaves the change in place:
+subscribers, hooks, and persistence still see it, and then `dispatch()` raises.
+An action that changes nothing, such as a broadcast only hooks handle, is
+announced the same way. A dispatch cancelled after the reducer ran still saves
+the change and tells subscribers, but hooks that had not started when the
+cancel landed do not run. Persistence saves what a reducer commits, so a
+change made by assigning `store.state` directly is not saved.
+
 Middleware executes in registration order. Each middleware wraps the next one, forming a chain:
 
 ```
 dispatch -> middleware_1 -> middleware_2 -> reducer
 ```
+
+### Awaiting Before `next_fn`
+
+A middleware can await before passing the action on, to write an audit row or
+check a rate limit. Other dispatches can run and commit while it waits, so when
+it passes on the `state` it was given, the next middleware and the reducer
+receive the store's current state instead, and a change another dispatch made in
+the meantime is kept. Each call to `next_fn` applies the action to the state
+current at that call, so calling it twice applies the action twice.
+
+A middleware that passes a new mapping (`{**state, ...}`) has that mapping
+reduced as it is, so a change another dispatch commits while a middleware after
+it awaits is not in it. Install a middleware that builds a mapping after any
+middleware that awaits.
 
 ### Short-Circuiting
 
@@ -40,6 +65,9 @@ async def block_spam(action, state, next_fn):
         return state  # Action never reaches the reducer
     return await next_fn(action, state)
 ```
+
+A blocked action changes nothing and is not announced: no subscriber is told
+and no `store.on()` hook runs. It still appears in `store.history`.
 
 ## Adding Middleware
 
@@ -90,7 +118,7 @@ Fans writes across two namespaces (registry, application) with independent debou
 
 Construct `PersistenceMiddleware` directly with the backends and bot reference it needs; `setup_middleware` installs it and its `initialize(store)` method runs the full pipeline (manager build, backend init, migrations, blocking rehydrate, message-cleanup listener, reattach). See [Persistence](persistence.md) for the full setup flow.
 
-The middleware uses a state identity check to skip actions that don't mutate state, so dispatch-only or pure-bookkeeping actions never trigger a write. Only state-mutating actions on opted-in slots reach disk. Slots default to in-memory; the middleware consults `is_persistent_slot(name)` during its identity-diff scan and only writes slots that have been opted in -- either via the `persistent_slots` class attribute on a `_StatefulMixin` subclass or via `SlotPolicy(persistent=True)` at setup time.
+The middleware uses a state identity check to skip actions that don't mutate state, so dispatch-only or pure-bookkeeping actions never trigger a write. Only state-mutating actions on opted-in slots reach disk. Slots default to in-memory, and the scan looks only at the opted-in slot names, never the whole `application` tree. A slot is written when what it stores changes. A `@cascade_reducer` hands every slot back as a copy, so after such an action each opted-in slot is serialized and compared with what was last loaded or saved, and one that matches is not written again. A slot opts in via the `persistent_slots` class attribute on a `_StatefulMixin` subclass, `access_slot(..., persistent=True)` from a reducer, or `SlotPolicy(persistent=True)` at setup time.
 
 ### Undo Middleware
 
@@ -107,10 +135,10 @@ await setup_middleware(UndoMiddleware())
 The middleware automatically:
 
 - Checks if the dispatching view has `enable_undo = True`
-- Captures a per-slot diff of the `application` keys the action changed, plus the session's `shared_data`, before the reducer runs
-- Pushes the diff onto the view's undo stack -- only slots the action touched are snapshotted, so concurrent writes to other slots by sibling views survive this view's undo path
+- Records, as the reducer commits the action, a per-slot diff of the `application` keys it changed, plus the session's `shared_data` as it was, so steps follow the order the store committed them even when a middleware around it awaits or dispatches after `next_fn`
+- Pushes the diff onto the view's undo stack. Only what the action touched is snapshotted: whole slots, and within a dict slot only the keys it changed, at any depth. Every user's scoped data shares the `scoped` slot, so one user's undo restores that user's keys and leaves every other user's alone. A write to the same key by another view is still overwritten
 - Skips internal lifecycle actions (view creation, navigation, etc.)
-- Respects batching (one snapshot per batch, not per action)
+- Respects batching (one snapshot per batch, not per action, placed where the batch's first change was made)
 
 See [State Management -- Undo/Redo](state.md#undoredo) for the view-side API.
 
@@ -163,7 +191,6 @@ Middleware runs in the order passed to `setup_middleware`, which matters when mi
 from cascadeui.persistence import SQLiteBackend
 
 # Good: logging sees every action (including those blocked by rate limiting).
-# UndoMiddleware captures state before PersistenceMiddleware writes it.
 await setup_middleware(
     LoggingMiddleware(),
     UndoMiddleware(),

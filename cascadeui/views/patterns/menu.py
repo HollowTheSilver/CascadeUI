@@ -46,6 +46,17 @@ class _BaseMenuMixin:
         "auto_exit_button",
     )
 
+    def _menu_inputs(self) -> tuple:
+        """The attributes the menu's buttons are built from, compared at each render."""
+        return (self.menu_style, self.auto_exit_button)
+
+    async def on_load(self) -> None:
+        """Rebuild before a render when an instance override changed what the
+        buttons are built from, so it shows from the first message rather than
+        the next state change."""
+        if self._menu_inputs() != self._menu_built_for:
+            await await_maybe(self.build_ui())
+
     async def on_category_selected(
         self, category: Dict[str, Any], index: int, interaction: Interaction
     ) -> None:
@@ -69,12 +80,9 @@ class _BaseMenuMixin:
 
         self_is_v2 = isinstance(self, _LayoutView)
         for index, category in enumerate(categories):
-            # Shape first: every read below and in the item builders assumes a
-            # mapping with both keys, so a tuple entry otherwise fails inside
-            # this check with an AttributeError naming neither the entry nor
-            # the expected shape, and a missing key surfaces later as a bare
-            # KeyError from the builder. Duck-typed rather than isinstance so
-            # any mapping keeps working, not only dict.
+            # Shape first: a tuple entry would otherwise fail with an
+            # AttributeError naming neither the entry nor the shape. Duck-typed,
+            # so any mapping works, not only dict.
             if not hasattr(category, "get") or not hasattr(category, "__getitem__"):
                 raise TypeError(
                     f"{type(self).__name__} categories[{index}] must be a mapping "
@@ -91,8 +99,16 @@ class _BaseMenuMixin:
                         f"'emoji', 'description', 'style' and 'rebuild' are optional."
                     )
             view_cls = category.get("view")
-            if not isinstance(view_cls, type):
-                continue
+            # Every click pushes this, so an instance works on the first click
+            # only and anything else on none.
+            if not (isinstance(view_cls, type) and issubclass(view_cls, _StatefulMixin)):
+                raise TypeError(
+                    f"{type(self).__name__} category {category.get('label')!r} has "
+                    f"'view' {view_cls!r}, which is not a view class. Each click "
+                    f"pushes a new view built from it.\n"
+                    f"  Fix: pass the class, e.g. {{'view': StatsView}}, not an "
+                    f"instance of it."
+                )
             if issubclass(view_cls, _LayoutView) is self_is_v2:
                 continue
             source = "V2 (LayoutView)" if self_is_v2 else "V1 (View)"
@@ -106,18 +122,23 @@ class _BaseMenuMixin:
 
     def _make_push_callback(self, category: Dict[str, Any], index: int):
         view_cls = category["view"]
-        # An explicit per-category rebuild wins. Otherwise a destination that
-        # names its own nav_rebuild keeps it, and one that renders through
-        # some other seam entirely (on_load, or its own __init__) is left
-        # alone, since the menu's fallback calls a method it does not have.
-        # What remains is the plain view the fallback was written for.
+        # An explicit per-category rebuild wins, then the destination's own
+        # nav_rebuild. The menu's fallback applies only to a destination that
+        # has the render hook it calls.
         rebuild = category.get("rebuild")
         if (
             rebuild is None
             and getattr(view_cls, "nav_rebuild", None) is None
             and hasattr(view_cls, self._category_render_hook)
         ):
-            rebuild = type(self).nav_rebuild
+            fallback = type(self).nav_rebuild
+
+            def rebuild(view):
+                # Kept as the destination's own, so the edits it makes later
+                # (a redraw after a failed push, its close, a pop back to it)
+                # render it the way this push did.
+                view.nav_rebuild = fallback
+                return fallback(view)
 
         async def callback(interaction: Interaction):
             await await_maybe(self.on_category_selected(category, index, interaction))
@@ -172,26 +193,18 @@ class MenuView(_BaseMenuMixin, StatefulView):
     _category_render_hook: ClassVar[str] = "build_embed"
     nav_rebuild = staticmethod(lambda v: {"embed": v.build_embed()})
 
-    async def send(
-        self,
-        content: Optional[str] = None,
-        *,
-        embed: Optional[discord.Embed] = None,
-        **kwargs,
-    ):
-        """Send the view, using ``build_embed()`` when no content is given.
+    async def _preload_send_content(self, send_kwargs: dict) -> None:
+        """Send ``build_embed()`` when the caller gives no content.
 
         The hub card is the menu's own render, so sending without one ships
-        the category buttons over an empty body. An explicit ``embed`` or
-        ``content`` wins.
+        the category buttons over an empty body. An explicit ``content``,
+        ``embed``, or ``embeds`` wins.
         """
-        if embed is None and content is None:
-            embed = self.build_embed()
-        return await super().send(
-            content=content,
-            embed=embed,
-            **kwargs,
-        )
+        if {"content", "embed", "embeds"} & send_kwargs.keys():
+            return
+        embed = self.build_embed()
+        if embed is not None:
+            send_kwargs["embed"] = embed
 
     def __init__(
         self,
@@ -209,14 +222,16 @@ class MenuView(_BaseMenuMixin, StatefulView):
         self._build_extra_items()
 
         if self.auto_exit_button:
-            self.add_exit_button(row=4)
+            self._add_auto_exit_button("menu_exit", row=4)
+        self._menu_built_for = self._menu_inputs()
 
     def _build_extra_items(self):
         """Hook for subclasses to add components alongside category buttons.
 
-        Called once during init, after category buttons are built but
-        before the exit button. Override to add domain-specific controls
-        (e.g. a Reset All button on a later row).
+        Called during init and again on every ``build_ui()`` rebuild, after
+        the category buttons and before the exit button, so build the items
+        fresh each time. Override to add domain-specific controls (e.g. a
+        Reset All button on a later row).
         """
         pass
 
@@ -257,7 +272,8 @@ class MenuView(_BaseMenuMixin, StatefulView):
         self._build_extra_items()
 
         if self.auto_exit_button:
-            self.add_exit_button(row=4)
+            self._add_auto_exit_button("menu_exit", row=4)
+        self._menu_built_for = self._menu_inputs()
 
         # Restore the navigation back button if push() added one.
         self._restore_navigation_artifacts()
@@ -317,6 +333,8 @@ class MenuLayoutView(_BaseMenuMixin, StatefulLayoutView):
         self._categories: List[Dict[str, Any]] = categories or []
         self._validate_categories(self._categories)
         self._build_ui_sync()
+        # Stamped here as well as in build_ui(), which an override may replace.
+        self._menu_built_for = self._menu_inputs()
 
     def build_header(self):
         """Return V2 components for the area above category items.
@@ -386,7 +404,8 @@ class MenuLayoutView(_BaseMenuMixin, StatefulLayoutView):
                 self.add_item(item)
 
         if self.auto_exit_button:
-            self.add_item(ActionRow(self.make_exit_button()))
+            self.add_item(ActionRow(self._make_auto_exit_button("menu_exit")))
+        self._menu_built_for = self._menu_inputs()
 
         # Restore the navigation back button if push() added one.
         self._restore_navigation_artifacts()

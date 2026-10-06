@@ -51,11 +51,26 @@ class _BaseTabMixin:
         "active_tab_style",
         "inactive_tab_style",
     )
+    # Adds the library's Exit button, kept through every re-render.
+    auto_exit_button: ClassVar[bool] = False
+    _BOOL_ATTRS: ClassVar[tuple] = (
+        *_StatefulMixin._BOOL_ATTRS,
+        "auto_exit_button",
+    )
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         if "tab_overflow_policy" in cls.__dict__:
             cls._validate_tab_overflow_policy(cls.__dict__["tab_overflow_policy"])
+
+    @classmethod
+    def _validate_attribute_value(cls, name: str, value) -> None:
+        # Routed here too so set_class_attribute() refuses what the class
+        # body would, rather than accepting a preset the rows then misread.
+        if name == "tab_overflow_policy":
+            cls._validate_tab_overflow_policy(value)
+            return
+        super()._validate_attribute_value(name, value)
 
     @classmethod
     def _validate_tab_overflow_policy(cls, value) -> None:
@@ -113,8 +128,8 @@ class _BaseTabMixin:
 
         Default implementation branches on the attribute. Subclasses
         override for genuinely bespoke splits (conditional row widths,
-        runtime-computed layouts). The return shape -- a list of lists
-        of buttons -- is consumed identically by V1 (row index) and V2
+        runtime-computed layouts). The return shape, a list of lists of
+        buttons, is consumed identically by V1 (row index) and V2
         (ActionRow wrapping).
         """
         if not buttons:
@@ -228,6 +243,13 @@ class _BaseTabMixin:
 
         Default is a no-op. Override for analytics, async setup, or
         validation that should fire on every tab change.
+
+        Fires before the repaint, so it reports the tab the user asked
+        for. When that repaint does not land (its edit never reaches
+        Discord, or the tab's builder raises) the view stays on the tab
+        it showed, and this hook is not called again. Data set up here for
+        the builder is best keyed by tab, so a tab that never rendered
+        leaves nothing behind for the one still on screen.
         """
         return None
 
@@ -286,8 +308,12 @@ class _BaseTabMixin:
         """Name of the currently active tab."""
         return self._tab_names[self._active_tab]
 
-    async def switch_tab(self, name: str):
+    async def switch_tab(self, name: str, *, notify: bool = True):
         """Switch to a tab by name and refresh the view.
+
+        ``notify=False`` skips ``on_tab_switched``, for a switch the view
+        makes on its own rather than one a user asked for. The render, and
+        the rewind when its edit does not land, are the same either way.
 
         Raises ``ValueError`` if the tab name is not found.
         """
@@ -297,7 +323,8 @@ class _BaseTabMixin:
             raise ValueError(f"Tab '{name}' not found. Available: {self._tab_names}")
         previous = self._active_tab
         self._active_tab = index
-        await self._call_hook_safe(self.on_tab_switched, index)
+        if notify:
+            await self._call_hook_safe(self.on_tab_switched, index)
         await self._refresh_tabs(previous_tab=previous)
 
     async def refresh_content(self) -> None:
@@ -309,6 +336,44 @@ class _BaseTabMixin:
         re-fetch) before re-rendering.
         """
         await self._refresh_tabs()
+
+    async def _refresh_tabs(self, *, previous_tab: Optional[int] = None):
+        """Render the active tab under the view's reload turn.
+
+        A tab builder is awaited while the view's content is being rebuilt,
+        so a reload running at the same time would interleave its own
+        rebuild and ship duplicated components.
+        """
+        async with self._within_reload_turn("a tab render"):
+            declined = self._declined_render()
+            if declined is not None:
+                return declined
+            try:
+                return await self._render_tabs(previous_tab=previous_tab)
+            except Exception:
+                await self._rewind_tab(previous_tab, raised=True)
+                raise
+
+    async def _rewind_tab(self, previous: Optional[int], *, raised: bool = False) -> None:
+        """Put the active tab back when a switch's edit did not land.
+
+        Covers a dropped edit and a render that raised (``raised``): the
+        screen still shows the previous tab, so the cursor returns to it and
+        the tree is matched to it. No second edit is sent, and
+        ``on_tab_switched`` is not re-fired.
+        """
+        if not self._edit_never_landed(previous, self._active_tab, cursor="Tab", raised=raised):
+            return
+        self._active_tab = previous
+        await self._match_tab_tree()
+
+    async def _match_tab_tree(self) -> None:
+        """Re-derive the tree for the active tab after a rewind.
+
+        Button styling is the only tree-resident tab artifact in V1 (the
+        body rides the embed kwarg).
+        """
+        self._sync_tab_styles()
 
 
 # // ========================================( V1: TabView )======================================== // #
@@ -349,6 +414,8 @@ class TabView(_BaseTabMixin, StatefulView):
 
         self._build_tab_buttons()
         self._build_extra_items()
+        if self.auto_exit_button:
+            self._add_auto_exit_button("tab_exit", row=4)
 
     def _build_extra_items(self):
         """Hook for subclasses to add components alongside the tab row.
@@ -378,33 +445,70 @@ class TabView(_BaseTabMixin, StatefulView):
                 callback=self._make_switch_callback(i),
             )
             self._tab_buttons.append(button)
+        self._place_tab_rows()
 
+    def _place_tab_rows(self) -> None:
+        """Add the tab buttons on the rows ``tab_overflow_policy`` groups them into."""
         for row_idx, row_buttons in enumerate(self._build_tab_rows(self._tab_buttons)):
             for button in row_buttons:
                 button.row = row_idx
                 self.add_item(button)
+        self._tab_rows_policy = self.tab_overflow_policy
 
-    async def send(
-        self,
-        content: Optional[str] = None,
-        *,
-        embed: Optional[discord.Embed] = None,
-        **kwargs,
-    ):
-        """Send the view, using the active tab's content when none is given.
+    def _relay_tab_rows(self) -> None:
+        """Move the tab buttons onto the rows the current ``tab_overflow_policy`` asks for.
+
+        A layout the view's other rows cannot hold is refused naming the
+        attribute, and the layout it would have replaced is put back.
+        """
+        placed = self._tab_rows_policy
+        for button in self._tab_buttons:
+            self.remove_item(button)
+        try:
+            self._place_tab_rows()
+        except ValueError as e:
+            refused = self.tab_overflow_policy
+            for button in self._tab_buttons:
+                self.remove_item(button)
+            self.tab_overflow_policy = placed
+            self._place_tab_rows()
+            raise ValueError(
+                f"{type(self).__name__}.tab_overflow_policy {refused!r} puts a tab on a row "
+                f"the view's other components already fill ({e}); the previous layout was "
+                f"kept.\n  Fix: choose a layout that leaves those rows free, or move what "
+                f"_build_extra_items() adds to other rows."
+            ) from e
+
+    def _apply_class_attribute(self, name: str) -> None:
+        super()._apply_class_attribute(name)
+        if name == "tab_overflow_policy" and self.tab_overflow_policy != self._tab_rows_policy:
+            # Laid out now, so a layout the rows cannot hold is refused by the
+            # call that set it rather than inside a later click.
+            self._relay_tab_rows()
+
+    def _match_controls(self) -> None:
+        """Bring the tab rows and the auto Exit in line with their attributes.
+
+        Run at each render, so an instance override takes effect at the next.
+        """
+        if self.tab_overflow_policy != self._tab_rows_policy:
+            self._relay_tab_rows()
+        self._match_auto_exit("tab_exit", row=4)
+
+    async def _preload_send_content(self, send_kwargs: dict) -> None:
+        """Send the active tab's content when the caller gives none.
 
         Tab builders are async and cannot run in ``__init__``, so the first
         message would otherwise ship the tab row over an empty body. This is
         the same render ``_nav_edit_kwargs`` supplies on a ``pop``. An
-        explicit ``embed`` or ``content`` wins.
+        explicit ``content``, ``embed``, or ``embeds`` wins.
         """
-        if embed is None and content is None:
-            embed = (await self._nav_edit_kwargs()).get("embed")
-        return await super().send(
-            content=content,
-            embed=embed,
-            **kwargs,
-        )
+        self._match_controls()
+        if {"content", "embed", "embeds"} & send_kwargs.keys():
+            return
+        embed = (await self._nav_edit_kwargs()).get("embed")
+        if embed is not None:
+            send_kwargs["embed"] = embed
 
     nav_rebuild = staticmethod(lambda v: v._nav_edit_kwargs())
 
@@ -418,31 +522,32 @@ class TabView(_BaseTabMixin, StatefulView):
         """
         if not self._tab_names:
             return {}
+        self._match_controls()
         builder = self._tabs[self._tab_names[self._active_tab]]
         return {"embed": await await_maybe(builder())}
 
     async def _reload_render(self) -> Optional[RenderOutcome]:
         return await self._refresh_tabs()
 
-    async def _refresh_tabs(self, *, previous_tab: Optional[int] = None) -> Optional[RenderOutcome]:
+    async def _render_tabs(self, *, previous_tab: Optional[int] = None) -> Optional[RenderOutcome]:
         """Mutate tab button styles in place and rebuild active content.
 
         ``previous_tab`` is the tab the caller switched away from, so a
         switch whose edit never reached Discord can put the cursor back.
         """
         self._sync_tab_styles()
+        self._match_controls()
 
         tab_name = self._tab_names[self._active_tab]
         builder = self._tabs[tab_name]
         embed = await await_maybe(builder())
+        declined = self._declined_render()
+        if declined is not None:
+            # The view changed while this awaited: torn down, or armed.
+            return declined
 
         outcome = await self.refresh(embed=embed)
-        if self._edit_never_landed(previous_tab, self._active_tab, cursor="Tab"):
-            # Button styling is the only tree-resident tab artifact in V1 (the
-            # body rides the embed kwarg). No second edit: the connection is
-            # still down.
-            self._active_tab = previous_tab
-            self._sync_tab_styles()
+        await self._rewind_tab(previous_tab)
         return outcome
 
 
@@ -484,6 +589,8 @@ class TabLayoutView(_BaseTabMixin, StatefulLayoutView):
         # _build_extra_items() is preserved through tab switches.
         pre_extra = list(self.children)
         self._build_extra_items()
+        if self.auto_exit_button:
+            self._add_auto_exit_button("tab_exit")
         self._extra_items = [c for c in self.children if c not in pre_extra]
 
     def _build_extra_items(self):
@@ -514,10 +621,14 @@ class TabLayoutView(_BaseTabMixin, StatefulLayoutView):
             )
             self._tab_buttons.append(button)
 
-        for row_buttons in self._build_tab_rows(self._tab_buttons):
-            row = ActionRow(*row_buttons)
-            self._tab_rows.append(row)
+        self._lay_tab_rows()
+        for row in self._tab_rows:
             self.add_item(row)
+
+    def _lay_tab_rows(self) -> None:
+        """Group the tab buttons into the rows ``tab_overflow_policy`` asks for."""
+        self._tab_rows = [ActionRow(*row) for row in self._build_tab_rows(self._tab_buttons)]
+        self._tab_rows_policy = self.tab_overflow_policy
 
     async def _compose_tab_tree(self) -> None:
         """Compose the tree for the active tab: tab rows, content, extras.
@@ -525,9 +636,14 @@ class TabLayoutView(_BaseTabMixin, StatefulLayoutView):
         The single build seam. ``on_load`` runs it before every render the
         library drives (the send pipeline, each push/pop edit, ``reload``)
         and ``_refresh_tabs`` runs it on a tab click; both need the same
-        tree, so neither owns a private copy of this sequence.
+        tree, so neither owns a private copy of this sequence. An instance
+        override of ``tab_overflow_policy`` or ``auto_exit_button`` takes
+        effect here.
         """
         self._sync_tab_styles()
+        if self.tab_overflow_policy != self._tab_rows_policy:
+            self._lay_tab_rows()
+        self._match_auto_exit("tab_exit", extras=self._extra_items)
 
         # Clear and re-add in order: tab rows, content, extras.
         self.clear_items()
@@ -568,7 +684,7 @@ class TabLayoutView(_BaseTabMixin, StatefulLayoutView):
         if self._tab_names:
             await self._compose_tab_tree()
 
-    async def _refresh_tabs(self, *, previous_tab: Optional[int] = None):
+    async def _render_tabs(self, *, previous_tab: Optional[int] = None) -> Optional[RenderOutcome]:
         """Rebuild the active tab's content and ship the edit.
 
         The tab-button ActionRow and any items registered through
@@ -576,9 +692,15 @@ class TabLayoutView(_BaseTabMixin, StatefulLayoutView):
         only the tab content children are rebuilt.
         """
         await self._compose_tab_tree()
-        await self.refresh()
-        if self._edit_never_landed(previous_tab, self._active_tab, cursor="Tab"):
-            # A V2 tree IS the content, so the rollback rebuilds it or the next
-            # refresh ships the tab the cursor no longer names.
-            self._active_tab = previous_tab
-            await self._compose_tab_tree()
+        declined = self._declined_render()
+        if declined is not None:
+            # The view changed while this awaited: torn down, or armed.
+            return declined
+        outcome = await self.refresh()
+        await self._rewind_tab(previous_tab)
+        return outcome
+
+    async def _match_tab_tree(self) -> None:
+        # A V2 tree IS the content, so the restore rebuilds it or the next
+        # refresh ships the tab the cursor no longer names.
+        await self._compose_tab_tree()

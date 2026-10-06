@@ -530,13 +530,14 @@ class BattleshipLeaderboard(LeaderboardLayoutView):
         return f"**{wins}W** / {games - wins}L"
 
     def build_header(self, page):
-        # Aggregate stats read from the loaded top-N, rendered above the
-        # rankings on every page. Each game contributes to two player rows,
-        # so halve for unique games.
-        unique_games = sum(s.get("games", 0) for _, s in self.ranked_entries) // 2
+        # Server totals above the rankings on every page. get_entries() is
+        # every player (the entries= list); ranked_entries is only the top 25.
+        # Each game contributes to two player rows, so halve for unique games.
+        entries = self.get_entries()
+        unique_games = sum(s.get("games", 0) for _, s in entries) // 2
         return stats_card(
             "Overview",
-            {"Players": str(len(self.ranked_entries)), "Games Played": str(unique_games)},
+            {"Players": str(len(entries)), "Games Played": str(unique_games)},
         )
 
 

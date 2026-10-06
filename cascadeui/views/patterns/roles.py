@@ -33,6 +33,9 @@ _role_category_registry: Dict[str, RoleCategory] = {}
 # independently if the shape ever needs to diverge.
 _role_view_class_registry: Dict[str, type] = {}
 
+# (member id, role id) for each role click being handled.
+_role_clicks_in_flight: set = set()
+
 
 def _category_slug(name: str) -> str:
     """Normalize a category name to a custom_id-safe slug."""
@@ -98,7 +101,21 @@ class _RoleToggleButton(
             )
             return
 
-        await view_class._handle_role_click(interaction, category, self.role_id)
+        # A click reads the member's roles from its own interaction, so a second
+        # click sent before the first lands would repeat or undo that change. It
+        # is dropped like a toggle's double-click; the trailing ack answers it.
+        clicking = (interaction.user.id, self.role_id)
+        if clicking in _role_clicks_in_flight:
+            logger.debug(
+                f"Dropped a click on {view_class.__name__} ({self.custom_id!r}): the same "
+                f"role is still being toggled for this member"
+            )
+            return
+        _role_clicks_in_flight.add(clicking)
+        try:
+            await view_class._handle_role_click(interaction, category, self.role_id)
+        finally:
+            _role_clicks_in_flight.discard(clicking)
 
 
 # // ========================================( Shared Mixin )======================================== // #
@@ -136,11 +153,8 @@ class _BaseRolesMixin:
     subtitle: ClassVar[Optional[str]] = None
 
     # === Mode hints ===
-    # Text-size Unicode glyphs (not emoji) so all four hints render at the
-    # same visual weight on one line. Emoji code points (U+1F518 RADIO
-    # BUTTON et al.) trigger Discord's emoji renderer and produce a glyph
-    # noticeably larger than adjacent text characters, breaking visual
-    # alignment when paired with the asterisk.
+    # Text-size glyphs, not emoji: Discord draws an emoji code point (U+1F518)
+    # larger than the text beside it, out of line with the asterisk.
     hint_normal: ClassVar[Optional[str]] = None
     hint_exclusive: ClassVar[Optional[str]] = "◉"  # ◉ fisheye -- "select one"
     hint_required: ClassVar[Optional[str]] = "*"
@@ -153,15 +167,18 @@ class _BaseRolesMixin:
     swap_message: ClassVar[str] = "Switched to **{role}** (removed {removed})."
     role_error_message: ClassVar[str] = "Could not update roles: {error}"
 
-    # Each message is rendered inside a click handler, where a typo'd
-    # placeholder surfaces as a bare KeyError naming neither the attribute
-    # nor the fix. Each test value carries the type its own render site
-    # passes, because a format spec valid for one type is not valid for
-    # another. Four of them are strings (a role name, a category name, a
-    # joined list). ``error`` is an exception on the paths that matter, and
-    # an exception accepts only the empty format spec, so testing with one
-    # admits exactly the templates that also work when a caller passes the
-    # string half of the union.
+    _STR_OR_NONE_ATTRS: ClassVar[tuple] = (
+        "title",
+        "subtitle",
+        "hint_normal",
+        "hint_exclusive",
+        "hint_required",
+        "hint_exclusive_required",
+    )
+    # Each template renders inside a click handler, where a typo'd placeholder
+    # would raise a bare KeyError. The test values carry the type each render
+    # site passes, since a format spec valid for a str may not be for another;
+    # error is tested as an exception, the stricter half of its union.
     _FORMAT_ATTRS: ClassVar[dict] = {
         **StatefulLayoutView._FORMAT_ATTRS,
         "assigned_message": {"role": "r", "category": "c"},
@@ -170,6 +187,22 @@ class _BaseRolesMixin:
         "swap_message": {"role": "r", "category": "c", "removed": "x"},
         "role_error_message": {"error": RuntimeError("e")},
     }
+    # The role hooks and the hint router are classmethods: a role button
+    # dispatches with no view instance, so they read these from the class.
+    # A click finds its category in the registry the class body fills, so
+    # an instance's own categories render buttons no click can resolve.
+    _CLASS_ONLY_ATTRS: ClassVar[tuple] = (
+        "categories",
+        "assigned_message",
+        "removed_message",
+        "required_message",
+        "swap_message",
+        "role_error_message",
+        "hint_normal",
+        "hint_exclusive",
+        "hint_required",
+        "hint_exclusive_required",
+    )
 
     # === Registration ===
 
@@ -182,12 +215,9 @@ class _BaseRolesMixin:
         """
         super().__init_subclass__(**kwargs)
 
-        # The card and its buttons compose inside the synchronous build_ui,
-        # which runs from __init__ and cannot await these. An async override
-        # is not loud there: the coroutine becomes the card's text or the
-        # button's label, the placement validator passes it (it skips
-        # non-string content by design), and the mistake surfaces at HTTP
-        # send as unserializable JSON naming neither hook nor class.
+        # build_ui is synchronous and runs from __init__, so an async hook would
+        # put a coroutine in the card text or a label, pass the validator, and
+        # fail at send as unserializable JSON naming neither hook nor class.
         for name in (
             "format_category_title",
             "format_category_hint",
@@ -357,6 +387,13 @@ class _BaseRolesMixin:
             return
 
         category_role_ids = set(category.roles.values())
+        if role_id not in category_role_ids:
+            # A button from an older post of the panel, still live, can name
+            # a role the category no longer offers.
+            await await_maybe(
+                cls.on_role_error(interaction, "That role is no longer offered on this panel.")
+            )
+            return
         is_present = role in member.roles
 
         try:
@@ -396,11 +433,9 @@ class _BaseRolesMixin:
             )
             await await_maybe(cls.on_role_error(interaction, exc))
         except DISCORD_CALL_ERRORS as exc:
-            # RateLimited and aiohttp's transport errors are siblings of
-            # HTTPException, so they need naming or they bypass the
-            # on_role_error hook entirely. This button is a DynamicItem with no
-            # _scheduled_task beneath it, so an escape here reaches the user as
-            # a bare "interaction failed" rather than the hook.
+            # RateLimited and aiohttp's transport errors are not HTTPException
+            # subclasses, so the tuple names them; one escaping here would skip
+            # on_role_error and leave the click with a silent acknowledgement.
             logger.warning(f"HTTP error toggling role {role.name!r}: {exc}")
             await await_maybe(cls.on_role_error(interaction, exc))
 
@@ -454,7 +489,10 @@ class _BaseRolesMixin:
         role: discord.Role,
         category: RoleCategory,
     ) -> None:
-        """Called when a required-category removal is rejected. Default: ephemeral required_message."""
+        """Called when a required-category removal is rejected.
+
+        Default: an ephemeral ``required_message``.
+        """
         message = cls.required_message.format(role=role.name, category=category.name)
         await respond_safe(interaction, message, ephemeral=True)
 
@@ -516,6 +554,14 @@ class RolesLayoutView(_BaseRolesMixin, StatefulLayoutView):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._build_ui_sync()
+        # Stamped here as well as in build_ui(), which an override may replace.
+        self._heading_built_for = (self.title, self.subtitle)
+
+    async def on_load(self) -> None:
+        """Rebuild before a render when ``title`` or ``subtitle`` was set on
+        the instance after the panel was built, so the first message shows it."""
+        if (self.title, self.subtitle) != self._heading_built_for:
+            await await_maybe(self.build_ui())
 
     def build_ui(self) -> None:
         self.clear_items()
@@ -524,6 +570,7 @@ class RolesLayoutView(_BaseRolesMixin, StatefulLayoutView):
             self.add_item(TextDisplay(f"## {self.title}"))
         if self.subtitle:
             self.add_item(TextDisplay(self.subtitle))
+        self._heading_built_for = (self.title, self.subtitle)
 
         for category in self.categories:
             self.add_item(self.build_category_card(category))

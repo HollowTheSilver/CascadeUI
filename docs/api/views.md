@@ -19,9 +19,9 @@ theme=None,            # Per-view Theme override
 Pass either `context` or `interaction` -- both extract the user, guild, and interaction for `send()`. Use `context` from prefix/hybrid commands, `interaction` from app commands or component callbacks. A bare `discord.TextChannel` has no `.author`, so passing one as `context` derives no `user_id` and no `session_id`; the view is ownerless. See [View identity](../guide/persistence.md#view-identity-user_id-and-session_id-follow-the-construction-context) for the full model.
 
 !!! warning "Reserved constructor parameters"
-    Eight constructor kwargs already mean something to the library: `context`,
-    `interaction`, `message`, `state_store`, `session_id`, `user_id`,
-    `guild_id`, and `parent`. Application data under one of these names is not
+    Seven constructor kwargs already mean something to the library: `context`,
+    `interaction`, `state_store`, `session_id`, `user_id`, `guild_id`, and
+    `parent`. Application data under one of these names is not
     stored, it is read: `user_id` names the view's owner, and access control,
     session derivation, and instance scoping all consult it. An internal
     account id passed as `user_id` turns the access check into one no clicker
@@ -48,17 +48,22 @@ Sends the view as a message. V1 accepts `content`, `embed`, `embeds`, `file`, `f
 
 `allowed_mentions` overrides the [`allowed_mentions` class attribute](#allowed_mentions) for one send. When both are `None`, the bot's client-level rules apply.
 
-The V1 patterns (`PaginatedView`, `TabView`, `WizardView`, `FormView`, `MenuView`) supply their own content when the caller passes neither `embed` nor `content`, so `await view.send()` renders the first page, tab, step, or hub card. An explicit `embed=` or `content=` wins. See [View Patterns](../guide/patterns.md).
+The V1 patterns (`PaginatedView`, `TabView`, `WizardView`, `FormView`, `MenuView`) supply their own content when the caller passes no `content`, `embed`, or `embeds`, so `await view.send()` renders the first page, tab, step, or hub card. An explicit `content=`, `embed=`, or `embeds=` wins. See [View Patterns](../guide/patterns.md).
 
-**Return value:** the sent `discord.Message` on success, or `None` when the view was blocked before reaching Discord. Three conditions produce `None`:
+**Return value:** the sent `discord.Message` on success, or `None` when the send put no live view on a new message. Four conditions produce `None`:
 
 1. **`on_pre_send` veto** -- the override returned `False`. No message ships, no state registers, and the interaction's response slot stays open for the override to respond to the user.
 2. **Instance limit rejection** -- `instance_policy = "reject"` and the user has hit `instance_limit`. The `on_instance_limit` hook fires and handles the response automatically.
 3. **Participant registration failure** -- `auto_register_participants = True` and a user in `allowed_users` already occupies an instance of this view type. Rollback removes all side effects (registry, state tree, participants).
+4. **Closed or stopped during the send** -- an `exit()` (from the view's own `on_load()`, from another task, or an instance-limit replacement) closed the view while it was being sent, or `stop()` stopped it. Before the view has loaded and been checked against its instance limit, nothing is posted. After that, the message is posted and then frozen or deleted as the close asked; a stopped view is closed as `exit()` closes it, since no click can reach it.
 
-In each case, the view is fully cleaned up -- no message was sent, no state remains. See [send() and Rollback](../guide/views.md#send-and-rollback) for usage patterns.
+In each case the send leaves no state and no live message behind, and the first three post nothing. A view already live on a message and sent again stays live there when the new send is blocked. See [send() and Rollback](../guide/views.md#send-and-rollback) for usage patterns.
 
-All three are decided before the Discord call, which is what makes `None` mean "nothing happened". Once the message is live the rollback path is behind it, so a failure in the bookkeeping that follows the send degrades and logs what is inactive on the message rather than reporting the send as failed. `send()` still returns the message. Retrying on the return value therefore never posts a second copy.
+Sending a view that is already live on a message moves it: once the new message is posted, the one it left closes as `exit()` would close it, frozen or deleted by `exit_policy`, and stops answering clicks. A send that fails leaves the view on its old message.
+
+`send()` raises `RuntimeError` on a view that has closed (including one whose earlier send failed or was refused), whose timeout is running, or that handed its panel on (a `push()` or `pop()` from it, an ephemeral panel's Continue button, or a restart that restored the panel), and on one already being sent; construct a new view instead. A send made while a push or pop from the view is in flight waits for it first.
+
+None of the four puts a live view on a new message, which is what makes `None` safe to act on: retrying never puts a second live copy on screen. Once the message is live, a failure in the bookkeeping that follows the send is logged rather than reported as a failed send, and `send()` still returns the message.
 
 #### `dispatch(action_type, payload=None)`
 
@@ -127,7 +132,7 @@ Construction opens no connection and needs no token. A persistent view takes its
 
 `from cascadeui.testing import stub_interaction`
 
-Returns a `StubInteraction` that records what is said through it instead of sending it: the double [`Modal.submit`](components.md#await-modalsubmitinteraction-values-bool) expects. It carries a response slot that tracks whether it is spent, a followup, and a user id, which is what the library reads off a real one.
+Returns a `StubInteraction` that records what is said through it instead of sending it: the double [`Modal.submit`](components.md#await-modalsubmitinteraction-values-bool) expects. It carries a response slot that tracks whether it is spent and what spent it (`response.type`, as discord.py records it), a followup, and a user id, which is what the library reads off a real one.
 
 ```python
 interaction = stub_interaction()
@@ -138,9 +143,13 @@ assert "at least 5" in interaction.replies[0]
 
 `replies` merges the response slot and the followup into one list. Which of the two carries a rejection depends on the ack backstop's timing, an ordering internal to the library, so a test asserts on the message without predicting it. `deferred` reports whether the submission was acknowledged, and `answered` is true when either happened.
 
-#### `refresh(**kwargs)`
+#### `refresh(**kwargs)` {#refresh}
 
 Edits the view's message with `view=self` plus any extra kwargs forwarded to `message.edit()`. Does NOT rebuild components -- call your rebuild method (e.g. `build_ui()`) first. Handles `discord.NotFound` silently if the message has been deleted. V2 callers pass no args; V1 callers pass `embed=` or `content=`.
+
+A refresh another task makes while the view is being sent, or while a `push()` or `pop()` from the view is in flight, returns `RenderOutcome.DEFERRED` and is held. It runs once the message exists or a failed navigation hands the view back, with the `embed=`, `content=`, or `attachments=` it was called with, and never over an edit asked for after it. When the push or pop lands, the view has left the message and the held refresh is dropped with it. See [Renders That Run Late](../guide/known-limitations.md#renders-that-run-late).
+
+On a view that has closed (exited, timed out, or stopped), the edit still ships and shows the controls as the close left them: disabled, with link buttons still clickable since a link opens its URL on its own, or left off where a V1 `exit()` removed them. An `on_timeout()` override can therefore compose a final card after `super()` and refresh it, and a late update from a caller's own loop cannot make a closed panel look live again. Inside a `refresh_cooldown_ms` window or a rate-limit backoff, a closed view's render ships when the window ends, as the tree stands, with the keywords it was called with; one Discord itself refuses with a 429 is dropped with a warning. When the close deleted the message, a render sends nothing and returns `RenderOutcome.NO_MESSAGE`.
 
 A transport failure (a request that never reached Discord, which raises from aiohttp and carries no HTTP status) is swallowed rather than raised: the edit is dropped, the render baseline is cleared so the next state change re-ships, and `refresh_degraded` reports it. Raising would surface a network blip as `on_error`'s failure card over a repaint that merely needs repeating. See [Transport Failures Degrade Quietly](../guide/known-limitations.md#transport-failures-degrade-quietly).
 
@@ -178,7 +187,7 @@ Nothing is restored when the render lands, nor when the block raises: an excepti
 
 Read-only `bool`. `True` when the most recent `refresh()` was dropped by a transport failure, `False` otherwise. Reset at the top of every `refresh()`, so it always describes the latest call.
 
-Read it when the caller changed something *before* the render that should not stand if the render never landed. A paginated view is the worked example: the page cursor advances first, so a dropped edit otherwise leaves the reader on the previous page with the cursor already moved.
+Read it when the caller changed something *before* the render that should not stand if the render never landed. A paginated view is the worked example: the page cursor advances first, so a dropped edit otherwise leaves the user on the previous page with the cursor already moved.
 
 ```python
 before = self.current_page
@@ -222,6 +231,8 @@ Opens a modal dialog, with a graceful fallback if the response slot is already c
 
 Returns `True` if the modal was sent, `False` if the fallback fired.
 
+A modal stays open after the view that opened it closes, so a user can submit one to a view that has timed out. A `Modal` opened this way still runs its callback. When the view had closed before the callback ran, and the callback neither replied (through `respond()` or the interaction's response) nor deferred the submission itself (a defer made by the callback is taken as the start of its own followup), `on_session_ended()` runs, which sends the view's `session_ended_message` ("This session has ended." by default), rather than the user seeing nothing happen. A raw `interaction.followup.send()` passes no library code, so a callback that sends one without deferring first, after the ack backstop has deferred for it, is followed by the notice too: reply through `respond()`, or defer first and then use the followup. A callback that closes or moves the view itself is not followed by the notice, and neither is a submission to a view that navigated with `push()` or `pop()` while the view that took its place is open. A submission that fails validation on a closed view gets the notice instead of the list of fields to fix, since the form cannot be reopened. Whenever nothing is said, the submission is still acknowledged.
+
 ```python
 await self.open_modal(interaction, modal)
 
@@ -233,25 +244,47 @@ Use `self.open_modal()` instead of `interaction.response.send_modal()` in any Ca
 
 #### `attach_child(child_view)`
 
-Registers a child view for automatic cleanup. When the parent exits or times out, all attached children that haven't finished are exited with `delete_message=True`. Enforces three invariants: self-attachment raises `ValueError`, circular chains raise `ValueError`, and re-parenting detaches from the old parent cleanly. The `parent=` kwarg on the child's constructor automates this -- `send()` calls `attach_child` on success. See [Child Attachment](../guide/views.md#child-attachment).
+Registers a child view for automatic cleanup. When the parent exits or times out, all attached children that haven't finished are exited with `delete_message=True`. Enforces three invariants: self-attachment raises `ValueError`, circular chains raise `ValueError`, and re-parenting detaches from the old parent cleanly. The `parent=` kwarg on the child's constructor automates this -- `send()` calls `attach_child` on success. A view that has handed its panel on (a `push()` or `pop()` from it, an ephemeral panel's Continue button, or a restart that restored the panel) stands for the view that took its place, as the parent or as the child. See [Child Attachment](../guide/views.md#child-attachment).
+
+#### `exit_children(*, delete_message=True)` *(async)*
+
+Exits every view attached to this one and leaves this view open: the same cascade its own exit or timeout runs, for a parent whose companions go before it does (a game view closing its players' private panels when a round ends). `delete_message` is passed to the `exit()` of each child still open: `True` deletes its message, `False` freezes it, and `None` leaves it to the child's `exit_policy`. A child that already closed, by its own timeout or `exit()`, keeps what that close left. A child with a push or pop in flight is waited out, and the view that took its place is the one closed. A view attached while it runs is left alone, for the next call or the parent's own exit. Called from inside a push or pop a child takes part in (the new view's `on_load()` or a rebuild hook), it raises `RuntimeError` before closing anything.
 
 #### `parent`
 
-Read-only property holding the view this one is attached to, or `None` for a root. A child constructed with `parent=` reads it before the send that attaches it, and every child reads it after, so a child panel that needs its parent to read state or call `respond` has it without storing the same view a second time under its own name. Mutation goes through `attach_child` on the parent, which enforces the invariants above.
+Read-only property holding the view this one is attached to, or `None` for a root. A child constructed with `parent=` reads it before the send that attaches it, and every child reads it after, so a child panel that needs its parent to read state or call `respond` has it without storing the same view a second time under its own name. A parent that has handed its panel on (a `push()` or `pop()` from it, or an ephemeral panel's Continue button) reads as the view that took its place. Mutation goes through `attach_child` on the parent, which enforces the invariants above.
+
+#### `current_view`
+
+Read-only property holding the view now showing this view's panel: this view, or the view it handed the panel to, following each hand-off in turn. A hand-off is a `push()` or `pop()`, the Continue button of an ephemeral panel, whose replacement goes on a new message, or a [restart in the same process](../guide/persistence.md#restarting-in-the-same-process) that restored the panel. The library returns the new view only to the callback that ran the hand-off, so code that keeps a reference to the panel (a cog closing it from a slash command, say) reaches the screen now on it through this: `await panel.current_view.exit()`. After `replace()` the old view reads as itself, since the caller already holds the view it returned. `refresh()`, `reload()`, `load()`, `exit()`, and `exit_children()` called on the old view do nothing, and the first such call logs a warning naming the view the panel shows now; `push()`, `pop()`, `replace()`, and `send()` raise `RuntimeError`.
 
 #### `on_timeout()` *(async, override)*
 
-Called when the view's timeout elapses. The default is the full teardown: it exits attached children, cancels tasks, unsubscribes from the store, drops the registry entries, and then edits the message with every component disabled. Freezing is unconditional, since `exit_policy` governs close gestures and an expiry is not one.
+Called when the view's timeout elapses. The default is the full teardown: it exits attached children, cancels tasks, unsubscribes from the store, drops the registry entries, and then edits the message with every control disabled except link buttons, which open their URL with no view behind them. Freezing is unconditional, since `exit_policy` governs close gestures and an expiry is not one.
+
+A view pushed onto a persistent panel's message does not freeze it: when its timeout elapses it returns to the panel with `pop()`, since the panel never times out and a frozen message would stay dead until a restart. Defining `on_timeout()` on the pushed view opts it out, and it times out as the override says. A return that fails times out as usual. See [Retiring a registration](../guide/persistence.md#retiring-a-registration).
 
 An override that neither delegates to `super().on_timeout()` nor calls `exit()` leaves the view subscribed and registered, still holding its instance-limit slot. Either one tears it down. Render before tearing down: both unsubscribe, so a dispatch issued afterwards no longer reaches the view that made it. See [Timeout](../guide/views.md#timeout).
 
+#### `build_refresh_button()` *(override)*
+
+Builds the Continue button the ephemeral refresh handoff shows shortly before the 15-minute window closes. The default is a `StatefulButton` from the `refresh_button_label`, `refresh_button_style`, and `refresh_button_emoji` class attributes. Override it for what those do not cover, such as a custom `custom_id` or row placement, starting from `super().build_refresh_button()` so the button still runs the handoff, and return the button itself: a V2 view wraps it in a row. May be `async def`. A button that cannot be built or placed (an override that raises, a label past 80 characters) is logged as a warning and the panel stays as it was. A class that overrides the older name `_build_refresh_button()` keeps working, called through this one, and gets a `DeprecationWarning` when it is defined.
+
+#### `build_reopen_view(interaction)` *(override)*
+
+Builds the view the ephemeral refresh handoff's Continue button sends in place of this one. Called on this view with the Continue click; the view it returns is sent as a new ephemeral message and takes this view's place, carrying over the navigation stack, the selection `get_nav_state()` reports, the session, undo history, participants, and attached views, and [`current_view`](#current_view) on this view reaches it. The default constructs this view's class again with the keyword arguments it was constructed with, the reconstruction `pop()` performs. Return `None` to end the session instead: `on_reopen_failure()` then runs with `error=None`. A raise runs it with the exception, and so does a result that cannot be sent: this same view, or another one already sent, pushed, or closed (`RuntimeError`), or anything that is not a CascadeUI view instance, such as the class itself (`TypeError`). May be `async def`.
+
 #### `on_message_delete()` *(async, override)*
 
-Called when the view's Discord message is deleted externally: by a delete or bulk purge (reported by the gateway to a bot holding the message intents), by deleting the channel or thread holding it, or by an edit that finds the message already gone (after `on_message_gone()`). A view already torn down is not called again. Default calls `exit(delete_message=False)`. Override for custom behavior (logging, re-sending). If overriding without calling `exit()` or `super().on_message_delete()`, the view remains as a ghost in the state store. See [Message Deletion Cleanup](../guide/views.md#message-deletion-cleanup).
+Called when the view's Discord message is deleted externally: by a delete or bulk purge (reported by the gateway to a bot holding the message intents), by deleting the channel or thread holding it, or by an edit that finds the message already gone (after `on_message_gone()`). A view already torn down is not called again. Default calls `exit(delete_message=False)`, and when a `push()` or `pop()` from the view lands while that exit waits, closes the view it handed the message to as well. Override for custom behavior (logging, re-sending). If overriding without calling `exit()` or `super().on_message_delete()`, the view remains as a ghost in the state store. See [Message Deletion Cleanup](../guide/views.md#message-deletion-cleanup).
 
 #### `on_message_gone()` *(async, override)*
 
-Called when `refresh()` issues an edit that returns `discord.NotFound` (the message was deleted out from under the view). The library nulls `self._message` and fires this hook so a consumer tracking the message in its own store can reconcile that reference; key the reconcile on the view's stable identity (`persistence_key`), since `self._message` is already nulled. Default is a no-op. The hook itself does not exit the view: once it returns, the library tears the view down on its own task through `on_message_delete()`, so an override never needs to exit, and a bot without message intents still retires the view. A deletion the gateway also reports can reach a consumer through both hooks, so make the reconcile idempotent. It may run while the view's update lock is held, so an override may do I/O but should not dispatch a state change back into this view.
+Called when `refresh()` issues an edit that returns `discord.NotFound` (the message was deleted out from under the view). It is not called when the view's own close deleted the message. The library nulls `self._message` and fires this hook so a consumer tracking the message in its own store can reconcile that reference; key the reconcile on the view's stable identity (`persistence_key`), since `self._message` is already nulled. Default is a no-op. The hook runs on a task of its own once the render that found the message gone has returned, so an override may dispatch, reload, or send the view again; it is not called when a send has moved the view to a new message by then. The hook itself does not exit the view: once it returns, the library tears the view down through `on_message_delete()` unless the override sent it again, so an override never needs to exit, and a bot without message intents still retires the view. A deletion the gateway also reports can reach a consumer through both hooks, so make the reconcile idempotent.
+
+#### `on_session_ended(interaction)` *(async, override)*
+
+Called when a user reaches this view's session after it ended: a modal submitted after the view closed (see [`open_modal()`](#open_modal)), or the ephemeral Continue button when `build_reopen_view()` returned `None`. Default sends `session_ended_message` as an ephemeral, or nothing when it is `None`. Override for a localized reply, an embed, or logging. May be `async def` or plain `def`; a raise is logged, and the interaction is still acknowledged.
 
 #### `on_replaced()` *(async, override)*
 
@@ -259,7 +292,7 @@ Called on the old view when `instance_policy = "replace"` is about to evict it. 
 
 #### `check_instance_available(*, user_id=None, guild_id=None, session_origin=None, state_store=None)` *(classmethod)*
 
-Sync pre-check that returns `True` if a new instance slot is available, `False` if the limit would be exceeded. Counts both owners and participants. Avoids constructing the view when `__init__` is expensive. Returns `True` when no `instance_limit` is set or when scope can't be determined (missing `user_id`/`guild_id`).
+Sync pre-check that returns `True` if a new instance slot is available, `False` if the limit would be exceeded. Counts both owners and participants. Avoids constructing the view when `__init__` is expensive. Returns `True` when no `instance_limit` is set or when scope can't be determined (missing `user_id`/`guild_id`). `session_origin` is the key of a navigation chain's root view (`f"{cls.__module__}.{cls.__qualname__}"`, or its `session_class_key`): a view reached by `push()` counts under its root, with the root's `instance_scope` and `instance_limit`, and passing the root's key checks a pushed class the same way (see [Pre-Checking Availability](../guide/views.md#pre-checking-availability-command-level-guard)). As a classmethod it reads the root class's `instance_limit`; a limit set on one panel with `set_class_attribute()` is not visible to it, though `register_participant()` on that panel enforces it.
 
 #### `auto_refresh_ephemeral` *(class attribute)*
 
@@ -283,11 +316,13 @@ See [Auto-Refresh for Long-Lived Ephemerals](../guide/views.md#auto-refresh-for-
 
 #### `replace(view_or_class, interaction=None, **kwargs)`
 
-Replaces the current view with another view. One-way (no stack history saved). `view_or_class` accepts either a view class (constructed internally with `**kwargs`) or a pre-constructed view instance (used directly; `**kwargs` must be empty).
+Replaces the current view with another view. One-way (no stack history saved). `view_or_class` accepts either a view class (constructed internally with `**kwargs`) or a pre-constructed view instance (used directly; `**kwargs` must be empty). An instance goes on one message once: one that has been sent, pushed, or closed raises `RuntimeError`.
+
+The returned view has no message yet: call its `send()`. The current view closes as its `exit()` would, so its `exit_policy` freezes its message (the default) or deletes it, a persistent panel's registration is removed, and views attached to it close. An `exit()` override on the current view runs as well. A `replace()` that fails leaves the current view working and its message untouched, and a `push()` or `pop()` made on it while the `replace()` runs raises `RuntimeError`. On a view that has handed its panel on (a `push()` or `pop()` from it, an ephemeral panel's Continue button, or a restart that restored the panel), `replace()` raises `RuntimeError` as `push()` and `pop()` do, since the panel is another view's: replace from [`current_view`](#current_view). It raises too on the view a failed `push()` or `pop()` returned, since the panel is still on the view the navigation started from. A view that has closed can still be replaced, which is how an `on_timeout()` override swaps the panel for a new message.
 
 #### `push(view_or_class, interaction, *, rebuild=None, **kwargs)`
 
-Pushes the current view onto the navigation stack and navigates to the next view. `view_or_class` accepts either a view class (constructed internally with `**kwargs`; constructor kwargs auto-captured so `pop()` can reconstruct faithfully) or a pre-constructed view instance (used directly; `**kwargs` must be empty). The instance form pairs with the classmethod constructors, like `PaginatedLayoutView.from_data` (awaited) and `from_cursor` (called bare), where the view is built before the navigation call.
+Pushes the current view onto the navigation stack and navigates to the next view. `view_or_class` accepts either a view class (constructed internally with `**kwargs`; constructor kwargs auto-captured so `pop()` can reconstruct faithfully) or a pre-constructed view instance (used directly; `**kwargs` must be empty). The instance form pairs with the classmethod constructors, like `PaginatedLayoutView.from_data` (awaited) and `from_cursor` (called bare), where the view is built before the navigation call. An instance goes on one message once: one that has been sent, pushed, or closed raises `RuntimeError`, so build a new one for each push rather than caching it.
 
 Passing extra kwargs alongside an instance raises `TypeError` -- the instance is already initialized.
 
@@ -295,9 +330,13 @@ The Discord message edit fires on every push regardless of whether `rebuild` is 
 
 Omitting `rebuild` does not mean no rebuild runs: the destination's own [`nav_rebuild`](#nav_rebuild) applies instead, which is how every V1 pattern renders itself on arrival. An explicit `rebuild=` wins over it.
 
+Either hook runs after the destination's `on_load()`, and the edit ships after the hook returns, so a hook that calls the destination's `reload()` or `load()` raises `RuntimeError`. State the load reads goes on the view before navigating: a constructor keyword, or a view built and passed as the instance form.
+
+Only the navigation edits the message while it runs. The current view stays live, background tasks and state subscription included, but what it is asked to render is held: a failed edit leaves it working on the message it still owns, and it renders what it held once. An edit that stalls may still have reached Discord, so the current view then redraws itself with the content `pop()` would restore. The destination does not render until its edit lands, so it never ships a tree its `on_load()` has not built. Once the edit lands, the message and any persistent registration it carries belong to the destination: the current view's `message` reads `None`, its tasks are cancelled, a second `push()` or `pop()` on it raises `RuntimeError`, and `exit()` on it does nothing. An `exit()`, a timeout, `replace()`, a parent's cleanup, or another `push()` or `pop()` that starts on either view while the edit is in flight waits for the outcome, and a click that reaches the current view is dropped once it has moved on. Called from inside the navigation instead (the destination's `on_load()`, or a `rebuild=` or `nav_rebuild` hook), `push()`, `pop()`, `replace()`, and `exit()` raise `RuntimeError` on either view, since the navigation has not yet decided which one owns the message, and so does a parent's `exit()` that would close either. `push()` and `pop()` on a view that has closed through `exit()`, a timeout, or `stop()`, or whose `exit()` or `replace()` has begun, raise as well, and a click reaching it is acknowledged and dropped. A click can reach a view as soon as its message is posted, while `send()` is still finishing: a `push()`, `pop()`, or `replace()` then waits for the send, and one called from inside the send itself (the view's `on_pre_send()`, `on_load()`, `seed_initial_state()`, or a hook the send runs) raises `RuntimeError`. A push or pop made without an interaction runs the destination's `on_load()` and edits the message through the channel. So does one driven by a slash command or by a click on another message, after acknowledging it: a command's original response may be a different message from the panel. While a push or pop is in flight, the panel counts once toward its `instance_limit`.
+
 #### `pop(interaction, *, rebuild=None)`
 
-Pops the top entry from the navigation stack, reconstructs that view with its original kwargs, and returns it. Returns `None` if the stack is empty. Non-reconstructible kwargs (`context`, `interaction`, etc.) are re-supplied by the framework. `rebuild` takes the same shape as `push(rebuild=...)` and is rarely needed, since the restored view's [`nav_rebuild`](#nav_rebuild) already names how it renders.
+Pops the top entry from the navigation stack, reconstructs that view with its original kwargs, and returns it. Returns `None` if the stack is empty. Non-reconstructible kwargs (`context`, `interaction`, etc.) are re-supplied by the framework. `rebuild` takes the same shape as `push(rebuild=...)` and is rarely needed, since the restored view's [`nav_rebuild`](#nav_rebuild) already names how it renders. The view it is called on hands its message over the same way `push()` does, and raises `RuntimeError` when it already has.
 
 #### `batch()`
 
@@ -343,6 +382,10 @@ await self.update_session(lang="fr", difficulty="hard")
 
 Overrides a class-level policy attribute (`participant_limit`, `instance_limit`, `instance_policy`, etc.) with a per-invocation value while running the same `__init_subclass__` validator pipeline. Resolves the grammar tension where views need to parameterize a policy from a slash-command argument without bypassing validation.
 
+An override takes effect from the view's next render: its send, a page, tab, or step change, a push or pop onto it, or `reload()`. A pattern's buttons and layout (labels, styles, `jump_threshold`, `tab_overflow_policy`, `auto_exit_button`, and so on) are rebuilt then, and `enable_undo`, `undo_limit`, and `subscribed_actions` apply when set. A bare `refresh()` re-sends the tree as it stands. `pop()` and the Continue button rebuild a view from its constructor arguments and set its overrides again on the view they build. A restart does not: a persistent panel is restored from its stored constructor arguments and reads its class values. For an override that must outlive a restart, take the value as a constructor argument and call `set_class_attribute()` in `__init__`, which the restore runs again.
+
+An attribute the library reads with no view instance in hand raises `ValueError`, since a value set on one instance could never be read: `session_continuity` (read inside `__init__`), `persistent_slots` and `session_class_key` (read when the class is defined), a persistent view's `kwargs_schema_version` (read at restore), and the roles panel's `categories`, `*_message`, and `hint_*` attributes (read by a role button's click, which has no panel instance). Set those on the class body.
+
 ```python
 view = LobbyView(context=ctx)
 view.set_class_attribute("participant_limit", player_count)
@@ -382,6 +425,10 @@ Adds an exit button that calls `self.exit()`. In V2 views, the button is wrapped
 #### `await exit(delete_message=None)`
 
 Cleans up the view: cancels tasks, unsubscribes, disables components. When `delete_message` is `None` (the default), behavior is resolved from the `exit_policy` class attribute (`"disable"` freezes, `"delete"` deletes). Pass `True` or `False` explicitly to override the policy at any call site. V2 views freeze components in place (since `edit(view=None)` would empty the message); V1 views strip the view entirely.
+
+A view is torn down once. Called while another `exit()` or a timeout is closing the view, `exit()` waits for it, for up to 30 seconds, after which that close carries this one out when it finishes. Called after one, it does only what that teardown left undone: it retires a persistent registration the view still carries (a timeout keeps it), freezes a message nothing froze, and deletes the message when asked. `VIEW_DESTROYED` reaches hooks and subscribers once per view. Content another task passed to `refresh()` while the view was being sent, or while a push or pop from it was in flight, still reaches a frozen message, under the frozen controls; a delete ships nothing first. A state change still waiting on another task's reload is not shown, since a view stops rendering from state once it begins closing. Called while the view is being sent, the send carries the close out and `exit()` returns at once: see [`send()`](#send). Called from inside a push or pop the view or one attached to it takes part in (the new view's `on_load()` or a rebuild hook), it raises `RuntimeError` before closing anything.
+
+On a view that has handed its panel on (a `push()` or `pop()` from it, including one that lands while this call waits for it, an ephemeral panel's Continue button, even one still sending its replacement when this call is made, or a restart that restored the panel), `exit()` does nothing: code still holding the old view (its own timeout, the lines right after the push) refers to a view that has handed its message on, not to the one that replaced it. Close the panel through the view the navigation returned, or through [`current_view`](#current_view) from a reference kept outside the panel. The library's own cleanup (an instance-limit replacement, a parent's cleanup, a persistent panel's retirement, the devtools exits) closes whichever view holds the place.
 
 #### `get_theme()`
 
@@ -446,17 +493,32 @@ def restore_nav_state(self, state):
     self._severity = state.get("severity", self._severity)
 ```
 
-#### `await reload()`
+#### `await reload()` {#reload}
 
 Runs `on_load()` followed by `refresh()`. The out-of-band counterpart to the automatic `on_load()` calls: use it inside a callback that mutated the view's data source and needs an immediate re-fetch and re-render. Under an active `refresh_cooldown_ms` window (or a 429 backoff), the whole reload, including the `on_load()` fetch, is deferred to the window boundary and coalesced with any other pending reload. Boolean keywords OR across a coalesced window, so a `force=True` is not lost to a later unforced call.
 
-Reloads on one view run one at a time. A reload arriving while another is mid-fetch waits its turn and then re-fetches, so the last to run renders the freshest data. Calling `reload()` from inside the view's own `on_load` raises `RuntimeError`.
+Every `on_load()` run on one view happens one at a time: the send's, a push or pop's, and each `reload()` and `load()`. A reload arriving while another is mid-fetch waits its turn and then re-fetches, so the last to run renders the freshest data. While the view is being sent, a reload waits out the send's own `on_load()` and its delivery; one arriving while the send registers the view runs there, its data ships in the first message, and it returns `DEFERRED`. A reload on a view that is the source of a push or pop in flight runs `on_load()` at once and returns `DEFERRED`: its edit ships if the navigation fails and hands the view back, and is dropped with the view if the navigation lands. A state change that arrives meanwhile does not wait: its `on_state_changed()` runs once the turn is released, or during a send once the message exists, against the state at that point. An `exit()` or timeout that closes the view meanwhile freezes it without that change. The reverse does wait: a reload that starts while `on_state_changed()` is running in another task waits for it to finish.
 
-Returns a `RenderOutcome`: `RENDERED` (the edit reached Discord), `SKIPPED` (the tree matches the last shipped render), `DEFERRED` (a scheduled task re-renders at the throttle boundary), `DROPPED` (attempted, not known to have landed, nothing scheduled), or `NO_MESSAGE` (no editable message remains, so retrying cannot help). `None` when a subclass render override reports nothing. Members compare equal to their string values, so `outcome == "deferred"` works. `refresh()` returns the same type.
+Calling `reload()` from inside the view's own `on_load`, or from a `rebuild=` or [`nav_rebuild`](#nav_rebuild) hook on a navigation to it, raises `RuntimeError`. So does a reload that would wait forever: two views whose `on_load` awaits the other's `reload()` or `load()` hang each other when both start at once, and the second to queue raises instead, naming the views. The check follows direct awaits only; a cycle through `asyncio.gather()` or a task the `on_load` created still hangs, and logs a warning once the wait passes 30 seconds. Keep `on_load` to loading its own view's data, and reload another view after this reload returns. The same applies to `on_state_changed()`: one that awaits a separate task reloading its own view, such as `asyncio.gather(self.reload())`, waits on a reload that is waiting for it. Await `self.reload()` directly there, which runs inside the render.
+
+Returns a `RenderOutcome`: `RENDERED` (the edit reached Discord), `SKIPPED` (the tree matches the last shipped render), `DEFERRED` (nothing shipped yet; the render runs later, at the throttle boundary, once a send in progress has created the message, or when a failed navigation hands the view back), `DROPPED` (attempted, not known to have landed, nothing scheduled), or `NO_MESSAGE` (no editable message remains, or the view was torn down by the time the reload's turn came, so retrying cannot help). `None` when a subclass render override reports nothing. Members compare equal to their string values, so `outcome == "deferred"` works. `refresh()` returns the same type.
 
 ```python
 async def on_refresh(self, interaction):
     await self.reload()
+```
+
+#### `await load()`
+
+Runs `on_load()` without editing the message: `reload()` with the render step left out. Use it when a view's loaded data is read by something other than its own message, such as a companion view that renders from it, so the load stays serialized with the view's reloads without spending an edit on a message that does not change. No throttle applies, since a load ships nothing.
+
+Returns `True` when `on_load()` ran. Returns `False` without running it while an ephemeral view is armed for its refresh handoff, since `on_load()` would rebuild the tree over the refresh button, and once the view has been torn down, since its `on_load()` may read state the teardown cleared. Raises `RuntimeError` in the same cases `reload()` does.
+
+```python
+class Controls(StatefulLayoutView):
+    async def on_load(self):
+        await self.rankings.load()  # serialized with the rankings' own reloads
+        self.build_ui()
 ```
 
 #### `await seed_initial_state(state)` *(override)*
@@ -516,8 +578,8 @@ Called before every component callback. Returns `True` to allow, `False` to bloc
 ### Shared Properties
 
 - `id` (str): UUID instance identifier
-- `persistence_key` (str | None): Stable data identity key
-- `message` (Message | None): The sent message, if any
+- `persistence_key` (str | None): Stable data identity key. A value that is not a string raises `TypeError` and an empty string raises `ValueError`, since stored keys come back from the database as strings
+- `message` (Message | None): The sent message, if any. `None` once a `push()` or `pop()` from the view lands, since the destination owns it then
 - `state_store` (StateStore): The singleton store
 - `session_id` (str | None): Session identity for this view. `None` when no `user_id` could be derived (channel-posted views have no `.author`, so they carry no session). When `user_id` is present, auto-derived as `<module.QualName>:user_<id>:<8hex>` unless `session_continuity = True` is set on the class (which drops the `:<8hex>` suffix) or an explicit `session_id=` kwarg is passed.
 - `scoped_state` (dict): The scoped state for this view's user/guild (empty dict if no state_scope)
@@ -526,20 +588,23 @@ Called before every component callback. Returns `True` to allow, `False` to bloc
 ### Shared Class Attributes
 
 !!! note "Validated at subclass-definition time"
-    Class attributes whose values are bounded -- string enums (`instance_policy`, `instance_scope`, `state_scope`, `replace_policy`, `exit_policy`), positive integers (`instance_limit`, `participant_limit`, `undo_limit`), positive floats (`edit_timeout`, and `auto_defer_delay`, which must also stay under `3.0`), and booleans (`owner_only`, `auto_defer`, `auto_register_participants`, etc.) -- are validated by `_StatefulMixin.__init_subclass__` when a subclass is defined. A typo like `instance_policy = "rejct"` raises `ValueError` at module import with a message naming the class, the attribute, the bad value, and the valid options. Validation runs once per subclass at class-definition time and inspects only `cls.__dict__`, so per-subclass cost is `O(overrides-on-this-subclass)` -- inherited defaults pay zero cost. There is no per-instantiation overhead.
+    Class attributes whose values are bounded are validated by `_StatefulMixin.__init_subclass__` when a subclass is defined: string enums (`instance_policy`, `instance_scope`, `state_scope`, `replace_policy`, `exit_policy`), positive integers (`instance_limit`, `participant_limit`, `undo_limit`), positive floats (`edit_timeout`, and `auto_defer_delay`, which must also stay under `3.0`), and booleans (`owner_only`, `auto_defer`, `auto_register_participants`, etc.). A typo like `instance_policy = "rejct"` raises `ValueError` at module import with a message naming the class, the attribute, the bad value, and the valid options. Validation runs once per subclass at class-definition time and inspects only `cls.__dict__`, so per-subclass cost is `O(overrides-on-this-subclass)` and inherited defaults pay zero cost. There is no per-instantiation overhead.
 
 - `subscribed_actions` (set[str] | None): Action types to listen for. Default is an empty set (no notifications). Set the actions your view needs to react to. Set to `None` to receive all actions (not recommended). Every matching dispatch fires the view's `on_state_changed()`, so subscribe only to actions the view reads.
 - `state_scope` (str | None): `"user"`, `"guild"`, `"user_guild"`, `"global"`, or `None`. Determines state scoping.
+- `scoped_slot` (str | None): The slot under `state["application"]` that this view's scoped reads and writes use. `None` (default) uses the shared `"scoped"` slot. A subsystem that names its own slot can list it in `persistent_slots` without saving every other subsystem's scoped data. Read by `scoped_state`, `scoped_state_for()`, and `dispatch_scoped()`, including calls that pass their own scope.
 - `enable_undo` (bool): Enable undo/redo for this view (default: `False`).
 - `undo_limit` (int): Max undo stack depth (default: `20`).
 - `auto_back_button` (bool): Automatically add a back button when pushed (default: `False`).
 - `instance_limit` (int | None): Maximum active instances within the instance scope. `None` (default) means unlimited.
 - `instance_scope` (str): How instances are grouped for limit counting. One of `"user"`, `"guild"`, `"user_guild"` (default), or `"global"`.
 - `instance_policy` (str): What to do when the limit is exceeded. `"replace"` (default) exits the oldest instances. `"reject"` blocks `send()` -- `on_instance_limit` fires and `send()` returns `None`.
+- `instance_limit_message` (str | None): Ephemeral message the default `on_instance_limit` sends when the limit rejects a send. `None` (default) or an empty string uses `InstanceLimitError.default_message`, which is worded for who the limit counts (the user, the server, everyone, or a joiner already taking part elsewhere) and for a limit of one or more. Override `on_instance_limit` for anything more.
 - `owner_only` (bool): Only the creating user can interact with the view (default: `True`). Set to `False` for shared views.
 - `unauthorized_message` (str): Ephemeral message sent to non-owners (default: `"You cannot interact with this."`).
 - `error_message` (str): Description used in the default `on_error` red embed (default: `"An unexpected error occurred while processing your interaction."`).
 - `reopen_failure_message` (str): Ephemeral message sent when the ephemeral refresh button fails to reconstruct the view (default: `"Could not refresh this view. Please reopen from the original command."`). Used by the default `on_reopen_failure` hook. Only relevant for ephemeral views where the auto-refresh handoff is engaged (either `auto_refresh_ephemeral = True` or derived from a timeout greater than `900`).
+- `session_ended_message` (str | None): Ephemeral message the default `on_session_ended` sends when a modal is submitted after its view closed, or when `build_reopen_view()` returns `None` for the refresh button (default: `"This session has ended."`). `None` sends nothing.
 - `allowed_users` (frozenset[int] | None): `None` (default) defers to `owner_only`. Once set to anything else, only those user IDs can interact and `owner_only` is ignored entirely. The gate tests `is not None`, so an explicitly assigned empty set admits nobody rather than falling back: clear the list by assigning `None`, not `set()`. Because the default is `None`, guard membership checks (`if view.allowed_users and uid in view.allowed_users`) rather than testing `in` directly. Stored as a `frozenset` and exposed via a property pair: assignment coerces both `int` and snowflake-shaped objects (`Member`, `User`, `Object`) at the setter, so `view.allowed_users = {member, 12345}` works. Direct mutation is unsupported -- to add a user after construction, use `await view.register_participant(user_id)` (which writes to `_participants`, not `allowed_users`) or rebind the attribute: `view.allowed_users = view.allowed_users | {new_id}`.
 - `participant_limit` (int | None): Maximum total view occupants (owner + participants). `None` (default) means unlimited. Owner counts toward the cap, so `participant_limit = 8` admits one host plus seven joiners. Enforced inside `register_participant`.
 - `participant_limit_message` (str): Ephemeral message sent when `register_participant` rejects a joiner due to view-capacity overflow (default: `"This session is full."`). Used by the default `on_participant_limit` hook.
@@ -547,13 +612,13 @@ Called before every component callback. Returns `True` to allow, `False` to bloc
 - `protect_attached` (bool): When `True` (default), views with active participants or attached children from other users are excluded from replacement candidates during instance enforcement. If no replaceable views remain, falls back to reject behavior (`on_instance_limit` fires). Same-user attachments do not trigger protection. Has no effect on views without attachments or when `instance_policy = "reject"`. Set to `False` for views where silent replacement is expected (e.g. spectator panels).
 - `replaced_message` (str | None): Static message sent to the channel when this view is replaced and has active participants. `None` (default) means silent replacement. Used by the default `on_replaced` hook.
 - `replace_policy` (str): What `instance_policy="replace"` does to the old view's message. `"delete"` (default) removes it; `"disable"` freezes its components in place. Only governs the instance-replace transition.
-- `exit_policy` (str): What bare `exit()` calls do when no `delete_message` argument is supplied. `"disable"` (default) freezes the components in place; `"delete"` removes the message. Always overridden by an explicit `delete_message=` argument or by an `exit()` method override. Independent of `replace_policy`.
-- `auto_defer` (bool): Enable the auto-defer safety net (default: `True`).
+- `exit_policy` (str): What bare `exit()` calls do when no `delete_message` argument is supplied. `"disable"` (default) freezes the components in place; `"delete"` removes the message. Always overridden by an explicit `delete_message=` argument or by an `exit()` method override. Independent of `replace_policy`. A view sent again to a new message closes the one it left by this policy as well.
+- `auto_defer` (bool): Enable the auto-defer safety net (default: `True`). With it off, a click is still answered when nothing else answered it and none of your code could: one on a control the library built (page, tab, wizard, form, and menu buttons, `choice_row`, Back and Exit), and one the library drops (on a closed view or a disabled item, or the second click of a double-click on a toggle, Finish, or Submit). A control built with your own callback is left for you to answer.
 - `auto_defer_delay` (float): Seconds before auto-deferring (default: `2.5`). Must be under `3.0`, Discord's acknowledgment deadline; a value at or past it raises `ValueError` when the subclass is defined.
 - `ack_first` (bool): Acknowledge the interaction immediately, before the access checks and the callback run (default: `False`). An advanced escape hatch for callbacks that synchronously block the event loop past `auto_defer_delay`; it trades the acting-view one-request refresh for a guaranteed early ack. Do not combine with `open_modal()` in the same callback: a modal must be the first response, and the early ack has already consumed the slot.
 - `refresh_cooldown_ms` (int | None): Proactive minimum gap between successive **background** Discord edits, in milliseconds. State-driven refreshes arriving inside an active window are coalesced into one deferred re-render that fires at the window boundary. Edits made in direct answer to a click on this view's own message are exempt and ship immediately. This paces the re-renders the library starts, and is not a spam guard. To throttle one expensive control per clicker, wrap it with `with_cooldown`. `None` (default) disables the proactive cooldown; the reactive 429 backoff is always active regardless. Validated as a positive int (`0` is rejected).
 - `serialize_interactions` (bool): Serialize rapid button clicks with an `asyncio.Lock` (default: `True`). Set to `False` for views that handle parallel callbacks.
-- `edit_timeout` (float | None): Maximum seconds any single Discord edit may stall before it is cancelled. Bounds the edits the library issues after the initial send -- state-driven refresh, exit/teardown, and navigation edits. discord.py issues edits with no total HTTP timeout, so without this a stalled connection would pin the view until the socket drops. Default `60.0` (clears realistic attachment uploads while capping a true hang). Set to `None` to disable the bound (unbounded, matching discord.py's own default). The acting-view fast path keeps its own tighter bound, which protects the 3-second ack deadline rather than guarding against a hang.
+- `edit_timeout` (float | None): Maximum seconds any single Discord edit may stall before it is cancelled. Bounds the edits the library issues after the initial send: state-driven refresh, exit/teardown, and navigation edits. discord.py passes no timeout of its own, so without this a stalled edit holds the view for aiohttp's default total of five minutes. Default `60.0` (clears realistic attachment uploads while capping a true hang). Set to `None` to leave only that five-minute default. The acting-view fast path keeps its own tighter bound, which protects the 3-second ack deadline rather than guarding against a hang.
 - `session_continuity` (bool): Governs `session_id` auto-derivation polarity. Default `False` gives every invocation a per-instance UUID suffix, so repeat opens of the same view class are independent sessions with their own nav stack, undo timeline, and `shared_data`. Set to `True` on views that want repeat-open state coalescing (undo history surviving close-and-reopen, `shared_data` continuity across gestures); the opt-in collapses derivation back to the class-coalesced shape. Push/pop chains stay on one session regardless because `_navigate_to` forwards `session_id` explicitly.
 - `session_class_key` (str, unset): Overrides the derived class-identity string (`f"{cls.__module__}.{cls.__qualname__}"`) used for session IDs, the instance index, session origin tracking, and the `view_class` column persistent registry rows store. Read from the class's own body, so it does not inherit. Pin it to the previously stored name when moving or renaming a persistent view class; two persistent classes sharing one pin raise at class definition. See [Class identity](../guide/persistence.md#class-identity-rows-resolve-by-the-name-they-recorded).
 
@@ -596,7 +661,7 @@ V2 views ARE the message content -- `send()` takes no `content` or `embed` param
 
 #### V2-Specific Class Attributes
 
-- `validate_placement` (bool): Run the V2 placement validator before every Discord round-trip. When `True` (default), the assembled component tree is walked at three seams (the initial `send()`, every state-driven `refresh()` after the render-hash short-circuit, and the in-place edits from `push()` / `pop()` navigation), and any composition Discord rejects with HTTP 400 raises `ValueError` with a path string identifying the violation node and a suggested fix. Type rejections cover Container nesting, Section nesting, Section accessory not in `{Button, Thumbnail}`, standalone `Button` / `Select` / `Thumbnail` at LayoutView or Container level, Modal-only types (`Label`, `RadioGroup`, `CheckboxGroup`, `Checkbox`, `FileUpload`) anywhere in the tree, and the Modal-only and display types in an ActionRow. An unknown `Item` subclass passes, so a component discord.py adds later is not rejected before the matrix learns it. Size rejections cover empty Containers, empty Sections, empty ActionRows, MediaGallery items outside the 1-10 range, empty text on a TextDisplay or a SelectOption label or value, empty media URLs on Thumbnail / MediaGalleryItem / File, an empty link-button `url`, and length caps on TextDisplay content (4000 chars), Button label (80), Button url (512), `custom_id` (100), Select placeholder (150), SelectOption label / value / description (100), and Thumbnail / MediaGalleryItem description (1024). Set to `False` only when the validator's matrix lags a discord.py or Discord update; opting out otherwise signals an actual placement bug, prefer fixing the tree. See [V2 Placement Rules](../guide/components.md#v2-placement-rules) for the full matrix and the builders-as-guardrails framing.
+- `validate_placement` (bool): Run the V2 placement validator before every Discord round-trip. When `True` (default), the assembled component tree is walked at three seams (the initial `send()`, every state-driven `refresh()` after the render-hash short-circuit, and the in-place edits from `push()` / `pop()` navigation), and any composition Discord rejects with HTTP 400 raises `ValueError` with a path string identifying the violation node and a suggested fix. Type rejections cover Container nesting, Section nesting, Section accessory not in `{Button, Thumbnail}`, standalone `Button` / `Select` / `Thumbnail` at LayoutView or Container level, Modal-only types (`Label`, `TextInput`, `RadioGroup`, `CheckboxGroup`, `Checkbox`, `FileUpload`) anywhere in the tree, and the Modal-only and display types in an ActionRow. An unknown `Item` subclass passes, so a component discord.py adds later is not rejected before the matrix learns it. Size rejections cover empty Containers, empty Sections, empty ActionRows, an ActionRow holding a select beside anything else, MediaGallery items outside the 1-10 range, empty text on a TextDisplay or a SelectOption label or value, empty media URLs on Thumbnail / MediaGalleryItem / File, an empty link-button `url`, and length caps on TextDisplay content (4000 chars), Button label (80), Button url (512), `custom_id` (100), Select placeholder (150), SelectOption label / value / description (100), and Thumbnail / MediaGalleryItem description (1024). Set to `False` only when the validator's matrix lags a discord.py or Discord update; opting out otherwise signals an actual placement bug, so prefer fixing the tree. See [V2 Placement Rules](../guide/components.md#v2-placement-rules) for the full matrix and the builders-as-guardrails framing.
 
 #### V2-Specific Methods
 
@@ -653,8 +718,17 @@ Each tab builder returns a list of V2 components; it may be `async def` or a pla
 | `active_tab_style` | `ButtonStyle.primary` | Style for the currently active tab button |
 | `inactive_tab_style` | `ButtonStyle.secondary` | Style for inactive tab buttons |
 | `tab_overflow_policy` | `"fill"` | Row-distribution strategy when tabs exceed the five-per-row ActionRow cap. Presets: `"fill"`, `"balance"`, `"pin_first"`, `"pin_last"`. Or `tuple[int, ...]` for explicit per-row widths. |
+| `auto_exit_button` | `False` | Adds the library's Exit button and keeps it through every tab switch. On a V1 view it takes a slot on row 4, and a row 4 that `_build_extra_items()` already filled raises `ValueError` naming the attribute. |
 
 #### Methods
+
+##### `await switch_tab(name, *, notify=True)`
+
+Switches to the tab named `name` and re-renders. Raises `ValueError` when `name` is not one of the view's tabs. `notify=False` skips `on_tab_switched`, for a switch the view makes on its own rather than one a user asked for.
+
+##### `active_tab`
+
+Read-only property: the name of the tab on screen.
 
 ##### `await refresh_content()`
 
@@ -662,7 +736,7 @@ Re-renders the current tab's content in place (V1 rebuilds the embed, V2 recompo
 
 ##### `on_tab_switched(self, index)` *(override)*
 
-Called after a tab switch completes. Override to inject analytics, async setup, or validation logic without reimplementing the tab-switch closure.
+Called when a switch moves the active tab, before the refresh, so it reports the tab the user asked for. Override to inject analytics, async setup, or validation logic without reimplementing the tab-switch closure. When the refresh does not land (its edit never reaches Discord, or the tab's builder raises) the view stays on the tab it showed and the hook is not called again, so data set up here for the builder is best keyed by tab.
 
 ---
 
@@ -705,7 +779,7 @@ Re-renders the current step's content in place (V1 rebuilds the embed, V2 recomp
 
 ##### `on_finish(self, interaction)` *(override)*
 
-Called when the final step passes validation. Default implementation calls `self.exit()`. Override to customize the finish behavior (e.g. build a summary card, save data, navigate).
+Called when the final step passes validation. Default implementation calls `self.exit()`. Override to customize the finish behavior (e.g. build a summary card, save data, navigate). Of the Finish clicks sent before `on_finish` returns, only the first runs it, so a double-click does not run an override that leaves the wizard open twice. A Finish refused by the step's validator does not count, so one sent after fixing the input runs.
 
 #### Navigation Button Customization
 
@@ -723,6 +797,7 @@ Back, Next, and Finish buttons are added automatically. Back is disabled on the 
 | `finish_button_emoji` | `None` | Finish button emoji |
 | `finish_button_style` | `ButtonStyle.success` | Finish button style |
 | `step_indicator_label` | `None` | Callable `(current, total) -> str`. Default: `"Step {current}/{total}"`. Must be synchronous; an `async def` is refused at class definition |
+| `auto_exit_button` | `False` | Adds the library's Exit button and keeps it through every step change. On a V1 view it sits on row 4 beside Back and Next. |
 
 ---
 
@@ -757,6 +832,7 @@ Three class attributes mirror the `refresh_button_*` grammar; a fourth (`text_ed
 | `text_edit_button_emoji` | `"\u270f\ufe0f"` (✏️) | Emoji on the grouped button. Set `None` to disable. |
 | `text_edit_button_style` | `ButtonStyle.secondary` | Button style. |
 | `text_edit_modal_auto_defer_delay` | `2.5` | Ack backstop in seconds for the grouped text-edit modal. Raise for a slow async field validator, keeping it under `3.0` (Discord's acknowledgment deadline). |
+| `auto_exit_button` | `False` | Adds the library's Exit button and keeps it through every re-render |
 
 `FormView` (V1) exposes the same four attributes and 5-field ceiling.
 
@@ -798,11 +874,23 @@ When `True` and `nav_inside_container` is also `True`, renders a divider between
 
 Creates a paginated view by chunking `items` and applying `formatter` to each chunk. The formatter should return a list of V2 components.
 
+##### `PaginatedLayoutView.from_cursor(fetch_fn, *, total, per_page, formatter, cache_size=10, **kwargs)`
+
+Creates a paginated view whose pages load on demand, for data too large to hold in memory. Not a coroutine: nothing is fetched until the first render. `fetch_fn(offset, limit)` returns the items for one page and `formatter` turns them into its components; either may be sync or async, and one that cannot take its arguments raises `TypeError` here, naming the signature it saw. Fetched pages are cached up to `cache_size` and evicted least recently used, never the page on screen. See [`from_cursor()` Classmethod](../guide/patterns.md#from_cursor-classmethod).
+
 #### Instance Methods
+
+##### `await set_page(page, *, notify=True)`
+
+Jumps to zero-based `page`, clamped to range, fires `on_page_changed`, and re-renders. The supported cursor move; setting `current_page` directly does not re-render. `notify=False` skips `on_page_changed`, for a jump the view makes on its own (a return to the first page after inactivity) rather than one a user asked for.
 
 ##### `await refresh_data(items)`
 
-Re-paginates with new data using the original `per_page` and `formatter`.
+Re-paginates with new data using the original `per_page` and `formatter`. Waits for a reload of the view already running, so an async formatter that finishes later cannot put older pages over newer ones. Raises `RuntimeError` on a view created with `from_cursor()`, naming `refresh_pages()`.
+
+##### `await refresh_pages(*, new_total=None)`
+
+The cursor-mode counterpart of `refresh_data()`, and `RuntimeError` on a view created with `from_data()`. Empties the page cache, fetches the page on screen again, and re-renders it; other pages are fetched as they are visited. Pass `new_total` when the row count changed: the page list resizes, the jump buttons follow the new count, and a current page past the end moves to the last one. `new_total` must be a non-negative `int` (`ValueError` otherwise). It waits for a `reload()` already fetching rather than rendering beside it.
 
 ##### `_build_extra_items()` *(override)*
 
@@ -810,7 +898,7 @@ Hook for adding components after the navigation row.
 
 ##### `on_page_changed(self, page)` *(override)*
 
-Called after a page change completes. Override to react to page changes without reimplementing the navigation wiring.
+Called when a turn moves `current_page`, before the refresh, so it reports the page the user asked for. Override to react to page changes without reimplementing the navigation wiring. When the refresh does not land the view stays on the page it showed and the hook is not called again, so data prepared here for the render is best keyed by page.
 
 #### Navigation Button Customization
 
@@ -842,7 +930,7 @@ await view.send()
 | `leaderboard_per_page` | `5` | Entries per page. `None` collapses into a single page equal to `top_n`. |
 | `title` | `"Leaderboard"` | H2 heading on the rankings card. Constructor `title=` kwarg overrides; `None` or `""` renders no text heading (with no `banner` either, the title divider is skipped too). |
 | `banner` | `None` | Full-width image at the top of the rankings card, above the title heading when both are set. URL string, `discord.File`, or anything with a string `.url` (`guild.icon` works directly). Constructor `banner=` kwarg overrides. |
-| `subtitle` | `"Rankings"` | H3 above the ranked rows. Set to `None` or `""` to skip. |
+| `subtitle` | `"Rankings"` | H3 above the ranked rows. Set to `None` or `""` to skip. For text that varies per board, pass `subtitle=` at construction. |
 | `leaderboard_empty_message` | `"No entries recorded yet."` | Static text when no entries exist. |
 | `entry_layout` | `"lines"` | `"lines"` packs entries into a single TextDisplay; `"sections"` renders each entry as a `Section` with optional avatar Thumbnail. Section mode caps `leaderboard_per_page` at 5. |
 | `podium_emojis` | `{1: "🥇", 2: "🥈", 3: "🥉"}` | Rank-keyed glyphs for `format_rank`. Override the dict to change the podium treatment without overriding `format_rank`. |
@@ -850,6 +938,8 @@ await view.send()
 | `card_color` | `None` | Optional `discord.Color` for the rankings card accent. `None` falls through to the active theme. |
 | `show_title_divider` | `True` | Toggle the divider rendered below the title. |
 | `avatar_backfill` | `False` | Section mode only. Renders default avatars immediately, resolves the real ones off the render path via `resolve_avatar_urls`, then reloads. Avoids a blocking first render and per-row fetches on large guilds. |
+
+These are checked when the class is defined: `title` and `subtitle` must be a `str` or `None`, `entry_separator` and `leaderboard_empty_message` a `str`, and `podium_emojis` a mapping from `int` ranks to text. Anything else raises `TypeError` naming the attribute; a `podium_emojis` keyed by strings would otherwise never match a rank.
 
 **What `entries=` accepts.** A sequence of `(user_id, stats_dict)` pairs is
 the documented shape, and `get_entries()` returns the same. Three other
@@ -876,10 +966,10 @@ failing later inside the page build.
 | `get_avatar_url(user_id, stats)` *(async)* | Section-mode `Thumbnail` URL. The default resolves from the bot's user cache when a `bot=` kwarg is passed (member avatar on a cache hit, a Discord default avatar on a miss), and returns `None` without a bot so the entry falls back to the two-line `TextDisplay`. Override to resolve from another source. |
 | `resolve_avatar_urls(user_ids)` *(async)* | Section-mode avatar backfill (with `avatar_backfill = True`). Takes a list of user ids, returns a `{user_id: url}` dict, resolved off the render path. Default resolves per user; override for a custom source. |
 | `build_title(page)` | Optional components replacing the rankings card's masthead (the `banner` image + `## title` heading) inside the Container. `None` (default) composes the masthead from the declarative `banner` / `title` pair. Same return shapes and `page` semantics as `build_header`. |
-| `build_header(page)` | Content above the rankings card. The value is prepended as-is: a `Container` renders as its own card (an Overview `stats_card`, a banner), anything else floats as a bare top-level item (no return-type branching, unlike `build_footer`). Read `ranked_entries` for aggregate stats. Returns a component, a list, or `None` (default). `page` is the zero-based page index. |
+| `build_header(page)` | Content above the rankings card. The value is prepended as-is: a `Container` renders as its own card (an Overview `stats_card`, a banner), anything else floats as a bare top-level item (no return-type branching, unlike `build_footer`). Read `ranked_entries` for stats over the ranked rows, and the full list `get_entries()` returns for totals across every entry. Returns a component, a list, or `None` (default). `page` is the zero-based page index. |
 | `build_footer(page)` | Content below the rankings, placed by return type: a raw component folds inside the rankings card below the entries, a `Container` renders as its own standalone card below it. Same return shapes and `page` semantics as `build_header`. |
 | `on_leaderboard_empty()` | Returns the V2 component list shown when `entries` is empty. The masthead composes above this return, so a board keeps its `banner` / `title` while empty and an override inherits it; `build_title` returning `[]` renders no masthead on that page. `ranked_entries` is empty here. `build_header` and `build_footer` run on this page too: header content renders above the masthead, footer content below the empty-state card, each in the order returned. |
-| `ranked_entries` *(property)* | The loaded top-N `(user_id, stats)` slice for the current render; read it in `build_header` / `build_footer` / `build_title` to compute aggregate stats without re-fetching. |
+| `ranked_entries` *(property)* | The loaded top-N `(user_id, stats)` slice for the current render; read it in `build_header` / `build_footer` / `build_title` for stats over the rows shown. It holds only the top `leaderboard_top_n`, so totals across every entry come from `get_entries()`. |
 | `bot` *(property, read-only)* | The client passed via `bot=` (or injected by `on_bind`). Read it in a `resolve_avatar_urls` / `get_avatar_url` override to resolve avatars through `self.bot` instead of a private attribute. `None` when no bot was supplied. |
 | `on_state_changed(state)` *(async, override)* | Calls `rebuild_pages()` then the paginated refresh; live-data subclasses subscribe to data actions and override `get_entries()`. |
 
@@ -913,7 +1003,7 @@ MenuLayoutView(
 
 Each category generates an `action_section()` item that pushes to the specified view class when clicked. The `description`, `emoji`, `style`, and `rebuild` keys are optional. A category with no `description` renders its label as the section text.
 
-A category whose `"view"` is the other component version raises `TypeError` at construction rather than on the click (see [V1 and V2 Views Cannot Push/Pop Between Each Other](../guide/known-limitations.md#v1-and-v2-views-cannot-pushpop-between-each-other)).
+A category whose `"view"` is the other component version raises `TypeError` at construction rather than on the click (see [V1 and V2 Views Cannot Push/Pop Between Each Other](../guide/known-limitations.md#v1-and-v2-views-cannot-pushpop-between-each-other)), and so does one whose `"view"` is not a view class: every click pushes a new view built from it, so pass the class, not an instance.
 
 #### Class Attributes
 
@@ -1050,7 +1140,12 @@ Each `*_message` template is validated at class definition against its
 documented placeholders (`{role}`, `{category}`, `{removed}`, `{error}`)
 -- a typo'd or unbalanced placeholder raises `ValueError` naming the
 attribute and the placeholders it accepts, instead of a bare `KeyError`
-from inside the click that renders it.
+from inside the click that renders it. `title`, `subtitle`, and the four
+`hint_*` attributes must be a `str` or `None`; anything else raises
+`TypeError` naming the attribute. A role button dispatches with no view
+instance, so the `*_message` and `hint_*` attributes are read from the class,
+and a click finds its category through the class's own `categories`;
+`set_class_attribute()` refuses all of them.
 
 #### Override Hooks
 
@@ -1142,7 +1237,7 @@ PersistentView(
 
 - `timeout` is forced to `None`
 - `owner_only` defaults to `False`
-- `persistence_key` must be provided (raises `ValueError`)
+- `persistence_key` must be a non-empty string (a missing or empty key raises `ValueError`, a value that is not a string `TypeError`)
 - All components must have explicit `custom_id` values
 - Cannot be sent as ephemeral (`send(ephemeral=True)` raises `ValueError`)
 - A send under a `persistence_key` another panel holds retires that panel: every other live
@@ -1151,6 +1246,9 @@ PersistentView(
 - `retire_previous_on_send` (bool, default `True`): set `False` to leave the previous panel for
   the caller to retire; see
   [Replacing a panel under its own key](../guide/persistence.md#replacing-a-panel-under-its-own-key)
+- `kwargs_schema_version` (positive int, default `1`): the version of the constructor kwargs a
+  stored panel was saved with; bump it and register a migrator when `__init__` changes. See
+  [Kwargs migrations](../guide/persistence.md#kwargs-migrations-for-persistentview-subclasses)
 
 #### Methods
 
@@ -1186,7 +1284,7 @@ Supports the same `menu_style`, `auto_exit_button`, `on_category_selected`, and 
 TabView(context=None, tabs={"Name": async_builder_fn, ...}, **kwargs)
 ```
 
-Supports the same `tab_overflow_policy`, `active_tab_style`, `inactive_tab_style`, `on_tab_switched`, and `_build_tab_rows` as `TabLayoutView`. V1 applies the per-row split by assigning `button.row`; V2 wraps each row in an `ActionRow`.
+Supports the same `tab_overflow_policy`, `active_tab_style`, `inactive_tab_style`, `on_tab_switched`, `switch_tab`, and `_build_tab_rows` as `TabLayoutView`. V1 applies the per-row split by assigning `button.row`; V2 wraps each row in an `ActionRow`. On V1 the tab rows share the five message rows with what `_build_extra_items()` adds, so `set_class_attribute("tab_overflow_policy", ...)` with a layout those rows cannot hold raises `ValueError` naming the attribute, and the previous layout stays.
 
 #### `WizardView`
 
@@ -1211,7 +1309,7 @@ FormView(
 )
 ```
 
-Non-text (`select`, `boolean`) fields share V1's five action rows; a field that overflows the budget raises `ValueError` at construction, naming the field. `FormLayoutView` has no equivalent row cap.
+Non-text (`select`, `boolean`) fields share V1's five action rows, one row each. The Edit and Submit buttons take the rows after them and share the last row once all five are used, which a `boolean` row has room for and a `select` row does not. A field or button that does not fit raises `ValueError` at construction, naming it. `FormLayoutView` has no equivalent row cap.
 
 #### `PaginatedView`
 
@@ -1224,20 +1322,23 @@ Pages can be `Embed` objects, strings, or dicts with `"embed"` and/or `"content"
 **Class Attributes:**
 
 - `jump_threshold` (int): Minimum page count at which first/last and go-to-page buttons appear (default: `5`). A view with five or more pages surfaces the jump controls.
+- `auto_exit_button` (bool): Adds the library's Exit button and keeps it through every page turn (default: `False`). The button has a fixed id, so it keeps working after a restart on a persistent panel. An override set with `set_class_attribute()` takes effect at the next render. On a V1 view it takes a slot on row 4, and a row 4 that `_build_extra_items()` already filled raises naming the attribute.
 
 **Class Methods:**
 
 - `await PaginatedView.from_data(items, per_page, formatter, **kwargs)` -- Chunks items and applies formatter (returns embed/str/dict). Stores `per_page` and `formatter` for `refresh_data()`.
+- `PaginatedView.from_cursor(fetch_fn, *, total, per_page, formatter, cache_size=10, **kwargs)` -- Loads pages on demand; same contract as `PaginatedLayoutView.from_cursor()`, with the formatter returning embed/str/dict.
 
 **Instance Methods:**
 
-- `await set_page(n)` -- Jumps to zero-based page `n`, clamped to range, fires `on_page_changed`, and re-renders. The supported cursor move; setting `current_page` directly does not re-render.
+- `await set_page(n, *, notify=True)` -- Jumps to zero-based page `n`, clamped to range, fires `on_page_changed` (skipped with `notify=False`), and re-renders. The supported cursor move; setting `current_page` directly does not re-render.
 - `await refresh_data(items)` -- Re-paginates with new data. Raises `RuntimeError` if not created via `from_data()`.
+- `await refresh_pages(*, new_total=None)` -- Cursor-mode counterpart of `refresh_data()`; same contract as on `PaginatedLayoutView`.
 - `_build_extra_items()` *(override)* -- Hook for adding components below navigation buttons (rows 1-4).
 
 ---
 
-## `PersistenceMiddleware(manager=None, *, backend=None, registry=None, application=None, bot=None, migrators=None, restore_concurrency=8)`
+## `PersistenceMiddleware(manager=None, *, backend=None, registry=None, application=None, bot=None, migrators=None, restore_concurrency=8, prune_unreachable_after_days=None)`
 
 Write-through middleware that owns the full persistence pipeline. Install via `setup_middleware` once in `setup_hook`, after loading cogs.
 
@@ -1247,6 +1348,7 @@ Write-through middleware that owns the full persistence pipeline. Install via `s
 - `registry`, `application`: per-namespace configs (`RegistryPersistence`, `ApplicationPersistence`) that override the shorthand. Scoped state rides under the application namespace -- opt a scoped slot in via `persistent_slots = ("scoped",)` on the view class.
 - `migrators`: optional dict with `"schema"` and/or `"kwargs"` keys, each mapping a `(name, from_version)` tuple to an async migrator callable. When omitted, no migrators are registered through this kwarg; the `@register_migrator` / `@register_kwargs_migrator` decorators are the canonical registration path, and this dict is the programmatic bulk alternative.
 - `restore_concurrency`: positive int bounding concurrency in both restore phases: the channel and message fetches during startup reattach, and the post-ready `on_restore` repaint that follows (default `8`). The repaint additionally serializes panels sharing a channel (message edits rate-bucket per channel) while panels in distinct channels fan out under this bound.
+- `prune_unreachable_after_days`: with `bot=`, deletes registry rows whose message has been unreachable for this many days, checked once the gateway is ready and daily after (default `None`, which never prunes). See [Rows that stay unreachable](../guide/persistence.md#rows-that-stay-unreachable).
 
 ```python
 from cascadeui import PersistenceMiddleware, setup_middleware
@@ -1276,6 +1378,7 @@ from cascadeui import InstanceLimitError
 - `view_type` (str): The class name of the view that hit the limit
 - `limit` (int): The instance limit value that was exceeded
 - `blocked_user_id` (int | None): The user ID that was blocked. Set when raised by `register_participant()`, `None` when raised by `send()`.
+- `scope` (str | None): The `instance_scope` the limit was counted under. `default_message` reads it to word the rejection for who is blocked: the server for `"guild"`, everyone for `"global"`, and the user otherwise.
 
 ### When it is raised
 
@@ -1323,13 +1426,32 @@ from cascadeui import safe_execute
 result = await safe_execute(fetch_profile(user_id), fallback={})
 ```
 
+### `DISCORD_CALL_ERRORS`
+
+The exceptions a Discord API call raises when the call itself fails, as a tuple for an `except` clause: `discord.HTTPException`, `discord.RateLimited`, and `aiohttp.ClientError`. The library catches with it wherever a failed call must not stop the work around it. The last two are siblings of `HTTPException`, not subclasses, so `except discord.HTTPException` lets a rate limit (raised when the client sets `max_ratelimit_timeout`) or a dropped connection escape.
+
+```python
+from cascadeui import DISCORD_CALL_ERRORS
+
+try:
+    await member.send("Your trial has started.")
+except DISCORD_CALL_ERRORS as e:
+    logger.debug(f"Trial notice not delivered: {e}")
+```
+
+A programming error inside the same block (a `NameError`, an `AttributeError`) still raises, which a bare `except Exception` would log as though the network had failed. `discord.InteractionResponded` is not in the tuple: it means the response slot is already used, which a caller answers with a followup (`respond_safe` does) rather than tolerates.
+
 ---
 
 ## Task Manager
 
+### `create_task(coro)`
+
+Starts a task owned by this view. It is cancelled when the view exits, times out, or hands its message to a `push()` or `pop()` destination. An `exit()` or `on_timeout()` called from the task itself finishes first, and the task is cancelled once the call returns; one that navigates the view away carries on as the destination's. Returns the `asyncio.Task`, so a view that restarts a timer can cancel the previous one without touching its other tasks.
+
 ### `get_task_manager()`
 
-Returns the process-wide `TaskManager` singleton. The manager tracks background tasks per owner and cancels them cleanly on view exit or bot shutdown. Views own task creation and cancellation implicitly through `_StatefulMixin` -- direct use is only needed for standalone background work outside a view's lifecycle.
+Returns the process-wide `TaskManager` singleton. The manager tracks background tasks per owner, and a view's tasks (those it starts with `view.create_task()`) are cancelled when the view exits, times out, or navigates away with `push()` or `pop()`. A teardown called from one of the view's own tasks finishes first, and that task is cancelled once the call returns. Direct use is only needed for standalone background work outside a view's lifecycle.
 
 ```python
 from cascadeui import get_task_manager
@@ -1337,11 +1459,12 @@ from cascadeui import get_task_manager
 tm = get_task_manager()
 tm.create_task("my_worker", poll_loop())
 # Later:
-await tm.cancel_tasks("my_worker")
+tm.cancel_tasks("my_worker")
 ```
 
 The manager exposes four methods: `create_task(owner_id, coro)`,
-`cancel_tasks(owner_id)`, `wait_tasks(owner_id)`, and `get_task_count(owner_id=None)`.
+`cancel_tasks(owner_id)` (synchronous; returns how many tasks it cancelled),
+`wait_tasks(owner_id)`, and `get_task_count(owner_id=None)`.
 
 ---
 
@@ -1404,6 +1527,11 @@ setup_logging()
 That gives a colored console sink, a rotating file in `./logs`, and the action
 log, all at `INFO`. Everything below is optional tuning.
 
+The file sink writes `<prefix>-YYYY-MM-DD.log` and moves to the new day's file at
+midnight, so a long-running bot keeps one file per day. When it starts and at
+each midnight it deletes the oldest of those files past `max_files`; no other
+file in `path` is touched.
+
 Both sinks run behind a `QueueHandler` / `QueueListener`, so log I/O happens on a
 background thread rather than the calling one, and the queue drains at
 interpreter exit. Calling it again reconfigures from scratch, removing the
@@ -1411,13 +1539,13 @@ handlers a previous call attached, so repeat calls never double-log.
 
 | Parameter | Default | Purpose |
 |-----------|---------|---------|
-| `level` | `logging.INFO` | Level for the `cascadeui` logger |
-| `actions` | `True` | Install `LoggingMiddleware` so every dispatched action is logged. `False` drops the action log; a level string (`"DEBUG"`) places it lower so it stays out of INFO logs |
-| `file` | `True` | Write the date-stamped file sink |
+| `level` | `logging.INFO` | Level for the `cascadeui` logger: an int or a name such as `"DEBUG"`. An unknown name raises `ValueError` and leaves the previous configuration in place |
+| `actions` | `True` | Install `LoggingMiddleware` so every dispatched action is logged. `False` drops the action log; a level string (`"DEBUG"`) places it lower so it stays out of INFO logs. An unknown name raises `ValueError` |
+| `file` | `True` | Write the file sink: one file per day, moving to the next day's file at midnight |
 | `stream` | `True` | Write the console sink |
 | `trace` | `False` | Install ViewStore dispatch tracing |
 | `path` | `"logs"` | Directory for file sinks |
-| `max_files` | `10` | Rotation ceiling; older files are dropped past this count |
+| `max_files` | `10` | How many of its own dated files to keep; `0` keeps them all |
 | `prefix` | `"cascadeui"` | Filename prefix for file sinks |
 | `mode` | `"a"` | File open mode |
 | `encoding` | `"utf-8"` | File encoding |
@@ -1426,7 +1554,7 @@ handlers a previous call attached, so repeat calls never double-log.
 | `template` | `None` | A `FormatTemplate`, or a preset name: `"default"`, `"minimal"`, `"detailed"`, `"compact"` |
 | `stream_formatter` | `None` | Replace the console formatter outright |
 | `file_formatter` | `None` | Replace the file formatter outright |
-| `handler` | `None` | Attach an additional handler alongside the built-in sinks |
+| `handler` | `None` | Attach this handler instead of the built-in sinks. It runs on the calling thread, and `file`, `stream`, `colors`, `color`, `template` and both formatters are ignored |
 
 ```python
 from cascadeui import setup_logging

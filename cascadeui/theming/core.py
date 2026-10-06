@@ -25,7 +25,13 @@ _COLOUR_STYLE_KEYS = (
 
 
 class Theme:
-    """Defines styling for UI components."""
+    """Defines styling for UI components.
+
+    ``styles`` is a mapping, or a sequence of ``(key, value)`` pairs. It is
+    copied, so the caller's mapping is never written to and two Themes never
+    share one. The colour keys are coerced to ``discord.Colour``, an int
+    included, since a V2 Container stores an int accent verbatim.
+    """
 
     def __init__(
         self,
@@ -33,18 +39,8 @@ class Theme:
         styles: Optional[Union[Mapping[str, Any], Sequence[Tuple[str, Any]]]] = None,
     ) -> None:
         self.name = name
-        # Every read below is by key, so a sequence of pairs (the plausible
-        # near miss) otherwise fails on the first lookup with "list indices
-        # must be integers", naming neither the parameter nor the shape. The
-        # pair form carries the same mapping, so it is converted rather than
-        # refused, matching how the V2 builders treat the same argument.
-        # Copied, not adopted: the defaults below are seeded into this dict,
-        # so holding the caller's own mapping would make constructing a
-        # Theme silently add six keys to it, and two Themes built from one
-        # base dict would share a single live styles mapping where editing
-        # either restyles both. ``normalize_mapping`` returns a mapping
-        # untouched by contract, which is right for its read-only callers
-        # and wrong for the one caller that writes.
+        # Copied: the defaults below are written into it, and normalize_mapping
+        # returns a mapping as it was given.
         self.styles = (
             dict(normalize_mapping(styles, owner="Theme", param="styles")) if styles else {}
         )
@@ -65,11 +61,8 @@ class Theme:
         if "separator_spacing" not in self.styles:
             self.styles["separator_spacing"] = "small"
 
-        # Runs after the defaults so a derived ``accent_colour`` is covered
-        # too. discord.py coerces an int in ``Embed.colour``'s setter but
-        # stores one verbatim on ``Container.accent_colour``, so a hex
-        # literal that themes a V1 embed would otherwise reach a V2
-        # container as a bare int.
+        # After the defaults, so a derived accent is coerced too: discord.py
+        # coerces an int for an embed but stores it verbatim on a Container.
         for key in _COLOUR_STYLE_KEYS:
             if key in self.styles:
                 self.styles[key] = coerce_colour(

@@ -68,9 +68,10 @@ class GridShowcaseView(StatefulLayoutView):
     """
 
     owner_only = True
-    # Unthrottled so a recording can stack several grids in one channel.
+    # /grid_gallery posts three of these at once; a limit would make each
+    # send replace the one before it.
     instance_limit = None
-    exit_policy = "disable"
+    subscribed_actions = set()
     timeout = 180.0
 
     def __init__(self, *args, items=None, **kwargs):
@@ -134,8 +135,8 @@ class V2GridsExample(commands.Cog, name="v2_grids_example"):
         """Render a standalone EmojiGrid from user-supplied dimensions.
 
         The grid is built with a couple of demo overlays (a star in the
-        top-left and a filled rectangle in the interior) so the recording
-        shows off mutable cells and fill_rect() without needing a game.
+        top-left and a filled rectangle in the interior) to show mutable
+        cells and fill_rect() without needing a game.
         """
         try:
             grid = emoji_grid(
@@ -146,8 +147,8 @@ class V2GridsExample(commands.Cog, name="v2_grids_example"):
                 col_labels=_resolve_preset(col_labels),
             )
         except (ValueError, TypeError) as exc:
-            # The library validates at construction -- surface the error
-            # message verbatim so the recording can showcase the guardrails.
+            # The library validates at construction; the reply shows its
+            # error message verbatim.
             await context.send(f"\N{WARNING SIGN}\N{VARIATION SELECTOR-16} `{exc}`", ephemeral=True)
             return
 
@@ -236,7 +237,7 @@ class V2GridsExample(commands.Cog, name="v2_grids_example"):
     async def grid_gallery_cmd(self, context: Context) -> None:
         """Render a full variation set across three showcase messages.
 
-        Covers the feature surface in one shot for gif capture:
+        Covers the feature surface in one command:
 
             1. Blank square -- raw fill, no labels, no overlays.
             2. Wide rectangle -- 3x8 with numeric column headers only.
@@ -431,18 +432,12 @@ class V2GridsExample(commands.Cog, name="v2_grids_example"):
             showcase = card(
                 "## Image Sections",
                 TextDisplay(
-                    "-# `image_section(text, url=...)` pairs caption text "
-                    "with a Thumbnail accessory."
+                    "-# `image_section(*text, url=...)` pairs one to three "
+                    "text lines with a Thumbnail accessory."
                 ),
                 divider(),
-                image_section(
-                    f"**{context.author.display_name}**\nInvoker",
-                    url=invoker_url,
-                ),
-                image_section(
-                    f"**{bot_user.name if bot_user else 'Bot'}**\nBot",
-                    url=bot_url,
-                ),
+                image_section(f"**{context.author.display_name}**", "Invoker", url=invoker_url),
+                image_section(f"**{bot_user.name if bot_user else 'Bot'}**", "Bot", url=bot_url),
                 color=discord.Color.purple(),
             )
 

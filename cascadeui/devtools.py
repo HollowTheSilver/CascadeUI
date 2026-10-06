@@ -26,20 +26,28 @@ from .views.patterns import TabLayoutView
 logger = logging.getLogger(__name__)
 
 
-# Shared display cap for list-style commands (``views``, ``sessions``).
-# Unified so both commands truncate at the same point -- previously
-# ``views`` capped at 15 while ``sessions`` capped at 10, which made the
-# two commands feel inconsistent on a store with many entries.
+# Display cap shared by the list commands (``views``, ``sessions``).
 _LIST_DISPLAY_CAP = 15
 
 
 # // ========================================( Store Internals )======================================== // #
 #
-# The inspector is the library's own debugging surface, so it reaches into
-# store state that user code never should. Private access concentrates
-# through these helpers so the privacy boundary stays auditable from one
-# place -- refactors to store internals change the helpers, not the dozens
-# of call sites downstream.
+# The inspector reads store internals user code never should. The helpers
+# below hold the reads several tabs share; the rest read the store directly.
+
+
+def _live_views(store) -> dict:
+    """The registered views still subscribed.
+
+    A view whose teardown unsubscribed it but could not remove it from the
+    state stays registered; it answers nothing, so it is listed and cleaned
+    up as a ghost.
+    """
+    return {
+        view_id: view
+        for view_id, view in store.get_active_views().items()
+        if view_id in store.subscribers
+    }
 
 
 async def _cleanup_ghost_view(store, view_id: str) -> None:
@@ -58,13 +66,9 @@ async def _cleanup_ghost_view(store, view_id: str) -> None:
 
 # // ========================================( Computed Aggregations )======================================== // #
 #
-# Module-level @computed registrations expose the library's derived-state
-# API inside its own DevTools. Only pure functions of `state` are eligible;
-# store runtime (active-view registry, subscribers, middleware) stays inline
-# in the Config tab because it is not part of the Redux state tree.
-#
-# Consumers subtract the inspector's own contribution (one view, one session)
-# at the read site, since @computed has no view context.
+# Aggregates of the state tree, as @computed registrations. Store runtime
+# (registry, subscribers, middleware) is not state, so the Config tab reads it
+# inline. Readers subtract the inspector's own view and session themselves.
 
 
 @computed(selector=lambda s: len(s.get("views", {})))
@@ -112,15 +116,9 @@ class InspectorView(TabLayoutView):
     instance_limit = 1
     instance_scope = "user_guild"
     instance_policy = "replace"
-    # Push/pop routes through ``store.batch()`` which collapses VIEW_CREATED
-    # plus VIEW_DESTROYED into one BATCH_COMPLETE action. The navigation
-    # families (NAVIGATION_PUSH / NAVIGATION_POP / NAVIGATION_REPLACE) are
-    # subscribed explicitly so the selector fires on every transition even
-    # when the view count happens to be stable through the batch.
-    # VIEW_UPDATED keeps the Views tab's Channel / Msg fields live when the
-    # ``_message`` / ``_update_message_state`` contract writes land on
-    # existing rows. Session families catch cross-chain session membership
-    # changes that don't produce a VIEW_* action.
+    # The navigation families fire on every push and pop, even one whose batch
+    # leaves the view count unchanged; VIEW_UPDATED keeps the Channel / Msg
+    # fields live; the session families catch membership changes with no VIEW_*.
     subscribed_actions = {
         "VIEW_CREATED",
         "VIEW_UPDATED",
@@ -240,7 +238,7 @@ class InspectorView(TabLayoutView):
 
     def _filtered_active_views(self):
         """Return active view instances excluding the inspector itself."""
-        return {k: v for k, v in self.state_store._active_views.items() if k != self.id}
+        return {k: v for k, v in _live_views(self.state_store).items() if k != self.id}
 
     def _filtered_components(self):
         """Return component entries excluding the inspector's own interactions."""
@@ -259,12 +257,8 @@ class InspectorView(TabLayoutView):
         return ActionRow(self.make_exit_button(label="Close", emoji="\u274c"))
 
     async def _refresh(self, interaction):
-        # No pre-defer: _refresh_tabs() -> refresh() rides the acting-view
-        # fast path (edit + ack in one call), and the post-callback defer
-        # acks if the digest short-circuits. Pre-deferring would consume the
-        # response slot and force the slow two-call path. Only the genuinely
-        # slow inspector callbacks (flush, exit-all, session-clear) keep an
-        # ack-first _safe_defer, because their work can exceed the 3s window.
+        # No pre-defer, which would cost the one-request fast path; the action
+        # buttons and select handlers below ack first with _safe_defer.
         await self._refresh_tabs()
 
     def _truncate(self, items, max_len=200):
@@ -543,7 +537,7 @@ class InspectorView(TabLayoutView):
         active = self._filtered_active_views()
         if view_id in active:
             try:
-                await active[view_id].exit()
+                await active[view_id]._exit_or_successor()
                 logger.info(f"Inspector: exited live view {view_id[:8]}...")
             except Exception as e:
                 logger.warning(f"Inspector: exit failed for {view_id[:8]}...: {e}")
@@ -565,12 +559,11 @@ class InspectorView(TabLayoutView):
         for view_id, view in list(active.items()):
             # One view's exit cascades to the children attached to it, so a
             # snapshot taken before the first exit can name a view that is
-            # already gone by the time the loop reaches it.
-            if view._torn_down():
-                continue
+            # already gone by the time the loop reaches it, or one whose
+            # place a push or pop has passed on. Both are resolved here.
             try:
-                await view.exit()
-                exited += 1
+                if await view._exit_or_successor():
+                    exited += 1
             except Exception as e:
                 logger.warning(f"Inspector: exit failed for {view_id[:8]}...: {e}")
 
@@ -618,11 +611,8 @@ class InspectorView(TabLayoutView):
             color=discord.Color.gold(),
         )
 
-        # Session select + clear controls. SelectOption.value is capped at
-        # 100 chars by Discord; session IDs follow ClassName:user:guild:...
-        # patterns that routinely exceed the cap. Ship positional indices
-        # on the wire and resolve back to the real session_id at callback
-        # time via _session_index_map.
+        # Session ids routinely pass Discord's 100-character option value cap,
+        # so the options carry indices that _session_index_map resolves.
         self._session_index_map: dict[str, str] = {}
         options = []
         for idx, (session_id, session_data) in enumerate(shown):
@@ -679,13 +669,13 @@ class InspectorView(TabLayoutView):
             self._selected_session_id = None
             return await self._refresh_tabs()
 
-        active = self.state_store._active_views
+        active = _live_views(self.state_store)
         exited = 0
         for view_id in list(session_data.get("members", [])):
             if view_id in active:
                 try:
-                    await active[view_id].exit()
-                    exited += 1
+                    if await active[view_id]._exit_or_successor():
+                        exited += 1
                 except Exception as e:
                     logger.warning(f"Inspector: exit failed for {view_id[:8]}...: {e}")
             else:
@@ -870,8 +860,8 @@ class InspectorView(TabLayoutView):
     def _build_perf_report(self, dispatches, notifies, refreshes, enabled):
         """Format the perf buffers as markdown with a trailing JSON appendix.
 
-        Sections mirror the Performance tab's three cards -- Dispatch,
-        Subscriber, Refresh -- but emit every sample rather than summary
+        Sections mirror the Performance tab's three cards (Dispatch,
+        Subscriber, Refresh) but emit every sample rather than summary
         percentiles. Raw JSON at the end keeps the report lossless for
         programmatic analysis; ad-hoc tooling can skip the markdown and
         parse the tail fence directly.
@@ -1183,11 +1173,8 @@ class InspectorView(TabLayoutView):
                 color=discord.Color.blue(),
             )
 
-        # Per-subscriber breakdown -- aggregates the notify_samples ring
-        # by subscriber_id, ranks by p95 so the slowest handler rises to
-        # the top. Pair with the dispatch card's Notify row: if notify_ms
-        # is high and one subscriber dominates this list, that's the
-        # candidate to selector-gate or fire-and-forget.
+        # Per-subscriber p95 from the notify samples, slowest first: the one to
+        # selector-gate when the dispatch card's notify time is high.
         subscriber_card = None
         if notifies:
             notify_stats = self._summarize(notifies, "ms")
@@ -1315,11 +1302,8 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
         /cascadeui subscribers    List active state subscribers
     """
 
-    # Marks this cog's commands as owner-gated. A consumer that routes owner-only
-    # tooling differently (e.g. to a control guild so it never reaches a member's
-    # slash picker) reads getattr(cog, "is_owner_tool", False) instead of matching
-    # the class name. Any owner-gated cog (library or consumer) can carry the
-    # same marker, so the check generalizes.
+    # Marks the cog as owner-gated for a bot that routes such cogs elsewhere
+    # (getattr(cog, "is_owner_tool", False)); any owner-gated cog can carry it.
     is_owner_tool = True
 
     def __init__(self, bot):
@@ -1361,7 +1345,7 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
             for k, v in store.state.get("views", {}).items()
             if gid is None or v.get("guild_id") == gid
         }
-        active = store.get_active_views()
+        active = _live_views(store)
 
         if not views:
             return await ctx.send("No active views.", ephemeral=True)
@@ -1404,10 +1388,10 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
         # Defer before the view exit (a Discord edit). A slash command has no
         # auto-defer backstop, so a slow exit blows the 3s interaction wall.
         await ctx.defer(ephemeral=True)
-        active = store.get_active_views()
+        active = _live_views(store)
         if match in active:
             try:
-                await active[match].exit()
+                await active[match]._exit_or_successor()
                 await ctx.send(
                     f"\U0001f7e2 Exited live **{view_type}** (`{match[:12]}...`).", ephemeral=True
                 )
@@ -1427,19 +1411,18 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
         store = get_store()
         gid = self._scope_guild(ctx)
         views = dict(store.state.get("views", {}))
-        active = dict(store.get_active_views())
+        active = _live_views(store)
         exited = 0
         failed = 0
 
         for view_id, view in list(active.items()):
             if gid is not None and getattr(view, "guild_id", None) != gid:
                 continue
-            # A view an earlier exit cascaded to is already gone.
-            if view._torn_down():
-                continue
+            # A view an earlier exit cascaded to is already gone, and one a
+            # push or pop moved on from is exited as the view that took over.
             try:
-                await view.exit()
-                exited += 1
+                if await view._exit_or_successor():
+                    exited += 1
             except Exception as exc:
                 logger.debug("exit_all: view %s failed to exit cleanly: %s", view_id, exc)
                 failed += 1
@@ -1533,34 +1516,36 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
         # state half-torn-down.
         failed = 0
         for view_id, view in list(store.get_active_views().items()):
-            # A view an earlier exit cascaded to is already gone.
-            if view._torn_down():
-                continue
+            # A view an earlier exit cascaded to is already gone, and one a
+            # push or pop moved on from is exited as the view that took over.
             try:
-                await view.exit()
+                await view._exit_or_successor()
             except Exception as exc:
                 logger.debug("reset: view %s failed to exit cleanly: %s", view_id, exc)
                 failed += 1
 
         # Reset state via the canonical shape helper so new top-level keys
         # added to ``StateStore.__init__`` flow through here automatically.
-        store.state = StateStore._build_initial_state()
+        # In the state turn, so a reducer awaiting in another task commits
+        # before the reset rather than over it.
+        async with store._state_turn("/cascadeui reset"):
+            store.state = StateStore._build_initial_state()
 
-        # The registry mirror is rebuilt rather than left empty: rows the exit
-        # loop above did not delete are still on disk, and a mirror that has
-        # forgotten them retires nothing when their key is exited later.
-        manager = getattr(store, "persistence_manager", None)
-        if manager is not None:
-            manager.reseed_registry_mirror()
+            # The registry mirror is rebuilt rather than left empty: rows the exit
+            # loop above did not delete are still on disk, and a mirror that has
+            # forgotten them retires nothing when their key is exited later.
+            manager = getattr(store, "persistence_manager", None)
+            if manager is not None:
+                manager.reseed_registry_mirror()
 
-        # Observability: invalidate every @computed so cached aggregates
-        # recompute against the empty state on next access, and clear the
-        # selector memo so subscriber selectors do not short-circuit on
-        # stale identity comparisons post-reset.
-        for cv in store._computed.values():
-            if isinstance(cv, ComputedValue):
-                cv.invalidate()
-        store._last_selected.clear()
+            # Observability: invalidate every @computed so cached aggregates
+            # recompute against the empty state on next access, and clear the
+            # selector memo so subscriber selectors do not short-circuit on
+            # stale identity comparisons post-reset.
+            for cv in store._computed.values():
+                if isinstance(cv, ComputedValue):
+                    cv.invalidate()
+            store._last_selected.clear()
 
         manager = getattr(store, "persistence_manager", None)
         if manager is not None:
@@ -1609,14 +1594,14 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
             return await ctx.send(f"No session found: `{session_id}`.", ephemeral=True)
 
         session_data = sessions[session_id]
-        active = store.get_active_views()
+        active = _live_views(store)
         exited = 0
         failed = 0
         for view_id in list(session_data.get("members", [])):
             if view_id in active:
                 try:
-                    await active[view_id].exit()
-                    exited += 1
+                    if await active[view_id]._exit_or_successor():
+                        exited += 1
                 except Exception as exc:
                     logger.debug("clear_session: view %s failed to exit cleanly: %s", view_id, exc)
                     failed += 1

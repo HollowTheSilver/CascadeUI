@@ -4,19 +4,21 @@
 import asyncio
 import inspect
 import logging
-from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Union
+import math
+from typing import Dict, FrozenSet, Iterable, List, Optional, Union
 
 import discord
-from discord.ui import Item
 
 from ..state.actions import ActionCreators
 from ..state.store import _CURRENT_INTERACTION
 from ..utils.coercion import coerce_snowflake_match
 from ..utils.hooks import accepts_second_positional, await_maybe, can_accept_positional
 from ..utils.responses import (
+    _collect_stalled_renders,
     ack_backstop,
     open_modal_safe,
     respond_safe,
+    ship_stalled_renders,
     trailing_ack,
     validate_ack_delay,
 )
@@ -54,13 +56,13 @@ def require_url(url, owner: str, label: str = "") -> None:
     Takes the owner's name because two constructors reach it: refusing in
     ``LinkButton``'s vocabulary from a ``link_section`` call would point
     at a class the caller never wrote.
+
+    Raises ``TypeError`` for a non-string (a ``yarl.URL`` is the likely
+    one, since discord.py stores it and fails only at serialization) and
+    ``ValueError`` for a blank string.
     """
     named = f"(label={label!r}) " if label else ""
-    # Checked before the emptiness test, because a truthy non-str answers
-    # ``strip`` by raising from inside this guard rather than reporting
-    # the input. A yarl.URL is the realistic one: aiohttp is a hard
-    # dependency, so every consumer holds the type, and discord.py stores
-    # whatever it is given and fails on it at serialization.
+    # Before the emptiness test, which a truthy non-str would crash inside.
     if not isinstance(url, str):
         raise TypeError(
             f"{owner}{named}needs a str url, got {type(url).__name__}.\n"
@@ -92,6 +94,40 @@ def refuse_wrong_arity(fn, arity: int, message: str) -> None:
     """
     if can_accept_positional(fn, arity) is False:
         raise TypeError(message)
+
+
+async def run_unless_repeat(item, run) -> bool:
+    """Run ``run()`` for a click, unless the click repeats one on the same render.
+
+    A toggle's click asks for the state its render showed, flipped. Two
+    clicks of one double-click both come from that render, so the second
+    asks for what the first already set, and running it would flip the
+    control back. The view numbers clicks as they arrive, before its lock;
+    one numbered at or below the count taken when this control's
+    previous click finished was sent before that result was on screen.
+    Returns whether ``run()`` ran.
+
+    The count is kept on the view under the item's ``custom_id``, which is
+    how Discord routes a click: a control rebuilt under the same id is a
+    new object, and the second click of a double-click reaches it.
+    """
+    view = item.view
+    if getattr(view, "_arrived_after", None) is None:
+        await run()
+        return True
+    if view._click_marks is None:
+        view._click_marks = {}
+    marks = view._click_marks
+    key = item.custom_id
+    if not view._arrived_after(marks.get(key, 0)):
+        view._log_dropped_click(item, "the second click of a double-click")
+        return False
+    marks[key] = math.inf
+    try:
+        await run()
+    finally:
+        marks[key] = view._clicks_received
+    return True
 
 
 def require_value_callback(fn, owner: str, param: str, value_name: str) -> None:
@@ -163,27 +199,17 @@ class StatefulComponent:
         """
         component_id = getattr(component, "custom_id", None) or str(id(component))
 
-        # Keep the caller's own function reachable. Once this returns,
-        # ``component.callback`` is the wrapper below, and every stateful
-        # component in a view shares its identity -- so anything that wants
-        # to tell two components apart by what they DO has to read through
-        # the wrapper to the function it closes over.
+        # Every stateful component's ``callback`` is the wrapper below, so code
+        # that tells components apart by what they do reads this instead.
         component._cascadeui_user_callback = original_callback
 
-        # Pre-compute whether to pass select values to the callback.
-        # When the component is a select and the callback accepts a second
-        # positional parameter, component.values is passed automatically.
-        # The real property is "is this a select", which only a select's
-        # ``values`` attribute answers: discord.py injects ``custom_id`` onto
-        # every attached item, so that one cannot discriminate.
         _pass_values = False
         if original_callback:
+            # "Is this a select" is read from ``values``: buttons and selects
+            # both carry a ``custom_id``, so that cannot tell.
             is_select = hasattr(component, "values")
-            # Decide the call shape first, then refuse against that shape.
-            # A signature the component can never call is a mistake made
-            # here, at the builder line, and discovered on a click minutes
-            # later as a bare arity TypeError raised from inside the wrapper
-            # below. Refusing it names the component and the shape it wants.
+            # Refused here, at the builder line, not as a bare arity error on
+            # the first click.
             _pass_values = is_select and accepts_second_positional(original_callback)
             refuse_wrong_arity(
                 original_callback,
@@ -203,31 +229,22 @@ class StatefulComponent:
                     return await await_maybe(original_callback(interaction))
                 return
 
-            # Per-component owner-only gate. Routes through the view's
-            # ``on_unauthorized`` hook + ``unauthorized_message`` so the
-            # rejection UX matches the view-level gate. Skipped when the
-            # view has no owner (``user_id is None``) so anonymous flows
-            # still work. Strictly checks ``user_id`` -- ``allowed_users``
-            # is intentionally NOT consulted because the typical use case
-            # is a host-only button on an open-join view (lobby, ticket,
-            # poll), where allowed_users would let participants through.
-            #
-            # ``is True`` rather than truthiness: the kwarg stores exactly
-            # ``True`` or ``False``, so anything else reaching this
-            # attribute is not a caller opting in.
+            # The per-component owner_only gate (see StatefulButton). ``is
+            # True``: the kwarg stores exactly True or False, so anything else
+            # here is not a caller opting in.
             if (
                 getattr(component, "_button_owner_only", False) is True
                 and getattr(view, "user_id", None) is not None
                 and interaction.user.id != view.user_id
             ):
+                view._log_dropped_click(
+                    component, f"the control's owner_only refused user {interaction.user.id}"
+                )
                 await await_maybe(view.on_unauthorized(interaction))
                 return
 
-            # Bind the live interaction for the acting-view fast path in
-            # ``_StatefulMixin.refresh()``. Scope-narrow: set for the original
-            # callback + dispatch sequence, reset in the ``finally`` so
-            # subsequent interactions on the same event loop task never see
-            # a stale value.
+            # Read by refresh()'s acting-view fast path; the finally resets it
+            # so no later interaction in this task sees it.
             token = _CURRENT_INTERACTION.set(interaction)
             try:
                 # Call original callback FIRST so it can respond to the interaction
@@ -282,7 +299,10 @@ class StatefulButton(discord.ui.Button, StatefulComponent):
     as the default response) instead of invoking the user callback.
     Pairs with view-level ``owner_only=False`` to express "open view,
     host-only button" -- the canonical shape for lobby Start/Disband
-    buttons, ticket Close buttons, and poll End buttons.
+    buttons, ticket Close buttons, and poll End buttons. Only
+    ``view.user_id`` passes: ``allowed_users`` is not consulted, since it
+    would let the participants of an open view through. A view with no
+    ``user_id`` skips the gate.
 
     Raises:
         TypeError: ``callback`` cannot be called with ``(interaction)``.
@@ -340,12 +360,8 @@ class StatefulSelect(discord.ui.Select, StatefulComponent):
         # the surrounding layout stays stable across state changes.
         options = kwargs.get("options")
         if options is not None:
-            # A mapping has to be excluded before len() reads it, because it
-            # answers with a different meaning: len({"label": .., "value": ..})
-            # is 2, which clears both the empty check and the cap below, and
-            # discord.py then iterates the keys into two options named after
-            # them. Entries are checked here rather than at send, where the
-            # only symptom is an AttributeError raised inside discord.py.
+            # A mapping answers len() with its key count and iterates its keys,
+            # so it is refused before len() reads it.
             if hasattr(options, "items"):
                 raise TypeError(
                     "StatefulSelect options must be a list of SelectOption, not a "
@@ -443,12 +459,9 @@ class StatefulSelect(discord.ui.Select, StatefulComponent):
 # // ========================================( Dynamic Persistent Button )======================================== // #
 
 
-# Registry mapping fully-qualified class path (module.QualName) -> subclass for every
-# DynamicPersistentButton subclass that declares a template. The qualified key prevents
-# cross-module collisions when two unrelated cogs define a class with the same bare
-# name. Populated at class-definition time via __init_subclass__; consumed by
-# PersistenceManager.reattach_persistent_views, which registers the full set with the
-# bot via bot.add_dynamic_items(*classes) on every reattach pass.
+# Class path (module.QualName) -> every DynamicPersistentButton subclass with a
+# template, filled by __init_subclass__; the qualified key keeps two cogs' same-named
+# classes apart. Every reattach pass registers the set with bot.add_dynamic_items.
 _dynamic_button_classes: Dict[str, type] = {}
 
 
@@ -465,12 +478,8 @@ _SNOWFLAKE_CAPTURES: FrozenSet[str] = frozenset(
 )
 
 
-# Sentinel regex for DynamicPersistentButton itself. discord.py's
-# DynamicItem.__init_subclass__ requires a ``template=`` kwarg on every
-# subclass, so the intermediate base class must declare one. ``(?!)`` is a
-# negative lookahead of empty string -- it never matches any input, so
-# even if the base class were accidentally registered via
-# bot.add_dynamic_items, no real custom_id would route to it.
+# discord.py requires ``template=`` on every DynamicItem subclass, this base
+# included. ``(?!)`` matches nothing, so no custom_id can route to the base.
 _NEVER_MATCH_TEMPLATE = r"(?!)"
 
 
@@ -542,11 +551,8 @@ class DynamicPersistentButton(
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # The custom_id is a template-matched value supplied by the
-        # subclass __init__ (or the from_custom_id classmethod on
-        # restore). Mark it as user-provided so the parent view's
-        # _stabilize_custom_ids skips it -- rewriting would clobber the
-        # template match and discord.py would raise on assignment.
+        # The id is template-matched and fixed, so with_cooldown keys a
+        # cooldown on it, as on any id the caller provided.
         self._provided_custom_id = True
 
     def __init_subclass__(cls, **kwargs):
@@ -613,13 +619,16 @@ class DynamicPersistentButton(
         """
         token = _CURRENT_INTERACTION.set(interaction)
         defer_task = asyncio.create_task(self._auto_defer_timer(interaction))
+        stalled: dict = {}
         try:
-            await await_maybe(self.on_click(interaction))
+            with _collect_stalled_renders() as stalled:
+                await await_maybe(self.on_click(interaction))
         finally:
             _CURRENT_INTERACTION.reset(token)
             if not defer_task.done():
                 defer_task.cancel()
             await trailing_ack(interaction, owner=self.__class__.__name__, log=logger)
+            await ship_stalled_renders(stalled)
 
     async def respond(
         self,

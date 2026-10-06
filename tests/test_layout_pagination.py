@@ -1,5 +1,6 @@
 """Tests for PaginatedLayoutView (V2 pagination)."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -183,6 +184,34 @@ class TestPaginatedLayoutViewFromData:
         with pytest.raises(RuntimeError, match="from_data"):
             await view.refresh_data([1, 2, 3])
 
+    async def test_overlapping_refresh_data_calls_leave_the_last_one_on_screen(self):
+        """With an async formatter, an earlier call that formatted more slowly
+        finished last and put the older data back on screen."""
+        release_older = asyncio.Event()
+
+        async def formatter(chunk):
+            if chunk == ["old"]:
+                await release_older.wait()
+            return [Container(TextDisplay(",".join(chunk)))]
+
+        view = await PaginatedLayoutView.from_data(
+            items=["first"], per_page=5, formatter=formatter, interaction=_make_interaction()
+        )
+        await view.send()
+        older = asyncio.create_task(view.refresh_data(["old"]))
+        await asyncio.sleep(0)
+        newer = asyncio.create_task(view.refresh_data(["new"]))
+        await asyncio.sleep(0)
+        release_older.set()
+        await asyncio.gather(older, newer)
+
+        shown = [
+            item.content
+            for item in view.pages[0][0].walk_children()
+            if isinstance(item, TextDisplay)
+        ]
+        assert shown == ["new"]
+
 
 class TestPaginatedLayoutViewJump:
     """Jump buttons and go-to-page threshold tests."""
@@ -281,3 +310,29 @@ class TestPaginatedLayoutViewCursorRestore:
         await view.on_load()
 
         assert calls == []
+
+
+class TestPopAfterRefreshData:
+    async def test_pop_back_shows_the_refreshed_items(self):
+        """pop() rebuilt the paginator from its constructor kwargs, which still
+        held the items refresh_data had replaced."""
+        from helpers import RenderableLayoutView
+
+        class _Detail(RenderableLayoutView):
+            pass
+
+        def fmt(chunk):
+            return [TextDisplay(", ".join(chunk))]
+
+        view = await PaginatedLayoutView.from_data(
+            ["old-a", "old-b"], 1, fmt, interaction=_make_interaction(user_id=1, guild_id=100)
+        )
+        await view.send()
+        await view.refresh_data(["new-a", "new-b", "new-c"])
+        detail = await view.push(_Detail, interaction=_make_interaction(user_id=1, guild_id=100))
+
+        back = await detail.pop(interaction=_make_interaction(user_id=1, guild_id=100))
+
+        texts = [c.content for c in back.walk_children() if isinstance(c, TextDisplay)]
+        assert len(back.pages) == 3
+        assert texts[0] == "new-a"

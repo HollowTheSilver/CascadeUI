@@ -195,6 +195,85 @@ class TestCustomIdValidation:
         # Must not raise despite the link button's custom_id being None.
         view._validate_custom_ids()
 
+    async def test_a_tree_built_in_on_load_is_checked_at_send(self):
+        """send() checked before on_load ran, so a button built there went out
+        with an id no restart could reattach."""
+        from helpers import make_interaction
+
+        from cascadeui.state.singleton import get_store
+
+        class _Panel(PersistentLayoutView):
+            async def on_load(self):
+                self.clear_items()
+                self.add_item(
+                    discord.ui.ActionRow(StatefulButton(label="Go", callback=AsyncMock()))
+                )
+
+        interaction = make_interaction()
+        view = _Panel(interaction=interaction, persistence_key="test:on_load_ids")
+
+        with pytest.raises(ValueError, match="is missing a custom_id"):
+            await view.send()
+
+        interaction.response.send_message.assert_not_called()
+        assert view.id not in get_store()._active_views
+
+
+class TestComposedPanelsCheckNestedIds:
+    """The persistent leaderboard and roles panels compose the persistent
+    mixin with a V2 pattern and never pass through ``PersistentLayoutView``,
+    so the id check read only their top-level containers and a nested
+    control with a per-run id reached a panel that dies on restart."""
+
+    @staticmethod
+    async def _leaderboard(**attrs):
+        from helpers import make_interaction
+
+        from cascadeui import PersistentLeaderboardLayoutView
+
+        async def get_entries(self):
+            return [(1, {"score": 1})]
+
+        cls = type(
+            "_Board", (PersistentLeaderboardLayoutView,), {"get_entries": get_entries, **attrs}
+        )
+        view = cls(interaction=make_interaction(), persistence_key="board:ids")
+        await view.on_load()
+        return view
+
+    @staticmethod
+    async def _roles(**attrs):
+        from cascadeui import PersistentRolesLayoutView, RoleCategory
+
+        cls = type(
+            "_Roles",
+            (PersistentRolesLayoutView,),
+            {"categories": [RoleCategory(name="NestedIdCat", roles={"X": 8801})], **attrs},
+        )
+        return cls(persistence_key="roles:ids")
+
+    @pytest.mark.parametrize("factory", ["_leaderboard", "_roles"])
+    async def test_a_nested_control_without_an_id_is_refused(self, factory):
+        async def noop(interaction):
+            pass
+
+        view = await getattr(self, factory)()
+        view.add_item(discord.ui.ActionRow(StatefulButton(label="Extra", callback=noop)))
+
+        with pytest.raises(ValueError, match="missing a custom_id"):
+            view._validate_custom_ids()
+
+    @pytest.mark.parametrize("factory", ["_leaderboard", "_roles"])
+    async def test_the_panel_as_built_passes(self, factory):
+        view = await getattr(self, factory)()
+
+        view._validate_custom_ids()
+
+    async def test_auto_exit_button_passes_with_its_fixed_id(self):
+        view = await self._leaderboard(auto_exit_button=True)
+
+        view._validate_custom_ids()
+
 
 # // ========================================( Reducers )======================================== // #
 
@@ -1042,6 +1121,25 @@ class TestRealViewStoreRepair:
         await asyncio.sleep(0)
 
 
+# _setup() below builds a fresh PersistenceMiddleware per test and spawns a
+# registry-namespace flush task on every register/unregister. Left uncancelled,
+# that task is bound to the test's own event loop, which pytest-asyncio closes
+# at teardown -- the task can never resume, and the coroutine it awaits is
+# collected as "never awaited" whenever the garbage collector next runs,
+# which can land during an unrelated, later test. Draining here, not in each
+# test body, covers every test that reaches _setup() (including the ones in
+# TestPanelExitAndNavigation and TestPanelExitThatFails that call it through a
+# throwaway TestRetirePreviousOnSend() instance).
+_pending_persistence_middleware = []
+
+
+@pytest.fixture(autouse=True)
+async def _drain_persistence_middleware():
+    yield
+    while _pending_persistence_middleware:
+        await _pending_persistence_middleware.pop().flush_all()
+
+
 class TestRetirePreviousOnSend:
     """A send under a key another panel holds retires that panel by default.
 
@@ -1087,6 +1185,7 @@ class TestRetirePreviousOnSend:
         await backend.initialize()
         middleware = PersistenceMiddleware(backend=backend)
         await setup_middleware(middleware)
+        _pending_persistence_middleware.append(middleware)
         store = get_store()
         cls = self._panel_class(retire)
 
@@ -1106,6 +1205,125 @@ class TestRetirePreviousOnSend:
 
         await middleware.flush_all()
         return await backend.row_select(TABLE_PERSISTENT_VIEWS, {"persistence_key": self.KEY})
+
+    async def test_a_swap_rolled_back_mid_push_hands_the_key_to_the_panel_on_screen(self):
+        """The hand-back picked the view the push was still bringing in, so the
+        stored row carried its kwargs while the old panel stayed on screen."""
+        store, backend, middleware, old, new = await self._setup(retire=False)
+        gate, entered = asyncio.Event(), asyncio.Event()
+
+        class _Loading(type(old)):
+            async def on_load(self):
+                entered.set()
+                await gate.wait()
+
+        pushing = asyncio.create_task(old.push(_Loading, label="dest", persistence_key=self.KEY))
+        await asyncio.wait_for(entered.wait(), 1)
+        try:
+            await new._register_persistent(new._message)
+            await new.exit()
+
+            assert store.get_active_view(persistence_key=self.KEY) is old
+            rows = await self._row(backend, middleware)
+            assert json.loads(rows[0]["init_kwargs"])["label"] == "old"
+            assert rows[0]["view_class"] == type(old)._class_session_key()
+        finally:
+            gate.set()
+            await pushing
+
+    async def test_rolling_back_a_swap_restores_a_panel_showing_a_pushed_view(self):
+        """The hand-back looked only for a panel holding the key, and a panel
+        that had pushed holds none, so the registration was lost and a restart
+        reattached nothing to the panel's message."""
+        from helpers import RenderableLayoutView
+
+        class _Detail(RenderableLayoutView):
+            def __init__(self, *, detail="d", **kwargs):
+                super().__init__(**kwargs)
+
+        store, backend, middleware, old, new = await self._setup(retire=False)
+        child = await old.push(_Detail, detail="sub")
+        await new._register_persistent(new._message)
+
+        await new.exit()
+
+        entry = store.state["persistent_views"][self.KEY]
+        assert entry["message_id"] == "111"
+        assert entry["class_name"] == type(old)._class_session_key()
+        rows = await self._row(backend, middleware)
+        assert rows[0]["view_class"] == type(old)._class_session_key()
+        # The panel's own arguments, not the pushed view's.
+        assert json.loads(rows[0]["init_kwargs"]) == {"label": "old"}
+        assert store.get_active_view(persistence_key=self.KEY) is child
+
+        # Closing the pushed view then closes the panel, as it would have
+        # before the swap.
+        await child.exit(delete_message=False)
+        assert self.KEY not in store.state["persistent_views"]
+
+    async def test_rolling_back_after_the_pushed_view_moved_restores_nothing(self):
+        """Sent again to a new message, the view the old panel pushed to still
+        carried the old message's registration, so rolling the swap back put
+        the key on the message its send had just frozen: a restart restored a
+        panel there with nothing to click."""
+        from helpers import RenderableLayoutView, make_interaction
+
+        store, backend, middleware, old, new = await self._setup(retire=False)
+        child = await old.push(RenderableLayoutView)
+        await new._register_persistent(new._message)
+        child.interaction = make_interaction()
+        child.interaction.original_response.return_value.id = 777
+        assert await child.send() is not None
+
+        await new.exit()
+
+        assert self.KEY not in store.state["persistent_views"]
+        assert await self._row(backend, middleware) == []
+
+    async def test_rolling_back_with_nothing_on_the_old_message_restores_nothing(self):
+        from helpers import RenderableLayoutView
+
+        store, backend, middleware, old, new = await self._setup(retire=False)
+        child = await old.push(RenderableLayoutView)
+        await new._register_persistent(new._message)
+        await child.exit(delete_message=True)
+
+        await new.exit()
+
+        assert self.KEY not in store.state["persistent_views"]
+        assert await self._row(backend, middleware) == []
+
+    async def test_closing_a_view_the_new_panel_pushed_hands_the_key_back(self):
+        """Closing it closes the panel, so it hands the registration back as the
+        panel's own exit() does; it removed the registration and left the old
+        panel with no row to restore from."""
+        from helpers import RenderableLayoutView
+
+        store, backend, middleware, old, new = await self._setup(retire=False)
+        await new._register_persistent(new._message)
+        child = await new.push(RenderableLayoutView)
+
+        await child.exit(delete_message=False)
+
+        assert store.state["persistent_views"][self.KEY]["message_id"] == "111"
+        rows = await self._row(backend, middleware)
+        assert json.loads(rows[0]["init_kwargs"]) == {"label": "old"}
+
+    async def test_a_panel_sent_again_keeps_the_record_of_the_panel_it_superseded(self):
+        """Moving its own row recorded that row as the one superseded, so the
+        hand-back went to the panel's own previous message and was lost."""
+        from helpers import RenderableLayoutView
+
+        store, backend, middleware, old, new = await self._setup(retire=False)
+        await old.push(RenderableLayoutView)
+        await new._register_persistent(new._message)
+        moved_to = self._message(555)
+        new._message = moved_to
+        await new._register_persistent(moved_to)
+
+        await new.exit()
+
+        assert store.state["persistent_views"][self.KEY]["message_id"] == "111"
 
     async def test_default_still_exits_the_previous_panel(self):
         store, backend, middleware, old, new = await self._setup(retire=True)
@@ -1183,18 +1401,117 @@ class TestRetirePreviousOnSend:
         assert rebuilds == []
         assert self.KEY not in store.state.get("persistent_views", {})
 
-    async def test_a_pushed_view_frozen_in_place_keeps_the_registration(self):
-        """The message is still up, so the row still describes something."""
+    async def test_a_panel_exiting_after_its_push_keeps_the_registration(self):
+        """The panel kept the registration id it handed on, so its exit removed
+        the row the view now on its message carries."""
         from helpers import RenderableLayoutView
 
         store, backend, middleware, old, new = await self._setup(retire=True)
         child = await old.push(RenderableLayoutView)
 
-        await child.exit(delete_message=False)
+        await old.exit(delete_message=False)
         await middleware.flush_all()
 
         assert store.state["persistent_views"][self.KEY]["message_id"] == "111"
         assert len(await self._row(backend, middleware)) == 1
+        assert not child.is_finished()
+
+    async def test_a_panel_exiting_during_its_push_waits_for_the_hand_off(self):
+        from helpers import RenderableLayoutView, make_interaction
+
+        store, backend, middleware, old, new = await self._setup(retire=True)
+        gate = asyncio.Event()
+
+        async def deferred_edit(**kwargs):
+            await gate.wait()
+
+        nav = make_interaction(is_done=True)
+        nav.edit_original_response = AsyncMock(side_effect=deferred_edit)
+        push = asyncio.create_task(old.push(RenderableLayoutView, interaction=nav))
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        closing = asyncio.create_task(old.exit(delete_message=False))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        gate.set()
+        child = await push
+        await closing
+        await middleware.flush_all()
+
+        assert store.state["persistent_views"][self.KEY]["message_id"] == "111"
+        assert len(await self._row(backend, middleware)) == 1
+        assert not child.is_finished()
+
+    @pytest.mark.parametrize("close", ["freeze", "replace"])
+    async def test_closing_a_pushed_view_retires_the_panel(self, close):
+        """Frozen in place, the panel kept its row, so the next restart put it
+        back on the message it had been closed on, beside any replacement."""
+        from helpers import RenderableLayoutView
+
+        store, backend, middleware, old, new = await self._setup(retire=True)
+        child = await old.push(RenderableLayoutView)
+
+        if close == "freeze":
+            await child.exit(delete_message=False)
+        else:
+            await child.replace(RenderableLayoutView)
+        await middleware.flush_all()
+
+        assert self.KEY not in store.state.get("persistent_views", {})
+        assert await self._row(backend, middleware) == []
+
+    async def test_a_pushed_view_that_times_out_keeps_the_panel_restorable(self):
+        """A pushed view that times out (its own on_timeout() calls super(), or
+        its return to the panel failed) is not a close: the panel stays
+        registered, so a restart brings it back on its message."""
+        from helpers import RenderableLayoutView
+
+        store, backend, middleware, old, new = await self._setup(retire=True)
+        child = await old.push(RenderableLayoutView)
+
+        await child.on_timeout()
+        await middleware.flush_all()
+
+        assert store.state["persistent_views"][self.KEY]["message_id"] == "111"
+        assert len(await self._row(backend, middleware)) == 1
+
+    async def test_an_exit_cut_off_while_closing_renders_what_it_declined(self):
+        """A closing view declines state renders; one whose exit is cut off
+        stays live and must still show the state that arrived meanwhile."""
+        from helpers import RenderableLayoutView
+
+        store, backend, middleware, old, new = await self._setup(retire=True)
+        closing = asyncio.Event()
+        renders = []
+
+        class _Slow(RenderableLayoutView):
+            async def exit(self, delete_message=None):
+                closing.set()
+                await asyncio.Event().wait()
+
+        async def on_state_changed(state):
+            renders.append(state)
+
+        old.on_state_changed = on_state_changed
+        old.subscribed_actions = None
+        store.subscribe(old.id, old._handle_state_notification, None, old._build_selector())
+        old.attach_child(_Slow())
+        task = asyncio.create_task(old.exit())
+        await asyncio.wait_for(closing.wait(), 1)
+
+        await store.dispatch("CLOSING_TICK", {})
+        await store._flush_notifications()
+        assert renders == []  # declined while closing
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        assert not old._closed()
+        assert len(renders) == 1  # replayed once the exit was cut off
 
     async def test_a_raising_hand_back_does_not_escape_exit(self):
         """The teardown still has to run: a caller rolling a swap back would
@@ -1321,6 +1638,393 @@ class TestRetirePreviousOnSend:
                 retire_previous_on_send = "no"
 
 
+class TestPanelExitAndNavigation:
+    """A panel's retire and exit against a push from it in flight."""
+
+    @staticmethod
+    async def _panels():
+        return await TestRetirePreviousOnSend()._setup(retire=True)
+
+    async def test_a_failed_push_hands_back_a_view_whose_exit_keeps_the_registration(self):
+        """The discarded view still carried the panel's registration id, so its
+        exit() removed the registration of the panel that stayed live."""
+        from unittest.mock import MagicMock
+
+        from helpers import make_interaction
+
+        store, backend, middleware, old, new = await self._panels()
+        response = MagicMock(status=429, reason="Too Many Requests", headers={"Retry-After": "1"})
+        nav = make_interaction(user_id=1, guild_id=100, message=old._message)
+        nav.response.edit_message = AsyncMock(
+            side_effect=discord.HTTPException(response, {"message": "rate limited", "code": 0})
+        )
+
+        discarded = await old.push(
+            type(old), interaction=nav, label="next", persistence_key=TestRetirePreviousOnSend.KEY
+        )
+        await discarded.exit(delete_message=True)
+
+        assert not old.is_finished()
+        assert store.state["persistent_views"][TestRetirePreviousOnSend.KEY]["message_id"] == "111"
+        assert len(await TestRetirePreviousOnSend()._row(backend, middleware)) == 1
+
+    async def test_a_pushed_view_whose_message_goes_retires_every_row_naming_it(self):
+        """A key renamed in place left the old row naming the same message, and
+        only the first match was retired, so the other kept claiming a deleted
+        message until the next restart."""
+        from helpers import RenderableLayoutView
+
+        from cascadeui.state.actions import ActionCreators
+
+        store, backend, middleware, old, new = await self._panels()
+        await store.dispatch(
+            "PERSISTENT_VIEW_REGISTERED",
+            ActionCreators.persistent_view_registered("swap:old-name", "_SwapPanel", "111", "222"),
+        )
+        child = await old.push(RenderableLayoutView)
+
+        await child.exit(delete_message=True)
+
+        registry = store.state["persistent_views"]
+        assert TestRetirePreviousOnSend.KEY not in registry
+        assert "swap:old-name" not in registry
+
+    async def test_replacing_a_panel_removes_its_registration(self):
+        """replace() stopped the panel and left its row, so the next restart
+        attached the replaced panel to its old message again."""
+        from helpers import RenderableLayoutView
+
+        store, backend, middleware, old, new = await self._panels()
+
+        await old.replace(RenderableLayoutView)
+
+        assert TestRetirePreviousOnSend.KEY not in store.state["persistent_views"]
+        assert not await TestRetirePreviousOnSend()._row(backend, middleware)
+
+    async def test_retiring_a_panel_exits_the_view_its_push_in_flight_hands_over_to(self, caplog):
+        """The retire exited the panel it collected, which did nothing once
+        the panel's push landed, and the pushed view stayed live on the old
+        message. The retire follows the push itself, so it warns about no
+        stale reference."""
+        from helpers import RenderableLayoutView, make_interaction
+
+        class _Child(RenderableLayoutView):
+            pass
+
+        store, backend, middleware, old, new = await self._panels()
+        release = asyncio.Event()
+
+        async def blocked(**kwargs):
+            if kwargs.get("view") is old:
+                await release.wait()
+            return old._message
+
+        # An edit of the panel in flight holds its push before the pushed
+        # view exists, so the retire collects the panel alone.
+        old._message.edit = AsyncMock(side_effect=blocked)
+        refreshing = asyncio.create_task(old.refresh())
+        for _ in range(5):
+            await asyncio.sleep(0)
+        pushing = asyncio.create_task(
+            old.push(_Child, interaction=make_interaction(user_id=1, guild_id=100))
+        )
+        for _ in range(5):
+            await asyncio.sleep(0)
+        with caplog.at_level(logging.WARNING, logger="cascadeui"):
+            retiring = asyncio.create_task(new._register_persistent(new._message))
+            for _ in range(5):
+                await asyncio.sleep(0)
+            release.set()
+            await refreshing
+            child = await pushing
+            await retiring
+
+        assert old._successor is child
+        assert child._torn_down()
+        assert not [r for r in caplog.records if "handed its panel on" in r.getMessage()]
+
+    async def test_a_push_while_the_panel_exit_unregisters_raises(self):
+        """The persistent exit dispatched its unregister before stopping the
+        panel, and a push in that window ran on the panel being closed."""
+        from helpers import RenderableLayoutView, make_interaction
+
+        class _Child(RenderableLayoutView):
+            pass
+
+        store, backend, middleware, old, new = await self._panels()
+        suspended, release = asyncio.Event(), asyncio.Event()
+
+        async def slow_unregister(action, state, next_fn):
+            if action["type"] == "PERSISTENT_VIEW_UNREGISTERED":
+                suspended.set()
+                await release.wait()
+            return await next_fn(action, state)
+
+        store._add_middleware(slow_unregister)
+        try:
+            exiting = asyncio.create_task(old.exit())
+            await suspended.wait()
+            with pytest.raises(RuntimeError, match="has closed"):
+                await old.push(_Child, interaction=make_interaction(user_id=1, guild_id=100))
+            release.set()
+            await exiting
+        finally:
+            store._remove_middleware(slow_unregister)
+
+        assert not any(isinstance(v, _Child) for v in store._active_views.values())
+
+
+class TestPanelExitThatFails:
+    @pytest.mark.parametrize("close", ["exit", "replace"])
+    async def test_a_close_cut_off_while_children_close_keeps_the_registration(self, close):
+        """The registration went before the attached views closed, so a cancel
+        there left the panel live and answering clicks, with no row to
+        reattach it after a restart."""
+        from helpers import RenderableLayoutView
+
+        setup = TestRetirePreviousOnSend()
+        store, backend, middleware, old, new = await setup._setup(retire=True)
+        closing = asyncio.Event()
+
+        class _Slow(RenderableLayoutView):
+            async def exit(self, delete_message=None):
+                closing.set()
+                await asyncio.Event().wait()
+
+        old.attach_child(_Slow())
+        task = asyncio.create_task(
+            old.exit() if close == "exit" else old.replace(RenderableLayoutView)
+        )
+        await asyncio.wait_for(closing.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert not old._closed()
+        assert store.state["persistent_views"][setup.KEY]["message_id"] == "111"
+        assert len(await setup._row(backend, middleware)) == 1
+
+    async def test_a_second_exit_does_not_unregister_again(self):
+        """The second call dispatched PERSISTENT_VIEW_UNREGISTERED for a key it
+        no longer held, so a store.on() hook saw the panel retired twice."""
+        setup = TestRetirePreviousOnSend()
+        store, backend, middleware, old, new = await setup._setup(retire=True)
+        unregistered = []
+
+        async def hook(action, state):
+            unregistered.append(action["payload"]["persistence_key"])
+
+        store.on("PERSISTENT_VIEW_UNREGISTERED", hook)
+
+        await old.exit()
+        await old.exit()
+
+        assert unregistered == [setup.KEY]
+
+    async def test_an_exit_after_a_pushed_views_timeout_still_retires_the_panel(self):
+        """A timeout keeps the panel restorable; an exit afterwards closes it,
+        which is what the exit would have done on its own."""
+        from helpers import RenderableLayoutView
+
+        setup = TestRetirePreviousOnSend()
+        store, backend, middleware, old, new = await setup._setup(retire=True)
+        child = await old.push(RenderableLayoutView)
+
+        await child.on_timeout()
+        assert setup.KEY in store.state["persistent_views"]
+        await child.exit()
+        await middleware.flush_all()
+
+        assert setup.KEY not in store.state.get("persistent_views", {})
+        assert await setup._row(backend, middleware) == []
+
+    async def test_a_panel_closed_while_it_posts_is_not_registered(self):
+        """The registration ran after the send returned, so a panel closed
+        while it posted still wrote a row and came back after a restart."""
+        from discord.ui import ActionRow, TextDisplay
+        from helpers import make_interaction
+
+        from cascadeui import PersistentLayoutView, StatefulButton
+
+        class _Panel(PersistentLayoutView):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.add_item(TextDisplay("panel"))
+                self.add_item(ActionRow(StatefulButton(label="Go", custom_id="closing_go")))
+
+        posting, gate = asyncio.Event(), asyncio.Event()
+        interaction = make_interaction(user_id=1, guild_id=100)
+        real_send = interaction.response.send_message
+
+        async def send_slowly(*args, **kwargs):
+            posting.set()
+            await gate.wait()
+            return await real_send(*args, **kwargs)
+
+        interaction.response.send_message = send_slowly
+        panel = _Panel(persistence_key="closing:panel", interaction=interaction)
+        registered = []
+
+        async def hook(action, state):
+            registered.append(action["payload"]["persistence_key"])
+
+        panel.state_store.on("PERSISTENT_VIEW_REGISTERED", hook)
+        try:
+            sending = asyncio.create_task(panel.send())
+            await asyncio.wait_for(posting.wait(), 1)
+            await asyncio.wait_for(panel.exit(), 1)
+            gate.set()
+            assert await sending is None
+        finally:
+            panel.state_store.off("PERSISTENT_VIEW_REGISTERED", hook)
+
+        assert registered == []
+
+    async def test_a_panel_closed_while_on_bind_runs_posts_nothing(self):
+        """The bind ran before the send held the panel, so the close ran on
+        its own and the send then raised for a panel it had not begun."""
+        from discord.ui import ActionRow, TextDisplay
+        from helpers import make_interaction
+
+        from cascadeui import PersistentLayoutView, StatefulButton
+
+        binding, gate = asyncio.Event(), asyncio.Event()
+
+        class _Panel(PersistentLayoutView):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.add_item(TextDisplay("panel"))
+                self.add_item(ActionRow(StatefulButton(label="Go", custom_id="binding_go")))
+
+            async def on_bind(self, bot):
+                binding.set()
+                await gate.wait()
+
+        interaction = make_interaction(user_id=1, guild_id=100)
+        panel = _Panel(persistence_key="binding:panel", interaction=interaction)
+        sending = asyncio.create_task(panel.send())
+        await asyncio.wait_for(binding.wait(), 1)
+        await asyncio.wait_for(panel.exit(), 1)
+        gate.set()
+
+        assert await sending is None
+        interaction.response.send_message.assert_not_awaited()
+        assert "binding:panel" not in panel.state_store.state.get("persistent_views", {})
+
+    async def test_a_panel_stopped_while_it_is_sent_is_not_registered(self):
+        from discord.ui import ActionRow, TextDisplay
+        from helpers import make_interaction
+
+        from cascadeui import PersistentLayoutView, StatefulButton
+
+        class _Panel(PersistentLayoutView):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.add_item(TextDisplay("panel"))
+                self.add_item(ActionRow(StatefulButton(label="Go", custom_id="stopping_go")))
+
+            async def seed_initial_state(self, state):
+                self.stop()
+
+        panel = _Panel(
+            persistence_key="stopping:panel", interaction=make_interaction(user_id=1, guild_id=100)
+        )
+
+        assert await panel.send() is None
+        assert panel._torn_down()
+        assert "stopping:panel" not in panel.state_store.state.get("persistent_views", {})
+        assert "closing:panel" not in panel.state_store.state.get("persistent_views", {})
+        assert panel._torn_down()
+
+    async def test_a_panel_exit_that_raises_leaves_the_panel_usable(self):
+        """The unregister dispatch raised after exit() had marked the panel
+        closing, and the panel then dropped every click until a restart."""
+        from discord.ui import ActionRow, TextDisplay
+        from helpers import make_interaction
+
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        ran = []
+
+        class _Panel(PersistentLayoutView):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+
+                async def go(interaction):
+                    ran.append(interaction)
+
+                self.button = StatefulButton(label="Go", custom_id="panel_go", callback=go)
+                self.add_item(TextDisplay("panel"))
+                self.add_item(ActionRow(self.button))
+
+        panel = _Panel(
+            persistence_key="flaky:panel", interaction=make_interaction(user_id=1, guild_id=100)
+        )
+        await panel.send()
+        store = panel.state_store
+
+        async def flaky(action, state, next_fn):
+            if action["type"] == "PERSISTENT_VIEW_UNREGISTERED":
+                raise RuntimeError("backend blip")
+            return await next_fn(action, state)
+
+        store._add_middleware(flaky)
+        try:
+            with pytest.raises(RuntimeError, match="backend blip"):
+                await panel.exit()
+        finally:
+            store._remove_middleware(flaky)
+
+        assert not panel._closed()
+        await panel._scheduled_task(panel.button, make_interaction(user_id=1, guild_id=100))
+        assert len(ran) == 1
+
+
+class TestKwargsSchemaVersionValidation:
+    """Read with int() at every registry write, so a bad value failed there."""
+
+    def test_a_per_instance_version_is_refused(self):
+        """The restore compares a row against the class's version, so a value
+        set on one instance was stored and then never matched."""
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        class _Panel(PersistentLayoutView):
+            kwargs_schema_version = 2
+
+        panel = _Panel(persistence_key="version:instance")
+        with pytest.raises(ValueError, match="read from the class"):
+            panel.set_class_attribute("kwargs_schema_version", 5)
+
+    async def test_the_stored_version_is_the_classs(self):
+        """The row build read the instance while the restore read the class."""
+        setup = TestRetirePreviousOnSend()
+        store, backend, middleware, old, new = await setup._setup(retire=True)
+        type(new).kwargs_schema_version = 3
+        new.kwargs_schema_version = 9
+
+        await new._register_persistent(new._message)
+
+        rows = await setup._row(backend, middleware)
+        assert [row["kwargs_schema_version"] for row in rows] == [3]
+
+    @pytest.mark.parametrize("value", ["two", None, 0, True])
+    def test_a_version_that_is_not_a_positive_int_is_refused(self, value):
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        with pytest.raises(ValueError, match="kwargs_schema_version must be a positive int"):
+
+            class _Panel(PersistentLayoutView):
+                kwargs_schema_version = value
+
+    def test_a_positive_version_is_accepted(self):
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        class _Panel(PersistentLayoutView):
+            kwargs_schema_version = 3
+
+        assert _Panel.kwargs_schema_version == 3
+
+
 class TestUnregisterReducerScope:
     """The unregister reducer removes a key only when it still points at the
     message that asked; a payload without a message id keeps the old meaning."""
@@ -1360,13 +2064,13 @@ class TestRegistrationOwnershipSeams:
         registered = []
         fallbacks = []
         store.on("PERSISTENT_VIEW_REGISTERED", lambda action, state: registered.append(action))
-        original = _PersistentMixin._reregister_live_predecessor
+        original = _StatefulMixin._reregister_live_predecessor
 
         async def spy(self, key):
             fallbacks.append(self.id)
             return await original(self, key)
 
-        monkeypatch.setattr(_PersistentMixin, "_reregister_live_predecessor", spy)
+        monkeypatch.setattr(_StatefulMixin, "_reregister_live_predecessor", spy)
         make = TestRetirePreviousOnSend._message
 
         old = TestRetirePreviousOnSend._panel_class(True)(label="old", persistence_key="own:1")
@@ -1459,3 +2163,486 @@ class TestRegistrationOwnershipSeams:
 
         assert old.is_finished()
         assert [r["message_id"] for r in await setup._row(backend, middleware)] == [999]
+
+
+class TestIdlePushedScreenReturnsToPanel:
+    """A view pushed onto a persistent panel's message timed out and froze the
+    shared panel for everyone until a restart. It now returns to the panel."""
+
+    @staticmethod
+    async def _settle():
+        for _ in range(30):
+            await asyncio.sleep(0)
+
+    @staticmethod
+    def _screen(name="_Screen", **attrs):
+        from discord.ui import ActionRow, TextDisplay
+
+        async def noop(interaction):
+            pass
+
+        def __init__(self, **kwargs):
+            StatefulLayoutView.__init__(self, **kwargs)
+            self.add_item(TextDisplay(name))
+            self.add_item(ActionRow(StatefulButton(label="Back", custom_id="back", callback=noop)))
+
+        return type(name, (StatefulLayoutView,), {"__init__": __init__, **attrs})
+
+    async def test_an_idle_pushed_screen_returns_to_the_panel(self):
+        setup = TestRetirePreviousOnSend()
+        store, backend, middleware, old, new = await setup._setup(retire=True)
+        message = old._message
+        screen = await old.push(self._screen())
+        message.edit.reset_mock()
+
+        screen._dispatch_timeout()
+        await self._settle()
+
+        panel = screen._successor
+        assert panel is not None and type(panel) is type(old)
+        assert message.edit.await_args.kwargs["view"] is panel
+        assert not panel.is_finished() and panel._nav_stack == []
+        assert store.state["persistent_views"][setup.KEY]["message_id"] == "111"
+        assert store.get_active_view(persistence_key=setup.KEY) is panel
+
+    async def test_a_deeper_screen_returns_to_the_panel_itself(self):
+        setup = TestRetirePreviousOnSend()
+        store, backend, middleware, old, new = await setup._setup(retire=True)
+        middle = await old.push(self._screen("_Middle"))
+        deeper = await middle.push(self._screen("_Deeper"))
+
+        deeper._dispatch_timeout()
+        await self._settle()
+
+        panel = deeper._successor
+        assert type(panel) is type(old)
+        assert panel._nav_stack == []
+
+    async def test_a_screen_whose_panel_row_was_pruned_times_out(self):
+        """The operator pruned the panel's row: a return would bring back a
+        panel no restart restores, so the screen freezes as before."""
+        setup = TestRetirePreviousOnSend()
+        store, backend, middleware, old, new = await setup._setup(retire=True)
+        screen = await old.push(self._screen())
+        await store.persistence_manager.prune_registry(persistence_keys=[setup.KEY])
+
+        screen._dispatch_timeout()
+        await self._settle()
+
+        assert screen._successor is None and screen.is_finished()
+
+    async def test_a_screen_with_its_own_on_timeout_keeps_it(self):
+        ran = []
+
+        async def on_timeout(self):
+            ran.append(self)
+            await StatefulLayoutView.on_timeout(self)
+
+        setup = TestRetirePreviousOnSend()
+        store, backend, middleware, old, new = await setup._setup(retire=True)
+        screen = await old.push(self._screen(on_timeout=on_timeout))
+
+        screen._dispatch_timeout()
+        await self._settle()
+
+        assert ran == [screen]
+        assert screen._successor is None and screen.is_finished()
+
+    async def test_a_return_that_fails_times_out_as_before(self):
+        setup = TestRetirePreviousOnSend()
+        store, backend, middleware, old, new = await setup._setup(retire=True)
+        message = old._message
+        screen = await old.push(self._screen())
+        response = MagicMock(status=500, reason="Server Error")
+        message.edit = AsyncMock(
+            side_effect=[discord.HTTPException(response, "down"), message, message]
+        )
+
+        screen._dispatch_timeout()
+        await self._settle()
+
+        assert screen._successor is None and screen.is_finished()
+        frozen = message.edit.await_args.kwargs["view"]
+        assert all(
+            button.disabled
+            for button in frozen.walk_children()
+            if isinstance(button, discord.ui.Button)
+        )
+        assert store.state["persistent_views"][setup.KEY]["message_id"] == "111"
+
+    async def test_a_return_that_raises_times_out_as_before(self, caplog):
+        """A raise from the return (the panel could not be rebuilt) ended the
+        timeout's task, so the screen stayed live with its timer spent."""
+        from helpers import until
+
+        setup = TestRetirePreviousOnSend()
+        store, backend, middleware, old, new = await setup._setup(retire=True)
+        screen = await old.push(self._screen())
+        entry = screen._nav_stack[-1]
+        entry["kwargs"] = {**entry["kwargs"], "unknown_option": 1}
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui"):
+            screen._dispatch_timeout()
+            try:
+                await until(screen.is_finished)
+            except asyncio.TimeoutError:
+                pytest.fail("the screen stayed live with its timer spent")
+            await self._settle()
+
+        assert screen._successor is None
+        assert any("could not return to its panel" in r.getMessage() for r in caplog.records)
+
+    async def test_a_screen_on_an_ordinary_view_times_out_as_before(self):
+        from helpers import make_interaction
+
+        root = self._screen("_Root")(interaction=make_interaction())
+        await root.send()
+        screen = await root.push(self._screen())
+
+        screen._dispatch_timeout()
+        await self._settle()
+
+        assert screen._successor is None and screen.is_finished()
+
+    async def test_a_push_that_lands_while_the_timeout_waits_is_left_alone(self):
+        """The screen handed its message on while the return waited for the
+        navigation, so returning would navigate a view that owns nothing."""
+        from helpers import RenderableLayoutView
+
+        setup = TestRetirePreviousOnSend()
+        store, backend, middleware, old, new = await setup._setup(retire=True)
+        screen = await old.push(self._screen())
+        gate, entered = asyncio.Event(), asyncio.Event()
+
+        class _Loading(RenderableLayoutView):
+            async def on_load(self):
+                entered.set()
+                await gate.wait()
+
+        pushing = asyncio.create_task(screen.push(_Loading))
+        await asyncio.wait_for(entered.wait(), 1)
+        screen._dispatch_timeout()
+        await self._settle()
+        gate.set()
+        loaded = await pushing
+        await self._settle()
+
+        assert screen._successor is loaded
+        assert not loaded.is_finished()
+        assert loaded._successor is None  # nothing returned it to the panel
+
+    async def test_a_timeout_during_an_exit_takes_the_ordinary_path(self):
+        """A timeout arriving while an exit closes the screen does not return
+        it to the panel, and still times it out if that exit is cut off."""
+        from helpers import RenderableLayoutView
+
+        setup = TestRetirePreviousOnSend()
+        store, backend, middleware, old, new = await setup._setup(retire=True)
+        screen = await old.push(self._screen())
+        closing = asyncio.Event()
+
+        class _Slow(RenderableLayoutView):
+            async def exit(self, delete_message=None):
+                closing.set()
+                await asyncio.Event().wait()
+
+        screen.attach_child(_Slow())
+        exiting = asyncio.create_task(screen.exit())
+        await asyncio.wait_for(closing.wait(), 1)
+        screen._dispatch_timeout()
+        exiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await exiting
+        await self._settle()
+
+        assert screen.is_finished()  # the timeout still ran
+
+    async def test_an_exit_that_begins_while_the_return_waits_still_times_out(self):
+        """The return gave up on a closing screen without timing it out, and
+        discord.py's timer had already fired, so an exit cut off afterwards
+        left the screen live with nothing left to close it."""
+        from helpers import RenderableLayoutView
+
+        setup = TestRetirePreviousOnSend()
+        store, backend, middleware, old, new = await setup._setup(retire=True)
+        screen = await old.push(self._screen())
+        gate, entered, closing = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        class _Failing(RenderableLayoutView):
+            async def on_load(self):
+                entered.set()
+                await gate.wait()
+                raise RuntimeError("load failed")
+
+        class _Slow(RenderableLayoutView):
+            async def exit(self, delete_message=None):
+                closing.set()
+                await asyncio.Event().wait()
+
+        screen.attach_child(_Slow())
+        pushing = asyncio.create_task(screen.push(_Failing))
+        await asyncio.wait_for(entered.wait(), 1)
+        exiting = asyncio.create_task(screen.exit())  # waits out the push first
+        await self._settle()
+        screen._dispatch_timeout()  # the return queues behind the exit
+        await self._settle()
+        gate.set()
+        with pytest.raises(RuntimeError, match="load failed"):
+            await pushing
+        await asyncio.wait_for(closing.wait(), 1)
+        await self._settle()
+        exiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await exiting
+        await self._settle()
+
+        assert screen._successor is None
+        assert screen.is_finished()
+
+
+class TestPanelSentAgain:
+    async def test_a_panel_sent_again_freezes_the_message_it_left(self):
+        # The duplicate-key cleanup took the message the panel had just left
+        # for an orphan from an earlier run and deleted it, whatever the
+        # panel's exit_policy said.
+        from discord.components import _component_factory
+        from discord.ui import ActionRow, TextDisplay
+        from helpers import make_interaction
+
+        from cascadeui import PersistentLayoutView
+
+        class _Panel(PersistentLayoutView):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.add_item(TextDisplay("panel"))
+                self.add_item(ActionRow(StatefulButton(label="Go", custom_id="moving_go")))
+
+        panel = _Panel(persistence_key="moving:panel", interaction=make_interaction())
+        await panel.send()
+        old = panel._message
+        # Real components, so an orphan cleanup would have something to freeze.
+        old.components = [_component_factory(payload) for payload in panel.to_components()]
+        again = make_interaction()
+        again.original_response.return_value.id = 4321
+        again.original_response.return_value.components = [
+            _component_factory(payload) for payload in panel.to_components()
+        ]
+        # A client whose channel lookup finds the old message, so the orphan
+        # cleanup would run if it took the message for one.
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.fetch_message = AsyncMock(return_value=old)
+        again.client = MagicMock()
+        again.client.get_channel = MagicMock(return_value=channel)
+        panel.interaction = again
+
+        assert await panel.send() is not None
+
+        channel.fetch_message.assert_not_awaited()
+        old.delete.assert_not_awaited()
+        old.edit.assert_awaited_once()
+        assert old.edit.await_args.kwargs["view"].is_finished()
+        entry = panel.state_store.state["persistent_views"]["moving:panel"]
+        assert entry["message_id"] == "4321"
+
+    @staticmethod
+    def _board(custom_id):
+        from discord.ui import ActionRow, TextDisplay
+
+        from cascadeui import PersistentLayoutView
+
+        class _Panel(PersistentLayoutView):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.add_item(TextDisplay("panel"))
+                self.add_item(ActionRow(StatefulButton(label="Go", custom_id=custom_id)))
+
+        return _Panel
+
+    async def test_a_message_posted_without_its_channel_still_registers(self):
+        # discord.py leaves the channel off a message posted in a channel type
+        # it cannot build, and registering read it and raised: the panel was
+        # live and would not come back after a restart.
+        from helpers import make_interaction
+
+        interaction = make_interaction()
+        interaction.channel_id = 555
+        interaction.original_response.return_value.id = 100
+        interaction.original_response.return_value.channel = None
+        panel = self._board("nochannel_go")(persistence_key="nochannel", interaction=interaction)
+
+        assert await panel.send() is not None
+
+        state = panel.state_store.state
+        assert state["persistent_views"]["nochannel"]["channel_id"] == "555"
+        assert state["views"][panel.id]["channel_id"] == "555"
+
+    async def test_a_panel_stopped_once_its_registration_moved_retires_it(self):
+        # Closed as a timeout leaves a view, the stopped panel kept its row,
+        # and a restart restored it on a message whose buttons were disabled.
+        from helpers import make_interaction
+
+        panel = self._board("stopped_go")(persistence_key="stopped", interaction=make_interaction())
+        await panel.send()
+        old = panel._message
+
+        async def stop_while_leaving(**kwargs):
+            panel.stop()
+            return old
+
+        old.edit = AsyncMock(side_effect=stop_while_leaving)
+        again = make_interaction()
+        again.original_response.return_value.id = 200
+        panel.interaction = again
+
+        assert await panel.send() is None
+
+        assert panel._torn_down()
+        assert "stopped" not in panel.state_store.state["persistent_views"]
+
+
+class TestPolicyFollowsTheMessage:
+    """A message a view leaves or supersedes closes by the view's exit_policy,
+    and a registration naming it goes with it."""
+
+    @staticmethod
+    def _panel_class(**attrs):
+        from discord.ui import ActionRow, TextDisplay
+
+        from cascadeui import PersistentLayoutView
+
+        def __init__(self, **kwargs):
+            PersistentLayoutView.__init__(self, **kwargs)
+            self.add_item(TextDisplay("panel"))
+            self.add_item(ActionRow(StatefulButton(label="Go", custom_id="policy_go")))
+
+        return type("_Panel", (PersistentLayoutView,), {"__init__": __init__, **attrs})
+
+    async def test_a_screen_a_panel_pushed_to_sent_again_takes_the_panel_along(self):
+        # The re-send retired the panel's registration, so Back on the new
+        # message rebuilt a live panel that no restart would bring back.
+        from helpers import RenderableLayoutView, make_interaction
+
+        first = make_interaction()
+        first.original_response.return_value.id = 100
+        panel = self._panel_class()(persistence_key="policy:panel", interaction=first)
+        await panel.send()
+        store = panel.state_store
+        registered = dict(store.state["persistent_views"]["policy:panel"])
+        screen = await panel.push(RenderableLayoutView, make_interaction(message=MagicMock(id=100)))
+        again = make_interaction()
+        again.original_response.return_value.id = 200
+        screen.interaction = again
+
+        await screen.send()
+
+        entry = store.state["persistent_views"]["policy:panel"]
+        assert entry["message_id"] == "200"
+        assert entry["class_name"] == registered["class_name"]
+        assert "policy:panel" in store._live_persistence_keys()
+        popped = await screen.pop(make_interaction(message=MagicMock(id=200)))
+        assert store.get_active_view(persistence_key="policy:panel") is popped
+        assert store.state["persistent_views"]["policy:panel"]["message_id"] == "200"
+
+    async def test_a_screen_sent_again_as_its_bot_closes_keeps_the_panel_restorable(self):
+        # The close cleared the screen's registration id, and the re-send then
+        # retired the panel's row as if the screen had closed: the restart
+        # restored nothing.
+        from helpers import RenderableLayoutView, make_interaction
+
+        class _Screen(RenderableLayoutView):
+            releasing = False
+
+            async def _update_message_state(self, message):
+                await super()._update_message_state(message)
+                if self.releasing:
+                    # What the store does to each view of a bot that closes.
+                    self._release_for_restart()
+
+        first = make_interaction()
+        first.original_response.return_value.id = 100
+        panel = self._panel_class()(persistence_key="policy:released", interaction=first)
+        await panel.send()
+        screen = await panel.push(_Screen, make_interaction(message=MagicMock(id=100)))
+        again = make_interaction()
+        again.original_response.return_value.id = 200
+        screen.interaction = again
+        screen.releasing = True
+
+        await screen.send()
+
+        entry = screen.state_store.state["persistent_views"]["policy:released"]
+        assert entry["message_id"] == "100"
+
+    @pytest.mark.parametrize("policy", ["disable", "delete"])
+    async def test_an_earlier_runs_message_closes_by_exit_policy(self, policy):
+        # It was deleted whatever the policy said, while the same re-post over a
+        # panel restored in this process froze it.
+        from discord.components import _component_factory
+        from helpers import make_interaction
+
+        from cascadeui.state.actions import ActionCreators
+
+        panel_class = self._panel_class(exit_policy=policy)
+        first = make_interaction()
+        first.original_response.return_value.id = 300
+        panel = panel_class(persistence_key="policy:orphan", interaction=first)
+        await panel.state_store.dispatch(
+            "PERSISTENT_VIEW_REGISTERED",
+            ActionCreators.persistent_view_registered(
+                persistence_key="policy:orphan",
+                class_name="earlier",
+                message_id="999",
+                channel_id="888",
+                guild_id=None,
+                user_id=None,
+            ),
+        )
+        orphan = MagicMock(id=999)
+        orphan.edit = AsyncMock()
+        orphan.delete = AsyncMock()
+        orphan.components = [_component_factory(p) for p in panel.to_components()]
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.fetch_message = AsyncMock(return_value=orphan)
+        first.client = MagicMock()
+        first.client.get_channel = MagicMock(return_value=channel)
+
+        await panel.send()
+
+        if policy == "delete":
+            orphan.delete.assert_awaited_once()
+            orphan.edit.assert_not_awaited()
+        else:
+            orphan.delete.assert_not_awaited()
+            frozen = orphan.edit.await_args.kwargs["view"]
+            assert frozen.is_finished()
+
+    async def test_a_panel_sent_again_moves_its_registration_before_closing_the_old_message(
+        self,
+    ):
+        # The registration waited behind closing the old message, so a send
+        # cancelled there left the row naming the message it had just frozen.
+        from helpers import make_interaction
+
+        first = make_interaction()
+        first.original_response.return_value.id = 400
+        panel = self._panel_class()(persistence_key="policy:moving", interaction=first)
+        await panel.send()
+        old = panel._message
+        closing = asyncio.Event()
+
+        async def hang(**kwargs):
+            closing.set()
+            await asyncio.Event().wait()
+
+        old.edit = AsyncMock(side_effect=hang)
+        again = make_interaction()
+        again.original_response.return_value.id = 500
+        panel.interaction = again
+        sending = asyncio.create_task(panel.send())
+        await asyncio.wait_for(closing.wait(), 1)
+        sending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await sending
+
+        entry = panel.state_store.state["persistent_views"]["policy:moving"]
+        assert entry["message_id"] == "500"

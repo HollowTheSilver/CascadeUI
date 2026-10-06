@@ -5,10 +5,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 import pytest
+from discord.ui import TextDisplay
 from helpers import make_interaction as _make_interaction
 
 from cascadeui.state.singleton import get_store
-from cascadeui.views.patterns import PaginatedView
+from cascadeui.views.patterns import PaginatedLayoutView, PaginatedView
 
 
 def _make_embeds(n):
@@ -47,6 +48,28 @@ class TestBasicPages:
         pages = ["Hello", "World", "Test"]
         view = PaginatedView(pages=pages, interaction=_make_interaction())
         assert view.pages == pages
+
+    @pytest.mark.parametrize("layout", [False, True], ids=["v1", "v2"])
+    async def test_an_on_load_that_grows_the_pages_after_super_keeps_the_page(self, layout):
+        """An eager view whose on_load() calls super() and then grows its page
+        list had current_page clamped against the old list first, so the view
+        landed on the old last page instead of the page asked for."""
+        if layout:
+            base, make = PaginatedLayoutView, lambda i: [TextDisplay(f"Page {i + 1}")]
+        else:
+            base, make = PaginatedView, lambda i: discord.Embed(title=f"Page {i + 1}")
+
+        class Growing(base):
+            async def on_load(self):
+                await super().on_load()
+                self.pages = [make(i) for i in range(5)]
+
+        view = Growing(pages=[make(i) for i in range(2)], interaction=_make_interaction())
+        view.current_page = 4
+
+        await view.load()
+
+        assert view.current_page == 4, f"the load moved the reader to page {view.current_page}"
 
     async def test_stacked_page_dict(self):
         """Pages can be dicts with embed and content keys."""
@@ -312,6 +335,208 @@ class TestGotoModal:
 
         goto_btn = _get_item(view, "paginated_goto")
         assert goto_btn.label == "1/10"
+
+    @staticmethod
+    async def _submit(view, typed):
+        interaction = _make_interaction()
+        await _get_item(view, "paginated_goto").callback(interaction)
+        modal = interaction.response.send_modal.call_args.args[0]
+        modal.page_input._value = typed
+        submit = _make_interaction()
+        await modal.on_submit(submit)
+        return submit
+
+    @staticmethod
+    def _sent_view(cls=PaginatedView, n=10):
+        view = cls(pages=_make_embeds(n), interaction=_make_interaction())
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+        return view
+
+    @pytest.mark.parametrize(
+        "typed, page", [("3", 2), ("999", 9), ("0", 0)], ids=["jump", "overshoot", "undershoot"]
+    )
+    async def test_goto_submit_turns_to_the_typed_page(self, typed, page):
+        view = self._sent_view()
+
+        await self._submit(view, typed)
+
+        assert view.current_page == page
+        view._message.edit.assert_awaited()
+
+    @staticmethod
+    async def _submit_from_the_message(view, typed):
+        """Submit the go-to modal as Discord delivers it: from the view's message."""
+        opener = _make_interaction()
+        goto = next(
+            c for c in view.walk_children() if getattr(c, "custom_id", None) == "paginated_goto"
+        )
+        await goto.callback(opener)
+        modal = opener.response.send_modal.call_args.args[0]
+        modal.page_input._value = typed
+        submit = _make_interaction(message=view._message)
+        submit.type = discord.InteractionType.modal_submit
+        await modal.on_submit(submit)
+        return submit
+
+    async def test_goto_answers_the_submission_with_the_page(self):
+        """The go-to answered the submission, then edited the message through
+        the channel endpoint, which is not ordered with the next click's
+        edit: that edit could land first and the typed page never showed."""
+        view = self._sent_view()
+
+        submit = await self._submit_from_the_message(view, "4")
+
+        assert view.current_page == 3
+        submit.response.edit_message.assert_awaited_once()
+        assert submit.response.edit_message.call_args.kwargs["embed"] is view.pages[3]
+        submit.response.defer.assert_not_awaited()
+        view._message.edit.assert_not_awaited()
+
+    async def test_goto_answers_the_submission_with_the_page_on_a_layout_view(self):
+        view = await PaginatedLayoutView.from_data(
+            items=[f"item {i}" for i in range(10)],
+            per_page=1,
+            formatter=lambda chunk: [TextDisplay(chunk[0])],
+            interaction=_make_interaction(),
+        )
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+
+        submit = await self._submit_from_the_message(view, "4")
+
+        submit.response.edit_message.assert_awaited_once()
+        assert submit.response.edit_message.call_args.kwargs["view"] is view
+        assert "item 3" in [c.content for c in view.walk_children() if isinstance(c, TextDisplay)]
+        view._message.edit.assert_not_awaited()
+
+    async def test_goto_to_the_page_on_screen_still_answers_the_submission(self):
+        """Nothing changes, so no edit ships to carry the answer, and Discord
+        shows an error on a modal it never hears back about."""
+        view = await PaginatedLayoutView.from_data(
+            items=[f"item {i}" for i in range(10)],
+            per_page=1,
+            formatter=lambda chunk: [TextDisplay(chunk[0])],
+            interaction=_make_interaction(),
+        )
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+        view._last_tree_digest = view._compute_tree_digest()
+
+        submit = await self._submit_from_the_message(view, "1")
+
+        submit.response.edit_message.assert_not_awaited()
+        submit.response.defer.assert_awaited_once()
+
+    async def test_a_page_whose_answer_stalls_is_sent_once_the_submission_is_answered(self):
+        """Answering with the page abandons the edit when Discord is slow to
+        respond; the typed page then never showed until the next render."""
+
+        class _Slow(PaginatedLayoutView):
+            auto_defer_delay = 1.5
+
+        view = await _Slow.from_data(
+            items=[f"item {i}" for i in range(10)],
+            per_page=1,
+            formatter=lambda chunk: [TextDisplay(chunk[0])],
+            interaction=_make_interaction(),
+        )
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+        opener = _make_interaction()
+        goto = next(
+            c for c in view.walk_children() if getattr(c, "custom_id", None) == "paginated_goto"
+        )
+        await goto.callback(opener)
+        modal = opener.response.send_modal.call_args.args[0]
+        modal.page_input._value = "4"
+        submit = _make_interaction(message=view._message)
+        submit.type = discord.InteractionType.modal_submit
+
+        async def _stall_forever(*args, **kwargs):
+            await asyncio.sleep(60)
+
+        submit.response.edit_message = AsyncMock(side_effect=_stall_forever)
+
+        await modal.on_submit(submit)
+
+        submit.response.defer.assert_awaited_once()
+        view._message.edit.assert_awaited_once()
+        assert "item 3" in [c.content for c in view.walk_children() if isinstance(c, TextDisplay)]
+
+    async def test_a_slow_page_load_behind_the_goto_is_acknowledged_in_time(self):
+        """The go-to deferred the submission before loading, so a slow page
+        load could not miss Discord's window; answering with the page must
+        not lose that."""
+
+        class _Slow(PaginatedLayoutView):
+            auto_defer_delay = 0.05
+
+        async def fetch(offset, limit):
+            await asyncio.sleep(0.3)
+            return [f"row {offset}"]
+
+        view = _Slow.from_cursor(
+            fetch,
+            total=10,
+            per_page=1,
+            formatter=lambda rows: [TextDisplay(rows[0])],
+            interaction=_make_interaction(),
+        )
+        await view.on_load()
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+
+        submit = await self._submit_from_the_message(view, "4")
+
+        submit.response.defer.assert_awaited_once()
+        submit.response.edit_message.assert_not_awaited()
+        view._message.edit.assert_awaited()
+        assert "row 3" in [c.content for c in view.walk_children() if isinstance(c, TextDisplay)]
+
+    async def test_goto_submit_that_is_not_a_number_answers_and_stays(self):
+        view = self._sent_view()
+
+        submit = await self._submit(view, "abc")
+
+        assert view.current_page == 0
+        submit.response.send_message.assert_awaited()
+        view._message.edit.assert_not_awaited()
+
+    async def test_goto_submit_after_the_view_closed_says_so_and_stays(self):
+        """The modal outlives the view; a page typed after it closed turned
+        nothing and said nothing."""
+        view = self._sent_view()
+        interaction = _make_interaction()
+        await _get_item(view, "paginated_goto").callback(interaction)
+        modal = interaction.response.send_modal.call_args.args[0]
+        view.stop()
+        modal.page_input._value = "3"
+        submit = _make_interaction()
+
+        await modal.on_submit(submit)
+
+        assert view.current_page == 0
+        submit.response.send_message.assert_awaited_once()
+        assert submit.response.send_message.call_args.args[0] == "This session has ended."
+
+    async def test_goto_submit_after_the_view_closed_is_answered_when_silent(self):
+        """The go-to modal is a raw discord.py Modal with no trailing ack, so
+        a notice set to None left the submission unanswered."""
+        view = self._sent_view()
+        view.set_class_attribute("session_ended_message", None)
+        interaction = _make_interaction()
+        await _get_item(view, "paginated_goto").callback(interaction)
+        modal = interaction.response.send_modal.call_args.args[0]
+        view.stop()
+        modal.page_input._value = "3"
+        submit = _make_interaction()
+
+        await modal.on_submit(submit)
+
+        assert view.current_page == 0
+        submit.response.send_message.assert_not_awaited()
+        submit.response.defer.assert_awaited_once()
 
 
 # // ========================================( from_data )======================================== // #
@@ -710,23 +935,124 @@ class TestFromCursor:
     # // ----( Send-time load )---- // #
 
     async def test_send_loads_page_zero(self):
-        """send() preloads page 0 before handing off to super().send()."""
+        """send() loads page 0 and ships it as the first message's embed."""
         calls = []
         fetch = self._make_fetch(15, track_calls=calls)
+        interaction = _make_interaction()
         view = PaginatedView.from_cursor(
             fetch,
             total=15,
             per_page=5,
             formatter=self._embed_formatter,
-            interaction=_make_interaction(),
+            interaction=interaction,
         )
 
-        with patch.object(type(view).__mro__[2], "send", new=AsyncMock(return_value=MagicMock())):
-            await view.send()
+        await view.send()
 
         assert calls == [(0, 5)]
         assert isinstance(view.pages[0], discord.Embed)
         assert view.pages[1] is None
+        assert interaction.response.send_message.call_args.kwargs["embed"] is view.pages[0]
+
+    async def test_a_view_opened_on_a_later_page_sends_that_page(self):
+        """Only page 0 was loaded and sent, under the indicator of the page
+        the view was set to."""
+        calls = []
+        interaction = _make_interaction()
+        view = PaginatedView.from_cursor(
+            self._make_fetch(15, track_calls=calls),
+            total=15,
+            per_page=5,
+            formatter=self._embed_formatter,
+            interaction=interaction,
+        )
+        view.current_page = 2
+
+        await view.send()
+
+        assert calls == [(10, 5)]
+        assert interaction.response.send_message.call_args.kwargs["embed"] is view.pages[2]
+
+    @pytest.mark.parametrize("layout", [False, True], ids=["v1", "v2"])
+    async def test_a_page_set_past_the_end_sends_the_last_page(self, layout):
+        """on_load() read the page before anything clamped it, so the send
+        raised IndexError."""
+        interaction = _make_interaction()
+        if layout:
+            view = PaginatedLayoutView.from_cursor(
+                self._make_fetch(15),
+                total=15,
+                per_page=5,
+                formatter=lambda chunk: [TextDisplay(f"Items: {chunk}")],
+                interaction=interaction,
+            )
+        else:
+            view = PaginatedView.from_cursor(
+                self._make_fetch(15),
+                total=15,
+                per_page=5,
+                formatter=self._embed_formatter,
+                interaction=interaction,
+            )
+        view.current_page = 7
+
+        await view.send()
+
+        assert view.current_page == 2
+        assert view.pages[2] is not None
+
+    async def test_an_explicit_content_is_sent_in_place_of_page_zero(self):
+        fetch = self._make_fetch(15)
+        interaction = _make_interaction()
+        view = PaginatedView.from_cursor(
+            fetch,
+            total=15,
+            per_page=5,
+            formatter=self._embed_formatter,
+            interaction=interaction,
+        )
+
+        await view.send(content="custom")
+
+        sent = interaction.response.send_message.call_args.kwargs
+        assert sent["content"] == "custom"
+        assert "embed" not in sent
+
+    async def test_a_page_turn_leaves_an_armed_view_on_its_refresh_button(self):
+        """A programmatic page turn rebuilt the tree over the refresh button,
+        and an armed view drops every notification that could put it back."""
+
+        class Pages(PaginatedLayoutView):
+            auto_refresh_ephemeral = True
+
+        view = await Pages.from_data(
+            list(range(30)),
+            per_page=5,
+            formatter=lambda chunk: [TextDisplay(str(chunk))],
+            interaction=_make_interaction(),
+        )
+        await view.send(ephemeral=True)
+        await view._arm_refresh_button()
+        armed_tree = [c.label for c in view.walk_children() if isinstance(c, discord.ui.Button)]
+
+        await view.set_page(2)
+
+        assert [c.label for c in view.walk_children() if isinstance(c, discord.ui.Button)] == (
+            armed_tree
+        )
+
+    async def test_explicit_embeds_are_sent_in_place_of_page_zero(self):
+        """Page zero's embed was added beside them, and discord.py refuses
+        ``embed`` and ``embeds`` together."""
+        interaction = _make_interaction()
+        view = PaginatedView(pages=_make_embeds(3), interaction=interaction)
+        mine = [discord.Embed(title="mine")]
+
+        await view.send(embeds=mine)
+
+        sent = interaction.response.send_message.call_args.kwargs
+        assert sent["embeds"] is mine
+        assert "embed" not in sent
 
     # // ----( Ensure-page-loaded )---- // #
 
@@ -973,45 +1299,171 @@ class TestFromCursor:
 
         assert calls == []
 
+    async def test_a_refresh_that_read_older_rows_cannot_overwrite_a_newer_one(self):
+        """Two refreshes after a data change: the one that read the older rows
+        stalled mid-fetch and finished last. Its page landed in the cache the
+        newer refresh had just rebuilt, and the view showed the older rows."""
+        data = {"version": 1}
+        gate = asyncio.Event()
+        stall = {"next": False}
+
+        async def fetch(offset, limit):
+            version = data["version"]
+            if stall["next"]:
+                stall["next"] = False
+                await gate.wait()
+            return [f"rows v{version}"]
+
+        view = PaginatedView.from_cursor(
+            fetch,
+            total=3,
+            per_page=1,
+            formatter=lambda rows: rows[0],
+            interaction=_make_interaction(),
+        )
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+        await view._ensure_page_loaded(0)
+
+        stall["next"] = True
+        older = asyncio.create_task(view.refresh_pages())  # reads v1, stalls
+        await asyncio.sleep(0)
+        data["version"] = 2
+        newer = asyncio.create_task(view.refresh_pages())
+        for _ in range(5):
+            await asyncio.sleep(0)
+        gate.set()
+        await asyncio.wait_for(asyncio.gather(older, newer), timeout=2)
+
+        assert view.pages[0] == "rows v2"
+        assert view._message.edit.await_args.kwargs["content"] == "rows v2"
+
+    async def test_a_page_load_in_flight_cannot_overwrite_a_refresh(self):
+        """A page turn read the older rows and stalled; the data changed and
+        refresh_pages ran. The page turn's load landed afterwards in the
+        cache the refresh had rebuilt."""
+        data = {"version": 1}
+        gate = asyncio.Event()
+        stall = {"next": False}
+
+        async def fetch(offset, limit):
+            version = data["version"]
+            if stall["next"]:
+                stall["next"] = False
+                await gate.wait()
+            return [f"page {offset} v{version}"]
+
+        view = PaginatedView.from_cursor(
+            fetch,
+            total=3,
+            per_page=1,
+            formatter=lambda rows: rows[0],
+            interaction=_make_interaction(),
+        )
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+        await view._ensure_page_loaded(0)
+
+        stall["next"] = True
+        view.current_page = 1
+        page_turn = asyncio.create_task(view._update_page())  # reads v1, stalls
+        await asyncio.sleep(0)
+        data["version"] = 2
+        refresh = asyncio.create_task(view.refresh_pages())
+        for _ in range(5):
+            await asyncio.sleep(0)
+        gate.set()
+        await asyncio.wait_for(asyncio.gather(page_turn, refresh), timeout=2)
+
+        assert view.pages[1] == "page 1 v2"
+
+    @pytest.mark.parametrize(
+        "cls, formatter",
+        [
+            (PaginatedView, lambda rows: rows[0]),
+            (PaginatedLayoutView, lambda rows: TextDisplay(rows[0])),
+        ],
+        ids=["v1", "v2"],
+    )
+    async def test_page_turns_that_outlive_an_exit_leave_the_frozen_panel_alone(
+        self, cls, formatter
+    ):
+        """A page turn whose fetch was running when exit() froze the panel, and
+        one queued behind it, both shipped live controls onto it afterwards."""
+        gate = asyncio.Event()
+        fetches = []
+
+        async def fetch(offset, limit):
+            fetches.append(offset)
+            if len(fetches) > 1:
+                await gate.wait()
+            return [f"page {offset}"]
+
+        view = cls.from_cursor(
+            fetch,
+            total=3,
+            per_page=1,
+            formatter=formatter,
+            interaction=_make_interaction(),
+        )
+        await view.send()
+        message = view._message
+        in_flight = asyncio.create_task(view.set_page(1))
+        await asyncio.sleep(0)
+        queued = asyncio.create_task(view.set_page(2))
+        await asyncio.sleep(0)
+        await view.exit()
+        edits = message.edit.await_count
+
+        gate.set()
+        await asyncio.wait_for(asyncio.gather(in_flight, queued), timeout=2)
+
+        assert message.edit.await_count == edits
+        assert fetches == [0, 1]  # the queued turn never fetched for the dead view
+
 
 # // ========================================( Send Kwargs Propagation )======================================== // #
 
 
 class TestSendKwargsPropagation:
-    """V1 ``PaginatedView.send`` forwards ``file=``/``files=`` to ``super().send()``.
+    """``file=``/``files=`` ride the V1 ``PaginatedView`` send beside the first page."""
 
-    The patches target ``cascadeui.views.view.StatefulView.send`` (the V1
-    base) rather than ``PaginatedView.send`` (the override) because
-    ``PaginatedView.send`` invokes ``super().send(...)`` whose MRO
-    resolves to ``StatefulView.send``. Patching the override would not
-    intercept the super-call; the base is the only seam where the
-    forwarded kwargs land. Each ``with`` block scopes the patch to the
-    test, so cross-test pollution stays contained.
-    """
-
-    async def test_files_forwarded_to_super_send(self):
-        """``files=`` reaches the V1 base ``send`` call alongside the page kwargs."""
-        view = PaginatedView(pages=_make_embeds(3), interaction=_make_interaction())
+    async def test_files_ship_with_the_first_page(self):
+        pages = _make_embeds(3)
+        interaction = _make_interaction()
+        view = PaginatedView(pages=pages, interaction=interaction)
         photo = MagicMock(spec=discord.File)
 
-        with patch(
-            "cascadeui.views.view.StatefulView.send",
-            new=AsyncMock(return_value=MagicMock()),
-        ) as mock_super_send:
-            await view.send(files=[photo])
+        await view.send(files=[photo])
 
-        mock_super_send.assert_called_once()
-        assert mock_super_send.call_args.kwargs["files"] == [photo]
+        sent = interaction.response.send_message.call_args.kwargs
+        assert sent["files"] == [photo]
+        assert sent["embed"] is pages[0]
 
-    async def test_single_file_forwarded_to_super_send(self):
-        """``file=`` (singular) reaches the V1 base ``send`` call."""
-        view = PaginatedView(pages=_make_embeds(3), interaction=_make_interaction())
+    async def test_a_single_file_ships_with_the_first_page(self):
+        pages = _make_embeds(3)
+        interaction = _make_interaction()
+        view = PaginatedView(pages=pages, interaction=interaction)
         photo = MagicMock(spec=discord.File)
 
-        with patch(
-            "cascadeui.views.view.StatefulView.send",
-            new=AsyncMock(return_value=MagicMock()),
-        ) as mock_super_send:
-            await view.send(file=photo)
+        await view.send(file=photo)
 
-        assert mock_super_send.call_args.kwargs["file"] is photo
+        sent = interaction.response.send_message.call_args.kwargs
+        assert sent["file"] is photo
+        assert sent["embed"] is pages[0]
+
+    async def test_a_view_sent_again_posts_the_page_it_is_on(self):
+        """A paginator sent again from page 2 posted page 1's embed under a
+        "Page 2/3" indicator."""
+        pages = _make_embeds(3)
+        view = PaginatedView(pages=pages, interaction=_make_interaction())
+        await view.send()
+        view.current_page = 1
+        await view._update_page()
+
+        again = _make_interaction()
+        view.interaction = again
+        await view.send()
+
+        sent = again.response.send_message.call_args.kwargs
+        assert sent["embed"] is pages[1], "the re-send posted another page's embed"

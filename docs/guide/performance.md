@@ -134,21 +134,23 @@ The split has three consequences:
   rides the ack cycle; background subscribers fan out as usual.
 - **The acting view's refresh ships as one REST round-trip, not two.**
   When the handled interaction is a component click targeting this
-  view's message and its response slot is still open, `refresh()`
-  routes the edit through `interaction.response.edit_message()`, which
-  combines the Discord ack packet with the edit payload in a single
-  request. Disqualified cases (modal submits, cross-view dispatches,
-  missing message, already-deferred responses) fall through to the
+  view's message, or the submission of a modal opened from one, and its
+  response slot is still open, `refresh()` routes the edit through
+  `interaction.response.edit_message()`, which combines the Discord ack
+  packet with the edit payload in a single request. Disqualified cases
+  (cross-view dispatches, missing message, already-deferred responses)
+  fall through to the
   channel `PATCH` endpoint with no behavior change. On a 429 the
   reactive backoff arms and the edit is re-queued to ship once the
   window clears; on any other HTTP error the edit falls through to the
   channel path so a transient interaction-endpoint failure never loses
   the refresh. On a stall
   past `auto_defer_delay - 1.0` seconds (default 1.5s), the
-  `wait_for` guard cancels the in-flight edit and `refresh()` returns
+  bound cancels the in-flight edit and `refresh()` returns
   immediately rather than falling through -- a second edit on top of
   the cancelled fast path would consume the auto-defer timer's ack
-  budget under genuine Discord latency. See
+  budget under genuine Discord latency; the render is sent again once
+  the interaction is acknowledged. See
   [Fast-Path Stall Under Discord Edit Latency](known-limitations.md#fast-path-stall-under-discord-edit-latency)
   for the trade-off. **Pattern callbacks deliberately do NOT
   pre-defer** because a manual `defer()` consumes the response slot
@@ -165,9 +167,9 @@ scheduled on the same dispatch can complete in either order. Code
 that needs a strict sequence should use an explicit subscription
 chain rather than the implicit subscriber-then-hook ordering.
 
-Tests that assert on cross-view subscriber side effects -- a counter
+Tests that assert on cross-view subscriber side effects (a counter
 incremented in a secondary view, a list written by a non-acting
-subscriber -- need to drain the background tasks before the assertion
+subscriber) need to drain the background tasks before the assertion
 runs. The store exposes an internal flush helper the test suite uses
 for this purpose; see the cross-view notification tests in
 `tests/test_state_store.py` for the pattern. Production code has no
@@ -416,7 +418,7 @@ and `StatefulLayoutView`:
 | `auto_defer` | `True` | The ack safety net. A background timer acknowledges the interaction if the callback has not responded in time. | Keep it on. Turning it off removes the only thing standing between a slow callback and Discord's 3-second ack wall. |
 | `auto_defer_delay` | `2.5` | How long the safety net waits before acking (seconds). | Rarely. Two edit budgets derive from it by `-1.0` (the acting-view fast path and the ack-coupled navigation edits), so lowering it to ack sooner also shrinks the in-place edit window. The default leaves headroom under the 3s wall, and a value of `3.0` or more raises `ValueError` when the class is defined. |
 | `ack_first` | `False` | Acks before the access checks and the callback run, so the ack lands even if the callback then starves the event loop. | A callback does synchronous work heavy enough to delay the safety-net timer. It costs the one-call refresh fast path on every render, and `open_modal()` degrades to an ephemeral message because the slot is already spent. |
-| `serialize_interactions` | `True` | Serializes callbacks behind a lock so rapid clicks cannot fire racing `message.edit()` calls. | Keep it on for views that edit one shared message. It serializes the edits, not the data loads. |
+| `serialize_interactions` | `True` | Serializes callbacks behind a lock so rapid clicks cannot fire racing `message.edit()` calls. | Keep it on for views that edit one shared message. It serializes the callbacks; `on_load()` runs are serialized separately, per view, whether a send, a push or pop, `reload()`, or `load()` started them. |
 | `refresh_cooldown_ms` | `None` | A proactive throttle on **background** re-renders: state-driven edits inside the window coalesce into one deferred render, and a `reload()` in the window defers its `on_load()` fetch too, not just the edit. Edits answering a click on the view's own message are exempt. | A view re-renders rapidly on its own and you want fewer REST round-trips. Not a spam guard (see below). The reactive 429 backoff is always on regardless. |
 | `edit_timeout` | `60.0` | The ceiling on every edit the library issues after the initial send. A stalled edit is cancelled at this bound. | Uploads or large payloads need longer than 60s per edit. Set `None` to await with no ceiling. |
 | `timeout` | `180` (discord.py default) | The discord.py view timeout, in seconds. Values over 900s engage the ephemeral refresh handoff automatically. | Long-lived panels. A persistent view sets `timeout = None`. |

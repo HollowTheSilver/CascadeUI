@@ -87,6 +87,23 @@ When proposing new public surface, show how it fits the existing grammar. If
 it introduces a new naming convention, explain why the existing conventions
 don't work.
 
+## Deprecations and Breaking Changes
+
+Within a major version, a change to a public name keeps the old name
+working and warns first:
+
+- Call `warn_deprecated(message)` from `cascadeui/utils/deprecation.py`. It
+  issues a `DeprecationWarning` that points at the caller's line rather than
+  at library code, and `REMOVED_IN` names the release that removes the old
+  name, so the message reads the same in every deprecation.
+- Add a test that the old name still works and warns, and one that the new
+  name does not warn.
+- List the change under `### Deprecated` in `CHANGELOG.md`, naming the
+  replacement and the removal release.
+
+A PR that changes a public name without this path, or removes one before the
+next major, will be asked to add it.
+
 ## Branch Strategy
 
 - **`main`** is the release branch. Only merge-ready code lands here.

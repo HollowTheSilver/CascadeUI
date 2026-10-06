@@ -3,10 +3,11 @@ V2 Form -- CascadeUI V2 Form & Validation
 ==========================================
 
 A registration form built entirely from a declarative ``fields=[...]``
-list on ``FormLayoutView``. ``"text"`` fields render through a grouped
-"Edit Text Fields" button that opens a single :class:`cascadeui.Modal`
-pre-populated from ``self.values``; every builtin validator factory is
-demonstrated in one place, along with one async validator.
+list on ``FormLayoutView``. The ``"text"`` and ``"integer"`` fields render
+through one grouped "Edit Fields" button that opens a single
+:class:`cascadeui.Modal` pre-populated from ``self.values``; every builtin
+validator factory is demonstrated in one place, along with one async
+validator.
 
 Each entry is a :class:`cascadeui.FormField` dataclass. The typed
 variant validates ``id``, ``label``, and ``type`` at construction --
@@ -48,10 +49,10 @@ V2 features on display:
       email field's placeholder with a domain hint for the next modal
       open, keeping the suggestion out of the validated values
     - ``MODAL_SUBMITTED`` dispatch flows through the Redux pipeline, so
-      text-edit hops show up in ``/inspect`` History with the form's
-      view id as source
-    - ``card()``, ``key_value()``, and ``divider()`` presentation via the
-      default ``FormLayoutView`` display (no override needed)
+      text-edit hops show up in ``/cascadeui inspect`` History with the
+      form's view id as source
+    - ``card()`` and ``alert()`` presentation via the default
+      ``FormLayoutView`` display (no override needed)
 
 Commands:
     /v2form   Open the registration form
@@ -107,18 +108,23 @@ async def username_available(value, field, all_values):
 class RegistrationFormView(FormLayoutView):
     """Declarative V2 registration form.
 
-    The entire form is defined by ``fields=[...]``. Text fields render
-    via the grouped "Edit Text Fields" button that ``FormLayoutView``
-    emits automatically; the select field renders inline as its own
-    action row. On submit, ``on_submit`` receives the validated
+    The entire form is defined by ``fields=[...]``. Text and integer
+    fields render via the grouped "Edit Fields" button that
+    ``FormLayoutView`` emits automatically; the select field renders inline
+    as its own action row. On submit, ``on_submit`` receives the validated
     values and renders a confirmation embed.
     """
 
     instance_limit = 1
     instance_scope = "user"  # one open form per user, across guilds
     instance_policy = "reject"  # block a second concurrent form for the same user
-    instance_limit_message = "You already have a registration form open. Finish or close it first."
+    # Submitting closes the form; there is no other close control.
+    instance_limit_message = (
+        "You already have a registration form open. Submit it, or wait for it to time out."
+    )
     exit_policy = "delete"
+    # Filling in a modal takes a while; discord.py's default is 180 seconds.
+    timeout = 600.0
     state_scope = None
     owner_only = True
     auto_defer = True
@@ -126,9 +132,8 @@ class RegistrationFormView(FormLayoutView):
     def __init__(self, *args, **kwargs):
         # Each field is a ``FormField`` dataclass -- the typed construction
         # path catches typos (e.g. ``type="interger"``) at construction time
-        # rather than at first render. ``FormField`` lowers to the same
-        # internal dict shape the pattern has always consumed via
-        # ``to_dict()``, so every downstream helper keeps working unchanged.
+        # rather than at first render. Each one becomes a plain dict in
+        # ``self.fields``, which ``on_field_changed`` below reads.
         fields = [
             # Fields carry a ``group`` label so the V2 form renders one
             # ``card()`` per group. Ungrouped fields would render in a
@@ -235,19 +240,10 @@ class RegistrationFormView(FormLayoutView):
     async def on_field_changed(self, field_id, old, new):
         """Fires after a field value changes (select, toggle, modal write-back).
 
-        Fire-and-forget -- exceptions are logged by the pattern and do
-        not block the state rebuild. The ``old`` / ``new`` pair lets the
-        override react to the transition rather than just the current
-        value (useful for diff-aware analytics, undo-style fallbacks,
-        or skipping work when the value is unchanged).
-
-        Here the country choice updates the email field's *placeholder*
-        with a matching domain hint, so the text modal suggests it the
-        next time it opens. The hint rides the placeholder, not
-        ``self.values``: a suggestion is not an entered value, so it must
-        never land in the data the form validates and submits. (Writing a
-        complete, valid dependent value into ``self.values`` here would be
-        fine; a partial hint like a bare domain is not a value.)
+        The country choice sets the email field's *placeholder* to a matching
+        domain hint for the next modal open. It rides the placeholder rather
+        than ``self.values``, because a hint is not an entered value and must
+        never reach the data the form validates and submits.
         """
         if field_id == "country" and new:
             default_domain = {
@@ -304,7 +300,7 @@ class V2FormExample(commands.Cog, name="v2_form_example"):
     async def v2form(self, context: Context) -> None:
         """Open the registration form.
 
-        Click "Edit Text Fields" to fill in username, email, password,
+        Click "Edit Fields" to fill in username, email, password,
         age, and bio through a single modal. Pick a country from the
         dropdown, then hit Submit. Four builtin validator factories,
         one typed integer field with numeric range, and one async

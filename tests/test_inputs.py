@@ -6,6 +6,7 @@ FileUpload) and are auto-collected by ``Modal`` at construction time.
 """
 
 import asyncio
+from unittest.mock import AsyncMock
 
 import discord
 import pytest
@@ -781,6 +782,33 @@ class TestModalChildStructure:
         assert isinstance(children[0], discord.ui.Label)
         assert isinstance(children[0].component, discord.ui.TextInput)
 
+    def test_a_raw_button_is_refused(self):
+        """A Button carries a custom_id, so it passed; Discord rejects the
+        modal that holds one when it opens."""
+        with pytest.raises(TypeError, match="Button is a message component"):
+            Modal(title="T", inputs=[discord.ui.Button(label="Go", custom_id="go")])
+
+    @pytest.mark.parametrize(
+        "make",
+        [
+            lambda: discord.ui.Select(custom_id="pick", options=[discord.SelectOption(label="a")]),
+            lambda: discord.ui.UserSelect(custom_id="who"),
+        ],
+        ids=["string", "user"],
+    )
+    def test_a_select_outside_a_label_is_refused(self, make):
+        """On its own it rides an action row, which Discord refuses in a
+        modal; there a select belongs inside a Label."""
+        with pytest.raises(TypeError, match="only inside a ui.Label"):
+            Modal(title="T", inputs=[make()])
+
+    def test_a_select_inside_a_label_is_accepted(self):
+        sel = discord.ui.Select(custom_id="pick", options=[discord.SelectOption(label="a")])
+
+        modal = Modal(title="T", inputs=[discord.ui.Label(text="Pick", component=sel)])
+
+        assert modal.inputs["pick"].component is sel
+
     def test_raw_label_passthrough(self):
         # User constructs ui.Label themselves -- escape hatch path
         raw_label = discord.ui.Label(
@@ -1063,6 +1091,55 @@ class TestModalSubmit:
 
         assert accepted is False
         assert seen == []
+
+    @staticmethod
+    def _sent(interaction):
+        calls = (
+            interaction.response.send_message.call_args_list
+            + interaction.followup.send.call_args_list
+        )
+        return " ".join(str(c.args[0] if c.args else c.kwargs.get("content")) for c in calls)
+
+    async def test_a_required_answer_of_only_spaces_is_refused(self):
+        """Discord refuses an empty required box and accepts one of spaces."""
+        seen = []
+
+        async def on_submitted(interaction, values):
+            seen.append(values)
+
+        modal = Modal(title="Task", inputs=[TextInput(label="Title")], callback=on_submitted)
+        interaction = make_interaction()
+
+        assert await modal.submit(interaction, {"Title": "   "}) is False
+        assert seen == []
+        assert "**Title**: This field is required." in self._sent(interaction)
+
+    async def test_a_blank_required_answer_skips_its_validators(self):
+        modal = Modal(
+            title="Code",
+            inputs=[TextInput(label="Code", validators=[regex(r"^\d+$", "Digits only")])],
+        )
+        interaction = make_interaction()
+
+        assert await modal.submit(interaction, {"Code": "  "}) is False
+        sent = self._sent(interaction)
+        assert "This field is required." in sent
+        assert "Digits only" not in sent
+
+    async def test_an_optional_answer_of_only_spaces_is_accepted(self):
+        seen = []
+
+        async def on_submitted(interaction, values):
+            seen.append(values)
+
+        modal = Modal(
+            title="Note",
+            inputs=[TextInput(label="Note", required=False)],
+            callback=on_submitted,
+        )
+
+        assert await modal.submit(make_interaction(), {"Note": "  "}) is True
+        assert seen == [{"input_note": "  "}]
 
     async def test_an_accepted_value_runs_the_whole_pipeline(self):
         seen = []
@@ -1391,17 +1468,52 @@ class TestModalSubmit:
         assert seen == [{"input_name": "", "pick": ["b"]}]
 
     def test_a_modal_child_with_no_custom_id_is_refused_by_name(self):
-        """A display item carries no value, so it cannot be an input."""
+        """A component that submits nothing, other than text, cannot be an input."""
 
         async def on_submitted(interaction, values):
             pass
 
-        with pytest.raises(TypeError, match="carries no custom_id"):
-            Modal(
-                title="T",
-                inputs=[discord.ui.TextDisplay("Section header")],
-                callback=on_submitted,
-            )
+        with pytest.raises(TypeError, match="Separator carries no custom_id"):
+            Modal(title="T", inputs=[discord.ui.Separator()], callback=on_submitted)
+
+    async def test_text_is_shown_in_a_modal_and_submits_nothing(self):
+        """Discord shows a TextDisplay in a modal, and the constructor refused
+        it as an input with no custom_id."""
+        received = []
+
+        async def on_submitted(interaction, values):
+            received.append(values)
+
+        modal = Modal(
+            title="T",
+            inputs=[discord.ui.TextDisplay("Read this first"), TextInput(label="Name")],
+            callback=on_submitted,
+        )
+
+        assert [c.to_component_dict()["type"] for c in modal.children] == [10, 18]
+        assert await modal.submit(stub_interaction(), {"Name": "Ada"}) is True
+        assert received == [{"input_name": "Ada"}]
+
+    @pytest.mark.parametrize("route", ["inputs", "add_item"])
+    def test_a_button_or_a_bare_select_is_refused_on_both_routes(self, route):
+        """The refusal rode the constructor's loop, so ``add_item()`` let
+        either through and ``open_modal()`` sent a modal Discord refuses."""
+
+        async def on_submitted(interaction, values):
+            pass
+
+        select = discord.ui.Select(options=[discord.SelectOption(label="a")])
+        for item, message in (
+            (discord.ui.Button(label="B"), "a Button is a message component"),
+            (select, "a Select passed on its own"),
+        ):
+            with pytest.raises(TypeError, match=message):
+                if route == "inputs":
+                    Modal(title="T", inputs=[item], callback=on_submitted)
+                else:
+                    Modal(title="T", inputs=[TextInput(label="N")], callback=on_submitted).add_item(
+                        item
+                    )
 
     async def test_a_label_two_inputs_claim_resolves_to_neither(self):
         """A name two inputs answer to is not a free name.
@@ -1635,6 +1747,466 @@ class TestModalSubmit:
 
         with pytest.raises(RuntimeError, match="validator exploded"):
             await modal.submit(make_interaction(), {"A": "abc"})
+
+
+class TestSubmissionToAClosedView:
+    """A modal outlives the view that opened it; a submission after the view
+    closed used to be acknowledged in silence, so the user saw nothing happen."""
+
+    @staticmethod
+    async def _opened(callback=None, validators=()):
+        from cascadeui.views.view import StatefulView
+
+        class _Panel(StatefulView):
+            pass
+
+        view = _Panel(interaction=make_interaction())
+        await view.send()
+        modal = Modal(
+            title="Profile",
+            inputs=[TextInput(label="Name", validators=list(validators), required=True)],
+            callback=callback,
+        )
+        await view.open_modal(make_interaction(), modal)
+        return view, modal
+
+    @staticmethod
+    def _sent(interaction):
+        calls = (
+            interaction.response.send_message.call_args_list
+            + interaction.followup.send.call_args_list
+        )
+        return [c.args[0] if c.args else c.kwargs.get("content") for c in calls]
+
+    async def test_the_user_is_told_and_the_callback_still_runs(self):
+        seen = []
+
+        async def on_submitted(interaction, values):
+            seen.append(values)
+
+        view, modal = await self._opened(on_submitted)
+        await view.exit()
+        submit = make_interaction()
+
+        assert await modal.submit(submit, {"Name": "Kael"}) is True
+
+        assert seen  # a callback doing its own work is not skipped
+        assert self._sent(submit) == ["This session has ended."]
+
+    async def test_a_callback_that_replied_gets_no_second_message(self):
+        async def on_submitted(interaction, values):
+            await interaction.response.send_message("Saved.")
+
+        view, modal = await self._opened(on_submitted)
+        await view.exit()
+        submit = make_interaction()
+
+        await modal.submit(submit, {"Name": "Kael"})
+
+        assert self._sent(submit) == ["Saved."]
+
+    async def test_a_callback_that_deferred_itself_is_left_to_reply(self):
+        """A defer the callback makes is the prelude to its own followup, and
+        a followup sent directly passes no library code that could see it."""
+
+        async def on_submitted(interaction, values):
+            await interaction.response.defer()
+            await interaction.followup.send("Saved.")
+
+        view, modal = await self._opened(on_submitted)
+        await view.exit()
+        submit = make_interaction()
+
+        await modal.submit(submit, {"Name": "Kael"})
+
+        assert self._sent(submit) == ["Saved."]
+
+    async def test_a_submission_the_backstop_deferred_is_still_told(self):
+        """The backstop's defer answers Discord, not the user."""
+
+        async def slow(interaction, values):
+            await asyncio.sleep(0.05)
+
+        view, modal = await self._opened(slow)
+        modal.auto_defer_delay = 0.01
+        await view.exit()
+        submit = make_interaction()
+
+        await modal.submit(submit, {"Name": "Kael"})
+
+        submit.response.defer.assert_awaited_once()
+        assert self._sent(submit) == ["This session has ended."]
+
+    async def test_a_real_submission_the_backstop_deferred_is_still_told(self):
+        """Through the dispatch, which arms its backstop before on_submit runs."""
+
+        async def slow(interaction, values):
+            await asyncio.sleep(0.05)
+
+        view, modal = await self._opened(slow)
+        modal.auto_defer_delay = 0.01
+        await view.exit()
+        submit = make_interaction()
+        submit.type = discord.InteractionType.modal_submit
+
+        await modal._scheduled_task(submit, [], {})
+
+        submit.response.defer.assert_awaited_once()
+        assert self._sent(submit) == ["This session has ended."]
+
+    async def test_invalid_input_to_a_closed_view_gets_the_notice_not_the_errors(self):
+        view, modal = await self._opened(validators=[min_length(3)])
+        await view.exit()
+        submit = make_interaction()
+
+        assert await modal.submit(submit, {"Name": "ab"}) is False
+
+        assert self._sent(submit) == ["This session has ended."]
+
+    async def test_a_submission_answered_before_validation_gets_no_notice(self):
+        """A modal whose ``on_submit`` replies and then calls up already carries
+        a reply when validation finds the view closed; the notice went out as a
+        second message beside it."""
+        from cascadeui.views.view import StatefulView
+
+        class _Checking(Modal):
+            async def on_submit(self, interaction):
+                await interaction.response.send_message("Checking...")
+                await super().on_submit(interaction)
+
+        view = StatefulView(interaction=make_interaction())
+        await view.send()
+        modal = _Checking(
+            title="Profile", inputs=[TextInput(label="Name", validators=[min_length(3)])]
+        )
+        await view.open_modal(make_interaction(), modal)
+        await view.exit()
+        submit = make_interaction()
+
+        assert await modal.submit(submit, {"Name": "ab"}) is False
+
+        assert self._sent(submit) == ["Checking..."]
+
+    async def test_the_notice_is_the_views_session_ended_message(self):
+        view, modal = await self._opened(lambda interaction, values: None)
+        view.set_class_attribute("session_ended_message", "Ce panneau est fermé.")
+        await view.exit()
+        submit = make_interaction()
+
+        await modal.submit(submit, {"Name": "Kael"})
+
+        assert self._sent(submit) == ["Ce panneau est fermé."]
+
+    async def test_on_session_ended_answers_the_submission(self):
+        view, modal = await self._opened(lambda interaction, values: None)
+        seen = []
+
+        async def ended(interaction):
+            seen.append(interaction)
+            await view.respond(interaction, "Session over, run /panel again.", ephemeral=True)
+
+        view.on_session_ended = ended
+        await view.exit()
+        submit = make_interaction()
+
+        await modal.submit(submit, {"Name": "Kael"})
+
+        assert seen == [submit]
+        assert self._sent(submit) == ["Session over, run /panel again."]
+
+    async def test_an_on_session_ended_that_raises_still_acknowledges(self):
+        view, modal = await self._opened(lambda interaction, values: None)
+
+        def ended(interaction):
+            raise RuntimeError("boom")
+
+        view.on_session_ended = ended
+        await view.exit()
+        submit = make_interaction()
+
+        await modal.submit(submit, {"Name": "Kael"})
+
+        submit.response.defer.assert_awaited()
+
+    async def test_a_session_ended_message_of_none_sends_nothing(self):
+        view, modal = await self._opened(lambda interaction, values: None)
+        view.set_class_attribute("session_ended_message", None)
+        await view.exit()
+        submit = make_interaction()
+
+        await modal.submit(submit, {"Name": "Kael"})
+
+        assert self._sent(submit) == []
+        submit.response.defer.assert_awaited()
+
+    async def test_an_open_view_is_left_alone(self):
+        view, modal = await self._opened(lambda interaction, values: None)
+        submit = make_interaction()
+
+        await modal.submit(submit, {"Name": "Kael"})
+
+        assert self._sent(submit) == []
+        submit.response.defer.assert_awaited()
+
+    async def test_a_callback_that_closes_the_view_itself_gets_no_notice(self):
+        """The view was open when the submission arrived; a save-and-close
+        callback closing it is not the view having closed on the user."""
+        holder = {}
+
+        async def save_and_close(interaction, values):
+            await holder["view"].exit()
+
+        view, modal = await self._opened(save_and_close)
+        holder["view"] = view
+        submit = make_interaction()
+
+        await modal.submit(submit, {"Name": "Kael"})
+
+        assert view._closed()
+        assert self._sent(submit) == []
+        submit.response.defer.assert_awaited()
+
+    async def test_no_notice_while_the_view_that_took_its_place_is_open(self):
+        """The session goes on in the view the opener pushed to, so telling
+        the user it ended is false; the submission is still acknowledged."""
+        from cascadeui.views.view import StatefulView
+
+        class _Detail(StatefulView):
+            pass
+
+        seen = []
+        view, modal = await self._opened(lambda interaction, values: seen.append(values))
+        detail = await view.push(_Detail, make_interaction(message=view._message))
+        assert view._closed() and not detail._closed()
+        submit = make_interaction()
+
+        await modal.submit(submit, {"Name": "Kael"})
+
+        assert seen
+        assert self._sent(submit) == []
+        submit.response.defer.assert_awaited()
+
+    async def test_invalid_input_with_no_message_is_still_acknowledged(self):
+        """The validation path returns before the modal's own trailing ack,
+        so a silent notice left the submission unanswered."""
+        view, modal = await self._opened(validators=[min_length(3)])
+        view.set_class_attribute("session_ended_message", None)
+        await view.exit()
+        submit = make_interaction()
+
+        assert await modal.submit(submit, {"Name": "ab"}) is False
+
+        assert self._sent(submit) == []
+        submit.response.defer.assert_awaited()
+
+    async def test_a_reply_sent_as_a_followup_gets_no_second_message(self):
+        """A reply made after the ack backstop fired travels as a followup and
+        leaves the response type at the defer."""
+        holder = {}
+
+        async def slow_save(interaction, values):
+            await asyncio.sleep(0.05)
+            await holder["view"].respond(interaction, "Saved.")
+
+        view, modal = await self._opened(slow_save)
+        modal.auto_defer_delay = 0.01
+        holder["view"] = view
+        await view.exit()
+        submit = make_interaction()
+
+        await modal.submit(submit, {"Name": "Kael"})
+
+        assert self._sent(submit) == ["Saved."]
+
+    async def test_an_offline_submission_to_a_closed_view(self):
+        """The testing stub's response slot reports what answered it, as
+        discord.py's does; the notice read it once the backstop had deferred,
+        and raised AttributeError."""
+        from cascadeui.testing import stub_interaction
+
+        async def slow(interaction, values):
+            await asyncio.sleep(0.05)
+
+        view, modal = await self._opened(slow)
+        modal.auto_defer_delay = 0.01
+        await view.exit()
+        submit = stub_interaction()
+
+        assert await modal.submit(submit, {"Name": "Kael"}) is True
+
+        assert submit.deferred
+        assert submit.replies == ["This session has ended."]
+
+
+class TestModalRerenderAnswersTheSubmission:
+    """A re-render of the view a modal came from answered the submission and
+    then edited the message through the channel endpoint, which is not
+    ordered with the next click's edit. It now answers with the edit, as a
+    click does."""
+
+    @staticmethod
+    async def _opened(callback=None, *, subscribed=False):
+        from cascadeui.views.view import StatefulView
+
+        class _Panel(StatefulView):
+            if subscribed:
+                subscribed_actions = {"MODAL_SUBMITTED"}
+
+            def build_ui(self):
+                self.rendered = getattr(self, "rendered", 0) + 1
+                self.clear_items()
+                self.add_item(discord.ui.Button(label=f"render {self.rendered}", disabled=True))
+
+        view = _Panel(interaction=make_interaction())
+        view.build_ui()
+        await view.send()
+        modal = Modal(
+            title="Profile",
+            inputs=[TextInput(label="Name", required=True)],
+            callback=callback,
+            view_id=view.id if subscribed else None,
+        )
+        await view.open_modal(make_interaction(), modal)
+        submit = make_interaction(message=view._message)
+        submit.type = discord.InteractionType.modal_submit
+        return view, modal, submit
+
+    async def test_a_callback_rerender_answers_the_submission(self):
+        async def on_submitted(interaction, values):
+            await view.refresh(content=f"Hello {values['input_name']}")
+
+        view, modal, submit = await self._opened(on_submitted)
+
+        await modal.submit(submit, {"Name": "Kael"})
+
+        submit.response.edit_message.assert_awaited_once()
+        assert submit.response.edit_message.call_args.kwargs["content"] == "Hello Kael"
+        submit.response.defer.assert_not_awaited()
+
+    async def test_a_state_rerender_leaves_the_answer_to_the_callback(self):
+        """The render MODAL_SUBMITTED drives runs before the callback. Answering
+        with it made the callback's own first reply or defer raise
+        InteractionResponded, ending the callback before anything after it ran."""
+
+        async def on_submitted(interaction, values):
+            await interaction.response.send_message("Saved!", ephemeral=True)
+
+        view, modal, submit = await self._opened(on_submitted, subscribed=True)
+        before = view.rendered
+
+        await modal.submit(submit, {"Name": "Kael"})
+
+        assert view.rendered == before + 1
+        view._message.edit.assert_awaited_once()
+        submit.response.edit_message.assert_not_awaited()
+        submit.response.send_message.assert_awaited_once()
+        assert submit.response.send_message.call_args.args[0] == "Saved!"
+
+    async def test_a_closed_view_is_answered_with_the_notice_not_its_render(self):
+        """Answering with a closed view's frozen render would leave the user
+        no word that the view had closed."""
+
+        async def on_submitted(interaction, values):
+            await view.refresh(content="Saved")
+
+        view, modal, submit = await self._opened(on_submitted)
+        await view.exit()
+
+        await modal.submit(submit, {"Name": "Kael"})
+
+        submit.response.edit_message.assert_not_awaited()
+        submit.response.send_message.assert_awaited_once()
+        assert submit.response.send_message.call_args.args[0] == "This session has ended."
+
+    async def test_a_rerender_whose_answer_stalls_is_sent_once_the_submission_is_answered(self):
+        async def on_submitted(interaction, values):
+            await view.refresh(content=f"Hello {values['input_name']}")
+
+        async def _stall_forever(*args, **kwargs):
+            await asyncio.sleep(60)
+
+        view, modal, submit = await self._opened(on_submitted)
+        view.set_class_attribute("auto_defer_delay", 1.5)
+        view._message.edit = AsyncMock()
+        submit.response.edit_message = AsyncMock(side_effect=_stall_forever)
+
+        await modal.submit(submit, {"Name": "Kael"})
+
+        submit.response.defer.assert_awaited_once()
+        view._message.edit.assert_awaited_once()
+        assert view._message.edit.call_args.kwargs["content"] == "Hello Kael"
+
+    async def test_a_stalled_rerender_is_sent_when_the_callback_raises_after_it(self):
+        async def on_submitted(interaction, values):
+            await view.refresh(content="Saved")
+            raise RuntimeError("after the render")
+
+        async def _stall_forever(*args, **kwargs):
+            await asyncio.sleep(60)
+
+        view, modal, submit = await self._opened(on_submitted)
+        view.set_class_attribute("auto_defer_delay", 1.5)
+        view._message.edit = AsyncMock()
+        submit.response.edit_message = AsyncMock(side_effect=_stall_forever)
+
+        with pytest.raises(RuntimeError, match="after the render"):
+            await modal.submit(submit, {"Name": "Kael"})
+
+        view._message.edit.assert_awaited_once()
+
+    async def test_a_raising_callback_leaves_the_response_to_on_error(self):
+        """The raise path answered the submission before the exception reached
+        on_error, so an on_error answering through the response (the
+        discord.py idiom) failed whenever Discord had been slow."""
+        order = []
+
+        async def on_submitted(interaction, values):
+            await view.refresh(content="Saved")
+            raise RuntimeError("after the render")
+
+        async def _stall_forever(*args, **kwargs):
+            await asyncio.sleep(60)
+
+        view, modal, submit = await self._opened(on_submitted)
+        view.set_class_attribute("auto_defer_delay", 1.5)
+        view._message.edit = AsyncMock(side_effect=lambda **kwargs: order.append("edit"))
+        submit.response.edit_message = AsyncMock(side_effect=_stall_forever)
+
+        def _defer(*args, **kwargs):
+            order.append("defer")
+            submit.response.is_done.return_value = True
+
+        submit.response.defer = AsyncMock(side_effect=_defer)
+
+        with pytest.raises(RuntimeError, match="after the render"):
+            await modal.submit(submit, {"Name": "Kael"})
+
+        assert order == ["edit"]
+        assert not submit.response.is_done()
+
+    async def test_a_view_closed_during_the_dispatch_is_answered_with_the_notice(self):
+        """Whether to answer with a render was decided before the
+        MODAL_SUBMITTED dispatch, so a view a hook closed there answered with
+        its frozen render and the user got no word."""
+
+        async def on_submitted(interaction, values):
+            await view.refresh(content="Saved")
+
+        view, modal, submit = await self._opened(on_submitted)
+        modal.view_id = view.id
+
+        async def close_it(action, state):
+            await view.exit()
+
+        view.state_store.on("MODAL_SUBMITTED", close_it)
+        try:
+            await modal.submit(submit, {"Name": "Kael"})
+        finally:
+            view.state_store.off("MODAL_SUBMITTED", close_it)
+
+        submit.response.edit_message.assert_not_awaited()
+        submit.response.send_message.assert_awaited_once()
+        assert submit.response.send_message.call_args.args[0] == "This session has ended."
 
 
 class TestModalDuplicateInputs:

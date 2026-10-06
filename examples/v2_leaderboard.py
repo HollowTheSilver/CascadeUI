@@ -24,9 +24,9 @@ Demonstrates:
       fake-but-valid-shape snowflakes so the client renders ``<@ID>`` as an
       "@Unknown User" mention pill: same blue highlight as a real member
       mention, no Members intent required.
-      The library's TextDisplay-collapse fallback remains the
-      last-resort path (Section requires a non-``None`` accessory).
-      This example bypasses it by always returning a URL.
+      Because ``bot=`` gives every row an avatar URL, the library's
+      TextDisplay fallback (used when no avatar resolves, since a Section
+      needs an accessory) never triggers here.
     - ``build_header`` builds the Overview stats card above the rankings on
       every page, so the aggregate stats stay visible while the user flips
       through. Stats are composed content, not a separate hook: the override reads
@@ -86,11 +86,8 @@ from cascadeui import (
 
 _TARGET_SIZE = 25  # Exactly 5 pages of 5 entries
 
-# Base for the fake-but-valid-shape snowflakes assigned to synthetic demo
-# rows. A 64-bit integer in the 10^17 range is a plausible Discord
-# snowflake shape; the client tries to resolve it, fails, and renders
-# ``<@ID>`` as an "@Unknown User" pill. That's what gives the demo rows
-# the blue mention-pill look without requiring real guild members.
+# Base for the synthetic rows' fake-but-valid-shape snowflakes (see
+# _synthetic_entry).
 _FAKE_SNOWFLAKE_BASE = 100_000_000_000_000_000
 
 
@@ -182,11 +179,11 @@ class ServerLeaderboard(LeaderboardLayoutView):
     leaderboard_top_n = _TARGET_SIZE
     leaderboard_per_page = 5
     # Jump buttons (first / last / go-to-page) appear at >= jump_threshold
-    # pages. Raised to 6 so this 5-page board shows only prev / next, freeing
-    # two nav slots for the in-card build_footer (each page nears the 40-node cap).
+    # pages. At 6 this 5-page board shows only prev / next, which keeps
+    # headroom under Discord's 40-component cap: every page carries two cards
+    # (the Overview stats card and the rankings card) plus the nav row.
     jump_threshold = 6
     entry_layout = "sections"
-    exit_policy = "delete"
 
     def __init__(self, *args, mode: str = "", icon_url=None, **kwargs):
         # ``bot=`` flows through to the base view, which stores it for the
@@ -196,10 +193,7 @@ class ServerLeaderboard(LeaderboardLayoutView):
         # Guild icon URL for the Overview card heading; ``None`` when the guild
         # has no icon, which ``build_header`` degrades to a plain heading.
         self._icon_url = icon_url
-        # ``_detailed`` toggles the win-rate bar in every row. The button on
-        # the Overview card (built in ``build_header``) flips it and calls
-        # ``reload(force=True)``: the entry data is unchanged, so the
-        # entry-signature short-circuit would skip the rebuild without the flag.
+        # Shows the win-rate bar in every row; see _toggle_detail.
         self._detailed = True
         super().__init__(*args, **kwargs)
 
@@ -221,10 +215,6 @@ class ServerLeaderboard(LeaderboardLayoutView):
             line = f"{line} \N{BULLET} {bar}"
         return line
 
-    # Every page carries two cards (the Overview stats card + the rankings card
-    # with its in-card footer) plus the nav row, under Discord's 40-component
-    # cap. jump_threshold = 6 drops the first / last / go-to buttons on this
-    # 5-page board to keep headroom.
     def build_header(self, page: int):
         """Build the Overview stats card above the rankings, on every page.
 

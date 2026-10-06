@@ -1,5 +1,6 @@
 """Tests for PaginatedView / PaginatedLayoutView customization and parity."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
@@ -191,6 +192,36 @@ class TestOnPageChangedHook:
 
         assert view.current_page == 1
         assert view._message.edit.called
+
+    @pytest.mark.parametrize(
+        "cls,formatter",
+        [
+            (PaginatedLayoutView, lambda chunk: [TextDisplay(str(chunk))]),
+            (PaginatedView, lambda chunk: {"content": str(chunk)}),
+        ],
+        ids=["v2", "v1"],
+    )
+    async def test_set_page_without_notify_renders_without_the_hook(self, cls, formatter):
+        # A jump the view makes on its own, such as a return to the first
+        # page after inactivity, whose hook would re-arm the timer running it.
+        calls = []
+
+        class Tracked(cls):
+            async def on_page_changed(self, page):
+                calls.append(page)
+
+        view = await Tracked.from_data(list(range(30)), per_page=5, formatter=formatter)
+        view.interaction = _make_interaction()
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+
+        await view.set_page(3, notify=False)
+        assert calls == []
+        assert view.current_page == 3
+        view._message.edit.assert_awaited()
+
+        await view.set_page(1)
+        assert calls == [1]
 
 
 # // ========================================( V2 nav identity + extra_items preservation )======================================== // #
@@ -900,3 +931,75 @@ class TestPageCursorRewindsWhenTheEditNeverLanded:
         await view.refresh_data(list(range(30)))
 
         assert view.current_page == 1
+
+    @pytest.mark.parametrize(
+        "cls,formatter",
+        [
+            (PaginatedLayoutView, lambda chunk: [TextDisplay(str(chunk))]),
+            (PaginatedView, lambda chunk: {"content": str(chunk)}),
+        ],
+        ids=["v2", "v1"],
+    )
+    async def test_a_refused_page_turn_does_not_skip_a_page(self, cls, formatter):
+        # Discord refusing the edit raises out of refresh(), and the screen
+        # never left page 2.
+        view, message = await self._view(cls, formatter)
+
+        message.edit = AsyncMock(
+            side_effect=discord.HTTPException(
+                MagicMock(status=400, reason="Bad Request"), "Invalid Form Body"
+            )
+        )
+        with pytest.raises(discord.HTTPException):
+            await view._make_step_callback(1)(_make_interaction())
+        assert view.current_page == 1, "cursor must stay where the screen still is"
+        if cls is PaginatedLayoutView:
+            assert view._page_content_items[0].content == "[5, 6, 7, 8, 9]"
+        else:
+            assert "2/6" in view._indicator_btn.label
+
+        message.edit = AsyncMock()
+        await view._make_step_callback(1)(_make_interaction())
+        assert view.current_page == 2, "the recovery press advances one page, not two"
+
+    async def test_a_page_whose_fetch_raises_does_not_move_the_cursor(self):
+        async def fetch(offset, limit):
+            if offset >= 10:
+                raise RuntimeError("database unavailable")
+            return list(range(offset, offset + limit))
+
+        view = PaginatedLayoutView.from_cursor(
+            fetch,
+            total=30,
+            per_page=5,
+            formatter=lambda chunk: [TextDisplay(str(chunk))],
+            interaction=_make_interaction(),
+        )
+        view.user_id = 1
+        view.guild_id = 2
+        message = MagicMock()
+        message.id = 999
+        message.edit = AsyncMock()
+        view._message = message
+        await view.set_page(1)
+        message.edit.reset_mock()
+
+        with pytest.raises(RuntimeError, match="database unavailable"):
+            await view._make_step_callback(1)(_make_interaction())
+
+        assert view.current_page == 1
+        message.edit.assert_not_awaited()
+        assert view._page_content_items[0].content == "[5, 6, 7, 8, 9]"
+
+    async def test_a_cancelled_page_turn_keeps_its_cursor(self):
+        # A cancel can land after Discord applied the edit, so the outcome is
+        # unknown and the cursor stays where the turn put it.
+        view, message = await self._view(
+            PaginatedLayoutView, lambda chunk: [TextDisplay(str(chunk))]
+        )
+
+        message.edit = AsyncMock(side_effect=asyncio.CancelledError())
+        with pytest.raises(asyncio.CancelledError):
+            await view._make_step_callback(1)(_make_interaction())
+
+        assert view.current_page == 2

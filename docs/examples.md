@@ -47,7 +47,7 @@ Registration form using `FormLayoutView` with native `text` fields, a dropdown s
 
 ### v2_pagination.py
 
-Paginated inventory viewer using `PaginatedLayoutView`, showing both construction modes against the same data. `from_data()` chunks an in-memory list up front; `from_cursor()` fetches one page at a time through an async callable, caching pages in an LRU that protects the page on screen from eviction. Container-based page content with jump controls (first/last, go-to-page modal). Demonstrates `_build_extra_items()` for an exit button below navigation, and gives each mode its own view class so the two browsers do not compete for one `instance_limit` slot.
+Paginated inventory viewer using `PaginatedLayoutView`, showing both construction modes against the same data. `from_data()` chunks an in-memory list up front; `from_cursor()` fetches one page at a time through an async callable, caching pages in an LRU that protects the page on screen from eviction. Container-based page content with jump controls (first/last, go-to-page modal). Demonstrates `auto_exit_button` for an Exit button kept through page turns and `cache_size` bounding the cursor cache, and gives each mode its own view class so the two browsers do not compete for one `instance_limit` slot.
 
 **Commands:** `/v2pages` (eager), `/v2cursor` (cursor)
 
@@ -65,9 +65,10 @@ each render. Push and pop re-fetch the destination's source automatically
 (reload-on-render), so no `rebuild=` callback is needed; `make_nav_row()`
 builds the Back plus Exit footer. The row list is paged by a
 `PaginatedRegion` fed from `on_load()`, so a page turn re-slices against the
-current repo data.
+current repo data. `/tasks_close` closes a user's panel from the cog through
+`current_view`, the screen on the message after the user opens a task.
 
-**Command:** `/tasks`
+**Commands:** `/tasks` (open), `/tasks_close` (close)
 
 ### v2_computed.py
 
@@ -77,19 +78,19 @@ Quick poll demonstrating `@computed` for global memoized values that multiple vi
 
 ### v2_wizard.py
 
-D&D character creator using `WizardLayoutView`. Six steps (Identity, Class, Abilities, Background, a conditional Destiny step, Review) with per-step validation, cross-step state (class list filters by race, subclass by class, ability points draw from a shared pool), a live character-sheet preview card on every step, and the `on_finish` method hook. Demonstrates navigation button customization, `choice_row` segmented choices with race-based language defaults, a `toggle_section` boolean flag (heroic destiny), and the structured modal inputs: the name modal pairs a `TextInput` with an optional `FileUpload` portrait that replaces the preview image, and the background modal combines paragraph text with `RadioGroup`, `CheckboxGroup`, and `Checkbox` in one edit-in-place form.
+D&D character creator using `WizardLayoutView`. Six steps (Identity, Class, Abilities, Background, a conditional Destiny step, Review) with per-step validation, cross-step state (class list filters by race, subclass by class, ability points draw from a shared pool), a live character-sheet preview card on every step, and the `on_finish` method hook. Demonstrates navigation button customization, `choice_row` segmented choices with race-based language defaults, a `toggle_section` boolean flag (heroic destiny), and the structured modal inputs: the name modal pairs a `TextInput` with an optional `FileUpload` portrait that replaces the preview image (a validator refuses a file that is not an image), and the background modal combines paragraph text with `RadioGroup`, `CheckboxGroup`, and `Checkbox` in one edit-in-place form. A Cancel button added once through `_build_extra_items` stays on every step.
 
 **Command:** `/v2wizard`
 
 ### v2_persistence.py
 
-A `PersistentRolesLayoutView`-based role selector panel that survives bot restarts. Categories are rendered as accent-colored containers, with exclusive-mode support (selecting one role in a category auto-removes the others). Running `/v2roles` again automatically cleans up the previous panel. `/v2visits` covers the other half of persistence: a per-user visit counter whose state is restored from disk rather than re-derived, so the count survives a restart.
+A `PersistentRolesLayoutView`-based role selector panel that survives bot restarts. Categories are rendered as accent-colored containers, with exclusive-mode support (selecting one role in a category auto-removes the others). Running `/v2roles` again automatically cleans up the previous panel, and `/v2roles_move` moves the panel to another channel, turning off `retire_previous_on_send` so the old panel is deleted only after the new one has posted. `/v2visits` covers the other half of persistence: a per-user visit counter whose state is restored from disk rather than re-derived, so the count survives a restart.
 
-**Commands:** `/v2roles`, `/v2visits`
+**Commands:** `/v2roles`, `/v2roles_move`, `/v2visits`
 
 ### v2_tictactoe.py
 
-Two-player TicTacToe demonstrating multi-user interaction patterns. Features a challenge acceptance flow (opponent must accept before the game starts), dynamic board size (3x3 to 5x5), configurable win length (e.g. 3-in-a-row on a 5x5 board), Discord mentions, mutual rematch agreement (both players must confirm), forfeit tracking, and participant-aware instance limiting via `register_participant()`. Uses `allowed_users` to restrict interaction to the two players; per-player lifetime stats are written to scoped state via `SCOPED_UPDATE` and grouped into a server ranking by a `@computed` selector (no custom reducer). The finished board freezes on Close (`exit_policy = "disable"`), matching Battleship. `/tictactoe leaderboard` renders the ranking on a Section-mode `LeaderboardLayoutView` with avatar thumbnails and an Overview stats card.
+Two-player TicTacToe demonstrating multi-user interaction patterns. Features a challenge acceptance flow (opponent must accept before the game starts), dynamic board size (3x3 to 5x5), configurable win length (e.g. 3-in-a-row on a 5x5 board), Discord mentions, mutual rematch agreement (both players must confirm), forfeit tracking, and participant-aware instance limiting via `auto_register_participants` and `instance_policy = "reject"`, so a player already in a game is refused a second one rather than losing the first. Each callback checks the game's phase first, so a click queued behind the deciding move changes nothing. Uses `allowed_users` to restrict interaction to the two players; per-player lifetime stats are written to scoped state via `SCOPED_UPDATE` and grouped into a server ranking by a `@computed` selector (no custom reducer). The finished board freezes on Close (`exit_policy = "disable"`), matching Battleship. `/tictactoe leaderboard` renders the ranking on a Section-mode `LeaderboardLayoutView` with avatar thumbnails and an Overview stats card.
 
 **Commands:** `/tictactoe play @user [size] [win]`, `/tictactoe stats [user]`, `/tictactoe leaderboard`
 
@@ -113,7 +114,7 @@ Display-only showcase for the V2 media builders (`gallery()`, `image_section()`,
 
 ### v2_battleship.py
 
-Two-player 10x10 Battleship with a standard fleet, text-rendered emoji grids, a fleet setup phase with re-roll consensus, ephemeral private fleet panels via `attach_child()`, turn-based select targeting, and automatic cleanup via `_cleanup_attached_children()` on game end. Demonstrates `attach_child()`, `register_participant()`, dispatch-then-cleanup ordering, the ephemeral interaction-bound constraint, and live cross-view reactivity (Re-Roll dispatches update both the ephemeral and the public ready card via the standard subscriber pipeline). A phase-aware `exit()` override deletes an abandoned setup but freezes the finished board as a record. `/battleship leaderboard` renders server rankings on a Section-mode `LeaderboardLayoutView` with avatar thumbnails and an Overview stats card.
+Two-player 10x10 Battleship with a standard fleet, text-rendered emoji grids, a fleet setup phase where each player re-rolls their own fleet and readies up, ephemeral private fleet panels attached with `parent=` and closed with `exit_children()` when the game ends, and turn-based select targeting. Each callback checks the game's phase first, so a click queued behind a finished game or a started one changes nothing. Demonstrates `auto_register_participants`, the ephemeral interaction-bound constraint, and live cross-view reactivity (Re-Roll dispatches update both the ephemeral and the public ready card via the standard subscriber pipeline). A phase-aware `exit()` override deletes an abandoned setup but freezes the finished board as a record. `/battleship leaderboard` renders server rankings on a Section-mode `LeaderboardLayoutView` with avatar thumbnails and an Overview stats card.
 
 **Commands:** `/battleship play @user`, `/battleship stats [user]`, `/battleship leaderboard`
 
@@ -137,7 +138,7 @@ Advanced settings menu retained as the legacy V1 demonstration. Showcases instan
 
 ### navigation.py
 
-Navigation stack with push/pop between multi-level views and session data sharing. A dark mode toggle in the settings view writes to `shared_data`, which the nested view reads without any constructor kwargs. Demonstrates `update_session()`, `shared_data`, and `SESSION_UPDATED` subscriptions alongside multi-level push/pop.
+Navigation stack with push/pop between multi-level views and session data sharing. A dark mode toggle in the settings view writes to `shared_data`, which the nested view reads without any constructor kwargs. Demonstrates `update_session()`, `shared_data`, and `SESSION_UPDATED` subscriptions alongside multi-level push/pop, and a Start Over button that uses `replace()` to post a fresh menu with no Back history.
 
 **Command:** `/navtest`
 

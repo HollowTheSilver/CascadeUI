@@ -125,6 +125,7 @@ from .utils.decorators import cascade_component, cascade_reducer
 from .utils.errors import RetryConfig, safe_execute, with_error_boundary, with_retry
 from .utils.fetch import fetch_as_file
 from .utils.logging import ColorScheme, FormatTemplate, JSONFormatter, setup_logging
+from .utils.responses import DISCORD_CALL_ERRORS
 from .utils.strings import is_emoji, slugify
 from .utils.tasks import get_task_manager
 from .validation import (
@@ -184,7 +185,7 @@ if "PostgresBackend" in _persistence_all:
 # // ========================================( Script )======================================== // #
 
 
-__version__ = "3.13.0"
+__version__ = "3.14.0"
 
 # Export public API
 __all__ = [
@@ -367,6 +368,7 @@ __all__ = [
     "with_retry",
     "RetryConfig",
     "safe_execute",
+    "DISCORD_CALL_ERRORS",
     "cascade_reducer",
     "cascade_component",
     "slugify",

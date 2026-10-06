@@ -9,12 +9,8 @@ from discord.utils import DISCORD_EPOCH
 # // ========================================( Constants )======================================== // #
 
 
-# A snowflake carries its creation time in bits 63-22, counted from Discord's
-# epoch. An id whose timestamp bits decode to the epoch day itself carries no
-# timestamp at all -- those bits are effectively zero, which is what an
-# application's own counter looks like. Discord did not exist on that day, so
-# the floor rejects every such id without excluding any real one: the earliest
-# real snowflakes on record are four orders of magnitude above it.
+# An id whose timestamp bits (63-22) decode to Discord's epoch day carries no
+# timestamp, as an application's own counter does. No real id is that early.
 _SNOWFLAKE_FLOOR_MS = DISCORD_EPOCH + 86_400_000
 
 # Tolerance for clock skew between this host and Discord's id generators.

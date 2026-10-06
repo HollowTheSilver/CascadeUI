@@ -49,7 +49,14 @@ from .patterns import (
     toggle_section,
 )
 from .selects import ChannelSelect, Dropdown, MentionableSelect, RoleSelect, UserSelect
-from .types import EmojiInput, MediaInput
+from .types import (
+    MAX_COMPONENT_ID,
+    MAX_MESSAGE_CHARACTERS,
+    MAX_MESSAGE_COMPONENTS,
+    MAX_SELECT_OPTIONS,
+    EmojiInput,
+    MediaInput,
+)
 from .v1_composition import CompositeComponent, get_component, register_component
 from .wrappers import with_confirmation, with_cooldown, with_loading_state
 
@@ -131,4 +138,9 @@ __all__ = [
     # Type aliases
     "EmojiInput",
     "MediaInput",
+    # Discord limits
+    "MAX_COMPONENT_ID",
+    "MAX_MESSAGE_CHARACTERS",
+    "MAX_MESSAGE_COMPONENTS",
+    "MAX_SELECT_OPTIONS",
 ]

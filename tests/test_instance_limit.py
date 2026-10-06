@@ -187,8 +187,27 @@ class TestScopeIsolation:
 
         # Same guild, different user: should be rejected
         view_b = _GuildView(interaction=_make_interaction(user_id=2, guild_id=100))
-        with pytest.raises(InstanceLimitError):
+        with pytest.raises(InstanceLimitError) as info:
             await view_b.send()
+        # The open one is another user's, so the refusal names the server.
+        assert info.value.scope == "guild"
+        assert info.value.default_message == "One of these is already open in this server."
+
+    async def test_guild_scope_under_replace_names_the_server(self):
+        """Another user's view is not this user's to replace."""
+
+        class _GuildView(_RaiseOnLimit, StatefulView):
+            instance_limit = 1
+            instance_scope = "guild"
+            instance_policy = "replace"
+
+        view_a = _GuildView(interaction=_make_interaction(user_id=1, guild_id=100))
+        await view_a.send()
+
+        view_b = _GuildView(interaction=_make_interaction(user_id=2, guild_id=100))
+        with pytest.raises(InstanceLimitError) as info:
+            await view_b.send()
+        assert info.value.default_message == "One of these is already open in this server."
 
     async def test_global_scope(self):
         """Any view of the same type shares the limit with global scope."""
@@ -203,8 +222,9 @@ class TestScopeIsolation:
 
         # Completely different user and guild: should still be rejected
         view_b = _GlobalView(interaction=_make_interaction(user_id=2, guild_id=200))
-        with pytest.raises(InstanceLimitError):
+        with pytest.raises(InstanceLimitError) as info:
             await view_b.send()
+        assert info.value.default_message == "One of these is already open."
 
 
 # // ========================================( Persistent View Protection )======================================== // #
@@ -512,6 +532,143 @@ class TestNavigationChainTracking:
             == 0
         )
 
+    # A screen that declares no instance_scope of its own (the default is
+    # user_guild) under a root scoped differently: the case the tests above
+    # cannot see, since every root in them uses the default too.
+
+    @staticmethod
+    def _hub_and_screen(policy):
+        class _Hub(StatefulView):
+            instance_limit = 1
+            instance_policy = policy
+            instance_scope = "user"
+
+        class _Screen(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        return _Hub, _Screen
+
+    async def test_a_pushed_screen_counts_under_the_roots_scope(self):
+        _Hub, _Screen = self._hub_and_screen("replace")
+        store = get_store()
+        hub = _Hub(interaction=_make_interaction())
+        await hub.send()
+        screen = await hub.push(_Screen)
+
+        assert store._get_active_views(_Hub._class_session_key(), "user:100") == [screen]
+        assert screen._instance_root_scope == "user"
+
+        second = _Hub(interaction=_make_interaction())
+        await second.send()
+
+        assert screen._torn_down(), "the new panel replaces the screen the user is on"
+
+    async def test_a_pushed_screen_blocks_a_second_root_under_reject(self):
+        _Hub, _Screen = self._hub_and_screen("reject")
+        hub = _Hub(interaction=_make_interaction())
+        await hub.send()
+        screen = await hub.push(_Screen)
+
+        second = _Hub(interaction=_make_interaction())
+        assert await second.send() is None
+        assert not screen._torn_down()
+
+    async def test_the_root_scope_clears_on_pop_to_the_root_and_on_replace(self):
+        _Hub, _Screen = self._hub_and_screen("replace")
+        hub = _Hub(interaction=_make_interaction())
+        await hub.send()
+        screen = await hub.push(_Screen)
+        restored = await screen.pop()
+        assert restored._instance_root_scope is None
+
+        class _Elsewhere(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        screen = await restored.push(_Screen)
+        dest = await screen.replace(_Elsewhere)
+        assert dest._instance_root_scope is None
+
+    async def test_check_instance_available_reads_a_chain_under_its_roots_scope(self):
+        _Hub, _Screen = self._hub_and_screen("replace")
+
+        class _LimitedScreen(StatefulView):
+            instance_limit = 1
+
+            async def on_state_changed(self, state):
+                pass
+
+        hub = _Hub(interaction=_make_interaction())
+        await hub.send()
+        await hub.push(_LimitedScreen)
+
+        assert not _LimitedScreen.check_instance_available(
+            user_id=100, guild_id=200, session_origin=_Hub._class_session_key()
+        )
+
+    async def test_a_chain_check_reads_the_roots_limit_for_a_screen_without_one(self):
+        """The check returned early on the screen's own absent limit before it
+        read ``session_origin``."""
+        _Hub, _Screen = self._hub_and_screen("replace")
+        hub = _Hub(interaction=_make_interaction())
+        await hub.send()
+        await hub.push(_Screen)
+
+        assert not _Screen.check_instance_available(
+            user_id=100, guild_id=200, session_origin=_Hub._class_session_key()
+        )
+
+    async def test_a_participant_cannot_join_past_the_roots_limit_through_a_pushed_screen(self):
+        """The join was checked against the screen's own limit, under the root's key."""
+        _Hub, _Screen = self._hub_and_screen("reject")
+        store = get_store()
+        mine = _Hub(interaction=_make_interaction(user_id=100))
+        await mine.send()
+        theirs = _Hub(interaction=_make_interaction(user_id=101))
+        await theirs.send()
+        screen = await theirs.push(_Screen)
+
+        assert await screen.register_participant(100) is False
+        assert store._get_active_views(_Hub._class_session_key(), "user:100") == [mine]
+
+    async def test_a_limit_set_on_the_root_instance_holds_through_a_pushed_screen(self):
+        """The join read the root class's limit, so an override set with
+        set_class_attribute() on the root was ignored for its pushed screens."""
+
+        class _Hub(StatefulView):
+            instance_scope = "user"
+
+        class _Screen(StatefulView):
+            async def on_state_changed(self, state):
+                pass
+
+        mine = _Hub(interaction=_make_interaction(user_id=100))
+        await mine.send()
+        theirs = _Hub(interaction=_make_interaction(user_id=101))
+        theirs.set_class_attribute("instance_limit", 1)
+        await theirs.send()
+        screen = await theirs.push(_Screen)
+
+        assert await theirs.register_participant(100) is False
+        assert await screen.register_participant(100) is False
+
+    async def test_an_instance_scope_override_files_the_view_again(self):
+        """The index was left holding the view under its old key, so a dead id
+        stayed counted after it exited."""
+        _Hub, _Screen = self._hub_and_screen("replace")
+        store = get_store()
+        hub = _Hub(interaction=_make_interaction())
+        await hub.send()
+
+        hub.set_class_attribute("instance_scope", "guild")
+
+        key = _Hub._class_session_key()
+        assert store._get_active_views(key, "user:100") == []
+        assert store._get_active_views(key, "guild:200") == [hub]
+        await hub.exit()
+        assert not any(store._instance_index.values())
+
 
 # // ========================================( Participant Sessions )======================================== // #
 
@@ -539,6 +696,39 @@ class TestParticipantSessions:
             len(store._get_active_views(_GameView._class_session_key(), "user_guild:300:200")) == 1
         )
         assert 300 in view._participants
+
+    async def test_an_instance_scope_override_files_participants_again(self):
+        """Only the owner was filed under the new scope, so a participant was
+        counted under a key nothing reads and was free under the one that is."""
+
+        class _GameView(StatefulView):
+            instance_limit = 1
+            instance_scope = "user_guild"
+
+        store = get_store()
+        view = _GameView(interaction=_make_interaction(user_id=100, guild_id=200))
+        await view.send()
+        await view.register_participant(300)
+
+        view.set_class_attribute("instance_scope", "user")
+
+        key = _GameView._class_session_key()
+        assert store._get_active_views(key, "user:300") == [view]
+        assert store._get_active_views(key, "user_guild:300:200") == []
+
+    def test_an_instance_scope_override_on_an_unsent_view_files_nothing(self):
+        """The override filed a view that was never registered, and the entry
+        outlived it in the index."""
+
+        class _GameView(StatefulView):
+            instance_limit = 1
+
+        store = get_store()
+        view = _GameView(interaction=_make_interaction(user_id=100, guild_id=200))
+
+        view.set_class_attribute("instance_scope", "guild")
+
+        assert not any(view.id in ids for ids in store._instance_index.values())
 
     async def test_register_participant_coerces_snowflake_object(self):
         """register_participant accepts Member-shaped objects via snowflake coercion."""
@@ -1160,6 +1350,20 @@ class TestProtectAttached:
         await game2.send()
 
         channel_send.assert_called_once_with("This game has been cancelled.")
+
+    async def test_replaced_message_skips_a_message_without_its_channel(self):
+        """A message posted in a channel discord.py cannot build carries no
+        channel, and the default raised reading it: an error with a traceback
+        where a notification that fails to send logs a debug line."""
+
+        class _NotifyGame(StatefulView):
+            replaced_message = "This game has been cancelled."
+
+        game = _NotifyGame(interaction=_make_interaction(user_id=1, guild_id=100))
+        game._participants.add(2)
+        game._message = MagicMock(channel=None)
+
+        assert await game.on_replaced() is None
 
     async def test_replaced_message_skips_without_participants(self):
         """Default on_replaced does not send replaced_message when

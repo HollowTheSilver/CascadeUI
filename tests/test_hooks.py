@@ -116,6 +116,141 @@ class TestEventHooks:
         await store.dispatch("MULTI_HOOK", {})
         assert received == ["a", "b"]
 
+    @staticmethod
+    async def _run(batched, dispatches):
+        store = get_store()
+        if batched:
+            async with store.batch():
+                for action_type in dispatches:
+                    await store.dispatch(action_type, {})
+        else:
+            for action_type in dispatches:
+                await store.dispatch(action_type, {})
+
+    @pytest.mark.parametrize("batched", [False, True])
+    async def test_a_hook_that_removes_itself_leaves_the_next_hook_called(self, batched):
+        # Hooks were read from the live list, so removing one mid-pass made the
+        # hook after it miss the action; a batch read them all up front, so
+        # the removed hook ran again for the next action.
+        store = get_store()
+        calls = []
+
+        def once(action, state):
+            calls.append("once")
+            store.off("PING", once)
+
+        store.on("PING", once)
+        store.on("PING", lambda action, state: calls.append("other"))
+        await self._run(batched, ["PING", "PING"])
+        assert calls == ["once", "other", "other"]
+
+    @pytest.mark.parametrize("batched", [False, True])
+    async def test_a_hook_removed_by_another_is_not_called_afterwards(self, batched):
+        store = get_store()
+        calls = []
+
+        def later(action, state):
+            calls.append(("later", action["type"]))
+
+        def remover(action, state):
+            calls.append(("remover", action["type"]))
+            store.off("PING", later)
+            store.off("PONG", later)
+
+        store.on("PING", remover)
+        store.on("PING", later)
+        store.on("PONG", later)
+        await self._run(batched, ["PING", "PONG"])
+        assert calls == [("remover", "PING")]
+
+    @pytest.mark.parametrize("batched", [False, True])
+    async def test_a_hook_added_during_a_dispatch_is_called_from_the_next_action(self, batched):
+        store = get_store()
+        calls = []
+
+        def added(action, state):
+            calls.append(("added", action["type"]))
+
+        def adder(action, state):
+            calls.append(("adder", action["type"]))
+            store.on("PING", added)
+            store.on("PONG", added)
+
+        store.on("PING", adder)
+        await self._run(batched, ["PING", "PONG"])
+        assert calls == [("adder", "PING"), ("added", "PONG")]
+
+    async def test_a_hook_whose_eq_expects_its_own_type_is_called(self):
+        # Registrations were compared with ==, which called this __eq__ with
+        # another hook, and dispatch() raised for every action.
+        store = get_store()
+        calls = []
+
+        class Tagged:
+            tag = "t"
+
+            def __eq__(self, other):
+                return self.tag == other.tag
+
+            __hash__ = object.__hash__
+
+            def __call__(self, action, state):
+                calls.append("tagged")
+
+        store.on("PING", lambda action, state: calls.append("plain"))
+        store.on("PING", Tagged())
+        await store.dispatch("PING", {})
+        assert calls == ["plain", "tagged"]
+
+    async def test_off_removes_one_registration_of_a_callback_registered_twice(self):
+        store = get_store()
+        calls = []
+
+        def twice(action, state):
+            calls.append("twice")
+
+        def remover(action, state):
+            calls.append("remover")
+            if calls.count("remover") == 1:
+                store.off("PING", twice)
+
+        store.on("PING", remover)
+        store.on("PING", twice)
+        store.on("PING", twice)
+        await store.dispatch("PING", {})
+        await store.dispatch("PING", {})
+        assert calls == ["remover", "twice", "remover", "twice"]
+
+    async def test_off_of_an_equal_callback_skips_the_registration_it_removed(self):
+        # off() removes the first registration equal to its argument; the
+        # equal callback still registered is the one called.
+        store = get_store()
+        calls = []
+
+        class Named:
+            def __init__(self, name):
+                self.name = name
+
+            def __eq__(self, other):
+                return isinstance(other, Named)
+
+            __hash__ = object.__hash__
+
+            def __call__(self, action, state):
+                calls.append(self.name)
+
+        first, second = Named("first"), Named("second")
+
+        def remover(action, state):
+            calls.append("remover")
+            store.off("PING", second)
+
+        store.on("PING", remover)
+        store.on("PING", first)
+        store.on("PING", second)
+        await store.dispatch("PING", {})
+        assert calls == ["remover", "second"]
+
 
 class TestAwaitMaybe:
     """The shared helper the whole sync-or-async contract rests on.

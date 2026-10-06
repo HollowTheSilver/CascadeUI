@@ -7,15 +7,19 @@ embed-based view hierarchy through Discord's component system, and how
 ``shared_data`` shares ephemeral state across the entire navigation chain.
 
 Patterns demonstrated:
-    - ``push(view_class, interaction, *, rebuild=...)`` for V1 embed transitions
-    - ``pop(interaction, *, rebuild=...)`` for unwinding the stack
+    - ``nav_rebuild`` on each view, naming the embed a push or pop edits in
+    - ``push(view_class, interaction, rebuild=...)`` to override that edit for
+      one hop
+    - ``pop(interaction)`` behind an explicit Back button, and
+      ``auto_back_button`` supplying the same button
     - Deep nesting (Main -> Settings -> Nested) on a single message
+    - ``replace()`` for a one-way Start Over that leaves no Back history
     - ``update_session()`` to write ephemeral metadata shared across views
     - ``shared_data`` property to read that metadata from any view in the chain
     - ``subscribed_actions = {"SESSION_UPDATED"}`` for cross-view reactivity
     - ``state_selector`` narrowed to session data changes
 
-All three views share a ``session_id`` (inherited automatically through
+All four views share a ``session_id`` (inherited automatically through
 push/pop), so ``update_session(dark_mode=True)`` in SettingsView is
 immediately readable as ``self.shared_data["dark_mode"]`` in NestedView.
 Session data is ephemeral -- it lives for the duration of the navigation
@@ -53,6 +57,8 @@ class MainMenuView(StatefulView):
     instance_limit = 1
     instance_scope = "user"
     instance_policy = "replace"
+    # A second /navtest replaces this hub and deletes its message. That is the
+    # instance limit, unrelated to the replace() call NestedView makes below.
     replace_policy = "delete"
     exit_policy = "disable"
     auto_defer = True
@@ -60,8 +66,10 @@ class MainMenuView(StatefulView):
     # which is ephemeral and shared across the push/pop chain.
     state_scope = None
     timeout = 300.0
-    # Manual back buttons on sub-views; the hub has no parent to pop to.
+    # The hub is the bottom of the stack, so it has no Back button.
     auto_back_button = False
+    # Static content: nothing to re-render on a dispatch.
+    subscribed_actions = set()
     # Sub-views pop back here without passing rebuild=, so the hub names its
     # own edit. A V1 destination that names none ships components alone, and
     # the sub-view's embed stays on screen above the hub's buttons.
@@ -96,9 +104,16 @@ class MainMenuView(StatefulView):
         )
 
     async def go_settings(self, interaction):
-        # An explicit rebuild= overrides the destination's own nav_rebuild,
-        # which is how a caller renders one hop differently from the rest.
-        await self.push(SettingsView, interaction, rebuild=lambda v: {"embed": v.build_embed()})
+        # An explicit rebuild= replaces the destination's own nav_rebuild for
+        # this one push: here it adds a footer naming where Settings was
+        # opened from. Later renders use the view's own embed again.
+        await self.push(
+            SettingsView,
+            interaction,
+            rebuild=lambda v: {
+                "embed": v.build_embed().set_footer(text="Opened from the main menu")
+            },
+        )
 
     async def go_about(self, interaction):
         # No rebuild= needed: AboutView names its own via nav_rebuild.
@@ -109,7 +124,7 @@ class SettingsView(StatefulView):
     """Settings view with a dark mode toggle stored in session data.
 
     ``update_session(dark_mode=...)`` writes the preference into the
-    session's shared ``data`` dict. Every view in the push/pop chain
+    session's ``shared_data`` dict. Every view in the push/pop chain
     reads it via ``self.shared_data`` -- no constructor kwargs, no
     Redux state, no scoped state. The preference is ephemeral: it
     lasts for this navigation session and disappears on timeout or exit.
@@ -129,10 +144,12 @@ class SettingsView(StatefulView):
     nav_rebuild = staticmethod(lambda v: {"embed": v.build_embed()})
     # No Redux state: this view uses session data, not scoped state.
     state_scope = None
-    # Manual back button; auto_back_button doesn't call rebuild.
+    # An explicit Back button, to show pop(); the other sub-views let
+    # auto_back_button add the same one.
     auto_back_button = False
     # React to session data changes from update_session().
     subscribed_actions = {"SESSION_UPDATED"}
+    timeout = 300.0
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -209,26 +226,35 @@ class NestedView(StatefulView):
 
     owner_only = True
     auto_defer = True
+    # Start Over closes this view through replace(): "disable" leaves the old
+    # panel frozen in the channel above the new menu.
+    exit_policy = "disable"
     nav_rebuild = staticmethod(lambda v: {"embed": v.build_embed()})
     state_scope = None
-    auto_back_button = False
+    # push() adds a Back button that pops to the view below.
+    auto_back_button = True
     # Reads shared_data on push and displays it -- never rebuilds on an external
     # dispatch. Subscribe to nothing so the default refresh-on-notify does not
     # re-edit the message on every action in the session.
     subscribed_actions = set()
+    timeout = 300.0
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-
         self.add_item(
             StatefulButton(
-                label="Back",
+                label="Start Over",
                 style=discord.ButtonStyle.secondary,
-                emoji="\N{BLACK LEFT-POINTING TRIANGLE}",
-                row=4,
-                callback=self.go_back,
+                callback=self.start_over,
             )
         )
+
+    async def start_over(self, interaction):
+        # replace() is one-way: the views below this one are dropped rather
+        # than restored, so the new menu has no Back history. This view
+        # closes by its own exit_policy, and the new view comes back unsent.
+        view = await self.replace(MainMenuView, interaction)
+        await view.send(embed=view.build_embed())
 
     def build_embed(self):
         # Read session data written by SettingsView. No kwargs needed,
@@ -240,13 +266,10 @@ class NestedView(StatefulView):
             description=(
                 "Two levels deep in the navigation stack.\n\n"
                 f"Dark mode is **{mode_label}** (read from session data).\n"
-                "Hit **Back** to unwind."
+                "Hit **Back** to unwind, or **Start Over** for a fresh menu."
             ),
             color=discord.Color.dark_theme() if dark else discord.Color.orange(),
         )
-
-    async def go_back(self, interaction):
-        await self.pop(interaction)
 
 
 class AboutView(StatefulView):
@@ -256,22 +279,10 @@ class AboutView(StatefulView):
     auto_defer = True
     nav_rebuild = staticmethod(lambda v: {"embed": v.build_embed()})
     state_scope = None
-    auto_back_button = False
+    auto_back_button = True
     # Static page -- no Redux state to react to, so subscribe to nothing.
     subscribed_actions = set()
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-        self.add_item(
-            StatefulButton(
-                label="Back",
-                style=discord.ButtonStyle.secondary,
-                emoji="\N{BLACK LEFT-POINTING TRIANGLE}",
-                row=4,
-                callback=self.go_back,
-            )
-        )
+    timeout = 300.0
 
     def build_embed(self):
         return discord.Embed(
@@ -283,9 +294,6 @@ class AboutView(StatefulView):
             ),
             color=discord.Color.greyple(),
         )
-
-    async def go_back(self, interaction):
-        await self.pop(interaction)
 
 
 # // ========================================( Cog )======================================== // #

@@ -406,6 +406,42 @@ class TestCompositeComponent:
         assert result is None
 
 
+class TestV1CompositeAck:
+    """A V1 composite with no callback of its own acks the click, and the
+    auto-defer backstop, which runs outside the interaction lock, can take the
+    response slot between the is_done() check and the defer."""
+
+    @staticmethod
+    def _raced_interaction():
+        interaction = _make_interaction(is_done=False)
+        response = MagicMock(status=400, reason="Bad Request")
+        interaction.response.defer = AsyncMock(
+            side_effect=discord.HTTPException(
+                response, {"code": 40060, "message": "Interaction has already been acknowledged."}
+            )
+        )
+        return interaction
+
+    async def test_a_page_turn_the_backstop_acked_first_does_not_raise(self):
+        from cascadeui import PaginationControls
+
+        controls = PaginationControls(page_count=3)
+
+        await controls._on_next(self._raced_interaction())
+
+        assert controls.current_page == 1
+
+    async def test_a_toggle_group_pick_the_backstop_acked_first_does_not_raise(self):
+        from cascadeui import StatefulView, ToggleGroup
+
+        view = StatefulView(interaction=_make_interaction())
+        group = ToggleGroup(options=["A", "B"])
+        group.add_to_view(view)
+        button = next(b for b in view.children if getattr(b, "label", None) == "B")
+
+        await button.callback(self._raced_interaction())
+
+
 class TestV1CompositeCallbackArity:
     """The V1 composites hold the same callback contract as the builders:
     value-carrying controls refuse a callback that cannot receive the value,
@@ -486,6 +522,72 @@ class TestV1CompositeCallbackArity:
         await button.callback(make_interaction())
 
         assert received == [1]
+
+    @pytest.mark.parametrize("direction", ["next", "prev"])
+    async def test_pagination_controls_return_when_the_render_raises(self, direction):
+        # The callback draws the page, so a raise leaves the old page on
+        # screen; the next press must move from there, not skip one.
+        from helpers import make_interaction
+
+        from cascadeui.components.patterns.v1 import PaginationControls
+
+        async def cb(interaction, page):
+            raise RuntimeError("database unavailable")
+
+        controls = PaginationControls(page_count=3, current_page=1, on_page_change=cb)
+        button = controls.next_button if direction == "next" else controls.prev_button
+        button._view = self._make_view()
+
+        with pytest.raises(RuntimeError, match="database unavailable"):
+            await button.callback(make_interaction())
+
+        assert controls.current_page == 1
+        assert controls.indicator.label == "Page 2/3"
+        assert not controls.prev_button.disabled
+        assert not controls.next_button.disabled
+
+    async def test_pagination_controls_keep_the_move_on_a_cancel(self):
+        # A cancel can land after the callback's edit did, so the move stays.
+        import asyncio
+
+        from helpers import make_interaction
+
+        from cascadeui.components.patterns.v1 import PaginationControls
+
+        async def cb(interaction, page):
+            raise asyncio.CancelledError()
+
+        controls = PaginationControls(page_count=3, on_page_change=cb)
+        button = controls.next_button
+        button._view = self._make_view()
+
+        with pytest.raises(asyncio.CancelledError):
+            await button.callback(make_interaction())
+
+        assert controls.current_page == 1
+
+    async def test_pagination_controls_answer_a_next_past_the_last_page(self):
+        # A Next queued behind the click that reached the last page moves
+        # nothing, and the component still answers it, as it does Previous
+        # on the first page.
+        from helpers import make_interaction
+
+        from cascadeui.components.patterns.v1 import PaginationControls
+
+        received = []
+
+        async def cb(interaction, page):
+            received.append(page)
+
+        controls = PaginationControls(page_count=3, current_page=2, on_page_change=cb)
+        button = controls.next_button
+        button._view = self._make_view()
+        interaction = make_interaction()
+
+        await button.callback(interaction)
+
+        assert received == [] and controls.current_page == 2
+        interaction.response.defer.assert_awaited_once()
 
 
 class TestStatefulCallbackTokenDiscipline:

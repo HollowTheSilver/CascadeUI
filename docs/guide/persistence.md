@@ -274,6 +274,81 @@ same five-bucket summary as
 also re-registers every `DynamicPersistentButton` subclass with the bot, so a
 dynamic button defined in the late-loaded cog routes clicks too.
 
+### Shutdown
+
+Registry writes reach the backend at once. Application-slot writes are
+batched: a change is written about two seconds after the last one, and no
+later than ten seconds after it was made. Closing persistence writes whatever
+is still batched and then closes the backends.
+
+With `bot=`, persistence closes when the bot does, whether `bot.run()` stops
+or your code calls `await bot.close()`, from a shutdown command or anywhere
+else. The bot's own `close()` runs first, including an override on your bot
+class, so a cog that saves state while it unloads is written too.
+
+On Linux and macOS, systemd, `docker stop`, and most hosting panels stop a
+program with SIGTERM, which discord.py leaves at its default: the process
+dies on the spot. So with `bot=`, the first SIGTERM closes the bot instead,
+which ends a program that runs the bot as its main task (`bot.run()`, or
+`bot.start()` in `async with bot`). A program running other work beside the
+bot keeps running, and a second SIGTERM ends it at once. Once the bot has
+closed, with nothing left for SIGTERM to close, a SIGTERM ends the process
+as it would without CascadeUI. A bot started again in the same process after
+a SIGTERM (a retry loop that builds a new bot) ends the process
+instead of running on until the process manager kills it, since the process
+was asked to stop; a change made since the close is written first. A
+SIGTERM handler of your own, installed with `signal.signal()` or
+`loop.add_signal_handler()` before or after `setup_middleware()`, takes
+precedence. On Windows, a process
+ended from outside (Task Manager, most process managers) runs no cleanup at
+all, so stop a bot there with Ctrl+C or `await bot.close()`.
+
+Without `bot=`, the library has no way to know the process is stopping, so
+close it yourself before the event loop ends:
+
+```python
+await get_store().persistence_manager.close()
+```
+
+A process that skips this loses the batched writes, and on `SQLiteBackend` it
+does not exit at all: the database runs on a worker thread that keeps the
+interpreter alive until the backend closes. Closing twice is harmless, even
+from two tasks at once. Each backend gets up to ten seconds to close; one
+that takes longer is logged and persistence closes without it, so the bot's
+`close()` still returns.
+
+### Restarting in the same process
+
+discord.py cannot log a closed bot in again, so a restart in the same
+process builds a new bot object, and its `setup_hook` runs
+`setup_middleware()` again. That passes the new bot to the installed
+middleware and reopens persistence, which closes with the new bot from then
+on. A change made while persistence is closed is held in memory and written
+when it reopens, and the first one logs a warning, since it is lost if the
+process exits instead.
+
+The views a bot leaves are handled as a process restart would handle them,
+with or without persistence. When the bot closes, each view sent through it
+stops: its timeout never fires, its instance slot is freed, code awaiting
+its `wait()` is cancelled as it would be when the process ends (a later
+`wait()` on it raises `asyncio.CancelledError` too), and nothing is edited,
+since the client it was sent through has closed. They leave the state with
+their sessions at the close, and no action is dispatched for them: no
+`VIEW_DESTROYED` reaches a hook or a middleware, as none would after a
+process restart. The release runs inside the bot's `close()`, which is
+wrapped when `setup_middleware()` runs or the bot sends its first view; a
+reference to `bot.close` taken before that, or a call to the class's own
+`close()`, skips the release, and persistence's close with it.
+
+A persistent panel among them keeps its registration and is restored
+through the new bot when its `setup_hook` runs `setup_middleware()`, before
+the bot connects, so the panel is back in place by `on_ready`. A bot that
+closes while its `setup_hook` is still restoring leaves the panels it had
+not restored registered, and the next bot restores them. Code that kept
+a reference to the old panel reaches the restored one through
+[`current_view`](../api/views.md#current_view); on any other view from
+before the restart, `refresh()` and `exit()` do nothing.
+
 ## Backends
 
 ### Built-in backends
@@ -312,7 +387,7 @@ consumer's own schema when both share a database.
 A database created before the registry and slots tables carried the prefix
 is renamed in place: `apply_migrations` finds `persistent_views` or
 `application_slots`, confirms the table carries the library's columns, and
-renames it -- indexes and schema-version record included -- in one
+renames it (indexes and schema-version record included) in one
 transaction before schema versions resolve. A same-named table *without*
 the library's columns is a consumer's own and is never touched; when both
 the old and new names exist and both hold rows, nothing is renamed, the
@@ -432,16 +507,26 @@ GRANT SELECT, INSERT, UPDATE, DELETE
 #### Cross-process invalidation
 
 `PostgresBackend` uses `LISTEN`/`NOTIFY` to broadcast slot invalidations
-to other CascadeUI processes connected to the same database. Bots
-running multiple workers automatically observe each other's writes. The
-listener connection sits outside the connection pool (LISTEN
-registrations are session-scoped per the PostgreSQL contract) and
-auto-reconnects on drop.
+to other CascadeUI processes connected to the same database. Each worker
+hears about another worker's writes through the callback below. The listener
+connection sits outside the connection pool (LISTEN registrations are
+session-scoped per the PostgreSQL contract) and auto-reconnects on drop.
+
+!!! warning "Each worker keeps its own copy of a slot"
+    The library does not reload a slot into memory on its own, so a worker
+    that ignores the notification keeps serving its own copy. A worker also
+    skips a write that would store what it last stored: once another worker
+    has changed a slot, setting the slot on this worker back to the value it
+    last stored writes nothing, and the other worker's value stays on disk.
+    The expiry sweep reads this worker's own record too, so a slot whose
+    expiry, as this worker last recorded it, has passed leaves its memory
+    even when another worker has written the row since. The row itself
+    stays.
 
 The channel carries `table_prefix` when one is set, so two deployments
 sharing a database stay off each other's bus the same way they stay out of
 each other's tables. Workers of the *same* deployment share a prefix and so
-still see each other's writes, which is the point. A notification names the
+still hear about each other's writes, which is the point. A notification names the
 logical namespace and key, and the key is empty when the payload would
 exceed PostgreSQL's 8000-byte limit, meaning "drop this whole namespace" --
 so a shared channel would turn one neighbour's large write into a full cache
@@ -485,10 +570,10 @@ backend = PostgresBackend(
 ### Custom tables and raw SQL
 
 CascadeUI's namespace API (`row_upsert` / `row_select` / `kv_*`)
-covers the common cases. For everything else -- domain tables in the
+covers the common cases. Backends that declare `Capability.RAW_SQL`
+expose a raw-SQL escape hatch for everything else: domain tables in the
 same database, vendor-specific features (PostgreSQL JSONB GIN queries,
-SQLite FTS5), custom indexes, ad-hoc analytics queries -- backends that
-declare `Capability.RAW_SQL` expose a raw-SQL escape hatch.
+SQLite FTS5), custom indexes, and ad-hoc analytics queries.
 
 Three patterns to choose from:
 
@@ -609,14 +694,27 @@ async with backend.transaction():            # outer
     await backend.execute(...)                # outer commits cleanly
 ```
 
+A transaction belongs to the task that opened it. Another command running
+at the same time does not join it: that command's writes are not rolled
+back with it, and its reads do not see rows the transaction has not
+committed. SQLite has one connection, so there the other command waits
+for the transaction to end. A task started inside the body shares the
+transaction instead of getting its own, so run its statements in the
+body or start it after the block ends. On SQLite, such a task opening a
+transaction of its own raises `RuntimeError`.
+
 Only the raw-SQL methods (`execute`, `fetch`, `executemany`,
-`fetch_one`) participate in the transaction. The namespace API
-(`row_upsert`, `kv_*`, etc.) auto-commits per call regardless of
-transaction state -- to group namespace operations atomically, use raw
-SQL inside the transaction body.
+`fetch_one`) participate in the transaction. To group namespace
+operations (`row_upsert`, `kv_*`, etc.) atomically, use raw SQL inside
+the transaction body. A namespace write inside the body commits on its
+own on PostgreSQL and raises `RuntimeError` on SQLite, where it would
+wait on the lock the transaction holds. A namespace read inside the body
+sees the transaction's uncommitted writes on SQLite, which has one
+connection, and not on PostgreSQL, where it runs on a connection of its own.
 
 The transaction holds an underlying connection for the lifetime of the
-`async with` block. Long-running transactions starve the pool; keep
+`async with` block. Long-running transactions starve the pool, and on
+SQLite they hold up every other command's database calls. Keep
 transaction bodies short.
 
 #### Portability vs vendor-specific code
@@ -801,8 +899,9 @@ manager.register_slot_policy(
 )
 ```
 
-Unregistered slots fall back to `SlotPolicy()` (ephemeral, no TTL) with
-a DEBUG log: audit-friendly without emitting warnings on every dispatch.
+A slot with no registered policy takes `SlotPolicy()`'s retention, so it
+never expires; whether it is saved still follows the three routes below. The
+fallback is logged at DEBUG, once per slot.
 
 !!! tip "Three ways to opt a slot in"
     All three routes mark the slot persistent; pick the one that lives
@@ -835,9 +934,9 @@ and whether the *view* must re-attach to its original message.
 (a fresh UUID per instance) when no `persistence_key=` is passed at
 construction. That fallback is safe for the top row and for views
 that never key a persistent slot off `self.persistence_key`. The three rows
-that involve persistence need a domain-stable value -- guild id,
-composite user-guild key, or an explicit `persistence_key=f"counter:{uid}"`
--- to avoid writing to a fresh bucket on every restart.
+that involve persistence need a domain-stable value (guild id,
+composite user-guild key, or an explicit `persistence_key=f"counter:{uid}"`)
+to avoid writing to a fresh bucket on every restart.
 
 ## Pattern 1: Data persistence via a named slot
 
@@ -1024,6 +1123,22 @@ retire the row directly through the manager:
 await store.persistence_manager.prune_registry(persistence_keys=["roles:panel:123"])
 ```
 
+A panel that navigates keeps its registration through the view now on its
+message. Closing that view with its Exit button, a `replace()` from it, or the
+library's own cleanup (an instance-limit replacement, a parent's exit) closes
+the panel: the row goes whether the message is frozen or deleted, as it would
+for the panel's own `exit()`. Sending that view again to another message moves
+the row with it instead, so Back rebuilds the panel there and a restart
+restores it there. Give a pushed screen a Back button when the panel should
+stay up behind it.
+
+A pushed view left idle does not time out on the panel's message. It returns to
+the panel, which never times out, so the panel keeps answering clicks instead
+of freezing until the next restart. A pushed view that defines its own
+`on_timeout()` times out as that says, and one whose return fails (its panel's
+class is no longer registered, or the edit is refused) times out as usual,
+leaving the panel restorable after a restart.
+
 The two routes are not interchangeable. `exit()` retires the registration only
 while the view still owns it; `prune_registry` matches by key and deletes
 whatever holds it, so it is for a key no live panel holds. Pruning a key a
@@ -1125,6 +1240,11 @@ serializable. Passing one as a constructor kwarg declines the registry write
 (with a directed error naming the kwarg and pointing here), so the view would
 silently drop on the next restart.
 
+Dict keys inside a kwarg must be strings for the same reason. JSON stores
+every key as a string, so `scores={42: 3}` restores as `{"42": 3}` and a
+lookup by `42` misses. The row is still written, and an ERROR names the
+kwarg and the key.
+
 Inject them in `on_bind(bot)` instead:
 
 ```python
@@ -1164,7 +1284,9 @@ Keep `on_bind` idempotent; it may run more than once. A sync override
 ### Kwargs migrations for PersistentView subclasses
 
 When a `PersistentView` subclass changes its `__init__` signature, bump
-`kwargs_schema_version` on the class and register a migrator:
+`kwargs_schema_version` on the class and register a migrator. Versions start
+at `1`, and any value that is not a positive `int` raises `ValueError` when the
+class is defined:
 
 ```python
 from cascadeui.persistence import register_kwargs_migrator
@@ -1200,9 +1322,12 @@ next step are skipped with a WARNING and left on disk for later recovery.
 
 **Requirements for `PersistentView`:**
 
-- `persistence_key` is required (raises `ValueError` if not provided).
+- `persistence_key` is required and must be a non-empty string: a missing or
+  empty key raises `ValueError` and a non-string one `TypeError`, since stored
+  keys come back from the database as strings.
 - All components must have explicit `custom_id` values (auto-generated IDs
-  do not survive restarts).
+  do not survive restarts). `send()` raises `ValueError` for one without,
+  whether it was built in `__init__` or in `on_load()`.
 - `timeout` is forced to `None` (persistent views never time out).
 - `owner_only` defaults to `False`; override explicitly if your panel
   should be creator-only.
@@ -1221,7 +1346,8 @@ next step are skipped with a WARNING and left on disk for later recovery.
 Re-sending a panel under a key another panel holds retires the old one during
 the send: a live instance is exited (its `exit_policy` decides whether the
 message is frozen or deleted), and so is a view it pushed onto that message; a
-message left from before a restart is cleaned up. That suits a plain re-post.
+message left from before a restart is frozen or deleted by the new panel's
+`exit_policy` the same way. That suits a plain re-post.
 It does not suit a swap that has to confirm the new panel before the old one
 comes down, because by the time `send()` returns the old panel is already gone.
 
@@ -1253,10 +1379,12 @@ The new panel owns the registration as soon as it is sent, so the old panel's
 (which exits the old view through the message-deletion cleanup). When the new
 panel exits instead, as in the rollback above, the registration moves back to
 the old panel while it is still live, so a restart reattaches the panel that is
-actually on screen. A predecessor you have already stopped is treated as
-retired, and the new panel's `exit()` removes the row. The flag is per class;
-`set_class_attribute("retire_previous_on_send", False)` sets it for one
-instance.
+actually on screen. That holds when the old panel is showing a view it pushed:
+the registration goes back to its message with the panel's own class and
+arguments, the ones Back would rebuild it from. A predecessor you have already
+stopped is treated as retired, and the new panel's `exit()` removes the row.
+The flag is per class; `set_class_attribute("retire_previous_on_send", False)`
+sets it for one instance.
 
 Retiring a panel this way never involves `prune_registry`. That call matches by
 key and would delete whichever row the key points at, including the one an
@@ -1344,8 +1472,8 @@ Two migrator surfaces exist:
 ```python
 from cascadeui.persistence import register_migrator
 
-@register_migrator("cascadeui_persistent_views", from_version=1)
-async def _migrate_persistent_views_1_to_2(backend):
+@register_migrator("cascadeui_persistent_views", from_version=2)
+async def _migrate_persistent_views_2_to_3(backend):
     rows = await backend.row_select("cascadeui_persistent_views")
     for row in rows:
         row["new_column"] = derive(row)
@@ -1359,13 +1487,25 @@ the logical one there targets the unprefixed table: absent on a prefixed
 database, or a consumer's own table of that name. Resolve it first:
 
 ```python
-from cascadeui.persistence import physical_table, register_migrator
+from cascadeui.persistence import Capability, physical_table, register_migrator
 
-@register_migrator("cascadeui_persistent_views", from_version=2)
-async def _migrate_persistent_views_2_to_3(backend):
+@register_migrator("cascadeui_persistent_views", from_version=3)
+async def _migrate_persistent_views_3_to_4(backend):
+    if Capability.OPEN_ROWS in backend.capabilities:
+        return  # open rows already read a missing column as None
     table = physical_table(backend, "cascadeui_persistent_views")
-    await backend.execute(f"ALTER TABLE {table} ADD COLUMN priority INTEGER")
+    async with backend.transaction():
+        await backend.execute(f"ALTER TABLE {table} ADD COLUMN priority INTEGER")
 ```
+
+A migrator that changes columns should return early on a backend declaring
+`OPEN_ROWS`, whose rows are open mappings that a new column does not alter.
+A backend without `RAW_SQL` is not that case: it only lacks the raw-SQL
+surface. Keep several statements in one `transaction()`. The new version is
+recorded after the migrator returns, so one that fails partway runs again
+on the next boot, and so does one interrupted between its commit and that
+record. SQLite has no `ADD COLUMN IF NOT EXISTS`, so a migrator adding a
+column there reads it first and returns when it is already present.
 
 Library-owned migrators run automatically during `apply_migrations` in the
 setup pipeline. A missing migrator for a required version step raises
@@ -1379,12 +1519,12 @@ checks the backend's capability declaration: `OPEN_ROWS` skips the DDL,
 
 Registering a migrator under one of the pre-rename table names raises
 `ValueError` naming the current name. `persistent_views` and
-`application_slots` are no longer keys the migration loop resolves, so a
+`application_slots` are not keys the migration loop resolves, so a
 migrator keyed on either would sit in the registry and never be looked up.
 The same refusal covers the `migrators=` bulk form, which registers through
 the same function.
 
-The library ships one schema migrator today: `cascadeui_persistent_views`
+The library ships one schema migrator: `cascadeui_persistent_views`
 from version 1 to 2, adding the `first_unreachable_at` column described in
 [Rows that stay unreachable](#rows-that-stay-unreachable). A database
 created before that column existed migrates automatically on the next
@@ -1404,7 +1544,7 @@ await setup_middleware(
         backend=SQLiteBackend("state.db"),
         bot=bot,
         migrators={
-            "schema": {("cascadeui_persistent_views", 1): _migrate_views_1_to_2},
+            "schema": {("cascadeui_persistent_views", 2): _migrate_views_2_to_3},
             "kwargs": {("mybot.cogs.panel.TicketPanel", 1): _migrate_panel_1_to_2},
         },
     )
@@ -1412,20 +1552,24 @@ await setup_middleware(
 ```
 
 Both keys are optional; each maps `(name, from_version)` to an async callable.
-Registration is idempotent and runs before the migrations and rehydration that
-consume it, so re-constructing the middleware never raises a duplicate-key
-error. The two paths write to the same registry -- use whichever fits how the
-migrator was authored.
+Registration runs before the migrations and rehydration that consume it, and
+re-constructing the middleware never raises a duplicate-key error. A
+`(name, from_version)` already registered keeps the migrator it has, and the
+one passed here is ignored with a WARNING; the decorators raise `ValueError`
+for the same collision. The library registers
+`("cascadeui_persistent_views", 1)` itself. The two paths write to the same
+registry: use whichever fits how the migrator was authored.
 
 ## Pruning
 
-Three prune methods live on the manager. Callers typically reach them via
-the `/cascadeui` DevTools command group or a scheduled task:
+Three prune methods live on the manager, for a scheduled task or an admin
+command; DevTools runs `prune_unreachable` through `/cascadeui unreachable`:
 
 ```python
 manager = store.persistence_manager
 
-# Application slots: delete one slot, OR delete rows by expires_at cutoff.
+# Application slots: delete one slot, OR the slots whose expires_at is more
+# than 7 days past. A pruned slot leaves the running bot's state too.
 await manager.prune_application(slot="cache:search")
 await manager.prune_application(older_than_days=7)
 
@@ -1446,24 +1590,29 @@ Each prune dispatches a bookkeeping action (`APPLICATION_SLOTS_PRUNED`,
 `REGISTRY_PRUNED`) so subscribers and hooks observe the deletion without
 inferring it from row counts.
 
+A prune or an expiry leaves undo history alone. On a view with
+`enable_undo = True`, undoing a step taken before the slot was removed brings
+back what that step changed (for a dict slot, only the keys it touched), and
+the slot is saved again.
+
 ### Automatic TTL sweeping
 
 When any slot declares `ttl_days`, the manager starts a daily background
-sweeper during initialization. It calls `row_delete_where_lt` on
-`cascadeui_application_slots.expires_at` once every 24 hours and drops rows whose
-absolute wall-clock expiration has passed. No cadence configuration is
-exposed -- TTLs are expressed in days, sub-day precision is meaningless,
-and asking the user to also schedule a prune task is friction the library
-can absorb.
+sweeper during initialization. Once every 24 hours it deletes the rows whose
+`expires_at` has passed (`row_delete_where_lt` on
+`cascadeui_application_slots`) and drops the same slots from the running
+bot's state, so an expired slot stops being served without a restart. The
+cadence is fixed, since TTLs are counted in days.
 
 `expires_at` is an absolute timestamp written at write-time, not a
-duration. It survives bot restarts: a row written with `ttl_days=7` two
-days before a crash still has five days left after a restart. `rehydrate()`
+duration. A slot is written only when what it stores changes, so its expiry
+counts from its last change, not from the bot's last action. It survives bot
+restarts: a row written with `ttl_days=7` two days before a crash still has
+five days left after a restart. `rehydrate()`
 runs one prune pass before reading so rows that expired while the bot was
 offline are dropped rather than loaded into memory.
 
-Manual `prune_application(older_than_days=...)` remains available for
-devtools and one-off operations.
+`prune_application(older_than_days=...)` runs the same deletion on demand.
 
 ## Observability
 
@@ -1487,7 +1636,8 @@ manager.register_hook("on_error", on_error)
 Hooks run under the middleware's write lock for the namespace they
 describe. Keep them fast and non-blocking. The middleware enters
 exponential backoff on flush failure (1s, 2s, 4s, 8s, 16s, capped at 60s)
-and logs CRITICAL after `MAX_RETRIES` consecutive failures. Rows stay
+and logs CRITICAL after `MAX_RETRIES` consecutive failures. A write still
+running after 30 seconds is cancelled and counts as a failure. Rows stay
 dirty across retries so no writes are lost.
 
 ## What gets persisted
@@ -1529,14 +1679,18 @@ required.
 
 !!! tip "Store IDs, not discord.py objects"
     State is serialized as JSON. discord.py model objects (`Member`,
-    `Role`, `Channel`, etc.) are not JSON-serializable and raise
-    `TypeError` at flush time with a message suggesting the fix. Store
-    the `.id` integer:
+    `Role`, `Channel`, etc.) are not JSON-serializable: the slot holding
+    one is not saved, and `PersistenceMiddleware` logs an ERROR naming it.
+    Store the `.id` integer:
 
     ```python
-    # Wrong: fails at persistence time
+    # Wrong: the slot is not saved
     await self.dispatch_scoped({"target": interaction.user})
 
     # Right: store the snowflake ID
     await self.dispatch_scoped({"target_id": interaction.user.id})
     ```
+
+    An ID used as a dict key goes in as `str(user.id)`. JSON stores every
+    key as a string, so an `int` key reads back as `"42"` after a restart;
+    the slot is still saved, with an ERROR naming the key.

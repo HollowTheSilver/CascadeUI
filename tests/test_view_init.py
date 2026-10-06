@@ -445,6 +445,22 @@ class TestClassAttributeValidation:
         assert _Ok.instance_limit == 3
 
 
+class TestPersistenceKeyValidation:
+    """A stored key comes back from the database as a string, so a key of
+    any other type stopped matching its own row after a restart, and an
+    unhashable one broke ``send()`` part way through registering."""
+
+    @pytest.mark.parametrize("key", [5, ["a", 1], {"x": 1}], ids=["int", "list", "dict"])
+    def test_a_key_that_is_not_a_string_is_refused(self, key):
+        with pytest.raises(TypeError, match="persistence_key= must be a str"):
+            StatefulView(persistence_key=key)
+
+    def test_an_empty_key_is_refused(self):
+        """The property read it as absent and fell back to the view's own id."""
+        with pytest.raises(ValueError, match="must not be empty"):
+            StatefulView(persistence_key="")
+
+
 class TestSetClassAttribute:
     """``set_class_attribute`` lets a view instance override a class-level
     policy attribute with a per-invocation value while running the same
@@ -466,6 +482,31 @@ class TestSetClassAttribute:
         view = StatefulView()
         view.set_class_attribute("auto_register_participants", True)
         assert view.auto_register_participants is True
+
+    async def test_auto_register_participants_set_on_the_instance_is_honored(self):
+        """send() read the class, so the override registered nobody."""
+        view = StatefulView(interaction=_make_interaction(user_id=1, guild_id=100))
+        view.allowed_users = {1, 2}
+        view.set_class_attribute("auto_register_participants", True)
+
+        await view.send()
+
+        assert 2 in view.participants
+
+    @pytest.mark.parametrize(
+        "name, value", [("session_continuity", True), ("persistent_slots", ("scoped",))]
+    )
+    def test_an_attribute_read_from_the_class_is_refused(self, name, value):
+        """The instance value was accepted and never read."""
+        with pytest.raises(ValueError, match="read from the class"):
+            StatefulView().set_class_attribute(name, value)
+
+    def test_a_pinned_session_class_key_is_refused(self):
+        class _Pinned(StatefulView):
+            session_class_key = "tests.view_init.Pinned"
+
+        with pytest.raises(ValueError, match="read from the class"):
+            _Pinned().set_class_attribute("session_class_key", "tests.view_init.Other")
 
     def test_invalid_enum_value_raises(self):
         view = StatefulView()
