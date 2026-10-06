@@ -28,14 +28,14 @@ await setup_middleware(
 - `manager` -- optional pre-built `PersistenceManager`. When supplied, the pipeline kwargs (`backend`, `registry`, `application`, `bot`, `migrators`, `restore_concurrency`, `prune_unreachable_after_days`) are ignored and the middleware presumes the caller already ran `initialize_backends`, `apply_migrations`, and `rehydrate`. Reserved for advanced call sites that customize manager internals before install.
 - `backend` -- shorthand: fills any namespace not configured via `registry=`/`application=`.
 - `registry`, `application` -- per-namespace overrides. Each accepts the matching config class from `cascadeui.persistence`. Explicit config wins over shorthand; passing the config with `backend=None` opts the namespace out entirely.
-- `bot` -- when supplied, enables the reattach pipeline for `PersistentView` subclasses and installs the message-deletion cleanup listener. When omitted, only state data is restored.
+- `bot` -- when supplied, enables the reattach pipeline for `PersistentView` subclasses, installs the message-deletion cleanup listener, and closes persistence when the bot closes, a SIGTERM included (see [`close()`](#async-close-and-async-flush_all)). When omitted, only state data is restored, and closing persistence at shutdown is the caller's job.
 - `migrators` -- optional dict with `"schema"` and/or `"kwargs"` keys, each mapping a `(name, from_version)` tuple to an async migrator callable. When omitted, no migrators are registered through this kwarg; the `@register_migrator` / `@register_kwargs_migrator` decorators are the canonical registration path, and this dict is the programmatic bulk alternative.
 - `restore_concurrency` -- positive int bounding concurrency in both restore phases: the channel and message fetches during startup reattach, and the post-ready `on_restore` repaint that follows once the gateway is ready (default `8`). The repaint additionally serializes panels that share a channel (message edits rate-bucket per channel), so same-channel repaints run one at a time regardless of this value, while panels in distinct channels fan out under it.
 - `prune_unreachable_after_days` -- `None` (the default) or a positive int. When set, the manager runs `prune_unreachable(older_than_days=...)` once the gateway is ready and daily after, until it closes. Requires `bot=`. A zero, negative, or non-int value, or a value without `bot=`, raises `ValueError` here. See [Rows that stay unreachable](../guide/persistence.md#rows-that-stay-unreachable).
 
 ### `async initialize(store)`
 
-Runs the async startup pipeline: build the manager from the stashed config, initialize unique backends, apply schema migrations, blocking rehydrate both namespaces, install the gateway message-cleanup listener (when `bot` is available), stash the manager on the store as `store.persistence_manager`, start the TTL sweeper if any slot declares `ttl_days` and the unreachable sweep if `prune_unreachable_after_days` is set, and reattach persistent views (when `bot` is available). Idempotent: subsequent calls return immediately. With a pre-built `manager=`, the pipeline itself is skipped, but the manager's configured sweeps are still started.
+Runs the async startup pipeline: build the manager from the stashed config, initialize unique backends, apply schema migrations, blocking rehydrate both namespaces, install the gateway message-cleanup listener (when `bot` is available), stash the manager on the store as `store.persistence_manager`, start the TTL sweeper if any slot declares `ttl_days` and the unreachable sweep if `prune_unreachable_after_days` is set, and reattach persistent views (when `bot` is available). Idempotent: a later call skips the pipeline, but reopens persistence if it has closed and restores the persistent panels a closed bot left, which is what a restart in the same process needs from the new bot's `setup_hook`. With a pre-built `manager=`, the pipeline itself is skipped, but the manager's configured sweeps are still started.
 
 Invoked automatically by `setup_middleware`. Direct invocation is supported for test fixtures that bypass the install helper.
 
@@ -55,7 +55,7 @@ Governs the `state["application"]` namespace. `slots` maps slot name to a `SlotP
 
 ### `SlotPolicy(ttl_days=None, persistent=False)`
 
-Per-slot policy declared inside `ApplicationPersistence.slots={"slot_name": SlotPolicy(...)}`. `persistent=True` writes the slot through to the backend; `persistent=False` (the default) keeps it in-memory. `ttl_days=N` prunes rows older than the cutoff on auto-prune cycles; `ttl_days=None` disables TTL. `persistent=False` paired with `ttl_days=N` raises `ValueError` -- in-memory slots never reach storage, so a TTL has nothing to prune.
+Per-slot policy declared inside `ApplicationPersistence.slots={"slot_name": SlotPolicy(...)}`. `persistent=True` writes the slot through to the backend; `persistent=False` (the default) keeps it in-memory. `ttl_days=N` lets the daily sweep delete the slot N days after its last write, from storage and from the running bot; `ttl_days=None` disables TTL. `persistent=False` paired with `ttl_days=N` raises `ValueError` -- in-memory slots never reach storage, so a TTL has nothing to prune.
 
 Slot opt-in is additive with the class-level `persistent_slots` tuple on `_StatefulMixin` subclasses and with `access_slot(..., persistent=True)`. All three register the slot in the library's sticky `_PERSISTENT_SLOTS` set and combine cleanly when used together; `SlotPolicy` is the only one of them that also carries a TTL.
 
@@ -116,6 +116,8 @@ Three correctness guarantees beyond the method signatures:
 
 `row_upsert_many` batches the writes a flush would otherwise issue one at a time -- the SQL backends collapse it into a single transaction (`executemany` plus one commit). It shares `row_upsert`'s copy-on-store and conflict semantics. The persistence middleware falls back to per-row `row_upsert` when a backend does not implement it, so a custom backend may omit it.
 
+A closed backend must open again when `initialize()` is called: a restart in the same process reopens persistence on the same backend objects. Its `close()` runs inside the bot's close, so persistence waits up to ten seconds for it, then logs a warning and closes without it.
+
 `InMemoryBackend` is the reference implementation.
 
 ---
@@ -173,6 +175,12 @@ backend = PostgresBackend("postgresql://user:pass@host/db?sslmode=verify-full")
 
 Importable from `cascadeui.persistence` only when `asyncpg` is installed; the import is optional and silent otherwise. `dsn` takes the standard libpq URL; `pool_kwargs` forwards extra arguments to the `asyncpg` pool. `table_prefix` behaves as on `SQLiteBackend`.
 
+The `LISTEN` connection is watched by two class attributes a subclass may override. `listener_poll_seconds` (default `10.0`) is the time between health checks of that connection; a check is local and cheap, and a dropped connection is noticed at the next one, so a lower value reconnects sooner. `listener_retry_seconds` (default `5.0`) is the wait before reconnecting after an error.
+
+### `physical_table(backend, table) -> str`
+
+Resolves a library table's name to the one `backend` created, applying its `table_prefix` the way the backend's own SQL does. A migrator writing raw SQL against a library table passes the name through this rather than interpolating it, so a prefixed deployment does not write to the unprefixed table.
+
 ---
 
 ## `PersistenceManager`
@@ -183,7 +191,7 @@ The reattach/rehydrate/prune coordinator. Normally created and wired automatical
 # Drop one slot entirely (any age).
 await mgr.prune_application(slot="settings")
 
-# Whole-namespace TTL sweep across every persistent slot.
+# Drop every slot whose TTL ran out more than 90 days ago.
 await mgr.prune_application(older_than_days=90)
 
 # Drop specific registry rows; omit persistence_keys to clear the
@@ -192,6 +200,8 @@ await mgr.prune_registry(persistence_keys=["roles:main", "tickets:panel"])
 ```
 
 `slot=` and `older_than_days=` are mutually exclusive on `prune_application`.
+A pruned slot leaves the running bot as well as the database: its value in
+`state["application"]` and any write still waiting for it go too.
 
 `prune_registry` matches by key alone, so it deletes whatever holds a key when
 it runs. It is for a key no live panel holds: a live one is retired through its
@@ -200,8 +210,33 @@ own `exit()`, which removes the registration only while that view owns it, and
 prune that does take a live panel's row logs a warning.
 
 `prune_registry` also takes `reason=`, which labels the `REGISTRY_PRUNED`
-dispatch so a subscriber can tell why a row went. Left unset it keeps the
-value the method has always computed.
+dispatch so a subscriber can tell why a row went. Left unset it is
+`"explicit"` for a targeted prune and `"clear_all"` for a full wipe.
+
+### `async close()` and `async flush_all()`
+
+`close()` stops the sweepers, writes every change still batched, then closes
+each backend. Safe to call twice, even from two tasks at once. With `bot=` it
+runs when the bot closes, after the bot's own `close()` and even when that
+raises, and on Linux and macOS a SIGTERM closes the bot unless the application
+handles SIGTERM itself; without a bot, await it at shutdown. Persistence
+reopens when `setup_middleware()` runs again in the `setup_hook` of the bot
+that replaces a closed one in the same process, and the persistent panels the
+closed bot left are restored through the new one. After a close a SIGTERM
+started, that ends the process instead, once any change made since is
+written. Changes made while persistence is closed are held in memory and
+written when it reopens, and the first one logs a warning, since they are
+lost if the process exits first. See
+[Shutdown](../guide/persistence.md#shutdown).
+
+Each backend's `close()` gets up to ten seconds; one that takes longer is
+logged and persistence closes without it, so the bot's `close()` still
+returns. Closing a SQL backend waits up to five seconds for a transaction
+already running on it, then closes anyway. On `SQLiteBackend` a transaction
+cut off that way raises `RuntimeError` when it exits and commits nothing; on
+`PostgresBackend` its connection is terminated.
+
+`flush_all()` writes what is batched now and leaves persistence running.
 
 ### `last_reattach_summary` and `total_reattach_summary`
 

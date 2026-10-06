@@ -156,9 +156,10 @@ class V2SettingsHubView(MenuLayoutView):
     # state_scope = None keeps dispatch_scoped() unavailable (intentional;
     # writes go through the SETTINGS_UPDATED reducer for cross-view reactivity).
     state_scope = None
-    # Named-action subscription is the cross-view reactivity gate: any
-    # sub-page dispatching SETTINGS_UPDATED rebuilds the hub in place,
-    # regardless of which scope the sub-page wrote to.
+    # Named-action subscription is the cross-view reactivity gate: a
+    # settings change made anywhere (this hub's Reset All, the same user's
+    # panel in another server, the V1 /settings panel) re-renders every open
+    # hub, whichever scope it wrote to.
     subscribed_actions = {"SETTINGS_UPDATED"}
     # Exit button is placed manually in build_footer alongside Reset All.
     auto_exit_button = False
@@ -305,10 +306,10 @@ class V2SettingsHubView(MenuLayoutView):
         )
 
     async def reset_all(self, interaction):
-        # ``with_confirmation`` already consumed ``interaction.response``
-        # -- no reply is sent here; dispatching is enough.
+        # ``with_confirmation`` already consumed ``interaction.response``,
+        # so no reply is sent here; dispatching is enough.
         # ``self.batch()`` groups all dispatches into a single subscriber
-        # notification -- reducers still run for each action, but subscribers
+        # notification: reducers still run for each action, but subscribers
         # are only notified once at the end.
         async with self.batch():
             for key, value in DEFAULT_SETTINGS.items():
@@ -335,6 +336,8 @@ class V2AppearanceView(StatefulLayoutView):
     auto_defer = True
     state_scope = "user"
     exit_policy = "disable"
+    # The hub gives the panel 10 minutes; a page opened from it gets the same.
+    timeout = 600.0
     subscribed_actions = {"SETTINGS_UPDATED"}
 
     _THEME_OPTIONS = [
@@ -396,23 +399,12 @@ class V2AppearanceView(StatefulLayoutView):
             )
         )
 
-        self.add_item(
-            ActionRow(
-                StatefulButton(
-                    label="Back",
-                    style=discord.ButtonStyle.secondary,
-                    emoji="\N{LEFTWARDS ARROW WITH HOOK}",
-                    callback=self.go_back,
-                )
-            )
-        )
+        # Back pops to the hub, which the menu renders with its own build_ui.
+        self.add_item(ActionRow(self.make_back_button()))
 
     async def on_theme_select(self, interaction, values):
         # auto_defer handles acknowledgment.
         await self.dispatch_scoped_as("SETTINGS_UPDATED", {"theme": values[0]}, scope="user")
-
-    async def go_back(self, interaction):
-        await self.pop(interaction, rebuild=lambda v: v.build_ui())
 
 
 # // ========================================( Notifications )======================================== // #
@@ -425,16 +417,18 @@ class V2NotificationsView(StatefulLayoutView):
         - Undo/redo with stack depth display
         - ``toggle_section()`` for green/red toggle buttons
         - State selector narrowed to notification keys only
-        - Batched dispatch from Reset All propagation
     """
 
     owner_only = True
     auto_defer = True
     state_scope = "user"
     exit_policy = "disable"
+    timeout = 600.0
     enable_undo = True
     undo_limit = 10
-    subscribed_actions = {"SETTINGS_UPDATED", "UNDO", "REDO"}
+    # Undo and Redo re-render every view whose selection changed, so they
+    # need no entry here.
+    subscribed_actions = {"SETTINGS_UPDATED"}
 
     _TOGGLES = [
         ("notifications_dm", "Direct Messages", "Get notified about new DMs"),
@@ -500,12 +494,7 @@ class V2NotificationsView(StatefulLayoutView):
                     emoji="\N{RIGHTWARDS ARROW WITH HOOK}",
                     callback=self.do_redo,
                 ),
-                StatefulButton(
-                    label="Back",
-                    style=discord.ButtonStyle.secondary,
-                    emoji="\N{BLACK LEFT-POINTING TRIANGLE}",
-                    callback=self.go_back,
-                ),
+                self.make_back_button(),
             )
         )
 
@@ -515,13 +504,12 @@ class V2NotificationsView(StatefulLayoutView):
         Captures ``key`` in a closure so a single definition can produce
         distinct callbacks per toggle -- otherwise a plain ``for`` loop
         over ``_TOGGLES`` would alias every callback to the last key.
-        Mirrors ``V2GuildPrefsView._make_toggle`` (user_guild scope) and
-        ``NotificationsView._make_toggle`` in ``settings_menu.py`` (V1).
         """
 
-        async def callback(interaction):
-            s = _read_settings(self.scoped_state)
-            await self.dispatch_scoped_as("SETTINGS_UPDATED", {key: not s[key]}, scope="user")
+        # The second parameter is the state the click asks for, so a
+        # double-click sets it twice instead of flipping it back.
+        async def callback(interaction, active):
+            await self.dispatch_scoped_as("SETTINGS_UPDATED", {key: active}, scope="user")
 
         return callback
 
@@ -532,9 +520,6 @@ class V2NotificationsView(StatefulLayoutView):
 
     async def do_redo(self, interaction):
         await self.redo()
-
-    async def go_back(self, interaction):
-        await self.pop(interaction, rebuild=lambda v: v.build_ui())
 
 
 # // ========================================( Locale )======================================== // #
@@ -553,6 +538,7 @@ class V2LocaleView(StatefulLayoutView):
     auto_defer = True
     state_scope = "user"
     exit_policy = "disable"
+    timeout = 600.0
     subscribed_actions = {"SETTINGS_UPDATED"}
 
     _LANGUAGES = ["English", "Spanish", "French", "German", "Japanese"]
@@ -621,16 +607,7 @@ class V2LocaleView(StatefulLayoutView):
             )
         )
 
-        self.add_item(
-            ActionRow(
-                StatefulButton(
-                    label="Back",
-                    style=discord.ButtonStyle.secondary,
-                    emoji="\N{LEFTWARDS ARROW WITH HOOK}",
-                    callback=self.go_back,
-                )
-            )
-        )
+        self.add_item(ActionRow(self.make_back_button()))
 
     async def on_language(self, interaction, values):
         # auto_defer handles acknowledgment.
@@ -638,9 +615,6 @@ class V2LocaleView(StatefulLayoutView):
 
     async def on_timezone(self, interaction, values):
         await self.dispatch_scoped_as("SETTINGS_UPDATED", {"timezone": values[0]}, scope="user")
-
-    async def go_back(self, interaction):
-        await self.pop(interaction, rebuild=lambda v: v.build_ui())
 
 
 # // ========================================( Server Preferences )======================================== // #
@@ -660,6 +634,7 @@ class V2GuildPrefsView(StatefulLayoutView):
     auto_defer = True
     state_scope = "user_guild"
     exit_policy = "disable"
+    timeout = 600.0
     subscribed_actions = {"SETTINGS_UPDATED"}
 
     _TOGGLES = [
@@ -707,16 +682,7 @@ class V2GuildPrefsView(StatefulLayoutView):
             )
         )
 
-        self.add_item(
-            ActionRow(
-                StatefulButton(
-                    label="Back",
-                    style=discord.ButtonStyle.secondary,
-                    emoji="\N{LEFTWARDS ARROW WITH HOOK}",
-                    callback=self.go_back,
-                )
-            )
-        )
+        self.add_item(ActionRow(self.make_back_button()))
 
     def _make_toggle(self, key):
         """Factory for a guild-scoped toggle callback bound to ``key``.
@@ -724,18 +690,12 @@ class V2GuildPrefsView(StatefulLayoutView):
         Captures ``key`` in a closure so a single definition can produce
         distinct callbacks per toggle -- otherwise a plain ``for`` loop
         over ``_TOGGLES`` would alias every callback to the last key.
-        Mirrors ``V2NotificationsView._make_toggle`` (user scope) -- the
-        only differences are the scope and the settings-reader helper.
         """
 
-        async def callback(interaction):
-            s = _read_guild_settings(self.scoped_state)
-            await self.dispatch_scoped_as("SETTINGS_UPDATED", {key: not s[key]}, scope="user_guild")
+        async def callback(interaction, active):
+            await self.dispatch_scoped_as("SETTINGS_UPDATED", {key: active}, scope="user_guild")
 
         return callback
-
-    async def go_back(self, interaction):
-        await self.pop(interaction, rebuild=lambda v: v.build_ui())
 
 
 # // ========================================( Cog )======================================== // #

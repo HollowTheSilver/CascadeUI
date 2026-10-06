@@ -3,27 +3,16 @@
 import copy
 from typing import Any, Dict
 
-from .middleware.undo import _MISSING
+from ._batching import next_commit_sequence
+from .middleware.undo import _MISSING, _KeyedDiff
 from .types import Action, StateData
 
 # // ========================================( Constants )======================================== // #
 
-# Action types owned by the built-in reducers in this module. Registering a
-# custom reducer for any of these via @cascade_reducer would silently shadow
-# the library's own state machinery (sessions, navigation, undo stacks, etc.)
-# and produce hard-to-trace breakage. The decorator raises ValueError at
-# decoration time when a user attempts the collision -- see
-# cascadeui/utils/decorators.py.
-# Prune actions are library-owned signals fired by the persistence manager
-# after deleting rows on disk. REGISTRY_PRUNED reduces, because the store
-# mirrors the registry in state["persistent_views"] and a prune that left
-# it stale sent the duplicate-key cleanup after a message the caller kept
-# on purpose. APPLICATION_SLOTS_PRUNED stays dispatch-only: the slot it
-# removes is still live in memory and re-upserts on the next write, so
-# reducing it would fight the namespace rather than reconcile it.
-# Reducing does not hide either from a listener; both notification passes
-# run after the chain. Both are listed here so @cascade_reducer raises on
-# collision.
+# Action types the library owns; @cascade_reducer raises ValueError on any of
+# them rather than let a custom reducer shadow the library's own. REGISTRY_PRUNED
+# reduces, keeping the persistent_views mirror current; APPLICATION_SLOTS_PRUNED
+# is dispatch-only, since the slots it names have left memory before it is sent.
 _BUILTIN_REDUCER_ACTIONS = frozenset(
     {
         "VIEW_CREATED",
@@ -54,21 +43,10 @@ _BUILTIN_REDUCER_ACTIONS = frozenset(
 
 # // ========================================( Coroutines )======================================== // #
 
-#
-# All reducers below follow the shallow-spread contract:
-#
-#   1. Return ``state`` unchanged (same identity) when the action is a no-op.
-#   2. Otherwise return a new top-level dict, spreading intermediate dicts
-#      and lists only along the mutation path.  Unchanged branches share
-#      references with the input state.
-#   3. Never mutate the input ``state`` or any nested structure reachable
-#      from it.  The per-dispatch ``copy.deepcopy`` that used to gate this
-#      contract is gone -- the shallow spread replaces it.
-#
-# User reducers registered through ``@cascade_reducer`` still receive a
-# deep-copied ``state`` so the existing "mutate freely" contract is intact
-# for user code.  The shallow-spread pattern here is an internal speedup.
-#
+# These reducers never mutate their input, which nothing deep-copies first: a
+# no-op returns ``state`` itself, anything else a new dict that spreads only the
+# dicts and lists on the mutation path. Reducers registered with
+# ``@cascade_reducer`` still receive a deep copy they may mutate.
 
 
 async def reduce_view_created(action: Action, state: StateData) -> StateData:
@@ -130,47 +108,79 @@ async def reduce_view_updated(action: Action, state: StateData) -> StateData:
 async def reduce_view_destroyed(action: Action, state: StateData) -> StateData:
     """Handle VIEW_DESTROYED actions."""
     payload = action["payload"]
-
     view_id = payload.get("view_id")
+    if not view_id:
+        return state
+    if view_id not in state.get("views", {}):
+        return _without_empty_session(state, payload.get("session_id"))
+    return _without_views(state, {view_id})
+
+
+def _without_empty_session(state: StateData, session_id) -> StateData:
+    """``state`` without session ``session_id`` when it has no member."""
+    session = state.get("sessions", {}).get(session_id) if session_id else None
+    if session is None or session.get("members"):
+        return state
+    sessions = {key: value for key, value in state["sessions"].items() if key != session_id}
+    return {**state, "sessions": sessions}
+
+
+def _without_views(state: StateData, view_ids) -> StateData:
+    """``state`` without the given views, their component and modal entries, and
+    their session membership; a session left with no member goes too."""
+    ids = set(view_ids)
     views = state.get("views", {})
-    if not view_id or view_id not in views:
+    gone = {view_id for view_id in ids if view_id in views}
+    # An interaction recorded for a view whose row is already gone can still
+    # leave an entry.
+    modals = state.get("modals")
+    stale_modals = bool(modals) and not ids.isdisjoint(modals)
+    components = state.get("components")
+    stale_components = bool(components) and any(
+        c.get("view_id") in ids for c in components.values()
+    )
+    if not gone and not stale_modals and not stale_components:
         return state
 
-    view_data = views[view_id]
-    session_id = view_data.get("session_id")
-
     new_state = {**state}
-    new_state["views"] = {k: v for k, v in views.items() if k != view_id}
+    new_state["views"] = {k: v for k, v in views.items() if k not in gone}
 
-    # Remove component interaction entries owned by this view
-    components = state.get("components")
+    # Remove component interaction entries owned by these views
     if components:
-        filtered = {cid: c for cid, c in components.items() if c.get("view_id") != view_id}
-        # Empty, not absent: ``components`` is one of the four keys
-        # _build_initial_state establishes, and dropping it leaves the
-        # state shape depending on whether a view happened to be destroyed.
-        new_state["components"] = filtered
+        # Empty, not absent: ``components`` is a key _build_initial_state
+        # establishes, and dropping it leaves the state shape depending on
+        # whether a view happened to be destroyed.
+        new_state["components"] = {
+            cid: c for cid, c in components.items() if c.get("view_id") not in ids
+        }
 
-    # Remove modal submission entries owned by this view
-    modals = state.get("modals")
-    if modals and view_id in modals:
-        new_modals = {k: v for k, v in modals.items() if k != view_id}
+    # Remove modal submission entries owned by these views
+    if stale_modals:
+        new_modals = {k: v for k, v in modals.items() if k not in ids}
         if new_modals:
             new_state["modals"] = new_modals
         else:
             new_state.pop("modals", None)
 
-    # Remove from session if applicable
-    if session_id:
-        sessions = state.get("sessions", {})
-        session = sessions.get(session_id)
-        if session and view_id in session.get("members", []):
-            new_members = [m for m in session["members"] if m != view_id]
-            if new_members:
-                new_session = {**session, "members": new_members}
-                new_state["sessions"] = {**sessions, session_id: new_session}
-            else:
-                new_state["sessions"] = {k: v for k, v in sessions.items() if k != session_id}
+    # Remove them from their sessions
+    sessions = state.get("sessions", {})
+    new_sessions = None
+    for session_id in {views[view_id].get("session_id") for view_id in gone}:
+        session = sessions.get(session_id) if session_id else None
+        if not session:
+            continue
+        members = session.get("members", [])
+        kept = [m for m in members if m not in gone]
+        if len(kept) == len(members):
+            continue
+        if new_sessions is None:
+            new_sessions = dict(sessions)
+        if kept:
+            new_sessions[session_id] = {**session, "members": kept}
+        else:
+            del new_sessions[session_id]
+    if new_sessions is not None:
+        new_state["sessions"] = new_sessions
 
     return new_state
 
@@ -353,7 +363,7 @@ async def reduce_registry_pruned(action: Action, state: StateData) -> StateData:
     stale until it drops the same keys. Leaving it stale is not inert: the
     duplicate-key cleanup in ``_PersistentMixin._register_persistent`` reads
     this mapping, and a pruned key still listed there sends it down the
-    orphan branch, which strips or deletes the very message a caller pruned
+    orphan branch, which freezes or deletes the very message a caller pruned
     the row to leave standing.
 
     Reducing does not stop a subscriber or hook from observing the prune.
@@ -506,36 +516,60 @@ async def reduce_scoped_update(action: Action, state: StateData) -> StateData:
 def _apply_slot_diff(application: dict, diff: Dict[str, Any]) -> dict:
     """Apply a per-slot diff to an application dict and return a new dict.
 
-    Values mapped to ``_MISSING`` delete the slot; any other value
-    replaces the slot wholesale. Slots absent from ``diff`` carry
-    through unchanged so sibling views' concurrent writes survive.
+    Values mapped to ``_MISSING`` delete the slot; a ``_KeyedDiff`` sets
+    or deletes only the keys it names inside the slot, at any depth; any
+    other value replaces the slot wholesale. Slots and keys absent from
+    ``diff`` carry through unchanged so sibling views' concurrent writes
+    survive.
     """
-    new_application = dict(application)
-    for name, target_value in diff.items():
-        if target_value is _MISSING:
-            new_application.pop(name, None)
+    return _apply_keyed(application, diff)
+
+
+def _apply_keyed(target: dict, diff: Dict[str, Any]) -> dict:
+    """``target`` with the entries of ``diff`` applied, as a new dict."""
+    result = dict(target)
+    for key, value in diff.items():
+        if isinstance(value, _KeyedDiff):
+            current = result.get(key, _MISSING)
+            if current is not _MISSING and not isinstance(current, dict):
+                # Another writer has since replaced the dict these keys lived
+                # in; its value is kept.
+                continue
+            nested = _apply_keyed({} if current is _MISSING else current, value)
+            if value.created and not nested:
+                result.pop(key, None)
+            else:
+                result[key] = nested
+        elif value is _MISSING:
+            result.pop(key, None)
         else:
-            new_application[name] = target_value
-    return new_application
+            result[key] = value
+    return result
 
 
-def _build_inverse_diff(current_application: dict, diff_keys: Any) -> Dict[str, Any]:
-    """Build the inverse diff from the current application for the same slot names.
+def _build_inverse_diff(current_application: dict, diff: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the inverse of ``diff`` from the current application.
 
-    The inverse of applying ``diff`` is "restore these slots to their
-    current values (or delete if currently absent)." Captures current
-    slot values by deepcopy so the inverse diff is self-contained, and
-    maps absent slots to ``_MISSING`` so the symmetric UNDO<->REDO
-    round-trip re-deletes slots that were added after the partner
-    action.
+    The inverse of applying ``diff`` is "restore what it names to its
+    current value (or delete it if currently absent)": whole slots for a
+    slot entry, and only the named keys for a ``_KeyedDiff``. Captures
+    current values by deepcopy so the inverse diff is self-contained, and
+    maps absent slots and keys to ``_MISSING`` so the symmetric UNDO<->REDO
+    round-trip re-deletes what was added after the partner action.
     """
-    inverse: Dict[str, Any] = {}
-    for name in diff_keys:
-        current_val = current_application.get(name, _MISSING)
-        if current_val is _MISSING:
-            inverse[name] = _MISSING
+    return dict(_invert_keyed(current_application, diff))
+
+
+def _invert_keyed(current: Any, diff: Dict[str, Any]) -> _KeyedDiff:
+    """What restores the entries ``diff`` names to their values in ``current``."""
+    source = current if isinstance(current, dict) else {}
+    inverse = _KeyedDiff(created=current is _MISSING)
+    for key, entry in diff.items():
+        now = source.get(key, _MISSING)
+        if isinstance(entry, _KeyedDiff):
+            inverse[key] = _invert_keyed(now, entry)
         else:
-            inverse[name] = copy.deepcopy(current_val)
+            inverse[key] = _MISSING if now is _MISSING else copy.deepcopy(now)
     return inverse
 
 
@@ -564,7 +598,7 @@ async def reduce_undo(action: Action, state: StateData) -> StateData:
     current_application = state.get("application", {})
     current_shared = session.get("shared_data", {}) if session else {}
 
-    redo_diff = _build_inverse_diff(current_application, undo_diff.keys())
+    redo_diff = _build_inverse_diff(current_application, undo_diff)
     redo_snapshot = {
         "application_slots": redo_diff,
         "shared_data": copy.deepcopy(current_shared),
@@ -613,10 +647,13 @@ async def reduce_redo(action: Action, state: StateData) -> StateData:
     current_application = state.get("application", {})
     current_shared = session.get("shared_data", {}) if session else {}
 
-    undo_diff = _build_inverse_diff(current_application, redo_diff.keys())
+    undo_diff = _build_inverse_diff(current_application, redo_diff)
+    # A redo is a new change: stamped like one, so a batch that began after it
+    # places its own entry above this one when it ends.
     undo_snapshot = {
         "application_slots": undo_diff,
         "shared_data": copy.deepcopy(current_shared),
+        "seq": next_commit_sequence(),
     }
     undo_stack = view.get("undo_stack", [])
     new_undo_stack = [*undo_stack, undo_snapshot]

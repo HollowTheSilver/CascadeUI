@@ -32,32 +32,11 @@ if TYPE_CHECKING:
 # // ========================================( Type aliases )======================================== // #
 
 
-# A schema migrator rewrites the on-disk shape of one table from
-# version N to version N+1. Runs against the backend directly so it
-# can move data or rewrite rows in bulk via the backend row API.
-#
-# Data-level migrations (rewriting rows through row_select + row_upsert)
-# are supported today on every backend that implements Capability.RELATIONAL.
-#
-# DDL-level migrations (ALTER TABLE, ADD COLUMN, DROP INDEX) go through
-# the backend's raw-SQL surface (Capability.RAW_SQL). A backend that
-# declares Capability.OPEN_ROWS stores rows as open mappings, so a
-# column-level change alters nothing on disk -- skip on that flag, for
-# that reason, never on the absence of RAW_SQL (which only says the
-# escape hatch is missing, not that skipping is safe):
-#
-#     if Capability.OPEN_ROWS in backend.capabilities:
-#         return  # open rows already read a missing column as None
-#     async with backend.transaction():
-#         await backend.execute("ALTER TABLE ...")
-#
-# apply_migrations refuses to run a migrator on a backend declaring
-# neither flag, so the DDL branch can assume the raw-SQL surface exists.
-#
-# Group the statements inside one transaction() block: apply_migrations
-# records the new version in a separate call after the migrator returns,
-# so a migrator that fails partway leaves the old version recorded and
-# will be re-run against a half-migrated schema otherwise.
+# A schema migrator moves one table from version N to N+1. Row rewrites work on
+# any RELATIONAL backend; DDL goes through RAW_SQL and returns early on OPEN_ROWS,
+# never on RAW_SQL's absence (see _persistent_views_1_to_2). One with several
+# statements groups them in one transaction(): the version is recorded only after
+# it returns, so one that fails partway is re-run against whatever it left.
 Migrator = Callable[["PersistenceBackend"], Awaitable[None]]
 
 
@@ -111,14 +90,25 @@ def register_migrator(table: str, from_version: int) -> Callable[[Migrator], Mig
 
     The pre-rename table names (``persistent_views``,
     ``application_slots``) are refused with a ``ValueError`` naming the
-    current name; a migrator keyed on one would never be looked up.
+    current name; a migrator keyed on one would never be looked up. A
+    ``(table, from_version)`` already registered raises ``ValueError`` too,
+    and the library registers ``("cascadeui_persistent_views", 1)`` itself.
+
+    A migrator that changes columns should return early on a backend
+    declaring ``Capability.OPEN_ROWS``, and one with several statements
+    should group them in one ``transaction()``: the new version is recorded
+    only after it returns, so one that fails partway is re-run against
+    whatever it left.
 
     Example::
 
-        @register_migrator("cascadeui_persistent_views", 1)
-        async def _migrate_persistent_views_1_to_2(backend):
+        @register_migrator("cascadeui_persistent_views", 2)
+        async def _migrate_persistent_views_2_to_3(backend):
+            if Capability.OPEN_ROWS in backend.capabilities:
+                return
             table = physical_table(backend, "cascadeui_persistent_views")
-            await backend.execute(f"ALTER TABLE {table} ADD COLUMN ...")
+            async with backend.transaction():
+                await backend.execute(f"ALTER TABLE {table} ADD COLUMN ...")
     """
 
     def decorator(fn: Migrator) -> Migrator:
@@ -223,13 +213,10 @@ async def _persistent_views_1_to_2(backend: Any) -> None:
     if Capability.OPEN_ROWS in backend.capabilities:
         return
 
-    # apply_migrations records the new version only after this returns, so a
-    # crash in that window re-runs the migrator against a table that already
-    # has the column -- and SQLite has no ADD COLUMN IF NOT EXISTS. Probing
-    # first is what makes the re-run a no-op instead of a duplicate-column
-    # error. The except is broad because the driver raises its own vendor
-    # type unwrapped; anything that is not a missing column resurfaces on the
-    # ALTER below with its real message intact.
+    # The version is recorded after this returns, so a crash in between re-runs
+    # it, and SQLite has no ADD COLUMN IF NOT EXISTS: the probe makes the re-run
+    # a no-op. Broad, for the driver's vendor type; any other failure resurfaces
+    # on the ALTER below.
     table = physical_table(backend, TABLE_PERSISTENT_VIEWS)
     try:
         await backend.fetch(f"SELECT first_unreachable_at FROM {table} LIMIT 1")
@@ -237,11 +224,8 @@ async def _persistent_views_1_to_2(backend: Any) -> None:
     except Exception:
         pass
 
-    # PostgreSQL supports IF NOT EXISTS on ADD COLUMN and SQLite does not.
-    # Using it where it exists closes the two-process boot race: both can pass
-    # the probe above, and without it the process that loses the ALTER fails
-    # its whole startup over a column the winner just added. SQLite keeps the
-    # bare form, where the probe is the only guard available and a single-file
-    # database makes the race far less reachable.
+    # Two processes booting together can both pass the probe; on PostgreSQL IF
+    # NOT EXISTS keeps the loser of the ALTER from failing its startup. SQLite
+    # has no such clause, and a single-file database makes the race rarer.
     guard = "" if backend.placeholder_style == "qmark" else "IF NOT EXISTS "
     await backend.execute(f"ALTER TABLE {table} ADD COLUMN {guard}first_unreachable_at BIGINT")

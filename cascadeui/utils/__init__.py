@@ -11,7 +11,7 @@ from .decorators import cascade_component, cascade_reducer
 from .errors import RetryConfig, safe_execute, with_error_boundary, with_retry
 from .fetch import fetch_as_file
 from .logging import ColorScheme, FormatTemplate, JSONFormatter, setup_logging
-from .responses import respond_safe
+from .responses import DISCORD_CALL_ERRORS, respond_safe
 from .strings import is_emoji, slugify
 from .tasks import get_task_manager
 
@@ -38,4 +38,5 @@ __all__ = [
     "FormatTemplate",
     "JSONFormatter",
     "respond_safe",
+    "DISCORD_CALL_ERRORS",
 ]

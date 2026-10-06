@@ -129,7 +129,7 @@ Iterates the named scoped slot in an explicit `state` dict, yielding `(identifie
 
 #### `set_scoped(scope, data, *, slot_name="scoped", **identifiers)`
 
-Sets scoped state for the given scope type and ids.
+Sets scoped state for the given scope type and ids. A reducer running in another task commits first, and this write lands after it.
 
 #### `get_active_views() -> Mapping[str, Any]`
 
@@ -168,7 +168,9 @@ if panel is not None:
 - Matches the `persistence_key=` the view was constructed with. A view given
   no key holds none, so a view id never matches; the argument is keyword-only
   for that reason.
-- A finished view (exited, or stopped without exiting) is never returned.
+- A finished view (exited, or stopped without exiting) is never returned,
+  and neither is a view a `push()` or `pop()` is still bringing in: until
+  its edit lands, the view it would replace is the one on screen.
 - When several unfinished views hold the key, the one the stored registration
   points at is returned, which is the panel on screen: during a swap under
   [`retire_previous_on_send = False`](../guide/persistence.md#replacing-a-panel-under-its-own-key)
@@ -176,6 +178,9 @@ if panel is not None:
   (a non-persistent view keyed for a slot), the most recently registered
   holder is returned.
 - Works whether or not persistence is installed.
+- Costs the same however many views are live: the store indexes views by key
+  and by registration message as they register, so a refresh loop can resolve
+  every panel it owns without walking the registry once per panel.
 - A persistent panel that has pushed a child view still holds its key, through
   the view now on its message: navigation replaces the instance, so the
   destination carries the registration's message id without the key, and that
@@ -213,6 +218,12 @@ async def my_reducer(action, state):
 The `return state` is required, not stylistic: the store commits whatever the
 reducer hands back. Falling off the end raises `TypeError` naming the reducer
 and the action, which the store logs while keeping the previous state.
+
+Reducers run one at a time, from reading the state to committing the result,
+so a reducer that awaits holds up every other dispatch until it returns. A
+dispatch kept waiting 30 seconds logs a warning naming the reducer it waits
+for. `dispatch()` called from inside a reducer, or from a task the reducer
+starts while it runs, raises `RuntimeError`.
 
 ---
 
@@ -279,7 +290,7 @@ class MyBot(commands.Bot):
 - `*middlewares` -- middleware instances in the order they should appear in the dispatch chain.
 - `store` -- optional explicit store. Defaults to the global singleton from `get_store()`.
 
-**Idempotency.** `initialize` is always awaited, even when the middleware is already installed. Middlewares contract their `initialize` methods as idempotent (subsequent calls return immediately), so the always-await policy is safe.
+**Idempotency.** `initialize` is always awaited, even when the middleware is already installed. Middlewares contract their `initialize` methods as idempotent (a later call does not repeat startup work), so the always-await policy is safe. A call that passes a new instance of a class already installed initializes the installed one and does not use the new instance. A restart in the same process builds a new bot object (discord.py cannot log a closed one in again), and its `setup_hook` makes that call: the installed `PersistenceMiddleware` takes the new bot from the new instance, reopens the persistence the old bot's close shut, and restores through the new bot the persistent panels the old one left. A plain function or method middleware is matched by equality rather than class (the same function, or the same method of the same object), since every function has the same class.
 
 ---
 

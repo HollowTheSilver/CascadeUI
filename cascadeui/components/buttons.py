@@ -14,6 +14,7 @@ from .base import (
     _describe_callback,
     refuse_wrong_arity,
     require_url,
+    run_unless_repeat,
 )
 
 logger = logging.getLogger(__name__)
@@ -102,11 +103,8 @@ class ToggleButton(StatefulButton):
         self.user_callback = callback
         self._callback_wants_state = accepts_second_positional(callback)
         if callback is not None:
-            # Refused against the arity the line above just chose, not
-            # against whether either arity could bind. The generic button
-            # message does not fit here: it tells the caller this control
-            # passes no second value and points at other builders for one,
-            # which is the opposite of what a ToggleButton does.
+            # Refused against the arity chosen above, with a message of its own:
+            # the generic button one says no second value is passed.
             wants = self._callback_wants_state
             raise_with = "(interaction, toggled)" if wants else "(interaction)"
             refuse_wrong_arity(
@@ -138,6 +136,9 @@ class ToggleButton(StatefulButton):
         return self.is_toggled
 
     async def _toggle(self, interaction: Interaction) -> None:
+        await run_unless_repeat(self, lambda: self._flip(interaction))
+
+    async def _flip(self, interaction: Interaction) -> None:
         self.is_toggled = not self.is_toggled
         self.label = self.toggled_label if self.is_toggled else self.original_label
         self.style = ButtonStyle.success if self.is_toggled else ButtonStyle.secondary

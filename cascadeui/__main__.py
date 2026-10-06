@@ -12,11 +12,8 @@ def main():
 
     import cascadeui
 
-    # The imported code, not the installed distribution's metadata. An
-    # editable install keeps serving whatever version it recorded at
-    # install time, so metadata can trail the working tree by releases --
-    # and this block is a required field on the bug report template,
-    # where a stale number arrives stated as fact.
+    # The imported code's version: an editable install's metadata keeps the
+    # version recorded at install time, and can trail the working tree.
     cascadeui_version = cascadeui.__version__
     try:
         installed = importlib.metadata.version("pycascadeui")

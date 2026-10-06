@@ -46,6 +46,9 @@ class StubResponse:
     def __init__(self, interaction: "StubInteraction") -> None:
         self._interaction = interaction
         self._done = False
+        # What answered the slot, as discord.py records it: the library tells
+        # a defer from a reply by this.
+        self.type = None
 
     def is_done(self) -> bool:
         return self._done
@@ -64,14 +67,17 @@ class StubResponse:
 
     async def defer(self, *args, **kwargs) -> None:
         self._claim()
+        self.type = discord.InteractionResponseType.deferred_channel_message
         self._interaction.deferred = True
 
     async def send_message(self, content: str = "", **kwargs) -> None:
         self._claim()
+        self.type = discord.InteractionResponseType.channel_message
         self._interaction.replies.append(content)
 
     async def send_modal(self, modal) -> None:
         self._claim()
+        self.type = discord.InteractionResponseType.modal
         self._interaction.modals.append(modal)
 
 

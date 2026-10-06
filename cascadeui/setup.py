@@ -25,11 +25,22 @@ Usage in ``setup_hook``::
 # // ========================================( Modules )======================================== // #
 
 
+import functools
+import inspect
+import logging
 from typing import Any, Optional
 
 from .state.singleton import get_store
 
+logger = logging.getLogger(__name__)
+
 # // ========================================( Helper )======================================== // #
+
+
+def _same_middleware(installed: Any, middleware: Any) -> bool:
+    if inspect.isroutine(middleware) or isinstance(middleware, functools.partial):
+        return installed == middleware
+    return isinstance(installed, type(middleware))
 
 
 async def setup_middleware(*middlewares: Any, store: Optional[Any] = None) -> None:
@@ -39,12 +50,23 @@ async def setup_middleware(*middlewares: Any, store: Optional[Any] = None) -> No
 
     1. **Install, once.** If the store already holds a middleware of
        the same class, the install step is skipped. This keeps repeat
-       ``setup_middleware`` calls from double-registering.
-    2. **Initialize, always.** If the middleware defines an
+       ``setup_middleware`` calls from double-registering. A plain
+       function or method middleware is matched by equality instead (the
+       same function, or the same method of the same object), since every
+       function shares one class.
+    2. **Initialize, always.** If the installed middleware defines an
        ``async initialize(store)`` method, it is awaited. Middlewares
        that need backend init, migrations, or blocking rehydrate run
        that work here. Initialize implementations must be idempotent
        so the always-await policy is safe.
+
+    A repeat call that passes a new instance of a class already installed
+    initializes the installed one, and the new instance is not used.
+    ``setup_hook`` runs on every login, so a bot closed and started again
+    in the same process makes exactly that call, and the installed
+    ``PersistenceMiddleware`` reopens the persistence the bot's close shut.
+    When the restart built a new bot object too, the installed instance
+    takes that bot from the new one.
 
     Parameters
     ----------
@@ -66,9 +88,21 @@ async def setup_middleware(*middlewares: Any, store: Optional[Any] = None) -> No
         store = get_store()
 
     for middleware in middlewares:
-        if not store.has_middleware(type(middleware)):
+        installed = next((m for m in store._middleware if _same_middleware(m, middleware)), None)
+        if installed is None:
             store._add_middleware(middleware)
+            installed = middleware
+        elif installed is not middleware:
+            # Initializing an instance the chain never runs would build a
+            # second pipeline beside the installed one.
+            logger.debug(
+                f"{type(middleware).__name__} is already installed; initializing "
+                "the installed instance instead of the new one"
+            )
+            adopt = getattr(installed, "_adopt", None)
+            if adopt is not None:
+                adopt(middleware)
 
-        initialize = getattr(middleware, "initialize", None)
+        initialize = getattr(installed, "initialize", None)
         if initialize is not None:
             await initialize(store)

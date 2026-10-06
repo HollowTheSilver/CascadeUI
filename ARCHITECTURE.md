@@ -1,8 +1,8 @@
 # Architecture
 
 CascadeUI is a state-management and UI framework built on top of
-discord.py. It replaces ad-hoc view logic -- scattered attribute mutation,
-manual message edits, hand-rolled navigation stacks -- with a centralized
+discord.py. It replaces ad-hoc view logic (scattered attribute mutation,
+manual message edits, hand-rolled navigation stacks) with a centralized
 store, dispatched actions, and reducer-driven updates. The architecture
 borrows from the Redux family (unidirectional data flow, pure reducers,
 middleware pipeline) and adapts the pattern to Discord's component model.
@@ -294,24 +294,26 @@ import, not forty clicks into a game when a user triggers the limit.
 Validating at subclass-definition time produces clear errors at the
 right call site with zero runtime cost.
 
-### 11. Navigation atomicity via defer-teardown
+### 11. Navigation as one transaction on the message
 
-**Decision:** `push()` and `pop()` defer the source view's teardown until
-the destination edit confirms. The source is unsubscribed but not
-destroyed until the edit succeeds; a failed edit rolls back to the live
-source instead of a torn-down one.
+**Decision:** A `push()` or `pop()` hands the message from one view to the
+next, or leaves it where it was. Only the navigation edits the message
+while it runs. The source stays subscribed, holding its renders, and is
+torn down only once the destination's edit lands; a failed edit discards
+the destination and leaves the source as live as it was.
 
-**Alternatives considered:** Tear the source down before the edit (the
-original order); best-effort teardown with logging on edit failure.
+**Alternatives considered:** Tear the source down before the edit;
+unsubscribe the source for the duration and re-subscribe it on failure.
 
 **Reason:** Tearing the source down first meant a failed edit (a missed
 ack, an expired token, a transient 5xx) left the message showing a view
 whose handlers were already gone, so every later click was silently
-dropped. Deferring teardown past the fallible edit makes navigation
-all-or-nothing: on success the source is committed-destroyed, on failure
-it is re-subscribed and stays clickable on the message it still owns.
-`replace()` keeps inline teardown because it is a one-way transition with
-no source to recover to.
+dropped. Unsubscribing it for the duration needed a stand-in to catch the
+state changes that arrived meanwhile, and the stand-in raced the commit.
+Keeping the source subscribed and settling the outcome in one synchronous
+step makes navigation all-or-nothing. `replace()` is a one-way transition:
+it closes its source through `exit()`, so `exit_policy`, attached views,
+and a persistent registration are handled as in any other close.
 
 ### 12. Duplicate custom_id detection over auto-uniqueness
 
@@ -326,9 +328,12 @@ suffix; leave it to Discord's HTTP 400 at send.
 Discord stored on the original message, so a suffix minted fresh on
 restart dead-ends the button. Raising instead surfaces the collision
 at the call site rather than as a render-time 400 (or, for modal inputs, a
-silent value overwrite). The ids the stabilizer assigns are already
-collision-free by tree-position anchoring, so only caller-supplied ids
-reach this check, where a collision is always a genuine mistake.
+silent value overwrite). The ids the library generates name what a button
+does (its callback and label) rather than where it sits, and skip any id
+already on the tree, so only caller-supplied ids reach this check, where a
+collision is always a genuine mistake. Naming by behavior also means a
+click sent from an older render runs the action its user saw, not whatever
+now occupies that position.
 
 ### 13. Pre-flight placement validation over Discord's HTTP 400
 

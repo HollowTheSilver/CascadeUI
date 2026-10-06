@@ -10,7 +10,7 @@ impossible with V1 embeds:
     - Tabbed navigation via ``TabLayoutView`` with customized tab styles
     - ``on_tab_switched`` hook for analytics on every tab change
     - Separators for visual hierarchy between content blocks
-    - State-driven module toggles with live visual feedback
+    - Module toggles held on the view, with live visual feedback
     - The V2 builder set on the Controls tab: ``tab_nav`` inner navigation,
       ``button_row``, ``toggle_button``, ``cycle_button``, and a
       ``choice_row`` dropdown placed inside a card
@@ -98,11 +98,10 @@ async def _dashboard_tab_visited(action, state):
 
     The visits dict lives at
     ``state["application"]["dashboard"][guild_id]`` so the ``@computed``
-    aggregate below has a stable read path. Lifting visits out of
-    instance state is what lets the Overview tab back its "Tab visits"
-    line with a derived store value rather than a per-view dict that
-    would not survive a session restart. Keying by guild matters here
-    because the Overview card is headed with the current guild's name:
+    aggregate below has a stable read path. Held in application state
+    rather than on the view, the count survives the panel being closed
+    and reopened, which a per-view dict would not. Keying by guild matters
+    here because the Overview card is headed with the current guild's name:
     an unpartitioned counter would show one server's tab clicks on
     every other server's dashboard.
     """
@@ -119,9 +118,9 @@ def dashboard_total_visits(visits_by_guild):
 
     Returns ``{guild_id: total}``. Selector returns the guild-keyed
     visits dict; the compute step sums each guild's tab counts. The
-    cache key is the dict itself, so the sums only run when some
-    guild's visit counts actually mutate -- subsequent renders reuse
-    the cached mapping.
+    cached result is reused until the selected dict compares unequal to
+    the one it was computed from, so the sums only run when some
+    guild's visit counts change.
     """
     return {guild_id: sum(tab_counts.values()) for guild_id, tab_counts in visits_by_guild.items()}
 
@@ -135,7 +134,7 @@ class DashboardView(TabLayoutView):
     Four tabs demonstrate different V2 component patterns:
 
         Overview  -- Multiple themed containers with section accessories
-        Modules   -- State-driven toggles + a Collapsible reset confirm
+        Modules   -- Toggles held on the view + a Collapsible reset confirm
         Controls  -- The interactive builder set: tab_nav inner navigation,
                      button_row, toggle_button, cycle_button, and a
                      choice_row dropdown inside a card
@@ -154,8 +153,6 @@ class DashboardView(TabLayoutView):
     # visits travel through application state via the custom reducer above and
     # are read in build_overview.
     state_scope = None
-    # Non-ephemeral panel; the flag has no effect here.
-    auto_refresh_ephemeral = False
 
     # // ----( Tab styling )---- // #
     # Active tab uses success green, inactive tabs use secondary.
@@ -185,7 +182,7 @@ class DashboardView(TabLayoutView):
             reveal=self._reset_reveal,
             # ``summary`` flips the trigger into an in-card action_section: the
             # button sits beside this one-line summary instead of standing alone.
-            summary=lambda: "Reset all modules to defaults?",
+            summary="Reset all modules to defaults?",
             key="reset",
         )
 
@@ -218,7 +215,7 @@ class DashboardView(TabLayoutView):
         """One ActionRow holding just a Close (Exit) button for each tab.
 
         ``make_nav_row(back=False)`` yields the standard Back+Exit footer
-        with Back dropped -- an exit-only row -- so there is no ActionRow to
+        with Back dropped (an exit-only row), so there is no ActionRow to
         hand-roll.
         """
         return self.make_nav_row(back=False, exit_label="Close")
@@ -341,8 +338,10 @@ class DashboardView(TabLayoutView):
     def _make_toggle(self, module_name):
         """Create a toggle callback for a specific module."""
 
-        async def callback(interaction):
-            self._modules[module_name] = not self._modules[module_name]
+        # The second parameter is the state the click asks for, so a
+        # double-click sets it twice instead of flipping it back.
+        async def callback(interaction, active):
+            self._modules[module_name] = active
             await self.refresh_content()
 
         return callback
@@ -438,7 +437,6 @@ class DashboardView(TabLayoutView):
                     selected=self._notif_types,
                     on_select=self._on_notif_types,
                     multi=True,
-                    custom_id="notif_types",
                 ),
                 color=discord.Color.blurple(),
             )
@@ -447,7 +445,6 @@ class DashboardView(TabLayoutView):
     def _controls_appearance(self):
         # Six theme presets render choice_row as a dropdown -- placed inside
         # the card, not stranded below it. Picking one recolors this card.
-        # custom_id keeps this control distinct from any other choice_row.
         return [
             card(
                 "## Appearance",
@@ -456,7 +453,6 @@ class DashboardView(TabLayoutView):
                     {name: name for name in _THEME_PRESETS},
                     selected=self._theme_preset,
                     on_select=self._on_theme,
-                    custom_id="theme",
                 ),
                 color=_THEME_PRESETS[self._theme_preset],
             )
@@ -577,8 +573,8 @@ class V2DashboardExample(commands.Cog, name="v2_dashboard_example"):
             await context.send("This command can only be used in a server.", ephemeral=True)
             return
 
-        # send() auto-handles InstanceLimitError via on_instance_limit,
-        # which sends an ephemeral default message. No try/except needed.
+        # instance_policy = "replace" closes this user's previous dashboard
+        # in the server (replace_policy = "delete" removes its message).
         view = DashboardView(context=context)
         await view.send()
 

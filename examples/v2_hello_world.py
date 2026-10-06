@@ -58,8 +58,9 @@ class CounterView(StatefulLayoutView):
     replace_policy = "delete"
 
     # -- Lifecycle --
-    # ``"disable"`` freezes components on exit/timeout; ``"delete"`` would
-    # remove the message instead.
+    # ``exit()`` (the devtools exit command, for one) freezes the message
+    # under ``"disable"``; ``"delete"`` would remove it. A timeout always
+    # freezes it.
     exit_policy = "disable"
 
     # -- Interaction acking --
@@ -128,16 +129,9 @@ class HelloCog(commands.Cog):
 
     @commands.hybrid_command(name="hello", description="Open the counter")
     async def hello(self, ctx: Context):
-        # Optional: pre-check instance availability before constructing
-        # the view. Useful when __init__ does expensive work (DB queries,
-        # API calls) and you want to fail fast. The view's send() handles
-        # this automatically, but the pre-check avoids wasted setup.
-        #
-        # if not CounterView.check_instance_available(user_id=ctx.author.id):
-        #     await ctx.send("You already have a counter open!", ephemeral=True)
-        #     return
-
-        view = CounterView(interaction=ctx.interaction)
+        # context= serves both invocations: a slash command replies to its
+        # interaction, a prefix command sends to the channel.
+        view = CounterView(context=ctx)
         await view.send()
 
 

@@ -18,6 +18,13 @@ happens inside the fixture's own coroutine.
 import contextlib
 import uuid
 
+# testcontainers moved its modules under ``testcontainers.community`` and
+# deprecated the old path; the fallback keeps the ``>=4.0`` floor working.
+try:
+    from testcontainers.community.postgres import PostgresContainer
+except ImportError:
+    from testcontainers.postgres import PostgresContainer
+
 
 @contextlib.asynccontextmanager
 async def postgres_test_db(container):

@@ -1,11 +1,10 @@
 # // ========================================( Modules )======================================== // #
 
 
-import asyncio
 import inspect
 import re
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 # // ========================================( Result )======================================== // #
 
@@ -138,11 +137,8 @@ async def validate_field(
     validators = field_def.get("validators", [])
     errors = []
 
-    # An empty value on an optional field passes without running validators.
-    # Most validators reject blank (min_length, regex, choices, min/max_value),
-    # so running them would make every validated optional field secretly
-    # required; the required-check owns the blank-required case separately.
-    # 0 and False are values, not blanks, so only None and blank strings skip.
+    # A blank optional field skips its validators, most of which reject blank;
+    # 0 and False are values, so only None and blank strings count.
     is_empty = value is None or (isinstance(value, str) and not value.strip())
     if is_empty and not field_def.get("required", False):
         return errors

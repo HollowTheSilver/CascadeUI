@@ -52,6 +52,10 @@ class StatefulView(_StatefulMixin, View):
             policy gate blocked the send and the library handled the
             user response internally.
 
+        A cancel landing once Discord has accepted the message cuts the step
+        it lands in; the steps after it, such as registering the view, still
+        run for at most five seconds, and the cancel is raised after them.
+
         See ``_StatefulMixin._send_pipeline`` for the full exception
         contract and rollback semantics.
         """

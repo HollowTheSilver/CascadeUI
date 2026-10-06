@@ -2,6 +2,7 @@
 
 
 import asyncio
+from collections.abc import Mapping
 from typing import ClassVar, Dict, List, Optional, Tuple, Union
 
 import discord
@@ -81,11 +82,9 @@ def _normalize_entries(entries, owner: str, source: str):
                 f"pairs, got {type(entries).__name__}"
             ) from None
     for index, entry in enumerate(entries):
-        # A mapping is excluded before the length and item reads below: it
-        # satisfies both and then indexes by key, so ``entry[1]`` on a
-        # two-key dict raises KeyError from inside this check rather than
-        # reporting the shape. Strings and sets fail the same reads for
-        # their own reasons, so all three are named here.
+        # A mapping answers len() and then indexes by key, so entry[1] would
+        # raise KeyError from inside this check instead of naming the shape.
+        # Strings and sets fail the same reads for their own reasons.
         if (
             isinstance(entry, (str, bytes))
             or hasattr(entry, "items")
@@ -182,72 +181,47 @@ class _BaseLeaderboardMixin:
     is unchanged.
     """
 
-    # Entries without a ``display_name`` render as ``<@id>`` mentions, so
-    # a stock leaderboard would notify every ranked player on the initial
-    # send and again on every settlement refresh. The rows still render as
-    # mention links; they just stop pinging. Override with a permissive
-    # AllowedMentions on a board that genuinely wants to notify.
+    # Rows without a display_name render as <@id>, so a stock board would
+    # ping every ranked player when sent; the rows still render as mention
+    # links. Applied to every render. Override to let one notify.
     allowed_mentions = discord.AllowedMentions.none()
 
     # Total entries to consider from the data source
     leaderboard_top_n: int = 10
 
-    # Entries per page; ``None`` defaults to ``leaderboard_top_n`` (single page)
+    # Entries per page; ``None`` puts every entry on one page
     leaderboard_per_page: Optional[int] = 5
 
-    # Rankings card H2 title. Default when no ``title=`` kwarg is passed.
-    # Falsy (``None`` or empty string) renders no text heading, so a
-    # banner-only or heading-free masthead needs no override.
+    # Rankings card H2 heading; the title= kwarg overrides it. Falsy renders
+    # no heading, so a banner-only masthead needs no override.
     title: Optional[str] = "Leaderboard"
 
-    # Full-width banner image rendered at the top of the rankings card,
-    # above the ``title`` heading when both are set. Accepts a URL
-    # string, a ``discord.File``, or any object with a string ``.url``
-    # (``discord.Asset``, so ``guild.icon`` works directly). ``None``
-    # renders no banner. Class attribute OR ``banner=`` constructor
-    # kwarg; the ``build_title`` hook overrides both.
+    # Full-width image atop the rankings card: a URL, a discord.File, or
+    # anything with a string .url (guild.icon works). build_title overrides it.
     banner: Optional[MediaInput] = None
 
-    # H3 subtitle rendered above the ranking rows. The library emits
-    # ``f"### {subtitle}"`` verbatim when truthy; set to ``None`` (or
-    # empty string) to skip the subtitle entirely, which is the
-    # natural pairing when an Overview ``build_header`` card already
-    # carries its own heading. Callers that want dynamic
-    # content assign ``self.subtitle`` in ``__init__`` using an f-string.
+    # H3 above the ranked rows; falsy skips it. Per board, pass subtitle=.
     subtitle: Optional[str] = "Rankings"
 
     # Static message when no entries exist
     leaderboard_empty_message: str = "No entries recorded yet."
 
-    # Render mode for entries. ``"lines"`` (default) packs all entries on
-    # one page into a single TextDisplay. ``"sections"`` renders each
-    # entry as a discord.py ``Section`` with a two-line body and an
-    # optional avatar ``Thumbnail`` accessory. Sections consume more
-    # component budget, so ``leaderboard_per_page`` is capped at 5 when
-    # this is ``"sections"`` (enforced at class-definition time).
+    # "lines" packs a page into one TextDisplay; "sections" renders a Section
+    # per entry with its avatar (stacked text when none resolves), capping
+    # leaderboard_per_page at 5.
     entry_layout: str = "lines"
 
-    # Podium emojis keyed by rank (1-indexed). ``format_rank`` reads
-    # this dict to pick the rank-1/2/3 glyph; ranks beyond 3 fall back
-    # to ``f"**{rank}.**"``. Override the dict to change the podium
-    # treatment without overriding ``format_rank`` itself.
+    # The rank 1-3 glyphs format_rank reads; later ranks render "**{rank}.**".
     podium_emojis: ClassVar[Dict[int, str]] = {
         1: "\U0001f947",  # gold medal
         2: "\U0001f948",  # silver medal
         3: "\U0001f949",  # bronze medal
     }
 
-    # Separator rendered between the name and stat columns inside
-    # ``format_entry`` (``"lines"`` mode). Override on a subclass to
-    # change visual rhythm without overriding ``format_entry``
-    # entirely.
+    # Between the name and stat columns in format_entry ("lines" mode).
     entry_separator: str = " -- "
 
-    # Optional accent color for the rankings card. ``None`` falls
-    # through to the theme default. Set to a ``discord.Color`` on a
-    # subclass to give the card its own accent (useful when a
-    # ``build_header`` Overview card carries its own accent and a
-    # deliberate two-color layout is wanted).
+    # The rankings card's accent; None falls through to the theme.
     card_color: Optional[discord.Color] = None
 
     # Whether to render a horizontal divider below the title and above
@@ -265,14 +239,15 @@ class _BaseLeaderboardMixin:
         "entry_layout": {"lines", "sections"},
     }
     # Opt-in: render Discord default avatars immediately, then resolve the real
-    # ones off the render path and reload(force=True) when ready. Avoids the
-    # choose-your-poison of sync-cache-defaults vs a serial per-row fetch storm.
+    # ones off the render path and reload(force=True) when ready. Avoids
+    # choosing between cached defaults and a per-row fetch before the first render.
     avatar_backfill: ClassVar[bool] = False
     _BOOL_ATTRS: ClassVar[tuple] = (
         *_BasePaginatedMixin._BOOL_ATTRS,
         "show_title_divider",
         "avatar_backfill",
     )
+    _STR_OR_NONE_ATTRS: ClassVar[tuple] = ("title", "subtitle")
 
     @classmethod
     def _validate_attribute_value(cls, name: str, value) -> None:
@@ -286,6 +261,24 @@ class _BaseLeaderboardMixin:
         if name == "banner":
             if value is not None:
                 _coerce_banner(value, cls.__name__)
+            return
+        if name == "podium_emojis":
+            # Read with .get() for every row, so a wrong shape would fail
+            # inside the render, naming neither the attribute nor the fix.
+            if not isinstance(value, Mapping) or not all(
+                isinstance(rank, int) and not isinstance(rank, bool) and isinstance(text, str)
+                for rank, text in value.items()
+            ):
+                raise TypeError(
+                    f"{cls.__name__}.podium_emojis must map ranks (int) to the text shown "
+                    f"for them, like {{1: '1st'}}; got {value!r}"
+                )
+            return
+        if name in ("entry_separator", "leaderboard_empty_message"):
+            # The empty-board message becomes a text display's content, which
+            # Discord refuses as anything but a string, naming nothing.
+            if not isinstance(value, str):
+                raise TypeError(f"{cls.__name__}.{name} must be a str, got {type(value).__name__}")
             return
         super()._validate_attribute_value(name, value)
 
@@ -310,14 +303,12 @@ class _BaseLeaderboardMixin:
                 f"leaderboard_per_page <= 5 (Discord component budget); "
                 f"got leaderboard_per_page={per_page}."
             )
-        if "banner" in own:
-            cls._validate_attribute_value("banner", own["banner"])
+        for name in ("banner", "podium_emojis", "entry_separator", "leaderboard_empty_message"):
+            if name in own:
+                cls._validate_attribute_value(name, own[name])
 
-        # These four compose the rank row inside the synchronous
-        # ``format_entry``, which cannot await them. An async override is not
-        # loud there: the coroutine formats into the row and the board renders
-        # "<coroutine object ...>" where the name or the score belongs, with
-        # nothing raised. Rejected here so the mistake surfaces at import.
+        # format_entry is synchronous, so an async column hook would render
+        # "<coroutine object ...>" in the row with nothing raised.
         for name in ("format_rank", "format_name", "format_stats", "format_accessory"):
             hook = own.get(name)
             if hook is not None and is_async_callable(hook):
@@ -447,9 +438,10 @@ class _BaseLeaderboardMixin:
           accessory).
 
         Async so an override that genuinely must await a non-cache source
-        still can, but prefer the cache: a per-entry ``fetch_user`` issues one
-        serial HTTP round-trip per ranked row before the first render, adding
-        latency proportional to entry count. Override to resolve from a
+        still can, but prefer the cache: a per-entry ``fetch_user`` issues
+        one HTTP request per ranked row before the first render, and every
+        one of them shares a single rate-limit bucket, so the wait grows with
+        entry count. Override to resolve from a
         different source, or to force the TextDisplay fallback (return
         ``None``) even when a bot is set.
         """
@@ -498,15 +490,7 @@ class _BaseLeaderboardMixin:
         from ...state.store import _CURRENT_INTERACTION
 
         _CURRENT_INTERACTION.set(None)
-        try:
-            resolved = await await_maybe(self.resolve_avatar_urls(user_ids))
-        except asyncio.CancelledError:
-            # Cancelled before completing (view teardown, or a navigation that
-            # later rolled back to this view). Clear the schedule stamp so a
-            # recovered view re-schedules the backfill instead of rendering
-            # default avatars until the entry set changes.
-            self._avatar_backfilled_signature = None
-            raise
+        resolved = await await_maybe(self.resolve_avatar_urls(user_ids))
         if not resolved:
             return
         cache = self.__dict__.setdefault("_avatar_cache", {})
@@ -549,9 +533,10 @@ class _BaseLeaderboardMixin:
         """The loaded top-N ``(user_id, stats)`` slice for the current render.
 
         Populated before each page build, so ``build_header`` /
-        ``build_footer`` / ``build_title`` overrides can compute aggregate
-        stats or counts from the ranked data without re-fetching. Empty
-        until the first build.
+        ``build_footer`` / ``build_title`` overrides can compute stats over
+        the ranked rows without re-fetching. It holds only the top
+        ``leaderboard_top_n``; totals across every entry come from
+        :meth:`get_entries`. Empty until the first build.
         """
         return getattr(self, "_ranked_entries", [])
 
@@ -575,10 +560,9 @@ class _BaseLeaderboardMixin:
         by ``card()`` itself during the page build). The empty-state
         page has no rankings card, so the masthead renders at the page's
         top level there; the same components stay legal. Pages rebuild
-        only when the entry
-        signature changes, so a masthead that depends on data outside
-        the entries needs ``reload(force=True)`` -- the same contract as
-        the other frame hooks.
+        only when the entry signature changes, so a masthead that depends
+        on data outside the entries needs ``reload(force=True)``, the same
+        contract as the other frame hooks.
         """
         return None
 
@@ -612,9 +596,11 @@ class _BaseLeaderboardMixin:
         renders as its own card, anything else floats as a bare top-level
         item. Unlike ``build_footer``, there is no return-type branching
         here: the value is placed as given. Read ``self.ranked_entries``
-        for aggregate stats; an Overview ``stats_card(...)`` is the
-        typical use. Return a single V2 component, a list of components, or
-        ``None`` (default) for no header. On the empty-state page the
+        for stats over the ranked rows, and the full list
+        :meth:`get_entries` returns for totals across every entry; an
+        Overview ``stats_card(...)`` is the typical use. Return a single V2
+        component, a list of components, or ``None`` (default) for no
+        header. On the empty-state page the
         return renders above the masthead, at the page's top level;
         ``ranked_entries`` is empty there, so a hook computing aggregates
         must tolerate an empty slice.
@@ -695,8 +681,13 @@ class _BaseLeaderboardMixin:
         ``rebuild_pages`` short-circuits when the entry signature has
         not changed, so button-click dispatches that do not mutate
         leaderboard data skip the avatar-resolve fan-out entirely.
+
+        The rebuild takes the view's reload turn, so it runs after a
+        reload already fetching rather than beside it: an older fetch
+        finishing last would otherwise overwrite the newer one.
         """
-        await self.rebuild_pages()
+        async with self._within_reload_turn("rebuild_pages()"):
+            await self.rebuild_pages()
         await super().on_state_changed(state)
 
     async def _build_leaderboard_pages(self, entries=None) -> list:
@@ -721,11 +712,8 @@ class _BaseLeaderboardMixin:
             return await self._build_leaderboard_pages_inner(entries)
 
     async def _build_leaderboard_pages_inner(self, entries=None) -> list:
-        # Reading the hook here as well leaves page building reachable on its
-        # own, and re-consults an override that returns a different shape
-        # later. rebuild_pages passes what it already read, because an async
-        # override backed by a database would otherwise be queried twice per
-        # rebuild and render a set its own signature did not describe.
+        # rebuild_pages passes what it already read, so an async source is
+        # queried once per rebuild and renders the set its signature describes.
         if entries is None:
             entries = await await_maybe(self.get_entries())
         entries = _normalize_entries(entries, type(self).__name__, "get_entries()")
@@ -738,21 +726,12 @@ class _BaseLeaderboardMixin:
             items = await self._build_masthead(0)
             if items and self.show_title_divider:
                 items.append(divider())
-            # The frames run here for the same reason the masthead does: the
-            # board keeps its frame while empty, and an override inherits it
-            # rather than having to know it was lost. There is no rankings
-            # card on this page, so the return-type fold has nothing to fold
-            # into: header components render above the masthead (mirroring
-            # their above-the-card placement), footer components below the
-            # empty-state content, each in returned order at the page's top
-            # level.
+            # The board keeps its frames while empty. With no rankings card to
+            # fold into, header and footer render at the page's top level.
             header = _as_frame_items(await await_maybe(self.build_header(0)))
             footer = _as_frame_items(await await_maybe(self.build_footer(0)))
-            # The empty-state content is composed here rather than inside the
-            # default hook -- see on_leaderboard_empty. Routed through
-            # _resolve_page so the same non-list shapes (bare component,
-            # string) every page value accepts also work on an override's
-            # return.
+            # Composed here, not in the default hook (see on_leaderboard_empty);
+            # _resolve_page accepts every shape a page value may take.
             return [
                 [
                     *header,
@@ -775,13 +754,9 @@ class _BaseLeaderboardMixin:
         # the H3 entirely, which is the natural shape for a two-card look.
         heading = f"### {self.subtitle}" if self.subtitle else None
 
-        # Resolve every avatar URL across the full top-N slice in one
-        # fan-out, so the page-build loop below stays synchronous and reads
-        # from the pre-resolved list by absolute entry index. A cache-first
-        # override (``bot.get_user``) resolves with no HTTP at all. An
-        # override that awaits ``bot.fetch_user`` per entry does NOT
-        # parallelize across this gather: those calls share one rate-limit
-        # bucket and run serially, so keep HTTP off this path.
+        # One fan-out over the whole slice, so the page loop below reads by
+        # absolute entry index. Per-entry fetch_user calls share one rate-limit
+        # bucket, so the gather is paced by it (see get_avatar_url).
         if self.entry_layout == "sections":
             avatar_urls = await asyncio.gather(
                 *(await_maybe(self.get_avatar_url(uid, stats)) for uid, stats in top),
@@ -822,11 +797,9 @@ class _BaseLeaderboardMixin:
                     if avatar:
                         items.append(image_section(primary, secondary, url=avatar))
                     else:
-                        # Section requires a non-None accessory. When no avatar
-                        # resolves for an entry, collapse to a stacked
-                        # TextDisplay so the entry still renders cleanly. An
-                        # empty half is dropped rather than joined, matching
-                        # how image_section handles the same case above.
+                        # A Section needs an accessory, so an entry with no
+                        # avatar stacks as a TextDisplay, dropping an empty half
+                        # as image_section does.
                         stacked = "\n".join(part for part in (primary, secondary) if part)
                         items.append(TextDisplay(stacked))
             else:
@@ -843,12 +816,8 @@ class _BaseLeaderboardMixin:
                     items.append(gap())
                     items.append(TextDisplay(body))
 
-            # build_footer placement follows its return type: a raw component
-            # folds INSIDE the rankings card as a trailing child (a caption stays
-            # attached to the entries, never a floating orphan), while a Container
-            # renders as its own standalone card below the rankings. Folding a raw
-            # footer in also keeps the page a single wrappable Container under
-            # nav_inside_container.
+            # Placed by return type (see build_footer). A raw footer folded in
+            # also keeps the page one Container nav_inside_container can wrap.
             footer = _as_frame_items(await await_maybe(self.build_footer(page_idx)))
             footer_cards = [f for f in footer if isinstance(f, Container)]
             footer_inline = [f for f in footer if not isinstance(f, Container)]
@@ -885,8 +854,9 @@ class LeaderboardLayoutView(_BaseLeaderboardMixin, PaginatedLayoutView):
         ``build_header(page)``
             Content above the rankings card -- an Overview ``stats_card``,
             a banner image, any component. A ``Container`` renders as its
-            own card, a raw component floats. Read ``self.ranked_entries``
-            for aggregate stats. ``None`` (default) renders nothing.
+            own card, a raw component floats. ``self.ranked_entries``
+            holds the ranked rows, ``get_entries()`` every entry.
+            ``None`` (default) renders nothing.
         ``build_footer(page)``
             Content below the rankings, placed by return type: a raw
             component folds inside the rankings card (below the entries),
@@ -925,8 +895,8 @@ class LeaderboardLayoutView(_BaseLeaderboardMixin, PaginatedLayoutView):
         ``leaderboard_top_n``
             Total entries to consider from the data source (default 10).
         ``leaderboard_per_page``
-            Entries per page (default ``None`` = same as ``top_n``).
-            Set lower than ``top_n`` to enable multi-page navigation.
+            Entries per page (default 5). ``None`` puts every entry on one
+            page, sized by ``leaderboard_top_n``.
 
     Avatar resolution:
         ``bot``
@@ -957,13 +927,9 @@ class LeaderboardLayoutView(_BaseLeaderboardMixin, PaginatedLayoutView):
     def __init__(
         self, *args, entries=None, title=_UNSET, subtitle=_UNSET, banner=_UNSET, bot=None, **kwargs
     ):
-        # ``bot`` (optional) powers the default ``get_avatar_url``: section
-        # mode resolves avatars from ``bot.get_user`` when it is set. Held as a
-        # live reference, so it is stripped from the persistence round-trip
-        # (_NON_PERSISTABLE_KWARGS) and re-injected via ``on_bind`` on the
-        # persistent variant. Rejected at construction when it is not a client,
-        # so a typo'd bot fails here rather than as an AttributeError inside the
-        # section-mode avatar gather.
+        # Checked here, so a wrong bot fails at construction rather than as an
+        # AttributeError inside the avatar gather. A live reference, it is left
+        # out of the persistence round-trip (_NON_PERSISTABLE_KWARGS).
         if bot is not None and not isinstance(bot, discord.Client):
             raise TypeError(f"bot must be a discord.Client (or subclass), got {type(bot).__name__}")
         self._bot = bot
@@ -971,24 +937,26 @@ class LeaderboardLayoutView(_BaseLeaderboardMixin, PaginatedLayoutView):
         # passing ``None`` explicitly suppresses that masthead piece,
         # while omitting the kwarg falls back to the class default.
         if title is not _UNSET:
+            type(self)._validate_str_or_none("title", title)
             self.title = title
         if subtitle is not _UNSET:
+            type(self)._validate_str_or_none("subtitle", subtitle)
             self.subtitle = subtitle
         if banner is not _UNSET:
             self.banner = _coerce_banner(banner, type(self).__name__)
         self._entries = (
             _normalize_entries(entries, type(self).__name__, "entries=") if entries else []
         )
+        # A reload(force=True) not yet taken by a rebuild; the next
+        # rebuild_pages consumes it. See reload().
+        self._force_rebuild = False
         # Pages build lives in ``on_load()`` so the async ``get_avatar_url``
         # hook can resolve thumbnails before the first render. ``__init__``
         # hands the paginated base an empty list until then.
         kwargs["pages"] = []
         super().__init__(*args, **kwargs)
-        # The kwargs snapshot for push/pop and persistence captures the raw
-        # ``banner=`` value before the coercion above ran. Write the
-        # resolved value back so a ``discord.Asset`` banner round-trips as
-        # its JSON-safe URL string, the only shape the registry row's JSON
-        # serialization and restart reattachment can carry.
+        # The kwargs snapshot holds banner= as passed; a discord.Asset would
+        # fail the registry row's JSON, so the resolved URL replaces it.
         if "banner" in self._init_kwargs:
             self._init_kwargs["banner"] = self.banner
 
@@ -1010,19 +978,17 @@ class LeaderboardLayoutView(_BaseLeaderboardMixin, PaginatedLayoutView):
         placeholder until this runs. Rebuilding the nav row against the
         final page count keeps ``_show_jump`` and the initial ``disabled``
         state matched to the real total, not the empty-list ``__init__``
-        snapshot.
+        snapshot. An override calls ``super().on_load()`` after anything it
+        fetches: the recompose it ends with rebuilds the nav row against the
+        final page count and restores the Back button ``push()`` adds.
         """
-        # The paginated base preloads a cursor page here. A leaderboard is
-        # always eager-mode, so the call is a no-op, but the preload seam
-        # belongs to the base and overrides chain through it.
-        await super().on_load()
+        # Entries first: the base recomposes the tree when an instance
+        # override changed what it is built from, and that clamps the page
+        # against whatever list it finds.
         await self.rebuild_pages()
-        # rebuild_nav=True re-runs _build_nav_buttons against the final page
-        # count (entries are fetched async here, so __init__ saw an empty
-        # list). The shared helper handles the clear/compose/extras/back-button
-        # sequence; it restores the auto back button push() injects, so a
-        # pushed leaderboard is not stranded. Subclasses that override on_load
-        # must keep this call after fetching.
+        await super().on_load()
+        # The nav row is rebuilt against the final page count, which __init__
+        # could not know.
         self._recompose_page_tree(rebuild_nav=True)
 
     def _recompose_page_tree(self, *, rebuild_nav: bool = False) -> None:
@@ -1156,8 +1122,13 @@ class LeaderboardLayoutView(_BaseLeaderboardMixin, PaginatedLayoutView):
         without re-resolving avatars. ``force=True`` bypasses the signature
         check -- for when something outside the entry data changed the
         rendered pages (a filter, or a select's highlighted option read
-        by ``build_header``).
+        by ``build_header``). A pending ``reload(force=True)`` forces the
+        next rebuild the same way.
         """
+        # Taken before the first await, so a rebuild already past this point
+        # when the forced reload was requested leaves the request for the next.
+        force = force or self._force_rebuild
+        self._force_rebuild = False
         entries = _normalize_entries(
             await await_maybe(self.get_entries()), type(self).__name__, "get_entries()"
         )
@@ -1178,18 +1149,21 @@ class LeaderboardLayoutView(_BaseLeaderboardMixin, PaginatedLayoutView):
 
         The inherited :meth:`reload` runs ``on_load`` then ``refresh``.
         ``on_load`` fetches through ``rebuild_pages``, which short-circuits
-        when the entry signature is unchanged. ``force=True`` clears that
-        signature first, so a change outside the entry data (a filter, or a
-        select's highlighted option read by ``build_header``) still
-        rebuilds the pages. Call this rather than ``rebuild_pages`` directly
-        when triggering an out-of-band refresh.
+        when the entry signature is unchanged. ``force=True`` makes the
+        next page rebuild run regardless, so a change outside the entry
+        data (a filter, or a select's highlighted option read by
+        ``build_header``) still rebuilds the pages, including when this
+        reload queues behind one already running. Call this rather than
+        ``rebuild_pages`` directly when triggering an out-of-band refresh.
         """
+        # A request rather than a cleared signature: a run already in
+        # flight stamps the signature when it finishes, which would erase a
+        # clear made while it ran and leave this reload unforced.
         if force:
-            self._entries_signature = None
-        # Forward force so a reload coalesced by refresh_cooldown_ms replays it
-        # at the boundary (the deferred re-entry calls reload with the captured
-        # kwargs). The signature is already nulled above, so the rebuild forces
-        # even without the replay, but forwarding keeps the general contract.
+            self._force_rebuild = True
+        # Forwarded so a reload coalesced by refresh_cooldown_ms replays it at
+        # the boundary (the deferred re-entry calls reload with the captured
+        # kwargs).
         return await super().reload(force=force)
 
     @staticmethod

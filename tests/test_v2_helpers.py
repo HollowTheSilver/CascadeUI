@@ -1,6 +1,8 @@
 # // ========================================( Modules )======================================== // #
 
 
+import asyncio
+import logging
 from io import BytesIO
 from unittest.mock import AsyncMock, MagicMock
 
@@ -780,6 +782,229 @@ class TestToggleButton:
             toggle_button(active=True, on_toggle=_noop)
 
 
+class TestDoubleClickOnAStatefulControl:
+    """Both clicks of a double-click come from one render and ask for the
+    same state, so the second must not flip the toggle back.
+
+    Each click is numbered as it reaches the view, before the lock; one that
+    arrived before the same control's previous click finished repeats it.
+    """
+
+    @staticmethod
+    def _host():
+        view = RenderableLayoutView(interaction=make_interaction())
+        return view
+
+    @staticmethod
+    async def _double(view, button):
+        await asyncio.gather(
+            view._scheduled_task(button, make_interaction()),
+            view._scheduled_task(button, make_interaction()),
+        )
+
+    async def test_toggle_section_with_a_one_parameter_callback(self, caplog):
+        """The callback flips its own state, as the settings examples did."""
+        caplog.set_level(logging.DEBUG, logger="cascadeui")
+        view = self._host()
+        state = {"on": False}
+
+        async def flip(interaction):
+            state["on"] = not state["on"]
+            await asyncio.sleep(0)
+
+        section = toggle_section("Alerts", active=False, callback=flip)
+        view.add_item(section)
+
+        await self._double(view, section.accessory)
+
+        assert state["on"] is True
+        assert any(
+            "Dropped a click" in r.getMessage()
+            and "the second click of a double-click" in r.getMessage()
+            for r in caplog.records
+            if r.name.startswith("cascadeui")
+        )
+
+    async def test_toggle_button_reports_the_new_state_once(self):
+        view = self._host()
+        seen = []
+
+        async def on_toggle(interaction, active):
+            seen.append(active)
+            await asyncio.sleep(0)
+
+        button = toggle_button(active=False, on_toggle=on_toggle)
+        view.add_item(ActionRow(button))
+
+        await self._double(view, button)
+
+        assert seen == [True]
+        assert button._toggle_active is True
+
+    async def test_the_dropped_click_is_answered_without_auto_defer(self):
+        # No callback of the user's ran for it, so nothing else could answer it.
+        view = self._host()
+        view.auto_defer = False
+        seen = []
+
+        async def on_toggle(interaction, active):
+            seen.append(active)
+            await asyncio.sleep(0)
+
+        button = toggle_button(active=False, on_toggle=on_toggle)
+        view.add_item(ActionRow(button))
+        first, second = make_interaction(), make_interaction()
+
+        await asyncio.gather(
+            view._scheduled_task(button, first),
+            view._scheduled_task(button, second),
+        )
+
+        assert seen == [True]
+        second.response.defer.assert_awaited()
+
+    async def test_toggle_button_component_flips_once(self):
+        from cascadeui import ToggleButton
+
+        view = self._host()
+        calls = []
+
+        async def cb(interaction):
+            calls.append(1)
+            await asyncio.sleep(0)
+
+        button = ToggleButton(label="Mute", callback=cb)
+        view.add_item(ActionRow(button))
+
+        await self._double(view, button)
+
+        assert button.is_toggled is True
+        assert calls == [1]
+
+    async def test_cycle_button_advances_once(self):
+        view = self._host()
+        seen = []
+
+        async def on_change(interaction, value):
+            seen.append(value)
+            await asyncio.sleep(0)
+
+        button = cycle_button(values=["a", "b", "c"], on_change=on_change)
+        view.add_item(ActionRow(button))
+
+        await self._double(view, button)
+
+        assert seen == ["b"]
+
+    async def test_collapsible_opens_once(self):
+        class _Slow(Collapsible):
+            async def on_toggle(self, expanded):
+                # Stands in for the edit, which is what lets the second
+                # click arrive while the first is still being handled.
+                await asyncio.sleep(0)
+
+        view = self._host()
+        box = _Slow(label="More", reveal=lambda: [TextDisplay("hidden")], key="more")
+        row = box.render(view)[0]
+        view.add_item(row)
+        trigger = row.children[0]
+
+        await self._double(view, trigger)
+
+        assert box.expanded is True
+
+    async def test_a_click_sent_after_the_result_flips_again(self):
+        view = self._host()
+        seen = []
+
+        async def on_toggle(interaction, active):
+            seen.append(active)
+
+        button = toggle_button(active=False, on_toggle=on_toggle)
+        view.add_item(ActionRow(button))
+        await view._scheduled_task(button, make_interaction())
+
+        await view._scheduled_task(button, make_interaction())
+
+        assert seen == [True, False]
+
+    async def test_a_multi_choice_row_rebuilt_under_the_same_ids_toggles_once(self):
+        """A persistent view keeps a choice_row's ids across renders, so the
+        second click of a double-click reaches the rebuilt option, whose
+        snapshot already holds the first click's result, and toggled it back
+        out."""
+        view = self._host()
+        picks = []
+        rebuilt = asyncio.Event()
+        release = asyncio.Event()
+
+        def build(selected):
+            async def on_select(interaction, values):
+                picks.append(values)
+                view.clear_items()
+                view.add_item(build(values))
+                rebuilt.set()
+                await release.wait()
+
+            return choice_row(
+                {"Red": "r", "Blue": "b"},
+                on_select=on_select,
+                selected=selected,
+                multi=True,
+                custom_id="tags",
+            )
+
+        view.clear_items()
+        view.add_item(build([]))
+        old = view.children[0].children[0]
+        first = asyncio.create_task(view._scheduled_task(old, make_interaction()))
+        await rebuilt.wait()
+        new = view.children[0].children[0]
+        assert new is not old and new.custom_id == old.custom_id
+        second = asyncio.create_task(view._scheduled_task(new, make_interaction()))
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(first, second)
+
+        assert picks == [["r"]]
+
+    async def test_a_control_rebuilt_under_the_same_id_keeps_its_mark(self):
+        """Discord routes a click by custom_id, so the second click of a
+        double-click reaches the rebuilt control, a new object with no mark
+        of its own; it flipped the toggle back."""
+        view = self._host()
+        saves = []
+        rebuilt = asyncio.Event()
+        release = asyncio.Event()
+
+        def build(active):
+            async def on_toggle(interaction, new):
+                saves.append(new)
+                view.clear_items()
+                view.add_item(ActionRow(build(new)))
+                rebuilt.set()
+                await release.wait()
+
+            return toggle_button(active=active, on_toggle=on_toggle, custom_id="dark")
+
+        old = build(False)
+        view.add_item(ActionRow(old))
+        first = asyncio.create_task(view._scheduled_task(old, make_interaction()))
+        await rebuilt.wait()
+        new = view.children[0].children[0]
+        assert new is not old and new.custom_id == old.custom_id
+        second = asyncio.create_task(view._scheduled_task(new, make_interaction()))
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(first, second)
+
+        assert saves == [True]
+
+        await view._scheduled_task(view.children[0].children[0], make_interaction())
+
+        assert saves == [True, False]
+
+
 class TestStatsCard:
     """Container composition of heading + divider + key_value."""
 
@@ -921,6 +1146,7 @@ class _FakeHost:
         self._finished = finished
         self._async_build = async_build
         self.deferred = []
+        self.answered = []
         self.responded = []
         self.opened_modal = None
 
@@ -942,11 +1168,18 @@ class _FakeHost:
     async def _safe_defer(self, interaction):
         self.deferred.append(interaction)
 
+    async def _render_as_answer(self, interaction, render):
+        self.answered.append(interaction)
+        await render()
+
     async def respond(self, interaction, content, **kwargs):
         self.responded.append(content)
 
     async def open_modal(self, interaction, modal):
         self.opened_modal = modal
+
+    async def _answer_if_closed(self, interaction):
+        return self._finished
 
 
 class _OnLoadHost:
@@ -1495,6 +1728,39 @@ class TestPaginatedRegionNavigation:
         assert region.page == 2
         assert builds == [1]
 
+    async def test_show_page_before_the_region_has_a_host_raises_and_moves_nothing(self):
+        calls = []
+
+        class Tracked(PaginatedRegion):
+            async def on_page_changed(self, page):
+                calls.append(page)
+
+        region = Tracked(per_page=2, items=list(range(6)))
+
+        with pytest.raises(RuntimeError, match=r"set_page\(index\)"):
+            await region.show_page(2)
+        assert region.page == 0
+        assert calls == []
+
+    async def test_show_page_without_notify_renders_without_the_hook(self):
+        calls = []
+
+        class Tracked(PaginatedRegion):
+            async def on_page_changed(self, page):
+                calls.append(page)
+
+        region = Tracked(per_page=2, items=list(range(6)))
+        host = _FakeHost()
+        region.controls(host)
+
+        await region.show_page(2, notify=False)
+        assert calls == []
+        assert region.page == 2
+        assert host.refresh_calls == 1
+
+        await region.show_page(1)
+        assert calls == [1]
+
     async def test_step_prev_clamps_at_zero(self):
         region = PaginatedRegion(per_page=2, items=list(range(6)))
         region.controls(_FakeHost())
@@ -1620,7 +1886,7 @@ class TestPaginatedRegionGoto:
         await modal.on_submit(make_interaction())
         assert region.page == 2  # page 3 (1-based) -> index 2
         assert host.refresh_calls == 1
-        assert len(host.deferred) == 1
+        assert len(host.answered) == 1
 
     async def test_goto_submit_invalid_responds(self):
         region = PaginatedRegion(per_page=2, items=list(range(10)))
@@ -1644,7 +1910,7 @@ class TestPaginatedRegionGoto:
         await modal.on_submit(make_interaction())
         assert region.page == 4  # clamped to last page
         assert host.refresh_calls == 1
-        assert len(host.deferred) == 1
+        assert len(host.answered) == 1
 
     async def test_goto_submit_clamps_undershoot(self):
         region = PaginatedRegion(per_page=2, items=list(range(10)))
@@ -1656,6 +1922,79 @@ class TestPaginatedRegionGoto:
         await modal.on_submit(make_interaction())
         assert region.page == 0
         assert host.refresh_calls == 1
+
+    async def test_goto_answers_the_submission_with_the_page(self):
+        """The region's go-to answered the submission, then edited the host's
+        message through the channel endpoint, which is not ordered with the
+        next click's edit."""
+        region = PaginatedRegion(per_page=2, items=list(range(10)))
+
+        class _Host(StatefulLayoutView):
+            def build_ui(self):
+                self.clear_items()
+                self.add_item(TextDisplay(f"rows {region.page_items}"))
+                for row in region.controls(self):
+                    self.add_item(row)
+
+        host = _Host(interaction=make_interaction())
+        host.build_ui()
+        host._message = MagicMock()
+        host._message.edit = AsyncMock()
+        opening = make_interaction()
+        await region._open_goto_modal(opening)
+        modal = opening.response.send_modal.call_args.args[0]
+        modal.page_input._value = "3"
+        submit = make_interaction(message=host._message)
+        submit.type = discord.InteractionType.modal_submit
+
+        await modal.on_submit(submit)
+
+        assert region.page == 2
+        submit.response.edit_message.assert_awaited_once()
+        assert "rows [4, 5]" in [
+            c.content for c in host.walk_children() if isinstance(c, TextDisplay)
+        ]
+        submit.response.defer.assert_not_awaited()
+        host._message.edit.assert_not_awaited()
+
+    async def test_goto_submit_after_the_host_closed_says_so_and_stays(self):
+        """The modal outlives the host; a page typed after it closed turned
+        nothing and said nothing."""
+        region = PaginatedRegion(per_page=2, items=list(range(10)))
+        host = RenderableLayoutView(interaction=make_interaction())
+        region.controls(host)
+        opening = make_interaction()
+        await region._open_goto_modal(opening)
+        modal = opening.response.send_modal.call_args.args[0]
+        host.stop()
+        modal.page_input._value = "3"
+        submit = make_interaction()
+
+        await modal.on_submit(submit)
+
+        assert region.page == 0
+        submit.response.send_message.assert_awaited_once()
+        assert submit.response.send_message.call_args.args[0] == "This session has ended."
+
+    async def test_goto_submit_after_the_host_closed_is_answered_when_silent(self):
+        """The go-to modal is a raw discord.py Modal with no trailing ack, so
+        a notice set to None left the submission unanswered."""
+        region = PaginatedRegion(per_page=2, items=list(range(10)))
+        host = RenderableLayoutView(interaction=make_interaction())
+        host.set_class_attribute("session_ended_message", None)
+        region.controls(host)
+        opening = make_interaction()
+        await region._open_goto_modal(opening)
+        modal = opening.response.send_modal.call_args.args[0]
+        host.stop()
+        modal.page_input._value = "3"
+        submit = make_interaction()
+
+        await modal.on_submit(submit)
+
+        assert region.page == 0
+        submit.response.send_message.assert_not_awaited()
+        submit.response.defer.assert_awaited_once()
 
 
 # // ========================================( Choice Row )======================================== // #
@@ -2296,9 +2635,15 @@ class TestCollapsibleSummary:
         result = card("### Title", *c.render(_FakeHost()))
         assert isinstance(result, Container)
 
-    def test_summary_not_callable_raises(self):
-        with pytest.raises(TypeError, match="summary must be callable"):
-            Collapsible(label="Edit", reveal=_reveal_one, summary="text")
+    def test_summary_given_as_text_renders_that_text(self):
+        c = Collapsible(label="Edit", reveal=_reveal_one, summary="Advanced options")
+        trigger = c.render(_FakeHost())[0]
+        assert isinstance(trigger, Section)
+        assert trigger.children[0].content == "Advanced options"
+
+    def test_summary_neither_text_nor_callable_raises(self):
+        with pytest.raises(TypeError, match="summary must be a str, a callable, or None"):
+            Collapsible(label="Edit", reveal=_reveal_one, summary=5)
 
     def test_async_summary_raises(self):
         async def _async_summary():
@@ -2484,3 +2829,34 @@ class TestCompositeCursorRewindsWhenTheEditNeverLanded:
         message.edit = AsyncMock()
         await collapsible._toggle(make_interaction())
         assert collapsible.expanded is True
+
+    async def test_paginated_region_rewinds_when_the_edit_is_refused(self):
+        region = PaginatedRegion(items=list(range(30)), per_page=5)
+        _host, message = self._host(region, kind="region")
+        message.edit = AsyncMock(
+            side_effect=discord.HTTPException(
+                MagicMock(status=400, reason="Bad Request"), "Invalid Form Body"
+            )
+        )
+
+        with pytest.raises(discord.HTTPException):
+            await region._make_step(1)(make_interaction())
+        assert region.page == 0, "the cursor must stay on the slice still shown"
+
+        message.edit = AsyncMock()
+        await region._make_step(1)(make_interaction())
+        assert region.page == 1, "the recovery press advances one page, not two"
+
+    async def test_collapsible_rewinds_when_its_reveal_raises(self):
+        def broken():
+            raise RuntimeError("database unavailable")
+
+        collapsible = Collapsible(label="More", reveal=broken, key="c")
+        _host, message = self._host(collapsible, kind="collapsible")
+        message.edit = AsyncMock()
+
+        with pytest.raises(RuntimeError, match="database unavailable"):
+            await collapsible._toggle(make_interaction())
+
+        assert collapsible.expanded is False, "the trigger on screen never opened"
+        message.edit.assert_not_awaited()

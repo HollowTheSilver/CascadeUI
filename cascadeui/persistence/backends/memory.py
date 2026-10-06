@@ -119,24 +119,14 @@ class InMemoryBackend:
         rows: list[dict[str, Any]],
         key_columns: list[str],
     ) -> None:
-        # No round-trip to batch for the in-memory store -- per-row upsert
-        # is O(1) amortized, and delegating keeps copy-on-store and conflict
-        # semantics identical to row_upsert.
-        #
-        # The snapshot is what makes the batch all-or-nothing, matching the
-        # SQL backends' rollback. The middleware's retry re-enqueues the
-        # whole batch, so a partial commit here would be re-applied on top
-        # of itself. This backend is also the reference implementation, so
-        # a new backend author reading it should see the contract honored.
+        # The snapshot makes the batch all-or-nothing, like the SQL backends'
+        # rollback: the middleware's retry re-enqueues the whole batch, so a
+        # partial commit would be applied twice.
         stored = self._rows.setdefault(namespace, [])
         snapshot = [dict(existing) for existing in stored]
         try:
-            # One key index for the whole batch. Delegating to row_upsert
-            # rescanned every stored row per incoming row, making a flush
-            # O(batch x stored) -- 200 rows against 2000 stored measured two
-            # orders of magnitude slower than the same batch into an empty
-            # namespace. This is the reference implementation a new backend
-            # author reads, so the shape it models should be the good one.
+            # One key index for the whole batch: a row_upsert per row would
+            # rescan every stored row, O(batch x stored).
             index = {
                 tuple(existing.get(col) for col in key_columns): idx
                 for idx, existing in enumerate(stored)
@@ -214,12 +204,8 @@ class InMemoryBackend:
 
     # // ========================================( Raw SQL opt-out stubs )======================================== // #
 
-    # Capability.RAW_SQL is deliberately not declared on this backend --
-    # in-memory storage has no SQL engine to escape to. The five methods
-    # below raise NotImplementedError with a clear remediation message
-    # rather than producing AttributeError, so callers who reach for the
-    # escape hatch against InMemoryBackend get a directed error pointing
-    # them at SQLiteBackend or PostgresBackend.
+    # No Capability.RAW_SQL: there is no SQL engine to escape to. The methods
+    # below raise NotImplementedError naming the backends that have one.
 
     _RAW_SQL_ERROR: ClassVar[str] = (
         "InMemoryBackend does not support Capability.RAW_SQL. "

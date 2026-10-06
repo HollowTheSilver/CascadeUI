@@ -112,16 +112,20 @@ class LobbyView(StatefulLayoutView):
     ``on_replaced`` notifies participants in the channel.
 
     ``allowed_users`` is intentionally left empty -- this is the
-    open-join pattern. Authorization happens at the per-callback level
-    (Start/Disband check ``interaction.user.id == self.user_id``), not
-    at the view level via ``allowed_users``.
+    open-join pattern. Authorization happens per button (Start and
+    Disband carry ``owner_only=True``), not at the view level via
+    ``allowed_users``.
     """
 
     # No allowed_users -- open join. interaction_check passes everyone.
     owner_only = False
     participant_limit = DEFAULT_MAX_PLAYERS
     auto_register_participants = False  # Manual Join button instead
+    # Read by on_participant_limit below, which adds the joiner's mention.
     participant_limit_message = "This lobby is full."
+    # A player already in one lobby cannot open or join another until they
+    # leave it, whether they host that lobby or joined it.
+    instance_limit_message = "You're already in a lobby. Leave it first."
     timeout = LOBBY_TIMEOUT
     exit_policy = "delete"
     # The roster rebuilds on every Join and Leave, so without this each
@@ -133,10 +137,7 @@ class LobbyView(StatefulLayoutView):
     instance_scope = "user"  # one lobby per host across all guilds
     instance_policy = "replace"
     replace_policy = "delete"  # replacing a lobby deletes the old message
-    # A lobby is a staging area, not a committed game, so replacement is
-    # expected when the host opens a fresh one. ``protect_attached`` defaults to
-    # True, which would block replacement while participants are present; False
-    # lets it proceed, and the ``on_replaced`` hook below notifies them.
+    # Replacement proceeds with players waiting; on_replaced notifies them.
     protect_attached = False
     # ``state_scope = None`` because lobby stats live under custom reducers
     # written to the global state tree, not under any built-in scope key.
@@ -220,7 +221,7 @@ class LobbyView(StatefulLayoutView):
         # subtext so the remaining capacity is visible at a glance. The
         # heading shares the roster TextDisplay instead of adding its own,
         # so a growing roster stays clear of the 40-component message cap.
-        roster_lines = [f"### Players", f"1. {host_mention} *(host)*"]
+        roster_lines = ["### Players", f"1. {host_mention} *(host)*"]
         for idx, uid in enumerate(sorted(self.participants), start=2):
             roster_lines.append(f"{idx}. <@{uid}>")
         for slot in range(slots_filled + 1, capacity + 1):
@@ -298,7 +299,8 @@ class LobbyView(StatefulLayoutView):
         if interaction is not None:
             await self.respond(
                 interaction,
-                f"<@{user_id}> the lobby is full ({self.participant_limit} players).",
+                f"<@{user_id}> {self.participant_limit_message} "
+                f"It holds {self.participant_limit} players.",
                 ephemeral=True,
             )
 
@@ -362,6 +364,9 @@ class LobbyView(StatefulLayoutView):
         # build_ui renders the started recap once the flag is set.
         self.build_ui()
         await self.refresh()
+        # Close the lobby so every player can host or join another. The
+        # argument keeps the recap on screen, overriding exit_policy = "delete".
+        await self.exit(delete_message=False)
 
     async def _disband(self, interaction: discord.Interaction):
         # Host-only auth declared on the button; see ``_start``.
@@ -398,7 +403,8 @@ class LobbyExample(commands.Cog, name="v2_lobby_example"):
             # avatar), and the 128px variant keeps the thumbnail light.
             host_avatar_url=context.author.display_avatar.with_size(128).url,
         )
-        await view.send()  # send() returns None if on_pre_send vetoes (returns False); the hook already responded
+        # send() returns None when on_pre_send vetoes the open; the hook replied.
+        await view.send()
 
 
 async def setup(bot) -> None:

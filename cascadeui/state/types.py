@@ -1,7 +1,7 @@
 # // ========================================( Modules )======================================== // #
 
 
-from typing import Any, Awaitable, Callable, Dict, List, Optional, TypeVar
+from typing import Any, Awaitable, Callable, Dict, Optional, TypeVar
 
 # Public type aliases used across the state module.
 ViewId = str
@@ -25,17 +25,10 @@ SubscriberFn = Callable[[StateData, Action], Awaitable[None]]
 # next_fn continues the chain or runs the reducer if last.
 MiddlewareFn = Callable[[Action, StateData, Callable], Awaitable[StateData]]
 
-# Selector: extracts a slice of state for change detection.
-# Returns any value; the store compares old vs new to decide whether to notify.
-#
-# Selector purity contract: ``state_selector(self, state)`` (and any free
-# ``SelectorFn``) must read from the ``state`` argument, never from the live
-# store (e.g. ``self.scoped_state``, ``self.user_scoped_state()``, or
-# ``self.state_store.state``). The dispatcher passes the post-reduce snapshot
-# to the selector so the equality check sees the same slice the subscriber
-# will see; reading the live store races the dispatch and may compare a half-
-# applied state against the new snapshot. ``StateStore.get_scoped_from(state,
-# scope, **ids)`` is the right read inside selectors.
+# Selector: extracts the slice a subscriber watches; the store compares old and new
+# to decide whether to notify. It reads the ``state`` argument, never the live
+# store (``StateStore.get_scoped_from``), so it is correct whatever state it is
+# evaluated against.
 SelectorFn = Callable[[StateData], Any]
 
 # Hook: async callable receiving (action, state) -> None.

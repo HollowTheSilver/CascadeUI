@@ -32,9 +32,9 @@ except ImportError:
 postgres_available = False
 try:
     import asyncpg  # noqa: F401
-    from testcontainers.postgres import PostgresContainer  # noqa: F401
 
     from cascadeui.persistence.backends.postgres import PostgresBackend
+    from tests._pg_helpers import PostgresContainer  # noqa: F401
 
     postgres_available = True
 except ImportError:
@@ -269,6 +269,81 @@ class TestRawSqlTransactions:
         rows = await sql_backend.fetch("SELECT * FROM txn_rollback_tbl")
         assert rows == []
         await sql_backend.execute("DROP TABLE txn_rollback_tbl")
+
+    async def test_executemany_inside_a_transaction_rolls_back_with_it(self, sql_backend):
+        # Outside the transaction's connection, executemany waited on the lock
+        # the transaction held, and never ran.
+        class _Failed(Exception):
+            pass
+
+        await sql_backend.execute(
+            "CREATE TABLE IF NOT EXISTS txn_many_tbl (id INTEGER PRIMARY KEY)"
+        )
+        ph = _placeholder(sql_backend, 1)
+        with pytest.raises(_Failed):
+            async with sql_backend.transaction():
+                inserted = sql_backend.executemany(
+                    f"INSERT INTO txn_many_tbl VALUES ({ph})", [(1,), (2,)]
+                )
+                try:
+                    assert await asyncio.wait_for(inserted, 5) == 2
+                except asyncio.TimeoutError:
+                    pytest.fail("executemany waited on the lock its own transaction holds")
+                rows = await sql_backend.fetch("SELECT id FROM txn_many_tbl ORDER BY id")
+                assert [r["id"] for r in rows] == [1, 2]
+                raise _Failed()
+        assert await sql_backend.fetch("SELECT * FROM txn_many_tbl") == []
+        await sql_backend.execute("DROP TABLE txn_many_tbl")
+
+    async def test_a_transaction_in_an_abandoned_generator_lets_go(self, sql_backend):
+        # The loop finalizes an abandoned async generator from another context,
+        # where the transaction's marker cannot be reset; the lock and the
+        # pooled connection must still go back.
+        ph = _placeholder(sql_backend, 1)
+        await sql_backend.execute("CREATE TABLE IF NOT EXISTS txn_gen_tbl (id INTEGER)")
+
+        async def rows():
+            async with sql_backend.transaction():
+                await sql_backend.execute(f"INSERT INTO txn_gen_tbl VALUES ({ph})", 1)
+                yield
+
+        gen = rows()
+
+        async def step():
+            await gen.__anext__()
+
+        async def finalize():
+            await gen.aclose()
+
+        await asyncio.create_task(step())
+        await asyncio.create_task(finalize())
+        await asyncio.wait_for(sql_backend.execute(f"INSERT INTO txn_gen_tbl VALUES ({ph})", 2), 2)
+        assert [r["id"] for r in await sql_backend.fetch("SELECT id FROM txn_gen_tbl")] == [2]
+        await sql_backend.execute("DROP TABLE txn_gen_tbl")
+
+    async def test_another_tasks_write_does_not_join_an_open_transaction(self, sql_backend):
+        # Two commands running at once: one's transaction fails and rolls
+        # back, and the other's unrelated write must survive it.
+        await sql_backend.execute("CREATE TABLE IF NOT EXISTS txn_task_tbl (who TEXT)")
+        ph = _placeholder(sql_backend, 1)
+        opened = asyncio.Event()
+
+        async def failing():
+            with pytest.raises(RuntimeError):
+                async with sql_backend.transaction():
+                    await sql_backend.execute(f"INSERT INTO txn_task_tbl VALUES ({ph})", "a")
+                    opened.set()
+                    await asyncio.sleep(0.05)
+                    raise RuntimeError("simulated failure")
+
+        async def unrelated():
+            await opened.wait()
+            await sql_backend.execute(f"INSERT INTO txn_task_tbl VALUES ({ph})", "b")
+
+        await asyncio.gather(failing(), unrelated())
+        rows = await sql_backend.fetch("SELECT who FROM txn_task_tbl")
+        assert [r["who"] for r in rows] == ["b"]
+        await sql_backend.execute("DROP TABLE txn_task_tbl")
 
     async def test_nested_transaction_savepoint_isolation(self, sql_backend):
         """Inner transaction failure rolls back to savepoint; outer

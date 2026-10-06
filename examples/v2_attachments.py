@@ -7,6 +7,7 @@ Demonstrates the V2 media builder family with local file uploads:
     * ``gallery()``         : MediaGallery from MediaInput references
     * ``image_section()``   : Section with Thumbnail accessory
     * ``file_attachment()`` : Downloadable File component card
+    * ``fetch_as_file()``   : a URL fetched into an in-memory ``discord.File``
 
 The bytes and the reference are independent. The builder emits an
 ``attachment://<filename>`` reference into the component tree; the
@@ -79,8 +80,8 @@ def _bot_report_file() -> discord.File:
         "CascadeUI attachment surface report\n"
         "------------------------------------------\n"
         "Builders: gallery(), image_section(), file_attachment()\n"
-        "Type alias: MediaInput = Union[str, discord.File]\n"
-        "Also accepted: discord.Asset, discord.UnfurledMediaItem\n"
+        "Type alias: MediaInput = Union[str, discord.File, discord.UnfurledMediaItem]\n"
+        "Also accepted: discord.Asset (read through .url)\n"
         "Send kwargs: view.send(file=) and view.send(files=[...])\n"
         "Refresh: view.refresh(attachments=[...])  -- replacement list\n"
     )
@@ -119,12 +120,18 @@ class _GalleryView(StatefulLayoutView):
         self.add_exit_button()
 
 
+def _avatar_urls(ctx: Context) -> list[str]:
+    """The invoker's and the bot's avatar URLs, the invoker's twice without a bot user."""
+    author = ctx.author.display_avatar.with_size(128).url
+    bot_user = ctx.bot.user
+    return [author, bot_user.display_avatar.with_size(128).url if bot_user else author]
+
+
 def _section_labels(invoker_name: str, bot_name: str) -> list[tuple[str, str]]:
     """Build the (name, role) pairs ``_SectionView`` renders.
 
     Each pair becomes two text children of one Section, so the name and the
-    role render as separate lines. A single string with a newline in it is a
-    different shape and the view rejects it.
+    role render as separate lines.
     """
     return [(f"**{invoker_name}**", "Invoker"), (f"**{bot_name}**", "Bot")]
 
@@ -145,8 +152,8 @@ class _SectionView(StatefulLayoutView):
             card(
                 "## Section layout",
                 TextDisplay(
-                    "-# `image_section(text, *, url)` pairs caption text "
-                    "with a Thumbnail accessory."
+                    "-# `image_section(*text, url=...)` pairs one to three "
+                    "text lines with a Thumbnail accessory."
                 ),
                 divider(),
                 *(
@@ -190,10 +197,9 @@ class _SwapView(StatefulLayoutView):
     """Mid-session attachment swap via ``refresh(attachments=[...])``.
 
     Holds the candidate URLs and toggles between them on the Swap button
-    click. Each swap fetches fresh bytes (a ``discord.File`` is consumed
-    by its initial send), rebuilds the gallery against the new file, and
-    ships ``refresh(attachments=[new_file])`` -- a replacement list, not
-    additive.
+    click. Each swap fetches the next image, rebuilds the gallery against
+    the new file, and ships ``refresh(attachments=[new_file])`` -- a
+    replacement list, not additive.
 
     The filename increments monotonically (``swap_0.png``, ``swap_1.png``,
     ``swap_2.png``, ...) so the ``attachment://`` reference in the
@@ -247,7 +253,6 @@ class _SwapView(StatefulLayoutView):
                 StatefulButton(
                     label="Swap",
                     style=discord.ButtonStyle.primary,
-                    custom_id="attach_swap_button",
                     callback=self._on_swap,
                 )
             )
@@ -276,7 +281,10 @@ class _SwapView(StatefulLayoutView):
 
 
 class V2AttachmentsExample(commands.Cog, name="v2_attachments_example"):
-    """File-attachment surface showcase: gallery, image_section, file_attachment, and refresh swap."""
+    """File-attachment surface showcase.
+
+    Covers gallery, image_section, file_attachment, and the refresh swap.
+    """
 
     def __init__(self, bot) -> None:
         self.bot = bot
@@ -292,22 +300,10 @@ class V2AttachmentsExample(commands.Cog, name="v2_attachments_example"):
         # payloads small without visible quality loss at the rendered
         # size. Reuse one aiohttp session across both fetches so the
         # requests share a TCP pool.
-        bot_user = ctx.bot.user
+        url_a, url_b = _avatar_urls(ctx)
         async with aiohttp.ClientSession() as session:
-            avatar_a = await fetch_as_file(
-                ctx.author.display_avatar.with_size(128).url,
-                "avatar_a.png",
-                session=session,
-            )
-            avatar_b = await fetch_as_file(
-                (
-                    bot_user.display_avatar.with_size(128).url
-                    if bot_user
-                    else ctx.author.display_avatar.with_size(128).url
-                ),
-                "avatar_b.png",
-                session=session,
-            )
+            avatar_a = await fetch_as_file(url_a, "avatar_a.png", session=session)
+            avatar_b = await fetch_as_file(url_b, "avatar_b.png", session=session)
         view = _GalleryView(context=ctx, files=[avatar_a, avatar_b])
         await view.send(files=[avatar_a, avatar_b])
 
@@ -317,21 +313,10 @@ class V2AttachmentsExample(commands.Cog, name="v2_attachments_example"):
     )
     async def attach_section(self, ctx: Context) -> None:
         bot_user = ctx.bot.user
+        url_a, url_b = _avatar_urls(ctx)
         async with aiohttp.ClientSession() as session:
-            avatar_a = await fetch_as_file(
-                ctx.author.display_avatar.with_size(128).url,
-                "avatar_a.png",
-                session=session,
-            )
-            avatar_b = await fetch_as_file(
-                (
-                    bot_user.display_avatar.with_size(128).url
-                    if bot_user
-                    else ctx.author.display_avatar.with_size(128).url
-                ),
-                "avatar_b.png",
-                session=session,
-            )
+            avatar_a = await fetch_as_file(url_a, "avatar_a.png", session=session)
+            avatar_b = await fetch_as_file(url_b, "avatar_b.png", session=session)
         labels = _section_labels(ctx.author.display_name, bot_user.name if bot_user else "Bot")
         view = _SectionView(context=ctx, files=[avatar_a, avatar_b], labels=labels)
         await view.send(files=[avatar_a, avatar_b])
@@ -357,15 +342,7 @@ class V2AttachmentsExample(commands.Cog, name="v2_attachments_example"):
         # above promote to an explicit ``async with aiohttp.ClientSession()``.
         # ``with_size(128)`` keeps swap-callback payloads small so each
         # click resolves quickly.
-        bot_user = ctx.bot.user
-        urls = [
-            ctx.author.display_avatar.with_size(128).url,
-            (
-                bot_user.display_avatar.with_size(128).url
-                if bot_user
-                else ctx.author.display_avatar.with_size(128).url
-            ),
-        ]
+        urls = _avatar_urls(ctx)
         initial = await fetch_as_file(urls[0], "swap_0.png")
         view = _SwapView(context=ctx, urls=urls)
         await view.send(files=[initial])

@@ -23,12 +23,9 @@ def slugify(text: str) -> str:
 # A custom Discord emoji token: ``<:name:id>`` or animated ``<a:name:id>``.
 _CUSTOM_EMOJI_RE = re.compile(r"^<a?:[A-Za-z0-9_]+:\d+>$")
 
-# Codepoint blocks that hold the bulk of unicode emoji: the main pictograph
-# blocks, dingbats and misc symbols, arrows, technical and geometric shapes,
-# and the regional-indicator flags. A heuristic, not a Unicode-perfect
-# classifier -- enough to gate "did the user type an emoji?" without a
-# dependency. Multi-codepoint sequences (ZWJ families, skin-tone modifiers,
-# flags) match because their base pictographs fall in these ranges.
+# Codepoint blocks holding the bulk of unicode emoji; a heuristic, not a Unicode
+# classifier. ZWJ sequences, skin tones, and flags match through their base
+# pictographs.
 _EMOJI_CHAR_RE = re.compile(
     "["
     "\U0001f000-\U0001faff"  # emoji, pictographs, symbols & pictographs extended

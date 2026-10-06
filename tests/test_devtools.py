@@ -3,10 +3,12 @@
 # // ========================================( Modules )======================================== // #
 
 
+import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock
 
 from discord.ui import ActionRow, Container, LayoutView, TextDisplay
+from helpers import RenderableLayoutView
 from helpers import make_interaction as _make_interaction
 
 from cascadeui.devtools import DevToolsCog, InspectorView
@@ -112,10 +114,74 @@ class TestInspectorFiltering:
 
         store._active_views[view.id] = view
         store._active_views["other_id"] = "other_view_instance"
+        store.subscribers["other_id"] = (lambda *args: None, None, None)
 
         filtered = view._filtered_active_views()
         assert view.id not in filtered
         assert "other_id" in filtered
+
+    async def test_a_view_whose_teardown_failed_is_cleaned_up_as_a_ghost(self):
+        # Unsubscribed by its exit and then left registered by a failed
+        # removal, it was listed as live, and its Exit did nothing.
+        store = get_store()
+        failing = [True]
+
+        async def flaky(action, state, next_fn):
+            if action["type"] == "VIEW_DESTROYED" and failing[0]:
+                raise RuntimeError("audit store down")
+            return await next_fn(action, state)
+
+        store._add_middleware(flaky)
+        view = RenderableLayoutView(interaction=_make_interaction(user_id=1, guild_id=9))
+        await view.send()
+        await view.exit()
+        assert view.id in store._active_views
+        failing[0] = False
+
+        inspector = InspectorView(interaction=_make_interaction())
+        assert view.id not in inspector._filtered_active_views()
+        inspector._selected_view_id = view.id
+        inspector._refresh_tabs = AsyncMock()
+        await inspector._exit_selected_view(_make_interaction())
+        await store._flush_notifications()
+        assert view.id not in store._active_views
+        assert view.id not in store.state["views"]
+
+    @staticmethod
+    async def _live_view_and_inspector():
+        view = RenderableLayoutView(interaction=_make_interaction())
+        await view.send()
+        inspector = InspectorView(interaction=_make_interaction())
+        inspector._refresh_tabs = AsyncMock()
+        return view, inspector
+
+    async def test_exit_selected_closes_a_live_view(self):
+        # Only ghost rows were ever cleaned here; a live view's Exit is the
+        # button's whole job.
+        view, inspector = await self._live_view_and_inspector()
+        inspector._selected_view_id = view.id
+
+        await inspector._exit_selected_view(_make_interaction())
+
+        assert view._torn_down()
+
+    async def test_exit_all_closes_every_live_view(self):
+        view, inspector = await self._live_view_and_inspector()
+        other = RenderableLayoutView(interaction=_make_interaction(user_id=101))
+        await other.send()
+
+        await inspector._exit_all_views(_make_interaction())
+
+        assert view._torn_down() and other._torn_down()
+        assert not inspector._torn_down()
+
+    async def test_clear_selected_session_closes_its_live_views(self):
+        view, inspector = await self._live_view_and_inspector()
+        inspector._selected_session_id = view.session_id
+
+        await inspector._clear_selected_session(_make_interaction())
+
+        assert view._torn_down()
 
 
 class TestInspectorGuildScope:
@@ -695,6 +761,30 @@ class TestDevToolsCogReset:
 
         assert store.state == StateStore._build_initial_state()
 
+    async def test_reset_waits_for_a_reducer_awaiting_in_another_task(self):
+        # The reset landed while the reducer awaited, and its result, read
+        # before the reset, brought the cleared state back.
+        from cascadeui.state.store import StateStore
+
+        store = get_store()
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def slow(action, state):
+            started.set()
+            await release.wait()
+            return {**state, "application": {**state.get("application", {}), "stale": 1}}
+
+        store._register_reducer("SLOW", slow)
+        pending = asyncio.ensure_future(store.dispatch("SLOW", {}))
+        await asyncio.wait_for(started.wait(), 2)
+        cog = DevToolsCog(bot=MagicMock())
+        resetting = asyncio.ensure_future(cog.reset.callback(cog, self._make_ctx(), confirm=True))
+        await asyncio.sleep(0.01)
+        release.set()
+        await asyncio.wait_for(asyncio.gather(pending, resetting), 2)
+
+        assert store.state == StateStore._build_initial_state()
+
     async def test_reset_invalidates_computed_cache(self):
         from cascadeui.state.computed import _SENTINEL, ComputedValue
 
@@ -785,23 +875,25 @@ class TestDevToolsCogExitAll:
         return ctx
 
     async def test_exit_all_reports_failures(self):
+        class _Broken(RenderableLayoutView):
+            async def exit(self, delete_message=None):
+                raise RuntimeError("nope")
+
         store = get_store()
         store._active_views.clear()
-        good = MagicMock()
-        good.exit = AsyncMock()
-        good._torn_down.return_value = False
-        bad = MagicMock()
-        bad.exit = AsyncMock(side_effect=RuntimeError("nope"))
-        bad._torn_down.return_value = False
-        store._active_views["good_v"] = good
-        store._active_views["bad_v"] = bad
+        good = RenderableLayoutView(interaction=_make_interaction(user_id=1, guild_id=100))
+        await good.send()
+        bad = _Broken(interaction=_make_interaction(user_id=2, guild_id=100))
+        await bad.send()
 
         cog = DevToolsCog(bot=MagicMock())
         ctx = self._make_ctx()
         await cog.exit_all.callback(cog, ctx)
 
         sent = ctx.send.call_args[0][0]
+        assert "Exited 1 view(s)" in sent
         assert "1 failed" in sent
+        assert good._torn_down()
 
     async def test_exit_all_silent_when_no_failures(self):
         store = get_store()
@@ -813,6 +905,39 @@ class TestDevToolsCogExitAll:
 
         sent = ctx.send.call_args[0][0]
         assert "failed" not in sent
+
+
+class TestDevToolsCogExitAndClear:
+    """``exit`` and ``clear`` close live views, not only ghost rows."""
+
+    @staticmethod
+    def _ctx():
+        ctx = MagicMock()
+        ctx.send = AsyncMock()
+        ctx.defer = AsyncMock()
+        return ctx
+
+    async def test_exit_by_a_partial_id_closes_the_live_view(self):
+        view = RenderableLayoutView(interaction=_make_interaction())
+        await view.send()
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = self._ctx()
+
+        await cog.exit_view.callback(cog, ctx, view.id[:8])
+
+        assert view._torn_down()
+        assert "Exited live" in ctx.send.call_args[0][0]
+
+    async def test_clear_closes_the_sessions_live_views(self):
+        view = RenderableLayoutView(interaction=_make_interaction())
+        await view.send()
+        cog = DevToolsCog(bot=MagicMock())
+        ctx = self._ctx()
+
+        await cog.clear_session.callback(cog, ctx, view.session_id)
+
+        assert view._torn_down()
+        assert "1 view(s) exited" in ctx.send.call_args[0][0]
 
 
 class TestDevToolsCogGuildScope:
@@ -850,51 +975,100 @@ class TestDevToolsCogGuildScope:
         assert "v_here" in sent
         assert "v_other" not in sent
 
+    @staticmethod
+    def _counted():
+        class _Counted(RenderableLayoutView):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.exits = 0
+
+            async def exit(self, delete_message=None):
+                self.exits += 1
+                return await super().exit(delete_message)
+
+        return _Counted
+
     async def test_exitall_scopes_to_guild(self):
         store = get_store()
         store._active_views.clear()
-        store.state["views"] = {}
-        here = MagicMock()
-        here.guild_id = 100
-        here.exit = AsyncMock()
-        here._torn_down.return_value = False
-        other = MagicMock()
-        other.guild_id = 200
-        other.exit = AsyncMock()
-        other._torn_down.return_value = False
-        store._active_views["here"] = here
-        store._active_views["other"] = other
+        counted = self._counted()
+        here = counted(interaction=_make_interaction(user_id=1, guild_id=100))
+        await here.send()
+        other = counted(interaction=_make_interaction(user_id=1, guild_id=200))
+        await other.send()
 
         cog = DevToolsCog(bot=MagicMock())
         ctx = self._ctx(100)
         await cog.exit_all.callback(cog, ctx)
 
-        here.exit.assert_awaited_once()
-        other.exit.assert_not_called()
+        assert here.exits == 1
+        assert other.exits == 0
+        assert not other._torn_down()
 
     async def test_exitall_skips_a_view_an_earlier_exit_cascaded_to(self):
         """The snapshot predates the first exit, and exiting a parent exits
         the children attached to it."""
         store = get_store()
         store._active_views.clear()
-        store.state["views"] = {}
-        parent = MagicMock()
-        parent.guild_id = 100
-        parent.exit = AsyncMock()
-        parent._torn_down.return_value = False
-        child = MagicMock()
-        child.guild_id = 100
-        child.exit = AsyncMock()
-        # Torn down by the parent's cascade before the loop reaches it.
-        child._torn_down.return_value = True
-        store._active_views["parent"] = parent
-        store._active_views["child"] = child
+        counted = self._counted()
+        parent = counted(interaction=_make_interaction(user_id=1, guild_id=100))
+        await parent.send()
+        child = counted(interaction=_make_interaction(user_id=1, guild_id=100), parent=parent)
+        await child.send()
 
         cog = DevToolsCog(bot=MagicMock())
         await cog.exit_all.callback(cog, self._ctx(100))
 
-        parent.exit.assert_awaited_once()
-        child.exit.assert_not_called()
+        assert parent.exits == 1
+        # Once, from the parent's cascade: the loop found it torn down.
+        assert child.exits == 1
+
+    async def test_exitall_exits_the_view_a_push_in_flight_hands_over_to(self):
+        """A view mid-push when the snapshot was taken hands its message to
+        the destination while its exit waits; the destination is the view
+        on screen, so it is the one exited."""
+        from discord.ui import Button
+
+        class _Next(RenderableLayoutView):
+            pass
+
+        store = get_store()
+        store._active_views.clear()
+        source = RenderableLayoutView(interaction=_make_interaction(user_id=1, guild_id=100))
+        await source.send()
+        gate = asyncio.Event()
+        message = source._message
+
+        async def channel_edit(**kwargs):
+            if kwargs.get("view") is source:
+                await gate.wait()
+            return message
+
+        # An edit of the source in flight holds its push before the
+        # destination exists, so the snapshot holds the source alone.
+        message.edit = AsyncMock(side_effect=channel_edit)
+        source.add_item(ActionRow(Button(label="x", custom_id="x")))
+        refreshing = asyncio.create_task(source.refresh())
+        for _ in range(5):
+            await asyncio.sleep(0)
+        push = asyncio.create_task(
+            source.push(_Next, interaction=_make_interaction(user_id=1, guild_id=100))
+        )
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        cog = DevToolsCog(bot=MagicMock())
+        exiting = asyncio.create_task(cog.exit_all.callback(cog, self._ctx(100)))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        gate.set()
+        await refreshing
+        destination = await push
+        await exiting
+
+        assert source._successor is destination
+        assert destination._torn_down()
+        assert not any(not v.is_finished() for v in store._active_views.values())
 
 
 class TestDevToolsCogGroupListing:

@@ -73,6 +73,7 @@ from the state tree and cleans up associated data.
 | Key | Type | Description |
 |-----|------|-------------|
 | `view_id` | `str` | View being destroyed |
+| `session_id` | `str` | Optional. A session to drop when the view never reached the state and the session has no member left |
 
 **State change:**
 
@@ -81,6 +82,8 @@ from the state tree and cleans up associated data.
 - Removes modal submission entries owned by this view
 - Removes `view_id` from its session's view list
 - Deletes the session entirely once its member list is empty
+- With `session_id` and no row for the view (a send rolled back before its
+  `VIEW_CREATED` landed), deletes that session when it has no member
 
 Push and pop keep the session alive by ordering rather than by a flag:
 `_navigate_to` registers the destination view in state before dispatching the
@@ -333,18 +336,19 @@ covers every reattach pass rather than the latest one; see the
 ### `APPLICATION_SLOTS_PRUNED`
 
 Dispatched by `PersistenceManager.prune_application()` and the daily TTL sweeper
-after deleting expired rows from the `application` namespace. Dispatch-only: no
-reducer, no state change. Subscribe or use `store.on("application_slots_pruned", ...)`
-to observe prunes.
+after deleting application slots. Dispatch-only: no reducer. Subscribe or use
+`store.on("application_slots_pruned", ...)` to observe prunes.
 
 **Payload:**
 
 | Key | Type | Description |
 |-----|------|-------------|
 | `deleted` | `int` | Number of application-slot rows removed |
-| `cutoff` | `Optional[int]` | The `expires_at` threshold used (epoch seconds) for a TTL sweep, or `None` for a manual prune |
+| `cutoff` | `Optional[int]` | The `expires_at` threshold used (epoch seconds), or `None` for a single-slot prune |
+| `slots` | `list[str]` | The slots removed from the running bot |
 
-**State change:** None.
+**State change:** None from the action. The slots in `slots` leave
+`state["application"]` before it is dispatched.
 
 ---
 
@@ -382,15 +386,17 @@ previous application state snapshot.
 
 **State change:**
 
-- Builds the inverse per-slot diff of the slots the undo entry names, and pushes it onto the view's `redo_stack` alongside the current `shared_data`
-- Pops the top entry from the view's `undo_stack` and applies its per-slot diff, plus the `shared_data` it carries
+- Builds the inverse diff of the slots and keys the undo entry names, and pushes it onto the view's `redo_stack` alongside the current `shared_data`
+- Pops the top entry from the view's `undo_stack` and applies its diff, plus the `shared_data` it carries
 
-The snapshot is a **per-slot diff**, not a copy of the whole `application`
-subtree: only the slots the undone action actually touched are restored, so a
-sibling view's concurrent writes to other slots survive an undo here. Scoped
-data lives under `application` as a top-level slot, so `dispatch_scoped()`
-changes round-trip the same way. Session data from `update_session()` is
-restored too.
+The snapshot is a diff, not a copy of the whole `application` subtree: only
+what the undone action changed is restored, so other views' writes survive an
+undo here. Inside a dict slot the diff is per key, at every depth. Every
+user's scoped data shares the one `scoped` slot, and a guild's bucket in it
+is shared by its members, so restoring either whole would put back other
+users' state along with the undone change. A slot holding
+anything other than a dict is restored whole. Session data from
+`update_session()` is restored too.
 
 ---
 
@@ -408,8 +414,8 @@ previously undone snapshot.
 
 **State change:**
 
-- Builds the inverse per-slot diff of the slots the redo entry names, and pushes it onto the view's `undo_stack` alongside the current `shared_data`
-- Pops the top entry from the view's `redo_stack` and applies its per-slot diff, plus the `shared_data` it carries
+- Builds the inverse diff of the slots and keys the redo entry names, and pushes it onto the view's `undo_stack` alongside the current `shared_data`
+- Pops the top entry from the view's `redo_stack` and applies its diff, plus the `shared_data` it carries
 
 ---
 
@@ -437,15 +443,15 @@ Three middleware components interact with these actions:
   immediately; the application namespace debounces. Skips bookkeeping actions
   (`SESSION_CREATED`, `SESSION_UPDATED`, `VIEW_CREATED`, `VIEW_UPDATED`,
   `VIEW_DESTROYED`, `COMPONENT_INTERACTION`, `MODAL_SUBMITTED`,
-  `NAVIGATION_PUSH`, `NAVIGATION_POP`,
-  `NAVIGATION_REPLACE`, `UNDO`, `REDO`, `BATCH_COMPLETE`,
-  `INSPECTOR_PURGED_STALE`, `APPLICATION_SLOTS_PRUNED`,
-  `REGISTRY_PRUNED`) that don't carry
-  application state changes. Also skips any dispatch-only action (no registered
-  reducer) where the state reference is unchanged. Slots default to in-memory;
-  the middleware only writes slots opted in through `_PERSISTENT_SLOTS`.
+  `NAVIGATION_PUSH`, `NAVIGATION_POP`, `NAVIGATION_REPLACE`,
+  `BATCH_COMPLETE`, `INSPECTOR_PURGED_STALE`, `APPLICATION_SLOTS_PRUNED`,
+  `REGISTRY_PRUNED`) that don't carry application state changes. `UNDO` and
+  `REDO` do, so an undone persistent slot is saved. Also skips any
+  dispatch-only action (no registered reducer) where the state reference is
+  unchanged. Slots default to in-memory; the middleware only writes slots
+  opted in through `_PERSISTENT_SLOTS`.
 
-- **`UndoMiddleware`** captures a per-slot diff of `state["application"]` across
+- **`UndoMiddleware`** captures a diff (per key at every depth, for a dict slot) of `state["application"]` across
   the reducer (holding the pre-state, computing the diff once the reducer
   returns) plus a copy of the session's `shared_data`, and pushes both onto the
   source view's `undo_stack`. Skips bookkeeping actions (`VIEW_CREATED`,
@@ -458,7 +464,7 @@ Three middleware components interact with these actions:
   `SESSION_UPDATED` is **not** skipped - `update_session()` changes are
   captured and restored by undo/redo.
 
-- **`LoggingMiddleware`** logs every dispatched action. The configured `level` (default `INFO`) is the action stream's *emission* level, not a threshold: pass `level="DEBUG"` to keep the routine action traffic out of INFO logs so it surfaces only when DEBUG is enabled. The middleware does not pin the logger threshold; visibility follows the `cascadeui.actions` logger and its handlers.
+- **`LoggingMiddleware`** logs every dispatched action. The configured `level` (default `INFO`) is the action stream's *emission* level, not a threshold: pass `level="DEBUG"` to keep the routine action traffic out of INFO logs so it surfaces only when DEBUG is enabled. The middleware does not pin the logger threshold; visibility follows the `cascadeui.actions` logger and its handlers. A level name logging does not know raises `ValueError`; an int is used as given.
 
 ## Action Filters and Undo
 

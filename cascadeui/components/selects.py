@@ -17,13 +17,12 @@ def _wrap_default_values(
 ) -> List[discord.SelectDefaultValue]:
     """Coerce a sequence of ints/snowflakes/SelectDefaultValue into the discord.py shape.
 
-    The four specialized selects (RoleSelect, UserSelect, ChannelSelect)
+    Three specialized selects (RoleSelect, UserSelect, ChannelSelect)
     each carry a single default-value type ("role", "user", "channel").
-    This helper accepts the permissive input shape -- raw ``int`` IDs,
-    objects with ``.id`` attributes (any ``discord.abc.Snowflake``), or
-    pre-built :class:`discord.SelectDefaultValue` instances -- and
-    returns the typed list discord.py's ``default_values=`` parameter
-    expects.
+    This helper accepts raw ``int`` IDs, objects with ``.id`` attributes
+    (any ``discord.abc.Snowflake``), or pre-built
+    :class:`discord.SelectDefaultValue` instances, and returns the typed
+    list discord.py's ``default_values=`` parameter expects.
 
     Empty input returns an empty list. Raises ``TypeError`` for inputs
     that are neither int-like nor a ``SelectDefaultValue`` (matches
@@ -100,11 +99,8 @@ class Dropdown(StatefulSelect):
         callback: Optional[Callable] = None,
         **kwargs,
     ):
-        # Dicts are converted; SelectOptions pass through. Anything else is
-        # rejected here rather than appended untouched: a plain string became
-        # an option with no label and no value, and a single option dict
-        # passed without its list iterated as its own keys, both surfacing
-        # only when Discord tried to render the select.
+        # Dicts are converted and SelectOptions pass through; anything else,
+        # or a lone dict (which iterates its keys), would fail only at render.
         if hasattr(options, "items"):
             raise TypeError(
                 "Dropdown options must be a list of option dicts, not a single "
@@ -137,18 +133,14 @@ class Dropdown(StatefulSelect):
         )
 
 
-class RoleSelect(discord.ui.RoleSelect, StatefulComponent):
-    """A role select menu with state management.
+class _TypedDefaultsSelect:
+    """Construction and ``set_default_values`` for a select whose defaults share one type.
 
-    Accepts a permissive ``default_values=`` kwarg: pass raw ``int``
-    role IDs, ``discord.Role`` objects, or pre-built
-    :class:`discord.SelectDefaultValue` instances. CascadeUI coerces
-    each entry to the discord.py shape, wrapping bare IDs/Snowflakes
-    with ``type="role"`` automatically. Use :meth:`set_default_values`
-    to update defaults after construction.
+    The subclass names the type in ``_DEFAULT_VALUE_TYPE``, and bare ids
+    and snowflakes passed as defaults are wrapped with it.
     """
 
-    _DEFAULT_VALUE_TYPE = "role"
+    _DEFAULT_VALUE_TYPE: str
 
     def __init__(
         self,
@@ -170,15 +162,27 @@ class RoleSelect(discord.ui.RoleSelect, StatefulComponent):
     def set_default_values(self, values: Optional[Sequence[Any]]) -> None:
         """Replace the default-value list with *values*.
 
-        Accepts the same permissive input shape as the constructor:
-        raw ``int`` role IDs, ``discord.Role`` objects, or pre-built
-        ``discord.SelectDefaultValue`` instances. ``None`` or an empty
-        sequence clears the defaults.
+        Accepts the same permissive input shape as the constructor. ``None``
+        or an empty sequence clears the defaults.
         """
         self.default_values = _wrap_default_values(values, self._DEFAULT_VALUE_TYPE)
 
 
-class ChannelSelect(discord.ui.ChannelSelect, StatefulComponent):
+class RoleSelect(_TypedDefaultsSelect, discord.ui.RoleSelect, StatefulComponent):
+    """A role select menu with state management.
+
+    Accepts a permissive ``default_values=`` kwarg: pass raw ``int``
+    role IDs, ``discord.Role`` objects, or pre-built
+    :class:`discord.SelectDefaultValue` instances. CascadeUI coerces
+    each entry to the discord.py shape, wrapping bare IDs/Snowflakes
+    with ``type="role"`` automatically. Use :meth:`set_default_values`
+    to update defaults after construction.
+    """
+
+    _DEFAULT_VALUE_TYPE = "role"
+
+
+class ChannelSelect(_TypedDefaultsSelect, discord.ui.ChannelSelect, StatefulComponent):
     """A channel select menu with state management.
 
     Accepts a permissive ``default_values=`` kwarg: pass raw ``int``
@@ -211,32 +215,8 @@ class ChannelSelect(discord.ui.ChannelSelect, StatefulComponent):
 
     _DEFAULT_VALUE_TYPE = "channel"
 
-    def __init__(
-        self,
-        placeholder: Optional[str] = None,
-        callback: Optional[Callable] = None,
-        default_values: Optional[Sequence[Any]] = None,
-        **kwargs,
-    ):
-        if default_values is not None:
-            kwargs["default_values"] = _wrap_default_values(
-                default_values, self._DEFAULT_VALUE_TYPE
-            )
-        super().__init__(placeholder=placeholder, **kwargs)
 
-        self.original_callback = callback
-        if callback:
-            self.callback = self.create_stateful_callback(self, callback)
-
-    def set_default_values(self, values: Optional[Sequence[Any]]) -> None:
-        """Replace the default-value list with *values*.
-
-        Accepts the same permissive input shape as the constructor.
-        """
-        self.default_values = _wrap_default_values(values, self._DEFAULT_VALUE_TYPE)
-
-
-class UserSelect(discord.ui.UserSelect, StatefulComponent):
+class UserSelect(_TypedDefaultsSelect, discord.ui.UserSelect, StatefulComponent):
     """A user select menu with state management.
 
     Accepts a permissive ``default_values=`` kwarg: pass raw ``int``
@@ -248,30 +228,6 @@ class UserSelect(discord.ui.UserSelect, StatefulComponent):
     """
 
     _DEFAULT_VALUE_TYPE = "user"
-
-    def __init__(
-        self,
-        placeholder: Optional[str] = None,
-        callback: Optional[Callable] = None,
-        default_values: Optional[Sequence[Any]] = None,
-        **kwargs,
-    ):
-        if default_values is not None:
-            kwargs["default_values"] = _wrap_default_values(
-                default_values, self._DEFAULT_VALUE_TYPE
-            )
-        super().__init__(placeholder=placeholder, **kwargs)
-
-        self.original_callback = callback
-        if callback:
-            self.callback = self.create_stateful_callback(self, callback)
-
-    def set_default_values(self, values: Optional[Sequence[Any]]) -> None:
-        """Replace the default-value list with *values*.
-
-        Accepts the same permissive input shape as the constructor.
-        """
-        self.default_values = _wrap_default_values(values, self._DEFAULT_VALUE_TYPE)
 
 
 class MentionableSelect(discord.ui.MentionableSelect, StatefulComponent):

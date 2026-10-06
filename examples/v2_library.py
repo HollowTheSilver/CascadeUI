@@ -121,8 +121,9 @@ def _make_formatter(name: str, accent: discord.Color):
 
     Each page is rendered as a ``card`` with the category accent so the
     color travels with the chunked items. The ``nav_inside_container``
-    flag on the view wraps the card + nav row in another Container; the
-    inner card keeps the per-category accent visible inside that wrapper.
+    flag on the view puts the nav row inside that card: the page renders
+    as one Container that keeps the card's accent, never one nested in
+    another.
     """
 
     def format_page(items: list) -> list:
@@ -226,8 +227,8 @@ class LibraryHubView(StatefulLayoutView):
                 interaction=interaction,
             )
             # ``from_data`` returns a fully-built paginator; no rebuild
-            # hook is needed. ``push`` defers the interaction and edits
-            # the message with the child view regardless.
+            # hook is needed. ``push`` edits the message and answers the
+            # click in one request.
             await self.push(child, interaction)
 
         return callback

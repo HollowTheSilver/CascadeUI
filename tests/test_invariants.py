@@ -178,3 +178,142 @@ class TestDiscordCallErrorsIsTheOnlyCatchTuple:
         # never enough.
         assert not issubclass(discord.RateLimited, discord.HTTPException)
         assert not issubclass(aiohttp.ClientError, discord.HTTPException)
+
+
+# // ========================================( Collected view exits )======================================== // #
+
+
+def _exits_outside_the_helper():
+    """``X.exit(...)`` calls whose receiver is neither ``self`` nor ``super()``."""
+    offenders = []
+    for path in _python_sources():
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for func in ast.walk(tree):
+            if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if func.name == "_exit_or_successor":
+                continue
+            for node in ast.walk(func):
+                if not (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "exit"
+                ):
+                    continue
+                receiver = node.func.value
+                if isinstance(receiver, ast.Name) and receiver.id == "self":
+                    continue
+                if (
+                    isinstance(receiver, ast.Call)
+                    and isinstance(receiver.func, ast.Name)
+                    and receiver.func.id == "super"
+                ):
+                    continue
+                offenders.append(f"{_rel(path)}:{node.lineno}")
+    return offenders
+
+
+class TestCollectedViewsExitThroughTheHelper:
+    """A view the library collected can hand its place on before it is closed.
+
+    ``exit()`` on a view that navigated away with ``push()`` or ``pop()``
+    does nothing, since a caller holding that view means it. Library code
+    that closes a view it found in a registry, a snapshot, or an attachment
+    list means the panel, so it calls ``_exit_or_successor``, which exits
+    whichever view holds the place once any navigation in flight settles. A
+    view closing itself (``self.exit()``, ``super().exit()``) is the other
+    legitimate shape. Each site this rule found closed a panel's former view
+    and left the one on screen live.
+    """
+
+    def test_no_exit_on_a_collected_view_bypasses_the_helper(self):
+        offenders = _exits_outside_the_helper()
+
+        assert not offenders, (
+            "These call exit() on a view other than self, so a push or pop that "
+            "lands while they run leaves the view on screen live. Call "
+            f"_exit_or_successor() instead: {offenders}"
+        )
+
+
+def _wait_for_calls(source: str) -> list:
+    """Line numbers of calls to ``asyncio.wait_for`` in ``source``, however imported.
+
+    Resolved through the module's imports, so ``import asyncio as aio`` and
+    ``from asyncio import wait_for as bounded`` are found, while a method that
+    happens to share the name (discord.py's ``bot.wait_for("message")``) is not.
+    """
+    tree = ast.parse(source)
+    modules, submodules, functions = set(), set(), set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "asyncio":
+                    modules.add(alias.asname or "asyncio")
+                elif alias.name == "asyncio.tasks":
+                    if alias.asname:
+                        submodules.add(alias.asname)
+                    else:
+                        modules.add("asyncio")
+        elif isinstance(node, ast.ImportFrom) and node.module in ("asyncio", "asyncio.tasks"):
+            for alias in node.names:
+                if alias.name == "wait_for":
+                    functions.add(alias.asname or "wait_for")
+                elif alias.name == "tasks" and node.module == "asyncio":
+                    submodules.add(alias.asname or "tasks")
+    lines = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id in functions:
+            lines.append(node.lineno)
+        elif isinstance(func, ast.Attribute) and func.attr == "wait_for":
+            owner = func.value
+            if isinstance(owner, ast.Name) and owner.id in submodules:
+                lines.append(node.lineno)
+                continue
+            if isinstance(owner, ast.Attribute) and owner.attr == "tasks":
+                owner = owner.value
+            if isinstance(owner, ast.Name) and owner.id in modules:
+                lines.append(node.lineno)
+    return lines
+
+
+class TestTheLibraryBoundsWithoutWaitFor:
+    """``asyncio.wait_for`` on 3.10 and 3.11 returns its result when the caller
+    is cancelled as the work finishes, and the cancel is lost: a teardown that
+    cancelled a view's render found it still running. The library bounds its
+    awaits with ``_bounded_wait`` in ``utils/tasks.py`` instead."""
+
+    def test_no_library_module_calls_asyncio_wait_for(self):
+        offenders = [
+            f"{_rel(path)}:{line}"
+            for path in _python_sources()
+            for line in _wait_for_calls(path.read_text(encoding="utf-8"))
+        ]
+
+        assert not offenders, (
+            "These call asyncio.wait_for, which loses a cancel on Python 3.10 and "
+            f"3.11. Use _bounded_wait from cascadeui.utils.tasks: {offenders}"
+        )
+
+    def test_the_check_resolves_imports(self):
+        found = _wait_for_calls(
+            "import asyncio\n"
+            "import asyncio as aio\n"
+            "import asyncio.tasks as t\n"
+            "from asyncio import wait_for as bounded\n"
+            "from asyncio import tasks\n"
+            "async def f(bot, x):\n"
+            "    await asyncio.wait_for(x, 1)\n"
+            "    await aio.wait_for(x, 1)\n"
+            "    await asyncio.tasks.wait_for(x, 1)\n"
+            "    await bounded(x, 1)\n"
+            "    await t.wait_for(x, 1)\n"
+            "    await tasks.wait_for(x, 1)\n"
+            "    await bot.wait_for('message')\n"
+            "    await x.wait_for(1)\n"
+        )
+
+        assert found == [7, 8, 9, 10, 11, 12]

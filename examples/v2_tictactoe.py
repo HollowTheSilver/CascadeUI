@@ -12,12 +12,12 @@ patterns with V2 components:
       multi-user views
     - ``unauthorized_message`` for custom rejection text when a
       non-participant tries to click
-    - ``check_instance_available()`` at the command level rejects the
-      challenger before a challenge prompt is shown to the opponent
-    - ``on_instance_limit`` override as a fallback that mentions the
-      challenger by ID so the opponent knows which player is busy
-    - ``protect_attached = True`` prevents the challenger from
-      silently abandoning an active game with another player
+    - ``check_instance_available()`` at the command level rejects a
+      challenge before the opponent sees it, for either player
+    - ``on_instance_limit`` override as a fallback that names the busy
+      player, for a game that became busy after the challenge went out
+    - ``instance_policy = "reject"`` on the board, so starting a new
+      game never replaces one a player is still in
     - ``exit_policy = "delete"`` on the disposable challenge prompt
     - ``exit_policy = "disable"`` on the finished game board, freezing it
       in place on Close so the completed card stays as a record (matching
@@ -69,6 +69,7 @@ from cascadeui import (
     get_store,
     image_section,
     key_value,
+    read_slot,
     render_progress,
     stats_card,
 )
@@ -195,7 +196,7 @@ class TicTacToeChallengeView(StatefulLayoutView):
                 # Opponent avatar resolves from the Member object with no
                 # fetch; display_avatar always falls back to a default.
                 image_section(
-                    f"## \N{CROSSED SWORDS}\N{VARIATION SELECTOR-16} TicTacToe Challenge\n"
+                    "## \N{CROSSED SWORDS}\N{VARIATION SELECTOR-16} TicTacToe Challenge",
                     f"-# <@{self.challenger_id}> challenges <@{self.opponent.id}>",
                     url=self.opponent.display_avatar.with_size(128).url,
                 ),
@@ -230,9 +231,7 @@ class TicTacToeChallengeView(StatefulLayoutView):
         )
 
     async def _accept(self, interaction: discord.Interaction):
-        await self.exit()
-
-        # Create the game view (challenger's context owns it for instance limiting)
+        # The challenger owns the game view for instance limiting.
         view = TicTacToeView(
             interaction=interaction,
             user_id=self.challenger_id,
@@ -243,10 +242,12 @@ class TicTacToeChallengeView(StatefulLayoutView):
         )
 
         # auto_register_participants = True on TicTacToeView claims a slot
-        # for both players from allowed_users during send(); rollback is
-        # all-or-nothing, so a None return means zero side effects.
+        # for both players from allowed_users during send(), all or nothing.
+        # A None return means no game was posted, so the challenge stays up
+        # and on_instance_limit has told the opponent who is busy.
         if await view.send() is None:
             return
+        await self.exit()
 
     async def _decline(self, interaction: discord.Interaction):
         self.clear_items()
@@ -294,26 +295,16 @@ class TicTacToeView(StatefulLayoutView):
     unauthorized_message = "You're not part of this game."
     instance_limit = 1
     instance_scope = "user_guild"
-    instance_policy = "replace"
-    replace_policy = "delete"
-    # The challenger cannot silently abandon an active game: they must exit
-    # the current board before starting a new one. Without this, Player B's
-    # game would vanish with no warning when Player A re-challenges someone
-    # else.
-    protect_attached = True
-    # The live game board is ephemeral view-local state: nothing about an
-    # in-progress game belongs to one player's profile. Lifetime stats are
-    # dispatched separately to ``user_guild`` scope at game end via
-    # ``_record_player_stats``.
+    # One board per player per server. /tictactoe play checks before a
+    # prompt is shown; the send refuses a board that would give either
+    # player a second one, and on_instance_limit says who is busy.
+    instance_policy = "reject"
+    # The board is view-local: no part of a game in progress belongs to one
+    # player's scope.
     state_scope = None
-    # Lifetime stats land under a dedicated ``tictactoe_stats`` slot via
-    # ``dispatch_scoped`` (see ``_record_player_stats``). Naming the slot
-    # on the class (``scoped_slot``) keeps TicTacToe's per-player totals
-    # in their own bucket instead of sharing the default ``scoped`` space
-    # with other subsystems. Opting the slot in through ``persistent_slots``
-    # marks it write-through for ``PersistenceMiddleware`` so W/L/D totals
-    # survive restarts. The live game board has no persistent state
-    # (``state_scope`` is ``None``) so nothing else here depends on disk.
+    # Lifetime stats go to their own scoped bucket (see _record_player_stats),
+    # and persistent_slots saves that bucket, so W/L/D totals survive a
+    # restart. The board itself is never saved.
     scoped_slot = "tictactoe_stats"
     persistent_slots = ("tictactoe_stats",)
     auto_defer = True
@@ -321,19 +312,15 @@ class TicTacToeView(StatefulLayoutView):
     # every move. Stats dispatches happen at game end and are not
     # observed by this view.
     subscribed_actions = set()
-    # participant_limit = 2 is technically redundant with allowed_users
-    # = {player_x, player_o} -- two IDs already cap occupancy at two.
-    # Both are kept as a side-by-side demonstration of the auth domain
-    # (allowed_users / on_unauthorized) versus the capacity domain
-    # (participant_limit / on_participant_limit). See "Combining
-    # allowed_users and participant_limit" in docs/guide/views.md.
+    # Two checks, two domains: allowed_users decides who may click,
+    # participant_limit caps how many players occupy the board. See
+    # "Combining allowed_users and participant_limit" in docs/guide/views.md.
     participant_limit = 2
     auto_register_participants = True
     # Close freezes the finished board in place as a record, matching the
     # default timeout freeze and Battleship's game-over Close. Exit here is
     # always post-game (no setup phase to abandon), so a declarative policy
-    # fits where Battleship needs a phase-aware exit() override. Stale games
-    # are still removed by replace_policy when a new one evicts them.
+    # fits where Battleship needs a phase-aware exit() override.
     exit_policy = "disable"
     # The turn indicator and legend both name the players, and the board
     # rebuilds on every move, so without this a full game notifies both
@@ -438,6 +425,10 @@ class TicTacToeView(StatefulLayoutView):
                         style=discord.ButtonStyle.primary,
                         emoji="\N{ANTICLOCKWISE DOWNWARDS AND UPWARDS OPEN CIRCLE ARROWS}",
                         callback=self._rematch,
+                        # A generated id follows the label, which counts votes,
+                        # so the second player's click, sent from the screen
+                        # shown before the first vote, would no longer match.
+                        custom_id="rematch",
                     ),
                     # make_exit_button's own defaults are this button:
                     # secondary style, cross-mark emoji, and a
@@ -494,6 +485,12 @@ class TicTacToeView(StatefulLayoutView):
         """Create a callback for placing a mark on a cell."""
 
         async def callback(interaction: discord.Interaction):
+            # Clicks queue behind one another, so this one may come from a
+            # board that has moved on: a decided game or a taken cell. Returning
+            # drops it; the library acknowledges the click.
+            if self.winner is not None or self.board[cell] != EMPTY:
+                return
+
             # Turn enforcement: the other player gets an ephemeral nudge
             current_player = self.player_x if self.turn == "X" else self.player_o
             if interaction.user.id != current_player:
@@ -536,8 +533,7 @@ class TicTacToeView(StatefulLayoutView):
         opponents. Each player's outcome is dispatched independently so
         a forfeit by one side doesn't silently double-count against the
         other. Both dispatches are wrapped in a single ``batch()`` so
-        subscribers see the post-game state as one transition and the
-        undo stack collapses to one entry (matches Battleship parity).
+        subscribers see the post-game state as one transition.
         """
         if self.guild_id is None:
             return
@@ -560,10 +556,9 @@ class TicTacToeView(StatefulLayoutView):
         binary won/lost pair Battleship uses. ``forfeit`` is only
         meaningful when ``outcome == "loss"``.
 
-        ``dispatch_scoped`` is called with explicit ``scope=`` and
-        ``user_id=`` kwargs so this view (``state_scope = None``) can
-        write into the opponent's scope key. Without overrides the call
-        would target ``self.user_id``, which is wrong here.
+        ``dispatch_scoped`` takes ``scope=`` because this view sets no
+        ``state_scope``, and ``user_id=`` because the default is the
+        view's owner, which is only one of the two players.
         """
         existing = self.state_store.get_scoped(
             "user_guild",
@@ -578,10 +573,8 @@ class TicTacToeView(StatefulLayoutView):
             "draws": existing.get("draws", 0) + (1 if outcome == "draw" else 0),
             "forfeits": existing.get("forfeits", 0) + (1 if forfeit else 0),
         }
-        # SCOPED_UPDATE shallow-merges ``data`` into the existing slice.
-        # The view's ``scoped_slot = "tictactoe_stats"`` routes the write
-        # to its own bucket, so the stats dict is passed directly (no
-        # ``"tictactoe"`` sub-key wrapper needed).
+        # SCOPED_UPDATE shallow-merges ``data`` into this player's entry in
+        # the view's ``scoped_slot`` bucket.
         await self.dispatch_scoped(
             new_stats,
             scope="user_guild",
@@ -593,6 +586,9 @@ class TicTacToeView(StatefulLayoutView):
 
     async def _forfeit(self, interaction: discord.Interaction):
         """The clicking player forfeits, the other player wins."""
+        # A forfeit queued behind the deciding move arrives too late.
+        if self.winner is not None:
+            return
         self._forfeited_by = interaction.user.id
         # Determine winner based on who clicked, not whose turn it is
         self.winner = "O" if interaction.user.id == self.player_x else "X"
@@ -602,6 +598,9 @@ class TicTacToeView(StatefulLayoutView):
 
     async def _rematch(self, interaction: discord.Interaction):
         """Vote for a rematch. Resets the board when both players agree."""
+        # A vote queued behind the reset belongs to the finished game.
+        if self.winner is None:
+            return
         self._rematch_votes.add(interaction.user.id)
 
         if len(self._rematch_votes) >= 2:
@@ -624,7 +623,7 @@ class TicTacToeView(StatefulLayoutView):
 # Derived leaderboard -- same shape as Battleship's. The selector reads
 # the raw ``tictactoe_stats`` bucket; the compute_fn groups by guild
 # and sorts each guild's list by wins desc then games desc.
-@computed(selector=lambda s: s.get("application", {}).get("tictactoe_stats", {}))
+@computed(selector=lambda s: read_slot(s, "tictactoe_stats", default={}))
 def tictactoe_leaderboards(bucket: dict) -> dict:
     """Return ``{guild_id: [(user_id, stats), ...]}`` sorted by wins desc."""
     # Wrap the cached bucket in a minimal envelope so StateStore.iter_scoped
@@ -689,16 +688,21 @@ class TicTacToeExample(commands.Cog, name="v2_tictactoe_example"):
             await context.send("You can't play against a bot!", ephemeral=True)
             return
 
-        # Pre-check: reject the command if the challenger already has an
-        # active game, before the opponent ever sees a challenge prompt.
+        # Pre-check both players before the opponent sees a challenge.
         if not TicTacToeView.check_instance_available(
             user_id=context.author.id,
             guild_id=context.guild.id,
         ):
             await context.send(
-                "You're already in a game. Finish or exit it first.",
+                "You're already in a game. Finish it and close the board first.",
                 ephemeral=True,
             )
+            return
+        if not TicTacToeView.check_instance_available(
+            user_id=opponent.id,
+            guild_id=context.guild.id,
+        ):
+            await context.send(f"{opponent.mention} is already in a game.", ephemeral=True)
             return
 
         win_length = win if win is not None else size
@@ -774,7 +778,7 @@ class TicTacToeExample(commands.Cog, name="v2_tictactoe_example"):
         description="Show this server's TicTacToe leaderboard.",
     )
     async def tictactoe_leaderboard(self, context: Context) -> None:
-        """Display server-wide totals and the top 3 players by wins."""
+        """Display server-wide totals and the top 10 players by wins."""
         if not context.guild:
             await context.send("This command can only be used in a server.", ephemeral=True)
             return
@@ -804,9 +808,10 @@ class TicTacToeExample(commands.Cog, name="v2_tictactoe_example"):
                 return f"{wins}W / {games}G \N{BULLET} {draws}D \N{BULLET} {bar}"
 
             def build_header(self, page):
-                # Overview stats card above the rankings on every page,
-                # read from self.ranked_entries (the loaded top-N slice).
-                entries = self.ranked_entries
+                # Overview stats card above the rankings on every page.
+                # get_entries() is every player in the server (the entries=
+                # list); ranked_entries holds only the top 10 shown below.
+                entries = self.get_entries()
                 # Each game contributes to two player rows.
                 unique_games = sum(e[1].get("games", 0) for e in entries) // 2
                 total_draws = sum(e[1].get("draws", 0) for e in entries) // 2

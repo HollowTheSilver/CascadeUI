@@ -19,6 +19,7 @@ from discord.ui import (
     Select,
     Separator,
     TextDisplay,
+    TextInput,
     Thumbnail,
     UserSelect,
     View,
@@ -84,6 +85,16 @@ class TestTopLevelRejections:
         with pytest.raises(ValueError, match="Button cannot be a child of LayoutView"):
             validate_placement(v)
 
+    def test_a_dynamic_button_at_top_level_is_rejected(self):
+        from discord.ui import DynamicItem
+
+        class _Dyn(DynamicItem[Button], template=r"dt:(?P<x>\d+)"):
+            def __init__(self, x: int):
+                super().__init__(Button(custom_id=f"dt:{x}", label="L"))
+
+        with pytest.raises(ValueError, match="Button cannot be a child of LayoutView"):
+            validate_placement(_view_with(_Dyn(1)))
+
     def test_standalone_select_at_top_level_rejected(self):
         v = _view_with(Select(custom_id="s", placeholder="p"))
         with pytest.raises(ValueError, match="Select cannot be a child of LayoutView"):
@@ -118,6 +129,16 @@ class TestContainerRejections:
         v = _view_with(outer)
         with pytest.raises(ValueError, match=r"Container\[1\]"):
             validate_placement(v)
+
+    def test_a_dynamic_button_in_a_container_is_rejected(self):
+        from discord.ui import DynamicItem
+
+        class _Dyn(DynamicItem[Button], template=r"dc:(?P<x>\d+)"):
+            def __init__(self, x: int):
+                super().__init__(Button(custom_id=f"dc:{x}", label="L"))
+
+        with pytest.raises(ValueError, match="Button cannot be a child of Container"):
+            validate_placement(_view_with(Container(_Dyn(1))))
 
     def test_button_in_container_rejected(self):
         v = _view_with(Container(Button(custom_id="b", label="L")))
@@ -190,8 +211,9 @@ class TestSectionRejections:
 
 
 class TestModalOnlyTypeRejections:
-    """Label, RadioGroup, CheckboxGroup, Checkbox, FileUpload belong inside a
-    Modal. Adding them to a LayoutView or Container triggers Discord HTTP 400."""
+    """Label, TextInput, RadioGroup, CheckboxGroup, Checkbox, FileUpload belong
+    inside a Modal. Adding them to a LayoutView or Container triggers Discord
+    HTTP 400."""
 
     def test_label_at_top_level_rejected(self):
         v = _view_with(Label(text="Field", component=Checkbox(custom_id="cb")))
@@ -216,6 +238,16 @@ class TestModalOnlyTypeRejections:
     def test_fileupload_at_top_level_rejected(self):
         v = _view_with(FileUpload())
         with pytest.raises(ValueError, match="FileUpload is a Modal-only component"):
+            validate_placement(v)
+
+    def test_textinput_at_top_level_rejected(self):
+        v = _view_with(TextInput(label="Name"))
+        with pytest.raises(ValueError, match="TextInput is a Modal-only component"):
+            validate_placement(v)
+
+    def test_textinput_in_an_action_row_rejected(self):
+        v = _view_with(ActionRow(TextInput(label="Name")))
+        with pytest.raises(ValueError, match="TextInput"):
             validate_placement(v)
 
     def test_label_in_container_rejected(self):
@@ -305,6 +337,28 @@ class TestButtonLabelSize:
     def test_exactly_at_cap_passes(self):
         v = _view_with(ActionRow(Button(custom_id="b", label="L" * 80)))
         validate_placement(v)
+
+    @staticmethod
+    def _dynamic(label):
+        from discord.ui import DynamicItem
+
+        class _Dyn(DynamicItem[Button], template=r"dl:(?P<x>\d+)"):
+            def __init__(self, x: int):
+                super().__init__(Button(custom_id=f"dl:{x}", label=label))
+
+        return _Dyn(1)
+
+    def test_an_oversized_dynamic_button_label_is_rejected(self):
+        """The check read only plain Buttons, so a DynamicItem (every role
+        button among them) sent an 81-character label to be refused by Discord."""
+        v = _view_with(ActionRow(self._dynamic("L" * 81)))
+        with pytest.raises(ValueError, match="Button label is 81 characters"):
+            validate_placement(v)
+
+    def test_an_oversized_dynamic_accessory_label_is_rejected(self):
+        s = Section(TextDisplay("hi"), accessory=self._dynamic("Z" * 90))
+        with pytest.raises(ValueError, match="80-character cap"):
+            validate_placement(_view_with(Container(s)))
 
 
 class TestButtonUrlSize:
@@ -736,14 +790,41 @@ class TestActionRowSizeBounds:
         v = _view_with(Container(row))
         validate_placement(v)
 
+    @pytest.mark.parametrize("buttons", [1, 4])
+    def test_a_select_followed_by_buttons_is_rejected(self, buttons):
+        """discord.py counts a select added first as one slot, so this row
+        constructs; Discord allows a select only on a row of its own."""
+        select = Select(custom_id="s", options=[SelectOption(label="a", value="a")])
+        row = ActionRow(select, *[Button(custom_id=f"b{i}", label="L") for i in range(buttons)])
+        v = _view_with(Container(TextDisplay("filler"), row))
+        with pytest.raises(ValueError, match=f"ActionRow holds a Select beside {buttons} other"):
+            validate_placement(v)
+
+    def test_a_dynamic_item_select_followed_by_a_button_is_rejected(self):
+        """A select wrapped in a DynamicItem is still a select to Discord."""
+        from discord.ui import DynamicItem
+
+        class _DynamicSelect(DynamicItem[Select], template=r"ds:(?P<x>\d+)"):
+            def __init__(self, x: int):
+                options = [SelectOption(label="a", value="a")]
+                super().__init__(Select(custom_id=f"ds:{x}", options=options))
+
+        row = ActionRow(_DynamicSelect(1), Button(custom_id="b", label="L"))
+        v = _view_with(Container(TextDisplay("filler"), row))
+        with pytest.raises(ValueError, match="ActionRow holds a Select beside 1 other"):
+            validate_placement(v)
+
+    def test_a_select_alone_is_accepted(self):
+        select = Select(custom_id="s", options=[SelectOption(label="a", value="a")])
+        validate_placement(_view_with(ActionRow(select)))
+
     def test_dynamic_item_in_actionrow_accepted(self):
         """DynamicItem-wrapped components serialize as Button/Select at send.
 
         DynamicItem is an Item subclass that is NOT a Button or Select
-        subclass at the Python level. The validator must let unknown
-        Item subclasses pass through ActionRow children so that
-        DynamicPersistentButton (CascadeUI's DynamicItem-based persistent
-        button) and similar wrappers do not falsely trip rejection.
+        subclass at the Python level, so the validator checks the component
+        it carries; DynamicPersistentButton (CascadeUI's DynamicItem-based
+        persistent button) and similar wrappers pass as the Button they hold.
         """
         from discord.ui import DynamicItem
 

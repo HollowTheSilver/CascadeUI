@@ -2,35 +2,33 @@
 
 
 import asyncio
+import contextlib
 import logging
-from typing import Optional
+from contextvars import ContextVar
+from typing import Any, Optional
 
 import aiohttp
 import discord
 
 logger = logging.getLogger(__name__)
 
-# Every way a Discord call reports that it did not land. ``RateLimited``
-# is a sibling of ``HTTPException`` rather than a subclass, so catching
-# the latter alone misses it. It is raised whenever the client was
-# built with ``max_ratelimit_timeout`` and a bucket exceeds it, which is
-# a supported upstream option, not an exotic one. ``aiohttp.ClientError``
-# is the third sibling: a request that never reached Discord raises from
-# the transport rather than from discord.py, so a reset connection or a
-# dropped keep-alive carries none of the HTTP types. It is the umbrella
-# rather than ``OSError`` for two reasons: ``ServerDisconnectedError``
-# is a ``ClientError`` and NOT an ``OSError``, and ``asyncio.TimeoutError``
-# IS an ``OSError`` from 3.11 but not on 3.10, so an ``OSError`` clause
-# would mean different things across the supported interpreters and would
-# swallow the ack-deadline timeouts these seams handle separately.
-#
-# Catch this tuple at any seam that must survive a failed call; catch
-# ``InteractionResponded`` separately, since at an ack it means the work
-# is already done and at an edit it means to try another endpoint.
+# Every way a Discord call reports that it did not land (see the API reference).
+# ``aiohttp.ClientError``, not ``OSError``: ``ServerDisconnectedError`` is no
+# ``OSError``, and from Python 3.11 ``asyncio.TimeoutError`` is one, which would
+# swallow the ack-deadline timeouts. ``InteractionResponded`` is caught on its own.
 DISCORD_CALL_ERRORS = (discord.HTTPException, discord.RateLimited, aiohttp.ClientError)
 
 # Discord drops an interaction left unacknowledged this long after creation.
 ACK_DEADLINE_SECONDS = 3.0
+
+# The interactions (by object identity) respond_safe answered inside a
+# _collect_replies() block, or None outside one. A followup leaves the
+# response type at the defer, so this is the only record a reply was sent.
+_REPLIES: ContextVar[Optional[set]] = ContextVar("cascadeui_replies", default=None)
+
+# Views whose one-request answer stalled inside a _collect_stalled_renders()
+# block, keyed by id() to the keywords and number of each stalled refresh.
+_STALLED: ContextVar[Optional[dict]] = ContextVar("cascadeui_stalled_renders", default=None)
 
 # // ========================================( Functions )======================================== // #
 
@@ -52,6 +50,72 @@ def validate_ack_delay(owner: str, name: str, value) -> None:
             f"{owner}.{name} must be under {ACK_DEADLINE_SECONDS} (Discord's interaction "
             f"acknowledgment deadline), got {value!r}"
         )
+
+
+@contextlib.contextmanager
+def _collect_replies():
+    """Yield a set gathering ``id()`` of each interaction answered in the block."""
+    replied: set = set()
+    token = _REPLIES.set(replied)
+    try:
+        yield replied
+    finally:
+        _REPLIES.reset(token)
+
+
+def _note_reply(interaction: discord.Interaction) -> None:
+    replied = _REPLIES.get()
+    if replied is not None:
+        replied.add(id(interaction))
+
+
+@contextlib.contextmanager
+def _collect_stalled_renders():
+    """Yield a mapping gathering each view whose one-request answer stalled in the block."""
+    stalled: dict = {}
+    token = _STALLED.set(stalled)
+    try:
+        yield stalled
+    finally:
+        _STALLED.reset(token)
+
+
+def _note_stalled_render(view, kwargs: dict, seq: int) -> None:
+    # Every one is kept: a later stall that carries no embed does not replace
+    # an earlier one's.
+    stalled = _STALLED.get()
+    if stalled is not None:
+        stalled.setdefault(id(view), (view, []))[1].append((kwargs, seq))
+
+
+async def ship_stalled_renders(stalled: dict) -> None:
+    """Ship the renders whose one-request answer stalled, through the view's message.
+
+    The acting-view edit rides the interaction's acknowledgement, so a
+    Discord response slow enough to threaten the 3s deadline is abandoned
+    and the backstop acknowledges instead. Each abandoned render is then
+    sent again through the view's message rather than waiting for the
+    view's next render: after the interaction is answered, or, when the
+    callback raised, before ``on_error`` answers it, since this edit does
+    not use the response.
+
+    Never raises: it runs in ``finally`` blocks, where a raise would replace
+    the callback's own exception, so a failed send is logged instead.
+    """
+    for view, renders in stalled.values():
+        for kwargs, seq in renders:
+            try:
+                await view._ship_stalled_render(kwargs, seq)
+            except DISCORD_CALL_ERRORS as exc:
+                logger.warning(
+                    f"Could not send the stalled render of {type(view).__name__} again: "
+                    f"{describe_discord_error(exc)}"
+                )
+            except Exception:
+                logger.warning(
+                    f"Could not send the stalled render of {type(view).__name__} again",
+                    exc_info=True,
+                )
 
 
 def describe_discord_error(exc: BaseException) -> str:
@@ -104,8 +168,11 @@ async def ack_backstop(
     log: Optional[logging.Logger] = None,
     ephemeral: bool = False,
     warn_on_expiry: bool = False,
-) -> None:
+) -> bool:
     """Sleep, then acknowledge the interaction if nothing else has.
+
+    Returns whether this acknowledged it, which tells a caller that finds
+    the interaction deferred whether its own handler made the defer.
 
     Discord drops an interaction that goes unacknowledged for 3 seconds.
     Every surface that runs user code on that clock arms one of these
@@ -155,17 +222,14 @@ async def ack_backstop(
                 f"Auto-defer backstop acked for {owner} after the handler used its "
                 f"full {delay:.2f}s budget: {elapsed_since(interaction)}"
             )
+            return True
     except asyncio.CancelledError:
         pass
     except discord.NotFound:
         if warn_on_expiry:
             log.warning(
-                # The rate-limit wait is named because it is invisible from
-                # here: discord.py sleeps on an exhausted bucket inside
-                # HTTPClient.request, so the call simply takes longer and
-                # nothing distinguishes it from a busy loop. The other two
-                # causes both point at the caller's own code, which sends an
-                # operator looking there first.
+                # A rate-limit wait is named: discord.py sleeps it inside the
+                # request, which nothing here can tell from a busy loop.
                 f"Auto-defer ack missed the 3s deadline in {owner}: "
                 f"{elapsed_since(interaction)} (event-loop congestion, slow "
                 f"pre-callback work, or a rate-limit wait inside an earlier "
@@ -175,6 +239,7 @@ async def ack_backstop(
             log.debug(f"Auto-defer found the interaction already expired in {owner}")
     except Exception:
         log.debug(f"Auto-defer failed for interaction in {owner}")
+    return False
 
 
 async def trailing_ack(
@@ -221,21 +286,52 @@ async def trailing_ack(
 
 
 def _rewind_files(kwargs: dict) -> None:
-    """Seek any attachment back to its start before a second send attempt.
+    """Read every attachment in ``kwargs`` from its start on the next attempt.
 
     A send that reaches the HTTP layer consumes the file's stream. discord.py
     rewinds only on retry attempts of its own loop (``File.reset(seek=False)``
-    on the first pass is deliberately a no-op), so a fall-through to the
-    followup path would upload zero bytes. Only reached when the first send
-    lost the response slot, which is the one case discord.py does not treat as
-    a retry.
+    on the first pass is deliberately a no-op), so a file passed to a later
+    call, or sent again through another endpoint (a followup after the
+    response slot was lost, an edit that falls through to the channel, a
+    stalled render sent again), would upload zero bytes. Edits carry their
+    files as ``attachments``.
+
+    A file discord.py opened from a path is closed by its send, so it is
+    opened again from that path. A stream an earlier send took goes into a
+    new ``File``, since aiohttp 3.11 closes a stream once it has written it.
+    Replacements go into ``kwargs``; the caller's own list is left as it was.
     """
-    for value in (kwargs.get("file"), *(kwargs.get("files") or ())):
-        if isinstance(value, discord.File):
-            try:
-                value.reset(seek=True)
-            except Exception:  # a closed or non-seekable stream is unrecoverable
-                logger.debug(f"Could not rewind {value.filename!r} for the followup send")
+    if "file" in kwargs:
+        kwargs["file"] = _rewound(kwargs["file"])
+    for key in ("files", "attachments"):
+        if kwargs.get(key):
+            kwargs[key] = [_rewound(value) for value in kwargs[key]]
+
+
+def _rewound(value: Any) -> Any:
+    """``value`` rewound to its start (a new ``File`` when the old one cannot be
+    reused), or ``value`` itself when it is not a file."""
+    if not isinstance(value, discord.File):
+        return value
+    try:
+        value.reset(seek=True)
+    except ValueError:
+        # Closed. discord.py closes a file it opened from a path once its
+        # request ends, so only a path can bring it back.
+        path = getattr(value.fp, "name", None)
+        if isinstance(path, str):
+            return discord.File(path, filename=value.filename, description=value.description)
+    except Exception:
+        pass
+    else:
+        # A File keeps aiohttp from closing its stream only until its first
+        # send, and aiohttp 3.11 closes the stream once it has written it. A
+        # new File over the same stream holds it open again.
+        if getattr(value.fp.close, "__self__", None) is value.fp:
+            return discord.File(value.fp, filename=value.filename, description=value.description)
+        return value
+    logger.debug(f"Could not read {value.filename!r} from its start again")
+    return value
 
 
 async def open_modal_safe(
@@ -286,11 +382,8 @@ async def open_modal_safe(
         except discord.InteractionResponded:
             pass
         except aiohttp.ClientError as e:
-            # The request never reached Discord, so the dialog did not open
-            # and the fallback would travel the same broken connection.
-            # Report non-delivery rather than raising: the caller is a
-            # component callback, where an escaping exception renders an
-            # error card over a click that merely needs repeating.
+            # Never reached Discord, so a fallback would travel the same broken
+            # connection. Reported, not raised, over a click that needs repeating.
             logger.warning(
                 f"Modal {modal.title!r} did not reach Discord: " f"{describe_discord_error(e)}"
             )
@@ -338,23 +431,20 @@ async def respond_safe(
             on both paths even though only ``send_message`` takes it
             natively.
     """
+    _rewind_files(kwargs)
     if not interaction.response.is_done():
         try:
             await interaction.response.send_message(content, ephemeral=ephemeral, **kwargs)
+            _note_reply(interaction)
             return
         except discord.InteractionResponded:
-            # The is_done() read and the send are not atomic. An ack backstop
-            # armed outside the interaction lock can take the slot in between,
-            # so the check passing does not mean the send will. Falling through
-            # to the followup path delivers the same reply either way.
+            # An ack backstop outside the interaction lock can take the slot
+            # between is_done() and the send; the followup delivers the reply.
             pass
         except aiohttp.ClientError as e:
-            # The request never reached Discord, so whether the reply landed
-            # is unknowable from here. The followup path is not retried: if
-            # the send did arrive, a second copy is worse than the missing
-            # one, and this is a transient notice either way. Raising is the
-            # worst of the three -- it renders an error card over a reply the
-            # user may already be reading.
+            # Whether it landed is unknown: not retried, since a second copy is
+            # worse than a missing notice, and not raised, since the reply may
+            # already be showing.
             logger.warning(f"Reply did not reach Discord: {describe_discord_error(e)}")
             return
         except discord.HTTPException as e:
@@ -372,11 +462,13 @@ async def respond_safe(
     try:
         if delete_after is None:
             await interaction.followup.send(content, ephemeral=ephemeral, **kwargs)
+            _note_reply(interaction)
             return
 
         # wait=True is what makes followup.send return the Message the timer
         # below needs a handle on.
         message = await interaction.followup.send(content, ephemeral=ephemeral, wait=True, **kwargs)
+        _note_reply(interaction)
     except aiohttp.ClientError as e:
         # Same contract as the response path above: a notice that never left
         # the host is logged, not raised into the caller's callback.
@@ -403,9 +495,6 @@ async def respond_safe(
         if exc is not None:
             logger.debug(f"delete_after task failed for a followup: {exc!r}")
 
-    # Deliberately un-owned. The timer's lifetime belongs to the message, not
-    # to any view: routing it through TaskManager under a view's id would let
-    # that view's exit() cancel the deletion and strand the notice on screen,
-    # the opposite of what the caller asked for. Mirrors how discord.py itself
-    # implements delete_after on the paths that support it natively.
+    # Owned by no view: a view's exit() would cancel the deletion and leave the
+    # notice up. discord.py's own delete_after is unowned the same way.
     asyncio.create_task(_delete_later()).add_done_callback(_report)

@@ -410,6 +410,8 @@ TextInput(
 
 `min_length` accepts 0-4000 and `max_length` accepts 1-4000; an out-of-range bound raises a directed `ValueError` at construction.
 
+Discord refuses an empty `required` input but accepts one holding only spaces; `Modal` refuses that answer too, naming the field, and skips its validators.
+
 The `custom_id` is auto-generated as `"input_{label}"` (lowercased, spaces replaced with underscores). Use `TextInput._slug(label)` to reproduce the same transformation externally.
 
 `description=` populates `ui.Label.description` for an optional secondary helper line beneath the title. Available on every wrapped input type (Checkbox, CheckboxGroup, RadioGroup, FileUpload all accept the same kwarg).
@@ -433,9 +435,10 @@ Modal(
 )
 ```
 
-- `inputs` accepts any combination of CascadeUI input wrappers (`TextInput`, `Checkbox`, `CheckboxGroup`, `RadioGroup`, `FileUpload`) or raw `discord.ui.TextInput` instances. Discord caps a modal at 5 top-level inputs; labels must be distinct because each input's `custom_id` derives from its label (duplicates raise at construction).
+- `inputs` accepts any combination of CascadeUI input wrappers (`TextInput`, `Checkbox`, `CheckboxGroup`, `RadioGroup`, `FileUpload`) or raw discord.py inputs: a `discord.ui.TextInput`, or a `discord.ui.Label` around any modal input, which is how a select goes into a modal. A `discord.ui.TextDisplay` among them is shown as text and submits nothing. A button, a select passed without its `Label`, or any other component that submits no value raises `TypeError` at construction, since Discord would refuse the modal when it opened; `modal.add_item()` refuses the button and the bare select too. Discord caps a modal at 5 top-level inputs; labels must be distinct because each input's `custom_id` derives from its label (duplicates raise at construction).
 - Validators are read from each input's `validators` list and collected internally. On failure, an ephemeral error message is sent and the callback is skipped. Each validator receives whatever its input submits: `str` for text, `bool` for a checkbox, `list[str]` for a checkbox group, `list[discord.Attachment]` for an upload.
 - `view_id` -- links the modal to a view's state. A `MODAL_SUBMITTED` action is dispatched before the callback runs.
+- A modal opened from a button on a view answers its submission with that view's re-render, in one request, when the callback re-renders it, as a click is answered. The callback then replies with `respond()` or `interaction.followup`, since the response slot is used; `interaction.response` raises `InteractionResponded`, as it does after a click's re-render. A view reacting to `MODAL_SUBMITTED` re-renders before the callback runs and edits its message, leaving the answer to the callback. If the view has closed by the time the callback runs, the closed-session notice answers instead.
 - If no `callback` is provided, the interaction is deferred automatically. A `callback` that cannot accept `(interaction, values)` raises `TypeError` at construction, since every submission delivers the collected values.
 - The constructor's signature is closed: an unrecognized keyword raises `TypeError` naming it, rather than being discarded silently. `on_submit=` is the method discord.py subclasses override and the natural wrong guess for `callback=`, and a modal with no handler set acknowledges every submission and runs nothing.
 - `auto_defer_delay` (class attribute, default `2.5`) -- the ack backstop in seconds. `Modal.on_submit` arms an auto-defer timer across the whole submission (the access check, the validators, and the callback), so a slow validator or a raising handler cannot leave the interaction unacknowledged. Raise it on a subclass with a slow async validator, but keep it under `3.0`: the timer defers after this delay, so a value at or past Discord's 3-second acknowledgment deadline can never land. It validates at class-definition time (a positive number under `3.0`).
@@ -628,7 +631,7 @@ action_section(
 
 Creates a `Section` with a green/red toggle button. `labels` sets the (active, inactive) button text -- pass `("On", "Off")` to relabel. `emoji` adds a button emoji. Pass `disabled=True` to render the button greyed out and non-interactive. Pass `custom_id=` inside a `PersistentLayoutView`, where auto-generated ids do not survive a restart.
 
-The callback takes `(interaction)` or `(interaction, active)`; the two-parameter form receives the state the click asks for (the flip of the rendered `active`), matching `toggle_button` and `cycle_button`. A callback that can accept neither shape raises `TypeError` at construction.
+The callback takes `(interaction)` or `(interaction, active)`; the two-parameter form receives the state the click asks for (the flip of the rendered `active`), matching `toggle_button` and `cycle_button`. A callback that can accept neither shape raises `TypeError` at construction. The second click of a double-click is dropped rather than flipping the toggle back, since both clicks come from the same render.
 
 ```python
 toggle_section(
@@ -729,7 +732,7 @@ for row in rows:
 
 ### `choice_row(options, *, on_select, selected=None, multi=False, disabled=False, allow_reselect=False, button_threshold=5, active_style=primary, inactive_style=secondary, placeholder=None, custom_id="choice")`
 
-A single-select (or multi-select) "choose one/any" control. Renders a segmented button `ActionRow` at or below `button_threshold` options (active = highlighted, and disabled in single-select), or a `StatefulSelect` dropdown for 6-25 options. Raises `ValueError` past 25. `on_select` takes `(interaction, value)` and receives the picked value (single) or the list of selected values (multi); a callback that cannot accept both raises `TypeError` at construction. The builder handles the string round-trip Discord forces on select option values, so the callback always gets the real Python value. `disabled=True` greys out the whole control (every button, or the dropdown) for a read-only or locked state. `allow_reselect=True` keeps the active single-select option clickable so a re-pick fires `on_select` again (default `False` makes a re-pick a no-op in both button and dropdown forms); it is ignored in multi-select, where active options already toggle.
+A single-select (or multi-select) "choose one/any" control. Renders a segmented button `ActionRow` at or below `button_threshold` options (active = highlighted, and disabled in single-select), or a `StatefulSelect` dropdown for 6-25 options. Raises `ValueError` past 25. `on_select` takes `(interaction, value)` and receives the picked value (single) or the list of selected values (multi); a callback that cannot accept both raises `TypeError` at construction. The builder handles the string round-trip Discord forces on select option values, so the callback always gets the real Python value. `disabled=True` greys out the whole control (every button, or the dropdown) for a read-only or locked state. `allow_reselect=True` keeps the active single-select option clickable so a re-pick fires `on_select` again (default `False` makes a re-pick a no-op in both button and dropdown forms); it is ignored in multi-select, where active options already toggle. In multi-select the second click of a double-click on one option is dropped rather than toggling it back.
 
 ```python
 choice_row(
@@ -739,7 +742,7 @@ choice_row(
 )
 ```
 
-`options` is a `{label: value}` dict or a sequence of `Choice`. `multi=True` reads `selected` as a collection of active values rather than one, turns the buttons into toggles, and delivers a list to `on_select`. Values need not be hashable -- a `Choice.value` may be any Python object, including a list or a dict. `active_style` / `inactive_style` set the button colors (button form only; dropdowns have no per-option style), and `placeholder` sets the dropdown's placeholder text. Two controls in one view need distinct `custom_id=` values. Raises `ValueError` for an empty `options`, more than 25 options, or a `button_threshold` outside 0-5; raises `TypeError` if `on_select` is not callable.
+`options` is a `{label: value}` dict or a sequence of `Choice`. `multi=True` reads `selected` as a collection of active values rather than one, turns the buttons into toggles, and delivers a list to `on_select`. Values need not be hashable -- a `Choice.value` may be any Python object, including a list or a dict. `active_style` / `inactive_style` set the button colors (button form only; dropdowns have no per-option style), and `placeholder` sets the dropdown's placeholder text. `custom_id` matters only inside a `PersistentLayoutView`, where each option's id is `{custom_id}_{n}`: give each control in the view its own, and keep its options in a fixed order, since those ids name positions. Raises `ValueError` for an empty `options`, more than 25 options, or a `button_threshold` outside 0-5; raises `TypeError` if `on_select` is not callable.
 
 ### `Choice`
 
@@ -753,7 +756,7 @@ Choice(label="Goals", value=Event.GOAL, emoji="⚽", description="Match goals")
 
 ### `toggle_button(*, active, on_toggle, labels=("Enabled", "Disabled"), emoji=None, custom_id=None)`
 
-A standalone boolean toggle button -- the `ActionRow` form of `toggle_section` (no accompanying text). Renders green when `active`, relabels between the two `labels` on each click, and calls `on_toggle` with the new state. `on_toggle` takes `(interaction, active)`; a callback that cannot accept both raises `TypeError` at construction. Pass `custom_id=` inside a `PersistentLayoutView`, where auto-generated ids do not survive a restart.
+A standalone boolean toggle button -- the `ActionRow` form of `toggle_section` (no accompanying text). Renders green when `active`, relabels between the two `labels` on each click, and calls `on_toggle` with the new state; the second click of a double-click is dropped rather than flipping it back. `on_toggle` takes `(interaction, active)`; a callback that cannot accept both raises `TypeError` at construction. Pass `custom_id=` inside a `PersistentLayoutView`, where auto-generated ids do not survive a restart.
 
 ```python
 ActionRow(toggle_button(active=self.notify, on_toggle=self._set_notify))
@@ -761,7 +764,7 @@ ActionRow(toggle_button(active=self.notify, on_toggle=self._set_notify))
 
 ### `button_row(buttons, *, style=secondary, emoji=None, custom_id=None)`
 
-An `ActionRow` built from a `{label: callback}` mapping: one `StatefulButton` per entry, sharing `style` and `emoji`. Each callback takes the interaction alone; one that demands a second argument raises `TypeError` at construction. Raises `ValueError` on an empty mapping or more than Discord's five buttons per row. `custom_id` is a base suffixed per button (`{custom_id}_0`, `{custom_id}_1`, ...); pass it inside a `PersistentLayoutView`, where auto-generated ids do not survive a restart.
+An `ActionRow` built from a `{label: callback}` mapping: one `StatefulButton` per entry, sharing `style` and `emoji`. Each callback takes the interaction alone; one that demands a second argument raises `TypeError` at construction. Raises `ValueError` on an empty mapping or more than Discord's five buttons per row. `custom_id` matters only inside a `PersistentLayoutView`, where it is a base suffixed per button (`{custom_id}_0`, `{custom_id}_1`, ...) and ids that survive a restart are required; outside one, each button's id is derived from what it does, as for any other button.
 
 ```python
 button_row({"Save": self._save, "Reset": self._reset}, style=discord.ButtonStyle.primary)
@@ -769,7 +772,7 @@ button_row({"Save": self._save, "Reset": self._reset}, style=discord.ButtonStyle
 
 ### `cycle_button(*, values, on_change, labels=None, style=secondary, emoji=None, start=0, custom_id=None)`
 
-A button that cycles through a fixed list of `values` on each click, advancing (and wrapping) the index before calling `on_change` with the new value. Use it when a setting has three or more options but a full select is overkill -- a single "Preset" button cycling `["Low", "Medium", "High"]` instead of three toggles. `on_change` takes `(interaction, value)`; a callback that cannot accept both raises `TypeError` at construction. `labels` defaults to `str(value)` per entry; `start` is the initial index. Pass `custom_id=` inside a `PersistentLayoutView`, where auto-generated ids do not survive a restart.
+A button that cycles through a fixed list of `values` on each click, advancing (and wrapping) the index before calling `on_change` with the new value. The second click of a double-click is dropped rather than skipping a value. Use it when a setting has three or more options but a full select is overkill -- a single "Preset" button cycling `["Low", "Medium", "High"]` instead of three toggles. `on_change` takes `(interaction, value)`; a callback that cannot accept both raises `TypeError` at construction. `labels` defaults to `str(value)` per entry; `start` is the initial index. Pass `custom_id=` inside a `PersistentLayoutView`, where auto-generated ids do not survive a restart.
 
 ```python
 cycle_button(
@@ -834,7 +837,8 @@ Preset-style buttons. All but `LinkButton` extend `StatefulButton`:
   `(interaction)` or `(interaction, toggled)`; the two-parameter form
   receives the post-flip state, matching `toggle_button` and
   `toggle_section`. A callback that can accept neither shape raises
-  `TypeError` at construction
+  `TypeError` at construction. The second click of a double-click is
+  dropped rather than flipping it back
 
 ---
 
@@ -887,11 +891,11 @@ def build_ui(self):
 
 #### `async on_page_changed(page) -> None`
 
-Override hook. Called after the page index updates, before the refresh. Default is a no-op. Use for analytics, async prefetch, or per-page validation. Read `self.host` for the view the region renders into, which is what a prefetch needs; it is `None` until the host's first render.
+Override hook. Called after the page index updates, before the refresh. Default is a no-op. Use for analytics, async prefetch, or per-page validation. Read `self.host` for the view the region renders into, which is what a prefetch needs; it is `None` until the host's first render. When the re-render does not land the region stays on the page it showed and the hook is not called again.
 
-#### `await show_page(index)`
+#### `await show_page(index, *, notify=True)`
 
-Jumps to a zero-based page index, fires `on_page_changed`, and re-renders the host: the async counterpart to a nav-button click, for a programmatic jump (a search hit, a "find me" button, landing on the page holding a row the user just created). Requires the region to be attached already, since `controls(view)` is what gives it a host to re-render.
+Jumps to a zero-based page index, fires `on_page_changed`, and re-renders the host: the async counterpart to a nav-button click, for a programmatic jump (a search hit, a "find me" button, landing on the page holding a row the user just created). Raises `RuntimeError`, moving nothing, when the region is not attached yet, since `controls(view)` is what gives it a host to re-render; seek with `set_page()` before then. `notify=False` skips `on_page_changed`, for a jump the host makes on its own rather than one a user asked for: a return to the first page after inactivity, run by the timer that `on_page_changed` re-arms, would otherwise cancel itself. When the edit does not land, the cursor goes back to the page on screen either way.
 
 #### `set_page(index)`, `page`, `page_count`
 
@@ -914,9 +918,9 @@ def build_ui(self):
         self.add_item(item)
 ```
 
-`render(view)` returns `[trigger]` collapsed, or the trigger plus `reveal()` (ordered by `trigger_first`) expanded. A click flips the state, fires `on_toggle`, and re-runs the host's render path (the same `build_ui`/`reload` seam `PaginatedRegion` uses). The trigger relabels/restyles via `expanded_label` / `expanded_style` / `expanded_emoji`. Two collapsibles in one view need distinct `key=` values.
+`render(view)` returns `[trigger]` collapsed, or the trigger plus `reveal()` (ordered by `trigger_first`) expanded. A click flips the state, fires `on_toggle`, and re-runs the host's render path (the same `build_ui`/`reload` seam `PaginatedRegion` uses). The second click of a double-click is dropped rather than closing what the first opened. The trigger relabels/restyles via `expanded_label` / `expanded_style` / `expanded_emoji`. Two collapsibles in one view need distinct `key=` values.
 
-By default the trigger is a bare `ActionRow(button)`. Pass `summary` (a zero-argument synchronous callable read on every render, like `reveal`) to fuse the trigger into an `action_section` instead: a Section carrying the summary text with the trigger button as its accessory. This is the shape a card-based disclosure wants, where the Edit button sits beside its summary line rather than in a row of its own. The whole disclosure then splats into one `card(...)`:
+By default the trigger is a bare `ActionRow(button)`. Pass `summary` (the text, or a zero-argument synchronous callable read on every render, like `reveal`, when the text changes) to fuse the trigger into an `action_section` instead: a Section carrying the summary text with the trigger button as its accessory. This is the shape a card-based disclosure wants, where the Edit button sits beside its summary line rather than in a row of its own. The whole disclosure then splats into one `card(...)`:
 
 ```python
 self.rep = Collapsible(
@@ -938,7 +942,7 @@ When `summary` returns an empty value (data not loaded yet), the trigger falls b
 
 #### `async on_toggle(expanded) -> None`
 
-Override hook. Called after the state flips, before the re-render. Default is a no-op. Use to fetch async data when expanded, log toggle events, or validate on every open/close. Read `self.host` for the view the collapsible renders into; it is `None` until the host's first render captures it.
+Override hook. Called after the state flips, before the re-render. Default is a no-op. Use to fetch async data when expanded, log toggle events, or validate on every open/close. Read `self.host` for the view the collapsible renders into; it is `None` until the host's first render captures it. When the re-render does not land the state flips back to match the screen and the hook is not called again.
 
 ---
 
@@ -962,7 +966,7 @@ PaginationControls(page_count=int, on_page_change=async_fn)
 controls.add_to_view(view)
 ```
 
-`on_page_change` takes `(interaction, page)` and receives the new zero-based page; a callback that cannot accept both raises `TypeError` at construction.
+`on_page_change` takes `(interaction, page)` and receives the new zero-based page; a callback that cannot accept both raises `TypeError` at construction. The callback draws the page, so when it raises, the controls return to the page they left before the exception propagates.
 
 ### `ToggleGroup`
 
@@ -1036,6 +1040,12 @@ keeps their state apart.
 ---
 
 ## Utilities
+
+### `fetch_as_file(url, filename, *, session=None, spoiler=False, description=None, max_bytes=100 * 1024 * 1024)`
+
+Fetches `url` into an in-memory `discord.File`, for the `attachment://` references the V2 media builders (`gallery`, `image_section`, `file_attachment`) emit. Pass one `aiohttp.ClientSession` across several fetches in a callback; a call without one opens and closes its own. See [Local file attachments](../guide/components.md#local-file-attachments).
+
+An error status raises `aiohttp.ClientResponseError` rather than returning the error page as the file. A body larger than `max_bytes` raises `ValueError`; it is counted as it arrives, and the read stops once the count passes the limit, so a larger body is never read in full. The default, 100 MiB, is the most Discord accepts from a bot in any server; pass `guild.filesize_limit` for one server's own limit, or `None` for no limit. A `max_bytes` that is not an `int` raises `TypeError`, and one below 1 raises `ValueError`, both before any request.
 
 ### `slugify(text)`
 

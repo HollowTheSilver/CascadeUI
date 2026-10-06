@@ -3,6 +3,8 @@
 # // ========================================( Modules )======================================== // #
 
 
+import asyncio
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import aiohttp
@@ -184,6 +186,40 @@ class _SampleRolesForHooks(RolesLayoutView):
         RoleCategory(name="HookRequired", roles={"C": 1003}, exclusive=False, required=True),
         RoleCategory(name="HookBoth", roles={"D": 1004}, exclusive=True, required=True),
     ]
+
+
+class TestTextAttributeValidation:
+    @pytest.mark.parametrize(
+        "name",
+        ["assigned_message", "role_error_message", "hint_normal", "hint_exclusive_required"],
+    )
+    def test_a_per_instance_value_for_a_class_read_attribute_is_refused(self, name):
+        """A role button dispatches with no panel instance, so the hooks and the
+        hint router read these from the class and a per-instance value was
+        accepted and never shown."""
+        from helpers import make_interaction
+
+        panel = RolesLayoutView(interaction=make_interaction(user_id=1, guild_id=100))
+        with pytest.raises(ValueError, match="read from the class"):
+            panel.set_class_attribute(name, "text")
+
+    def test_a_per_instance_category_list_is_refused(self):
+        """A click resolves its category from the registry the class body
+        fills, so the panel rendered buttons that answered "out of date", or
+        ran another panel's category that shared a name."""
+        from helpers import make_interaction
+
+        panel = _SampleRolesForHooks(interaction=make_interaction(user_id=1, guild_id=100))
+        extra = RoleCategory(name="NotRegistered", roles={"E": 1005})
+        with pytest.raises(ValueError, match="read from the class"):
+            panel.set_class_attribute("categories", [extra])
+
+    @pytest.mark.parametrize(
+        "name", ["title", "subtitle", "hint_normal", "hint_exclusive", "hint_required"]
+    )
+    def test_a_non_string_is_refused_at_definition(self, name):
+        with pytest.raises(TypeError, match=f"{name} must be a str or None"):
+            type("_Panel", (RolesLayoutView,), {name: ["x"], "__module__": __name__})
 
 
 class TestFormatHooks:
@@ -458,6 +494,21 @@ class TestCardinalityBehavior:
         msg = interaction.response.send_message.call_args.args[0]
         assert "not found" in msg.lower() or "error" in msg.lower()
 
+    async def test_a_role_the_category_no_longer_offers_is_refused(self):
+        # A button left live from an older post of the panel carries the role
+        # in its custom_id, whatever the category now lists.
+        stale = _make_role(7777, "Removed")
+        member = _make_member()
+        interaction = _make_interaction(member, guild_roles=[stale])
+        cat = _SampleRolesForClick.categories[0]
+
+        await _SampleRolesForClick._handle_role_click(interaction, cat, 7777)
+
+        member.add_roles.assert_not_called()
+        member.remove_roles.assert_not_called()
+        msg = interaction.response.send_message.call_args.args[0]
+        assert "no longer offered" in msg
+
 
 # // ========================================( Hook Overrides )======================================== // #
 
@@ -689,6 +740,97 @@ class TestDynamicButtonIntegration:
     def test_button_custom_id_encodes_category_and_role(self):
         button = _RoleToggleButton(category_slug="test_slug", role_id=9999, label="TestLabel")
         assert button.item.custom_id == "roles:test_slug:9999"
+
+    async def test_a_double_click_changes_the_role_once(self, caplog):
+        """Both clicks reported the member's roles from before the first
+        change, so the second granted the role again (and confirmed it again),
+        or took it back once the change showed."""
+        caplog.set_level(logging.DEBUG, logger="cascadeui")
+        role = _make_role(2001, "A")
+        member = _make_member(roles=[])
+        adding = asyncio.Event()
+        release = asyncio.Event()
+
+        async def add_roles(*roles, **kwargs):
+            adding.set()
+            await release.wait()
+            member.roles = [*member.roles, *roles]
+
+        member.add_roles = AsyncMock(side_effect=add_roles)
+        slug = _category_slug(_SampleRolesForClick.categories[0].name)
+        button = _RoleToggleButton(category_slug=slug, role_id=2001)
+        first = asyncio.create_task(button.on_click(_make_interaction(member, guild_roles=[role])))
+        await asyncio.wait_for(adding.wait(), 1)
+
+        second = asyncio.create_task(button.on_click(_make_interaction(member, guild_roles=[role])))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(first, second)
+
+        member.add_roles.assert_awaited_once()
+        member.remove_roles.assert_not_awaited()
+        assert any(
+            "Dropped a click" in r.getMessage() and "still being toggled" in r.getMessage()
+            for r in caplog.records
+            if r.name.startswith("cascadeui")
+        )
+
+    async def test_a_click_after_the_first_is_handled_toggles_again(self):
+        role = _make_role(2001, "A")
+        member = _make_member(roles=[])
+
+        async def add_roles(*roles, **kwargs):
+            member.roles = [*member.roles, *roles]
+
+        member.add_roles = AsyncMock(side_effect=add_roles)
+        slug = _category_slug(_SampleRolesForClick.categories[0].name)
+        button = _RoleToggleButton(category_slug=slug, role_id=2001)
+        await button.on_click(_make_interaction(member, guild_roles=[role]))
+
+        await button.on_click(_make_interaction(member, guild_roles=[role]))
+
+        member.remove_roles.assert_awaited_once()
+
+
+class TestDynamicButtonsFreezeAndRender:
+    """A role button is a DynamicItem: its label and disabled state live on the
+    button it wraps. The teardown freeze and the render digest read the
+    wrapper, so an exit left every role button live and a render that only
+    disabled one was skipped as unchanged.
+    """
+
+    async def test_exit_freezes_the_role_buttons(self, clean_role_registries):
+        from helpers import make_interaction as _interaction
+
+        class _Panel(PersistentRolesLayoutView):
+            categories = [RoleCategory(name="FreezeCat", roles={"A": 8001, "B": 8002})]
+
+        panel = _Panel(persistence_key="freeze-roles", interaction=_interaction())
+        await panel.send()
+        message = panel._message
+
+        await panel.exit()
+
+        message.edit.assert_awaited()
+        frozen = message.edit.await_args.kwargs["view"]
+        buttons = [i.item for i in frozen.walk_children() if isinstance(i, _RoleToggleButton)]
+        assert len(buttons) == 2 and all(b.disabled for b in buttons)
+
+    async def test_a_refresh_after_disabling_a_role_button_ships(self, clean_role_registries):
+        from helpers import make_interaction as _interaction
+
+        from cascadeui import RenderOutcome
+
+        class _Panel(RolesLayoutView):
+            categories = [RoleCategory(name="DigestCat", roles={"A": 8101})]
+
+        panel = _Panel(interaction=_interaction())
+        await panel.send()
+        (button,) = [i for i in panel.walk_children() if isinstance(i, _RoleToggleButton)]
+        button.item.disabled = True
+
+        assert await panel.refresh() == RenderOutcome.RENDERED
 
 
 class TestRespondSafe:

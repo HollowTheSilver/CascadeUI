@@ -27,13 +27,33 @@ def reset_state_store():
 # // ========================================( PostgresBackend fixtures )======================================== // #
 
 
+# Every Postgres test skips when its imports or Docker are missing, so a
+# broken probe would pass the CI postgres job with nothing run. That job
+# sets CASCADEUI_REQUIRE_POSTGRES, and a run with no Postgres test passed
+# then fails.
+_postgres_tests_passed = 0
+
+
+def pytest_runtest_logreport(report):
+    global _postgres_tests_passed
+    if report.when == "call" and report.passed and "postgres" in report.nodeid.lower():
+        _postgres_tests_passed += 1
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if os.environ.get("CASCADEUI_REQUIRE_POSTGRES") and not _postgres_tests_passed:
+        print("\nCASCADEUI_REQUIRE_POSTGRES is set and no Postgres test passed.")
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
 # Optional dependency probe. When asyncpg or testcontainers is missing,
 # postgres-dependent tests skip cleanly via pytest.mark.skipif rather
 # than failing at collection time.
 postgres_available = False
 try:
     import asyncpg  # noqa: F401
-    from testcontainers.postgres import PostgresContainer  # noqa: F401
+
+    from tests._pg_helpers import PostgresContainer  # noqa: F401
 
     postgres_available = True
 except ImportError:

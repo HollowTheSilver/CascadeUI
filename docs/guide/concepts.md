@@ -201,7 +201,7 @@ complete list with defaults.
 | `instance_scope` | `"user_guild"` | Instance limit indexing key | -- |
 | `instance_policy` | `"replace"` | What happens when limit exceeded: `"replace"` or `"reject"` | -- |
 | `replace_policy` | `"delete"` | What happens to the old view on replace: `"delete"` or `"disable"` | -- |
-| `exit_policy` | `"disable"` | Bare `exit()` behavior: `"disable"` (freeze) or `"delete"` | -- |
+| `exit_policy` | `"disable"` | Bare `exit()` behavior, and the message a view sent again leaves: `"disable"` (freeze) or `"delete"` | -- |
 | `participant_limit` | `None` (unlimited) | Max total occupants (owner + participants) | `on_participant_limit()` |
 | `participant_limit_message` | `"This session is full."` | Rejection text on capacity hit | `on_participant_limit()` |
 | `auto_register_participants` | `False` | Auto-register `allowed_users` on `send()` | -- |
@@ -209,6 +209,7 @@ complete list with defaults.
 | `replaced_message` | `None` | Channel notification when a view is replaced | `on_replaced()` |
 | `error_message` | `"An unexpected error occurred..."` | Ephemeral error embed description | `on_error()` |
 | `reopen_failure_message` | `"Could not refresh this view..."` | Ephemeral text when ephemeral refresh fails | `on_reopen_failure()` |
+| `session_ended_message` | `"This session has ended."` | Ephemeral text when a modal is submitted after its view closed, or the refresh button finds no view to reopen; `None` sends nothing | `on_session_ended()` |
 | `state_scope` | `None` | Scoped state key: `"user"`, `"guild"`, `"user_guild"`, `"global"` | -- |
 | `scoped_slot` | `None` | Named bucket for scoped writes (routes to `state["application"][slot]`); `None` uses the default `scoped` bucket | -- |
 
@@ -518,11 +519,12 @@ This distinction matters for long-lived views:
 | **Channel endpoint** | `message.edit()` | Never | Background updates, state-driven refreshes |
 
 CascadeUI's `refresh()` prefers the acting-view fast path when possible:
-if the current component click targets the view's own message and the
-response slot is still open, the refresh ships through
-`interaction.response.edit_message()` in one HTTP round trip (ack + edit
-combined). If any gate fails (no bound interaction, response already
-deferred, cross-view dispatch, modal submit), `refresh()` falls through
+if the current component click, or a modal opened from one, targets the
+view's own message and the response slot is still open, the refresh ships
+through `interaction.response.edit_message()` in one HTTP round trip (ack +
+edit combined). If any gate fails (no bound interaction, response already
+deferred, cross-view dispatch, a modal opened from a slash command),
+`refresh()` falls through
 to the channel endpoint (`self._message.edit()`), which has no token
 expiry and works indefinitely. `exit()` always uses the channel endpoint,
 so it works whether or not the interaction has been responded to.
@@ -532,8 +534,8 @@ The fast path is also cancelled if the edit itself stalls past
 `refresh()` returns immediately and lets the auto-defer timer ack the
 click; the channel endpoint is NOT engaged, because a second edit on
 top of the cancelled fast path would consume the timer's ack budget
-under genuine Discord latency. The next state-change refresh ships
-the rebuilt tree. See
+under genuine Discord latency. Once the click is acknowledged, the
+rebuilt tree is sent through the channel endpoint. See
 [Fast-Path Stall](known-limitations.md#fast-path-stall-under-discord-edit-latency)
 for the trade-off.
 
@@ -545,9 +547,9 @@ every refresh through the slower two-call channel path.
 
 The fast-callback rule above assumes the callback's work plus its
 state-driven refresh complete inside `auto_defer_delay` (default 2.5
-seconds). When a callback genuinely needs longer -- a database query
+seconds). When a callback genuinely needs longer (a database query
 that blocks for one to two seconds, an `asyncio.gather` over external
-APIs, heavy CPU work that cannot be moved off the event loop -- the
+APIs, heavy CPU work that cannot be moved off the event loop), the
 fast path is unavailable regardless of whether the callback pre-defers.
 The auto-defer timer fires at 2.5 seconds, pre-acks the click, and
 disqualifies the fast path; subsequent refreshes route through the

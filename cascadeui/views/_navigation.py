@@ -3,12 +3,15 @@
 
 import asyncio
 import logging
+from typing import Optional
 
 import discord
 
-from ..components.base import StatefulButton
 from ..state.actions import ActionCreators
-from ..utils.responses import DISCORD_CALL_ERRORS, describe_discord_error
+from ..state.store import _CURRENT_INTERACTION
+from ..utils.hooks import await_maybe
+from ..utils.responses import DISCORD_CALL_ERRORS, _rewind_files, describe_discord_error
+from ..utils.tasks import _in_teardown_scope
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +19,19 @@ logger = logging.getLogger(__name__)
 # property of the stack shape, so one warning per edge is enough however
 # many times a user walks it.
 _exit_policy_mismatch_warned: set = set()
+
+# The reload-turn label a navigation holds on its destination; base.py reads
+# it to give a reload from a rebuild hook its own fix text.
+_NAVIGATION_TURN = "push() or pop()"
+
+# How a push or pop's edit ended. "unknown" is an edit that timed out or was
+# cancelled after its request left, which Discord may or may not have applied.
+_NAV_LANDED = "landed"
+_NAV_FAILED = "failed"
+_NAV_UNKNOWN = "unknown"
+
+# A wait on a push or pop in flight that lasts this long is logged.
+_NAVIGATION_WAIT_WARN_SECONDS = 30.0
 
 
 # // ========================================( Mixin )======================================== // #
@@ -82,6 +98,14 @@ class _NavigationMixin:
         subscriber and stores identity but does not dispatch
         SESSION_CREATED / VIEW_CREATED; only this method and
         ``_send_pipeline`` do.
+
+        The whole sequence runs in one batch, so the navigation action and
+        the destination's registration (and, for ``replace()``, the source's
+        exit) notify once.
+        The batch's source is the destination, which takes the inline
+        notification: a push or pop destination records that render and
+        plays it once it owns the message, and the source, still subscribed,
+        records what it would have rendered.
         """
         is_instance = not isinstance(view_or_class, type)
         if is_instance:
@@ -96,6 +120,18 @@ class _NavigationMixin:
                 )
             new_view = view_or_class
             view_class = type(new_view)
+            if new_view._used_before():
+                # The navigation would take it off its own message, or bring
+                # a closed view back: a cached instance pushed a second time
+                # would tear the panel down onto a view that answers nothing.
+                method = {"NAVIGATION_PUSH": "push()", "NAVIGATION_REPLACE": "replace()"}.get(
+                    action_type, "The navigation"
+                )
+                raise RuntimeError(
+                    f"{method} was given a {view_class.__name__} instance that has "
+                    f"already been sent, pushed, or closed. A view instance goes on one "
+                    f"message once. Fix: construct a new instance, or pass the class."
+                )
         else:
             view_class = view_or_class
             new_view = None  # constructed inside the batch below
@@ -121,41 +157,25 @@ class _NavigationMixin:
                     f"one-way per message. Use replace() for cross-version transitions."
                 )
 
-        # Cancel background tasks owned by this view before stopping
-        self.task_manager.cancel_tasks(self.id)
+        if is_instance and defer_teardown:
+            # Muted before it is carried the message: it is already
+            # subscribed, and owns nothing until the navigation lands. Marked
+            # after the checks above, so a refused push leaves the caller's
+            # instance as it was.
+            new_view._arriving_from = self
+            self._navigation_destination = new_view
 
-        # Quiesce the source: unsubscribe so it cannot race the destination
-        # edit. The rest of the teardown -- stop(), undo de-registration, and
-        # (in the batch below) VIEW_DESTROYED -- splits on ``defer_teardown``:
-        #
-        # - replace() and the default path commit it here and in the batch,
-        #   the long-standing one-way behavior.
-        # - push()/pop() defer it to a post-edit commit (_commit_source_teardown)
-        #   so a failed destination edit can roll back to a live, re-clickable
-        #   source instead of stranding a dead view behind a message that never
-        #   swapped. The active-registry removal stays deferred to _destroy_view
-        #   either way so it commits only after the VIEW_DESTROYED state
-        #   removal lands.
-        self.state_store._unsubscribe(self.id)
+        # replace() closes the source only once the destination is registered,
+        # so it refuses clicks and navigation from here: a push landing during
+        # a registration that awaits would leave two views live.
+        was_closing = self._closing
         if not defer_teardown:
-            self.stop()
-            self.state_store._undo_enabled_views.pop(self.id, None)
+            self._closing = True
 
-        # Batch the full navigation sequence: NAVIGATION_* + SESSION_CREATED
-        # (via _register_state) + VIEW_CREATED (via _register_state) +
-        # VIEW_DESTROYED collapse into a single BATCH_COMPLETE. Reducers
-        # still run inline so the ordering invariant (register new view
-        # BEFORE destroying old) is preserved inside the batch.
-        #
-        # ``source_id`` is rebound to the new view's id after construction
-        # (self has already unsubscribed above, so the OLD view won't
-        # receive BATCH_COMPLETE -- the NEW view is the live subscriber
-        # whose on_state_changed needs to ride the interaction ack cycle).
-        # The source was quiesced before the batch opened (unsubscribed,
-        # and for replace() stopped). An abort in here would leave it on
-        # screen with live buttons that no longer render, and the
-        # half-registered destination in both registries, so the recovery
-        # the failed-edit path already owns runs for a raise too.
+        # Reducers still run inline in the batch, so the destination registers
+        # before the source is destroyed. An abort would leave replace()'s
+        # half-registered destination in both registries, so replace() discards
+        # it inside the batch; push() and pop() settle in _navigate_in_place.
         async with self.state_store.batch() as batch:
             try:
                 await self.state_store.dispatch(action_type, action_payload, source_id=self.id)
@@ -173,25 +193,14 @@ class _NavigationMixin:
 
                     # Create new view
                     new_view = view_class(interaction=current_interaction, **kwargs)
+                    if defer_teardown:
+                        new_view._arriving_from = self
+                        self._navigation_destination = new_view
                 else:
-                    # Pre-constructed instance: __init__ wired the subscriber
-                    # and populated session_id / user_id / guild_id /
-                    # state_store from whatever interaction or kwargs the
-                    # caller passed. _register_state has not run yet (only
-                    # _send_pipeline and this method dispatch it), so
-                    # rebinding these fields here is safe -- nothing in
-                    # state references the instance's auto-derived values.
-                    #
-                    # session_id rebinds to the parent's session so
-                    # shared_data and the session lifecycle behave
-                    # identically to the class path. Skipping this would
-                    # destroy the parent's session when the parent is
-                    # cleaned up (last-member rule), losing parent
-                    # shared_data across navigation. user_id, guild_id,
-                    # and state_store typically already match because the
-                    # instance was constructed from the same interaction
-                    # as the parent; rebind defensively for the
-                    # cross-interaction edge case.
+                    # Safe before _register_state: nothing in state names the
+                    # instance's own identity yet. Without the source's session,
+                    # the source's teardown would delete it (last member) and
+                    # its shared_data with it.
                     if not new_view._init_kwargs.get("session_id"):
                         new_view.session_id = self.session_id
                     if not new_view._init_kwargs.get("user_id"):
@@ -204,15 +213,15 @@ class _NavigationMixin:
                     # The class path constructs with the acting interaction; the
                     # instance path binds it here, or a later navigation from
                     # this view (the interaction-or-self.interaction fallback)
-                    # degrades to the no-edit programmatic path.
+                    # finds none and edits through the channel.
                     if current_interaction is not None:
                         new_view.interaction = current_interaction
 
                 new_view._ephemeral = self._ephemeral
                 # Push and pop reuse one message, so a policy disagreement decides
-                # the same message's teardown by depth. replace() sends a new
-                # message and tears the source down under replace_policy, so a
-                # differing policy there is coherent and not worth a warning.
+                # the same message's teardown by depth. replace()'s destination
+                # sends a message of its own, so a differing policy there is
+                # coherent and not worth a warning.
                 if action_type != "NAVIGATION_REPLACE":
                     self._warn_on_exit_policy_mismatch(new_view)
 
@@ -235,13 +244,14 @@ class _NavigationMixin:
                     registry_message_id = getattr(self, "_registry_message_id", None)
                     if registry_message_id is not None:
                         new_view._registry_message_id = registry_message_id
-                    # Carry the ephemeral arming deadline, never recompute it: the
-                    # webhook token belongs to the original send, so a mid-chain
-                    # hop's handoff timer must sleep only the remainder of the
-                    # original 900s window. The timer itself is scheduled
-                    # post-commit in _settle_navigation -- armed here, it would
-                    # orphan on rollback (_rollback_navigation never cancels the
-                    # destination's tasks) and clobber the recovered source.
+                    hand_back = (
+                        getattr(self, "_superseded_registration", None) or self._carried_hand_back
+                    )
+                    if hand_back is not None:
+                        new_view._carried_hand_back = hand_back
+                    # Carried, never recomputed: the webhook token belongs to the
+                    # original send. The timer is scheduled by _commit_navigation;
+                    # armed here, it would run on a destination the rollback discards.
                     new_view._ephemeral_arm_deadline = self._ephemeral_arm_deadline
 
                 # Forward-transfer the navigation stack.  Push appends an entry
@@ -256,19 +266,17 @@ class _NavigationMixin:
                         "class_name": _class_path(type(self)),
                         "module": self.__class__.__module__,
                         "kwargs": self._init_kwargs if self._init_kwargs else {},
-                        # Selection state the kwargs snapshot cannot carry: it was
-                        # chosen after construction. pop() hands this back to
-                        # restore_nav_state on the reconstruction. The entry is
-                        # view-local and never serialized, so live objects are fine
-                        # here. A raising override costs the restore, not the
-                        # navigation -- the user still reaches the child view.
+                        # Chosen after construction, so the kwargs cannot carry it.
+                        # Never serialized, so live objects are fine here.
                         "view_state": self._capture_nav_state(),
-                        # The library's own handoff resolution as this view holds
-                        # it now. pop() hands it back so the restored view resumes
-                        # the policy it had: inheritance flows down a chain, never
-                        # back up it, and the declaration is a class attribute
-                        # that rides the reconstruction on its own.
+                        # pop() restores the policy this view had: inheritance
+                        # flows down a chain, never back up it.
                         "refresh_handoff_resolved": self._refresh_handoff_resolved,
+                        # A render hook given to this instance rather than its
+                        # class (a menu's fallback for a destination that
+                        # names none), so the reconstruction renders the same.
+                        "nav_rebuild": self.__dict__.get("nav_rebuild"),
+                        "class_overrides": dict(self._class_overrides),
                     }
                     new_view._nav_stack = list(self._nav_stack) + [entry]
                 elif action_type == "NAVIGATION_POP":
@@ -282,20 +290,21 @@ class _NavigationMixin:
                     new_view._instance_root_class = None
                 else:
                     origin = self._instance_root_class or type(self)._class_session_key()
+                    # The chain is also keyed by the root's scope: a screen with
+                    # its own instance_scope would be filed where the root's
+                    # limit never looks, letting one user hold two live panels.
+                    origin_scope = self._instance_root_scope or self.instance_scope
                     # If the destination IS the root class (e.g. pop() back to root),
                     # clear the origin so it knows it's the root again.
                     if view_class._class_session_key() == origin:
                         new_view._instance_root_class = None
                     else:
                         new_view._instance_root_class = origin
+                        new_view._instance_root_scope = origin_scope
+                        new_view._instance_root_limit = self._root_instance_limit()
 
-                # Register the new view in the active view registry immediately.
-                # Sub-views from push/pop typically edit the existing message instead
-                # of calling send(), so register_view() must happen here -- otherwise
-                # the sub-view is invisible to instance limit enforcement.
-                # Pre-constructed instances also need this: __init__ wires the
-                # subscriber and stores identity, but register_view fires only
-                # from _send_pipeline or this navigation path.
+                # A push or pop destination never calls send(), so without this it
+                # would be invisible to instance limits.
                 self.state_store._register_view(new_view)
 
                 # Propagate participants for push/pop (same users, same message).
@@ -305,12 +314,8 @@ class _NavigationMixin:
                 if action_type != "NAVIGATION_REPLACE" and self._participants:
                     self._carry_participants_to(new_view)
 
-                # Register the new view in state BEFORE destroying the old one.
-                # This keeps session["members"] non-empty during the transition
-                # so the session is not prematurely deleted. Both class and
-                # instance paths reach this -- _register_state dispatches the
-                # SESSION_CREATED + VIEW_CREATED actions that populate the
-                # state row, and __init__ does not do this.
+                # Before the source is destroyed, so the session always keeps a
+                # member and is not deleted mid-transition.
                 await new_view._register_state()
 
                 # Push/pop targets inherit the parent's message without routing
@@ -320,37 +325,32 @@ class _NavigationMixin:
                 if action_type in ("NAVIGATION_PUSH", "NAVIGATION_POP") and new_view._message:
                     await new_view._update_message_state(new_view._message)
 
-                # Forward-transfer undo/redo stacks through push/pop chain so the
-                # undo timeline stays continuous across navigation. Routed through a
-                # VIEW_UPDATED dispatch so the transfer runs through the reducer like
-                # every other state mutation, rather than writing into the live
-                # state["views"] row in place.
+                # The undo timeline stays continuous across push and pop.
                 if action_type in ("NAVIGATION_PUSH", "NAVIGATION_POP"):
                     await self._carry_undo_stacks_to(new_view)
 
-                # Remove the old view from state. _destroy_view drops its
-                # active-registry entry once the state removal confirms, completing
-                # the teardown deferred from the top of this method. push()/pop()
-                # hold this until the destination edit confirms (see defer_teardown
-                # above); _commit_source_teardown runs it on success.
+                # replace() closes the source through exit() once the destination
+                # is registered; push() and pop() settle it in _navigate_in_place.
                 if not defer_teardown:
-                    await self.state_store._destroy_view(self.id, source_id=self.id)
+                    await self.exit()
             except BaseException:
-                # BaseException, not Exception: a cancellation mid-batch leaves
-                # the source unsubscribed and the destination half-registered
-                # exactly as a raise does.
-                # INSIDE the batch deliberately, mirroring _send_pipeline. The
-                # flush awards the inline notification slot to source_id
-                # (rebound to the destination above) and awaits that
-                # subscriber before any handler outside the block runs. A
-                # rollback placed outside would therefore let the destination
-                # paint itself onto the live message first, and only then be
-                # unsubscribed and destroyed, leaving the user clicking a view
-                # that no longer exists. Unsubscribing here lands before the
-                # flush, so the aborted batch announces a net-zero sequence.
-                await self._rollback_navigation(new_view)
+                # A cancel leaves the destination half-registered as a raise does.
+                # Inside the batch, since an abort still flushes the inline
+                # notification this batch awards the destination: unsubscribed
+                # first, it renders nothing for a navigation that failed.
+                if not defer_teardown:
+                    if new_view is not None:
+                        self._discard_destination(new_view)
+                        await self._destroy_settled(new_view, discarded=True)
+                    self._closing = was_closing
+                    if not was_closing:
+                        self._replay_if_owed()
                 raise
 
+        if not defer_teardown:
+            # A task this view owns that replaced it carries on as the
+            # destination's, so the view it built can still be sent from it.
+            self.task_manager._transfer(asyncio.current_task(), self.id, new_view.id)
         return new_view
 
     async def push(self, view_or_class, interaction=None, *, rebuild=None, **kwargs):
@@ -382,8 +382,21 @@ class _NavigationMixin:
                 ``rebuild`` is supplied.
             **kwargs: Additional kwargs passed to the new view constructor.
                 Must be empty when ``view_or_class`` is an instance.
+
+        Raises:
+            RuntimeError: This view already navigated away with ``push()``
+                or ``pop()`` (its message belongs to the view that call
+                returned, so navigate from that one), or has closed through
+                ``exit()``, a timeout, or ``stop()``, or is closing in an
+                ``exit()`` still running. Also raised when called
+                from inside a push or pop this view takes part in: from the
+                new view's ``on_load()`` or a rebuild hook, or from inside this
+                view's own ``send()``, which has not finished with its message.
         """
         from .base import _class_path
+
+        await self._wait_to_navigate("push()")
+        self._refuse_navigation("push()")
 
         push_payload = ActionCreators.navigation_push(
             session_id=self.session_id,
@@ -392,22 +405,23 @@ class _NavigationMixin:
             kwargs=self._init_kwargs if self._init_kwargs else None,
         )
 
-        new_view = await self._navigate_to(
-            view_or_class,
-            interaction,
-            action_type="NAVIGATION_PUSH",
-            action_payload=push_payload,
-            defer_teardown=True,
-            **kwargs,
+        def build():
+            return self._navigate_to(
+                view_or_class,
+                interaction,
+                action_type="NAVIGATION_PUSH",
+                action_payload=push_payload,
+                defer_teardown=True,
+                **kwargs,
+            )
+
+        def prepare(new_view):
+            if new_view.auto_back_button:
+                new_view._add_back_button()
+
+        return await self._navigate_in_place(
+            build, interaction, rebuild, prepare=prepare, inherit_handoff=True
         )
-
-        # Add back button if the target view wants one
-        if new_view.auto_back_button:
-            new_view._add_back_button()
-
-        await self._settle_navigation(new_view, interaction, rebuild)
-
-        return new_view
 
     async def pop(self, interaction=None, *, rebuild=None):
         """Pop the current view and return to the previous one on the nav stack.
@@ -422,14 +436,35 @@ class _NavigationMixin:
                 ``embed`` / ``content`` dict for the edit. The message
                 is edited with the restored view regardless of whether
                 ``rebuild`` is supplied.
+
+        Raises:
+            RuntimeError: This view already navigated away with ``push()``
+                or ``pop()`` (its message belongs to the view that call
+                returned, so navigate from that one), or has closed through
+                ``exit()``, a timeout, or ``stop()``, or is closing in an
+                ``exit()`` still running. Also raised when called
+                from inside a push or pop this view takes part in: from the
+                new view's ``on_load()`` or a rebuild hook, or from inside this
+                view's own ``send()``, which has not finished with its message.
         """
+        await self._wait_to_navigate("pop()")
+        self._refuse_navigation("pop()")
+
         if not self.session_id:
             return None
 
         if not self._nav_stack:
             return None
 
-        entry = self._nav_stack[-1]
+        return await self._pop_to(len(self._nav_stack) - 1, interaction, rebuild)
+
+    async def _pop_to(self, depth: int, interaction, rebuild):
+        """Return to the navigation entry at ``depth``, dropping every entry above it.
+
+        ``pop()`` is ``depth = len(self._nav_stack) - 1``. The caller has
+        waited out any navigation in flight and checked this view may navigate.
+        """
+        entry = self._nav_stack[depth]
 
         # Resolve the view class before navigating. Lazy import avoids a
         # circular import: base.py imports this module, and the registry
@@ -447,45 +482,113 @@ class _NavigationMixin:
         pop_payload = ActionCreators.navigation_pop(self.session_id)
         saved_kwargs = entry.get("kwargs") or {}
 
-        new_view = await self._navigate_to(
-            view_cls,
-            interaction,
-            action_type="NAVIGATION_POP",
-            action_payload=pop_payload,
-            defer_teardown=True,
-            **saved_kwargs,
+        def build():
+            return self._navigate_to(
+                view_cls,
+                interaction,
+                action_type="NAVIGATION_POP",
+                action_payload=pop_payload,
+                defer_teardown=True,
+                **saved_kwargs,
+            )
+
+        def prepare(new_view):
+            # The navigation trimmed one entry; a return further back trims
+            # to the entry it rebuilt.
+            new_view._nav_stack = list(self._nav_stack[:depth])
+            new_view._apply_class_overrides(entry.get("class_overrides") or {})
+            # What the parent selected since it was constructed. Before the
+            # edit, so on_load and a rebuild hook read the restored value.
+            new_view._apply_nav_state(entry.get("view_state") or {})
+            # Reconstruction resets the resolution and a pop never inherits, so
+            # without this a derived engagement would be lost to the token cliff.
+            new_view._refresh_handoff_resolved = entry.get("refresh_handoff_resolved")
+            if entry.get("nav_rebuild") is not None:
+                new_view.nav_rebuild = entry["nav_rebuild"]
+
+        return await self._navigate_in_place(
+            build, interaction, rebuild, prepare=prepare, inherit_handoff=False
         )
 
-        # Reapply the selection the parent held when it was pushed away from.
-        # The kwargs above rebuild what the parent was CONSTRUCTED with; this
-        # restores what it had SELECTED since. It runs before
-        # _settle_navigation, so on_load (and any rebuild hook) reads the
-        # restored value rather than the constructor's default.
-        if new_view is not None:
-            new_view._apply_nav_state(entry.get("view_state") or {})
-            # Resume the handoff resolution this view held when it was
-            # pushed away from. Reconstruction resets it to None and
-            # _settle_navigation never inherits on pop, so without the
-            # hand-back a derived engagement would be lost to the token
-            # cliff -- and a view that held no resolution comes back
-            # holding none.
-            new_view._refresh_handoff_resolved = entry.get("refresh_handoff_resolved")
+    async def _navigate_in_place(self, build, interaction, rebuild, *, prepare, inherit_handoff):
+        """Run a push or pop: move this view's message to a new view, or keep it.
 
-        await self._settle_navigation(new_view, interaction, rebuild, inherit_handoff=False)
+        A transaction on the message. While it runs this view is away: live,
+        still subscribed, its tasks running, but nothing it does edits the
+        message, and what it was asked to render is recorded. The new view
+        arrives muted and owns nothing until its edit lands. The navigation
+        ends in the ``finally`` below on every path, cancellation included,
+        and settles everything other code waits on before it awaits anything:
 
+        - landed: the message, the registration it carries, and the running
+          task pass to the new view, and this view is torn down;
+        - failed: the new view is discarded, and this view catches up on
+          what it recorded;
+        - unknown (the edit timed out or was cancelled after its request
+          left): as failed, and this view re-renders, since the message may
+          show the discarded view.
+
+        ``build`` constructs and registers the new view; ``prepare`` runs on it
+        before the edit. ``inherit_handoff`` lets a push destination adopt this
+        view's refresh-handoff policy; a pop hands the restored view its own.
+        """
+        self._begin_navigation()
+        outcome = _NAV_FAILED
+        try:
+            # An edit this view already started lands before this one, or the
+            # older render would arrive last and cover the new view.
+            await self._wait_for_own_edits()
+            new_view = await build()
+            prepare(new_view)
+            outcome = await self._apply_navigation_edit(new_view, interaction, rebuild)
+        except BaseException:
+            if self._nav_edit_started:
+                outcome = _NAV_UNKNOWN
+            raise
+        finally:
+            new_view = self._navigation_destination
+            self._navigation_destination = None
+            if outcome == _NAV_LANDED:
+                self._commit_navigation(new_view, inherit_handoff)
+                loser = self
+            else:
+                self._roll_back_navigation(new_view, reclaim=outcome == _NAV_UNKNOWN)
+                loser = new_view
+            if loser is not None:
+                await self._destroy_settled(loser, discarded=loser is not self)
         return new_view
 
-    async def _apply_navigation_edit(self, new_view, interaction, rebuild) -> bool:
+    async def _apply_navigation_edit(self, new_view, interaction, rebuild) -> str:
+        """Load, rebuild, and edit the message to ``new_view`` under its reload turn.
+
+        A reload or load that another task starts on the destination (an
+        avatar backfill its ``on_load`` schedules) waits for the navigation
+        to land instead of interleaving with this ``on_load`` or painting
+        the destination onto the message before this edit or a rollback.
+        """
+        async with new_view._reload_turn(_NAVIGATION_TURN):
+            return await self._edit_to_destination(new_view, interaction, rebuild)
+
+    async def _edit_to_destination(self, new_view, interaction, rebuild) -> str:
         """Run the optional rebuild hook, then edit the message to the new view.
 
-        Called by ``_settle_navigation`` (the push()/pop() tail). Returns
-        ``True`` when the destination reached the message and ``False`` when
-        every edit endpoint failed -- ``_settle_navigation`` commits the
-        deferred source teardown on ``True`` and rolls back to the live source
-        on ``False``. The message edit happens whenever a current interaction
-        is available, regardless of whether a ``rebuild`` callback was
-        supplied -- the navigation contract is that the Discord message
-        reflects the new view.
+        Called by ``_apply_navigation_edit``. Returns ``_NAV_LANDED`` when the
+        destination reached the message, ``_NAV_FAILED`` when no endpoint took
+        the edit, and ``_NAV_UNKNOWN`` when an edit stalled after its request
+        left. The message edit happens on every push and pop, through the
+        interaction when there is one and the channel endpoint otherwise,
+        whether or not a ``rebuild`` callback was supplied: the navigation
+        contract is that the Discord message reflects the new view.
+
+        The message edited is the one the source is on, carried onto the
+        destination, and the interaction's own endpoints edit it only when the
+        interaction is a click on that message. The channel endpoint edits it
+        instead when the interaction carries another message (the ephemeral
+        prompt a ``with_confirmation`` click comes from), carries none (a slash
+        command, or a modal opened from one, whose original response may be a
+        different message from a view sent as a followup), or there is no
+        interaction at all (a push or pop from a background task). A view never
+        sent has no message, and nothing is edited.
 
         ``rebuild`` is an optional pre-edit hook for callers whose
         views need post-construction setup (V2 views that build empty
@@ -501,21 +604,14 @@ class _NavigationMixin:
         acting-view fast path in ``refresh()`` uses. A slow rebuild lets the
         auto-defer timer ack first
         (``is_done()`` becomes True), routing to the deferred edit path.
+
+        The destination's ``on_load()`` runs first, on every push and pop, so
+        a view re-reads its data source whenever it is navigated to and needs
+        no ``rebuild`` hook for loading. A ``rebuild`` hook runs after it, for
+        setup other than data loading.
         """
         current_interaction = interaction or self.interaction
-        if current_interaction is None:
-            # No interaction to edit through (a programmatic push/pop). The
-            # caller owns display; treat the state transition as committed so
-            # the source teardown proceeds, matching the pre-deferral behavior.
-            return True
 
-        # Async preload on the destination view before the edit ships, so
-        # navigating to a child (push) or back to a parent (pop) re-reads
-        # its data source -- the reload-on-render contract. on_load()
-        # defaults to a no-op; a view that overrides it no longer needs
-        # rebuild=lambda v: v.load_and_build(). The explicit rebuild hook
-        # below still runs for views that use it for post-construction
-        # setup other than data loading.
         await new_view._run_on_load()
 
         # Fall back to the destination's own default rebuild. pop() passes no
@@ -527,9 +623,7 @@ class _NavigationMixin:
 
         edit_kwargs: dict = {}
         if rebuild is not None:
-            result = rebuild(new_view)
-            if asyncio.iscoroutine(result):
-                result = await result
+            result = await await_maybe(rebuild(new_view))
             if isinstance(result, dict):
                 edit_kwargs = result
                 # This dict reaches whichever of the three edit endpoints
@@ -537,73 +631,55 @@ class _NavigationMixin:
                 # refresh() enforces.
                 new_view._reject_non_portable_edit_kwargs(edit_kwargs)
 
-        # Pre-flight check on the new view's assembled tree. Catches the
-        # same class of HTTP 400 the validator catches in send/refresh:
-        # invalid placements introduced by a rebuild callback that
-        # populates the tree post-init. Theme-managed accents resolve
-        # first so the destination renders themed regardless of where
-        # its tree was built.
+        # The pre-flight check a send and a refresh run, on the finished tree,
+        # after stabilizing ids and resolving theme accents as the send does.
+        new_view._stabilize_custom_ids()
         new_view._apply_theme_defaults()
         new_view._sync_back_buttons()
         new_view._check_placement()
+        # After on_load() and the rebuild hook, which can change the links the
+        # commit carries: a link that would close a cycle rolls back here,
+        # where raising at the commit would leave the navigation unsettled.
+        self._check_hand_off(new_view)
 
-        # Push/pop reuse the parent's Discord message, carried onto
-        # new_view._message in the navigation batch above. That message --
-        # not the acting interaction's -- is the navigation edit target.
+        # Requests leave from here, so a raise or cancel past this point may
+        # follow an edit Discord applied.
+        self._nav_edit_started = True
+
+        # The source's message, carried onto new_view in the navigation batch
+        # above, is the edit target; the docstring says which endpoint edits it.
         target_message = new_view._message or self._message
-
-        # The acting interaction normally IS a click on target_message. A
-        # with_confirmation wrapper, though, runs the original callback with
-        # the confirm-button interaction, whose message is the ephemeral
-        # prompt -- a different message. Both interaction-coupled paths below
-        # (response.edit_message and edit_original_response) would then render
-        # the new view onto the prompt and leave target_message stale. When
-        # the interaction carries a message that differs from the view's,
-        # edit target_message directly through the channel endpoint instead.
-        # Interactions with no message (slash commands) keep the
-        # edit_original_response path -- their original response IS the view's
-        # message.
         interaction_msg_id = getattr(getattr(current_interaction, "message", None), "id", None)
-        if (
-            target_message is not None
-            and interaction_msg_id is not None
-            and interaction_msg_id != target_message.id
-        ):
-            # Ack the foreign interaction so the click does not error
-            # (_safe_defer no-ops when a wrapper already consumed the slot),
-            # then edit the view's own message. refresh() carries the
-            # cooldown/backoff/digest machinery and its own acting-fast-path
-            # gate re-confirms the message match.
-            await self._safe_defer(current_interaction)
+        if current_interaction is None and target_message is None:
+            return _NAV_LANDED
+        if interaction_msg_id is not None:
+            foreign = target_message is not None and interaction_msg_id != target_message.id
+        else:
+            foreign = (
+                target_message is not None
+                and current_interaction is not None
+                and current_interaction.type is not discord.InteractionType.component
+            )
+        if current_interaction is None or foreign:
+            # The deferral keeps the click from failing; refresh() re-checks the
+            # message match before its own fast path.
+            if current_interaction is not None:
+                await self._safe_defer(current_interaction)
             if new_view._message is None:
                 new_view._message = target_message
             try:
-                await new_view.refresh(**edit_kwargs)
-                if new_view._refresh_degraded:
-                    # refresh() swallows a transport failure because a repaint
-                    # can wait for the next state change. Navigation cannot:
-                    # the source is torn down on the strength of this edit, so
-                    # an edit that never reached Discord has to read as failure
-                    # here or the swap completes with the old view on screen.
-                    logger.warning(
-                        f"Navigation edit did not reach Discord in "
-                        f"{type(self).__name__}; rolling back to the source view."
-                    )
-                    return False
-                return True
+                result = await new_view.refresh(**edit_kwargs)
             except discord.HTTPException as e:
-                # refresh() already absorbs the three conditions that leave
-                # nothing to recover: NotFound, 429, and an expired
-                # ephemeral's 401. A remaining HTTP error means the view's
-                # own message could not be edited but the message is still
-                # reachable, so report failure and let the navigation roll
-                # back to the live source instead of stranding a dead view.
+                # refresh() absorbs NotFound, 429, and an expired ephemeral's 401.
+                # Any other error leaves a reachable message, so the navigation
+                # rolls back to the live source rather than strand a dead view.
                 logger.warning(
                     f"Navigation edit to the view's own message failed in "
                     f"{type(self).__name__}: status={getattr(e, 'status', '?')} "
                     f"code={getattr(e, 'code', '?')}; rolling back to source."
                 )
-                return False
+                return _NAV_FAILED
+            return self._refresh_outcome(new_view, result, "Navigation edit")
 
         # The destination's mention rules ride the two direct edits below.
         # They stay out of edit_kwargs deliberately: the refresh() paths above
@@ -613,26 +689,28 @@ class _NavigationMixin:
         direct_kwargs = dict(edit_kwargs)
         if nav_mentions is not None:
             direct_kwargs["allowed_mentions"] = nav_mentions
+        # A file the hook returned may have gone out with an earlier edit.
+        _rewind_files(direct_kwargs)
 
-        # Fast path: a component/modal interaction whose response slot is still
-        # open edits + acks in one request -- no separate defer round-trip, which
-        # was the source of the navigation pause. Bounded at the ack deadline via
-        # _ack_bounded (not edit_timeout) because the ack rides this call. Gated
-        # on interaction type because edit_message silently no-ops for
-        # slash-command interactions (e.g. a programmatic push() with no explicit
-        # interaction, which falls back to self.interaction).
+        # One request edits and acks, so it is bounded at the ack deadline, not
+        # edit_timeout. Gated on type because edit_message does nothing for a
+        # slash-command interaction.
         fast_eligible = current_interaction.type in (
             discord.InteractionType.component,
             discord.InteractionType.modal_submit,
         )
         if fast_eligible and not current_interaction.response.is_done():
             try:
-                await self._ack_bounded(
-                    current_interaction.response.edit_message(view=new_view, **direct_kwargs)
+                new_view._last_tree_digest = await self._ack_bounded(
+                    new_view._edit_and_digest(
+                        lambda: current_interaction.response.edit_message(
+                            view=new_view, **direct_kwargs
+                        )
+                    )
                 )
                 new_view._has_rendered = True
                 new_view._redrive_dynamic_items()
-                return True
+                return _NAV_LANDED
             except asyncio.TimeoutError:
                 # Ack window blown -- fall through to the deferred path (the
                 # auto-defer timer has likely acked by now) to recover the edit
@@ -642,32 +720,35 @@ class _NavigationMixin:
                     f"falling back to the deferred edit."
                 )
             except discord.InteractionResponded:
-                # The auto-defer timer (or another path) acked in the narrow
-                # window between the is_done() guard above and edit_message's
-                # own internal guard. InteractionResponded is a sibling of
-                # HTTPException, not a subclass, so it would otherwise escape
-                # the handler below. The slot is consumed -- fall through to the
-                # deferred original-response edit, which shows the destination.
+                # An ack landed between the is_done() check and edit_message's own
+                # guard. InteractionResponded is not an HTTPException, so it is
+                # caught by name; the deferred edit below ships the destination.
                 logger.debug(
                     f"Navigation fast path raced an ack in {type(self).__name__}; "
                     f"using the deferred edit."
                 )
             except DISCORD_CALL_ERRORS as e:
-                # 429: stamp the backoff and report failure so the navigation
-                # rolls back to the live source rather than hammering the rate
-                # limit; the user re-clicks to retry. Other transient failures
-                # fall through to the deferred path. RateLimited is a sibling
-                # of HTTPException, not a subclass, so it is named explicitly.
+                # A 429 rolls back to the live source rather than retry against
+                # the limit; other failures fall through to the deferred edit.
                 if self._handle_rate_limit(e):
-                    return False
+                    return _NAV_FAILED
 
         # Deferred path: the interaction is already acked (auto-defer timer, a
         # caller pre-defer, or a fast-path fall-through). Edit through the
-        # original-response endpoint.
+        # original-response endpoint. A fast path that ran streamed any file
+        # the edit carries.
+        _rewind_files(direct_kwargs)
         await self._safe_defer(current_interaction)
+        sent = {}
+
+        async def edit_original():
+            sent["message"] = await current_interaction.edit_original_response(
+                view=new_view, **direct_kwargs
+            )
+
         try:
-            msg = await self._bounded(
-                current_interaction.edit_original_response(view=new_view, **direct_kwargs)
+            new_view._last_tree_digest = await self._bounded(
+                new_view._edit_and_digest(edit_original)
             )
             new_view._has_rendered = True
             # Preserve the parent's plain Message ref. The edit response
@@ -675,35 +756,17 @@ class _NavigationMixin:
             # 15-minute interaction token; subsequent edits need the
             # channel endpoint, which the plain ref provides.
             if new_view._message is None:
-                new_view._message = msg
+                new_view._message = sent["message"]
             new_view._redrive_dynamic_items()
-            return True
+            return _NAV_LANDED
         except DISCORD_CALL_ERRORS:
-            # Ordered above the timeout clause deliberately. aiohttp's connect
-            # and socket timeouts inherit from both ClientError and
-            # asyncio.TimeoutError, and discord.py builds its session with no
-            # total timeout, so aiohttp's 30s sock_connect fires below
-            # edit_timeout. Catching the timeout first would route a request
-            # that never left the host past the one branch that recovers it.
-            #
-            # Interaction token expired (15-min lifetime), the ack was rate
-            # limited, or the request never reached Discord. Route the
-            # channel-endpoint fallback through refresh() so cooldown
-            # throttling, 429 backoff, and the render-hash short-circuit
-            # all participate in the edit.
+            # Above the timeout clause: aiohttp's connect timeouts are both
+            # ClientError and asyncio.TimeoutError, and a request that never
+            # left the host belongs here. An expired token, a rate-limited ack,
+            # or a transport failure edits through the channel via refresh().
             if new_view._message:
                 try:
-                    await new_view.refresh(**edit_kwargs)
-                    if new_view._refresh_degraded:
-                        # Same reasoning as the interaction path above: a
-                        # swallowed transport failure is still a swap that
-                        # did not happen.
-                        logger.warning(
-                            f"Navigation channel-endpoint edit did not reach "
-                            f"Discord in {type(self).__name__}; rolling back."
-                        )
-                        return False
-                    return True
+                    result = await new_view.refresh(**edit_kwargs)
                 except discord.HTTPException as e:
                     # refresh() already absorbs NotFound, 429, and an expired
                     # ephemeral's 401; remaining HTTP errors mean the channel
@@ -713,165 +776,619 @@ class _NavigationMixin:
                         f"{type(self).__name__}: status={getattr(e, 'status', '?')} "
                         f"code={getattr(e, 'code', '?')}; rolling back to source."
                     )
-            return False
+                    return _NAV_FAILED
+                return self._refresh_outcome(new_view, result, "Navigation channel-endpoint edit")
+            return _NAV_FAILED
         except asyncio.TimeoutError:
             logger.warning(
                 f"Navigation edit stalled past {self.edit_timeout}s in "
                 f"{type(self).__name__}; rolling back to source."
             )
-            return False
+            return _NAV_UNKNOWN
 
-    async def _settle_navigation(
-        self, new_view, interaction, rebuild, *, inherit_handoff=True
-    ) -> None:
-        """Edit the message to the destination, then commit or roll back.
+    def _refresh_outcome(self, new_view, result, where: str) -> str:
+        """Read a navigation edit made through ``refresh()`` as an outcome.
 
-        Shared tail of push()/pop(). ``_apply_navigation_edit`` reports whether
-        the destination reached the message. On success the source's attachment
-        tracking hands off to the destination, the deferred source teardown
-        commits, and the destination's ephemeral handoff timer (when the source
-        carried an arming deadline) is scheduled. ``inherit_handoff`` gates the
-        policy adoption inside that scheduling: ``True`` on push, where a
-        destination with no answer of its own adopts the source's, and
-        ``False`` on pop, where the restored view resumes the resolution
-        ``pop()`` handed back from the nav-stack entry. On failure -- a
-        contained edit error or a raising preload/rebuild -- the navigation
-        rolls back to the live source view.
+        ``refresh()`` absorbs failures a repaint can wait out, and navigation
+        cannot: the source is torn down on the strength of this edit. A
+        transport failure never reached Discord, a stall may have, and a
+        deferral under a rate limit sent nothing. A missing message still
+        commits: there is nothing left to show the source on.
         """
+        if result == "dropped":
+            if new_view._refresh_degraded:
+                logger.warning(
+                    f"{where} did not reach Discord in {type(self).__name__}; "
+                    f"rolling back to the source view."
+                )
+                return _NAV_FAILED
+            logger.warning(
+                f"{where} stalled in {type(self).__name__}; rolling back to the source view."
+            )
+            return _NAV_UNKNOWN
+        if result == "deferred":
+            return _NAV_FAILED
+        return _NAV_LANDED
+
+    def _begin_navigation(self) -> None:
+        """Mark this view away for a push or pop that is starting."""
+        self._away_for_navigation = True
+        self._missed_while_away = False
+        self._nav_edit_started = False
+        self._navigation_task = asyncio.current_task()
+        self._navigation_settled.clear()
+
+    def _end_navigation(self) -> None:
+        """Lift the away state and release every caller waiting on it."""
+        self._away_for_navigation = False
+        self._navigation_task = None
+        self._navigation_settled.set()
+
+    def _navigation_in_flight(self):
+        """The view running a push or pop this view takes part in, or ``None``.
+
+        This view when it is the source, the view it arrives from when it is
+        the destination.
+        """
+        if self._away_for_navigation:
+            return self
+        return self._arriving_from
+
+    def _used_before(self) -> bool:
+        """Whether this instance was already sent, pushed, or closed.
+
+        A view instance goes on one message once: placing a used one again
+        (a cached instance handed to ``push()``, ``replace()``, or returned by
+        ``build_reopen_view()``) would take it off its own message or bring a
+        closed view back.
+        """
+        return (
+            self._message is not None
+            or self._lifecycle_task is not None
+            or self._closed()
+            or self._torn_down()
+            or self._navigation_in_flight() is not None
+        )
+
+    async def _wait_out_navigation(self, method: str) -> None:
+        """Wait until no push or pop this view takes part in is in flight.
+
+        An ``exit()``, a timeout, a click, a parent's cleanup, or another
+        navigation would otherwise act on a message about to change hands, or
+        on a destination that may yet be discarded. Every waiter is woken when
+        a navigation settles and one of them can start the next, so each
+        re-checks before it proceeds. A wait that lasts
+        ``_NAVIGATION_WAIT_WARN_SECONDS`` is logged, since one that the
+        navigation is itself waiting on never ends.
+
+        Raises:
+            RuntimeError: The call comes from inside the navigation it would
+                wait for (the new view's ``on_load`` or a rebuild hook), which
+                would act on a message the navigation has not handed over.
+        """
+        source = self._navigation_in_flight()
+        if source is None:
+            return
+        if source._navigation_task is asyncio.current_task():
+            self._raise_inside_navigation(method, source)
+        watchdog = asyncio.get_running_loop().call_later(
+            _NAVIGATION_WAIT_WARN_SECONDS, self._warn_long_navigation_wait, method
+        )
         try:
-            edited = await self._apply_navigation_edit(new_view, interaction, rebuild)
-        except Exception:
-            # A raising on_load()/rebuild()/placement check left the
-            # destination unshowable. Recover the source, then re-raise so
-            # the error still reaches on_error.
-            await self._rollback_navigation(new_view)
-            raise
-        if edited:
-            # Migrate attachment tracking onto the destination (same message,
-            # same lifecycle) -- the same hand-off _reopen_ephemeral performs
-            # for its refreshed instance. Without it, a navigating parent
-            # orphans its attached children (the cleanup cascade dies with
-            # the source) and a navigating child escapes its own parent's
-            # cascade. The migration is destructive on the source's tracking,
-            # so it waits for the confirmed edit: a rolled-back push must find
-            # the source still holding its children and its parent link.
-            # replace() never reaches this tail, so its one-way behavior
-            # (attachments do not carry over) is preserved. Runs before the
-            # teardown commit so the source is fully live during the hand-off.
-            #
-            # Snapshot: attach_child prunes the source's list as it
-            # re-parents each child onto the destination.
-            self._carry_attachments_to(new_view)
+            while source is not None:
+                await source._navigation_settled.wait()
+                source = self._navigation_in_flight()
+        finally:
+            watchdog.cancel()
 
-            await self._commit_source_teardown()
-            # The source's arm timer was cancelled in _navigate_to and the
-            # destination inherited the deadline with the message refs.
-            # Scheduling waits until here, after the edit confirmed, because
-            # a timer armed pre-edit would survive rollback and clobber the
-            # recovered source. The carried deadline means the timer sleeps
-            # only the time remaining to the 900s token cliff; the next hop's
-            # cancel_tasks reaps this task, so the chain holds one live timer.
-            #
-            # Two separate questions gate the timer; conflating them would
-            # read the deadline's mere presence as the policy itself. The
-            # deadline answers WHEN: the message's token clock, present on
-            # any ephemeral chain. The destination answers WHETHER, via
-            # _refresh_handoff (see its property for the precedence).
-            # Inheritance flows down the chain only. A push destination with
-            # no answer of its own (no declaration and no resolution) adopts
-            # the source's onto _refresh_handoff_resolved, so the next hop
-            # and a rollback re-arm read a resolved policy rather than
-            # presence. On pop the source is the departing descendant, so
-            # nothing is adopted: pop() hands the restored view the
-            # resolution it held when it was pushed away from, and a view
-            # that held none does not acquire the child's.
-            handoff = new_view._refresh_handoff
-            if handoff is None and inherit_handoff:
-                handoff = self._refresh_handoff
-                if handoff is not None:
-                    new_view._refresh_handoff_resolved = handoff
-            if (
-                handoff is not False
-                and new_view._ephemeral_arm_deadline is not None
-                and not new_view._refresh_armed
-                and not new_view.is_finished()
-            ):
-                new_view.create_task(new_view._schedule_ephemeral_refresh())
-        else:
-            await self._rollback_navigation(new_view)
+    async def _wait_to_navigate(self, method: str) -> None:
+        """Wait until no send of this view, push or pop it takes part in, or Continue on it runs.
 
-    async def _commit_source_teardown(self) -> None:
-        """Complete the source view's teardown after a confirmed navigation edit.
+        A click reaches a view once its message is posted, while the send is
+        still fetching the message back and attaching the view to its
+        parent. A push or pop run then would move the message out from
+        under the send, which would report a view already torn down as sent.
+        A Continue wins as it does over a close: a navigation from code that
+        lands meanwhile finds the panel handed on to the replacement.
 
-        push()/pop() defer the source teardown past the destination edit (see
-        ``defer_teardown`` in ``_navigate_to``). Once the edit confirms, the
-        destination owns the message, so the source stops, drops its undo
-        registration, and leaves state. The source was already unsubscribed
-        during ``_navigate_to``.
+        Raises:
+            RuntimeError: The call comes from inside the send or the
+                navigation it would wait for.
         """
+        while True:
+            await self._wait_out_send(method)
+            await self._wait_out_navigation(method)
+            await self._wait_out_reopen(method)
+            reopening = (
+                self._reopen_task is not None and self._reopen_task is not asyncio.current_task()
+            )
+            if not self._lifecycle_sending and not reopening:
+                return
+
+    async def _wait_out_send(self, method: str) -> None:
+        """Wait for a send of this view in another task; raise inside the send itself."""
+        if not self._lifecycle_sending:
+            return
+        if self._lifecycle_task is asyncio.current_task():
+            raise RuntimeError(
+                f"{method} on {type(self).__name__} was called inside its own send(): "
+                f"from its on_pre_send(), on_load(), seed_initial_state(), or a hook the "
+                f"send ran. The send has not finished with the view's message. Fix: "
+                f"navigate once send() has returned."
+            )
+        watchdog = asyncio.get_running_loop().call_later(
+            _NAVIGATION_WAIT_WARN_SECONDS, self._warn_long_send_wait, method
+        )
+        try:
+            await self._send_finished()
+        finally:
+            watchdog.cancel()
+
+    def _warn_long_send_wait(self, method: str) -> None:
+        logger.warning(
+            f"{method} on {type(self).__name__} has waited "
+            f"{_NAVIGATION_WAIT_WARN_SECONDS:g}s for the view's send() to finish. If "
+            f"the send is waiting on this call (a hook it runs awaits a task that "
+            f"navigates this view), the wait never ends."
+        )
+
+    def _raise_inside_navigation(self, method: str, source) -> None:
+        role = "from it" if source is self else "bringing it in"
+        raise RuntimeError(
+            f"{method} on {type(self).__name__} was called inside the push() or pop() "
+            f"{role}, by the new view's on_load() or a rebuild= or nav_rebuild hook. "
+            f"That navigation has not yet decided which view owns the message. Fix: "
+            f"decide before calling push() or pop(), or act on the view it returns "
+            f"once it has returned."
+        )
+
+    async def _begin_exit(self, method: str) -> None:
+        """Start an ``exit()``: wait out a navigation, then mark the view closing.
+
+        A view closing takes no more clicks or navigation while its children
+        close. Refused first, before anything is closed, when the exit would
+        cascade into an attached view whose push or pop runs in this task
+        (the parent's ``exit()`` called from that navigation's new view):
+        the cascade would reach it only after this view had begun closing,
+        and could not wait on the navigation it is part of.
+        """
+        await self._wait_out_navigation(method)
+        await self._wait_out_reopen(method)
+        # After the waits, so a push or Continue that lands meanwhile is caught.
+        self._warn_if_handed_over(method)
+        self._refuse_cascade_into_own_navigation("A parent's exit()")
+        self._closing = True
+
+    def _refuse_cascade_into_own_navigation(self, method: str) -> None:
+        """Raise when a cascade from this view would reach a navigation in this task.
+
+        Checked before anything closes, so a refused call leaves every
+        attached view as it was.
+        """
+        current = asyncio.current_task()
+        pending = list(self._attached_children)
+        seen = set()
+        while pending:
+            view = pending.pop()
+            if id(view) in seen:
+                continue
+            seen.add(id(view))
+            source = view._navigation_in_flight()
+            if source is not None and source._navigation_task is current:
+                view._raise_inside_navigation(method, source)
+            pending.extend(view._attached_children)
+            if view._successor is not None:
+                pending.append(view._successor)
+
+    def _warn_long_navigation_wait(self, method: str) -> None:
+        logger.warning(
+            f"{method} on {type(self).__name__} has waited "
+            f"{_NAVIGATION_WAIT_WARN_SECONDS:g}s for a push() or pop() it takes part in "
+            f"to finish. If that navigation is waiting on this call (the new view's "
+            f"on_load or a rebuild hook awaits a task that exits, navigates, or "
+            f"clicks this view), the wait never ends."
+        )
+
+    async def _wait_for_own_edits(
+        self,
+        action: str = "A push() or pop() from",
+        timeout: Optional[float] = None,
+        *,
+        until_idle: bool = False,
+    ) -> bool:
+        """Wait for edits this view started before an edit that must land after them.
+
+        A push or pop edits the message to the new view, and a close freezes
+        it; an older edit landing last would cover either. Only the edits in
+        flight when the wait begins are waited for: one started later ships
+        what the push or close has already decided (an away view's render
+        only records, a closed view's ships its controls disabled), and
+        waiting for those too never ends while the view keeps editing.
+        ``until_idle`` also waits for edits started meanwhile, for a caller
+        whose edit nothing later accounts for. Each edit is bounded by
+        ``edit_timeout``; a wait with no bound that lasts
+        ``_NAVIGATION_WAIT_WARN_SECONDS`` is logged, naming ``action``.
+        Returns ``False`` when ``timeout`` seconds pass with an edit still in
+        flight.
+        """
+        pending = set(self._edits_pending)
+        if not pending:
+            return True
+        loop = asyncio.get_running_loop()
+        watchdog = loop.call_later(_NAVIGATION_WAIT_WARN_SECONDS, self._warn_long_edit_wait, action)
+        give_up = None if timeout is None else loop.time() + timeout
+        try:
+            while pending:
+                remaining = None if give_up is None else give_up - loop.time()
+                if remaining is not None and remaining <= 0:
+                    return False
+                _, pending = await asyncio.wait(pending, timeout=remaining)
+                if not pending and until_idle:
+                    # Another task can start an edit between the last one
+                    # landing and this task running.
+                    pending = set(self._edits_pending)
+            return True
+        finally:
+            watchdog.cancel()
+
+    def _warn_long_edit_wait(self, action: str) -> None:
+        logger.warning(
+            f"{action} {type(self).__name__} has waited {_NAVIGATION_WAIT_WARN_SECONDS:g}s "
+            f"for an edit the view started earlier to reach Discord, and edits the message "
+            f"after it; with edit_timeout = None that edit has no bound."
+        )
+
+    def _last_successor(self):
+        """The view this one's panel passed to, following each hand-off, or this view.
+
+        A hand-off is a ``push()`` or ``pop()``, an ephemeral panel's
+        Continue button, or a restart in the same process that restored the
+        panel.
+        """
+        view = self
+        while view._successor is not None:
+            view = view._successor
+        return view
+
+    def _warn_if_handed_over(self, method: str) -> None:
+        """Log once when a call that would do nothing reaches a view that handed its panel on.
+
+        The panel is another view's now, so a ``refresh()`` or ``exit()`` on
+        it changes nothing on screen. Code that keeps a reference to a panel
+        otherwise finds its calls stop working, with nothing said, as soon as
+        a user clicks into another screen. Silent for a view whose own
+        timeout fired while a push was landing, since its ``on_timeout()``
+        runs on the view it belonged to, and for an exit library cleanup
+        drives, which follows the push to the view that took over.
+        """
+        if (
+            self._successor is None
+            or self._warned_handed_over
+            or self._timed_out
+            or self._library_exits
+        ):
+            return
+        self._warned_handed_over = True
+        logger.warning(
+            f"{type(self).__name__}.{method} was called on a view that handed its panel "
+            f"on (a push() or pop() from it, an ephemeral panel's Continue button, or a "
+            f"restart that restored the panel), so "
+            f"it did nothing: the panel now shows {type(self._last_successor()).__name__}. "
+            f"Call it on current_view to reach that view."
+        )
+
+    @property
+    def current_view(self):
+        """The view now showing this view's panel.
+
+        This view, or the view it handed the panel to, following each
+        hand-off in turn: a ``push()`` or ``pop()``, the Continue button of
+        an ephemeral panel, whose replacement goes on a new message, or a
+        restart in the same process that restored the panel. Code
+        that keeps a reference to a panel reaches the screen now on it
+        through this: the library returns the new view only to the callback
+        that ran the hand-off, and the old view's ``exit()`` and navigation
+        calls no longer reach the panel.
+        """
+        return self._last_successor()
+
+    async def _exit_or_successor(self, delete_message=None) -> bool:
+        """Exit this view, or the view it handed its panel to.
+
+        For library cleanup of a view it collected before awaiting: an
+        instance-limit replacement, a persistent retire, a parent's cascade,
+        the devtools exits. ``exit()`` on a view that navigated away does
+        nothing, since a caller still holding it (its own timeout, code right
+        after the push) refers to the view that handed its message on. A
+        navigation the exit waits out can land, so the view that took over is
+        exited in turn. ``delete_message`` may be a callable that picks the
+        value for each view exited. Returns whether a view exited.
+        """
+        view = self
+        while True:
+            view = view._last_successor()
+            if view._torn_down():
+                return False
+            choice = delete_message(view) if callable(delete_message) else delete_message
+            # Marks the view, not the context, so tasks the exit spawns and
+            # later calls from user code still warn. A count, since a Continue
+            # on the view can be running a library exit of its own.
+            view._library_exits += 1
+            try:
+                await view.exit(delete_message=choice)
+            finally:
+                view._library_exits -= 1
+            if view._successor is None:
+                return True
+
+    def _refuse_handed_over(self, method: str) -> None:
+        """Raise when this view does not hold its panel.
+
+        Either another view took the panel over, or this view is the
+        destination a failed push or pop discarded, and the panel is still
+        on the view the navigation started from.
+        """
+        name = type(self).__name__
+        if self._discarded:
+            raise RuntimeError(
+                f"{name}.{method} was called on the view a failed push() or pop() "
+                f"returned. The navigation rolled back, so the panel is still on the "
+                f"view it started from. Fix: navigate from that view."
+            )
+        if self._successor is None:
+            return
+        if self._timed_out:
+            # The on_timeout() of a view whose timer fired while a push was
+            # landing: the panel is live on the new view, whose own timer runs.
+            fix = (
+                f"the panel is live on {type(self._last_successor()).__name__}, which "
+                f"keeps its own timeout, so there is nothing to replace. Check "
+                f"current_view is self before navigating from on_timeout()."
+            )
+        else:
+            fix = "navigate from that view instead."
+        concurrent = (
+            " Two clicks handled at once reach this when both navigate, since "
+            "serialize_interactions = False runs their callbacks side by side; "
+            "set it to True to queue them."
+            if not self.serialize_interactions
+            else ""
+        )
+        raise RuntimeError(
+            f"{name}.{method} was called on a view that already handed its panel on "
+            f"(a push() or pop() from it, an ephemeral panel's Continue button, or a restart "
+            f"that restored the panel). "
+            f"The panel belongs to the view current_view gives. Fix: {fix}{concurrent}"
+        )
+
+    def _refuse_navigation(self, method: str) -> None:
+        """Raise when this view no longer owns a message a push or pop could move."""
+        self._refuse_handed_over(method)
+        if self._closed():
+            raise RuntimeError(
+                f"{type(self).__name__}.{method} was called on a view that has closed "
+                f"(exit(), a timeout, or stop()) or is closing in an exit() or replace() "
+                f"still running. Navigating would bring its message back to life under a "
+                f"new view. Fix: navigate before closing it, or send a new view."
+            )
+
+    def _commit_navigation(self, new_view, inherit_handoff: bool) -> None:
+        """Hand this view's message and place to ``new_view``, and tear this view down.
+
+        Synchronous, so everything a waiting caller reads is settled before
+        the caller runs. The destination takes the message, the registration
+        it carries, this view's parent and child links, and the running task,
+        so code after ``push()`` or ``pop()`` in a task this view owned runs
+        on. This view's other tasks are cancelled. Kept, the message would let
+        this view edit it after the swap: a ``refresh()`` would paint its
+        stopped tree over the destination, a V1 ``exit()`` would strip the
+        destination's buttons, and a persistent ``exit()`` would remove the
+        registration the destination carries. Its state row is destroyed by
+        the caller.
+
+        The destination's refresh-handoff timer starts here, once its edit
+        has landed, and sleeps only what is left of the carried deadline; the
+        next hop's commit cancels it, so a chain holds one live timer. The
+        deadline says when, the destination's ``_refresh_handoff`` says
+        whether: a push destination with no policy of its own adopts this
+        view's, and a pop destination adopts nothing, since ``pop()`` hands
+        the restored view the resolution it held.
+        """
+        self._carry_attachments_to(new_view)
+        self._settle_undo_carry(new_view)
+        self._message = None
+        self._webhook_message = None
+        self._registry_message_id = None
+        self._successor = new_view
+        self._end_navigation()
+        self.state_store._unsubscribe(self.id)
+        self.task_manager._transfer(asyncio.current_task(), self.id, new_view.id)
+        self.task_manager._cancel_for_teardown(self.id)
         self.stop()
+        # Stopping removed this view's custom_ids from the message's routing,
+        # including any the destination shares.
+        new_view._reregister_dispatch()
         self.state_store._undo_enabled_views.pop(self.id, None)
-        await self.state_store._destroy_view(self.id, source_id=self.id)
+        # A render the destination recorded while arriving replays from its
+        # turn's release, which ran just before this with nothing awaited
+        # between, so the replay starts after the mute is lifted.
+        new_view._arriving_from = None
+        # Armed only now: a timer started before the edit landed would outlive
+        # a rollback and paint over the source.
+        handoff = new_view._refresh_handoff
+        if handoff is None and inherit_handoff:
+            handoff = self._refresh_handoff
+            if handoff is not None:
+                new_view._refresh_handoff_resolved = handoff
+        if (
+            handoff is not False
+            and new_view._ephemeral_arm_deadline is not None
+            and not new_view._refresh_armed
+            and not new_view.is_finished()
+        ):
+            new_view._schedule_ephemeral_refresh()
 
-    async def _rollback_navigation(self, new_view=None) -> None:
-        """Recover the source view after a failed navigation edit.
+    def _roll_back_navigation(self, new_view, *, reclaim: bool) -> None:
+        """Discard ``new_view`` and return this view to the message it kept.
 
-        The destination never reached the message, so its state registration is
-        torn down and the source is re-subscribed. On the push/pop paths the
-        source's teardown was deferred, so it was never stopped and comes back
-        live and re-clickable on the message it still owns.
-
-        ``replace()`` is the exception: it stops the source before the batch
-        opens, which is its point of no return. A stopped view cannot be made
-        clickable again (``StatefulButton`` skips dispatch once the view is
-        finished), so re-subscribing one would only give it renders nobody can
-        trigger. The subscription is restored for a live source only.
-
-        ``new_view`` is ``None`` when the destination raised in its own
-        ``__init__``: there is no registration to undo, and the source still
-        needs its subscription back.
+        Synchronous for the same reason as the commit. This view was never
+        stopped or unsubscribed, so it is live at once; it renders once if it
+        recorded a render while away, and re-arms its refresh handoff if the
+        timer came due meanwhile. With ``reclaim`` the message may show the
+        discarded view, so this view re-renders even with nothing recorded.
+        ``new_view`` is ``None`` when the destination was never built.
         """
         if new_view is not None:
-            # _destroy_view clears the state row and the active registry but
-            # not the subscriber __init__ wired up, and the subscriber holds a
-            # strong reference to the view.
-            self.state_store._unsubscribe(new_view.id)
-            await self.state_store._destroy_view(new_view.id, source_id=new_view.id)
-            # push()/pop() still return the destination, which carries the
-            # source's message from the navigation batch. Unbound, a later
-            # exit() on it cannot edit the message the recovered source owns.
-            new_view._message = None
-            new_view._webhook_message = None
-        if not self.is_finished():
-            self.state_store.subscribe(
-                self.id,
-                self._handle_state_notification,
-                self.subscribed_actions,
-                self._build_selector(),
-            )
-            # An edit that found the message gone while the source was
-            # unsubscribed for navigation skipped its teardown, since the
-            # source read as torn down; with the source recovered, that
-            # teardown is owed again. A missing message alone does not say so:
-            # a never-sent view has none either, and never scheduled one.
-            if self._message is None and self._message_gone_task is not None:
-                self._schedule_message_gone_teardown()
-        # _navigate_to cancelled the source's tasks ahead of the (now-failed)
-        # teardown. Re-arm the ephemeral refresh handoff so a recovered
-        # long-lived ephemeral source still swaps in its refresh button before
-        # the 900s token cliff. The deadline is stamped for every ephemeral
-        # send, so its presence only says the token clock is running --
-        # whether this view engaged is _refresh_handoff's call, which is why
-        # a pinned-off source comes back pinned off and a derived-declined
-        # one comes back declined. The re-scheduled timer sleeps only the
-        # remaining time to the original deadline.
+            self._discard_destination(new_view)
+        self._end_navigation()
+        # Before another task can render: the message stays as this view's
+        # last render left it, and refreshes held meanwhile come after that.
+        self._take_held_rules(self._mention_rules[1])
+        missed = self._missed_while_away
+        self._missed_while_away = False
+        if self.is_finished():
+            # Stopped while it was away: by its timer, whose teardown, waiting
+            # on this navigation, runs next, or by user code, which closes it
+            # here as a send closes a view stopped during it. The freeze edit
+            # is the redraw, and ships even with nothing to disable once the
+            # baseline no longer claims the message shows this view.
+            self._arm_after_rollback = False
+            if reclaim:
+                self._last_tree_digest = None
+                self._reclaim_pending = True
+            if missed:
+                # Content held while it was away ships under the frozen controls.
+                self._deliver_later(self._replay_render())
+            if not self._timed_out and not self._torn_down():
+                from .base import _MESSAGE_FREEZE
+
+                self._resume_close(True, _MESSAGE_FREEZE)
+            return
+        if reclaim:
+            self._last_tree_digest = None
+            self._reclaim_pending = True
+            self._deliver_later(self._reclaim_message(render=missed))
+        elif missed:
+            self._deliver_later(self._replay_render())
+        # A timer that came due while this view was away stood down; the one
+        # scheduled again waits only the time left. Every ephemeral send stamps
+        # a deadline, so _refresh_handoff decides whether this view engaged.
+        arm = self._arm_after_rollback
+        self._arm_after_rollback = False
         if (
-            self._refresh_handoff is not False
+            arm
+            and self._refresh_handoff is not False
             and self._ephemeral_arm_deadline is not None
             and not self._refresh_armed
-            and not self.is_finished()
         ):
-            self.create_task(self._schedule_ephemeral_refresh())
+            self._schedule_ephemeral_refresh()
+
+    def _discard_destination(self, new_view) -> None:
+        """Take down a navigation destination that never reached the message.
+
+        ``push()`` / ``pop()`` still return it, and it carries this view's
+        message and registration id from the navigation batch, so both are
+        unbound first: a later ``exit()`` on it can neither edit the message
+        this view kept nor remove the registration this view still owns. Its
+        tasks (an avatar backfill its ``on_load`` started) are cancelled,
+        sparing the running task, which may be one it was handed. Stopped, so
+        a reload on it answers that no message remains, and unsubscribed,
+        since ``_destroy_view`` clears the state row and the active registry
+        but not the subscriber, which holds a strong reference to the view.
+        Its state row is destroyed by the caller.
+        """
+        new_view._message = None
+        new_view._webhook_message = None
+        new_view._registry_message_id = None
+        new_view._arriving_from = None
+        new_view._discarded = True
+        new_view.task_manager._cancel_for_teardown(new_view.id, keep_caller=True)
+        new_view.stop()
+        self.state_store._unsubscribe(new_view.id)
+        self.state_store._undo_enabled_views.pop(new_view.id, None)
+
+    async def _destroy_settled(self, view, *, discarded: bool) -> None:
+        """Destroy the state row of the view a navigation settled against.
+
+        A ``discarded`` destination also closes its children (a companion
+        panel its ``on_load()`` sent with ``parent=``), as its ``exit()``
+        would have; a source that handed its message over passed its
+        children on at the commit. Shielded: this runs after the settle,
+        often while a cancellation is propagating, and a second cancel would
+        otherwise stop the removal part way and leave the row behind.
+
+        While it runs, a close of that view leaves the row for it to remove.
+        The mark is set before the first suspension: a close waiting on this
+        navigation wakes at the settle, ahead of the shielded task's first
+        step.
+        """
+        view._destroy_in_flight = True
+
+        async def destroy():
+            try:
+                if discarded:
+                    await view._cleanup_attached_children()
+                await self.state_store._destroy_view(view.id, source_id=view.id)
+            finally:
+                view._destroy_in_flight = False
+
+        await asyncio.shield(destroy())
+
+    async def _reclaim_message(self, *, render: bool) -> None:
+        """Put this view back on a message a failed navigation may have changed.
+
+        With ``render`` the view also missed renders while away, and they run
+        first, as a rollback's replay runs them. The content its
+        ``nav_rebuild`` names (the content ``pop()`` restores a V1 view with)
+        then ships with its tree, since those renders can leave the message
+        carrying the discarded view's embed. An armed view skips them and
+        ships its tree as it stands, the refresh button, which is put back
+        after ``nav_rebuild`` in case the hook rebuilt the tree.
+
+        A close that begins first and freezes the message runs the hook
+        itself, and the freeze carries the content; one undone runs this
+        again once the view is live. A teardown that leaves the message as it
+        is, or deletes it, runs neither.
+        """
+        _CURRENT_INTERACTION.set(None)
+        armed = self._refresh_armed
+        if render and not armed:
+            # Without a missed render, a deferred state render is a turn's to
+            # replay at its release.
+            origin, self._deferred_origin = self._deferred_origin, 0
+            held, self._held = self._held, {}
+            await self._run_deferred(origin, held)
+        if self._closing or self._torn_down():
+            self._reclaim_declined = True
+            return
+        self._reclaim_pending = False
+        try:
+            kwargs = {}
+            nav_rebuild = getattr(self, "nav_rebuild", None)
+            if nav_rebuild is not None:
+                frozen = list(self.children) if armed else None
+                result = await await_maybe(nav_rebuild(self))
+                if frozen is not None:
+                    self.clear_items()
+                    for item in frozen:
+                        self.add_item(item)
+                if isinstance(result, dict):
+                    kwargs = result
+            if not kwargs and self._deferred_origin:
+                # A render deferred behind a reload ships it at that reload's
+                # release; one already shipped is skipped by refresh().
+                return
+            await self.refresh(**kwargs)
+        except Exception as e:
+            # DEBUG when the bot closed meanwhile (no session to send through)
+            # or a close tore the view down while its hook ran (the hook may read
+            # what the close cleared, such as the parent link).
+            closed = self._closed_session(e)
+            logger.log(
+                logging.DEBUG if closed or self._torn_down() else logging.ERROR,
+                f"Re-rendering {type(self).__name__} after a failed navigation raised: {e}",
+                exc_info=not closed,
+            )
 
     async def _clear_on_empty_back(self, interaction) -> None:
         """Acknowledge a Back press that has nowhere to go.
@@ -987,6 +1504,12 @@ class _NavigationMixin:
         pushes current application state to the redo stack, and restores
         the snapshot. All state changes happen inside the reducer pipeline.
         """
+        handed = self._successor is not None
+        # A batch still collecting this view's steps adds its step at its exit.
+        await self.state_store._wait_for_undo_batches(self.id)
+        if not handed and self._successor is not None:
+            # The panel moved on during the wait, taking the history with it.
+            return await self._last_successor().undo()
         # Pre-check: don't dispatch if stack is empty (avoids a no-op dispatch)
         views = self.state_store.state.get("views", {})
         view = views.get(self.id, {})
@@ -1002,6 +1525,10 @@ class _NavigationMixin:
         pushes current application state to the undo stack, and restores
         the snapshot. All state changes happen inside the reducer pipeline.
         """
+        handed = self._successor is not None
+        await self.state_store._wait_for_undo_batches(self.id)
+        if not handed and self._successor is not None:
+            return await self._last_successor().redo()
         # Pre-check: don't dispatch if stack is empty
         views = self.state_store.state.get("views", {})
         view = views.get(self.id, {})
@@ -1012,6 +1539,7 @@ class _NavigationMixin:
 
     # // ==================( Transitions )================== // #
 
+    @_in_teardown_scope
     async def replace(self, view_or_class, interaction=None, **kwargs):
         """Replace the current view with a new one (no stack history saved).
 
@@ -1023,7 +1551,29 @@ class _NavigationMixin:
         (used directly; ``**kwargs`` must be empty). The instance form
         unblocks views built by async classmethods like
         ``PaginatedLayoutView.from_data`` and ``from_cursor``.
+
+        The new view has no message yet: send it. This view closes as its
+        ``exit()`` would, so its ``exit_policy`` freezes or deletes its
+        message, a persistent panel's registration is removed, and views
+        attached to it close. A swap that fails leaves this view working.
+
+        Waits for a ``push()`` or ``pop()`` from this view that is still in
+        flight. If it failed, this view is replaced as usual. If it landed,
+        this view has handed its message on and ``replace()`` raises
+        ``RuntimeError``, as ``push()`` and ``pop()`` do: replace from
+        :attr:`current_view`. It raises too on the view a failed ``push()``
+        or ``pop()`` returned, since the panel is still on the view the
+        navigation started from. Waits the same way for a ``send()`` of this
+        view still finishing. A view that has closed can still be replaced,
+        which is how an ``on_timeout()`` override swaps the panel for a new
+        message.
         """
+        # Run beside a push in flight, its teardown and its failure path would
+        # take the navigation's own state apart.
+        await self._wait_to_navigate("replace()")
+        # The screen on the message is another view's now: replacing from here
+        # would close nothing and post a second live panel beside it.
+        self._refuse_handed_over("replace()")
         destination_class = (
             view_or_class if isinstance(view_or_class, type) else type(view_or_class)
         )
@@ -1060,11 +1610,10 @@ class _NavigationMixin:
         if child_view is self:
             raise ValueError("A view cannot attach itself as its own child")
 
-        # Detect circular chains: walk up from self to see if child_view
-        # is already an ancestor. A->B->C->A would cause infinite
-        # recursion during cleanup. The chain is collected on the way up
-        # because two instances of one view class share a type name, and
-        # the type alone can't distinguish the ancestor from the new child.
+        # A cycle (A->B->C->A) would make every walk up the parent chain, this
+        # one included, loop forever. The chain is collected for the message,
+        # which names views by id since two instances of one class share a
+        # type name.
         ancestor = self._attached_to
         chain = [self]
         while ancestor is not None:
@@ -1096,26 +1645,72 @@ class _NavigationMixin:
         *different* parent re-parents the child (removes it from the old
         parent's list first).
 
+        A view that navigated away with ``push()`` or ``pop()`` stands for
+        the view that took its place, on either side: that is the one that
+        exits later, and the one a cascade has to reach.
+
         Args:
             child_view: The child view to attach.
         """
-        self._check_attachment(child_view)
+        parent = self._last_successor()
+        child_view = child_view._last_successor()
+        parent._check_attachment(child_view)
 
-        if child_view in self._attached_children:
+        if child_view in parent._attached_children:
             return
 
         # Re-parent: detach from old parent if attached elsewhere
         old_parent = child_view._attached_to
-        if old_parent is not None and old_parent is not self:
+        if old_parent is not None and old_parent is not parent:
             try:
                 old_parent._attached_children.remove(child_view)
             except ValueError:
                 pass
 
-        self._attached_children.append(child_view)
-        child_view._attached_to = self
+        parent._attached_children.append(child_view)
+        child_view._attached_to = parent
 
-    async def _cleanup_attached_children(self):
+    async def exit_children(self, *, delete_message: bool | None = True) -> None:
+        """Exit every view attached to this one, and leave this view open.
+
+        The same cascade this view's own ``exit()`` and timeout run, for a
+        parent that stays up while its companions go: a game view closing
+        its players' private panels when a round ends. A child with a push
+        or pop in flight is waited out, and the view that took its place is
+        the one closed. A view attached while this runs, or afterwards,
+        belongs to a new set, closed by the next call or by this view's own
+        exit.
+
+        A view that handed its panel on (a ``push()`` or ``pop()`` from it,
+        or an ephemeral panel's Continue button) handed its children to the
+        view that took its place, so on it this closes nothing.
+
+        Args:
+            delete_message: Passed to the ``exit()`` of each child still
+                open. ``True`` (the default, as in the cascade) deletes its
+                message, ``False`` freezes it, and ``None`` leaves it to the
+                child's ``exit_policy``. A child that already closed, by its
+                own timeout or ``exit()``, keeps what that close left.
+
+        Raises:
+            RuntimeError: Called from inside a push or pop a child takes
+                part in: from the new view's ``on_load()`` or a ``rebuild=``
+                or ``nav_rebuild`` hook.
+        """
+        self._warn_if_handed_over("exit_children()")
+        method = "A parent's exit_children()"
+        self._refuse_cascade_into_own_navigation(method)
+        await self._cleanup_attached_children(
+            delete_message=delete_message, method=method, leave_new=True
+        )
+
+    async def _cleanup_attached_children(
+        self,
+        *,
+        delete_message: bool | None = True,
+        method: str = "A parent's exit()",
+        leave_new: bool = False,
+    ):
         """Exit all tracked child views that are still alive.
 
         Finished entries are dropped silently. Stale references can accumulate
@@ -1123,43 +1718,69 @@ class _NavigationMixin:
         panels were refreshed via ``auto_refresh_ephemeral``); pruning here
         keeps the list bounded without requiring callers to manually untrack.
 
+        Each child stays in the list until its close returns, so another
+        cascade running at the same time (the parent's own exit during an
+        ``exit_children()``), the scan ``exit()`` makes first, and a later
+        cleanup after a cancel all still find it. A view attached while the
+        cascade runs is closed too, unless ``leave_new`` is set: that is
+        ``exit_children()``, where this view stays open and a view attached
+        after the call began belongs to the next set.
+
         The cascade is wrapped in ``store.batch()`` so N cascading
         ``VIEW_DESTROYED`` dispatches collapse into one ``BATCH_COMPLETE``
         notification. Subscribers see the final post-cleanup state once.
 
-        No ``source_id`` is threaded: the parent is exiting (and has
-        already unsubscribed), and every child unsubscribes before its
-        own ``VIEW_DESTROYED`` dispatch. No subscriber in the fan-out
-        owns the interaction ack cycle, so fire-and-forget is the right
-        notification shape for this batch.
+        No ``source_id`` is threaded: every child unsubscribes before its own
+        ``VIEW_DESTROYED`` dispatch, so no subscriber in the fan-out owns the
+        interaction's ack, and fire-and-forget is the right shape for this
+        batch.
         """
         async with self.state_store.batch():
-            for child in self._attached_children:
-                if child is None:
+            # id -> view: holding the view keeps its id from being reused by
+            # one attached later in the same cascade.
+            seen = {}
+            pending = [c for c in self._attached_children if c is not None]
+            while True:
+                if not pending:
+                    if leave_new:
+                        break
+                    pending = [
+                        c for c in self._attached_children if c is not None and id(c) not in seen
+                    ]
+                    if not pending:
+                        break
+                listed = pending.pop(0)
+                if id(listed) in seen:
                     continue
-                # Cleared before the finished-child skip, not after: the list
-                # is emptied below either way, so a child that kept the
-                # back-pointer would name a parent that no longer tracks it
-                # and is itself tearing down.
+                seen[id(listed)] = listed
+                # A push or pop in flight hands the child's place to its
+                # destination if the edit lands, reading the parent link, so the
+                # link stays until the outcome is known.
+                await listed._wait_out_navigation(method)
+                child = listed
+                while child._successor is not None and id(child._successor) not in seen:
+                    child = child._successor
+                    seen[id(child)] = child
+                # Cleared before the close, not after: a child that kept the
+                # back-pointer while tearing down would name a parent that is
+                # dropping it.
                 child._attached_to = None
                 if child.is_finished():
-                    # Torn down, not just quiesced: this branch never reaches
-                    # exit(), and unsubscribing is what answers "torn down",
-                    # so a child left in the registries is one every later
-                    # cleanup path skips. Idempotent.
-                    self.task_manager.cancel_tasks(child.id)
-                    self.state_store._unsubscribe(child.id)
-                    self.state_store._undo_enabled_views.pop(child.id, None)
-                    await self.state_store._destroy_view(child.id, source_id=child.id)
-                    continue
-                try:
-                    await child.exit(delete_message=True)
-                except Exception as e:
-                    # The list is cleared below either way, so a child that
-                    # cannot tear itself down leaves nothing else to find
-                    # it by.
-                    logger.debug(
-                        f"Attached child {type(child).__name__} failed to exit "
-                        f"under {type(self).__name__}: {type(e).__name__}: {e}"
-                    )
-        self._attached_children.clear()
+                    # Torn down fully, not only unsubscribed: later cleanups skip
+                    # a view that reads as torn down, so one left in the
+                    # registries would stay there. Its own close runs it once,
+                    # and a timeout still to run freezes it afterwards.
+                    await child._close_stopped()
+                else:
+                    try:
+                        await child._exit_or_successor(delete_message=delete_message)
+                    except Exception as e:
+                        # Dropped below either way, so a child that cannot
+                        # tear itself down leaves nothing else to find it by.
+                        logger.debug(
+                            f"Attached child {type(child).__name__} failed to exit "
+                            f"under {type(self).__name__}: {type(e).__name__}: {e}"
+                        )
+                for view in (listed, child):
+                    if view in self._attached_children:
+                        self._attached_children.remove(view)

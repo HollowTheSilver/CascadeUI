@@ -7,7 +7,8 @@ import discord
 from discord import ButtonStyle, Interaction
 
 from ...utils.hooks import await_maybe
-from ..base import StatefulButton, StatefulComponent, require_value_callback
+from ...utils.responses import trailing_ack
+from ..base import StatefulButton, require_value_callback
 from ..v1_composition import CompositeComponent, register_component
 
 # // ========================================( Classes )======================================== // #
@@ -54,7 +55,8 @@ class PaginationControls(CompositeComponent):
     """Navigation controls for paginated content.
 
     ``on_page_change`` takes ``(interaction, page)`` and receives the new
-    zero-based page after each move.
+    zero-based page after each move. When it raises, the controls return to
+    the page they left before the exception propagates.
 
     Raises:
         TypeError: ``on_page_change`` cannot accept ``(interaction, page)``.
@@ -97,33 +99,41 @@ class PaginationControls(CompositeComponent):
 
     async def _on_prev(self, interaction: Interaction) -> None:
         """Handle previous button click."""
-        # Bare defer is the intentional fallback when on_page_change is None
-        # or the click hits the boundary -- the click still needs ack-ing,
-        # but no rebuild is owed. The is_done() guard keeps it safe under
-        # auto-defer + serialize_interactions queueing.
+        # The click still needs an ack when on_page_change is None or it hits
+        # the boundary, though no rebuild is owed. trailing_ack treats an ack
+        # the auto-defer backstop made meanwhile as done.
         if self.current_page > 0:
-            self.current_page -= 1
-            self._update_buttons()
-
-            if self.on_page_change:
-                await await_maybe(self.on_page_change(interaction, self.current_page))
-            elif not interaction.response.is_done():
-                await interaction.response.defer()
-        elif not interaction.response.is_done():
-            await interaction.response.defer()
+            await self._move(interaction, self.current_page - 1)
+        else:
+            await trailing_ack(interaction, owner=type(self).__name__)
 
     async def _on_next(self, interaction: Interaction) -> None:
         """Handle next button click."""
         if self.current_page < self.page_count - 1:
-            self.current_page += 1
-            self._update_buttons()
+            await self._move(interaction, self.current_page + 1)
+        else:
+            await trailing_ack(interaction, owner=type(self).__name__)
 
-            if self.on_page_change:
+    async def _move(self, interaction: Interaction, page: int) -> None:
+        """Move to ``page`` and hand the render to ``on_page_change``.
+
+        A raise from the callback puts the cursor and buttons back before it
+        propagates: the callback draws the page, and a raise most often means
+        the page never reached the screen. A cancellation is not rewound,
+        since its edit may have landed.
+        """
+        previous = self.current_page
+        self.current_page = page
+        self._update_buttons()
+        if self.on_page_change:
+            try:
                 await await_maybe(self.on_page_change(interaction, self.current_page))
-            elif not interaction.response.is_done():
-                await interaction.response.defer()
-        elif not interaction.response.is_done():
-            await interaction.response.defer()
+            except Exception:
+                self.current_page = previous
+                self._update_buttons()
+                raise
+        else:
+            await trailing_ack(interaction, owner=type(self).__name__)
 
     def _update_buttons(self) -> None:
         """Update button states based on current page."""
@@ -191,8 +201,8 @@ class ToggleGroup(CompositeComponent):
 
                     if self.on_select:
                         await await_maybe(self.on_select(interaction, opt))
-                    elif not interaction.response.is_done():
-                        await interaction.response.defer()
+                    else:
+                        await trailing_ack(interaction, owner=type(self).__name__)
 
                 return callback
 

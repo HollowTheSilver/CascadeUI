@@ -1,7 +1,7 @@
 # // ========================================( Modules )======================================== // #
 
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from .types import ComponentId, GuildId, SessionId, UserId, ViewId
 
@@ -40,9 +40,15 @@ class ActionCreators:
         return {"view_id": view_id, **updates}
 
     @staticmethod
-    def view_destroyed(view_id: ViewId) -> ActionPayload:
-        """Create a VIEW_DESTROYED action payload."""
-        return {"view_id": view_id}
+    def view_destroyed(view_id: ViewId, session_id: Optional[SessionId] = None) -> ActionPayload:
+        """Create a VIEW_DESTROYED action payload.
+
+        ``session_id`` names a session to drop when the view never reached the
+        state and the session has no member.
+        """
+        if session_id is None:
+            return {"view_id": view_id}
+        return {"view_id": view_id, "session_id": session_id}
 
     @staticmethod
     def session_created(
@@ -150,15 +156,18 @@ class ActionCreators:
         }
 
     @staticmethod
-    def application_slots_pruned(deleted: int, cutoff: Optional[int] = None) -> ActionPayload:
+    def application_slots_pruned(
+        deleted: int, cutoff: Optional[int] = None, slots: Iterable[str] = ()
+    ) -> ActionPayload:
         """Create an APPLICATION_SLOTS_PRUNED action payload.
 
-        Fires after the persistence manager deletes expired rows from the
-        cascadeui_application_slots namespace. ``deleted`` is the row count removed;
-        ``cutoff`` is the ``expires_at`` threshold used (epoch seconds) or
-        ``None`` if prune was manual.
+        Fires after the persistence manager deletes application slots.
+        ``deleted`` is the row count removed; ``cutoff`` is the ``expires_at``
+        threshold used (epoch seconds) or ``None`` for a single-slot prune;
+        ``slots`` names the slots removed from the running bot, which happens
+        before the action is dispatched.
         """
-        return {"deleted": deleted, "cutoff": cutoff}
+        return {"deleted": deleted, "cutoff": cutoff, "slots": list(slots)}
 
     @staticmethod
     def registry_pruned(

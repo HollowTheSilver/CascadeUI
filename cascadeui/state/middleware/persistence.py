@@ -24,9 +24,10 @@ Design contracts:
   unwinds through asyncio's own coroutine driver so shutdown leaves no
   orphaned coroutines.
 - **Exponential backoff retry.** Failed flushes re-enqueue dirty rows
-  and schedule a retry with backoff capped at 60s. After
-  ``MAX_RETRIES`` consecutive failures the namespace logs CRITICAL and
-  resets its counter; the rows remain dirty so the next action retries.
+  and schedule a retry with backoff capped at 60s. A write still running
+  after 30 seconds fails the same way. After ``MAX_RETRIES`` consecutive
+  failures the namespace logs CRITICAL and resets its counter; the rows
+  remain dirty so the next action retries.
 - **Observability hooks.** The middleware fires ``on_flush`` and
   ``on_error`` on the manager so devtools or operator tooling can
   observe write cadence without scraping logs.
@@ -38,6 +39,7 @@ Design contracts:
 import asyncio
 import json
 import logging
+import signal
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Optional
@@ -53,6 +55,8 @@ from ...persistence.schema import (
     TABLE_PERSISTENT_VIEWS,
 )
 from ...utils.hooks import await_maybe
+from ...utils.tasks import _bounded_wait
+from ..store import _ON_COMMIT
 from ..types import Action, StateData
 
 if TYPE_CHECKING:
@@ -65,16 +69,10 @@ logger = logging.getLogger(__name__)
 # // ========================================( Constants )======================================== // #
 
 
-# Built-in actions that carry no persistence obligation. Views and
-# sessions are rebuilt from the registry rows on restart, navigation
-# state is ephemeral, ``INSPECTOR_PURGED_STALE`` mutates transient
-# component/modal dispatch-log buffers outside the ``application``
-# namespace, and the *_PRUNED actions fire *after* the manager has
-# already deleted rows on disk. ``SCOPED_UPDATE`` and
-# ``PERSISTENT_VIEW_REGISTERED`` / ``PERSISTENT_VIEW_UNREGISTERED`` are
-# deliberately absent -- scoped writes can ride the opt-in
-# ``persistent_slots`` path, and the persistent-view family is the
-# registry-row write signal.
+# Built-in actions with nothing to save: views and sessions rebuild from registry
+# rows, navigation is ephemeral, INSPECTOR_PURGED_STALE clears transient logs, and
+# the *_PRUNED actions report deletes already made. Left out: UNDO, REDO and
+# SCOPED_UPDATE change slots, and the persistent-view actions write the registry.
 _BOOKKEEPING_ACTIONS = frozenset(
     {
         "SESSION_CREATED",
@@ -87,8 +85,6 @@ _BOOKKEEPING_ACTIONS = frozenset(
         "NAVIGATION_PUSH",
         "NAVIGATION_POP",
         "NAVIGATION_REPLACE",
-        "UNDO",
-        "REDO",
         "BATCH_COMPLETE",
         "INSPECTOR_PURGED_STALE",
         "APPLICATION_SLOTS_PRUNED",
@@ -97,11 +93,90 @@ _BOOKKEEPING_ACTIONS = frozenset(
 )
 
 
-# Scheduled flush tasks live on ``PersistenceMiddleware._tasks`` via
-# ``_spawn`` (``asyncio.create_task`` + ``add_done_callback(discard)``),
-# not through ``TaskManager``. The flush lifecycle -- debounce windows,
-# retry backoff, cancel-on-teardown -- is coupled to this local task set,
-# so the middleware owns it directly.
+# Flush tasks live on ``PersistenceMiddleware._tasks`` via ``_spawn``, not
+# ``TaskManager``: their debounce, retry, and cancel-on-close are local here.
+
+
+_CONTAINERS = (dict, list, tuple)
+
+
+def _entries(container: Any) -> Any:
+    """An iterator of a dict's ``(key, item)`` pairs, or a list's ``(index, item)`` pairs."""
+    return iter(container.items()) if isinstance(container, dict) else iter(enumerate(container))
+
+
+def _non_string_key(value: Any) -> Optional[tuple]:
+    """The first dict key in ``value`` that is not a ``str``, with its path and dict, or ``None``.
+
+    Walked with a stack: from Python 3.12 ``json.dumps`` writes values nested
+    past the recursion limit, and a recursive walk would raise on them.
+    """
+    if not isinstance(value, _CONTAINERS):
+        return None
+    # A frame per container: its entry iterator, the container, and the trail
+    # of keys and indexes that reached it, as (parent trail, step) pairs.
+    stack = [(_entries(value), value, None)]
+    while stack:
+        entries, container, trail = stack[-1]
+        keyed = isinstance(container, dict)
+        for step, item in entries:
+            if keyed and not isinstance(step, str):
+                steps = []
+                while trail is not None:
+                    trail, part = trail
+                    steps.append(f"[{part!r}]")
+                return step, "".join(reversed(steps)), container
+            if isinstance(item, _CONTAINERS):
+                stack.append((_entries(item), item, (trail, step)))
+                break
+        else:
+            stack.pop()
+    return None
+
+
+def _key_coercion_note(value: Any, root: str) -> Optional[str]:
+    """Describe the first non-``str`` dict key in ``value``, or ``None`` when there is none.
+
+    Written, the value still round-trips, but JSON stores every key as a
+    string, so that key comes back changed after a restart.
+    """
+    found = _non_string_key(value)
+    if found is None:
+        return None
+    key, path, container = found
+    stored = next(iter(json.loads(json.dumps({key: None}))))
+    if stored in container:
+        return (
+            f"has the keys {key!r} and {stored!r} at {root}{path}. JSON stores keys as "
+            f"strings, so both are saved as {stored!r} and a restart keeps only one of "
+            f"their values. Fix: use string keys, e.g. str(user_id)."
+        )
+    return (
+        f"has the key {key!r} at {root}{path}. JSON stores keys as strings, so after a "
+        f"restart it reads back as {stored!r} and a lookup by {key!r} misses. Fix: use "
+        f"string keys, e.g. str(user_id)."
+    )
+
+
+async def _close_to_the_end(manager: "PersistenceManager") -> None:
+    """Close ``manager`` even when the task running this is cancelled.
+
+    A close started by another task (a shutdown command) is still running when
+    the task that owns ``async with bot`` returns, and ``asyncio.run`` then
+    cancels it. That teardown waits for the cancelled task, so one more attempt
+    writes the batch and closes the backends, whose SQLite worker thread would
+    otherwise keep the process alive. The cancel is re-raised afterwards.
+    """
+    try:
+        await manager.close()
+    except asyncio.CancelledError:
+        try:
+            await manager.close()
+        except Exception as exc:
+            logger.error(f"Persistence did not close with the bot: {exc}", exc_info=True)
+        raise
+    except Exception as exc:
+        logger.error(f"Persistence did not close with the bot: {exc}", exc_info=True)
 
 
 # // ========================================( Per-namespace state )======================================== // #
@@ -126,8 +201,23 @@ class _NamespaceState:
     first_dirty_at: Optional[float] = None
     last_action_at: float = 0.0
     task: Optional[asyncio.Task] = None
+    # The flush past its wait and not yet holding ``write_lock``: it has not
+    # taken its snapshot, so it writes every change routed before it does.
+    queued: Optional[asyncio.Task] = None
     write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     retry_count: int = 0
+    # When the pending retry of a failed write runs. A change before then
+    # waits for it rather than writing to a backend that just failed.
+    retry_at: Optional[float] = None
+    # Slot values queued since the last write, checked for keys JSON stores
+    # as strings when that write takes them.
+    unchecked: dict[str, Any] = field(default_factory=dict)
+    # The stored form of each slot as last loaded or queued: the manager's own
+    # record, so the slots rehydrate loads count as already stored.
+    saved: dict[str, str] = field(default_factory=dict)
+    # The expires_at of each slot with a TTL, also the manager's record, which
+    # the expiry sweep reads to drop expired slots from memory.
+    expiry: dict[str, int] = field(default_factory=dict)
 
 
 # // ========================================( Middleware )======================================== // #
@@ -160,6 +250,10 @@ class PersistenceMiddleware:
     _BACKOFF_BASE: float = 1.0
     _BACKOFF_CAP: float = 60.0
     MAX_RETRIES: int = 5
+    # A write still running after this long is cancelled and retried. A new
+    # change does not cancel a flush past its wait, so without a bound a
+    # stalled write would hold every later one behind it.
+    _WRITE_TIMEOUT: float = 30.0
 
     def __init__(
         self,
@@ -191,11 +285,8 @@ class PersistenceMiddleware:
                 f"got {restore_concurrency!r}."
             )
 
-        # Validate the migrators bulk-registration map at the construction
-        # site. Expected: None, or a dict with optional "schema" and "kwargs"
-        # keys, each mapping a (name, from_version) tuple to an async migrator
-        # callable. Registered into the module migrator registries during
-        # initialize(), before apply_migrations and rehydrate consume them.
+        # Registered during initialize(), before the migrations and the restore
+        # read it, so a malformed map is refused here, at the construction site.
         if migrators is not None:
             if not isinstance(migrators, dict):
                 raise TypeError(
@@ -209,12 +300,8 @@ class PersistenceMiddleware:
                     "expected 'schema' and/or 'kwargs'."
                 )
 
-        # Fail fast on a wrong-type bot. The reattach pipeline calls
-        # ``bot.add_listener`` / ``bot.get_channel``; passing a bare
-        # string or a non-Client object would crash deep inside
-        # :meth:`initialize` long after the construction site is gone
-        # from the stack. Lazy import so the state package does not
-        # hard-require discord.py at module load.
+        # A non-Client bot would otherwise fail deep inside initialize(), long
+        # after this call.
         if bot is not None:
             import discord
 
@@ -224,21 +311,15 @@ class PersistenceMiddleware:
                     f"(discord.Client subclass) or None, got {type(bot).__name__!r}."
                 )
 
-        # Two supported construction paths. The pre-built path
-        # (``manager=``) is for call sites that customize manager
-        # internals before install. The direct path stashes the raw
-        # config and defers manager construction to :meth:`initialize`,
-        # where the store reference is finally available.
+        # ``manager=`` takes a pre-built manager; otherwise the config waits for
+        # :meth:`initialize`, where the store is available.
         self._pending_config: Optional[dict[str, Any]]
         if manager is not None:
             self._manager = manager
             self._store = manager._store
             self._pending_config = None
-            # This path presumes the caller already ran the pipeline
-            # (initialize_backends + migrations + rehydrate) before
-            # constructing the middleware. Flag init as done so
-            # :meth:`initialize` short-circuits and does not re-run
-            # rehydrate on top of a hot store.
+            # The caller is expected to have run a pre-built manager's pipeline,
+            # so :meth:`initialize` must not rehydrate over a live store.
             self._initialized: bool = True
             # initialize() short-circuits on this path, so the back-reference
             # it normally sets has to be wired here or flush_all() and close()
@@ -264,10 +345,21 @@ class PersistenceMiddleware:
             self._ns_application = None  # type: ignore[assignment]
 
         self._closed: bool = False
+        self._warned_while_closed: bool = False
+        # Each key note is logged once: a slot written on every change would
+        # otherwise log the same ERROR each time.
+        self._logged_key_notes: set = set()
         # Tasks are owned here so cancel-before-start unwinds through
         # asyncio.Task's own coroutine driver (which closes the coro
         # cleanly) rather than orphaning a never-awaited coroutine.
         self._tasks: set[asyncio.Task] = set()
+        # The SIGTERM disposition installed by _close_on_sigterm, and the bot
+        # close a SIGTERM started. Not in _tasks: the close cancels those.
+        self._sigterm_disposition = None
+        self._sigterm_close: Optional[asyncio.Task] = None
+        # One future per wrapped bot close still running, resolved once
+        # persistence has closed after it (see _close_with_bot).
+        self._bot_closes: set = set()
 
     def _build_namespaces(self, manager: "PersistenceManager") -> None:
         """Construct the per-namespace routing state from a resolved manager.
@@ -288,6 +380,8 @@ class PersistenceMiddleware:
             backend=manager.application.backend,
             interval=2.0,
             max_age=10.0,
+            saved=manager._slot_payloads,
+            expiry=manager._slot_expiry,
         )
 
     # // ========================================( Initialize )======================================== // #
@@ -296,9 +390,11 @@ class PersistenceMiddleware:
         """Run the async startup pipeline for this middleware.
 
         Invoked by :func:`~cascadeui.setup.setup_middleware` after the
-        middleware is installed into the dispatch chain. The pipeline
-        is idempotent; re-invocation is a no-op once the middleware
-        has initialized.
+        middleware is installed into the dispatch chain. The pipeline runs
+        once. A later call reopens persistence if it has closed (a bot
+        started again in the same process), writes the changes held while
+        it was closed, restarts the sweepers, and closes persistence with
+        the bot again.
 
         The pipeline runs in seven phases:
 
@@ -316,11 +412,12 @@ class PersistenceMiddleware:
            ``bot`` is available).
         """
         if self._initialized:
-            # A pre-built manager ran its own pipeline, but the sweepers are
-            # the middleware's to start; without this a manager= install never
-            # swept anything. Idempotent on a re-invocation.
+            # A manager= install ran its own pipeline, but the sweepers are
+            # the middleware's to start.
             if self._manager is not None:
-                self._manager._start_sweepers()
+                # A bot closed and started again in the same process runs
+                # setup_hook again, after its close shut persistence.
+                await self._reopen_with_bot(store)
             return
 
         cfg = self._pending_config or {}
@@ -333,6 +430,9 @@ class PersistenceMiddleware:
         # call them report a write that never happened.
         manager._middleware = self
         self._build_namespaces(manager)
+        # Before the backends open: a migration or rehydrate that raises leaves
+        # them open, and the bot's close is what shuts them.
+        self._close_with_bot()
 
         # Register any caller-supplied migrators into the module registries
         # before apply_migrations (schema) and rehydrate (kwargs) consume them.
@@ -347,7 +447,7 @@ class PersistenceMiddleware:
         # listener installation path in _StatefulMixin. Install it
         # eagerly here so on_message_delete fires for externally-
         # deleted persistent messages.
-        if bot is not None and not getattr(store, "_cleanup_listener_installed", False):
+        if bot is not None:
             store._install_message_cleanup(bot)
 
         # Stash on the store so later code (prune, slot-policy
@@ -359,6 +459,11 @@ class PersistenceMiddleware:
         # ttl_days, and the unreachable-row sweep when it is configured. Each
         # is skipped when there is nothing for it to do.
         manager._start_sweepers()
+
+        # Routing is live before the restore: a restored panel's on_bind() can
+        # write a persistent slot, and that write would otherwise never be
+        # saved.
+        self._initialized = True
 
         if bot is not None:
             # The reattach pass also registers every DynamicPersistentButton
@@ -395,7 +500,89 @@ class PersistenceMiddleware:
                     "dispatch-time click routing."
                 )
 
-        self._initialized = True
+        # Last: a close while the backends are still opening would find nothing
+        # to close, and the backend would then open with nothing left to close
+        # it.
+        self._close_on_sigterm()
+
+    async def _reopen_with_bot(self, store: Any) -> None:
+        """Open persistence again after the bot's close shut it, and restore its panels.
+
+        The persistent panels a closed bot's views held are reattached through
+        the bot now running, as a process restart reattaches them at boot.
+        Reached from a ``setup_middleware()`` run again (the ``setup_hook`` of
+        the bot a restart in the same process builds), from the bot's
+        ``connect()`` when it runs again after the bot's close, and from a
+        close that finds a restart began while it ran.
+
+        Nothing reopens while a close of the bot is still running, or once
+        the bot is closed: a close that began first (SIGTERM while
+        ``setup_hook`` runs, a shutdown during a reconnect's backoff) would
+        leave it open with nothing to close it. A close still running from
+        before a restart reopens persistence itself when it finishes and
+        finds the bot running again (see :meth:`_close_with_bot`). Waiting
+        for it here instead would hang a close that waits for the bot to be
+        ready, which happens only after this returns. After a close a SIGTERM
+        started, the process ends instead of reopening.
+        """
+        # Wired first: a new bot object adopted while an old close still runs
+        # has to close persistence with it, and connect() through it.
+        self._close_with_bot()
+        if any(not f.done() for f in self._bot_closes):
+            return
+        bot = getattr(self._manager, "_bot", None)
+        if bot is not None and bot.is_closed():
+            return
+        # A SIGTERM this handled asked the process to stop, and the default is
+        # back (no handler of the application's since): a restart would run
+        # until the process manager kills it.
+        if self._sigterm_close is not None and signal.getsignal(signal.SIGTERM) is signal.SIG_DFL:
+            await self._end_after_sigterm(bot)
+            return
+        reopened = await self._open_again()
+        store.persistence_manager = self._manager
+        self._manager._start_sweepers()
+        self._close_on_sigterm()
+        # The panels a closed bot left come back here, in the new bot's
+        # setup_hook, as a process restart restores them at boot. A bot
+        # adopted while the old one closed leaves persistence open.
+        if bot is not None and (reopened or store._restore_owed):
+            store._restore_owed = False
+            await self._manager.reattach()
+            store._link_released()
+
+    async def _open_again(self) -> bool:
+        """Open persistence a close shut. Returns whether it had closed."""
+        reopened = await self._manager._reopen()
+        if reopened or self._closed:
+            reopened = True
+            self._closed = False
+            self._warned_while_closed = False
+            for ns in (self._ns_registry, self._ns_application):
+                # Nothing holds it while closed, and a bot run twice
+                # through asyncio.run reopens on another loop.
+                ns.write_lock = asyncio.Lock()
+                if ns.dirty_rows or ns.deleted_keys:
+                    self._schedule(ns)
+        return reopened
+
+    async def _end_after_sigterm(self, bot: Any) -> None:
+        """End the process when a bot a SIGTERM closed is started again.
+
+        The close the SIGTERM ran wrote the batch. A change held since then is
+        written next, and SIGTERM's default action then ends the process, as
+        it would have without the close.
+        """
+        logger.info(f"{type(bot).__name__} started again after SIGTERM; ending the process")
+        try:
+            namespaces = (self._ns_registry, self._ns_application)
+            if any(ns.dirty_rows or ns.deleted_keys for ns in namespaces):
+                await self._open_again()
+                await _close_to_the_end(self._manager)
+        except Exception as exc:
+            logger.error(f"Changes held since SIGTERM were not written: {exc}", exc_info=True)
+        finally:
+            signal.raise_signal(signal.SIGTERM)
 
     def _resolve_manager(self, store: Any, cfg: dict[str, Any]) -> "PersistenceManager":
         """Build a :class:`PersistenceManager` from the stashed config.
@@ -470,11 +657,9 @@ class PersistenceMiddleware:
             register_migrator,
         )
 
-        # Skip-if-present keeps re-constructing the middleware from raising a
-        # duplicate-key ValueError. The cost is that a genuine collision is
-        # silent, and the library now ships its own migrator, so a consumer
-        # registering one for the same table and version loses theirs without
-        # being told. The decorator path already raises; this path logs.
+        # Skip-if-present, so re-constructing the middleware never raises. A real
+        # collision (the library ships its own migrator) keeps the registered one
+        # and warns, where the decorator path raises.
         for (table, from_version), fn in (migrators.get("schema") or {}).items():
             if get_schema_migrator(table, from_version) is not None:
                 logger.warning(
@@ -510,118 +695,169 @@ class PersistenceMiddleware:
         if not self._initialized or self._ns_registry is None:
             return await next_fn(action, state)
 
-        state_before = self._store.state
-        result = await next_fn(action, state)
-        state_after = self._store.state
-
-        if self._closed:
+        on_commit = _ON_COMMIT.get()
+        if on_commit is None:
+            # Called outside a dispatch: the state before and after the call.
+            state_before = self._store.state
+            result = await next_fn(action, state)
+            self._route_commit(action, state_before, self._store.state)
             return result
 
+        # Queued at the commit, from exactly what the reducer changed: not another
+        # dispatch's commit during the chain, not skipped by a later raise, and
+        # nothing for an action no reducer ran.
+        def route(prior: StateData, committed: StateData) -> None:
+            self._route_commit(action, prior, committed)
+
+        on_commit.append(route)
+        try:
+            return await next_fn(action, state)
+        finally:
+            on_commit.remove(route)
+
+    def _route_commit(
+        self, action: Action, state_before: StateData, state_after: StateData
+    ) -> None:
+        """Queue the writes the change from ``state_before`` to ``state_after`` calls for."""
         action_type = action["type"]
         if action_type in _BOOKKEEPING_ACTIONS:
-            return result
+            return
         if state_after is state_before:
-            return result
+            return
 
+        # A closed middleware still routes: the rows are held, unscheduled,
+        # until a reopen writes them.
         if action_type in ("PERSISTENT_VIEW_REGISTERED", "PERSISTENT_VIEW_UNREGISTERED"):
-            self._route_registry(action, state_before, state_after)
+            queued = self._route_registry(action, state_before, state_after)
+            if queued and self._closed:
+                key = action["payload"].get("persistence_key")
+                self._warn_held(f"the {action_type} for {key!r}")
         else:
-            self._route_application(state_before, state_after)
-
-        return result
+            queued = self._route_application(state_before, state_after)
+            if queued and self._closed:
+                self._warn_held(f"a change to {', '.join(repr(n) for n in sorted(queued))}")
 
     # // ========================================( Routing )======================================== // #
 
-    def _route_registry(self, action: Action, before: StateData, after: StateData) -> None:
+    def _route_registry(self, action: Action, before: StateData, after: StateData) -> bool:
+        """Queue the registry write an action calls for; ``True`` when one was queued."""
         ns = self._ns_registry
         if ns.backend is None:
-            return
+            return False
         payload = action["payload"]
         persistence_key = payload.get("persistence_key")
         if not persistence_key:
-            return
+            return False
 
         if action["type"] == "PERSISTENT_VIEW_UNREGISTERED":
-            # Read the removal the reducer actually made, not the dict's
-            # identity: it refuses when the key has moved to another message,
-            # and returns the state object untouched to say so, which any
-            # middleware that hands the chain a rebuilt mapping erases. Routing
-            # a delete on a refusal would take the live successor's row.
+            # The removal the reducer made, not state identity: a middleware that
+            # rebuilds the mapping hides a refusal, and deleting on one would take
+            # the live successor's row.
             removed = persistence_key in before.get(
                 "persistent_views", {}
             ) and persistence_key not in after.get("persistent_views", {})
             if not removed:
-                return
+                return False
             ns.deleted_keys.add(persistence_key)
             ns.dirty_rows.pop(persistence_key, None)
             if self._manager is not None:
                 self._manager._forget_registry_row(persistence_key)
         else:
-            # The registering view supplies _init_kwargs +
-            # kwargs_schema_version. It was registered before it dispatched,
-            # and it stamped the message id the reducer just recorded, so the
-            # store's lookup selects it over any superseded panel still live
-            # under the key.
+            # The registering view supplies the kwargs. It stamped the message id
+            # just recorded, so the lookup picks it over a superseded panel.
             view = self._store.get_active_view(persistence_key=persistence_key)
             row = self._build_registry_row(payload, view)
             if row is None:
-                return
+                return False
             ns.dirty_rows[persistence_key] = row
             ns.deleted_keys.discard(persistence_key)
             if self._manager is not None:
                 self._manager._remember_registry_row(persistence_key, row)
 
         self._schedule(ns)
+        return True
 
-    def _route_application(self, state_before: StateData, state_after: StateData) -> None:
-        ns = self._ns_application
-        if ns.backend is None:
-            return
+    @staticmethod
+    def _changed_persistent_slots(state_before: StateData, state_after: StateData) -> set[str]:
+        # Only slots registered persistent are scanned; the rest stay in memory,
+        # so the walk is bounded by how many slots opted in.
+        from ..slots import _PERSISTENT_SLOTS
 
         app_before = state_before.get("application") or {}
         app_after = state_after.get("application") or {}
+        return {
+            slot_name
+            for slot_name in _PERSISTENT_SLOTS
+            if app_before.get(slot_name) is not app_after.get(slot_name)
+        }
 
-        # Positive filter: scan only slots registered persistent via
-        # access_slot(..., persistent=True). Everything else is in-memory
-        # by default and produces zero persistence pressure. No full-tree
-        # walk -- the set iteration is bounded by how many slots the
-        # user explicitly opted in.
-        from ..slots import _PERSISTENT_SLOTS
-
-        if not _PERSISTENT_SLOTS:
+    def _warn_held(self, what: str) -> None:
+        """Say once per closure that a change reached a closed persistence."""
+        if self._warned_while_closed:
             return
+        self._warned_while_closed = True
+        logger.warning(
+            f"Persistence is closed, so {what} is held in memory until setup_middleware() "
+            "reopens it, and is lost if the process exits first. Persistence closes when "
+            "the bot closes or when persistence_manager.close() runs."
+        )
 
-        changed: set[str] = set()
-        for slot_name in _PERSISTENT_SLOTS:
-            if app_before.get(slot_name) is not app_after.get(slot_name):
-                changed.add(slot_name)
+    def _first_key_note(self, note: str) -> bool:
+        """Whether ``note`` is being logged for the first time by this middleware."""
+        if note in self._logged_key_notes:
+            return False
+        self._logged_key_notes.add(note)
+        return True
 
+    def _route_application(self, state_before: StateData, state_after: StateData) -> list:
+        """Queue the slot writes a change calls for; the names of the slots queued."""
+        ns = self._ns_application
+        if ns.backend is None:
+            return []
+
+        changed = self._changed_persistent_slots(state_before, state_after)
         if not changed:
-            return
+            return []
 
+        app_after = state_after.get("application") or {}
         now = int(time.time())
+        queued = []
         for slot_name in changed:
             value = app_after.get(slot_name)
             if value is None:
                 ns.deleted_keys.add(slot_name)
                 ns.dirty_rows.pop(slot_name, None)
+                ns.saved.pop(slot_name, None)
+                ns.expiry.pop(slot_name, None)
+                queued.append(slot_name)
                 continue
 
             try:
-                # No ``default=`` fallback by design: a non-JSON payload
-                # surfaces as TypeError so the slot write is declined and
-                # logged, not silently coerced into a string the rehydrate
-                # path cannot consume. Matches the _capture_registry_row
-                # contract below.
+                # No ``default=`` fallback: a non-JSON value is declined and
+                # logged, not coerced into a string rehydrate cannot read, as in
+                # ``_build_registry_row``.
                 serialized = json.dumps(value)
-            except (TypeError, ValueError) as exc:
-                logger.error(f"Application slot {slot_name!r} is not JSON-serializable: {exc}")
+            except (TypeError, ValueError, RecursionError) as exc:
+                logger.error(
+                    f"Application slot {slot_name!r} was not saved: {exc}. Store plain "
+                    f"values, e.g. a member's .id rather than the Member."
+                )
                 continue
+            # A @cascade_reducer copies every slot, so most slots arrive here as
+            # new objects holding what is already stored. Writing one again
+            # would also push its ttl_days expiry back.
+            if ns.saved.get(slot_name) == serialized:
+                continue
+            ns.saved[slot_name] = serialized
+            ns.unchecked[slot_name] = value
 
             policy = self._manager.get_slot_policy(slot_name)
             expires_at: Optional[int] = None
             if policy.ttl_days is not None:
                 expires_at = now + (policy.ttl_days * 86400)
+                ns.expiry[slot_name] = expires_at
+            else:
+                ns.expiry.pop(slot_name, None)
 
             ns.dirty_rows[slot_name] = {
                 "slot_name": slot_name,
@@ -631,13 +867,21 @@ class PersistenceMiddleware:
                 "expires_at": expires_at,
             }
             ns.deleted_keys.discard(slot_name)
+            queued.append(slot_name)
 
-        self._schedule(ns)
+        # Rows a failed write left behind go with this change's flush even when
+        # it queued nothing: a retry that ran out schedules no flush of its own.
+        if queued or ns.dirty_rows or ns.deleted_keys:
+            self._schedule(ns)
+        return queued
 
     # // ========================================( Scheduler )======================================== // #
 
     def _schedule(self, ns: _NamespaceState) -> None:
         """Schedule or reschedule a debounced flush for ``ns``."""
+        if self._closed:
+            # The backend is closed or closing; a reopen schedules these rows.
+            return
         now = time.monotonic()
         if ns.first_dirty_at is None:
             ns.first_dirty_at = now
@@ -646,8 +890,11 @@ class PersistenceMiddleware:
         # Immediate flush: registry lifecycle events. Fire one task per
         # call without cancelling prior tasks so a burst of register +
         # unregister does not coalesce into a lost write.
+        retrying = ns.retry_at is not None and ns.task is not None and not ns.task.done()
         if ns.interval <= 0.0:
-            self._spawn(self._run_flush(ns, wait=0.0))
+            # The pending retry writes this change with the rows it holds.
+            if not retrying:
+                self._spawn(self._run_flush(ns, wait=0.0))
             return
 
         # Debounced flush: cancel and reschedule. The dirty-row buffer
@@ -663,6 +910,10 @@ class PersistenceMiddleware:
         wait_idle = ns.interval
         wait_ceiling = max(0.0, ns.max_age - age)
         wait = min(wait_idle, wait_ceiling)
+        # The flush replaces a pending retry, so it keeps the retry's backoff;
+        # otherwise steady traffic would retry a failing backend every window.
+        if retrying:
+            wait = max(wait, ns.retry_at - now)
 
         ns.task = self._spawn(self._run_flush(ns, wait=wait))
 
@@ -686,7 +937,21 @@ class PersistenceMiddleware:
         except asyncio.CancelledError:
             return
 
+        # Past its wait the flush is no longer the one a new change replaces:
+        # cancelling it mid-write under steady traffic would mean no write
+        # ever finishes. The next change schedules its own behind the lock.
+        current = asyncio.current_task()
+        if ns.task is current:
+            ns.task = None
+        # One flush waits for the lock at a time. A second would find the
+        # buffer already drained, and during a slow write every change past
+        # the max-age ceiling would queue another.
+        if ns.queued is not None and not ns.queued.done():
+            return
+        ns.queued = current
         async with ns.write_lock:
+            if ns.queued is current:
+                ns.queued = None
             await self._flush(ns)
 
     async def _flush(self, ns: _NamespaceState) -> None:
@@ -703,6 +968,25 @@ class PersistenceMiddleware:
         ns.dirty_rows.clear()
         ns.deleted_keys.clear()
         ns.first_dirty_at = None
+
+        # Once per write, not per commit: the walk covers the whole slot, and one
+        # scoped slot holds every user's data. Before the first await, so a cancel
+        # cannot skip it, and only while the value still serializes to the written
+        # payload, since it can change in place into a cycle or an unencodable key.
+        unchecked, ns.unchecked = ns.unchecked, {}
+        payloads = {row["slot_name"]: row["payload"] for row in rows} if unchecked else {}
+        for slot_name, value in unchecked.items():
+            try:
+                written = json.dumps(value) == payloads.get(slot_name)
+            except (TypeError, ValueError, RecursionError):
+                written = False
+            if not written:
+                continue
+            note = _key_coercion_note(value, slot_name)
+            if note is not None and self._first_key_note(f"{slot_name}: {note}"):
+                # Still written: refusing would drop every other entry in the
+                # slot too, other users' included in a shared one.
+                logger.error(f"Application slot {slot_name!r} {note}")
 
         table, key_columns, delete_column = self._namespace_tables(ns.name)
 
@@ -727,7 +1011,7 @@ class PersistenceMiddleware:
                 if key not in ns.dirty_rows:
                     ns.deleted_keys.add(key)
 
-        try:
+        async def write() -> None:
             if rows:
                 # Prefer the batched path (one round-trip) when the backend
                 # implements it; fall back to per-row upsert so a custom
@@ -740,28 +1024,33 @@ class PersistenceMiddleware:
                         await ns.backend.row_upsert(table, row, key_columns)
             for key in deletes:
                 await ns.backend.row_delete(table, {delete_column: key})
+
+        try:
+            await _bounded_wait(write(), self._WRITE_TIMEOUT)
         except asyncio.CancelledError:
-            # CancelledError is a BaseException, so the retry path below
-            # never saw it and the snapshot drained above was lost. That
-            # window is not hypothetical: ``flush_all`` cancels in-flight
-            # flush tasks before its own final drain, which is exactly a
-            # cancel landing mid-write at shutdown, and the rows it
-            # dropped were the ones ``close`` exists to persist. From
-            # here a cancel mid-write is indistinguishable from one
-            # before it, so the batch goes back for whoever flushes next
-            # rather than on the floor.
+            # A cancel bypasses the retry path below, and ``flush_all`` cancels
+            # in-flight flushes before its final drain, so the drained batch goes
+            # back for the next flush instead of being lost at shutdown.
             requeue()
             raise
         except Exception as exc:
             ns.retry_count += 1
+            detail = str(exc) or (
+                "timed out" if isinstance(exc, asyncio.TimeoutError) else type(exc).__name__
+            )
             logger.error(
                 f"Persistence flush failed for {ns.name!r} "
-                f"(retry {ns.retry_count}/{self.MAX_RETRIES}): {exc}"
+                f"(retry {ns.retry_count}/{self.MAX_RETRIES}): {detail}"
             )
+            # Re-enqueue before the hook, so a cancel landing in it cannot
+            # drop the rows this flush took out of the buffer.
+            requeue()
             await self._fire_hook("on_error", ns.name, exc)
 
-            # Re-enqueue so the next scheduled flush retries.
-            requeue()
+            # The final flush of a close: a retry would run against the
+            # backend the close is about to shut. The rows wait for a reopen.
+            if self._closed:
+                return
 
             if ns.retry_count >= self.MAX_RETRIES:
                 logger.critical(
@@ -777,10 +1066,18 @@ class PersistenceMiddleware:
                 self._BACKOFF_CAP,
                 self._BACKOFF_BASE * (2 ** (ns.retry_count - 1)),
             )
+            # A change during the write scheduled a flush. The retry replaces
+            # it: left running, it would run beside the retry out of reach.
+            if ns.task is not None and not ns.task.done():
+                ns.task.cancel()
+            ns.retry_at = time.monotonic() + backoff
             ns.task = self._spawn(self._run_flush(ns, wait=backoff))
             return
 
         ns.retry_count = 0
+        # A flush queued behind the failed one can land while the retry still
+        # sleeps; changes after it no longer wait for that retry.
+        ns.retry_at = None
         await self._fire_hook("on_flush", ns.name, len(rows), len(deletes))
 
     # // ========================================( Helpers )======================================== // #
@@ -813,31 +1110,38 @@ class PersistenceMiddleware:
             )
             return None
 
-        # Drop kwargs that the registry surfaces via dedicated columns
-        # (``persistence_key``) or that are never safely round-tripped
-        # through JSON (``theme``). Without this filter, a live ``Theme``
-        # would silently stringify to ``"<Theme object at 0x...>"`` (the
-        # old ``default=str`` fallback) and corrupt the row; reattach
-        # would then either raise or build a view with the wrong theme.
-        init_kwargs = {
-            k: v
-            for k, v in getattr(view, "_init_kwargs", {}).items()
-            if k not in _NON_PERSISTABLE_KWARGS
-        }
+        # Read off the class: a test double answers any attribute on the instance.
+        if getattr(type(view), "_registration_source", None) is not None:
+            source = view._registration_source(persistence_key)
+        else:
+            source = (
+                getattr(view, "_init_kwargs", {}),
+                int(getattr(type(view), "kwargs_schema_version", 1)),
+            )
+        if source is None:
+            logger.debug(
+                f"Live view for persistence_key {persistence_key!r} holds no record of "
+                f"the panel's arguments; skipping registry persist"
+            )
+            return None
+        source_kwargs, kwargs_version = source
+        # ``persistence_key`` has its own column, and ``theme`` and ``bot`` are
+        # live objects no row can carry.
+        init_kwargs = {k: v for k, v in source_kwargs.items() if k not in _NON_PERSISTABLE_KWARGS}
         try:
             # No ``default=`` fallback by design: any non-JSON kwarg
             # surfaces as a TypeError here so the row is declined and
             # logged, not silently coerced into a string the reattach
             # path cannot consume.
             init_kwargs_json = json.dumps(init_kwargs)
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, RecursionError) as exc:
             # Enumerate the non-serializable kwargs so the error names them.
             # Runtime dependencies belong in on_bind, not the constructor.
             bad = []
             for key, value in init_kwargs.items():
                 try:
                     json.dumps(value)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, RecursionError):
                     bad.append(f"{key}={type(value).__name__}")
             offenders = ", ".join(bad) if bad else str(exc)
             logger.error(
@@ -847,8 +1151,12 @@ class PersistenceMiddleware:
                 f"round-trip; pass them through on_bind(bot) instead."
             )
             return None
+        note = _key_coercion_note(init_kwargs, "kwargs")
+        if note is not None and self._first_key_note(f"{persistence_key}: {note}"):
+            # Still written: a declined row would leave the panel dead on the
+            # next restart rather than restored with one mismatched key.
+            logger.error(f"Persistent view {persistence_key!r} {note}")
 
-        kwargs_version = int(getattr(view, "kwargs_schema_version", 1))
         now = int(time.time())
 
         return {
@@ -882,7 +1190,9 @@ class PersistenceMiddleware:
         hooks: Optional[dict] = getattr(self._manager, "_hooks", None)
         if not hooks:
             return
-        for callback in hooks.get(hook_name, ()):
+        # A snapshot: a hook registered during this call first runs on the
+        # next one, and one that registers itself each time cannot loop here.
+        for callback in list(hooks.get(hook_name, ())):
             try:
                 # isawaitable, not iscoroutine: a hook returning a Future
                 # or any awaitable object is still work to wait on, and the
@@ -896,9 +1206,10 @@ class PersistenceMiddleware:
     async def flush_all(self) -> None:
         """Cancel pending tasks and flush every namespace synchronously.
 
-        Called by :meth:`~cascadeui.persistence.manager.PersistenceManager.close`
-        during bot shutdown. Each namespace flushes under its write
-        lock so no partial writes slip past ``close``.
+        Called by :meth:`~cascadeui.persistence.manager.PersistenceManager.close`,
+        which runs when the bot closes or when the caller closes persistence.
+        Each namespace flushes under its write lock so no partial writes slip
+        past ``close``.
 
         Cancelled tasks are gathered with exceptions suppressed so
         cancellation unwinds fully before backend close. Because the
@@ -912,11 +1223,8 @@ class PersistenceMiddleware:
         if to_cancel:
             await asyncio.gather(*to_cancel, return_exceptions=True)
 
-        # Skip namespaces that were never built -- the direct
-        # construction path leaves both None until :meth:`initialize`
-        # runs, so a shutdown path that fires before startup completes
-        # (failed boot, test teardown before install) must not crash
-        # on ``None.write_lock``.
+        # A namespace is None until :meth:`initialize` builds it, as on a
+        # shutdown after a failed boot.
         for ns in (self._ns_registry, self._ns_application):
             if ns is None:
                 continue
@@ -924,6 +1232,175 @@ class PersistenceMiddleware:
                 await self._flush(ns)
 
     async def close(self) -> None:
-        """Stop accepting new writes and drain outstanding flushes."""
+        """Stop scheduling writes, hold new changes for a reopen, and write what is batched."""
         self._closed = True
         await self.flush_all()
+
+    def _close_with_bot(self) -> None:
+        """Close persistence when the bot closes, and open it when the bot connects.
+
+        discord.py has no shutdown event, so without this a stopped bot loses
+        the application writes still batched, and a SQLite backend's worker
+        thread keeps the process alive. The bot's ``close()`` is wrapped on
+        the instance, so an override on the bot's class still runs first, and
+        persistence closes after it, even when it raises. Closing twice is
+        harmless, so a bot that also closes persistence itself is unaffected.
+
+        ``connect()`` is wrapped too. It reopens persistence a close shut
+        when the same bot connects again, which runs no ``setup_hook``. And a
+        close from another task (SIGTERM, a shutdown command) still has
+        persistence to close when ``connect()`` returns and the program
+        moves on to ending, so ``connect()`` waits for it. A bot replaced by
+        another (see :meth:`_adopt`) no longer closes it.
+        """
+        manager = self._manager
+        bot = getattr(manager, "_bot", None)
+        if bot is None:
+            return
+
+        closes = bot.close
+        if getattr(closes, "_cascadeui_closes", None) is not manager:
+
+            async def close(*args, **kwargs):
+                # A reopen skips while this is pending, and connect() waits for it.
+                closing = asyncio.get_running_loop().create_future()
+                self._bot_closes.add(closing)
+                finished = False
+                try:
+                    result = await closes(*args, **kwargs)
+                    finished = True
+                    return result
+                finally:
+                    # Before a reopen below restores the panels it leaves.
+                    self._store._release_views_of(bot)
+                    try:
+                        if manager._bot is bot:
+                            await _close_to_the_end(manager)
+                    finally:
+                        self._bot_closes.discard(closing)
+                        closing.set_result(None)
+                    # A restart that began during this close skipped its reopen,
+                    # so it happens here. Not after a close cut off part way:
+                    # the program is ending, and SQLite would keep it alive.
+                    running = manager._bot
+                    if finished and running is not None and not running.is_closed():
+                        try:
+                            await self._reopen_with_bot(self._store)
+                        except Exception as exc:
+                            logger.error(
+                                f"Could not reopen persistence after {type(running).__name__} "
+                                f"restarted: {exc}. Changes are held until persistence "
+                                "reopens, and lost if the process exits first.",
+                                exc_info=True,
+                            )
+
+            close._cascadeui_closes = manager
+            bot.close = close
+
+        connects = bot.connect
+        if getattr(connects, "_cascadeui_opens", None) is not manager:
+
+            async def connect(*args, **kwargs):
+                if manager._bot is bot and (
+                    self._closed or manager._closed or manager._close_started
+                ):
+                    try:
+                        await self._reopen_with_bot(self._store)
+                    except Exception as exc:
+                        # A database that is down must not stop the bot
+                        # reconnecting; the changes it misses are held.
+                        logger.error(
+                            f"Could not reopen persistence before {type(bot).__name__} "
+                            f"connects: {exc}. Connecting anyway; changes are held until "
+                            "persistence reopens, and lost if the process exits first.",
+                            exc_info=True,
+                        )
+                try:
+                    return await connects(*args, **kwargs)
+                finally:
+                    closing = [f for f in self._bot_closes if not f.done()]
+                    if closing:
+                        await asyncio.shield(asyncio.gather(*closing))
+
+            connect._cascadeui_opens = manager
+            bot.connect = connect
+
+    def _close_on_sigterm(self) -> None:
+        """Close the bot, and persistence with it, when the process gets SIGTERM.
+
+        systemd, ``docker stop``, and most process managers stop a program
+        with SIGTERM, which discord.py leaves at its default: the process
+        dies at once, and the writes still batched are lost. So when nothing
+        else handles SIGTERM, the first one closes the bot, which ends a
+        program that runs the bot as its main task, and puts the default
+        back, so a second SIGTERM ends a program that is still running, and a
+        bot started again after it ends the process (see
+        :meth:`_end_after_sigterm`). A handler the application installs takes
+        precedence, before or after this. Nothing is installed where the event
+        loop cannot handle signals: Windows, or a loop not running on the main
+        thread. A SIGTERM that arrives once the bot has closed ends the program
+        with the default action, as it would without this.
+        """
+        bot = getattr(self._manager, "_bot", None)
+        if bot is None:
+            return
+        if bot.is_closed():
+            return
+        if signal.getsignal(signal.SIGTERM) is not signal.SIG_DFL:
+            return
+        try:
+            asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, self._on_sigterm)
+        except RuntimeError:
+            # NotImplementedError on Windows, and the refusal off the main thread.
+            return
+        self._sigterm_disposition = signal.getsignal(signal.SIGTERM)
+
+    def _on_sigterm(self) -> None:
+        # asyncio still calls this after the application replaces the handler
+        # with signal.signal(), so a changed disposition means it is theirs.
+        if signal.getsignal(signal.SIGTERM) is not self._sigterm_disposition:
+            return
+        bot = getattr(self._manager, "_bot", None)
+        if bot is None:
+            return
+        asyncio.get_running_loop().remove_signal_handler(signal.SIGTERM)
+        # A close already running (a shutdown command's) writes the batch, and
+        # is waited for rather than started again: a second bot.close() would
+        # run the bot's own close() override twice. With nothing left to
+        # close, the program still running ends, as it would without this.
+        closing = [f for f in self._bot_closes if not f.done()]
+        if closing:
+            logger.info(f"SIGTERM received: {type(bot).__name__} is already closing")
+            self._sigterm_close = asyncio.ensure_future(asyncio.gather(*closing))
+            return
+        if bot.is_closed():
+            signal.raise_signal(signal.SIGTERM)
+            return
+        logger.info(f"SIGTERM received: closing {type(bot).__name__}")
+        self._sigterm_close = asyncio.ensure_future(self._close_bot(bot))
+
+    @staticmethod
+    async def _close_bot(bot) -> None:
+        try:
+            await bot.close()
+        except Exception as exc:
+            logger.error(f"Closing the bot on SIGTERM failed: {exc}", exc_info=True)
+
+    def _adopt(self, replacement: "PersistenceMiddleware") -> None:
+        """Take over the bot a replacement instance was built for.
+
+        :func:`~cascadeui.setup_middleware` keeps the installed instance when
+        a restart builds a new one. A restart that builds a new bot object as
+        well passes that bot here, so persistence closes with it, and its
+        message deletions reach the views.
+        """
+        if self._manager is None:
+            return
+        if replacement._manager is not None:
+            bot = replacement._manager._bot
+        else:
+            bot = (replacement._pending_config or {}).get("bot")
+        if bot is None or bot is self._manager._bot:
+            return
+        self._manager._bot = bot
+        self._store._install_message_cleanup(bot)

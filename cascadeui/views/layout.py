@@ -1,7 +1,6 @@
 # // ========================================( Modules )======================================== // #
 
 
-import asyncio
 import logging
 from typing import Any, Dict, Optional, Sequence
 
@@ -124,16 +123,10 @@ class StatefulLayoutView(_StatefulMixin, LayoutView):
     ``ActionRow`` before being added to the view.
     """
 
-    # Subclass config: V2 placement validation. When ``True`` (default),
-    # ``_send_pipeline`` walks the assembled component tree and raises
-    # ``ValueError`` on placements that Discord's API would reject with
-    # HTTP 400 (Container nesting, standalone Button at top level,
-    # Section accessory not in {Button, Thumbnail}, Modal-only types in
-    # a LayoutView, Section nested inside Section, etc). The check runs
-    # before the Discord round-trip, so the violation surfaces with a
-    # clear path string instead of a terse 400 response. Set to
-    # ``False`` only when discord.py / Discord has updated an
-    # enforcement rule the validator has not caught up to yet.
+    # Subclass config: before each send and edit, raise ValueError, naming the
+    # node, on a tree Discord would reject with a 400 (the teardown freeze and
+    # the Continue arming log instead). Turn off only when the validator lags
+    # a discord.py or Discord change.
     validate_placement: bool = True
 
     # ``validate_placement`` is V2-only -- ``_BOOL_ATTRS`` extends the
@@ -156,8 +149,11 @@ class StatefulLayoutView(_StatefulMixin, LayoutView):
         their display content as children (Container, TextDisplay,
         Section, etc.).
 
-        See ``_StatefulMixin._send_pipeline`` for the full exception
-        contract and rollback semantics.
+        A cancel landing once Discord has accepted the message cuts the step
+        it lands in; the steps after it, such as registering the view, still
+        run for at most five seconds, and the cancel is raised after them.
+        See ``_StatefulMixin._send_pipeline`` for the full
+        exception contract and rollback semantics.
 
         Args:
             file: Single attachment uploaded with the message. Pair with
@@ -215,11 +211,11 @@ class StatefulLayoutView(_StatefulMixin, LayoutView):
 
         Discord caps a V2 message at 40 components, counted recursively,
         and discord.py raises a terse ``ValueError`` from ``add_item`` the
-        moment the tree would cross it -- before the send and before the
+        moment the tree would cross it, before the send and before the
         placement validator runs. This override re-raises with the running
         count and a directed fix. It is the aggregate-size sibling of
-        ``validate_placement``'s per-node checks -- same error shape (count
-        plus a one-line fix), at the construction seam instead of the
+        ``validate_placement``'s per-node checks, with the same error shape
+        (count plus a one-line fix) at the construction seam instead of the
         pre-flight seam: discord.py owns the enforcement, the library owns
         the message.
         """
@@ -287,8 +283,8 @@ class StatefulLayoutView(_StatefulMixin, LayoutView):
     ) -> ActionRow:
         """Return an ``ActionRow`` combining a Back and/or an Exit button.
 
-        Builds the common pushed-sub-view footer -- a Back button that pops
-        the navigation stack next to an Exit button -- in one call. Both
+        Builds the common pushed-sub-view footer (a Back button that pops
+        the navigation stack next to an Exit button) in one call. Both
         buttons are on by default; set ``back=False`` or ``exit=False`` to
         drop either. With :meth:`on_load` defined, Back re-reads the restored
         parent's data automatically, so no rebuild callback is needed.

@@ -29,16 +29,41 @@ class InstanceLimitError(Exception):
             await ctx.send(e.default_message, ephemeral=True)
     """
 
-    def __init__(self, view_type: str, limit: int, blocked_user_id: int = None):
+    def __init__(
+        self,
+        view_type: str,
+        limit: int,
+        blocked_user_id: int = None,
+        scope: str = None,
+    ):
         self.view_type = view_type
         self.limit = limit
         self.blocked_user_id = blocked_user_id
+        self.scope = scope
         super().__init__(f"Session limit ({limit}) reached for {view_type}.")
 
     @property
     def default_message(self) -> str:
-        """Pre-formatted rejection string safe to send in an interaction reply."""
-        if self.limit == 1:
+        """Pre-formatted rejection string safe to send in an interaction reply.
+
+        Worded for who the limit counts: a joiner already taking part in
+        another view, a whole server (``scope="guild"``), everyone
+        (``"global"``), or the user who tried to open the view.
+        """
+        one = self.limit == 1
+        if self.blocked_user_id is not None:
+            if one:
+                return "You're already taking part in one of these."
+            return f"You can only take part in {self.limit} of these at once."
+        if self.scope == "guild":
+            if one:
+                return "One of these is already open in this server."
+            return f"This server can only have {self.limit} of these open at once."
+        if self.scope == "global":
+            if one:
+                return "One of these is already open."
+            return f"Only {self.limit} of these can be open at once."
+        if one:
             return "You already have one of these open. Close it first."
         return f"You can only have {self.limit} of these open at once."
 

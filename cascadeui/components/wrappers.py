@@ -51,12 +51,8 @@ def _claim_wrap(component: Any, wrapper: str) -> bool:
     if wrapper in wrapped:
         return True
 
-    # Name the callback the user wrote, before this wrapper buries it.
-    # ``with_cooldown`` keys its deadlines on that identity, and a wrapper
-    # installed first leaves only its own closure behind: one shared by
-    # every component that wrapper touched. ``StatefulComponent`` stamps this
-    # already, so the first claim wins and later wrappers read through to the
-    # same callback.
+    # Record the caller's own callback before a wrapper hides it: with_cooldown
+    # keys deadlines on it. The first claim wins (StatefulComponent stamps it).
     if getattr(component, "_cascadeui_user_callback", None) is None:
         component._cascadeui_user_callback = getattr(component, "callback", None)
 
@@ -138,11 +134,8 @@ def with_loading_state(
         if loading_emoji is not None and hasattr(component, "emoji"):
             component.emoji = loading_emoji
 
-        # Route pre-edit through view.refresh() for stateful views so the
-        # library's throttle/digest/backoff path handles the edit. Falls
-        # through to direct response.edit_message for plain discord.ui
-        # views, and silently skips when the response slot is already
-        # consumed (auto-defer fired, or the callback opened the slot).
+        # A stateful view edits through refresh() (throttle, digest, backoff);
+        # a plain view through the response slot, skipped once it is consumed.
         from ..views.base import _StatefulMixin
 
         if isinstance(view, _StatefulMixin) and view._message is not None:
@@ -256,12 +249,8 @@ def with_confirmation(
                         content=confirmed_message, embed=None, view=None
                     )
                 except (*DISCORD_CALL_ERRORS, discord.InteractionResponded):
-                    # A failed prompt edit (deleted message, dead ack, transient
-                    # 5xx, a rate limit, a slot something else already took)
-                    # must not cancel the confirmed action -- the contract is
-                    # "on confirm, run the callback". Swallow the cosmetic edit
-                    # failure and proceed; the callback acks the slot if it is
-                    # still open.
+                    # A failed prompt edit must not cancel the confirmed action;
+                    # the callback acks the slot if it is still open.
                     pass
                 await await_maybe(original_callback(confirm_interaction))
             finally:
@@ -311,11 +300,8 @@ def with_confirmation(
                 embed=embed, view=confirmation_view, ephemeral=True
             )
 
-        # Capture the prompt so on_timeout can disable its buttons. The
-        # followup path returns the message directly; the response-slot path
-        # resolves it via original_response(). Best-effort -- if the slot was
-        # pre-consumed on the respond() path, on_timeout still disables the
-        # buttons in memory.
+        # Captured so on_timeout can disable the prompt's buttons on screen;
+        # best effort, since on_timeout disables them in memory regardless.
         if prompt_message is None:
             try:
                 prompt_message = await interaction.original_response()
@@ -417,25 +403,10 @@ def with_cooldown(
                 f"  Fix: the only placeholder is {{remaining}}, and it arrives "
                 f"already rounded to one decimal, so it takes no format spec."
             ) from exc
-    # Resolved once, at wrap time. A rebuild hands back a fresh component
-    # object, so the key has to name something the render did not create.
-    #
-    # A custom_id the caller passed is exactly that: their own name for this
-    # control, stable by construction and unique inside the view (duplicates
-    # already fail placement validation). ``_stabilize_custom_ids`` reads the
-    # same flag for the same reason, so the escape hatch wins here too.
-    #
-    # An auto-generated custom_id is not a name: at wrap time it is still
-    # random hex, and the stabilizer later derives it from the label, so a
-    # trigger that relabels between states (Enable / Disable) would start a
-    # fresh cooldown on every flip.
-    #
-    # Failing that, what the component DOES is the one thing a rebuild keeps.
-    # Read through to the caller's own function, since a StatefulButton's
-    # ``callback`` is the stateful wrapper, whose qualname every stateful
-    # component in the library shares. Callables minted per item (factory
-    # closures, lambdas, partials) all carry one qualname, so those name
-    # their control through ``custom_id=`` or ``key=``.
+    # Resolved once, from something a rebuild keeps. A generated custom_id is
+    # not one: it is random hex at wrap time and later follows the label, so a
+    # relabeling toggle would restart its cooldown on every flip. The callback
+    # is read through the stateful wrapper, whose qualname every component shares.
     _keyed_on = getattr(component, "_cascadeui_user_callback", None) or original_callback
     if key:
         cooldown_key = key

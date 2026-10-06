@@ -43,13 +43,9 @@ logger = logging.getLogger(__name__)
 # // ========================================( Persistent registry )======================================== // #
 
 
-# Slots declared persistent are written through to the backend by
-# ``PersistenceMiddleware``; everything else is skipped. The routes that
-# add a name here are listed on ``is_persistent_slot`` below, so the list
-# lives in one place rather than in every comment that mentions it. The
-# registry is module-level so the marker is sticky across calls: once a
-# slot is declared persistent, every future write to that slot name
-# inherits the contract.
+# Slots ``PersistenceMiddleware`` writes through; the routes that add a name are
+# listed on ``is_persistent_slot``. Module-level, so the marker is sticky: every
+# later write to a slot declared persistent is saved.
 _PERSISTENT_SLOTS: Set[str] = set()
 
 
@@ -96,6 +92,11 @@ def access_slot(
     the same ``name`` inherits persistence without needing to re-pass
     the kwarg. Declare it once (typically inside ``seed_initial_state``)
     and writes from reducers, helpers, or elsewhere flow to disk.
+
+    A persistent slot's dict keys must be strings. JSON stores every key
+    as a string, so an ``int`` key such as a user id reads back as ``"42"``
+    after a restart and a lookup by ``42`` misses; the middleware logs an
+    ERROR naming the key. Key a persistent slot by ``str(user_id)``.
 
     Args:
         state: The state dict to walk. Either a reducer's snapshot or
@@ -236,14 +237,9 @@ class slot_property:
         self._key = key
         self._default = default
         self._attr_name = name  # overridden by __set_name__ when used in a class body
-        # Owner classes whose key= has already been reported as raising. A
-        # descriptor is read on every attribute access, so reporting per
-        # read buries the one line that matters under thousands of copies
-        # and teaches an operator to filter the logger out. The failure
-        # belongs to the declaration, not to any one read. Keyed by owner
-        # rather than a bare flag because one descriptor is shared by every
-        # subclass that inherits it, and the attribute the key reaches for
-        # may exist on some of them.
+        # Owner classes whose key= already reported raising: the descriptor is
+        # read on every access, and the failure belongs to the declaration.
+        # Per owner, since subclasses share it and the key may work on some.
         self._key_failed: Set[str] = set()
 
     def __set_name__(self, owner, name):
@@ -252,11 +248,9 @@ class slot_property:
     def __get__(self, instance, owner):
         if instance is None:
             return self
-        # Split the two reasons a read can come up empty. A store that is
-        # not wired yet is the ordinary case and stays silent. A key
-        # callable that raises is a mistake in the declaration, and folding
-        # it into the same swallow turned a typo into a default that looks
-        # correct in every test.
+        # A store not wired yet is ordinary and silent; a key= that raises is a
+        # mistake in the declaration, reported once per class and then read as
+        # the default.
         state = getattr(getattr(instance, "state_store", None), "state", None)
         if not isinstance(state, dict):
             return self._default

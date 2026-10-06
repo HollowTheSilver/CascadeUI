@@ -1039,6 +1039,23 @@ class TestSlotCoherenceValidation:
             class _Child(_Parent):
                 scoped_slot = "my_stats"
 
+    def test_an_instance_override_of_scoped_slot_is_checked_too(self):
+        """The override skipped the check the class body gets, so scoped writes
+        went to a slot nothing persisted and were lost on restart."""
+
+        class _Persisted(StatefulLayoutView):
+            persistent_slots = ("scoped",)
+
+        view = _Persisted(interaction=_make_interaction())
+        with pytest.raises(ValueError, match='persistent_slots includes "scoped"'):
+            view.set_class_attribute("scoped_slot", "my_stats")
+        assert view.scoped_slot is None
+
+    def test_an_instance_override_of_scoped_slot_without_scoped_persisted_is_accepted(self):
+        view = StatefulLayoutView(interaction=_make_interaction())
+        view.set_class_attribute("scoped_slot", "my_stats")
+        assert view.scoped_slot == "my_stats"
+
 
 class TestMergeScoped:
     """``merge_scoped(state, scope, data, *, slot_name, subkey, **identifiers)``

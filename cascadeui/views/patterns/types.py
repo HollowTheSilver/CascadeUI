@@ -20,7 +20,6 @@ Public exports (also re-exported from ``cascadeui``):
     - ``RoleCategory`` -- typed dataclass for a role-assign category
 """
 
-import inspect
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
 from typing import Any, Callable, Dict, FrozenSet, List, Optional

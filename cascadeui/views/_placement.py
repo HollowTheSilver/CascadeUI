@@ -18,34 +18,31 @@ from discord.ui import (
     Section,
     Separator,
     TextDisplay,
+    TextInput,
     Thumbnail,
 )
 from discord.ui.select import BaseSelect
 
 from ..components.types import MAX_COMPONENT_ID
 
-# Item types that belong inside a ``Modal``, never inside a ``LayoutView``
-# tree. discord.py accepts them at any tree position because every check
-# is ``isinstance(item, Item)``; Discord's API server rejects them at send
-# time. Every position a LayoutView tree can put an item in is covered
-# (top level, Container child, Section child, Section accessory, and
-# ActionRow child), each with a "this belongs in a Modal" message.
-_MODAL_ONLY_TYPES: Tuple[Type, ...] = (Label, RadioGroup, CheckboxGroup, Checkbox, FileUpload)
+# Modal-only item types. discord.py accepts them anywhere in a LayoutView
+# tree and Discord rejects them at send, so every tree position checks them.
+_MODAL_ONLY_TYPES: Tuple[Type, ...] = (
+    Label,
+    TextInput,
+    RadioGroup,
+    CheckboxGroup,
+    Checkbox,
+    FileUpload,
+)
 
-# MediaGallery's documented item-count range. Discord's API docs at
-# ``developers/components/reference.mdx`` describe MediaGallery as
-# displaying "1-10 media attachments" with the ``items`` field typed
-# as "1 to 10 media gallery items". discord.py does not enforce either
-# bound at construction.
+# Discord's component reference: 1 to 10 media gallery items. discord.py
+# enforces neither bound.
 _MEDIA_GALLERY_MIN_ITEMS = 1
 _MEDIA_GALLERY_MAX_ITEMS = 10
 
-# TextDisplay's content-length cap. Discord's component reference limits a
-# text display's ``content`` to 4000 characters. discord.py stores it as a
-# plain string with no length check, so an oversized body constructs cleanly
-# and only fails at HTTP send. The grid builder enforces the same cap at
-# construction (``components/patterns/v2.py``); this keeps the general
-# validator in step with it.
+# Discord caps a text display's content at 4000 characters, unchecked by
+# discord.py. The grid builder enforces the same cap at construction.
 _TEXTDISPLAY_MAX_CHARS = 4000
 
 # Button label-length cap. Discord's component reference limits a button's
@@ -54,10 +51,6 @@ _TEXTDISPLAY_MAX_CHARS = 4000
 # HTTP send.
 _BUTTON_LABEL_MAX = 80
 
-# Select placeholder-length cap. Discord's component reference limits a
-# select's ``placeholder`` to 150 characters. discord.py stores it as a plain
-# string with no length check, so oversized placeholder text constructs
-# cleanly and only fails at HTTP send.
 # Link-button URL cap. Discord's component reference limits a button's
 # ``url`` to 512 characters, and discord.py stores it unchecked, same as
 # the label.
@@ -68,6 +61,8 @@ _BUTTON_URL_MAX = 512
 # capped at 1024 characters. discord.py stores it unchecked.
 _MEDIA_DESCRIPTION_MAX = 1024
 
+# Discord caps a select's placeholder at 150 characters, unchecked by
+# discord.py.
 _SELECT_PLACEHOLDER_MAX = 150
 
 # SelectOption text cap. Discord's component reference limits each select
@@ -82,31 +77,18 @@ _SELECT_OPTION_TEXT_MAX = 100
 # ``key=``, or a caller's own string only meets a check here.
 _CUSTOM_ID_MAX = 100
 
-# Section's documented child-count minimum. Discord's API docs at
-# ``developers/components/reference.mdx`` describe the Section
-# ``components`` field as "One to three child components". The
-# ``accessory`` is a separate field and does NOT count toward this
-# cap. discord.py's ``Section.__init__`` routes every child through
-# ``add_item`` (``section.py:80-83``) which raises on the fourth
-# child, so the upper bound is unreachable through normal
-# construction -- the validator enforces only the lower bound here.
+# Discord: a Section holds one to three child components; the accessory is a
+# separate field. discord.py's add_item already refuses a fourth child, so
+# only the minimum is checked here.
 _SECTION_MIN_CHILDREN = 1
 
-# Container minimum child count. Discord's API docs do NOT document a
-# minimum or maximum on Container children -- the ``components`` field
-# is typed as just "array of container child components". The library
-# enforces ``min = 1`` conservatively because an empty Container has no
-# content to render. There is no library-enforced maximum: the only
-# documented Discord cap that applies is the message-level 40-component
-# recursive total, which the validator does not check.
+# Discord documents no Container child count; an empty one renders nothing,
+# so one child is required. The only cap is the message's 40-component
+# total, which discord.py enforces at add_item.
 _CONTAINER_MIN_CHILDREN = 1
 
-# ActionRow minimum child count. Discord's API docs describe ActionRow
-# as holding "Up to 5 interactive button components or a single select
-# component". An empty ActionRow has no interactive component to render.
-# discord.py enforces the upper width budget (5 button-units, with
-# selects = 5) at construction so the validator only enforces the
-# minimum here.
+# An empty ActionRow renders nothing. A select must have its row to itself,
+# which discord.py misses when the select is added first.
 _ACTION_ROW_MIN_CHILDREN = 1
 
 # // ========================================( V2 Placement Validator )======================================== // #
@@ -161,6 +143,11 @@ def validate_placement(view) -> None:
 # // ========================================( Layer Walkers )======================================== // #
 
 
+def _unwrap(item):
+    """The component a ``DynamicItem`` carries, which is what Discord receives."""
+    return item.item if isinstance(item, DynamicItem) else item
+
+
 def _validate_top_level(item, path: List[str]) -> None:
     """LayoutView top-level child rules.
 
@@ -168,9 +155,10 @@ def _validate_top_level(item, path: List[str]) -> None:
     Separator, ActionRow. Standalone Button / Select / Thumbnail are
     rejected -- Buttons and Selects belong inside an ActionRow, and
     Thumbnail is only legal as a Section accessory. Modal-only types
-    (Label, RadioGroup, CheckboxGroup, Checkbox, FileUpload) are
+    (Label, TextInput, RadioGroup, CheckboxGroup, Checkbox, FileUpload) are
     rejected with a directed message pointing at the Modal subsystem.
     """
+    item = _unwrap(item)
     if isinstance(item, Container):
         _validate_container(item, path)
         return
@@ -242,6 +230,7 @@ def _validate_container(container: Container, path: List[str]) -> None:
     _check_container_size(container, path)
     for index, child in enumerate(container.children):
         child_path = path + [f"{type(child).__name__}[{index}]"]
+        child = _unwrap(child)
         if isinstance(child, Container):
             _raise_placement_error(
                 child_path,
@@ -342,7 +331,7 @@ def _validate_section(section: Section, path: List[str]) -> None:
                 "auto-wrap to TextDisplay at construction).",
             )
 
-    accessory = section.accessory
+    accessory = _unwrap(section.accessory)
     if isinstance(accessory, Button):
         _check_button_label(accessory, path + [f"accessory({type(accessory).__name__})"])
         return
@@ -374,18 +363,17 @@ def _validate_section(section: Section, path: List[str]) -> None:
 def _validate_action_row(row: ActionRow, path: List[str]) -> None:
     """ActionRow rules.
 
-    Children must be ``Button`` or ``Select``. Known wrong-domain
-    types (Container, Section, etc.) raise with a directed message;
-    unknown Item subclasses pass through to leave headroom for future
-    Discord types and ``DynamicItem``-wrapped components that
-    discord.py serializes as Button/Select at send time. The width
-    budget (5 units, with Button=1 and Select=5) is enforced by
-    discord.py at construction so the validator does not re-check it.
-    Empty ActionRows are rejected per Discord's documented contract.
+    Children must be ``Button`` or ``Select``, a ``DynamicItem`` checked
+    as the one it carries. Known wrong-domain types (Container, Section,
+    etc.) raise with a directed message; unknown Item subclasses pass
+    through to leave headroom for future Discord types. Empty rows and
+    rows holding a select beside anything else are rejected per
+    Discord's documented contract; discord.py refuses a sixth child.
     """
     _check_action_row_size(row, path)
     for index, child in enumerate(row.children):
         child_path = path + [f"{type(child).__name__}[{index}]"]
+        child = _unwrap(child)
         if isinstance(child, Button):
             _check_button_label(child, child_path)
             continue
@@ -423,11 +411,9 @@ def _check_textdisplay_size(item: TextDisplay, path: List[str]) -> None:
     with the container types, whose minimum child counts are already enforced.
     """
     content = getattr(item, "content", None)
-    # discord.py stores every text field below unvalidated, so a caller can
-    # hand one a non-string and it reaches the payload as-is (an int
-    # SelectOption value is the common case). A character cap only means
-    # anything for a string, and raising TypeError from inside a pre-flight
-    # check is a worse failure than the HTTP 400 the check exists to prevent.
+    # discord.py stores the content unvalidated, so a non-string can arrive
+    # here. A length cap means nothing for it, and a TypeError from a
+    # pre-flight check is worse than the 400.
     if not isinstance(content, str):
         return
     length = len(content)
@@ -725,13 +711,14 @@ def _check_section_size(section: Section, path: List[str]) -> None:
 
 
 def _check_action_row_size(row: ActionRow, path: List[str]) -> None:
-    """Reject an empty ``ActionRow``.
+    """Reject an empty ``ActionRow``, and one that holds a select beside anything.
 
     Discord's API documentation describes ActionRow as holding "Up to
     5 interactive button components or a single select component"; an
     ActionRow with zero children has nothing to render. discord.py
-    enforces the upper bound (5-unit width budget) at construction but
-    does not enforce the minimum. The maximum is left to discord.py.
+    refuses a sixth child and a select added after a button, but it
+    counts a select added first as one slot, so a select followed by
+    buttons constructs and is rejected by Discord.
     """
     count = len(row.children)
     if count < _ACTION_ROW_MIN_CHILDREN:
@@ -742,6 +729,16 @@ def _check_action_row_size(row: ActionRow, path: List[str]) -> None:
             f"  Discord rejects this composition with HTTP 400.\n"
             f"  Fix: Add at least one Button or Select to the ActionRow, "
             f"or remove the empty ActionRow from the tree."
+        )
+    # A DynamicItem carries its select on .item, and discord.py counts it as
+    # one slot when added first, as it does a bare select.
+    if count > 1 and any(isinstance(_unwrap(child), BaseSelect) for child in row.children):
+        raise ValueError(
+            f"Invalid V2 placement: ActionRow holds a Select beside {count - 1} other "
+            f"component(s) (Discord allows up to 5 Buttons or a single Select per row).\n"
+            f"  Path: {' -> '.join(path)}\n"
+            f"  Discord rejects this composition with HTTP 400.\n"
+            f"  Fix: Put the Select in an ActionRow of its own."
         )
 
 
@@ -794,11 +791,9 @@ def validate_unique_custom_ids(view) -> None:
         custom_id = getattr(item, "custom_id", None)
         if custom_id is None:
             continue
-        # The length check rides this walk rather than the V2 structural one:
-        # this is the only walk that runs for V1 views and the only one that
-        # visits DynamicItem, which is not a Button subclass and so is invisible
-        # to the per-node checks. An id composed from user data (a role name, a
-        # record title) overflows here or nowhere.
+        # Here as well as in the V2 walk: only this walk runs for V1 views and
+        # visits DynamicItem, which the per-node checks miss. An id built from
+        # user data (a role name) overflows here or nowhere.
         if len(custom_id) > _CUSTOM_ID_MAX:
             raise ValueError(
                 f"custom_id is {len(custom_id)} characters, over Discord's "
@@ -814,8 +809,8 @@ def validate_unique_custom_ids(view) -> None:
                 f"  Discord rejects this message with HTTP 400 "
                 f"(code 50035: component custom id cannot be duplicated).\n"
                 f"  Fix: Give each component a distinct custom_id. A builder used more "
-                f"than once (choice_row, PaginatedRegion, Collapsible) needs a distinct "
-                f"custom_id=/key= per call."
+                f"than once needs a distinct key= (PaginatedRegion, Collapsible), or in "
+                f"a persistent view a distinct custom_id= (choice_row, button_row, tab_nav)."
             )
         seen.add(custom_id)
 

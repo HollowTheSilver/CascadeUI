@@ -161,8 +161,8 @@ class TestComputedMemoAgainstInPlaceMutation:
 
     A selector returns a slice of live state. Storing that slice by
     reference made the change check compare the slice against itself, so
-    a slot mutated in place -- which ``access_slot`` does by design, on
-    the live state ``seed_initial_state`` hands it -- left the cached
+    a slot mutated in place (which ``access_slot`` does by design, on
+    the live state ``seed_initial_state`` hands it) left the cached
     result standing. A later correct replacement did not rescue it: the
     aliased reference already equalled the new value while the cached
     result predated it, so the stale answer was permanent.

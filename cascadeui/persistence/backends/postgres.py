@@ -40,6 +40,7 @@ from typing import Any, AsyncIterator, Callable, ClassVar, Optional
 
 import asyncpg  # hard import -- backends/__init__.py catches ImportError
 
+from ...utils.tasks import _bounded_wait
 from ..protocols import Capability
 from ..schema import (
     TABLE_KV,
@@ -60,6 +61,11 @@ CHANNEL_INVALIDATION: str = "cascadeui_invalidation"
 ``table_prefix``. Hard-coded rather than composed from user state so no
 identifier-injection vector crosses the seam; the prefix is the only
 caller-supplied part, and it is the same value the table names carry."""
+
+
+_CLOSE_WAIT_SECONDS: float = 5.0
+"""How long ``close()`` lets a transaction already running finish before
+terminating its connection."""
 
 
 _NOTIFY_PAYLOAD_LIMIT_BYTES: int = 7900
@@ -112,8 +118,8 @@ def _escape_like(prefix: str) -> str:
 def _coerce_jsonb_for_write(table: str, row: dict[str, Any]) -> dict[str, Any]:
     """Coerce JSONB-bound dict values to JSON strings for asyncpg.
 
-    PersistenceManager pre-stringifies JSON payloads before calling
-    row_upsert (see manager.py's ``_capture_registry_row`` etc.), so most
+    PersistenceMiddleware pre-stringifies JSON payloads before calling
+    row_upsert (see the persistence middleware's ``_build_registry_row``), so most
     incoming values are already strings. This guard catches the case
     where a caller passes a dict directly: asyncpg's default JSONB
     encoder accepts strings, not dicts, so the conversion happens here
@@ -170,9 +176,9 @@ class PostgresBackend:
     listener connection for ``LISTEN``/``NOTIFY``. Both close cleanly on
     :meth:`close`.
 
-    Declares every capability -- relational rows, TTL index support,
-    schema metadata, KV surface -- so any namespace config works against
-    it without configuration.
+    Declares relational rows, TTL index support, schema metadata, the KV
+    surface, and raw SQL, so any namespace config works against it
+    without configuration.
 
     Cross-process invalidation: writes broadcast on the
     ``cascadeui_invalidation`` channel, prefixed by ``table_prefix`` when
@@ -190,13 +196,10 @@ class PostgresBackend:
 
     placeholder_style: ClassVar[str] = "numeric"
 
-    # Listener loop tunables. Heartbeat is the interval between health
-    # checks on the dedicated listener connection; retry is the delay
-    # before reconnecting after a caught exception. Subclasses override
-    # these to trade failover responsiveness against PG round-trip cost
-    # (a connection that is healthy answers ``is_closed()`` from local
-    # state, so the heartbeat cost is local; a torn connection only
-    # surfaces on the next health check).
+    # Listener tunables a subclass may override: seconds between health checks of
+    # the listener connection (``is_closed()`` answers locally, so a check is
+    # cheap, and a torn connection shows at the next one), and seconds before
+    # reconnecting after an error.
     listener_poll_seconds: ClassVar[float] = 10.0
     listener_retry_seconds: ClassVar[float] = 5.0
 
@@ -237,13 +240,10 @@ class PostgresBackend:
         self._dsn = dsn
         validate_table_prefix(table_prefix, "PostgresBackend")
         self.table_prefix = table_prefix
-        # The channel carries the prefix for the same reason the tables do.
-        # Two deployments sharing a database write to separate tables, and on
-        # one channel each would receive the other's invalidations: the
-        # payload names the LOGICAL namespace, which the prefix does not
-        # touch, so neither can tell a neighbour's key from its own. The
-        # oversized-payload fallback makes that worse than a stray cache miss,
-        # since an empty key means "drop this whole namespace".
+        # Prefixed like the tables: the payload names the logical namespace, so
+        # on a shared channel two deployments would take each other's
+        # invalidations, and the oversized-payload fallback's empty key drops a
+        # whole namespace.
         self._channel = f"{table_prefix}{CHANNEL_INVALIDATION}"
         self._pool_kwargs: dict[str, Any] = {
             "min_size": 2,
@@ -289,6 +289,9 @@ class PostgresBackend:
         """
         if self._pool is not None:
             return
+        # A backend initialized again after close() would otherwise start a
+        # listener loop that exits at once and never reconnects.
+        self._closing = False
 
         self._pool = await asyncpg.create_pool(self._dsn, **self._pool_kwargs)
 
@@ -319,20 +322,18 @@ class PostgresBackend:
 
         self._closing = True
 
-        # Snapshot the task set before cancelling: the done-callback
-        # discards entries while iteration is in progress, and a
-        # cancelled task can complete fast enough to mutate the set
-        # mid-loop. Iterating a copy keeps the cancel + await pass
-        # ordering deterministic.
+        # A copy: the done-callback removes tasks from the set during the loop.
         if self._tasks:
             tasks = list(self._tasks)
             for task in tasks:
                 task.cancel()
+            # asyncio.wait rather than awaiting each task: a cancel of this
+            # close still reaches its caller instead of being taken as the
+            # task's own.
+            await asyncio.wait(tasks)
             for task in tasks:
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
+                if not task.cancelled():
+                    task.exception()
             self._tasks.clear()
 
         if self._listen_conn is not None:
@@ -343,7 +344,16 @@ class PostgresBackend:
             self._listen_conn = None
 
         if self._pool is not None:
-            await self._pool.close()
+            # The pool waits for every acquired connection to be released; a
+            # transaction that never finishes would hold shutdown with it.
+            # asyncpg terminates the pool when this wait is cut short.
+            try:
+                await _bounded_wait(self._pool.close(), _CLOSE_WAIT_SECONDS)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"PostgresBackend closed with a transaction still open after "
+                    f"{_CLOSE_WAIT_SECONDS:g}s; its connection was terminated"
+                )
             self._pool = None
 
         logger.debug("PostgresBackend closed")
@@ -357,7 +367,7 @@ class PostgresBackend:
         """
         if self._pool is None:
             raise RuntimeError(
-                "PostgresBackend used before initialize(). "
+                "PostgresBackend used before initialize() or after close(). "
                 "Install PersistenceMiddleware via setup_middleware() or "
                 "await backend.initialize() first."
             )
@@ -594,7 +604,7 @@ class PostgresBackend:
                 # Bulk delete may affect many rows; emit a namespace-only
                 # NOTIFY (empty key = "invalidate everything in this
                 # namespace") so listeners drop their caches without
-                # us tracking individual row keys.
+                # tracking individual row keys.
                 if count > 0:
                     await self._notify_invalidation(conn, namespace, "")
         return count
@@ -792,23 +802,19 @@ class PostgresBackend:
         """Maintain the listener connection across drops.
 
         On reconnect, re-issues ``LISTEN`` via ``add_listener``. The race
-        rule from ``postgresql.org/docs/current/sql-listen.html`` --
-        first commit LISTEN, then inspect database state -- holds at
-        startup. After the brief drop/reconnect window, missed
-        invalidations show as cache misses on the next read; the
-        rehydrate path remains the source of truth.
+        rule from ``postgresql.org/docs/current/sql-listen.html`` (first
+        commit LISTEN, then inspect database state) holds at startup. After
+        the brief drop/reconnect window, missed invalidations show as cache
+        misses on the next read; the rehydrate path remains the source of
+        truth.
         """
         while not self._closing:
             try:
                 if self._listen_conn is None or self._listen_conn.is_closed():
-                    # Reconnect via a local variable so a cancel-during-
-                    # reconnect (close() racing with the connect or the
-                    # add_listener await) does not orphan the new
-                    # connection on the instance attribute. Ownership
-                    # transfers to ``self._listen_conn`` only after
-                    # ``add_listener`` returns successfully; on any
-                    # exception (including CancelledError) the local
-                    # ref is closed before propagating.
+                    # Through a local, so a close() cancelling the connect or
+                    # add_listener cannot orphan the new connection: it moves to
+                    # ``self._listen_conn`` only once add_listener returns, and
+                    # any exception closes it first.
                     new_conn = None
                     try:
                         new_conn = await asyncpg.connect(self._dsn)
@@ -904,12 +910,12 @@ class _PostgresTransaction:
         try:
             self._txn = self._conn.transaction()
             await self._txn.__aenter__()
-        except Exception:
+        except BaseException:
+            # A cancel during BEGIN included: the pool connection goes back.
             if self._is_outermost:
-                if self._token is not None:
-                    _CURRENT_TXN_CONN.reset(self._token)
                 if self._pool_acquire is not None:
                     await self._pool_acquire.__aexit__(None, None, None)
+                self._reset_marker()
             raise
         return self
 
@@ -924,7 +930,18 @@ class _PostgresTransaction:
                 await self._txn.__aexit__(exc_type, exc_val, exc_tb)
         finally:
             if self._is_outermost:
-                if self._token is not None:
-                    _CURRENT_TXN_CONN.reset(self._token)
-                if self._pool_acquire is not None:
-                    await self._pool_acquire.__aexit__(exc_type, exc_val, exc_tb)
+                try:
+                    if self._pool_acquire is not None:
+                        await self._pool_acquire.__aexit__(exc_type, exc_val, exc_tb)
+                finally:
+                    self._reset_marker()
+
+    def _reset_marker(self) -> None:
+        if self._token is None:
+            return
+        try:
+            _CURRENT_TXN_CONN.reset(self._token)
+        except ValueError:
+            # Exited from another context, as when the loop finalizes an
+            # abandoned async generator; that context never set the marker.
+            pass

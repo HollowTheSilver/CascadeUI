@@ -11,6 +11,8 @@ import subprocess
 import sys
 from logging.handlers import QueueHandler
 
+import pytest
+
 import cascadeui.utils.logging as log_mod
 from cascadeui.state.middleware import LoggingMiddleware
 from cascadeui.state.singleton import get_store
@@ -298,3 +300,92 @@ class TestSetupLoggingAsyncPipeline:
             assert not any(isinstance(h, QueueHandler) for h in lg.handlers)
             assert own in lg.handlers
             assert log_mod._queue_listener is None
+
+
+class TestLogFiles:
+    """The file sink writes one file per day and deletes only files it wrote."""
+
+    def _touch(self, folder, *names):
+        for name in names:
+            (folder / name).write_text("", encoding="utf-8")
+
+    @pytest.mark.parametrize(
+        "prefix, own, others",
+        [
+            ("cascadeui", "cascadeui-{}.log", ["cascadeui_errors.log", "discord.log"]),
+            ("", "{}.log", ["discord.log", "other-tool.log", "2026-10-01-backup.log"]),
+        ],
+    )
+    def test_the_purge_deletes_only_its_own_files_oldest_first(self, tmp_path, prefix, own, others):
+        days = ["2026-10-01", "2026-10-02", "2026-10-03"]
+        self._touch(tmp_path, *[own.format(day) for day in days], *others)
+        log_mod._purge_old_log_files(str(tmp_path), prefix, 2)
+        left = {p.name for p in tmp_path.iterdir()}
+        assert left == {own.format("2026-10-02"), own.format("2026-10-03"), *others}
+
+    def test_the_purge_orders_by_the_date_in_the_name(self, tmp_path, monkeypatch):
+        days = ("2026-10-01", "2026-10-02", "2026-10-03")
+        for day in days:
+            self._touch(tmp_path, f"cascadeui-{day}.log")
+        # File times run backwards against the dates, so a purge ordering by any
+        # of them keeps the oldest file. Set here, not by writing the files in
+        # reverse: two writes can land in one tick of the file system's clock.
+        backwards = {f"cascadeui-{day}.log": -i for i, day in enumerate(days)}
+        for name in ("getctime", "getmtime", "getatime"):
+            monkeypatch.setattr(
+                log_mod.os.path, name, lambda path: backwards.get(log_mod.os.path.basename(path), 0)
+            )
+        log_mod._purge_old_log_files(str(tmp_path), "cascadeui", 1)
+        assert {p.name for p in tmp_path.iterdir()} == {"cascadeui-2026-10-03.log"}
+
+    def test_a_record_after_midnight_goes_to_the_new_days_file(self, tmp_path, monkeypatch):
+        handler = log_mod._DailyFileHandler(str(tmp_path), "cascadeui", 1, "a", "utf-8")
+        try:
+            today = log_mod.datetime.now().date()
+            handler.emit(logging.makeLogRecord({"msg": "before", "levelno": 20}))
+            real = log_mod.datetime
+
+            class Tomorrow(real):
+                @classmethod
+                def now(cls, tz=None):
+                    return real.now(tz) + log_mod.timedelta(days=1)
+
+            monkeypatch.setattr(log_mod, "datetime", Tomorrow)
+            after = logging.makeLogRecord({"msg": "after", "levelno": 20})
+            after.created = handler._rollover_at
+            handler.emit(after)
+        finally:
+            handler.close()
+        tomorrow = today + log_mod.timedelta(days=1)
+        assert (tmp_path / f"cascadeui-{tomorrow}.log").read_text(encoding="utf-8") == "after\n"
+        # max_files=1: the switch deleted the previous day's file.
+        assert not (tmp_path / f"cascadeui-{today}.log").exists()
+
+
+class TestLevelNames:
+    """A misspelled level raises instead of falling back to INFO."""
+
+    def test_setup_logging_refuses_an_unknown_level(self):
+        with _isolated_root() as lg:
+            setup_logging(level="DEBUG", file=False, stream=False, actions=False)
+            with pytest.raises(ValueError, match="'DEBG' is not a logging level"):
+                setup_logging(level="DEBG", file=False, stream=False, actions=False)
+            assert lg.level == logging.DEBUG
+
+    def test_setup_logging_refuses_an_unknown_action_level(self):
+        with _isolated_root():
+            with pytest.raises(ValueError, match="actions level 'VERBOSE'"):
+                setup_logging(actions="VERBOSE", file=False, stream=False)
+
+    def test_logging_middleware_refuses_an_unknown_level(self):
+        with pytest.raises(ValueError, match="LoggingMiddleware level 'DEBG'"):
+            LoggingMiddleware(level="DEBG")
+
+    @pytest.mark.parametrize("name, value", [("warn", logging.WARNING), ("debug", logging.DEBUG)])
+    def test_known_names_still_work(self, name, value):
+        assert LoggingMiddleware(level=name)._level == value
+
+    def test_a_numeric_level_passes_through(self):
+        with _isolated_root() as lg:
+            setup_logging(level=15, file=False, stream=False, actions=False)
+            assert lg.level == 15

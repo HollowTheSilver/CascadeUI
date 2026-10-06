@@ -16,10 +16,1131 @@ preserved below for historical reference but are not the supported baseline.
 - **Image Renderer for leaderboards.** Optional `[images]` extra shipping
   `ImageLeaderboardLayoutView` with a `render: Callable[[entries, page],
   PIL.Image]` hook. Attachment-based rendering for ranked displays that
-  outgrow pure-text pagination -- avatars, gradients, custom fonts.
+  outgrow pure-text pagination: avatars, gradients, custom fonts.
   Pillow-backed; core install stays lean because the extra is opt-in.
 - **Redis persistence backend.** Capability-flag conformant `RedisBackend`
   with multi-process coordination and pub/sub for scoped invalidation.
+
+---
+
+## [3.14.0] - 2026-10-06
+
+### Breaking
+
+- **A `rebuild=` or `nav_rebuild` hook that calls the destination's
+  `reload()` or `load()` now raises `RuntimeError`.** The destination's
+  `on_load()` has already run by then, so the call loaded it a second time
+  and edited the message twice. Remove the call, and load what the hook
+  needs before navigating, as a constructor keyword or on a view built and
+  passed to `push()`.
+- **An `on_state_changed()` that awaits another task reloading the same view
+  now stalls.** A `reload()`, `load()`, send, or navigation now waits for a
+  state render already running on the view, so the two no longer rebuild
+  the tree at once. A render that awaits a separate task doing one of those
+  on its own view, such as `asyncio.gather(self.reload())`, waits on a call
+  that is waiting on it, and a warning naming the view is logged after 30
+  seconds. Await `self.reload()` directly, which runs inside the render, or
+  reload once `on_state_changed()` has returned.
+- **A modal callback that re-renders its view and then replies through
+  `interaction.response` raises `InteractionResponded`**, as a click
+  callback doing the same always has: the re-render now answers the
+  submission (see Changed). Reply with the view's `respond()` or with
+  `interaction.followup`.
+- **A reducer that awaits holds up other dispatches until it returns, and
+  `dispatch()` from inside a reducer raises `RuntimeError`.** Reducers now
+  run one at a time, so a change another command commits can no longer be
+  overwritten by a reducer that was awaiting; a dispatch waits behind it
+  instead, and one kept waiting 30 seconds logs a warning naming the reducer.
+  An action dispatched from inside a reducer, or from a task it started, was
+  lost when the reducer's result replaced the state, and now fails while the
+  reducer runs; unless the reducer catches the error, its own change is not
+  applied either. Do slow work before dispatching and pass its result in the
+  payload, and dispatch a follow-up after the first dispatch returns or from
+  a `store.on()` hook.
+- **A view that pushed or popped away hands its message to the view it
+  navigated to.** Once the edit lands, the old view's `message` reads
+  `None`, and a second `push()` or `pop()` on it raises `RuntimeError`.
+  Holding on to the message, the old view could still change it under the
+  new one: a `refresh()` painted over it, a V1 `exit()` stripped its
+  buttons, a persistent panel's `exit()` removed the registration it
+  carries, and a second `push()` shipped over it while it stayed live.
+  Navigate from the view the call returned; `replace()` on the old view
+  raises too, since it closed nothing and its new view posted a second live
+  panel, and so does `replace()` on the view a failed `push()` or `pop()`
+  returned, whose new view posted a second panel beside the one the
+  navigation started from. `exit()` on the old view does nothing, since code
+  still holding it (its own timeout, the lines right after the push) refers
+  to a view that has handed its message on; the library's own cleanup closes
+  the one that took its place. Code that keeps a reference to a panel
+  reaches the screen now on it through the new read-only `current_view`
+  property; a subclass that assigns an attribute of that name needs another
+  name for it.
+- **`push()`, `pop()`, `replace()`, and `exit()` raise `RuntimeError` when
+  called from inside a push or pop the view takes part in**: from the new
+  view's `on_load()`, or a `rebuild=` or `nav_rebuild` hook on either view,
+  including a parent's `exit()` that would close either one. The navigation
+  had not yet decided which view owns the message, so a nested push shipped
+  a view over the one it moved to, an exit froze it onto the message, and a
+  push from the source left a second view registered. Decide before
+  navigating, or act on the view `push()` or `pop()` returns. `push()`,
+  `pop()`, and `replace()` also raise from inside the view's own `send()`
+  (its `on_pre_send()`, `on_load()`, `seed_initial_state()`, or a hook the
+  send runs), where the push landed on a view with no message yet and the
+  send then reported the torn-down view as sent. Navigate once `send()`
+  returns.
+- **`push()` and `pop()` raise `RuntimeError` on a view that has closed or
+  is closing**: after `exit()`, a timeout, or `stop()`, or while `exit()` or
+  `replace()` runs. The push brought the closed panel's message back to life
+  under a new view, or raced its freeze and left a live view on a frozen
+  message. Navigate before closing, or send a new view. `send()` raises the
+  same way on a closed view, including one whose send failed or was refused
+  (it posted buttons that answered nothing), and on a view already being
+  sent, timing out, or navigated away. Construct a new view instead.
+- **`push()` and `replace()` raise `RuntimeError` for a view instance that
+  has already been sent, pushed, or closed.** A cached instance pushed a
+  second time was the view the first `pop()` had torn down, so the panel's
+  message was left with nothing answering it. Construct a new instance, or
+  pass the class.
+- **`replace()` closes the view it was called on as that view's `exit()`
+  would.** It only stopped the view, so the old panel kept buttons that
+  answered nothing, its attached views stayed open, and a persistent panel
+  was put back on its message at the next restart. Its `exit_policy` now
+  freezes the message (the default) or deletes it, attached views close, the
+  registration is removed, and an `exit()` override runs. Drop any cleanup of
+  the old message that follows a `replace()`: under `exit_policy = "delete"`
+  it is already gone.
+- **Closing a view a persistent panel pushed to retires the panel's
+  registration, whether the message is frozen or deleted.** Only a deleted
+  message retired it, so a panel closed from a pushed screen (its Exit
+  button, or a `replace()` from it) came back on that message at the next
+  restart, beside any replacement. Give the pushed screen a Back button when
+  the panel should stay up behind it. Sending the pushed view again to a new
+  message moves the registration there instead, so Back rebuilds the panel
+  on the new message and a restart restores it there. A pushed screen left
+  idle returns to the panel rather than closing it.
+- **A persistent panel's old message closes by the panel's `exit_policy`,
+  like every other view's: frozen by default.** When a panel was sent again,
+  or posted under a key an earlier run's panel still held, the duplicate-key
+  cleanup deleted the old message (V2) or stripped its buttons (V1),
+  whatever the policy said. A bot that re-posts its panels now leaves the
+  old ones frozen in the channel; set `exit_policy = "delete"` to keep
+  deleting them.
+- **A persistent panel's `send()` raises when a button its `on_load()`
+  builds has no `custom_id`.** The check ran before `on_load()`, so the panel
+  sent and then could not be reattached after a restart. Give the button a
+  `custom_id`, as one built in `__init__` already needed.
+- **More view attributes are checked when the class is defined**: the
+  leaderboard and roles panels' text attributes, `podium_emojis`,
+  `entry_separator`, and a persistent view's `kwargs_schema_version`. The
+  leaderboard's `title=` and `subtitle=` keywords are checked at
+  construction. A `podium_emojis` keyed by strings never matched a rank, so
+  the podium showed plain numbers. A `kwargs_schema_version` of `None` kept
+  the panel from being restored, and `0` read back as `1`, so a later bump to
+  `1` restored the old rows without their migrator. A value that happened to
+  work, such as a number for a title or a version written as `"2"`, now
+  raises too: write the string or the int. A class on version `0` moves to
+  `1`, which is how its stored rows already read.
+- **`persistence_key=` must be a non-empty string.** Stored keys come back
+  from the database as strings, so an `int` key stopped matching its own
+  registration after a restart, and the duplicate-key cleanup and every
+  lookup by that key missed it. An empty key was read as no key at all.
+  Build the key as a string, for example `f"panel:{guild_id}"`.
+- **The persistent leaderboard and roles panels check the ids of nested
+  controls.** Their id check read only the top-level containers, so a button
+  or select placed inside one without a `custom_id` posted fine and stopped
+  answering after the next restart. `send()` now raises `ValueError` naming
+  it, as it does for `PersistentLayoutView`. Give each such control a
+  `custom_id`.
+- **`set_class_attribute()` refuses an attribute the library reads with no
+  view instance in hand**: `session_continuity` (read in `__init__`),
+  `persistent_slots` and `session_class_key` (read when the class is
+  defined), a persistent view's `kwargs_schema_version` (read at restore),
+  and the roles panel's `categories`, `*_message`, and `hint_*` attributes
+  (read by a role button's click, which has no panel instance). A value set
+  on one instance was accepted and then ignored, and a roles panel's own
+  `categories` rendered buttons whose clicks answered "This role panel is out
+  of date". Set them on the class body. Every other attribute it accepts now
+  takes effect. A `scoped_slot` override is checked against the class's
+  `persistent_slots` as the class body is, raising `ValueError` where the
+  class persists `"scoped"`: the override sent scoped writes to a slot
+  nothing saved.
+- **`PaginatedRegion.show_page()` raises `RuntimeError` before the region
+  has a host.** Called before the host's render ran `controls(view)`, it
+  moved the cursor and fired `on_page_changed` with nothing rendered, and
+  returned as if it had. Use `set_page()` to seek before the first render.
+
+### Added
+
+- **`load()` runs a view's `on_load()` without editing its message.** It
+  takes the same lock as `reload()`, so two loads on one view never
+  interleave, and it suits a view whose data another view reads, where
+  `reload()` would ship an edit for a message that has not changed. No
+  throttle applies, and it returns `True` when `on_load()` ran. A subclass
+  that already defines `load` keeps its own; the library never calls
+  `load()` itself.
+- **`exit_children()` closes the views attached to a view and leaves it
+  open**: the cascade its own exit runs, for a game view closing its
+  players' private panels when a round ends. `delete_message=False` freezes
+  them instead, and `None` follows each one's `exit_policy`. The docs and
+  the Battleship example had called a private method for this.
+- **`current_view` gives the view now showing a panel.** Navigation inside
+  a panel returns the new view only to the callback that ran it, so code
+  that kept a reference to the panel (a cog closing it from a command) had
+  no way to reach the screen on it once the user moved; `panel.current_view`
+  follows each `push()` and `pop()`, and an ephemeral panel's Continue
+  button, to that view. A call that does nothing on the old view
+  (`refresh()`, `reload()`, `exit()`, ...) logs a warning naming the view the
+  panel shows now.
+- **The ephemeral Continue button's two hooks are public.**
+  `build_refresh_button()` builds the button, and
+  `build_reopen_view(interaction)` builds the view it sends. The default
+  rebuilds the view from its constructor arguments, as before; override it
+  for a view that must be built another way (a constructor with side effects,
+  a live reference the old view holds, or a different view), or return
+  `None` to end the session. A result that cannot be sent (the class instead
+  of an instance, a view already sent or closed) reaches `on_reopen_failure`
+  with an error naming the hook. The failure modes `on_reopen_failure`
+  documented were only reachable through a private attribute.
+  `build_refresh_button()` may be async. A button that cannot be built or
+  placed (an override that raises, a label past 80 characters) is logged
+  and leaves the panel as it was, where it used to freeze the panel with no
+  Continue button.
+- **`on_session_ended(interaction)` and `session_ended_message` answer a user
+  who reaches a session that has ended**: a modal submitted after its view
+  closed, or a Continue whose `build_reopen_view()` returned `None`. The
+  default hook sends the message ("This session has ended."), and `None`
+  sends nothing.
+- **`InstanceLimitError.scope`** is the `instance_scope` the limit counted
+  under, which the default reply reads to name who the limit counts.
+- **`auto_exit_button` on the paginated, tab, wizard, and form patterns**, as
+  `MenuView` has: `True` adds the library's Exit button and keeps it through
+  every page turn, tab switch, or step change. Off by default. The button
+  has a fixed id, so it keeps working after a restart on a persistent panel.
+- **`DISCORD_CALL_ERRORS` is exported**: `discord.HTTPException`,
+  `discord.RateLimited`, and `aiohttp.ClientError`, the exceptions a failed
+  Discord call raises, for an `except` that tolerates a failed call while a
+  programming error still raises. The last two are not subclasses of
+  `HTTPException`, so catching that alone lets a rate limit or a dropped
+  connection escape.
+- **`set_page()` on both paginated views, `switch_tab()` on both tab views,
+  and `PaginatedRegion.show_page()` take `notify=False`**, which moves
+  without firing `on_page_changed` or `on_tab_switched`: for a jump the view
+  makes on its own rather than one a user asked for. A timer that returns to
+  the first page after inactivity, re-armed by that hook, otherwise cancelled
+  itself.
+- **`Collapsible(summary=)` takes the text itself**, as well as a callable
+  for text that changes between renders; a string used to raise.
+- **`fetch_as_file(max_bytes=)`** refuses a larger body with `ValueError`,
+  counted as it arrives so it is never read in full. The default, 100 MiB,
+  is the most Discord accepts from a bot in any server, so nothing a bot
+  could upload is refused; `None` turns the limit off.
+- **Examples:** `/v2roles_move` moves the role panel to another channel with
+  `retire_previous_on_send` turned off, the navigation demo's Start Over
+  button uses `replace()`, the pagination demo sets `auto_exit_button`
+  and bounds its cursor cache with `cache_size`, `/tasks_close` closes a
+  task list through `current_view`, and the wizard answers a modal submitted
+  after it closed with its own `session_ended_message`.
+
+### Changed
+
+- **`StateStore.get_active_view()` costs the same however many views are
+  live.** It walked every live view on each call, so a refresh loop over
+  many panels slowed with the square of their count. It now answers from an
+  index kept as views register, with the same resolution rules as before.
+- **A modal opened from a button on a view answers its submission with the
+  view's re-render, in one request, as a click does.** This covers the
+  paginator and `PaginatedRegion` go-to-page modals, a form's field-edit
+  modal, and a `Modal` whose callback re-renders the view whose button
+  opened it. A view re-rendering on `MODAL_SUBMITTED` does so before the
+  callback runs and still edits its message, leaving the answer to the
+  callback. The submission used to be acknowledged first and the message
+  edited separately, through an endpoint Discord does not order against
+  later clicks, so a click made soon after could land first and the typed
+  page seem never to arrive.
+- **A click the library answers without running its callback logs a `DEBUG`
+  line** naming the view, the control's `custom_id`, and why: the view has
+  closed, the control is disabled on screen or is no longer on the message
+  (the click came from an earlier render), the click repeats one still being
+  handled (a double-click, a second Finish or Submit, a role button still
+  toggling, a second Continue), or the view's access check or the control's
+  own `owner_only` refused the user who clicked.
+- **`on_message_gone()` runs on a task of its own, after the render that
+  found the message deleted has returned.** It ran inside that render, where
+  dispatching a state change back into the view re-entered the render's
+  lock; an override may now dispatch, reload, or send the view again.
+  `refresh()` returns before the hook runs, and the hook is skipped when a
+  send has meanwhile moved the view to a new message.
+- **A frozen panel keeps its link buttons clickable.** The freeze on exit or
+  timeout disabled them too, though a link opens its URL with no view behind
+  it. Every other control is still disabled, and a V1 view's `exit()` still
+  removes every control.
+- **A persistence backend must open again when `initialize()` is called after
+  `close()`.** Persistence now closes with the bot and reopens on the same
+  backend objects on a restart in the same process (see Fixed).
+  The built-in backends support this; a custom backend whose `initialize()`
+  runs only once fails every write after such a restart. Every backend's
+  `close()` now gets ten seconds, after which persistence logs a warning and
+  closes without it.
+- **Closing a SQL backend waits up to five seconds for a transaction already
+  running on it, then closes anyway.** `SQLiteBackend` closed under an open
+  transaction at once, and `PostgresBackend` waited for it with no limit, so
+  one stuck query held a bot's shutdown indefinitely. A SQLite transaction the
+  close cuts off now raises when it exits instead of committing on whatever
+  connection is open by then.
+- **Outside a persistent view, `choice_row`, and `button_row` or `tab_nav`
+  given a `custom_id=`, no longer number their buttons `{custom_id}_{n}`.**
+  Ids that name positions are now derived the way auto-generated ids are
+  (see Fixed), so two `choice_row`s in one ordinary view no longer need
+  distinct `custom_id=` values. A persistent view keeps the numbered ids,
+  since its ids must survive a restart.
+- **The log file follows the date.** A process running past midnight moves
+  to the new day's `<prefix>-YYYY-MM-DD.log` and deletes the oldest past
+  `max_files`, as a daily restart would; it used to write everything to the
+  file named for the day it started, so a bot running for weeks kept one
+  growing file that `max_files` never reached.
+
+### Deprecated
+
+- **`_build_refresh_button()` is now `build_refresh_button()`.** The guides
+  have told users to override the private name since 3.0.0. An override of it
+  keeps working, called through the new name, and warns with a
+  `DeprecationWarning` when its class is defined;
+  `super()._build_refresh_button()` still returns the default button. The old
+  name is removed in 4.0.0.
+
+### Fixed
+
+- **A push or pop always ends as a landed swap or a working source.** A
+  cancellation while the new view was being built (an `asyncio.wait_for()`
+  around `push()`, or a `store.on()` hook that awaited), or a back button
+  that overflowed a full new view, left the source unsubscribed for good and
+  the new view registered, with nothing on screen able to recover either.
+- **A paginator rebuilt by `pop()` or an ephemeral panel's Continue button
+  shows the data it showed before.** The rebuild replayed the constructor's
+  arguments, so after `refresh_data()` the page list went back to the items
+  it was built with, and after `refresh_pages(new_total=)` to the old page
+  count.
+- **A push or pop that fails leaves its source working.** The source's tasks
+  were cancelled before an edit that could still fail and never restarted,
+  so a panel that looked live had lost its leaderboard avatar backfill, a
+  throttled render, and any task started with `create_task()`, and dropped
+  state changes meanwhile. The source now keeps its tasks and subscription
+  until the edit lands, and renders what it was asked to once the push
+  fails. A message deleted while the push was in flight now tears the source
+  down once it fails, where it stayed registered to a message that no longer
+  existed, and closes the view the push lands on when it lands, where that
+  view stayed live on the deleted message. A source stopped with `stop()`
+  while the push was in flight is closed once the push fails, as `exit()`
+  closes it, where it stayed registered under the discarded view's buttons.
+- **A push whose edit stalls redraws the view it left.** A stalled edit may
+  still have reached Discord, so the message could show the discarded view.
+  The view that stayed live now redraws itself with the content `pop()`
+  would restore, and one that times out or exits first carries that content
+  into its final edit, where a V1 view froze under the discarded view's
+  embed.
+- **Only the navigation edits the message while it runs.** A destination
+  that listens to state rendered before its `on_load()` ran, so the message
+  showed unloaded content before the loaded one, and a `refresh()` from the
+  destination's own `on_load()` edited the message before the push had
+  decided, so a push that then failed left the discarded view on screen.
+  Both now ride the navigation's edit, and a change that arrives meanwhile
+  renders after it lands. An edit the source had already started, including
+  one retried on another endpoint, could reach Discord after the push's and
+  cover the new view; the push now waits for it.
+- **A button the new view shares by `custom_id` with the one it replaced
+  keeps working after a push or pop.** The old view stopping removed every
+  id it had registered, the new view's matching ones included, so a view
+  pushing its own class, or one paginator pushing another, lost every shared
+  button.
+- **`exit()`, a timeout, `replace()`, a parent's cleanup, and another
+  navigation wait for a push or pop in flight on the same view, or on the
+  one it is bringing in.** They acted on a message about to change hands: an
+  exit froze the source over the destination, two pushes both edited the
+  message, a parent closing mid-push left the child's new screen up, and an
+  `exit()` on a new view still loading froze it before it arrived, and the
+  navigation then shipped it dead. A wait that lasts 30 seconds is logged,
+  naming the view.
+- **A push or pop and a send of the same view no longer overlap.** A click
+  can land as soon as the message is posted, while the send is still
+  finishing, and a push then moved the message under the send, which
+  returned a torn-down view and attached it to its parent. A send made while
+  the view's push was in flight posted a view the push then tore down. Each
+  now waits for the other.
+- **Library cleanup closes the view on screen, not one that navigated away
+  while it waited.** An instance-limit replacement, a persistent panel's
+  retirement, a parent's cleanup, and the devtools exits closed the old view,
+  which does nothing, when a push landed in between, leaving the new one
+  live: past the instance limit, or on a retired panel's message.
+- **A child sent with `parent=` while its parent pushes attaches to the view
+  the parent became.** It attached to the old parent, which never exits
+  again, so nothing closed the child. `view.parent` and `attach_child()`
+  resolve a view that navigated away the same way. A view attached as a
+  child and then pushed onto its parent's message no longer names that
+  parent as its own, and a child sent while its parent exits closes with it
+  instead of staying live.
+- **A panel the new view opens from its `on_load()` closes when the push
+  fails**, instead of staying live with nothing left to close it.
+- **A `push()` or `pop()` made without an interaction loads the new view and
+  edits the message.** Called from a background task on a view sent to a
+  channel, it committed with neither: the old buttons stayed on screen
+  answering nothing, and a new view that listens to state rendered before
+  its `on_load()` had run. A `rebuild=` hook passed to such a call now runs
+  as well.
+- **A push or pop driven by a slash command edits the panel it was called
+  on**, not the command's original response, which is a different message
+  when the panel was sent as a followup or by an earlier command.
+- **A view whose constructor takes a `message` keyword keeps it through a
+  push and pop.** `pop()` rebuilt the view without it, as if the library
+  supplied that keyword, so the view came back with its default.
+- **A view a menu opened looks the same when the user comes back to it.**
+  For a destination naming no `nav_rebuild`, the menu's own render
+  (`build_embed()` on V1, `build_ui()` on V2) applied to the push alone, so a
+  pop back rebuilt it bare: a V1 message kept the
+  child's embed under its buttons, and a V2 one came back without its tree.
+  Its redraw after a failed push and its close had the same gap.
+- **A menu category whose `"view"` is not a view class raises `TypeError`
+  when the menu is constructed.** Every click pushes it, so an instance
+  worked on the first click and failed on the second with an error naming
+  `push()`, and anything else failed on every click.
+- **A `rebuild=` hook may return any awaitable.** `push()` and `pop()`
+  awaited only a coroutine, so the edit keywords a `Future` resolved to were
+  dropped and the new view shipped without them.
+- **The first refresh after a push or pop no longer re-ships an unchanged
+  view.**
+- **A `replace()` that fails leaves the view it was called on working.** It
+  was left stopped and still listed by `get_active_views()` and the
+  inspector, on a message whose buttons answered nothing.
+- **A click sent from a screen that has since changed no longer runs a
+  different button.** Generated ids named a button by its label and
+  position, so a double-click, a second user on a shared panel, or a quick
+  page turn could run the row that took its place: a second "Delete" removed
+  the next task. The id now also reflects what the button does, so a stale
+  click reaches a button only when it would do the same thing, and is
+  dropped otherwise. A view whose callbacks capture objects rebuilt on every
+  render, with no equality of their own, gets new ids each time and ships an
+  edit where it used to skip one; `custom_id=` pins an id.
+- **A tree built in `on_load()` or `__init__` ships stable component ids.**
+  Only `build_ui()` stabilized ids, so such a tree went out with
+  discord.py's random ids, and the first refresh renamed them in an edit of
+  its own, which a click in that window could miss.
+- **A button added after a view's tree was built no longer shares an id with
+  an identical one.** A button added in `on_load()` after the same button in
+  `build_ui()` took the same id, and the send refused the view naming a
+  `custom_id` the caller never set.
+- **An extra click on a panel that has already moved on is dropped.** A
+  second click queued behind a Back or push ran on the view the first had
+  left, and a double-clicked Back left a second copy of the parent panel
+  live. It is now acknowledged and nothing runs; the same holds for a click
+  on a panel that has closed or is closing.
+- **A click on a button that is disabled on screen is dropped.** It was sent
+  from an older render, such as a second click on a board cell the first
+  click played, or a move on a game that had just ended, and it ran against
+  state the player never saw. It is now acknowledged and nothing runs.
+- **A click on a button a newer render replaced is answered.** discord.py
+  found no button for its id and discarded it unanswered, so Discord showed
+  "This interaction failed", as for the second player's vote on a rematch
+  button whose label counts the votes. It is now acknowledged and nothing
+  runs, and so is a click on a button `remove_item()` took off the view
+  before the edit reached the message. The acknowledgement waits
+  `auto_defer_delay` and is skipped when something else answered, so a
+  bot's own `on_interaction` handler for such clicks keeps its reply. A
+  button whose label changes while its action stays the same keeps its
+  clicks with `custom_id=`.
+- **A double-click acts once.** Its second click queued behind the first and
+  ran again: a wizard's `on_finish` or a form's `on_submit` ran twice
+  whenever the first left the view open, `ToggleButton`, `toggle_button`,
+  and `toggle_section` flipped back to where they started, a `Collapsible`
+  closed what it had just opened, `cycle_button` skipped a value, in a
+  persistent view `choice_row(multi=True)` toggled the option back out, and a
+  roles panel's button granted the role twice or took it back. The second
+  click is now dropped. A click sent after the first one's result
+  still acts, and so does a Finish or Submit sent after one that was
+  refused, by validation or by `on_submit`.
+- **A double-click on a wizard's Next or Back no longer skips a step.** The
+  second click advanced again, past a step the user never saw and its
+  validator. A nav click now acts only on the step it was drawn for, and the
+  Back and Next custom_ids carry that step (`wizard_next:2`).
+- **With `auto_defer = False`, a click on a control the library built is
+  answered.** A page or tab button whose render changed nothing, the Exit
+  button, a re-pick of the option a `choice_row` dropdown already shows, and
+  clicks the library drops showed "This interaction failed", since no code of
+  yours ran that could answer them. A control built with your own callback is
+  still yours to answer.
+- **A view is torn down once.** An `exit()` on a view whose `exit()` or
+  timeout was running or had run, or that had moved on with `push()` or
+  `pop()`, ran the teardown again: `VIEW_DESTROYED` reached `store.on()`
+  hooks and subscribers twice, the message was frozen again, and a persistent
+  panel's `PERSISTENT_VIEW_UNREGISTERED` fired twice. A parent's exit did the
+  same to a child that had already exited. A close that starts while another
+  is running now waits for it, for up to 30 seconds, and does only what the
+  earlier one left undone.
+- **A teardown called from a task its own view owns finishes.** `exit()` or
+  `on_timeout()` run from such a task, whether one the library schedules or
+  one started with `create_task()`, cancelled that task mid-freeze and left
+  the panel up with live-looking controls. A parent exited from its child's
+  task lost its freeze the same way, and a `push()` or `replace()` from one
+  stopped at its first await. The task is now cancelled once the call
+  returns, and one that navigated carries on as the destination's.
+- **A render that finishes after its view exits no longer repaints it.** A
+  reload, or a tab, step, or page render, still loading when `exit()` froze
+  the panel put live controls back on it, and a reload on a view that had
+  just pushed painted it over the destination. A state change coalesced into
+  a render in progress re-ran it after the exit as well. Such a render now
+  returns `RenderOutcome.NO_MESSAGE`, and `load()` returns `False`.
+- **A close freezes the message after an edit the view already started has
+  landed**, where the edit landing last put live-looking buttons back on the
+  closed view's message.
+- **A render after the close shows the controls as the close left them.** A
+  modal submitted after its view closed, or a caller's own loop still
+  updating a timed-out panel, rebuilt the tree and put its buttons back,
+  clickable, on the closed panel's message. `refresh()` on a stopped view
+  now ships them disabled, or leaves them off where a V1 `exit()` removed
+  them, and sends nothing when the close deleted the message. Neither that
+  render nor one already in flight when the view's own close deletes the
+  message calls `on_message_gone()`, which reports a message deleted out
+  from under the view: an override that sends the view again logged an
+  error on an ordinary Exit.
+- **A closed view's last render survives a cooldown or rate-limit window.**
+  An `on_timeout()` override's final card, or any other render after the
+  close, returned `RenderOutcome.DEFERRED` inside `refresh_cooldown_ms` or a
+  429 backoff and was then dropped, since the deferred render reads state a
+  closed view no longer follows. It now ships when the window ends, as the
+  tree stands, with the keywords it was called with. One Discord itself
+  refuses with a 429 is dropped with a warning rather than retried.
+- **A close cut off while it deletes or freezes the message makes that edit
+  again.** A view closed from a task another view owns (a parent's round
+  timer ending its players' panels, say) was cut off when that view pushed or
+  exited. It had already been torn down, so its message stayed up with
+  buttons that answered nothing.
+- **Views attached to a stopped view close when its parent closes.** A child
+  stopped with `stop()`, or whose `on_timeout()` override skips `super()`,
+  was torn down by its parent's cleanup without its own attached views,
+  which stayed live.
+- **`on_timeout()` called directly stops the view, as the timer does.**
+  discord.py kept such a view registered, with its timer running, after the
+  freeze, and a push during its cleanup moved the message to a new view the
+  freeze then covered. The view now refuses clicks and navigation from the
+  moment the call begins.
+- **A view closing or timing out freezes its `DynamicPersistentButton`s.**
+  They stayed live, so a role panel posted again, or exited, kept handing
+  out roles from the old message. A render that only changed a dynamic
+  button's label, style, or disabled state was also skipped as unchanged. A
+  role button whose role its category no longer lists is now refused rather
+  than granting it.
+- **The inspector cleans up a view whose teardown failed.** A view whose
+  `VIEW_DESTROYED` a middleware refused stayed registered after its exit, and
+  the inspector listed it as live, where its Exit did nothing. It is listed
+  and cleaned up as a ghost.
+- **A view closed while it is being sent no longer leaves a dead panel.** The
+  close tore the view down under the send, which then posted it with buttons
+  that answered nothing; the reachable case is a command run twice while
+  Discord is slow to answer the first, under `instance_policy = "replace"`.
+  The send now carries the close out and returns `None`: before the view has
+  loaded nothing is posted, and after that the message is posted and then
+  frozen or deleted as the close asked. A view stopped with `stop()` during
+  its send is closed the same way, as `exit()` closes it, since discord.py
+  routes no clicks to a stopped view, and a persistent panel closed or
+  stopped during its send, including during its `on_bind()`, is not
+  registered, or loses the registration the send gave it.
+- **A send that raises while it registers the view, or is cancelled while it
+  replaces an older one, is rolled back.** A raising
+  `on_participant_limit()` or `on_instance_limit()` override left the view
+  registered with no message and counted by its instance limit, which under
+  `instance_policy = "reject"` locked its owner out of the view class. A send
+  cancelled while a `view_created` hook awaits, such as a timeout around
+  `send()`, is rolled back the same way, and a send refused before its view
+  reached the state no longer leaves an empty session behind.
+- **A send cancelled after Discord accepted its message finishes before it
+  raises.** A timeout around `send()` landing after the post skipped the rest
+  of the send: a persistent panel was live but never registered, so it did
+  not come back after a restart; a view sent with `parent=` was not attached;
+  and a cancel while the posted message was read back left the view without
+  its message, so its renders never reached it and `exit()` could not freeze
+  it. The send now carries on with that work, then raises, so the caller's
+  `CancelledError`, or a timeout's `TimeoutError`, arrives when it is done.
+  The step the cancel lands in is cut and the steps after it run, for at
+  most five seconds after the cancel, after which none starts and a warning
+  is logged; the message a re-send left is still closed if that step was
+  the one cut. A close requested during the send is carried out after it
+  raises. A program ending while a send is in that window waits for it the
+  same way.
+- **A send is no longer rolled back after Discord accepted its message when
+  reading that message back fails.** The send read the posted message back
+  with a second request, though `send_message()` already returns it; a
+  failure there, such as a 503, rolled the send back and left the message on
+  screen with buttons that answered nothing, and a caller that retried posted
+  a second copy. The send now takes the message from the response, one
+  request fewer per interaction send. When the channel fetch that follows a
+  public interaction send times out, the view keeps the message the send
+  returned, as it already did on an HTTP or transport error. The timeout
+  escaped a send that had posted, before the view had its message or the
+  rest of the send had run.
+- **A step of a send that raises after Discord accepted the message no
+  longer skips the steps after it.** A middleware raising on the view's
+  `VIEW_UPDATED` left the ephemeral refresh handoff unscheduled and a view
+  sent with `parent=` unattached. Each failure is logged naming the step,
+  and the send goes on.
+- **Views a panel's `on_load()` sent with `parent=` close when the panel's
+  send is refused or fails**, instead of staying live attached to a panel
+  that no longer existed. Views attached before the send began stay open,
+  released from the panel.
+- **A view sent again closes the message it left, as its `exit_policy`
+  says.** The old message kept its buttons, still wired to the view, so a
+  click there acted on the panel now shown on the new message, for as long
+  as the process ran. A V1 view sent again from a context with no
+  interaction also sent its `refresh(embed=...)` edits to the old message,
+  so the new message kept its first embed. The old message is frozen as it
+  looked when the send began, and no render during the send reaches it: a
+  `refresh()` from `on_load()` or from another task used to put what the
+  send built, possibly for another user, on the message being left.
+- **A view sent again is no longer closed by the deletion of the message it
+  is leaving.** Deleting a panel's message and sending the same view again
+  raced the gateway's delete event, which tore the view down on its new
+  message and left that message's buttons answering nothing. A 404 from an
+  edit still in flight on the old message did the same, and so did an
+  `on_message_gone()` that sends the view again.
+- **Two views whose `on_load()` awaits the other's `reload()` no longer hang
+  each other.** Started at once, each waited on the other forever, with
+  nothing logged. The reload that would close the cycle now raises
+  `RuntimeError` naming the views, and the other completes. A cycle through
+  `asyncio.gather()` or a task the `on_load()` created cannot be seen that
+  way, and logs a warning naming the stalled view after 30 seconds.
+- **A reload started while a view is being sent or navigated to no longer
+  runs a second `on_load()` beside the first.** The leaderboard's
+  `avatar_backfill`, scheduled from inside the send's `on_load()`, could
+  finish first and render nothing, and the send then posted the default
+  avatars for good. A reload or `load()` from another task now waits while
+  the send loads or delivers the view; one arriving while the send registers
+  it runs there, and its data ships in the first message.
+- **The library's fetches outside `on_load()` no longer race a reload.** A
+  leaderboard's rebuild on a state change, a `from_cursor` view's page
+  loads and `refresh_pages()`, and `refresh_data()` with an async formatter
+  could finish last with older data and overwrite the newer result until the
+  data changed again. They now take the same turn as `on_load()`.
+- **`LeaderboardLayoutView.reload(force=True)` keeps its force when it
+  queues behind a reload already running**, instead of short-circuiting onto
+  pages built from the older data. The `reload()` docstring recommended that
+  shape for subclass keywords and now describes one that holds.
+- **A tab or wizard step render no longer interleaves with a reload.** A tab
+  switch, a step change, or `refresh_content()` could otherwise ship the
+  content and any extra rows twice. They now wait for the reload.
+- **A state change that arrives during a reload renders after it**, against
+  the state at that point, instead of rendering whatever `on_load()` had
+  loaded so far. That includes a change that coalesced into a render already
+  running when the reload began. A reload that starts while a state render
+  is running waits for that render. An `exit()` or timeout made before the
+  reload finishes freezes the message without the change.
+- **A state change that lands while a message is being sent now reaches
+  it.** A rebuild during the send's request was recorded as shipped, so
+  every later unchanged refresh skipped and the message stayed a state
+  behind. The send now replays that render once the message exists, and the
+  send, each refresh, and each push or pop record the tree they actually
+  sent. A rebuild while the send was still registering could also leave the
+  tree half-built when the send validated it, failing the send with a
+  placement error that blamed the view's own tree. An embed or content that
+  another task passed to `refresh()` during the send reached no message; it
+  now ships after the send.
+- **`refresh()` no longer raises `AttributeError` when a concurrent refresh
+  finds the message deleted.**
+- **A page turn, tab switch, or wizard step whose render raises no longer
+  leaves the cursor ahead of the screen**, where the next press moved on
+  from a page the user never saw. The patterns now put the cursor back when
+  Discord refuses the edit or the render fails before it (a page fetch, a
+  tab or step builder), as they did for a dropped edit. `PaginatedRegion`,
+  `Collapsible`, and the V1 `PaginationControls` (whose `on_page_change`
+  draws the page) had the same gap. The exception still reaches the caller.
+- **A render abandoned on a slow Discord response is sent once the
+  interaction is answered.** The one-request edit of a click is given up
+  when Discord is slow to respond, so the click's acknowledgement stays
+  inside the 3-second window, and the render then waited for the view's next
+  one: on a slow network a click seemed to do nothing, and the next click
+  jumped past it. The render is now sent through the view's message as soon
+  as the click is acknowledged. Modal submissions answered with a re-render
+  get the same.
+- **A `discord.File` arrives whole every time the library sends it.** A file
+  passed again to a later call (the same chart to every
+  `refresh(attachments=[...])`, an image a `respond()` and then a `send()`
+  both carry, a file a `rebuild=` or `nav_rebuild` hook hands back), or sent
+  again after a first attempt failed and the library fell back to another
+  endpoint (the one-request answer to a click, the interaction webhook after
+  its token expired, the edit of a push or pop, a view's send that lost the
+  race to a defer), was read from where the last request stopped and uploaded
+  empty, which Discord shows as a broken image, with nothing raised. A file
+  opened from a path raised instead. Each file is now read from its start,
+  and one opened from a path is opened again. A direct discord.py call such
+  as `channel.send(file=...)` still needs a new `discord.File`.
+- **An edit that fails after the view was sent again stays off the new
+  message.** A click's one-request answer, or an embed edit through the
+  interaction webhook, that failed once another task had sent the view again
+  fell back to the message the view had by then: the older render landed on
+  the message the send had just posted. An expired webhook token there also
+  cleared the handle the send had set, so that message's later embed edits
+  went through the channel endpoint, which ignores them. The render belonged
+  to the message the view left, and is now dropped.
+- **On Python 3.10 and 3.11, a cancel that lands as the library finishes an
+  edit or a save is no longer lost.** `asyncio.wait_for` on those versions
+  returns the result when its caller is cancelled just as the work finishes,
+  so a teardown that cancelled a view's render, or a shutdown that cancelled
+  a write, found the task still running. The library now bounds these waits
+  in a way that keeps the cancel on every supported version.
+- **`TaskManager` lets go of a task whose event loop closed before it ran.**
+  A loop closed that way (a test runner's, or one a program closed itself)
+  left the task tracked though it could never run: `wait_tasks()` on its
+  owner from the next loop raised, and `get_task_count()` still counted it.
+- **A panel with a push or pop in flight counts once toward its
+  `instance_limit`.** The panel and the view it was moving to were both
+  counted, as was a view torn down but not yet removed, so under a limit of
+  two a second send was refused and `check_instance_available()` answered no
+  while the first panel was navigating.
+- **A view pushed from a panel counts toward the panel's `instance_limit`
+  whatever its own `instance_scope`.** A panel scoped per user
+  (`instance_scope = "user"`) never found pushed views left at the default,
+  so running the command again opened a second panel while the first stayed
+  live. A participant joining through a pushed view is checked against the
+  panel's limit rather than the pushed view's own, and
+  `check_instance_available(session_origin=...)` reads the panel's scope and
+  limit as well.
+- **The default instance-limit reply names who the limit counts.** Under
+  `instance_scope = "guild"` or `"global"`, and for a participant turned
+  away for taking part in another view, it said "You already have one of
+  these open"; it now names the server, everyone, or the view they are in.
+  `InstanceLimitError` carries the `scope` it counted under.
+- **A view `replace()` returns can be sent under an `instance_limit`.** The
+  send counted that already-registered view against its own limit and closed
+  it.
+- **A view pushed onto a persistent panel returns to the panel when it times
+  out.** It froze instead, and since the panel itself never times out, the
+  shared message stayed dead for everyone until a restart. A pushed view
+  that defines its own `on_timeout()` still times out as that says, and one
+  whose return fails times out as before.
+- **A push that fails no longer lets the view it hands back remove the
+  panel's registration**, which left the panel on screen but not reattached
+  after a restart.
+- **A persistent panel whose `exit()` is cut off while its attached views
+  close keeps its registration.** It was removed first, so a cancelled or
+  failed exit left the panel live, answering clicks, with nothing to reattach
+  it after a restart.
+- **A persistent panel sent again whose registration fails no longer comes
+  back on the message it left.** When a middleware raised on the new
+  registration, a cancel cut it off, or the panel was stopped during the
+  send, the row still named the earlier message, which the send closes, so a
+  restart restored the panel there with nothing to click. That row is now
+  removed, and under `retire_previous_on_send = False` an earlier panel still
+  live under the key takes it back. A raise is logged as an error and a cancel
+  as a warning, each
+  saying where the panel is registered; the error used to say the panel
+  would not be reattached, even when it would be.
+- **A persistent panel posted in a channel discord.py cannot build
+  registers.** The posted message carried no channel, and registering it
+  raised, so the panel was live but did not come back after a restart. The
+  channel now comes from the interaction, which also fills in the view's
+  state row.
+- **`get_active_view()` no longer answers with a view a push is still
+  bringing in.** A failed push discards that view, so a `reload()` on the
+  result did nothing, and under `retire_previous_on_send = False` rolling a
+  swap back during a push registered it, so a restart attached its class to
+  the old panel's message.
+- **Rolling a swap back under `retire_previous_on_send = False` restores the
+  old panel when it is showing a view it pushed.** The registration was
+  lost, so a restart reattached nothing to that message; the registration
+  now returns to it with the panel's own class and arguments. Closing a view
+  the new panel pushed to hands it back the same way, and so does rolling
+  back after the new panel is sent again.
+- **When the view a panel pushed to loses its message, every registration
+  naming that message goes.** A key renamed in place leaves a second row on
+  the same message, and only one was retired, so the other claimed a deleted
+  message until the next restart.
+- **A persistent view's stored `kwargs_schema_version` is the class's.** A
+  version set on one instance was stored, and rows written under it skipped
+  their migrator.
+- **A persistent slot or persistent view argument with a non-string key is
+  named in the log.** JSON stores every key as a string, so `{42: 3}` came
+  back as `{"42": 3}` after a restart and a lookup by `42` missed, with
+  nothing raised. The value is still saved, and an ERROR names the key and
+  where it sits, once; a key beside its own string form (`42` and `"42"`) is
+  named as losing one of the two values. A slot value that cannot be saved
+  at all is now logged with what to store instead; the persistence guide said
+  that case raised, when the slot is skipped.
+- **Persistence closes with the bot.** Nothing closed it before, so
+  application-slot changes still batched when the bot stopped (up to ten
+  seconds of them) were lost, and a bot on `SQLiteBackend` never exited: the
+  database's worker thread kept the process alive. With `bot=`, persistence
+  now writes what is batched and closes its backends after the bot's own
+  `close()`, including when a shutdown command closes it from another task.
+  On Linux and macOS, the first SIGTERM (systemd, `docker stop`) now closes
+  the bot the same way instead of killing the process, unless the
+  application handles SIGTERM itself; a second one ends a program still
+  running other work, as does any SIGTERM once the bot has closed, and a
+  program that starts the bot again after a SIGTERM ends there, once any
+  change made since the close is written. Without
+  `bot=`, call
+  `await get_store().persistence_manager.close()` at shutdown. A restart
+  in the same process reopens persistence when the new bot's `setup_hook`
+  runs `setup_middleware()` again (discord.py cannot log a closed bot in
+  again, so the restart builds a new bot object); a change made while it is
+  closed is held and written once it reopens, and the first one logs a
+  warning.
+- **A restart in the same process releases the views the old bot left,
+  and restores its persistent panels.** Every view the closed bot left
+  answered "This interaction failed", held its instance slot (for good after
+  `bot.run()` again, whose new event loop had ended its timer), and logged
+  an error each time a state change rendered it through the closed client; a
+  persistent panel stayed dead until the process restarted. When a bot
+  closes, the views sent through it are now released without an edit, as a
+  process restart would release them: their timers stop, their instance
+  slots are freed, they leave the state with no action dispatched (no
+  `VIEW_DESTROYED` hook runs for them), and code awaiting a view's `wait()`
+  ends. Persistent
+  panels are restored through the new bot when its `setup_hook` runs
+  `setup_middleware()`, before it connects, and `current_view` on an old
+  panel reaches the one restored in its place.
+- **A `reattach()` re-drive no longer attaches a second panel when one is
+  sent under the same key while the re-drive runs.** Keys a live panel
+  holds were checked once, when the pass began, so a send landing while
+  the pass fetched its messages was restored beside. Each is now checked
+  again just before it is restored.
+- **A bot built on `discord.Client` works with `PersistenceMiddleware(bot=)`
+  and with every send.** `discord.Client` has no `listen()`, so installing
+  the message-deletion listeners raised: `initialize()` failed, and the
+  first send through such a client skipped the rest of its setup, so an
+  ephemeral view's Continue button never armed and a view sent with
+  `parent=` was never attached. The listeners are now skipped for a plain
+  client, whose deleted messages are found by the view's next edit.
+- **Steady traffic no longer keeps application writes from finishing.** A
+  change arriving while a batched write was in progress cancelled it, so with
+  changes coming faster than the backend wrote, nothing was saved until the
+  traffic stopped. A write in progress now finishes, and the change is
+  written after it. One still running after 30 seconds is cancelled and
+  retried.
+- **A batch whose write failed is kept for the retry when the `on_error`
+  hook is cancelled.** The batch went back to the buffer only after the hook
+  returned, so a shutdown cancelling the flush while its hook ran lost it.
+- **Calling `setup_middleware()` again with a new middleware instance uses the
+  one already installed.** A `setup_hook` that builds a new
+  `PersistenceMiddleware` each time it runs initialized that second instance
+  beside the installed one, which still handled every dispatch. The second
+  instance opened another database connection (on SQLite, one that kept the
+  process from exiting), rehydrated over live state, and pointed
+  `store.persistence_manager` at a manager nothing wrote through. A restart
+  that builds a new bot object hands that bot to the installed middleware,
+  and a `PersistenceMiddleware(manager=...)` install now sets
+  `store.persistence_manager` as well.
+- **`setup_middleware()` installs every function middleware it is given.** It
+  matched middlewares by class, and every function has the same class, so
+  only the first function passed was installed.
+- **A middleware that awaits before passing an action on no longer undoes
+  another dispatch's change.** The reducer ran on the state the chain was
+  called with, so with an audit or rate-limit middleware that awaits first,
+  two clicks at once kept only one of their changes. A middleware that passes
+  on the state it was given now hands the next step the store's current
+  state. `UndoMiddleware` records each step as the reducer commits it, so an
+  undo never takes back another dispatch's write, an action a middleware
+  stops adds no undo step, and a middleware that awaits or dispatches a
+  follow-up after passing the action on no longer loses a step. A batch
+  holding such a follow-up undoes back to before the batch; it could be left
+  with nothing to undo. A field a middleware adds to the state it passes on
+  is undone with the action, wherever that middleware sits.
+- **A reducer that awaits no longer overwrites a change another command
+  dispatched meanwhile.** Its result was built from the state it read before
+  the await, so a write committed during the await was lost, with nothing
+  logged. Reducers now run one at a time. A batch's undo step,
+  `set_scoped()`, the slots and registry rows restored at startup, the views
+  a bot's close lets go of, and `/cascadeui reset` are no longer replaced by
+  a reducer that was awaiting when they landed either.
+- **A middleware that raises after passing an action on no longer hides the
+  change.** The reducer had committed it, but the raise skipped the
+  notification, the hooks, and the write, so memory held a change that
+  subscribers never saw and a restart lost. The change is now announced and
+  saved, and then `dispatch()` raises; if a subscriber or hook raises first,
+  the middleware's error is logged. An action that changes nothing (a
+  broadcast only hooks handle) is announced as well. A dispatch cancelled
+  after the reducer ran still saves the change and tells subscribers; hooks
+  that had not started when the cancel landed do not run.
+- **An action a middleware stops writes nothing to disk.** Persistence
+  compared the store before and after the whole chain, so a change another
+  dispatch committed while a middleware below it awaited was saved as this
+  action's: a panel registration the middleware dropped left a registry row,
+  and the panel came back after a restart. Writes now follow exactly what the
+  reducer committed, so a change a middleware makes by assigning
+  `store.state` directly is no longer saved.
+- **An action a middleware blocks is not announced.** A middleware that
+  returned without calling `next_fn`, the documented way to block an action,
+  still had the action delivered to subscribers and `store.on()` hooks, so a
+  hook for it ran for something that never happened. A blocked action now
+  reaches neither; `store.history` still lists it.
+- **A value nested too deep to save is declined like any other.** A
+  persistent slot or persistent view kwarg deep enough to exhaust
+  `json.dumps` made `dispatch()` raise `RecursionError`; it now logs the same
+  "was not saved" error as a value that is not JSON.
+- **A persistent slot written while panels are restored at startup is
+  saved.** Persistence saved nothing until the restore had finished, so a
+  slot a restored panel's `on_bind()` wrote was only in memory and was gone
+  after the next restart.
+- **A persistent slot is written only when what it stores changes.** An
+  action handled by a `@cascade_reducer` copies the whole state, so every
+  persistent slot was queued to be written again after it, whatever the
+  action changed: each save wrote all saved data, and every `ttl_days` expiry
+  moved back, so a slot with a TTL never expired on a bot that ran such an
+  action within each TTL period. A slot's expiry now counts from its last
+  change.
+- **An expired or pruned application slot leaves the running bot.** The
+  daily TTL sweep and `prune_application()` deleted the database row only, so
+  the slot stayed in memory, was served until a restart, and was written back
+  by the next action; after `prune_application(slot=...)`, a write still
+  waiting for the slot also put the row back. The slot now leaves
+  `state["application"]` with any write waiting for it, and
+  `APPLICATION_SLOTS_PRUNED` names the slots removed in a new `slots` key.
+- **A failing database is retried with backoff while changes keep
+  arriving.** Each change replaced the pending retry with a flush after the
+  batching window, so under steady traffic a failing database was retried
+  every two seconds, and every registry change was tried at once, instead of
+  waiting out the backoff.
+- **`rehydrate()` run again on a running bot keeps changes not yet written.**
+  It replaced them in memory with the older stored value, which the waiting
+  write then overwrote on disk, so memory and the database disagreed. It also
+  waits for a write already in progress instead of reading around it.
+- **A selector returning a value that cannot be compared no longer stops the
+  fan-out.** A value such as an array, whose `==` refuses `bool()`, raised out
+  of the notification, so no other subscriber was told and no hook fired. The
+  subscriber is notified on every action instead, with a warning.
+- **A batch announces its actions in the order their reducers ran.** An
+  action whose middleware awaited after the reducer was announced, and
+  reached its hooks, after an action that was reduced later.
+- **A hook that removes itself no longer makes the next hook miss the
+  action.** Hooks ran from the list `store.off()` changes, so the hook after
+  one that removed itself was skipped. `off()` now holds from the moment it
+  returns, and a hook added while an action's hooks run is first called for
+  the next action, in a batch or outside one. Persistence's `on_flush` and
+  `on_error` hooks likewise first run a hook registered during a flush at the
+  next one; one that registered a hook each time it ran never let the flush
+  finish.
+- **Profiling times a batched dispatch under its own batch.** One dispatched
+  from inside another dispatch's middleware counted its reducer time as the
+  outer reducer's, so `/cascadeui perf` showed an instant reducer as slow. An
+  action that reached a batch after it closed reported zero for every timing;
+  it now reports its own.
+- **Another task no longer joins an open `SQLiteBackend` transaction.** The
+  transaction was tracked per backend, so while one command held
+  `backend.transaction()` open, another command's `execute()` ran inside it
+  and was rolled back with it, and its reads saw rows the transaction had
+  not committed. A transaction now belongs to the task that opened it, as on
+  `PostgresBackend`, and other tasks' reads and writes wait for it to
+  finish. A namespace write (`row_upsert`, `kv_write`, ...) inside the
+  task's own transaction hung forever on the lock that transaction holds;
+  it now raises `RuntimeError`.
+- **A `SQLiteBackend` write cancelled before its commit is rolled back.** It
+  stayed open on the database's one connection, so the next write's commit
+  saved it anyway (a batch included), and until then `backend.transaction()`
+  failed with "cannot start a transaction within a transaction". A shutdown
+  cancelling a write in progress, or a cancelled task awaiting `execute()` or
+  opening `transaction()`, left it that way.
+- **A `PostgresBackend` transaction always returns its pooled connection.**
+  One cancelled while it was starting, or ended from another task (the loop
+  closing an abandoned async generator that held one), kept its connection
+  out of the pool for good.
+- **An Undo or Redo of a persistent slot is saved.** Both were skipped as
+  bookkeeping, so the value a user undid came back after the next restart.
+- **An Undo or Redo inside a batch reaches every view it changes.** Only one
+  dispatched outside a batch passed a view's `subscribed_actions` filter, so
+  after an undo inside `self.batch()` another panel kept showing the undone
+  value.
+- **A batch that pushes or pops keeps its undo step.** The step was added
+  when the batch ended, to the view the batch started on, which the
+  navigation had already closed, so the first Undo on the new screen skipped
+  the batch's change. It now goes to the view the panel passed to, with the
+  rest of the undo history. So does the step for a change from the view that
+  commits after the push or pop: one another task made while the navigation
+  ran, one a middleware held until it landed, and one dispatched from the
+  view after `push()` returned. The last of these, and a change held ahead of
+  `UndoMiddleware` until the view had closed, recorded no step at all.
+- **A change or an Undo made while a push loads reaches the new screen's
+  undo history**, and one made while an ephemeral panel's Continue runs
+  reaches the replacement's. The history was copied when the push or the
+  Continue began, so a change made on the panel meanwhile was missing from
+  it, and an Undo made then left the undone step in place and lost its Redo.
+- **Undo steps back through changes in the order they were made.** A batch's
+  step was added when the batch ended, so a change another task made from
+  the same view while the batch was open (a timer tick during a click) was
+  undone after the batch's change instead of before it. A batch's step now
+  sits where its first change was made.
+- **An Undo or Redo made while another task's batch on the view is open
+  waits for the batch to end.** The batch's step joins the history only
+  then, so an Undo meanwhile took back an older step over the batch's
+  writes, and undoing everything afterwards ended on a value already undone.
+  That holds for an Undo on the view a batch pushed or popped to, and for
+  one a middleware held while a batch opened; one a middleware passed on a
+  state it built is skipped with a warning instead, since that state
+  predates the batch's writes. The wait is at most 30 seconds, after which
+  the Undo goes ahead and a warning is logged.
+- **Undoing everything returns to where the history began when a batch and
+  another task write the same key.** A batch's step takes the place of its
+  first change, so a write another task made to one of its keys between the
+  batch's changes sat above it, and the batch's step held that write's
+  result as the key's starting value. Undoing to the bottom ended on it; the
+  batch's step now holds the value from before the earlier of the two. The
+  same holds when the other writer is a batch too, and when a batch ends
+  with a key as it found it after another task changed the key in between,
+  which dropped the key from the batch's step.
+- **An action whose undo step cannot be recorded still applies.** A session
+  `shared_data` holding a value that cannot be copied made `dispatch()`
+  raise `TypeError` before the reducer ran; the action now applies, and an
+  error names Undo and the view left without a step for it. A batch whose
+  undo step could not be recorded, such as one comparing a `shared_data`
+  value whose `==` refuses `bool()`, raised out of `async with batch` without
+  announcing anything; it is now announced, with the same error.
+- **Undo puts back only what the undone action changed, so it no longer
+  erases other users' state.** All scoped data shares one application slot,
+  and an undo put back every slot the action touched, whole, so undoing a
+  scoped change wiped every other user's scoped data in every guild and
+  feature, and a Redo then restored stale copies of it. Undo now restores
+  only the keys the action changed, at any depth, so a guild or global bucket
+  every member writes into keeps the others' keys too. Undo is still per
+  view: on a panel several users share, it steps back through every change
+  made on that panel, whoever made it.
+- **The ephemeral refresh button is no longer overwritten by a render in
+  progress.** Arming it while an `on_load()` was running, or a tab, step, or
+  page render reaching the armed view, rebuilt the tree without it, and since
+  an armed view drops every notification that could restore it, the panel
+  froze at the token cliff with no way to reopen it. Arming now waits for the
+  load, and those renders leave the button in place.
+- **Continuing an ephemeral child panel that reads its parent while it is
+  built works.** The replacement was rebuilt without its `parent=`, so a
+  panel whose `__init__` read `self.parent` failed on every Continue with the
+  reopen-failure message.
+- **Continuing an ephemeral session whose replacement is refused keeps the
+  current panel.** When the replacement's `on_pre_send()` vetoed it, or it
+  hit an instance or participant limit, the panel closed anyway, handing its
+  attached views to a replacement that never went live, so nothing would
+  close them. The panel now stays, and Continue can be clicked again.
+- **A close or a navigation that lands while an ephemeral panel's Continue
+  runs waits for it.** An `exit()` from another task, or the panel's
+  timeout, closed the panel and its attached views while the replacement was
+  being sent, and the replacement then went live without them or its undo
+  history. A `push()`, `pop()`, or `replace()` from code committed as well,
+  leaving two live panels. Each now waits for the Continue to finish. Once
+  the replacement is live, an `exit()` does nothing and logs the warning it
+  logs after a `push()`, and a navigation raises as on any view that handed
+  its panel on; `current_view` reaches the replacement.
+- **Sending a view again no longer lets the earlier send's refresh handoff
+  arm it.** A timer left from a previous ephemeral send could mark the new
+  message's view armed, and it then dropped every render.
+- **The V1 patterns accept `embeds=` on `send()`.** `PaginatedView`,
+  `TabView`, `WizardView`, `FormView`, and `MenuView` added their own first
+  embed beside the caller's, and discord.py refuses `embed` and `embeds`
+  together.
+- **A V1 pattern's first embed reflects `seed_initial_state()`.** It was
+  built before the hook ran.
+- **A paginator sends the page it is on.** A V1 `PaginatedView` sent again
+  from page 2, or opened on a later page with `from_cursor()`, posted page 1
+  under the later page's indicator. A `from_cursor()` view, V1 or V2, whose
+  `current_page` was set past its last page raised `IndexError` when sent or
+  reloaded; it now shows the last page.
+- **A V1 form's row budget is checked against its finished layout.** Field
+  order decided whether a form fit: five boolean fields with a text field
+  listed last were refused, and the same fields with the text field first
+  accepted. Five select fields passed the check and then failed inside
+  discord.py with `item would not fit at row 4`; that case now names the
+  button that does not fit.
+- **`PaginationControls` and `ToggleGroup` no longer report a handled click
+  as an error.** A click queued behind a slow one could be acknowledged by
+  the auto-defer backstop first, and the composite's own acknowledgement then
+  raised into `on_error`, which sent the user the error reply.
+- **An attribute set with `set_class_attribute()` takes effect from the
+  view's next render.** Several were read only while the view was built, so
+  the override was accepted and never shown: the paginated patterns' button
+  labels, emoji, and styles, `jump_threshold`, `nav_inside_container`, and
+  `nav_divider`; the wizard's Back button; the form's Edit button;
+  `tab_overflow_policy`, which also skipped its own check and
+  accepted an unknown preset; `MenuView`'s `menu_style` and
+  `auto_exit_button`; a roles panel's `title` and `subtitle`;
+  `enable_undo`, `undo_limit`, and `subscribed_actions`, which `__init__` had
+  already registered; `instance_scope`, which left the view counted under
+  its old scope after it closed; and `instance_limit` on a root view, which a
+  participant joining through a screen it pushed did not meet.
+  `auto_exit_button` follows the same rule on every pattern that has it, and
+  `auto_register_participants` applies at the
+  next `send()`, which read the class and registered nobody. An override
+  also survives `pop()` and the Continue button, which rebuild the view from
+  its constructor arguments and dropped every override, so a limit set on a
+  panel lifted after one Back.
+- **Components Discord refuses in their container fail where they are
+  placed.** A `discord.ui.TextInput` in a view's tree fails the send's
+  placement check naming it, as the other modal-only inputs already did, and
+  so does an `ActionRow` holding a select beside buttons, which discord.py
+  builds when the select is added first. A button, or a select passed to a
+  `Modal` without the `discord.ui.Label` around it, raises `TypeError` at
+  construction or from `modal.add_item()`. A `DynamicItem`, such as a role
+  button, is checked as the button or select it carries, so an over-long
+  label or one placed outside an `ActionRow` is refused like a plain
+  button's. Each used to fail at Discord: the message was refused, or the
+  modal would not open.
+- **A `Modal` shows a `discord.ui.TextDisplay` passed among its inputs.**
+  It raised `TypeError` as an input with no `custom_id`, although Discord
+  displays text in a modal.
+- **A modal submitted after its view closed tells the user.** The
+  submission was acknowledged with nothing shown, so the user's input seemed
+  to vanish. A `Modal` opened with `open_modal()` still runs its callback,
+  and when the view had closed before it ran and it sent no reply of its own
+  (a defer it made counts as one), the view's new `on_session_ended()` runs,
+  whose default sends `session_ended_message` ("This session has ended." by
+  default, `None` for silence), the text the ephemeral refresh already sent.
+  A view that
+  navigated to one still open, or that the callback closed itself, gets no
+  notice. The paginated go-to-page dialogs answer the same way instead of
+  turning a page on a closed view.
+- **A required modal text field answered with only spaces is refused**, with
+  the field named, as a validator failure is. Discord refuses an empty
+  required box but accepts one of spaces, and the `Modal` passed it on,
+  through any validator that lets a blank value by.
+- **`setup_logging()` deletes only the log files it wrote.** Past `max_files`
+  it deleted the oldest `.log` files whose names merely began with `prefix`:
+  with `prefix=""` that was any `.log` file in the folder, and `prefix="bot"`
+  also took another tool's `bot_errors.log`. It now counts only its own
+  `<prefix>-YYYY-MM-DD.log` files, oldest date first.
+- **A misspelled log level raises.** `setup_logging(level="DEBG")` and
+  `LoggingMiddleware(level="DEBG")` fell back to INFO without a word; both
+  now raise `ValueError` naming the level, and `setup_logging()` keeps the
+  configuration it had. `LoggingMiddleware` also takes a numeric level, as
+  `setup_logging()` already did; an `int` raised `AttributeError`.
+- **`fetch_as_file()` raises on an error status,** as its docstring said. A
+  404 or 500 page came back as the file and was uploaded as a broken
+  attachment.
+- **`cascadeui.components` exports the four `MAX_*` limits and
+  `cascadeui.views` exports `EntryList`**, as the package root already did;
+  importing them from their subpackage raised `ImportError`.
+- **The Task Manager reference no longer awaits `cancel_tasks()`.** It is
+  synchronous, so the snippet raised `TypeError`. The page also credited the
+  manager with cancelling tasks at bot shutdown, which the event loop does.
+- **The API reference covers `switch_tab()`, `active_tab`, `create_task()`,
+  `physical_table()`, and `fetch_as_file()`**, which it had left out.
+- **The API reference says when `on_page_changed` and `on_tab_switched`
+  fire.** It said after the change completes; both run before the repaint,
+  report the move the user asked for, and are not called again when that
+  repaint does not land.
+- **The persistence guide's schema migrator examples can be registered.**
+  They used `cascadeui_persistent_views` version 1, the step the library's
+  own migrator holds, so the decorator example raised `ValueError` at import
+  and the `migrators=` example was skipped without a word. A `migrators=`
+  entry for a step already registered now logs a warning, and the guide
+  says a migrator keeps its statements in one `transaction()` and returns
+  early on an `OPEN_ROWS` backend.
+- **The two-player game examples ignore a click that arrives after the game
+  has moved on.** Clicks queue behind one another, so a second click made
+  before a move landed ran after it: TicTacToe and Battleship recorded a
+  finished game twice, a Forfeit queued behind the winning move flipped the
+  winner, and a Cancel queued behind the last Ready closed a game that had
+  just started. Each callback now checks the game's phase first. Accepting
+  a challenge while either player was busy also deleted the challenge; the
+  game is now posted first.
+- **Other example fixes.** `v2_hello_world.py` failed as a prefix command.
+  `v2_wizard.py` dropped a modal submitted after its default 180-second
+  timeout, told users to exit with no way to do it, and showed a portrait
+  upload that was not an image as a broken image; it now refuses the file
+  with a message. Battleship's fleet
+  panel froze three minutes after it opened. `v2_persistence.py` keyed its
+  visit counts by `int`, which reads back as a string after a restart. The
+  lobby kept its players seated after Start. The game leaderboards and the
+  README's leaderboard snippet labelled top-N sums as server totals.
 
 ---
 

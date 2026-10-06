@@ -21,8 +21,8 @@ CascadeUI patterns demonstrated
   dispatch (``BATTLESHIP_SHOT``, ``BATTLESHIP_REROLL``) triggers
   ``on_state_changed()`` on both the public board and private fleet
   panels, so two views stay in sync without manual refresh plumbing.
-* ``check_instance_available()`` at the command level to reject challenges
-  before the opponent is involved.
+* ``check_instance_available()`` at the command level to reject a
+  challenge before the opponent sees it, for either player.
 * Instance limiting (``instance_limit=1``, ``instance_scope="user_guild"``)
   with ``auto_register_participants`` to claim both players atomically.
 * Ephemeral fleet panels with ``auto_refresh_ephemeral`` for the 15-min
@@ -31,7 +31,10 @@ CascadeUI patterns demonstrated
   back through ``self.parent`` rather than keeping a second reference of
   its own, which is what every board and grid read below resolves through.
 * Phase-aware ``exit()`` override (delete during setup, freeze on
-  completion) and ``task_manager`` for the auto-start timer.
+  completion) and ``create_task()`` for the auto-start timer, so the view
+  owns it and cancels it on exit.
+* ``exit_children()`` closes both players' private fleet panels on a
+  rematch or at game end, while the board itself stays open.
 * ``seed_initial_state`` hook -- fleet randomization, defense-grid
   paint, and the initial component build all happen here instead of
   in ``__init__``. The hook fires inside the send-pipeline batch
@@ -71,6 +74,7 @@ from discord.ext.commands import Context
 from discord.ui import ActionRow, TextDisplay
 
 from cascadeui import (
+    DISCORD_CALL_ERRORS,
     DisplayLayoutView,
     EmojiGrid,
     InstanceLimitError,
@@ -192,14 +196,11 @@ def _make_attack_grid() -> EmojiGrid:
     )
 
 
-def _make_defense_grid(ships: dict[str, list[int]]) -> EmojiGrid:
-    """Create a defense grid with ships painted in their fleet colors."""
-    grid = emoji_grid(
-        BOARD_SIZE, BOARD_SIZE, fill=WATER_EMPTY, row_labels=ROW_EMOJI, col_labels=COL_EMOJI
-    )
+def _paint_fleet(grid: EmojiGrid, ships: dict[str, list[int]]) -> None:
+    """Clear a defense grid and paint each ship in its fleet color."""
+    grid.clear()
     for name, cells in ships.items():
         grid[cells] = SHIP_COLORS.get(name, "\N{WHITE LARGE SQUARE}")
-    return grid
 
 
 def _ship_status_line(ships: dict[str, list[int]], sunk_ships: set[str], emoji: bool = True) -> str:
@@ -215,17 +216,12 @@ def _ship_status_line(ships: dict[str, list[int]], sunk_ships: set[str], emoji: 
 
 # // ========================================( Reducers )======================================== // #
 #
-# Battleship demonstrates a deliberate mixed-scope state design.
-#
 # Shared per-game state lives under ``state["application"]["battleship"]``,
 # keyed by ``match_id`` (``BattleshipView.id``, stable across a rematch),
 # and is written by the five lifecycle reducers below. Both players read
-# this slot (via ``MyShipsView.state_selector``), so it cannot live behind
-# a per-user scope key -- but it also cannot live UNKEYED at the slot root:
-# a bot serving several guilds can have two unrelated matches in flight at
-# once, and a player who happens to be seated in both (a normal case for a
-# multi-guild bot, not an edge case) would have one match's fleet silently
-# overwrite the other's the moment either match seeds or rerolls.
+# it, so it cannot sit behind a per-user scope key, and it is keyed by
+# match because one player can be seated in two matches in different
+# guilds at once.
 #
 #     state["application"]["battleship"] = {
 #         match_id: {
@@ -236,15 +232,8 @@ def _ship_status_line(ships: dict[str, list[int]], sunk_ships: set[str], emoji: 
 #         ...
 #     }
 #
-# Per-player lifetime totals (games, wins, forfeits) live under
-# ``user_guild``-scoped state instead, written by ``SCOPED_UPDATE``
-# actions dispatched from ``BattleshipView._record_player_stats`` at game
-# end. Lifetime stats belong to one player and persist across matches
-# against different opponents -- exactly what scoped state is for.
-#
-# ``access_slot(state, "battleship", match_id)`` keeps the slot key in one
-# string instead of repeating ``state.setdefault("application", {})
-# .setdefault("battleship", {}).setdefault(match_id, {})`` in every reducer.
+# Per-player lifetime totals live under ``user_guild`` scope instead
+# (see ``BattleshipView._record_player_stats``).
 
 
 @cascade_reducer("BATTLESHIP_REROLL")
@@ -292,13 +281,7 @@ async def battleship_rematch_reducer(action, state):
 
 @cascade_reducer("BATTLESHIP_FINISHED")
 async def battleship_finished_reducer(action, state):
-    """Mark the match finished in the shared game slot.
-
-    Per-player lifetime stats (games, wins, forfeits) are dispatched
-    separately as ``SCOPED_UPDATE`` actions targeting ``user_guild``
-    scope -- see ``BattleshipView._record_player_stats`` for the
-    rationale.
-    """
+    """Mark the match finished in the shared game slot."""
     match = access_slot(state, "battleship", action["payload"]["match_id"])
     match["phase"] = "finished"
     return state
@@ -315,7 +298,7 @@ async def battleship_finished_reducer(action, state):
 # Any finished game writes a fresh scoped entry, which changes the
 # bucket dict and invalidates the cache. For two-player demos this is
 # cheap; production-scale rebuilds would want a per-guild shape.
-@computed(selector=lambda s: s.get("application", {}).get("battleship_stats", {}))
+@computed(selector=lambda s: read_slot(s, "battleship_stats", default={}))
 def battleship_leaderboards(bucket: dict) -> dict:
     """Return ``{guild_id: [(user_id, stats), ...]}`` sorted by wins desc."""
     # Wrap the cached bucket in a minimal envelope so StateStore.iter_scoped
@@ -343,7 +326,8 @@ class BattleshipChallengeView(StatefulLayoutView):
     """
 
     unauthorized_message = "Only the challenged player can respond."
-    exit_policy = "delete"  # disposable prompt -- never freeze
+    # Accept removes the prompt; Decline and expiry leave a record card.
+    exit_policy = "delete"
     # No scoped state -- the challenge prompt is a one-shot gate that
     # reads nothing from the store and writes nothing.
     state_scope = None
@@ -362,7 +346,7 @@ class BattleshipChallengeView(StatefulLayoutView):
         self.add_item(
             card(
                 image_section(
-                    f"## \N{ANCHOR} Battleship Challenge\n"
+                    "## \N{ANCHOR} Battleship Challenge",
                     f"-# <@{self.challenger_id}> challenges <@{self.opponent.id}>",
                     url=self.opponent.display_avatar.with_size(128).url,
                 ),
@@ -396,8 +380,6 @@ class BattleshipChallengeView(StatefulLayoutView):
         )
 
     async def _accept(self, interaction: discord.Interaction):
-        await self.exit()
-
         view = BattleshipView(
             interaction=interaction,
             user_id=self.challenger_id,
@@ -405,34 +387,28 @@ class BattleshipChallengeView(StatefulLayoutView):
             opponent_id=self.opponent.id,
         )
 
-        # send() returns None when on_instance_limit handles the block
-        # (the override on BattleshipView sends a custom <@user> message).
         # auto_register_participants = True on BattleshipView claims a slot
-        # for both players from allowed_users during send(); rollback is
-        # all-or-nothing, so a None return means zero side effects.
+        # for both players from allowed_users during send(), all or nothing.
+        # A None return means no game was posted, so the challenge stays up
+        # and on_instance_limit has told the opponent who is busy.
         if await view.send() is None:
             return
+        await self.exit()
 
-        # Auto-send the opponent's fleet view as an ephemeral followup so they
-        # see their ships immediately and discover the live re-roll showcase
-        # on their first interaction. Only the opponent's fleet view is
-        # auto-sent here, because ephemeral followups must attach to the
-        # interaction being handled -- this callback runs on the opponent's
-        # Accept click. The challenger spawns their own fleet view by clicking
-        # "View Fleet" on the public card, which fires their own interaction.
-        # Per StatefulLayoutView.send() contract: only Discord HTTP errors
-        # propagate from the send pipeline. Session/participant rejections
-        # return None (handled by the library), and RuntimeError would mean
-        # a programmer error, not something to swallow at runtime.
+        # Only the opponent's fleet panel can be sent here: an ephemeral
+        # followup attaches to the interaction being handled, which is the
+        # opponent's Accept click. The challenger opens theirs from View Fleet.
         fleet_view = MyShipsView(
             interaction=interaction,
             user_id=self.opponent.id,
             guild_id=self.guild_id,
             parent=view,
         )
+        # A failed Discord call costs only this convenience panel, so it is
+        # logged; a programming error still raises.
         try:
             await fleet_view.send(ephemeral=True)
-        except discord.HTTPException as e:
+        except DISCORD_CALL_ERRORS as e:
             logger.warning(f"Failed to auto-send opponent's fleet view: {e}")
 
     async def _decline(self, interaction: discord.Interaction):
@@ -447,9 +423,7 @@ class BattleshipChallengeView(StatefulLayoutView):
                 color=discord.Color.dark_grey(),
             )
         )
-        # ``delete_message=False`` overrides the class ``exit_policy = "delete"``
-        # for this one call so the decline card remains visible in the channel
-        # as a record of the refusal, matching the TicTacToe decline behavior.
+        # delete_message=False keeps the decline card as a record.
         await self.exit(delete_message=False)
 
     async def on_timeout(self):
@@ -478,39 +452,29 @@ class BattleshipView(StatefulLayoutView):
     their own board via the ephemeral "My Ships" button.
 
     Board state lives on four long-lived ``EmojiGrid`` instances (two
-    attack grids, two defense grids). Grids are mutated incrementally
-    on each shot -- no rebuild-from-scratch render functions. The same
-    grid objects are dropped into ``card()`` on every ``build_ui()``
-    call; their ``content`` is always current at add time.
+    attack grids, two defense grids), mutated in place on each shot and
+    dropped into ``card()`` on every ``build_ui()`` call.
     """
 
     unauthorized_message = "You're not part of this game."
     instance_limit = 1
     instance_scope = "user_guild"
     instance_policy = "reject"
-    # protect_attached is a no-op under instance_policy="reject" (rejection
-    # means replacement never fires).
-    protect_attached = True
-    # ``state_scope = None`` because game state lives under a custom reducer
-    # (BATTLESHIP_REROLL) written to the global state tree, not under any of
-    # the four built-in scope keys.
+    # Either player's click resets it. A match left idle this long freezes
+    # as it stands, with no result recorded.
+    timeout = 600.0
+    # Game state lives in the custom ``battleship`` slot (see the reducers),
+    # not under a scope key.
     state_scope = None
-    # Lifetime stats land in a named scoped bucket so Battleship data
-    # stays isolated from every other subsystem's scoped data. The
-    # bucket name also flows through ``persistent_slots`` so only this
-    # bucket is write-through to disk -- TicTacToe, Settings, and other
-    # views' scoped writes are unaffected. The live game state lives
-    # under the custom ``battleship`` slot (rebuilt fresh per match) so
-    # nothing in-match is persisted.
+    # Lifetime stats go to their own scoped bucket, and persistent_slots
+    # saves that bucket alone, so W/L totals survive a restart and nothing
+    # from a match in progress is written.
     scoped_slot = "battleship_stats"
     persistent_slots = ("battleship_stats",)
     auto_defer = True
-    # participant_limit = 2 is redundant with allowed_users = {player_1,
-    # player_2} -- two specific IDs already cap occupancy at two.
-    # ``allowed_users`` / ``on_unauthorized`` governs the auth domain;
-    # ``participant_limit`` / ``on_participant_limit`` governs the
-    # capacity domain. See "Combining allowed_users and
-    # participant_limit" in docs/guide/views.md.
+    # allowed_users already fixes the roster at two, so this cap never fires;
+    # it is set to show the capacity check beside the access check. See
+    # "Combining allowed_users and participant_limit" in docs/guide/views.md.
     participant_limit = 2
     auto_register_participants = True
     # exit_policy is not set here -- the choice is phase-dependent, so
@@ -523,7 +487,7 @@ class BattleshipView(StatefulLayoutView):
     # The setup card, turn indicator, and shot results all name the
     # players, and the tree rebuilds on every Ready toggle, re-roll, and
     # shot, so without this a match re-notifies both players once per
-    # move. The turn-nudge followups are separate sends and still ping.
+    # move.
     allowed_mentions = discord.AllowedMentions.none()
 
     # Ship placements live in
@@ -533,6 +497,10 @@ class BattleshipView(StatefulLayoutView):
     # _place_fresh_fleets helper below. Making them read-only @property enforces
     # that -- any stray ``self.ships_1 = ...`` raises AttributeError at the
     # call site instead of silently desynchronising state from local data.
+    def state_selector(self, state):
+        # A re-roll in another match leaves this board alone.
+        return read_slot(state, "battleship", self._match_key, "fleets")
+
     @property
     def ships_1(self) -> dict[str, list[int]]:
         return self._fleets().get(self.player_1, {})
@@ -562,11 +530,10 @@ class BattleshipView(StatefulLayoutView):
     def _place_fresh_fleets(self, state) -> None:
         """Write a randomly-generated ship layout for each player into the slot.
 
-        Called from ``seed_initial_state`` only -- that hook runs inside
-        the send-pipeline batch with a deep-copied state arg, so writing
-        into the slot directly is correct. The rematch path runs the
-        same placement logic inside the BATTLESHIP_REMATCH reducer
-        instead, which keeps the write on the standard reducer pipeline.
+        Called from ``seed_initial_state`` only, which is handed the live
+        store state to seed before the first render. A rematch places
+        ships through the BATTLESHIP_REMATCH reducer instead, since the
+        view is already live then.
         """
         match = access_slot(state, "battleship", self._match_key)
         fleets = match.setdefault("fleets", {})
@@ -574,18 +541,9 @@ class BattleshipView(StatefulLayoutView):
         fleets[self.player_2] = _place_ships(BOARD_SIZE, SHIPS)
 
     def _repaint_defense_grids(self) -> None:
-        """Repaint both defense grids from the current state-stored fleets.
-
-        Defense grids visually encode where ships sit; whenever fleets
-        change (initial placement or rematch swap) the grids must be cleared
-        and repainted so the visual matches the data.
-        """
-        self._defense_1.clear()
-        self._defense_2.clear()
-        for name, cells in self.ships_1.items():
-            self._defense_1[cells] = SHIP_COLORS.get(name, "\N{WHITE LARGE SQUARE}")
-        for name, cells in self.ships_2.items():
-            self._defense_2[cells] = SHIP_COLORS.get(name, "\N{WHITE LARGE SQUARE}")
+        """Repaint both defense grids from the fleets in state."""
+        _paint_fleet(self._defense_1, self.ships_1)
+        _paint_fleet(self._defense_2, self.ships_2)
 
     def __init__(self, *args, opponent_id: int, **kwargs):
         super().__init__(*args, **kwargs)
@@ -593,12 +551,8 @@ class BattleshipView(StatefulLayoutView):
         self.player_2 = opponent_id
         self.allowed_users = {self.player_1, self.player_2}
 
-        # Live grids -- created empty here, painted in
-        # seed_initial_state once fleets exist in state. Same grid
-        # instances stay live for the view's lifetime; mutations from
-        # _fire() are visible on every rebuild. Defense slots use the
-        # attack-grid factory at init because no ships exist yet; the
-        # ship painting happens once fleets are placed, via _make_defense_grid.
+        # Defense grids start as blank water too, and are painted in
+        # seed_initial_state once fleets exist in state.
         self._attack_1 = _make_attack_grid()
         self._attack_2 = _make_attack_grid()
         self._defense_1 = _make_attack_grid()
@@ -618,30 +572,17 @@ class BattleshipView(StatefulLayoutView):
         self._last_result: str | None = None  # "Hit!", "Miss!", "Sunk the Carrier!"
         self._rematch_votes: set[int] = set()
         self._ready: set[int] = set()
+        self._setup_task: asyncio.Task | None = None
 
         # Selected coordinates (from selects)
         self._selected_row: int | None = None
         self._selected_col: int | None = None
 
-        # No state writes or build_ui() here -- both deferred to
-        # seed_initial_state. The hook fires inside _send_pipeline
-        # AFTER register_view (so the slot is reachable from other
-        # views' selectors) but BEFORE the Discord HTTP send (so the
-        # painted grids and built component tree ship in the first
-        # render). __init__ stays pure: instance attributes only, no
-        # state writes, no UI construction.
-
     async def seed_initial_state(self, state):
         """Place fresh ships, paint defense grids, and build the component tree.
 
-        The three steps share a data dependency -- defense grids paint
-        the ship positions and ``build_ui`` reads ``self.ships_1`` /
-        ``self.ships_2`` (which read state) -- so collapsing them into
-        one hook keeps the order obvious. Runs once per send: the
-        rematch path skips this hook and goes through the
-        BATTLESHIP_REMATCH reducer (which places fresh ships as part
-        of its own dispatch) because the view is already alive at
-        that point.
+        Each step reads the one before it: the grids paint the placed
+        ships, and ``build_ui`` reads the fleets from state.
         """
         self._place_fresh_fleets(state)
         self._repaint_defense_grids()
@@ -662,12 +603,7 @@ class BattleshipView(StatefulLayoutView):
         return self.player_1 if self.turn == 1 else self.player_2
 
     def build_ui(self):
-        """Rebuild the full component tree from current game state.
-
-        Grid objects are long-lived -- they're already up-to-date from
-        incremental mutations in ``_fire()``. This method just drops
-        them into the component tree at the right position.
-        """
+        """Rebuild the full component tree from current game state."""
         self.clear_items()
 
         if self.phase == "setup":
@@ -735,12 +671,7 @@ class BattleshipView(StatefulLayoutView):
         )
 
     def _build_active(self):
-        """Build the UI for active play: attack board + targeting controls.
-
-        The attack grid is a long-lived ``EmojiGrid`` that was already
-        mutated by ``_fire()`` -- it's dropped straight into the card
-        with no rendering step.
-        """
+        """Build the UI for active play: attack board + targeting controls."""
         current_id = self._current_player_id()
         color = COLOR_P1_TURN if self.turn == 1 else COLOR_P2_TURN
 
@@ -873,6 +804,8 @@ class BattleshipView(StatefulLayoutView):
                     style=discord.ButtonStyle.primary,
                     emoji="\N{ANTICLOCKWISE DOWNWARDS AND UPWARDS OPEN CIRCLE ARROWS}",
                     callback=self._rematch,
+                    # Fixed, since a generated id would change with the vote count.
+                    custom_id="rematch",
                 ),
                 StatefulButton(
                     label="My Ships",
@@ -891,11 +824,18 @@ class BattleshipView(StatefulLayoutView):
 
     async def _cancel_setup(self, interaction: discord.Interaction):
         """Either player can cancel the game during setup."""
-        # phase == "setup" here, so exit() resolves to delete via the override.
+        # Clicks queue behind one another, so a click can come from a board
+        # the game has moved past; each callback checks the phase it was
+        # drawn for, and a dropped click is acknowledged by the library.
+        if self.phase != "setup":
+            return
+        # The exit() override deletes the message during setup.
         await self.exit()
 
     async def _ready_up(self, interaction: discord.Interaction):
         """Lock in the clicking player's fleet."""
+        if self.phase != "setup":
+            return
         self._ready.add(interaction.user.id)
 
         started = len(self._ready) >= 2
@@ -918,12 +858,9 @@ class BattleshipView(StatefulLayoutView):
         self._selected_col = int(values[0])
 
     async def _fire(self, interaction: discord.Interaction):
-        """Fire at the selected cell.
-
-        Mutates the current player's attack grid and the opponent's
-        defense grid incrementally -- no rebuild-from-scratch needed.
-        The grid content auto-updates on each cell assignment.
-        """
+        """Fire at the selected cell, marking both players' grids in place."""
+        if self.phase != "active" or self.winner is not None:
+            return
         current_id = self._current_player_id()
 
         if interaction.user.id != current_id:
@@ -1022,14 +959,15 @@ class BattleshipView(StatefulLayoutView):
             guild_id=self.guild_id,
             parent=self,
         )
-        # See _accept for the rationale on the narrowed except clause.
         try:
             await view.send(ephemeral=True)
-        except discord.HTTPException as e:
+        except DISCORD_CALL_ERRORS as e:
             logger.warning(f"Failed to open fleet view: {e}")
 
     async def _forfeit(self, interaction: discord.Interaction):
         """The clicking player forfeits."""
+        if self.phase != "active" or self.winner is not None:
+            return
         self._forfeited_by = interaction.user.id
         self.winner = 2 if interaction.user.id == self.player_1 else 1
         self._last_result = None
@@ -1039,13 +977,13 @@ class BattleshipView(StatefulLayoutView):
 
     async def _rematch(self, interaction: discord.Interaction):
         """Vote for a rematch. Resets to fleet setup when both players agree."""
+        if self.winner is None:
+            return
         self._rematch_votes.add(interaction.user.id)
 
         if len(self._rematch_votes) >= 2:
-            # Swap who goes first.  Ship placement for the new match
-            # flows through the reducer pipeline below so the write
-            # rides the standard subscriber / persistence / undo
-            # channels instead of mutating live store state out of band.
+            # Swap who goes first. Fresh ships are placed by the
+            # BATTLESHIP_REMATCH reducer below.
             self.player_1, self.player_2 = self.player_2, self.player_1
             self.sunk_by_1 = set()
             self.sunk_by_2 = set()
@@ -1068,7 +1006,7 @@ class BattleshipView(StatefulLayoutView):
 
             # Close stale ephemeral views -- they reference the old grid
             # state snapshot. Players re-open from the new setup card.
-            await self._cleanup_attached_children()
+            await self.exit_children()
 
             # Reset phase + shot counter and place fresh ships in one
             # reducer pass.  Player IDs ride the payload because the
@@ -1120,14 +1058,15 @@ class BattleshipView(StatefulLayoutView):
     # // ==================( Game Logic )================== // #
 
     def _start_setup_timer(self):
-        """Start the auto-lock countdown for fleet setup.
+        """Start the auto-lock countdown for fleet setup, replacing any earlier one.
 
-        Routed through ``task_manager`` so the timer is cancelled when the
-        view exits and so successive rematches don't accumulate stale
-        background tasks.  Cancels any prior timer first.
+        ``create_task()`` makes the view own the timer, so it is cancelled
+        when the view exits. Cancelling through the kept handle leaves the
+        view's other tasks alone.
         """
-        self.task_manager.cancel_tasks(self.id)
-        self.task_manager.create_task(self.id, self._auto_start())
+        if self._setup_task is not None:
+            self._setup_task.cancel()
+        self._setup_task = self.create_task(self._auto_start())
 
     async def _auto_start(self):
         """Auto-start the game after SETUP_TIMEOUT if still in setup phase."""
@@ -1141,16 +1080,10 @@ class BattleshipView(StatefulLayoutView):
     async def _finish_game(self, forfeit: bool):
         """Dispatch game result and close any private fleet panels.
 
-        The main game view stays alive so players can click Rematch or Close,
-        but the ephemeral fleet panels have no purpose once the game is over --
-        cleaning them up here keeps the registry honest and prevents stale
-        ephemerals from lingering until their interaction-token timeout.
-
-        Lifetime totals for both players are recorded as ``user_guild``
-        scoped writes so each player's stats follow them across matches
-        regardless of which seat they sat in. The original "p1_wins" /
-        "p2_wins" keys tied to seat position would silently misattribute
-        wins after a rematch swap.
+        The game view stays up for Rematch or Close; the fleet panels
+        have nothing left to show, so they close here. Stats are keyed
+        by player rather than seat, so they follow a player across the
+        seat swap a rematch makes.
         """
         winner_id = self.player_1 if self.winner == 1 else self.player_2
         loser_id = self.player_2 if self.winner == 1 else self.player_1
@@ -1161,22 +1094,14 @@ class BattleshipView(StatefulLayoutView):
             )
             await self._record_player_stats(winner_id, won=True, forfeit=False)
             await self._record_player_stats(loser_id, won=False, forfeit=forfeit)
-        await self._cleanup_attached_children()
+        await self.exit_children()
 
     async def _record_player_stats(self, player_id: int, *, won: bool, forfeit: bool) -> None:
         """Bump a player's lifetime totals via ``user_guild``-scoped state.
 
-        Demonstrates the mixed-scope half of the design: shared per-game
-        state (phase, fleets, shots_fired) lives under the BATTLESHIP_*
-        custom reducers because both players read it; per-player lifetime
-        totals live under ``user_guild`` scope because they belong to one
-        player and persist across opponents.
-
-        ``dispatch_scoped`` is called with explicit ``scope=`` and
-        ``user_id=`` kwargs so this view (``state_scope = None``) can
-        write into another player's scope key. Without overrides the
-        call would target ``self.user_id``, which is wrong when
-        recording the loser's stats from the winner's view.
+        ``dispatch_scoped`` takes ``scope=`` because this view sets no
+        ``state_scope``, and ``user_id=`` because the default is the
+        view's owner, which is only one of the two players.
         """
         if self.guild_id is None:
             return
@@ -1191,10 +1116,8 @@ class BattleshipView(StatefulLayoutView):
             "wins": existing.get("wins", 0) + (1 if won else 0),
             "forfeits": existing.get("forfeits", 0) + (1 if forfeit else 0),
         }
-        # SCOPED_UPDATE shallow-merges ``data`` into the existing slice.
-        # The view's ``scoped_slot`` attribute routes the write into
-        # ``state["application"]["battleship_stats"]``; other subsystems
-        # with their own ``scoped_slot`` values are untouched.
+        # SCOPED_UPDATE shallow-merges ``data`` into this player's entry in
+        # the view's ``scoped_slot`` bucket.
         await self.dispatch_scoped(
             new_stats,
             scope="user_guild",
@@ -1209,15 +1132,10 @@ class BattleshipView(StatefulLayoutView):
 class MyShipsView(StatefulLayoutView):
     """Ephemeral private board view with live updates and live re-roll.
 
-    Holds a back-reference to the parent ``BattleshipView`` so the re-roll
-    callback can mutate ship placements and defense grids directly. The
-    re-roll button only appears while the parent is in the setup phase;
-    once the game starts it disappears and the view becomes a pure
-    spectator of incoming damage.
-
-    The defense grid is a long-lived ``EmojiGrid`` owned by the parent.
-    This view references it directly -- mutations from ``_fire()`` on
-    the parent are already visible when this view rebuilds.
+    Reads the game view through ``self.parent``. The re-roll button only
+    appears while the game is in setup: it dispatches BATTLESHIP_REROLL and
+    repaints the parent's defense grid, which this panel shows directly.
+    Once the game starts the panel only shows incoming damage.
 
     Cross-view reactivity:
         * Subscribes to ``BATTLESHIP_REROLL`` so the view rebuilds in place
@@ -1226,7 +1144,6 @@ class MyShipsView(StatefulLayoutView):
           the opponent fires.
         * Subscribes to ``BATTLESHIP_STARTED`` so the re-roll button hides
           when both players ready up.
-        * Subscribes to ``BATTLESHIP_FINISHED`` to redraw the final state.
 
     Lifecycle ownership map:
 
@@ -1239,9 +1156,11 @@ class MyShipsView(StatefulLayoutView):
     |                                | (instance_limit=1 evicts the stale entry)|
     +--------------------------------+------------------------------------------+
     | Token nearing 15-min expiry    | auto_refresh_ephemeral hands off to a    |
-    |                                | fresh ephemeral via "Continue Session"   |
+    |                                | fresh ephemeral via the Refresh button   |
     +--------------------------------+------------------------------------------+
-    | Parent game cancelled / ends   | attach_child cleanup on parent.exit()    |
+    | Game cancelled or timed out    | exit() or timeout closes attached views  |
+    +--------------------------------+------------------------------------------+
+    | Game ends                      | _finish_game closes the fleet panels     |
     +--------------------------------+------------------------------------------+
     | User clicks Re-Roll            | No exit -- self.refresh() in place via   |
     |                                | the BATTLESHIP_REROLL subscriber path    |
@@ -1259,23 +1178,23 @@ class MyShipsView(StatefulLayoutView):
         "BATTLESHIP_REROLL",
         "BATTLESHIP_SHOT",
         "BATTLESHIP_STARTED",
-        "BATTLESHIP_FINISHED",
     }
     owner_only = True
     instance_limit = 1
     instance_scope = "user_guild"
-    # Fleet ephemerals should never linger frozen. ``instance_policy``
-    # evicts the previous fleet view when "View Fleet" is clicked again;
-    # ``replace_policy`` then deletes that view's message; ``exit_policy``
-    # covers the close button and every other ``exit()`` path that names
-    # no ``delete_message``.
+    # Opening View Fleet again deletes the previous panel, and Close
+    # deletes this one.
     instance_policy = "replace"
     replace_policy = "delete"
     exit_policy = "delete"
+    # The panel is watched rather than clicked once play starts, so no
+    # click would extend a timeout. It lives as long as the game: the
+    # game's own exit and timeout close it.
+    timeout = None
 
-    # ``auto_refresh_ephemeral`` installs a "Continue Session" button
-    # shortly before the 15-minute interaction token expires, spawning
-    # a fresh ephemeral with no visible cliff.
+    # ``auto_refresh_ephemeral`` installs a Refresh button shortly before
+    # the 15-minute interaction token expires; clicking it reopens the
+    # panel as a fresh ephemeral.
     auto_refresh_ephemeral = True
     refresh_button_label = "Refresh"
 
@@ -1284,13 +1203,13 @@ class MyShipsView(StatefulLayoutView):
 
         The store short-circuits ``on_state_changed`` when the tuple
         compares equal to the previous dispatch's tuple. Three slices
-        cover the four subscribed actions without false negatives:
+        cover the three subscribed actions without false negatives:
 
         * ``own_fleet`` -- changes only when THIS player rerolls, so the
           opponent's BATTLESHIP_REROLL short-circuits here (the primary
           performance win: no rebuild on data this view doesn't show).
-        * ``phase`` -- flips on STARTED ("active") and FINISHED
-          ("finished"), so setup-only UI elements drop correctly.
+        * ``phase`` -- flips to "active" on STARTED, so setup-only UI
+          elements drop correctly.
         * ``shots_fired`` -- monotonically increases on every SHOT, so
           incoming damage always produces a rebuild regardless of whose
           turn it was.
@@ -1395,10 +1314,7 @@ class MyShipsView(StatefulLayoutView):
             return
 
         new_ships = _place_ships(BOARD_SIZE, SHIPS)
-        defense = self._own_defense_grid()
-        defense.clear()
-        for name, cells in new_ships.items():
-            defense[cells] = SHIP_COLORS.get(name, "\N{WHITE LARGE SQUARE}")
+        _paint_fleet(self._own_defense_grid(), new_ships)
 
         self.parent._ready.discard(self.user_id)
 
@@ -1453,16 +1369,21 @@ class BattleshipExample(commands.Cog, name="v2_battleship_example"):
             await context.send("You can't play against a bot!", ephemeral=True)
             return
 
-        # Pre-check: reject the command if the challenger already has an
-        # active game, before the opponent ever sees a challenge prompt.
+        # Pre-check both players before the opponent sees a challenge.
         if not BattleshipView.check_instance_available(
             user_id=context.author.id,
             guild_id=context.guild.id,
         ):
             await context.send(
-                "You're already in a game. Finish or exit it first.",
+                "You're already in a game. Finish it and close the board first.",
                 ephemeral=True,
             )
+            return
+        if not BattleshipView.check_instance_available(
+            user_id=opponent.id,
+            guild_id=context.guild.id,
+        ):
+            await context.send(f"{opponent.mention} is already in a game.", ephemeral=True)
             return
 
         view = BattleshipChallengeView(
@@ -1527,7 +1448,7 @@ class BattleshipExample(commands.Cog, name="v2_battleship_example"):
         description="Show this server's Battleship leaderboard.",
     )
     async def battleship_leaderboard(self, context: Context) -> None:
-        """Display server-wide totals and the top 3 players by wins."""
+        """Display server-wide totals and the top 10 players by wins."""
         if not context.guild:
             await context.send("This command can only be used in a server.", ephemeral=True)
             return
@@ -1557,9 +1478,10 @@ class BattleshipExample(commands.Cog, name="v2_battleship_example"):
                 return f"{wins}W / {games}G \N{BULLET} {forfeits}F \N{BULLET} {bar}"
 
             def build_header(self, page):
-                # Overview stats card above the rankings on every page,
-                # read from self.ranked_entries (the loaded top-N slice).
-                entries = self.ranked_entries
+                # Overview stats card above the rankings on every page.
+                # get_entries() is every player in the server (the entries=
+                # list); ranked_entries holds only the top 10 shown below.
+                entries = self.get_entries()
                 # Each game contributes to two player rows.
                 unique_games = sum(e[1].get("games", 0) for e in entries) // 2
                 total_forfeits = sum(e[1].get("forfeits", 0) for e in entries)

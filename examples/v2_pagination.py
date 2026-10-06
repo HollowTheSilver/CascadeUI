@@ -13,7 +13,7 @@ V2 advantages shown here:
     - Multiple content blocks per page (not limited to one embed)
     - Inline page metadata alongside content
     - Jump buttons and go-to-page modal for large page counts
-    - _build_extra_items() hook for adding an exit button
+    - ``auto_exit_button`` for an Exit button kept through page turns
 
 Two construction modes:
 
@@ -21,10 +21,11 @@ Two construction modes:
       list is in memory; the paginator chunks and formats up front.
     - ``from_cursor(fetch, total, per_page, formatter)`` -- cursor mode.
       The paginator fetches one page at a time via an async callable,
-      caches the result in an LRU keyed on page index, and protects
-      the currently-displayed page from eviction. Use when the dataset
-      is large enough that eager load would waste bandwidth/memory, or
-      when the data lives behind an async source (database, HTTP API).
+      caches up to ``cache_size`` pages in an LRU keyed on page index,
+      and protects the currently-displayed page from eviction. Use when
+      the dataset is large enough that eager load would waste
+      bandwidth/memory, or when the data lives behind an async source
+      (database, HTTP API).
 
 Each mode has its own view class. ``instance_limit`` is keyed on the
 class, so one shared class would mean the two commands compete for a
@@ -104,12 +105,7 @@ RARITY_ORDER = ["Common", "Uncommon", "Rare", "Legendary"]
 
 
 class InventoryView(PaginatedLayoutView):
-    """Paginated inventory with an exit button below navigation.
-
-    Overrides ``_build_extra_items()`` to add an Exit button after
-    the pagination controls. This hook is called during init and
-    on every page turn.
-    """
+    """Paginated inventory with an Exit button below navigation."""
 
     owner_only = True
     instance_limit = 1
@@ -119,13 +115,12 @@ class InventoryView(PaginatedLayoutView):
         "You already have an eager browser open. Close it before opening another."
     )
     # A disposable browse session, so Exit removes the message rather than
-    # leaving a frozen card behind. The exit helpers below read this.
+    # leaving a frozen card behind.
     exit_policy = "delete"
     state_scope = None
-
-    def _build_extra_items(self):
-        """Add an exit button below the navigation row."""
-        self.add_exit_button()
+    # Adds the Exit button below the navigation row and keeps it there as
+    # the pages turn.
+    auto_exit_button = True
 
 
 class CursorInventoryView(InventoryView):
@@ -241,6 +236,9 @@ class V2PaginationExample(commands.Cog, name="v2_pagination_example"):
             total=len(SAMPLE_ITEMS),
             per_page=4,
             formatter=format_page,
+            # Seven pages, at most three held at once: turning past the third
+            # evicts the least recently seen one, never the page on screen.
+            cache_size=3,
             context=context,
         )
         await view.send()

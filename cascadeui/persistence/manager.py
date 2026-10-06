@@ -42,6 +42,7 @@ corresponding bookkeeping action (:data:`APPLICATION_SLOTS_PRUNED`,
 
 
 import asyncio
+import contextlib
 import functools
 import inspect
 import json
@@ -60,6 +61,7 @@ from ..exceptions import (
 from ..state.actions import ActionCreators
 from ..utils.hooks import await_maybe
 from ..utils.responses import DISCORD_CALL_ERRORS
+from ..utils.tasks import _bounded_wait
 from .config import (
     NAMESPACE_APPLICATION,
     NAMESPACE_REGISTRY,
@@ -84,14 +86,23 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# Kwargs captured by ``__init_subclass__`` that are also surfaced as
-# their own registry-row column (``persistence_key``) or are not safely
-# round-trippable through JSON (``theme`` is a live ``Theme`` object;
-# ``bot`` is a live client injected via ``on_bind`` on restore).
-# The middleware strips them at write so the registry stays clean, and
-# ``_reattach_one`` strips them at read so the row column wins on
-# reconstruction without a duplicate-keyword crash.
+# Captured kwargs a registry row does not carry: ``persistence_key`` has its own
+# column, and ``theme`` and ``bot`` are live objects (``bot`` returns through
+# ``on_bind``). Stripped at write by the middleware, and at read by
+# ``_reattach_one`` so the column's value is not passed twice.
 _NON_PERSISTABLE_KWARGS: frozenset[str] = frozenset({"persistence_key", "theme", "bot"})
+
+# How long a backend's close() may take before persistence closes without it.
+# It runs inside the bot's close, so a close that never returns would keep the
+# bot from ever exiting. Above the built-in SQL backends' own five-second wait.
+_BACKEND_CLOSE_SECONDS = 10.0
+
+
+def _bot_closed(bot: Any) -> bool:
+    """Whether ``bot`` has closed. Read with ``is True``: a stand-in without a
+    real ``is_closed`` reads as open."""
+    is_closed = getattr(bot, "is_closed", None)
+    return is_closed is not None and is_closed() is True
 
 
 def _validate_prune_unreachable_after_days(value: Any, bot: Any) -> None:
@@ -113,6 +124,14 @@ def _validate_prune_unreachable_after_days(value: Any, bot: Any) -> None:
             "prune_unreachable_after_days= needs bot=: the sweep re-verifies each "
             "unreachable row against Discord before deleting it."
         )
+
+
+async def _settle(task: asyncio.Task) -> None:
+    """Wait for a task this close cancelled, without taking its outcome as the
+    caller's: a cancel of the caller still reaches the caller."""
+    await asyncio.wait({task})
+    if not task.cancelled():
+        task.exception()
 
 
 # // ========================================( Manager )======================================== // #
@@ -142,8 +161,8 @@ class PersistenceManager:
         self.prune_unreachable_after_days = prune_unreachable_after_days
         # Held by every walk that can delete or re-attach registry rows
         # (a reattach pass and prune_unreachable), so a sweep cannot delete a
-        # row a concurrent reattach just found reachable again.
-        self._registry_walk_lock = asyncio.Lock()
+        # row a concurrent reattach just found reachable again. Taken
+        # through _loop_lock("registry_walk").
         self._registry_walk_owner: Optional[asyncio.Task] = None
 
         # Default to opted-out configs so every namespace has a config
@@ -163,7 +182,20 @@ class PersistenceManager:
         self._initialized: bool = False
         self._rehydrated: bool = False
         self._closed: bool = False
+        self._loop_locks: dict[str, tuple] = {}
+        # A close that began and was cut off before it finished still needs
+        # a reopen, though _closed is set only at the end.
+        self._close_started: bool = False
         self._registry_rows: list[dict[str, Any]] = []
+        # The stored form of each application slot as last loaded or queued for
+        # a write. PersistenceMiddleware routes through it and skips a slot whose
+        # stored form has not changed.
+        self._slot_payloads: dict[str, str] = {}
+        # The expires_at of each slot with a TTL, as last loaded or queued, so an
+        # expired slot can be dropped from the running bot as well as from disk.
+        self._slot_expiry: dict[str, int] = {}
+        # Slots already logged as having no registered policy.
+        self._unpolicied_slots: set[str] = set()
         # Keys restored across reattach passes. reattach() re-drives the
         # reattach and skips these so an already-live panel is never re-fetched
         # or double-registered on a second pass.
@@ -172,12 +204,8 @@ class PersistenceManager:
         # during initialize(); later ones come from reattach(). A class
         # missing on the first is expected and on a later one is not.
         self._reattach_passes: int = 0
-        # Summary from the most recent reattach_persistent_views() (restored /
-        # skipped / failed / removed key lists). Stashed so a consumer can read
-        # which persistence_keys were pruned for gone messages after
-        # setup_middleware returns: REGISTRY_PRUNED fires once during reattach,
-        # inside setup_middleware, so code that subscribes only after setup_hook
-        # (e.g. on_ready) misses it. None until the first reattach.
+        # The most recent pass's summary, readable after setup_middleware
+        # returns: REGISTRY_PRUNED fires inside it, before on_ready can listen.
         self.last_reattach_summary: Optional[dict[str, list[str]]] = None
         # Every key a pass has reported, under its most recent outcome; read
         # through total_reattach_summary. Outlives the attribute above across
@@ -188,12 +216,8 @@ class PersistenceManager:
         # and extended at runtime by register_slot_policy.
         self._slot_policies: dict[str, SlotPolicy] = dict(self.application.slots)
 
-        # A policy declaring persistent=True is an opt-in, so it registers
-        # the slot the same way persistent_slots and access_slot do. Seeding
-        # here rather than in PersistenceMiddleware.initialize() covers both
-        # construction paths: a caller passing a pre-built manager marks the
-        # middleware initialized, so initialize() short-circuits and never
-        # runs. Lazy import matches the other two seeding sites.
+        # persistent=True registers the slot as persistent_slots and access_slot
+        # do. Here rather than in initialize(), which a pre-built manager skips.
         for slot_name, policy in self._slot_policies.items():
             if policy.persistent:
                 self._register_persistent_slot(slot_name)
@@ -244,12 +268,11 @@ class PersistenceManager:
         """Register a slot policy at runtime. Raises :class:`ValueError`
         on re-registration so accidental overwrites surface immediately.
 
-        When the new policy declares ``ttl_days`` and the daily sweeper
-        is not yet running, bootstrap it here: the sweeper inspects
-        ``_slot_policies`` once at start time and never re-checks, so a
-        policy registered after it starts is invisible to it without this
-        bootstrap. Idempotent: ``_start_ttl_sweeper`` is a no-op when the
-        task is already alive or when the application backend is opted out.
+        ``initialize()`` starts the daily sweeper only when a registered
+        policy has a TTL, so a TTL policy registered later starts it here.
+        The sweep itself deletes every expired row, whatever its policy.
+        Idempotent: ``_start_ttl_sweeper`` is a no-op when the task is
+        already alive or when the application backend is opted out.
         """
         if not isinstance(name, str):
             raise TypeError(f"slot name must be str, got {type(name).__name__}")
@@ -258,6 +281,10 @@ class PersistenceManager:
         if name in self._slot_policies:
             raise ValueError(f"Slot policy already registered for {name!r}")
         self._slot_policies[name] = policy
+        # The stored row was written under the fallback policy: forgetting its
+        # form lets the next action that copies the state (any @cascade_reducer)
+        # rewrite it with this one's expiry.
+        self._slot_payloads.pop(name, None)
         if policy.persistent:
             self._register_persistent_slot(name)
 
@@ -280,8 +307,10 @@ class PersistenceManager:
         policy = self._slot_policies.get(name)
         if policy is None:
             # DEBUG because users who never declare slots still get sane
-            # behavior; noise-free unless someone is actively auditing.
-            logger.debug(f"No slot policy registered for {name!r}; using SlotPolicy()")
+            # behavior; once per slot, since every write of the slot asks.
+            if name not in self._unpolicied_slots:
+                self._unpolicied_slots.add(name)
+                logger.debug(f"No slot policy registered for {name!r}; using SlotPolicy()")
             return SlotPolicy()
         return policy
 
@@ -353,22 +382,18 @@ class PersistenceManager:
                 await self._reconcile_one_legacy_table(backend, table)
             except Exception as exc:
                 legacy_name = physical_table(backend, LEGACY_TABLE_RENAMES[table].old_name)
-                # The probes run before the transaction opens, so a second
-                # process booting alongside this one can commit the rename in
-                # between and this one fails on a table that is already gone.
-                # Losing that race is the healthy outcome, and reporting it as
-                # a rename failure would send an operator after GRANTs.
+                # A second process booting alongside can commit the rename
+                # between the probes and the transaction. Losing that race is
+                # healthy; reported as a failure it would read as a GRANT problem.
                 if await self._legacy_rename_already_done(backend, legacy_name, table):
                     logger.debug(
                         f"Another process renamed {legacy_name!r} to "
                         f"{physical_table(backend, table)!r} first; nothing to do."
                     )
                     continue
-                # Every other step of the pipeline wraps its failures in a
-                # persistence-domain error; unwrapped, the driver's own type
-                # leaves setup_hook naming neither the table nor the step. This
-                # runs before the version loop, so on a role that cannot rename
-                # it is the first DDL to fail and the one an operator sees.
+                # Wrapped like every other pipeline step: the driver's own type
+                # names neither the table nor the step, and on a role that cannot
+                # rename, this is the first DDL to fail.
                 raise PersistenceSchemaError(
                     f"Renaming {legacy_name!r} to {physical_table(backend, table)!r} "
                     f"failed: {type(exc).__name__}: {exc}. The rename commits as one "
@@ -425,11 +450,9 @@ class PersistenceManager:
         if qmark:
             exists_sql = "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?"
         else:
-            # information_schema filters by privilege, which is load-bearing
-            # rather than incidental: a role that cannot see the old table also
-            # cannot rename it, so the skip below is correct instead of lucky.
-            # pg_class and pg_tables do not filter, and reading either here
-            # turns a correct silent skip into a wrong one.
+            # information_schema filters by privilege, and that is required: a
+            # role that cannot see the old table cannot rename it either, so it
+            # is skipped. pg_class and pg_tables do not filter.
             exists_sql = (
                 "SELECT 1 AS present FROM information_schema.tables "
                 "WHERE table_schema = current_schema() "
@@ -444,13 +467,9 @@ class PersistenceManager:
         try:
             await backend.fetch(f"SELECT {cols} FROM {phys_old} LIMIT 0")
         except Exception:
-            # The driver raises its own vendor type unwrapped, so the except is
-            # broad, and a broad except cannot tell a missing column from a
-            # table that stopped existing between the check above and here.
-            # Re-read existence before naming a cause: a concurrent boot that
-            # renamed it is the one other way in, and reporting the library's
-            # own table as a consumer's would send an operator after the wrong
-            # one. Anything else resurfaces on the next statement.
+            # The driver's own vendor type makes this except broad, so it cannot
+            # tell a missing column from a table a concurrent boot just renamed.
+            # Existence is read again before the table is called a consumer's.
             if await backend.fetch_one(exists_sql, phys_old) is None:
                 logger.debug(
                     f"Table {phys_old!r} went away between the existence check "
@@ -486,21 +505,17 @@ class PersistenceManager:
                 # created; its index drops with it.
                 await backend.execute(f"DROP TABLE {phys_new}")
             await backend.execute(f"ALTER TABLE {phys_old} RENAME TO {phys_new}")
-            # A rename keeps the table's index under its old name on both
-            # engines. Drop it and recreate from the current DDL: an index is
-            # derived state, so the swap is safe, and left in place the next
-            # boot's CREATE INDEX IF NOT EXISTS would add a second index over
-            # the same columns under the current name.
+            # A rename keeps the index under its old name on both engines, and
+            # the next boot's CREATE INDEX IF NOT EXISTS would add a second one.
+            # An index is derived state, so it is dropped and recreated.
             await backend.execute(
                 f"DROP INDEX IF EXISTS {physical_table(backend, legacy.old_index)}"
             )
             await backend.execute(apply_table_prefix(legacy.index_ddl, prefix))
             if old_ver is not None:
-                # Move the version record with the data it describes, or the
-                # renamed table reads as unversioned and its migrators re-run.
-                # A record already keyed by the current name loses to the
-                # moved one: the only table it can describe is the shell
-                # dropped above.
+                # The version record moves with its data, or the renamed table
+                # reads as unversioned and its migrators re-run. A record under
+                # the current name can only describe the shell dropped above.
                 if new_ver is not None:
                     await backend.execute(f"DELETE FROM {meta} WHERE table_name = {ph1}", table)
                 await backend.execute(
@@ -586,12 +601,9 @@ class PersistenceManager:
         # quote identifiers. The desired name is library-constructed.
         quoted = '"' + conname.replace('"', '""') + '"'
         try:
-            # The rename takes ACCESS EXCLUSIVE, so any open read against the
-            # table blocks it: a long query, a running dump, an outgoing
-            # process still shutting down. Without a bound it waits rather
-            # than failing, and a step designed to warn and retry would hang
-            # the boot instead. The transaction scopes the timeout to this
-            # statement, so nothing is left set on a pooled connection.
+            # The rename takes ACCESS EXCLUSIVE, so any open read blocks it, and
+            # unbounded it would hang the boot instead of warning. SET LOCAL
+            # inside the transaction leaves nothing set on a pooled connection.
             async with backend.transaction():
                 await backend.execute("SET LOCAL lock_timeout = '3s'")
                 await backend.execute(f"ALTER TABLE {phys} RENAME CONSTRAINT {quoted} TO {desired}")
@@ -662,11 +674,9 @@ class PersistenceManager:
             on_disk = await ns_cfg.backend.get_schema_version(table)
 
             if on_disk == 0:
-                # Rows predate the version record and walk forward from v1
-                # (see the docstring); an empty table is a fresh install. A
-                # wrong guess only costs a re-run: every migrator is
-                # idempotent (SQLite probes for the column, PostgreSQL uses
-                # IF NOT EXISTS, an OPEN_ROWS backend skips its DDL entirely).
+                # Rows without a version record walk forward from v1 (see the
+                # docstring); an empty table is a fresh install. A wrong guess
+                # only re-runs migrators, and every one is idempotent.
                 if await ns_cfg.backend.row_select(table):
                     on_disk = 1
                     await ns_cfg.backend.set_schema_version(table, on_disk)
@@ -683,11 +693,9 @@ class PersistenceManager:
                     )
                 caps = ns_cfg.backend.capabilities
                 if not caps & (Capability.OPEN_ROWS | Capability.RAW_SQL):
-                    # The migrator cannot run DDL without a raw-SQL surface,
-                    # and skipping it is only safe when rows are open
-                    # mappings. Refusing here is what keeps the failure at
-                    # the misconfiguration instead of at the first registry
-                    # write carrying a column the table does not have.
+                    # With no raw-SQL surface the migrator cannot run its DDL,
+                    # and skipping it is safe only for open-mapping rows. Unrefused,
+                    # the first registry write carrying the new column would fail.
                     raise PersistenceConfigError(
                         f"{table} has a pending schema migration "
                         f"(v{on_disk} -> v{on_disk + 1}), and backend "
@@ -742,24 +750,44 @@ class PersistenceManager:
         self._rehydrated = True
 
     async def _rehydrate_application(self) -> None:
+        # Under the write lock, so a rehydrate run again while the bot is up
+        # waits for a write in flight instead of loading the row it replaces.
+        ns = getattr(self._middleware, "_ns_application", None)
+        async with ns.write_lock if ns is not None else contextlib.nullcontext():
+            await self._load_application_rows()
+
+    def _stored_under_current_policy(self, slot_name: str, row: dict) -> bool:
+        """Whether ``row``'s expiry is the one the slot's current policy would write."""
+        ttl_days = self.get_slot_policy(slot_name).ttl_days
+        expires_at = row.get("expires_at")
+        if ttl_days is None:
+            return expires_at is None
+        updated_at = row.get("updated_at")
+        return (
+            expires_at is not None
+            and updated_at is not None
+            and expires_at - updated_at == ttl_days * 86400
+        )
+
+    async def _load_application_rows(self) -> None:
         backend = self.application.backend
         assert backend is not None
 
-        # Drop expired rows before the select. expires_at is an absolute
-        # timestamp written at write-time, so TTL does not restart across
-        # restarts -- but the daily sweeper's first tick is 24h away, and
-        # without this pass an already-expired slot would reappear in
-        # memory for up to a day. Gated on "at least one TTL slot exists"
-        # so zero-TTL deployments pay nothing.
+        # Expired rows go before the select: loaded, an expired slot would be
+        # served until the next daily sweep. Skipped when no persistent slot
+        # declares a TTL.
         if any(p.ttl_days is not None and p.persistent for p in self._slot_policies.values()):
+            cutoff = int(time.time())
             try:
-                await backend.row_delete_where_lt(
-                    TABLE_APPLICATION_SLOTS, "expires_at", int(time.time())
-                )
+                await backend.row_delete_where_lt(TABLE_APPLICATION_SLOTS, "expires_at", cutoff)
             except Exception as exc:
                 # Prune failures should not block rehydrate -- the sweeper
                 # will catch the rows on its next tick. Log and continue.
                 logger.warning(f"Pre-rehydrate TTL prune failed: {exc}")
+            else:
+                # A rehydrate run again while the bot is up: the expired slots
+                # the select no longer returns leave memory too.
+                await self._drop_slots(expired_before=cutoff)
 
         try:
             rows = await backend.row_select(TABLE_APPLICATION_SLOTS)
@@ -768,19 +796,81 @@ class PersistenceManager:
                 f"Failed to read {TABLE_APPLICATION_SLOTS}: {exc}"
             ) from exc
 
-        state = self._store.state
-        app = state.setdefault("application", {})
-        restored = 0
+        slots = {}
+        expiry = {}
+        payloads = {}
         for row in rows:
             slot_name = row["slot_name"]
             try:
-                app[slot_name] = json.loads(row["payload"])
+                slots[slot_name] = json.loads(row["payload"])
             except (TypeError, ValueError) as exc:
                 raise PersistenceRehydrateError(
                     f"Corrupt payload for slot {slot_name!r}: {exc}"
                 ) from exc
-            restored += 1
-        logger.info(f"Rehydrated {restored} application slot(s)")
+            if row.get("expires_at") is not None:
+                expiry[slot_name] = row["expires_at"]
+            # A row written under another TTL policy is left unrecorded, so the
+            # next action that copies the state rewrites it with the current
+            # policy's expiry.
+            if self._stored_under_current_policy(slot_name, row):
+                # Serialized again rather than taken from the row: a backend may
+                # store its own normalized form, which would never match.
+                payloads[slot_name] = json.dumps(slots[slot_name])
+        loaded = []
+
+        def write():
+            # A change still waiting to be written is newer than its row, so a
+            # rehydrate run again while the bot is up leaves that slot alone.
+            pending = self._pending_slots()
+            fresh = {name: value for name, value in slots.items() if name not in pending}
+            self._store.state.setdefault("application", {}).update(fresh)
+            self._slot_payloads.update((n, p) for n, p in payloads.items() if n in fresh)
+            self._slot_expiry.update((n, at) for n, at in expiry.items() if n in fresh)
+            loaded.append(len(fresh))
+
+        # In the state turn: a reducer awaiting in another task would
+        # otherwise commit a state without these slots.
+        await self._store._write_in_turn(write, "rehydrating application slots")
+        logger.info(f"Rehydrated {loaded[0]} application slot(s)")
+
+    def _pending_slots(self) -> set:
+        """The application slots with a write or delete still waiting."""
+        ns = getattr(self._middleware, "_ns_application", None)
+        if ns is None:
+            return set()
+        return set(ns.dirty_rows) | ns.deleted_keys
+
+    async def _drop_slots(self, names=(), *, expired_before: Optional[int] = None) -> list:
+        """Remove slots from the running bot, with any write still waiting for them.
+
+        ``names`` drops those slots. ``expired_before`` drops every slot whose
+        recorded expiry is earlier, read at the moment of the drop, so a slot
+        changed since then carries its new expiry and stays. Runs in the state
+        turn, so no action lands between the slot leaving memory and its
+        waiting write being dropped. Returns the names that were in memory.
+        """
+        dropped: list = []
+
+        def write():
+            if expired_before is None:
+                chosen = list(names)
+            else:
+                chosen = [name for name, at in self._slot_expiry.items() if at < expired_before]
+            ns = getattr(self._middleware, "_ns_application", None)
+            for name in chosen:
+                self._slot_payloads.pop(name, None)
+                if ns is not None:
+                    ns.dirty_rows.pop(name, None)
+            state = self._store.state
+            application = state.get("application") or {}
+            present = [name for name in chosen if name in application]
+            if present:
+                kept = {k: v for k, v in application.items() if k not in present}
+                self._store.state = {**state, "application": kept}
+            dropped.extend(present)
+
+        await self._store._write_in_turn(write, "dropping pruned application slots")
+        return dropped
 
     async def _rehydrate_registry(self) -> None:
         backend = self.registry.backend
@@ -792,30 +882,24 @@ class PersistenceManager:
                 f"Failed to read {TABLE_PERSISTENT_VIEWS}: {exc}"
             ) from exc
 
-        # Registry rehydrate seeds the store's restored-registry buffer;
-        # actual re-attachment (fetch_message + construct view) happens
-        # in reattach_persistent_views once the bot is ready. Storing
-        # the raw row list keeps the reattach step free of its own
-        # backend read.
+        # The rows reattach_persistent_views restores from, so that pass needs
+        # no backend read of its own.
         self._registry_rows: list[dict[str, Any]] = list(rows)
 
-        # Seed the store's mirror of the registry, in the entry shape
-        # reduce_persistent_view_registered writes. Only the send path
-        # dispatches that action, so without this a restored view's key is
-        # absent: its exit() unregister changes no state and the row is never
-        # deleted, and a re-send under the same key skips the duplicate-key
-        # cleanup that retires the restored panel. Ids are strings there, and
-        # the cleanup compares message_id against str(message.id);
-        # registered_at is the ISO string an action timestamp carries. A key a
-        # send already registered in this process keeps its live entry.
-        state = self._store.state
+        # The store's mirror of every row, in the entry shape
+        # reduce_persistent_view_registered writes (ids as strings). Without it a
+        # restored view's exit() would change no state and its row would never
+        # be deleted. A key a send already registered keeps its live entry.
         seeded = self._mirror_entries(rows)
-        # Written in place rather than dispatched, the one such write in this
-        # subsystem: a dispatch would route these rows straight back to disk as
-        # if they were new registrations. Safe because rehydrate runs inside
-        # initialize(), before any view or subscriber holds a state reference.
-        # A live entry wins, so a send that raced the seed keeps its own row.
-        state["persistent_views"] = {**seeded, **state.get("persistent_views", {})}
+
+        # Written in place, not dispatched: a dispatch would route these rows
+        # back to disk as new registrations. Taken in the state turn, so an
+        # awaiting reducer cannot commit over it.
+        def write():
+            state = self._store.state
+            state["persistent_views"] = {**seeded, **state.get("persistent_views", {})}
+
+        await self._store._write_in_turn(write, "rehydrating the registry")
         logger.info(f"Rehydrated {len(rows)} persistent view row(s)")
 
     # // ========================================( Reattach )======================================== // #
@@ -902,7 +986,13 @@ class PersistenceManager:
         and a re-send skips its orphan cleanup. Returns the entry count.
         """
         entries = self._mirror_entries(self._registry_rows)
-        self._store.state["persistent_views"] = entries
+
+        def write():
+            self._store.state["persistent_views"] = entries
+
+        # Lands after a reducer running in another task commits, which would
+        # otherwise replace it.
+        self._store._write_when_free(write)
         return len(entries)
 
     def _remember_registry_row(self, persistence_key: str, row: dict[str, Any]) -> None:
@@ -984,7 +1074,7 @@ class PersistenceManager:
                 f"called it. Schedule it on its own task instead: "
                 f"asyncio.create_task(...)."
             )
-        async with self._registry_walk_lock:
+        async with self._loop_lock("registry_walk"):
             self._registry_walk_owner = current
             try:
                 return await walk()
@@ -1004,30 +1094,26 @@ class PersistenceManager:
         # last_reattach_summary["removed"] after setup_middleware to reconcile
         # records for messages deleted while the bot was down.
         self.last_reattach_summary = summary
-        if self._bot is None:
+        bot = self._bot
+        if bot is None:
             return summary
+        # The view store the panels restore onto answers stale clicks too:
+        # after the bot's clear() it is a new one, which no send has wrapped yet.
+        self._store._answer_stale_clicks(bot)
 
-        # Re-drive dynamic-item registration on every pass so a
-        # DynamicPersistentButton subclass imported after the initial
-        # reattach (a cog loaded later, a hot-reloaded extension) routes
-        # clicks without a restart -- the same recovery reattach() gives
-        # late-imported view classes. The full registry is passed each
-        # time: discord.py keys dynamic items on their compiled template,
-        # so re-registration is an idempotent dict write and a reloaded
-        # class cleanly replaces its predecessor. Lazy import breaks the
-        # components <-> persistence cycle.
+        # Re-driven every pass, so a DynamicPersistentButton class imported later
+        # routes clicks without a restart. discord.py keys dynamic items by their
+        # template, so passing the full registry again is an idempotent write.
+        # Lazy import breaks the components <-> persistence cycle.
         from ..components.base import _dynamic_button_classes
 
         if _dynamic_button_classes:
             self._bot.add_dynamic_items(*_dynamic_button_classes.values())
 
-        # Skip keys already restored on a prior pass so reattach() only
-        # processes rows that are new (a class imported after the initial
-        # reattach) or still pending (skipped / unreachable / failed). A key a
-        # live view in this process holds is skipped too: a send under a key
-        # still pending from boot rewrites its row, and re-driving that row
-        # would attach a second instance to the message the live panel owns,
-        # or prune the key on a 404 for the message it replaced.
+        # Keys a prior pass restored are skipped, and so are keys a live view
+        # holds: a send under a key pending from boot rewrites its row, and
+        # re-driving it would attach a second instance to the live panel's
+        # message, or prune the key on a 404 for the message it replaced.
         live_keys = self._store._live_persistence_keys()
         rows = [
             r
@@ -1050,26 +1136,14 @@ class PersistenceManager:
         # per string. summary["skipped"] also collects rows a kwargs migrator
         # turned away, so it cannot answer "which class is missing" on its own.
         missing_classes: Counter = Counter()
-        # Fetch SUCCEEDED, whatever construction then did. Clearing on
-        # restore-success instead would leave a stamp ageing on a panel
-        # whose message is perfectly reachable and whose view merely
-        # raised -- and that panel is live, so pruning it is the exact
-        # outcome the stamp exists to prevent.
+        # Fetch succeeded, whatever construction then did: a panel whose view
+        # raised still has a reachable message, and its stamp must not age.
         reachable_keys: list[str] = []
 
-        # Phase 1 (concurrent): resolve the view class, migrate kwargs, and
-        # fetch the Discord channel + message for every row. These are the
-        # per-row Discord round-trips that dominate startup; running them
-        # concurrently (bounded by ``restore_concurrency``) overlaps the
-        # network latency within Discord's rate budget instead of paying it
-        # serially on the setup_hook critical path. The per-row helpers
-        # already isolate failures (skipped / removed / failed land in the
-        # summary), so a bad row never aborts the fan-out. No per-channel
-        # ordering here, unlike the post-ready repaint: read buckets report
-        # their limits in response headers, so the HTTP layer paces a
-        # same-channel fetch burst itself. Message edits carry
-        # header-invisible sub-limits and get grouped in
-        # _run_post_ready_restore.
+        # Phase 1 (concurrent, bounded by restore_concurrency): resolve the
+        # class, migrate kwargs, and fetch channel and message for each row; a
+        # bad row lands in the summary and never aborts the fan-out. Fetches need
+        # no per-channel order: read buckets report their limits in headers.
         self._reattach_passes += 1
         sem = asyncio.Semaphore(self.restore_concurrency)
 
@@ -1084,13 +1158,9 @@ class PersistenceManager:
                 class_name = row["view_class"]
                 view_cls = _persistent_view_classes.get(class_name)
                 if view_cls is None:
-                    # Not yet imported is the state the two-pass design exists
-                    # to absorb: a cog loading after setup_middleware lands its
-                    # panels here, and reattach() picks them up. Reporting each
-                    # one at warning level put a fault on the sanctioned path
-                    # and, at one line per row, taught an operator to skim the
-                    # level. The aggregate below carries the signal, and says
-                    # what to do about it.
+                    # Expected for a cog loading after setup_middleware, which
+                    # reattach() picks up. The aggregate warning below carries
+                    # the signal, so each row logs at DEBUG.
                     logger.debug(
                         f"Persistent view class {class_name!r} not imported yet for "
                         f"persistence_key {persistence_key!r}; leaving it for reattach()."
@@ -1115,6 +1185,11 @@ class PersistenceManager:
                 reachable_keys.append(persistence_key)
                 return (row, view_cls, migrated, message)
             except Exception as exc:
+                if _bot_closed(bot):
+                    # A fetch through a closed client raises; the row stays
+                    # pending for the next bot rather than reading as failed.
+                    logger.debug(f"Left {persistence_key!r} for the next bot: its bot closed")
+                    return None
                 logger.error(
                     f"Failed to prepare persistent view {persistence_key!r}: {exc}",
                     exc_info=True,
@@ -1126,25 +1201,28 @@ class PersistenceManager:
 
         # Phase 2 (serial): construct + register each prepared view. Store
         # mutation (add_view, _register_view) must stay serial -- concurrent
-        # dispatches would race the shared registries. Batch state is
-        # task-scoped and is no longer a reason on its own.
+        # dispatches would race the shared registries.
         restored_views: list = []
         for item in prepared:
             if item is None:
                 continue
+            if _bot_closed(bot):
+                break
             row, view_cls, init_kwargs, message = item
+            # A send under the key while the fetches ran made its own panel;
+            # a second one here would share the message it took.
+            if self._store._holds_persistence_key(row["persistence_key"]):
+                continue
             outcome = await self._reattach_one(
                 row, view_cls, init_kwargs, message, row["view_class"], restored_views
             )
-            summary[outcome].append(row["persistence_key"])
+            if outcome is not None:
+                summary[outcome].append(row["persistence_key"])
 
-        # Delete rows whose channel or message disappeared while the bot
-        # was offline. prune_registry dispatches REGISTRY_PRUNED so
-        # subscribers observe the bookkeeping action. Nothing in this block
-        # may escape the pass: phase 2 already registered views, and an
-        # abort here skips the warm repaint and the _restored_keys update,
-        # so a later reattach() re-drive would construct a second view for
-        # a message that already has a live one.
+        # Rows whose channel or message disappeared while offline are pruned.
+        # Nothing here may escape the pass: phase 2 already registered views,
+        # and an abort would skip their post-ready repaint and raise out of
+        # setup_middleware.
         if removed_keys:
             verdicted = {r.get("persistence_key"): r for r in rows}
             confirmed, rewritten, unverified = await self._confirm_unchanged(
@@ -1160,11 +1238,9 @@ class PersistenceManager:
                         f"The rows stay on disk and the next pass re-verdicts them."
                     )
                     summary["failed"].extend(confirmed)
-            # A rewritten row points at a message this pass never fetched: it
-            # is reported unreachable and left on disk with its mirror already
-            # refreshed, so the next pass fetches the new coordinates. It is
-            # kept out of the stamp write below -- nothing about the new
-            # message failed, and stamping it would age a live panel.
+            # A rewritten row names a message this pass never fetched: reported
+            # unreachable and kept for the next pass, with no stamp, since
+            # nothing about the new message failed.
             summary["unreachable"].extend(rewritten)
             summary["failed"].extend(unverified)
         # Transiently unreachable rows are NOT pruned -- they stay on disk so a
@@ -1176,18 +1252,19 @@ class PersistenceManager:
         if reachable_keys:
             await self._write_unreachable_stamps(reachable_keys, None)
 
-        # Defer every restored view's on_restore render to after the gateway
-        # is ready. on_restore reads the bot cache (avatars, members,
-        # channels), cold on the setup_hook critical path; rendering there
-        # paints defaults. Registration above is live, so the views route
-        # interactions immediately while their render waits.
-        if restored_views:
+        # on_restore reads the bot cache, cold during setup_hook, so each render
+        # waits for the gateway; the views already route clicks. A bot that
+        # closed during the pass never becomes ready.
+        if restored_views and not _bot_closed(bot):
             task = asyncio.create_task(self._run_post_ready_restore(restored_views))
             task.add_done_callback(self._on_post_ready_restore_done)
             self._post_ready_restore_tasks.add(task)
 
-        # Remember what this pass restored so a later reattach() skips it.
-        self._restored_keys.update(summary["restored"])
+        # Remember what this pass restored so a later reattach() skips it,
+        # but not a panel its bot's close released during the pass.
+        self._restored_keys.update(
+            key for key in summary["restored"] if self._store._holds_persistence_key(key)
+        )
 
         # One aggregate summary (counts, not the full key lists) so a bot with
         # hundreds of persistent views does not flood startup; per-view detail
@@ -1197,14 +1274,9 @@ class PersistenceManager:
             f"{len(summary['skipped'])} skipped, {len(summary['failed'])} failed, "
             f"{len(summary['removed'])} removed, {len(summary['unreachable'])} unreachable"
         )
-        # Skipped rows are only news once the caller has had its chance to
-        # import them. reattach() is that chance, so the first pass says
-        # nothing louder than the count above and a later pass, finding the
-        # class still absent, reports it as the real problem it is by then.
-        # The stored string is the fix itself: what a class must register
-        # under, or what session_class_key pins to after a move. The warning
-        # names each one rather than counting them; distinct classes number
-        # in the single digits however many rows they own.
+        # A missing class is news only after reattach() had its chance to import
+        # it, so only a later pass warns. It names each stored string, which is
+        # what a class must register under or session_class_key pins to.
         if missing_classes and self._reattach_passes > 1:
             unresolved = ", ".join(
                 f"{name} ({count} row{'s' if count != 1 else ''})"
@@ -1343,12 +1415,10 @@ class PersistenceManager:
             discord.InvalidData,
             *DISCORD_CALL_ERRORS,
         ) as exc:
-            # RateLimited, InvalidData, and aiohttp's transport errors are all
-            # siblings of HTTPException rather than subclasses; uncaught they
-            # would land the row in "failed" (never retried) instead of
-            # "unreachable" (retried next restart). Transport matters most
-            # here: reattach runs at boot, which is exactly when the host may
-            # not have its connection yet.
+            # InvalidData, RateLimited, and aiohttp's transport errors are not
+            # HTTPException subclasses: uncaught they would log the row as failed,
+            # with a traceback and no unreachable stamp. Transport errors are
+            # likeliest at boot, before the host has its connection.
             logger.debug(
                 f"Could not reach channel {channel_id} for {persistence_key!r} "
                 f"({type(exc).__name__}); leaving the entry for the next restart."
@@ -1510,13 +1580,9 @@ class PersistenceManager:
                     continue
 
                 if Capability.RAW_SQL in backend.capabilities:
-                    # Touch the one column. Reading the row and writing it back
-                    # whole would carry the rest of the snapshot with it, and a
-                    # registry flush landing in the gap between that read and
-                    # that write is silently reverted -- leaving the registry
-                    # pointing at a message that was already replaced, which the
-                    # next boot then 404-prunes. One UPDATE cannot lose a column
-                    # it never names.
+                    # One column only: a whole-row write would revert a registry
+                    # flush landing between the read and the write, leaving the
+                    # row on a replaced message for the next boot to prune.
                     ph = "?" if backend.placeholder_style == "qmark" else "$1"
                     ph2 = "?" if backend.placeholder_style == "qmark" else "$2"
                     # Raw SQL does no prefixing of its own; the logical name
@@ -1529,11 +1595,9 @@ class PersistenceManager:
                         key,
                     )
                 else:
-                    # No SQL, and no await between the read and the write on a
-                    # dict-shaped backend, so there is no gap for a flush to
-                    # land in. Whole-row is required here: these backends
-                    # replace on upsert, so a partial dict would delete the
-                    # panel's own message reference.
+                    # No await between the read and the write, so no flush lands
+                    # between them. These backends replace on upsert, so the row
+                    # goes whole: a partial one would drop its message reference.
                     updated = dict(current)
                     updated["first_unreachable_at"] = stamp
                     await backend.row_upsert(TABLE_PERSISTENT_VIEWS, updated, ["persistence_key"])
@@ -1566,9 +1630,10 @@ class PersistenceManager:
         message: Any,
         class_name: str,
         restored_views: list,
-    ) -> str:
+    ) -> Optional[str]:
         """Construct + register a single view. Returns the summary
-        bucket name (``"restored"`` or ``"failed"``).
+        bucket name (``"restored"`` or ``"failed"``), or ``None`` when the
+        bot closed during it and the row stays pending for the next bot.
 
         ``on_restore`` is NOT run here. It reads the gateway cache, which is
         cold on the ``setup_hook`` critical path, so it is deferred to a
@@ -1578,19 +1643,12 @@ class PersistenceManager:
         """
         persistence_key = row["persistence_key"]
         view = None
-        # Tracks whether ``_register_state`` succeeded -- if a downstream
-        # step (``_update_message_state``, ``register_view``, ``on_bind``)
-        # raises, the rollback dispatches ``VIEW_DESTROYED`` to undo the
-        # ``SESSION_CREATED`` + ``VIEW_CREATED`` actions and prevent
-        # zombie entries.
+        # Set once SESSION_CREATED and VIEW_CREATED landed, so a later failure's
+        # rollback knows to dispatch VIEW_DESTROYED.
         state_registered = False
         try:
-            # Strip kwargs that are surfaced via dedicated columns
-            # (``persistence_key``) or that are never safely round-tripped
-            # through JSON (``theme``). The middleware also drops these
-            # at write, but defending the read seam keeps reattach
-            # tolerant of older rows captured before the write-side
-            # filter shipped.
+            # The middleware drops these at write too; a row an older release
+            # wrote can still carry them.
             init_kwargs = {k: v for k, v in init_kwargs.items() if k not in _NON_PERSISTABLE_KWARGS}
             view = view_cls(persistence_key=persistence_key, **init_kwargs)
 
@@ -1619,13 +1677,9 @@ class PersistenceManager:
             if row.get("guild_id") is not None:
                 view.guild_id = int(row["guild_id"])
 
-            # __init__ ran with user_id=None so session auto-derivation was
-            # skipped. Prefer the session_id captured at registration so a
-            # restored view rejoins its original session -- isolated or
-            # continuity, whichever it had -- rather than a re-derived
-            # suffix-free key that collides across same-class same-user panels.
-            # Fall back to deriving for rows written before the session_id
-            # column was persisted.
+            # __init__ had no user_id, so no session was derived. The recorded
+            # session is rejoined; a re-derived key would collide across one
+            # user's panels of a class. A row without one derives it.
             if not view.session_id:
                 persisted = row.get("session_id")
                 if persisted:
@@ -1641,13 +1695,8 @@ class PersistenceManager:
             # limit checks see a consistent state row at every step.
             self._store._register_view(view)
 
-            # Batch the registration dispatches so the three startup actions
-            # (SESSION_CREATED + VIEW_CREATED + VIEW_UPDATED) collapse into a
-            # single BATCH_COMPLETE notification per restored view. Without the
-            # batch, a project with N persistent views fires 3N+ standalone
-            # notification cycles at startup. Batch source_id is the view's id
-            # so the BATCH_COMPLETE rides the acting-view inline-notification
-            # path, matching the _send_pipeline contract.
+            # One BATCH_COMPLETE per restored view instead of three notification
+            # cycles, sourced from the view as _send_pipeline's batch is.
             async with self._store.batch(source_id=view.id):
                 await view._register_state()
                 state_registered = True
@@ -1675,10 +1724,15 @@ class PersistenceManager:
             return "restored"
 
         except Exception as exc:
-            logger.error(
-                f"Failed to restore persistent view {persistence_key!r}: {exc}",
-                exc_info=True,
-            )
+            # An on_bind that reaches Discord through a closed bot raises.
+            closed = _bot_closed(self._bot)
+            if closed:
+                logger.debug(f"Left {persistence_key!r} for the next bot: its bot closed")
+            else:
+                logger.error(
+                    f"Failed to restore persistent view {persistence_key!r}: {exc}",
+                    exc_info=True,
+                )
             if view is not None:
                 # Mirror the v2 rollback: __init__ already installed a
                 # subscriber + registry entry + undo-tracking row, all
@@ -1686,19 +1740,13 @@ class PersistenceManager:
                 self._store._unsubscribe(view.id)
                 self._store._undo_enabled_views.pop(view.id, None)
                 if state_registered:
-                    # State registration landed SESSION_CREATED + VIEW_CREATED,
-                    # so tear them down through the atomic seam: _destroy_view
-                    # dispatches VIEW_DESTROYED, then clears the active-registry
-                    # entry only after state confirms the removal. A failed
-                    # dispatch leaves both registries intact instead of
-                    # stranding a ghost; _destroy_view catches and logs the
-                    # dispatch failure internally. ``reduce_view_destroyed``
-                    # cleans up the session entry too when its members empty.
+                    # _destroy_view clears the registry entry only once state
+                    # confirms the removal, and drops a session left memberless.
                     await self._store._destroy_view(view.id)
                 else:
                     # State never registered; just drop the active entry.
                     self._store._unregister_view(view.id)
-            return "failed"
+            return None if closed else "failed"
 
     def register_hook(self, name: str, callback: Callable[..., Any]) -> None:
         """Register an observability hook.
@@ -1798,19 +1846,17 @@ class PersistenceManager:
             )
             return
         start = time.monotonic()
-        # Batch membership is task-scoped, so each panel's on_restore collects
-        # and flushes its own batch: rendering concurrently no longer folds
-        # independent panels into one false-nested batch where whichever
-        # finished last flushed them all. Bounded by ``restore_concurrency``,
-        # the ceiling the reattach fetch phase already uses, so a large
-        # install does not open its entire repaint against Discord at once.
+        # Batches are task-scoped, so each panel's on_restore flushes its own.
+        # Bounded by restore_concurrency, the fetch phase's ceiling.
         semaphore = asyncio.Semaphore(self.restore_concurrency)
 
         async def _render(view) -> bool:
-            if view.is_finished():
-                return False
             persistence_key = getattr(view, "_persistence_key", "?")
             async with semaphore:
+                # Read after the wait: a panel can close or push to another
+                # screen while it queues behind the others.
+                if view.is_finished():
+                    return False
                 try:
                     async with self._store.batch(source_id=view.id):
                         await await_maybe(view.on_restore(self._bot))
@@ -1822,16 +1868,10 @@ class PersistenceManager:
                     )
                     return False
 
-        # A repaint is a message edit, and Discord buckets message edits per
-        # channel (channel id is a Route major parameter), with sub-limits
-        # that response headers do not report -- so a same-channel burst 429s
-        # no matter how the HTTP layer paces on headers. Panels sharing a
-        # channel therefore repaint serially, in registry row order; panels in
-        # distinct channels are distinct buckets and still fan out under the
-        # semaphore. A view with no message ref (deleted out from under it
-        # during the ready wait: on_message_delete nulls ``_message`` before
-        # ``exit()``) derives no channel and repaints in its own group, so it
-        # neither crashes the grouping nor serializes unrelated panels.
+        # Message edits bucket per channel, with sub-limits response headers do
+        # not report, so a same-channel burst 429s however the HTTP layer paces.
+        # A view whose message was deleted during the wait has no channel and
+        # repaints in a group of its own.
         groups: dict[Any, list] = {}
         for view in views:
             channel = getattr(getattr(view, "_message", None), "channel", None)
@@ -1866,12 +1906,8 @@ class PersistenceManager:
     async def _ttl_sweeper_loop(self) -> None:
         """24-hour sleep loop that sweeps expired application slots.
 
-        Each tick issues one
-        ``row_delete_where_lt(TABLE_APPLICATION_SLOTS, "expires_at", now)``
-        call. Rows with ``expires_at=NULL`` are never touched by the
-        backend contract, so non-TTL slots are safe. Errors are logged
-        and the loop continues: transient backend hiccups must not
-        silently kill the sweeper.
+        Errors are logged and the loop continues: transient backend hiccups
+        must not silently kill the sweeper.
         """
         try:
             while not self._closed:
@@ -1881,25 +1917,31 @@ class PersistenceManager:
                     return
                 if self._closed:
                     return
-                backend = self.application.backend
-                if backend is None:
+                if self.application.backend is None:
                     return
                 try:
-                    cutoff = int(time.time())
-                    deleted = await backend.row_delete_where_lt(
-                        TABLE_APPLICATION_SLOTS,
-                        "expires_at",
-                        cutoff,
-                    )
-                    if deleted:
-                        await self._store.dispatch(
-                            "APPLICATION_SLOTS_PRUNED",
-                            ActionCreators.application_slots_pruned(deleted, cutoff=cutoff),
-                        )
+                    await self._sweep_expired_slots()
                 except Exception as exc:
                     logger.error(f"TTL sweeper error: {exc}", exc_info=True)
         except asyncio.CancelledError:
             return
+
+    async def _sweep_expired_slots(self) -> None:
+        """Delete expired slot rows, then drop the expired slots from the running bot.
+
+        Rows with ``expires_at=NULL`` are never touched by the backend
+        contract, so slots without a TTL are safe.
+        """
+        cutoff = int(time.time())
+        deleted = await self.application.backend.row_delete_where_lt(
+            TABLE_APPLICATION_SLOTS, "expires_at", cutoff
+        )
+        dropped = await self._drop_slots(expired_before=cutoff)
+        if deleted or dropped:
+            await self._store.dispatch(
+                "APPLICATION_SLOTS_PRUNED",
+                ActionCreators.application_slots_pruned(deleted, cutoff=cutoff, slots=dropped),
+            )
 
     async def _unreachable_sweeper_loop(self) -> None:
         """Run :meth:`prune_unreachable` once the gateway is ready, then daily.
@@ -1936,11 +1978,13 @@ class PersistenceManager:
         slot: Optional[str] = None,
         older_than_days: Optional[int] = None,
     ) -> int:
-        """Delete cascadeui_application_slots rows.
+        """Delete application slots, from storage and from the running bot.
 
-        When ``slot`` is given, deletes that one slot (any age). When
-        ``older_than_days`` is given, deletes rows whose ``expires_at``
-        is older than the cutoff. The two modes are mutually exclusive.
+        When ``slot`` is given, removes that one slot (any age): its row, any
+        write still waiting for it, and its value in memory. When
+        ``older_than_days`` is given, deletes rows whose ``expires_at`` passed
+        more than that many days ago and drops those slots from memory too. The two
+        modes are mutually exclusive. Returns the number of rows deleted.
         """
         backend = self.application.backend
         if backend is None:
@@ -1949,19 +1993,27 @@ class PersistenceManager:
             raise ValueError("prune_application: pass slot OR older_than_days, not both")
 
         if slot is not None:
-            deleted = await backend.row_delete(TABLE_APPLICATION_SLOTS, {"slot_name": slot})
+            # Under the write lock, so a flush already holding the slot's row
+            # lands, or puts it back after a failure, before the delete; the
+            # slot leaves memory and its waiting write only once the row is
+            # gone, so a delete that raises leaves everything as it was.
+            ns = getattr(self._middleware, "_ns_application", None)
+            async with ns.write_lock if ns is not None else contextlib.nullcontext():
+                deleted = await backend.row_delete(TABLE_APPLICATION_SLOTS, {"slot_name": slot})
+                dropped = await self._drop_slots([slot])
             cutoff = None
         elif older_than_days is not None:
             cutoff = int(time.time()) - (older_than_days * 86400)
             deleted = await backend.row_delete_where_lt(
                 TABLE_APPLICATION_SLOTS, "expires_at", cutoff
             )
+            dropped = await self._drop_slots(expired_before=cutoff)
         else:
             return 0
 
         await self._store.dispatch(
             "APPLICATION_SLOTS_PRUNED",
-            ActionCreators.application_slots_pruned(deleted, cutoff=cutoff),
+            ActionCreators.application_slots_pruned(deleted, cutoff=cutoff, slots=dropped),
         )
         return deleted
 
@@ -2218,15 +2270,37 @@ class PersistenceManager:
         Ordering matters: the middleware must drain its dirty buffers
         *before* the backends close, or in-flight writes get lost when
         the connection underneath them goes away. ``PersistenceMiddleware.close``
-        sets its closed flag first so no new dispatches enqueue work
-        while the final flush runs.
+        sets its closed flag first, so a change arriving during the final
+        flush is held for a reopen instead of scheduling a write.
 
-        Safe to call twice. One misbehaving backend is logged and does
-        not block the others from closing cleanly.
+        Safe to call twice, and from two tasks at once: the second waits
+        for the first. One misbehaving backend is logged and does not
+        block the others from closing cleanly.
         """
-        if self._closed:
-            return
+        async with self._lifecycle_lock():
+            if self._closed:
+                return
+            await self._close_now()
 
+    def _lifecycle_lock(self) -> asyncio.Lock:
+        """The lock :meth:`close` and :meth:`_reopen` share."""
+        return self._loop_lock("lifecycle")
+
+    def _loop_lock(self, name: str) -> asyncio.Lock:
+        """The lock kept under ``name``, made for the running loop.
+
+        A bot run twice through ``asyncio.run`` uses two loops, and a lock
+        one loop waited on refuses the other.
+        """
+        loop = asyncio.get_running_loop()
+        held = self._loop_locks.get(name)
+        if held is None or held[0] is not loop:
+            held = (loop, asyncio.Lock())
+            self._loop_locks[name] = held
+        return held[1]
+
+    async def _close_now(self) -> None:
+        self._close_started = True
         # Cancel the sweepers first. Each sleeps between runs and a cancelled
         # prune loses nothing: it drains no buffer, and a partial prune leaves
         # rows the next boot re-seeds the store from.
@@ -2235,10 +2309,7 @@ class PersistenceManager:
             if task is None:
                 continue
             task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
+            await _settle(task)
             setattr(self, field, None)
 
         # Cancel any post-ready restore renders still waiting on the gateway
@@ -2246,10 +2317,7 @@ class PersistenceManager:
         # callback discards from the set as each cancelled task settles.
         for task in list(self._post_ready_restore_tasks):
             task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
+            await _settle(task)
         self._post_ready_restore_tasks.clear()
 
         if self._middleware is not None:
@@ -2258,11 +2326,46 @@ class PersistenceManager:
             except Exception as exc:
                 logger.error(f"Error closing persistence middleware: {exc}")
 
-        for backend in self._unique_backends.values():
-            try:
-                await backend.close()
-            except Exception as exc:
-                logger.error(f"Error closing {type(backend).__name__}: {exc}")
+        await self._close_backends()
 
         self._closed = True
         logger.debug("PersistenceManager closed")
+
+    async def _close_backends(self) -> None:
+        for backend in self._unique_backends.values():
+            try:
+                await _bounded_wait(backend.close(), _BACKEND_CLOSE_SECONDS)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"Closing {type(backend).__name__} timed out after at most "
+                    f"{_BACKEND_CLOSE_SECONDS:g} seconds; persistence closed without it."
+                )
+            except Exception as exc:
+                logger.error(f"Error closing {type(backend).__name__}: {exc}")
+
+    async def _reopen(self) -> bool:
+        """Open the backends again after :meth:`close`; ``True`` when it did.
+
+        The middleware calls this when ``setup_middleware`` runs again (a bot
+        closed and started again in the same process), when the bot connects
+        again after its close, and when a close finds the bot started again
+        while it ran. It waits out a close still running, since a restart
+        command closes from its own task. State is still in memory, so
+        nothing is rehydrated and no migration runs; the sweepers are
+        restarted by the caller.
+        """
+        async with self._lifecycle_lock():
+            if not (self._closed or self._close_started):
+                return False
+            self._initialized = False
+            try:
+                await self.initialize_backends()
+            except BaseException:
+                # A backend that opened before another failed would keep a
+                # SQLite worker thread alive with nothing left to close it.
+                await self._close_backends()
+                raise
+            self._closed = False
+            self._close_started = False
+        logger.debug("PersistenceManager reopened")
+        return True

@@ -5,8 +5,8 @@
 
 discord.py's ``ViewStore`` routes component clicks via a dispatch table
 keyed by ``(message_id, component_type, custom_id)``.  When a click
-arrives for a component the store has already evicted -- or for one
-whose ``_view`` reference was nulled by an unexpected code path -- the
+arrives for a component the store has already evicted (or for one
+whose ``_view`` reference was nulled by an unexpected code path), the
 "View interaction referencing unknown view" warning fires and the
 click is silently discarded.
 

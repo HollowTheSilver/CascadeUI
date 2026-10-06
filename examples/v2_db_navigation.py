@@ -7,10 +7,10 @@ A repo-backed task list: a root list view, a pushed detail view, and a
 carrying them in constructor kwargs. The source of truth is the repo;
 the views never cache rows.
 
-The pattern (the reason this example exists):
+The pattern:
     - The repo is a stable, process-lifetime handle passed as a ``db=``
-      constructor kwarg. It lands in ``_init_kwargs``, so ``pop()`` can
-      reconstruct a view -- but no *rows* ride in kwargs, only the handle.
+      constructor kwarg, so ``pop()`` can rebuild a view with it. No *rows*
+      ride in kwargs, only the handle.
     - Each view loads its rows in ``async def on_load(self)`` and builds
       its tree there. CascadeUI calls ``on_load`` automatically before the
       first send and on every push/pop edit, so a view always renders
@@ -30,10 +30,16 @@ Reload-on-render payoff:
 
 Also shown: a ``PaginatedRegion`` pages the row list inside the root view.
 ``on_load`` feeds it the current rows and renders one page's slice, so a
-page turn re-slices against fresh repo data.
+page turn re-slices against fresh repo data. ``get_nav_state`` carries the
+page across a push, so Back returns to the page the user left.
+
+And ``current_view``: the cog keeps the view ``/tasks`` sent, and
+``/tasks_close`` closes the panel through ``current_view``, which is the
+screen on the message now (the list, or a task the user opened from it).
 
 Commands:
-    /tasks   Open the task list
+    /tasks         Open the task list
+    /tasks_close   Close your task list, whichever screen it shows
 
 Usage:
     Load this cog in your bot. Requires: pip install pycascadeui discord.py
@@ -136,14 +142,14 @@ class TaskListView(StatefulLayoutView):
     # Rows live in the repo, not Redux -- no scoped state, no subscriptions.
     state_scope = None
     subscribed_actions = set()
-    # Callbacks rebuild then reload(); the library acks each click for us.
+    # The library acks each click, so no callback defers.
     auto_defer = True
     timeout = 300.0
 
     def __init__(self, *args, db, **kwargs):
-        # ``db`` is a non-reserved kwarg, so it is captured into _init_kwargs
-        # and survives pop() reconstruction. The repo is a cheap, stable
-        # handle -- rows are NOT carried here; on_load() fetches them.
+        # ``db`` is an ordinary constructor argument, so pop() rebuilds the
+        # view with it. The repo is a cheap, stable handle -- rows are NOT
+        # carried here; on_load() fetches them.
         self.db = db
         # Pages the row list inside this view. on_load feeds it the current
         # rows; controls(self) returns the Prev/Next row (first/last + goto
@@ -157,24 +163,30 @@ class TaskListView(StatefulLayoutView):
         tasks = await self.db.list_tasks()
         self.clear_items()
 
-        if tasks:
-            # The pager owns the page index; a page turn re-runs on_load (via
-            # reload()) and re-slices the list automatically.
-            self.tasks_pager.items = tasks
-            sections = [
-                action_section(
-                    f"{_DONE_BOX if task['done'] else _TODO_BOX} **{task['title']}**",
-                    label="Open",
-                    callback=self._make_open(task_id),
-                )
-                for task_id, task in self.tasks_pager.page_items
-            ]
-            self.add_item(card("## Tasks", *sections, *self.tasks_pager.controls(self)))
-        else:
-            self.add_item(card("## Tasks", "*No tasks yet -- add one below.*"))
+        # The pager owns the page index; a page turn re-runs on_load (via
+        # reload()) and re-slices the list automatically.
+        self.tasks_pager.items = tasks
+        rows = [
+            action_section(
+                f"{_DONE_BOX if task['done'] else _TODO_BOX} **{task['title']}**",
+                label="Open",
+                callback=self._make_open(task_id),
+            )
+            for task_id, task in self.tasks_pager.page_items
+        ]
+        # controls() runs even with no rows: it attaches the pager to this
+        # view, which show_page() needs when the first task arrives. On a
+        # single page it adds no buttons.
+        self.add_item(
+            card(
+                "## Tasks",
+                *(rows or ["*No tasks yet -- add one below.*"]),
+                *self.tasks_pager.controls(self),
+            )
+        )
 
-        # The root is the stack floor -- no Back button -- so build the
-        # footer row by hand (New Task + Exit) rather than make_nav_row().
+        # The footer carries New Task beside Exit, so it is built by hand
+        # rather than with make_nav_row().
         self.add_item(
             ActionRow(
                 StatefulButton(
@@ -187,6 +199,14 @@ class TaskListView(StatefulLayoutView):
             )
         )
 
+    def get_nav_state(self) -> dict:
+        # The pager is rebuilt with the view on pop(), so its page would reset
+        # to the first. Carrying it returns the user to the page they left.
+        return {"page": self.tasks_pager.page}
+
+    def restore_nav_state(self, state: dict) -> None:
+        self.tasks_pager.set_page(state.get("page", 0))
+
     def _make_open(self, task_id):
         # The task id is bound at build time so each row's button opens its
         # own detail view. Only the id and the repo travel, never the row --
@@ -198,30 +218,19 @@ class TaskListView(StatefulLayoutView):
         return _open
 
     async def _new_task(self, interaction):
+        # required=True refuses an empty box, and the Modal refuses one of only
+        # spaces, so the callback always receives a title.
         title_input = TextInput(
             label="Task title",
             placeholder="What needs doing?",
             required=True,
-            min_length=1,
             max_length=80,
         )
 
         async def on_submitted(modal_interaction, values):
-            # min_length=1 blocks an empty box, but a single space strips to
-            # "", so guard before writing.
-            title = (title_input.value or "").strip()
-            if not title:
-                await self.respond(modal_interaction, "Title cannot be blank.", ephemeral=True)
-                return
-            await self.db.add_task(title)
-            # The new row lands last, off-screen for anyone not already on
-            # the final page, so the cursor has to move as well as the data.
-            # show_page seeks and then re-renders the host, so the rows the
-            # user sees come from the page the cursor just moved to. Seeking
-            # with set_page and calling refresh instead would ship the tree
-            # composed before the seek: the cursor advances and the rows do
-            # not. Negative index means the last page, resolved after the
-            # re-render loads, so this costs one read and one edit.
+            await self.db.add_task(title_input.value.strip())
+            # The new row lands last, so move to the last page and re-render
+            # in one call: one read, one edit.
             await self.tasks_pager.show_page(-1)
 
         await self.open_modal(
@@ -244,12 +253,11 @@ class TaskDetailView(StatefulLayoutView):
     state_scope = None
     subscribed_actions = set()
     exit_policy = "delete"  # drop the detail message on exit, matching the root
-    # Callbacks rebuild then reload(); the library acks each click for us.
+    # Toggle reloads in place; the library acks each click.
     auto_defer = True
-    # Match the root's timeout so pop() lands on a live view. Pushed sub-views
-    # need no instance_* or replace_* policies: those gate user-facing send(),
-    # and this view only ever arrives via push().
     timeout = 300.0
+    # No instance_* policies: a pushed view counts against the root's
+    # instance_limit, under the root's instance_scope.
 
     def __init__(self, *args, db, task_id, **kwargs):
         self.db = db
@@ -308,11 +316,29 @@ class DatabaseNavigationExample(commands.Cog, name="db_navigation_example"):
         self.bot = bot
         # One repo per process, built at cog load and shared by every view.
         self.repo = _TaskRepo()
+        # The panel each user opened with /tasks, for /tasks_close.
+        self.panels = {}
 
     @commands.hybrid_command(name="tasks", description="Open the repo-backed task list.")
     async def tasks(self, context: Context) -> None:
         view = TaskListView(context=context, db=self.repo)
-        await view.send()
+        if await view.send():
+            self.panels[context.author.id] = view
+
+    @commands.hybrid_command(
+        name="tasks_close", description="Close your task list, whichever screen it shows."
+    )
+    async def tasks_close(self, context: Context) -> None:
+        panel = self.panels.pop(context.author.id, None)
+        # Opening a task hands the message to the detail view, so the list
+        # this cog kept no longer owns it and its exit() would close nothing.
+        # current_view is the screen on the message now.
+        screen = panel.current_view if panel is not None else None
+        if screen is None or screen.is_finished():
+            await context.send("You have no task list open.", ephemeral=True)
+            return
+        await screen.exit()
+        await context.send("Closed your task list.", ephemeral=True)
 
 
 async def setup(bot) -> None:

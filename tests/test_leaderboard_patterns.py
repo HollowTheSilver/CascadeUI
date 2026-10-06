@@ -1,5 +1,6 @@
 """Tests for LeaderboardLayoutView and PersistentLeaderboardLayoutView."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import discord
@@ -16,6 +17,7 @@ from discord.ui import (
 from helpers import make_interaction as _make_interaction
 
 from cascadeui import MAX_MESSAGE_COMPONENTS
+from cascadeui.state.singleton import get_store
 from cascadeui.testing import stub_client
 from cascadeui.views.layout import StatefulLayoutView
 from cascadeui.views.patterns.leaderboard import (
@@ -458,6 +460,104 @@ class TestAvatarBackfill:
         view.reload.assert_awaited_once_with(force=True)
         # get_avatar_url now serves the cached real avatar, not a default.
         assert await view.get_avatar_url(111, {}) == "https://real/111.png"
+
+    async def test_a_backfill_that_resolves_during_the_send_reaches_the_message(self):
+        """The backfill is scheduled from inside the send's own on_load. When
+        it resolved before that on_load finished, its reload ran a second
+        on_load alongside the first, found no message to render onto, and
+        the send then shipped the default avatars it had resolved earlier.
+        The signature stamp kept the backfill from ever running again."""
+        header_gate = asyncio.Event()
+
+        class Board(LeaderboardLayoutView):
+            entry_layout = "sections"
+            avatar_backfill = True
+            parked = False
+
+            async def build_header(self, page):
+                # Only the first (send-time) build is slow, so the backfill's
+                # own build finishes first.
+                if not self.parked:
+                    self.parked = True
+                    await header_gate.wait()
+                return None
+
+        user = MagicMock()
+        user.display_avatar.with_size.return_value.url = "https://real/avatar.png"
+        bot = stub_client()
+        bot.get_user = MagicMock(return_value=None)
+        bot.fetch_user = AsyncMock(return_value=user)
+
+        interaction = _make_interaction()
+        delivered = []
+
+        async def send_message(**kwargs):
+            delivered.append(str(kwargs["view"].to_components()))
+            interaction.response.is_done.return_value = True
+
+        interaction.response.send_message = AsyncMock(side_effect=send_message)
+        message = interaction.original_response.return_value
+
+        async def edit(**kwargs):
+            delivered.append(str(kwargs["view"].to_components()))
+
+        message.edit = AsyncMock(side_effect=edit)
+
+        view = Board(interaction=interaction, bot=bot, entries=[(111, {"wins": 3})])
+        send = asyncio.create_task(view.send())
+        for _ in range(20):  # the backfill resolves while the header is parked
+            await asyncio.sleep(0)
+        header_gate.set()
+        await asyncio.wait_for(send, timeout=2)
+        await asyncio.wait_for(view.task_manager.wait_tasks(view.id), timeout=2)
+
+        assert bot.fetch_user.await_count == 1  # the backfill ran during the send
+        assert "https://real/avatar.png" in delivered[-1]
+
+    async def test_a_backfill_in_flight_during_a_failed_push_still_lands(self):
+        """A push cancelled the board's tasks before an edit it could still
+        fail, so a rolled-back board kept default avatars until its entries
+        changed."""
+        from helpers import RenderableLayoutView
+
+        gate = asyncio.Event()
+
+        class Board(LeaderboardLayoutView):
+            entry_layout = "sections"
+            avatar_backfill = True
+
+            async def resolve_avatar_urls(self, user_ids):
+                await gate.wait()
+                return {uid: f"https://real/{uid}.png" for uid in user_ids}
+
+        class Detail(RenderableLayoutView):
+            pass
+
+        bot = stub_client()
+        bot.get_user = MagicMock(return_value=None)
+        board = Board(interaction=_make_interaction(), bot=bot, entries=[(111, {"wins": 3})])
+        await board.send()
+
+        message = board._message
+        shown = []
+        error = discord.HTTPException(MagicMock(status=503), "boom")
+
+        async def channel_edit(**kwargs):
+            if isinstance(kwargs.get("view"), Detail):
+                raise error
+            shown.append(str(kwargs["view"].to_components()))
+            return message
+
+        nav = _make_interaction(is_done=True)
+        nav.edit_original_response = AsyncMock(side_effect=error)
+        message.edit = AsyncMock(side_effect=channel_edit)
+        await board.push(Detail, interaction=nav)
+        assert not board.is_finished()
+
+        gate.set()
+        await asyncio.wait_for(board.task_manager.wait_tasks(board.id), timeout=2)
+
+        assert shown and "https://real/111.png" in shown[-1]
 
 
 class TestPageFrameHooks:
@@ -996,6 +1096,42 @@ class TestLeaderboardReload:
         assert view._entries_signature != sig_before  # re-fetched new data
         view._message.edit.assert_awaited()  # re-rendered the message
 
+    @pytest.mark.parametrize("override", [None, "nav_divider"], ids=["plain", "instance_override"])
+    async def test_a_reload_shows_a_page_the_grown_board_has(self, override):
+        """A page set past the old page list was clamped to the old last page
+        before a reload rebuilt the grown board, so the reload showed ranks
+        6-10 instead of the page asked for. An instance override of what the
+        tree is built from made the base recompose, and clamp, before the
+        entries were fetched."""
+
+        class GrowingBoard(LeaderboardLayoutView):
+            leaderboard_top_n = 50
+            leaderboard_per_page = 5
+            size = 10
+
+            def get_entries(self):
+                return [(1000 + i, {"wins": 100 - i, "games": 100}) for i in range(self.size)]
+
+        view = GrowingBoard(interaction=_make_interaction())
+        await view.on_load()
+        assert len(view.pages) == 2
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+
+        view.size = 25
+        view.current_page = 4
+        if override is not None:
+            view.set_class_attribute(override, True)
+        await view.reload()
+
+        assert view.current_page == 4, f"the reload moved the reader to page {view.current_page}"
+        shown = [
+            item.content
+            for item in view.walk_children()
+            if isinstance(item, discord.ui.TextDisplay) and item.content
+        ]
+        assert any("**21.**" in text for text in shown), f"page 5 is not on screen: {shown}"
+
     async def test_reload_unchanged_signature_short_circuits_rebuild(self):
         # rebuild_pages short-circuits on an unchanged entry signature, so a
         # reload() with no data change does not re-run the page build.
@@ -1041,10 +1177,9 @@ class TestLeaderboardReload:
         assert build_calls["n"] == 1
 
     async def test_reload_force_rebuilds_despite_unchanged_signature(self):
-        # reload(force=True) clears the entry signature so on_load's
-        # rebuild_pages rebuilds even when the data is unchanged -- the public
-        # path the persistent out-of-band refresh actually calls (vs poking
-        # the private _entries_signature).
+        # reload(force=True) makes on_load's rebuild_pages rebuild even when
+        # the data is unchanged -- the public path the persistent out-of-band
+        # refresh actually calls (vs poking the private _entries_signature).
         view = LeaderboardLayoutView(interaction=_make_interaction(), entries=SAMPLE_ENTRIES)
         await view.on_load()
         view._message = MagicMock()
@@ -1063,6 +1198,193 @@ class TestLeaderboardReload:
         await view.reload()  # unchanged signature -> short-circuits
         assert build_calls["n"] == 0
         await view.reload(force=True)  # forced -> rebuilds
+        assert build_calls["n"] == 1
+
+    async def test_a_forced_reload_queued_behind_a_running_one_still_rebuilds(self):
+        """The running reload stamps the entry signature when its build
+        finishes. A force applied by clearing that signature was erased by
+        the stamp, so the queued forced reload short-circuited onto pages
+        built before the data it was forced to show."""
+        parked = asyncio.Event()
+        release = asyncio.Event()
+
+        class Board(LeaderboardLayoutView):
+            label = "before"
+            park = False
+
+            def build_footer(self, page):
+                return TextDisplay(f"footer={self.label}")
+
+            async def _build_leaderboard_pages(self, entries):
+                pages = await super()._build_leaderboard_pages(entries)
+                if self.park:
+                    # Built, not yet stamped: the window the queued reload lands in.
+                    self.park = False
+                    parked.set()
+                    await release.wait()
+                return pages
+
+        view = Board(interaction=_make_interaction(), entries=SAMPLE_ENTRIES)
+        await view.on_load()
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+
+        # New entries, so the running reload rebuilds on its own and parks
+        # between building and stamping the signature.
+        view.park = True
+        view._entries = [*SAMPLE_ENTRIES, (444, {"wins": 1, "games": 2})]
+        running = asyncio.create_task(view.reload())
+        await asyncio.wait_for(parked.wait(), timeout=2)
+
+        view.label = "after"  # data outside the entries changed
+        forced = asyncio.create_task(view.reload(force=True))
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.wait_for(asyncio.gather(running, forced), timeout=2)
+
+        texts = [i.content for i in view.walk_children() if isinstance(i, TextDisplay)]
+        assert "footer=after" in texts
+
+    async def test_a_notification_rebuild_waits_for_a_reload_already_fetching(self):
+        """A reload read the entries and stalled; newer entries landed and
+        were announced. The notification's rebuild ran beside the reload and
+        finished first, then the stalled reload overwrote it with the older
+        entries."""
+        store = get_store()
+
+        async def score(action, state):
+            return {**state, "application": {**state["application"], "score": 2}}
+
+        store._register_reducer("SCORE_CHANGED", score)
+        data = {"wins": 1}
+        gate = asyncio.Event()
+
+        class Board(LeaderboardLayoutView):
+            subscribed_actions = {"SCORE_CHANGED"}
+            stall_next = False
+
+            async def get_entries(self):
+                snapshot = dict(data)
+                if self.stall_next:
+                    self.stall_next = False
+                    await gate.wait()
+                return [(111, snapshot)]
+
+            def state_selector(self, state):
+                return state["application"].get("score")
+
+        view = Board(interaction=_make_interaction(), entries=[(111, {"wins": 1})])
+        await view.send()
+
+        view.stall_next = True
+        reload = asyncio.create_task(view.reload(force=True))  # reads wins=1
+        await asyncio.sleep(0)
+        data["wins"] = 2
+        await store.dispatch("SCORE_CHANGED", {})
+        for _ in range(10):
+            await asyncio.sleep(0)
+        gate.set()
+        await asyncio.wait_for(reload, timeout=2)
+        await asyncio.wait_for(store._flush_notifications(), timeout=2)
+
+        rows = [
+            i.content
+            for i in view.walk_children()
+            if isinstance(i, TextDisplay) and "<@111>" in i.content
+        ]
+        assert "2W" in rows[0]
+
+    async def test_a_notification_from_inside_the_boards_own_reload_rebuilds(self):
+        """A dispatch the board makes during its own on_load notifies it
+        inline, in the task already holding the reload turn. The rebuild runs
+        inside that turn instead of raising for re-entering it."""
+        store = get_store()
+
+        async def stamp(action, state):
+            return {**state, "application": {**state["application"], "stamped": True}}
+
+        store._register_reducer("BOARD_STAMPED", stamp)
+        rebuilds = []
+
+        class Board(LeaderboardLayoutView):
+            subscribed_actions = {"BOARD_STAMPED"}
+
+            async def get_entries(self):
+                if not self.state_store.state["application"].get("stamped"):
+                    await self.dispatch("BOARD_STAMPED", {})
+                return [(111, {"wins": 1})]
+
+            async def rebuild_pages(self, *, force=False):
+                rebuilds.append(force)
+                await super().rebuild_pages(force=force)
+
+            def state_selector(self, state):
+                return state["application"].get("stamped")
+
+        view = Board(interaction=_make_interaction())
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+
+        await asyncio.wait_for(view.reload(), timeout=2)
+
+        # The reload's rebuild, then the inline notification's inside it.
+        assert len(rebuilds) == 2
+
+    async def test_a_dispatch_from_a_task_inside_on_load_does_not_hang(self):
+        """The dispatch notifies the board inline in the gathered task, not the
+        one holding the turn, and the board's rebuild takes the turn. It waited
+        on the load that was awaiting it, forever and without a log line."""
+        store = get_store()
+
+        async def ping(action, state):
+            return {**state, "application": {**state["application"], "pinged": True}}
+
+        store._register_reducer("BOARD_PINGED", ping)
+        fetches = []
+
+        class Board(LeaderboardLayoutView):
+            subscribed_actions = {"BOARD_PINGED"}
+
+            def get_entries(self):
+                fetches.append(self._reload_task)
+                return [(111, {"wins": 1})]
+
+            async def on_load(self):
+                if not fetches:
+                    await asyncio.gather(self.dispatch("BOARD_PINGED", {}))
+                await super().on_load()
+
+            def state_selector(self, state):
+                return state["application"].get("pinged")
+
+        view = Board(interaction=_make_interaction())
+        assert await asyncio.wait_for(view.load(), timeout=2) is True
+        await asyncio.wait_for(view.task_manager.wait_tasks(view.id), timeout=2)
+
+        # The load's own fetch, then the notification's rebuild once it released.
+        assert len(fetches) == 2
+
+    async def test_force_reaches_an_on_load_that_rebuilds_directly(self):
+        """A subclass on_load that calls rebuild_pages itself, without
+        chaining to the base on_load, still gets the forced rebuild."""
+        build_calls = {"n": 0}
+
+        class Board(LeaderboardLayoutView):
+            async def on_load(self):
+                await self.rebuild_pages()
+                self._recompose_page_tree(rebuild_nav=True)
+
+            async def _build_leaderboard_pages(self, entries):
+                build_calls["n"] += 1
+                return await super()._build_leaderboard_pages(entries)
+
+        view = Board(interaction=_make_interaction(), entries=SAMPLE_ENTRIES)
+        await view.on_load()
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+        build_calls["n"] = 0
+
+        await view.reload(force=True)
         assert build_calls["n"] == 1
 
     async def test_failed_build_retries_on_next_rebuild(self):
@@ -1092,6 +1414,41 @@ class TestLeaderboardReload:
         view.boom = False
         await view.rebuild_pages()  # same data, no force -- must retry
         assert "<@2>" in _page_text(view)
+
+    async def test_a_rebuild_that_waited_for_the_turn_skips_a_view_torn_down_meanwhile(self):
+        """A notification can pass its checks in the instant a released turn
+        has a waiter not yet running, then queue behind that waiter. The view
+        exited while it waited, and the rebuild ran the board's hooks on it."""
+        calls = []
+
+        class Board(LeaderboardLayoutView):
+            async def get_entries(self):
+                calls.append("torn_down" if self._torn_down() else "live")
+                await asyncio.sleep(0.05)
+                return [(1, {"score": 1}), (2, {"score": 2})]
+
+        view = Board(interaction=_make_interaction())
+        await view.send()
+        calls.clear()
+        release = asyncio.Event()
+
+        async def holder():
+            async with view._reload_turn("reload()"):
+                await release.wait()
+                # A notification whose first step lands before the waiter runs.
+                asyncio.create_task(view._render_from_state())
+
+        holding = asyncio.create_task(holder())
+        await asyncio.sleep(0)
+        waiting = asyncio.create_task(view.load())
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.sleep(0.02)  # the load holds the turn, inside get_entries
+        await view.exit()
+        await asyncio.wait_for(asyncio.gather(holding, waiting), timeout=2)
+        await asyncio.sleep(0.1)
+
+        assert calls == ["live"]
 
 
 # // ========================================( PersistentLeaderboardLayoutView )======================================== // #
@@ -1291,6 +1648,40 @@ class TestProgressBarInEntry:
 
 
 # // ========================================( entry_layout Validation )======================================== // #
+
+
+class TestTextAttributeValidation:
+    """A wrong shape was rendered as its repr, mangled every row, or crashed
+    inside the render naming neither the attribute nor the fix."""
+
+    @pytest.mark.parametrize(
+        "name, value, message",
+        [
+            ("podium_emojis", "gold", "podium_emojis must map ranks"),
+            ("podium_emojis", {"1": "gold"}, "podium_emojis must map ranks"),
+            ("entry_separator", 7, "entry_separator must be a str"),
+            # Rendered as the empty board's text, which Discord refuses as
+            # anything but a string with a 400 naming nothing.
+            ("leaderboard_empty_message", None, "leaderboard_empty_message must be a str"),
+            ("leaderboard_empty_message", 5, "leaderboard_empty_message must be a str"),
+            ("title", ["Top"], "title must be a str or None"),
+            ("subtitle", 42, "subtitle must be a str or None"),
+        ],
+    )
+    def test_a_wrong_shape_is_refused_at_definition(self, name, value, message):
+        with pytest.raises((TypeError, ValueError), match=message):
+            type("_Board", (LeaderboardLayoutView,), {name: value, "__module__": __name__})
+
+    @pytest.mark.parametrize("name", ["title", "subtitle"])
+    def test_a_masthead_kwarg_of_the_wrong_shape_is_refused(self, name):
+        with pytest.raises(TypeError, match=f"{name} must be a str or None"):
+            LeaderboardLayoutView(**{name: ["Top"]})
+
+    def test_an_empty_subtitle_still_skips_the_line(self):
+        class _Board(LeaderboardLayoutView):
+            subtitle = ""
+
+        assert _Board.subtitle == ""
 
 
 class TestEntryLayoutValidation:

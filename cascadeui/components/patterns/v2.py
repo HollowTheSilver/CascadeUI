@@ -48,6 +48,7 @@ from ..base import (
     refuse_wrong_arity,
     require_url,
     require_value_callback,
+    run_unless_repeat,
 )
 from ..types import MAX_COMPONENT_ID, MAX_SELECT_OPTIONS, EmojiInput, MediaInput
 
@@ -113,6 +114,18 @@ def _stamp_custom_id(base: Optional[str], suffix: str) -> Optional[str]:
             f"{_CUSTOM_ID_MAX_CHARS - len(suffix) - 1} characters."
         )
     return composed
+
+
+def _composed(item):
+    """Mark ``item`` as carrying a custom_id composed from its position.
+
+    A persistent view keeps the composed id, since its ids must survive a
+    restart. Any other CascadeUI view re-derives it from what the item does,
+    like an auto-generated id, so a click sent from a render that has since
+    changed cannot land on the option that took its place.
+    """
+    item._cascadeui_composed_id = True
+    return item
 
 
 def _require_sync_result(value, owner: str, param: str):
@@ -262,7 +275,10 @@ def _resolve_media_ref(
     :class:`discord.File` resolves to its ``.uri`` (the
     ``"attachment://<filename>"`` reference built from the normalized
     filename). The builder emits only the reference string; the bytes
-    travel separately through ``view.send(files=[...])``.
+    travel separately through ``view.send(files=[...])``. Any other object
+    with a string ``.url`` (a :class:`discord.Asset` such as
+    ``member.display_avatar``) resolves to that URL; anything else raises
+    ``TypeError``.
 
     Only the ``.uri`` is extracted -- the ``description`` and ``spoiler``
     attributes of the source :class:`discord.File` are NOT forwarded.
@@ -279,13 +295,8 @@ def _resolve_media_ref(
         return value.uri
     if isinstance(value, (str, discord.UnfurledMediaItem)):
         return value
-    # An Asset is one attribute away from correct (``member.display_avatar``
-    # instead of ``member.display_avatar.url``), and every docstring example
-    # here shows the ``.url`` form, so the near miss is the likely one. It is
-    # coerced rather than refused, matching how the leaderboard's ``banner=``
-    # has always treated the same objects. Checked after UnfurledMediaItem,
-    # which carries a ``.url`` of its own but is a media reference already and
-    # would lose its other fields on the way through.
+    # After the UnfurledMediaItem check: that type has a ``.url`` too, and
+    # reading it would drop the item's other fields.
     url = getattr(value, "url", None)
     if isinstance(url, str):
         return url
@@ -378,12 +389,8 @@ def card(
         )
     """
     for index, child in enumerate(children):
-        # A Container is never a legal Container child, so the mistake is
-        # decidable here, while the composing call is still on the stack.
-        # Left in, the same tree fails at whichever seam ships the view,
-        # where the placement validator names Container indexes rather
-        # than this call -- on a push, that surfaces as a failed
-        # navigation instead of a construction error.
+        # Refused here, while this call is still in the traceback; at send
+        # the placement validator could only name a Container index.
         if isinstance(child, Container):
             raise ValueError(
                 f"card: child {index} is a Container ({type(child).__name__}), "
@@ -535,11 +542,7 @@ def toggle_section(
         )
     """
     _check_label_pair(labels, "toggle_section")
-    # toggle_button and cycle_button deliver the control's new state to a
-    # two-parameter callback, so one here is adapted rather than refused.
-    # This builder is immediate-mode: the delivered value is the flip of
-    # the rendered ``active``, the same post-flip state toggle_button
-    # reports.
+    # Adapted rather than refused, as toggle_button and cycle_button do.
     wants_state = accepts_second_positional(callback)
     refuse_wrong_arity(
         callback,
@@ -549,12 +552,12 @@ def toggle_section(
         f"  Fix: accept (interaction), or (interaction, active) to receive "
         f"the new state.",
     )
-    button_callback = callback
-    if wants_state:
-        requested = not active
+    requested = not active
 
-        async def button_callback(interaction):  # noqa: F811
-            await await_maybe(callback(interaction, requested))
+    async def button_callback(interaction):
+        # A second click of one double-click would flip the setting back.
+        args = (interaction, requested) if wants_state else (interaction,)
+        await run_unless_repeat(button, lambda: await_maybe(callback(*args)))
 
     button_kwargs = {
         "label": labels[0] if active else labels[1],
@@ -566,10 +569,11 @@ def toggle_section(
     _check_custom_id_length(custom_id, "toggle_section")
     if custom_id is not None:
         button_kwargs["custom_id"] = custom_id
+    button = StatefulButton(**button_kwargs)
     return _with_id(
         Section(
             TextDisplay(_require_text(text, "toggle_section", "text")),
-            accessory=StatefulButton(**button_kwargs),
+            accessory=button,
         ),
         id,
         "toggle_section",
@@ -600,8 +604,9 @@ def image_section(
             the same Section. At most two, per Discord's three-child cap.
             Empty lines are skipped, so a formatter that produces nothing
             for one entry shortens that entry instead of failing the send.
-        url: Image reference for the thumbnail. Accepts either a URL
-            string (remote or ``attachment://`` form) or a
+        url: Image reference for the thumbnail. Accepts a URL string
+            (remote or ``attachment://`` form), a
+            :class:`discord.UnfurledMediaItem`, or a
             :class:`discord.File` instance whose ``.uri`` is used.
             File-backed references require the same ``discord.File`` to
             be passed via ``view.send(files=[...])``.
@@ -619,11 +624,8 @@ def image_section(
             url=member.display_avatar.url,
         )
     """
-    # An empty line is dropped rather than rendered. Discord rejects a text
-    # display with empty content and fails the whole message, so a formatter
-    # that returns "" for one entry would otherwise take down every component
-    # beside it. A Section with one text child plus an accessory is legal, so
-    # the entry still renders.
+    # Discord rejects an empty text display and fails the whole message with
+    # it; a Section with one text child still renders.
     lines = tuple(line for line in (text, *more_text) if line)
     if not lines:
         raise ValueError(
@@ -857,12 +859,14 @@ def button_row(
     return _with_id(
         ActionRow(
             *(
-                StatefulButton(
-                    label=label,
-                    style=style,
-                    emoji=emoji,
-                    custom_id=_stamp_custom_id(custom_id, str(i)),
-                    callback=callback,
+                _composed(
+                    StatefulButton(
+                        label=label,
+                        style=style,
+                        emoji=emoji,
+                        custom_id=_stamp_custom_id(custom_id, str(i)),
+                        callback=callback,
+                    )
                 )
                 for i, (label, callback) in enumerate(buttons.items())
             )
@@ -942,10 +946,13 @@ def cycle_button(
             f"cycle_button: start={start} is out of range for " f"{len(values)} values."
         )
 
-    async def _cycle_callback(interaction):
+    async def _advance(interaction):
         button._cycle_index = (button._cycle_index + 1) % len(button._cycle_values)
         button.label = button._cycle_labels[button._cycle_index]
         await await_maybe(on_change(interaction, button._cycle_values[button._cycle_index]))
+
+    async def _cycle_callback(interaction):
+        await run_unless_repeat(button, lambda: _advance(interaction))
 
     button = StatefulButton(
         label=resolved_labels[start],
@@ -1016,13 +1023,16 @@ def toggle_button(
     require_value_callback(on_toggle, "toggle_button", "on_toggle", "active")
     _check_label_pair(labels, "toggle_button")
 
-    async def _toggle_callback(interaction):
+    async def _flip(interaction):
         button._toggle_active = not button._toggle_active
         button.label = labels[0] if button._toggle_active else labels[1]
         button.style = (
             discord.ButtonStyle.success if button._toggle_active else discord.ButtonStyle.danger
         )
         await await_maybe(on_toggle(interaction, button._toggle_active))
+
+    async def _toggle_callback(interaction):
+        await run_unless_repeat(button, lambda: _flip(interaction))
 
     button = StatefulButton(
         label=labels[0] if active else labels[1],
@@ -1199,10 +1209,12 @@ def choice_row(
         inactive_style: Button style for inactive options (default
             secondary). Applies only to the button form.
         placeholder: Placeholder text for the dropdown form.
-        custom_id: Base custom_id for the control. Defaults to ``"choice"``;
-            pass a distinct value to every ``choice_row`` in the same view,
-            or their buttons (and the dropdown) collide in Discord's
-            dispatch table.
+        custom_id: Base custom_id for the control in a persistent view,
+            where each option's id is ``{custom_id}_{n}`` and must survive a
+            restart; pass a distinct value to every ``choice_row`` in one
+            persistent view. Those ids name positions, so keep a persistent
+            control's options in a fixed order. In any other view the ids
+            are derived from what each option does and need no base.
 
     Returns:
         A single ``ActionRow`` holding either the buttons or the dropdown.
@@ -1278,26 +1290,24 @@ def _make_single_choice_callback(value: Any, on_select: Callable):
     return callback
 
 
-def _make_multi_choice_callback(value: Any, active: list, on_select: Callable):
-    # active is the build-time snapshot; clicking toggles this value in or
-    # out and hands the host the full new list. The host stores it and
-    # rebuilds, so the next render's buttons capture the updated selection.
-    #
-    # A list, not a set: a Choice.value is any Python object, and the
-    # construction path was widened to accept unhashable ones. Building a
-    # set here put the same restriction back one click later, which is
-    # strictly worse -- it moved the failure from where the options are
-    # written to where a user pressed a button. Options cap at 25, so the
-    # linear scan costs nothing.
+def _make_multi_choice_callback(value: Any, active: list, on_select: Callable, holder: dict):
+    # ``active`` is the render's snapshot; a click hands on_select the whole
+    # new selection. A list, not a set, since a Choice.value may be unhashable.
     async def callback(interaction: discord.Interaction):
-        # ``in`` is what the render path uses to decide which options draw
-        # active, so toggling reads membership the same way and the two
-        # cannot disagree about what is selected.
-        if value in active:
-            new = [v for v in active if v != value]
-        else:
-            new = [*active, value]
-        await await_maybe(on_select(interaction, new))
+        async def toggle():
+            # ``in`` is what the render path uses to decide which options draw
+            # active, so toggling reads membership the same way and the two
+            # cannot disagree about what is selected.
+            if value in active:
+                new = [v for v in active if v != value]
+            else:
+                new = [*active, value]
+            await await_maybe(on_select(interaction, new))
+
+        # The ids hold across renders in a persistent view, so the second
+        # click of a double-click reaches the rebuilt option, whose snapshot
+        # already has the first click's result, and would toggle it back.
+        await run_unless_repeat(holder["button"], toggle)
 
     return callback
 
@@ -1316,8 +1326,9 @@ def _choice_button_row(
     buttons = []
     for i, choice in enumerate(choices):
         is_active = choice.value in active
+        holder: dict = {}
         if multi:
-            callback = _make_multi_choice_callback(choice.value, active, on_select)
+            callback = _make_multi_choice_callback(choice.value, active, on_select, holder)
             # Whole-control disable only; a multi toggle is never self-disabled.
             button_disabled = disabled
         else:
@@ -1326,7 +1337,7 @@ def _choice_button_row(
             # caller opts into allow_reselect; the whole control is disabled
             # when the caller passes disabled=True.
             button_disabled = disabled or (is_active and not allow_reselect)
-        buttons.append(
+        holder["button"] = _composed(
             StatefulButton(
                 label=choice.label,
                 emoji=choice.emoji,
@@ -1336,6 +1347,7 @@ def _choice_button_row(
                 callback=callback,
             )
         )
+        buttons.append(holder["button"])
     return ActionRow(*buttons)
 
 
@@ -1366,15 +1378,15 @@ def _choice_select_row(
         # values (the str(i) option values), not the real choices. Resolve
         # each back to its Python value before handing it to on_select.
         resolved = [idx_to_value[int(v)] for v in values]
+        # No double-click guard, unlike the buttons: the selection comes from
+        # the submission itself, so a repeated one reports the same values
+        # rather than toggling a snapshot back.
         if multi:
             await await_maybe(on_select(interaction, resolved))
         else:
             picked = resolved[0] if resolved else None
-            # Match the button form: a single-select re-pick of the active
-            # option is a no-op unless allow_reselect is set. Without this
-            # guard the dropdown fires on_select on a re-pick while the button
-            # form cannot, so the control's behavior would flip at
-            # button_threshold. The host's post-callback defer acks the click.
+            # As in the button form, re-picking the active option does nothing
+            # unless allow_reselect is set; the post-callback defer acks it.
             if not allow_reselect and picked in active:
                 return
             await await_maybe(on_select(interaction, picked))
@@ -1388,7 +1400,9 @@ def _choice_select_row(
         disabled=disabled,
         callback=callback,
     )
-    return ActionRow(select)
+    # Its option values are positions too, so the select is re-derived with
+    # the buttons: a changed option list gives it a new id.
+    return ActionRow(_composed(select))
 
 
 # // ========================================( Content )======================================== // #
@@ -1730,8 +1744,9 @@ def tab_nav(
     supplied, the first tab is marked active.
 
     Args:
-        tabs: Mapping of ``label -> async callback``. Insertion order
-            determines display order.
+        tabs: Mapping of ``label -> async callback``, or an iterable of
+            ``(label, callback)`` pairs. Insertion order determines
+            display order.
         active: Label of the tab that should render as active. Must
             match a key in ``tabs``. Defaults to the first key.
         active_style: Style for the active tab (default: primary).
@@ -1762,13 +1777,8 @@ def tab_nav(
         )
     """
     _check_button_styles("tab_nav", active_style=active_style, inactive_style=inactive_style)
-    # Normalized first, before anything measures or indexes it. The size
-    # guards below call len(), which a non-mapping answers with its own
-    # error naming neither the builder nor the parameter, and which a
-    # generator of pairs, accepted by every sibling that takes a mapping,
-    # cannot answer at all. Normalizing here also resolves ``active``
-    # against real keys: reading the raw argument bound it to a
-    # ``(label, callback)`` tuple, so no tab rendered active.
+    # Normalized before anything measures or indexes it: len() cannot answer a
+    # generator of pairs, and ``active`` has to match real keys, not pairs.
     tabs = normalize_mapping(tabs, owner="tab_nav", param="tabs")
     if not tabs:
         raise ValueError("tab_nav: tabs mapping must not be empty.")
@@ -1787,11 +1797,13 @@ def tab_nav(
     return _with_id(
         ActionRow(
             *(
-                StatefulButton(
-                    label=label,
-                    style=active_style if label == active else inactive_style,
-                    custom_id=_stamp_custom_id(custom_id, str(i)),
-                    callback=callback,
+                _composed(
+                    StatefulButton(
+                        label=label,
+                        style=active_style if label == active else inactive_style,
+                        custom_id=_stamp_custom_id(custom_id, str(i)),
+                        callback=callback,
+                    )
                 )
                 for i, (label, callback) in enumerate(tabs.items())
             )
@@ -1861,7 +1873,7 @@ class PaginatedRegion:
     view without sharing a cursor.
 
     That index lives on the region, and the region is built in the host's
-    ``__init__`` -- so a ``pop`` that reconstructs the host builds a fresh
+    ``__init__``, so a ``pop`` that reconstructs the host builds a fresh
     region on page one. Name it in the host's ``get_nav_state`` to carry it::
 
         def get_nav_state(self):
@@ -2044,11 +2056,9 @@ class PaginatedRegion:
         self._key = key
 
         self._page = 0
-        # A negative index names a page from the end, and the count it counts
-        # back from is the one the NEXT render loads, not the one in hand when
-        # the call was made. Held here until fresh items land; cleared by any
-        # explicit cursor move. The Last button arms it too: resolving at click
-        # time is still one render too early on a host that reloads.
+        # A pending from-end page (a negative set_page, or Last), resolved
+        # against the count of the next items to land, since a host that
+        # reloads changes it; any explicit cursor move clears it.
         self._from_end: Optional[int] = None
         # Captured by controls() so click callbacks can rebuild + refresh
         # the host view (mirrors ToggleGroup.add_to_view).
@@ -2064,6 +2074,10 @@ class PaginatedRegion:
         validation that should fire on every page turn. The host owns the
         data, so an override that prefetches reads it through
         :attr:`host` (set by the time any page can turn).
+
+        Fires before the re-render, so it reports the page the user
+        asked for. When that re-render does not land the region stays on
+        the page it showed, and this hook is not called again.
         """
         return None
 
@@ -2078,11 +2092,8 @@ class PaginatedRegion:
     def items(self, value: Sequence[Any]) -> None:
         self._items = list(value)
         if self._from_end is not None:
-            # The count these fresh items produce is the one a pending
-            # from-end index meant. Without this the cursor keeps the value
-            # resolved against the old count, and a list that grew across a
-            # per_page boundary renders the second-to-last page under a
-            # request for the last one.
+            # Resolved against these items' count: the old count would show the
+            # second-to-last page when the list grew across a per_page boundary.
             self._page = max(0, self.page_count + self._from_end)
             self._from_end = None
         self._clamp()
@@ -2128,9 +2139,9 @@ class PaginatedRegion:
         the "jump and re-render" gesture the view-side method performs.
 
         Clamping waits while the region is empty. A host that loads its items
-        in ``on_load`` sets the page before they arrive -- ``restore_nav_state``
+        in ``on_load`` sets the page before they arrive (``restore_nav_state``
         runs first, so a page carried across a ``pop`` lands here against an
-        empty list -- and clamping then would quietly rewrite the index to
+        empty list), and clamping then would quietly rewrite the index to
         zero, losing the page the user was on.
 
         Nothing out of range can render regardless: the ``items`` setter
@@ -2243,11 +2254,8 @@ class PaginatedRegion:
         is a bare ``discord.ui.Button``, not a ``StatefulButton``, which is
         why the annotation stays the unparameterized ``List``.
         """
-        # Button state is a read of the cursor, and the cursor can be set
-        # before the items it indexes arrive (set_page defers its clamp for
-        # exactly that case). Clamp here as page_items does, so a host that
-        # builds its controls before assigning items cannot render prev/next
-        # flags and an indicator that disagree with the content.
+        # set_page defers its clamp until items arrive; clamping here as
+        # page_items does keeps the buttons in step with the content.
         self._clamp()
         total = self.page_count
         show_jump = (not compact) and total >= self.jump_threshold
@@ -2279,11 +2287,9 @@ class PaginatedRegion:
             )
         )
 
-        # Middle node: clickable go-to when jumps are available (full mode
-        # at or above jump_threshold, or any compact row), else a
-        # non-interactive page indicator. indicator_button_style governs the
-        # clickable node only; the disabled indicator stays secondary, since
-        # a disabled button in an accent colour reads as one that is broken.
+        # The clickable go-to when jumps show (full mode at jump_threshold or
+        # above, or compact), else a disabled indicator, which stays secondary:
+        # a disabled button in an accent colour reads as broken.
         if show_jump or compact:
             buttons.append(
                 StatefulButton(
@@ -2359,12 +2365,8 @@ class PaginatedRegion:
         return callback
 
     def _make_jump(self, target_fn: Callable[[], int], *, from_end: Optional[int] = None):
-        # target_fn re-resolves at click time rather than at build time, which
-        # is enough for a page named absolutely. It is not enough for "last":
-        # the re-render below reloads the host, so a list that grew since the
-        # previous render moves the last page after the click resolved it.
-        # Naming it from the end instead defers that to the fresh count, the
-        # same way set_page(-1) does.
+        # target_fn resolves at click time. "Last" also passes from_end, since
+        # the re-render reloads the host and can move the last page after that.
         async def callback(interaction: discord.Interaction):
             previous = self._page
             self._from_end = from_end
@@ -2390,6 +2392,8 @@ class PaginatedRegion:
             )
 
             async def on_submit(modal_self, modal_interaction: discord.Interaction):
+                if await view._answer_if_closed(modal_interaction):
+                    return
                 value = modal_self.page_input.value.strip()
                 try:
                     page_num = int(value)
@@ -2400,15 +2404,14 @@ class PaginatedRegion:
                         ephemeral=True,
                     )
                     return
-                previous = region.page
-                region.set_page(max(1, min(page_num, total)) - 1)
-                await view._safe_defer(modal_interaction)
-                await _guard_hook(region.on_page_changed, region.page, owner=region)
-                await region._rerender(previous_page=previous)
+                await view._render_as_answer(
+                    modal_interaction,
+                    lambda: region.show_page(max(1, min(page_num, total)) - 1),
+                )
 
         await view.open_modal(interaction, _GotoModal())
 
-    async def show_page(self, index: int) -> None:
+    async def show_page(self, index: int, *, notify: bool = True) -> None:
         """Jump to a zero-based page index and re-render the host.
 
         The counterpart to ``_BasePaginatedMixin.set_page`` on the view
@@ -2417,27 +2420,54 @@ class PaginatedRegion:
         programmatic jump (a search hit, a "find me" button). Requires the
         region to be attached (``controls(view)`` must have run), since
         there is no host to re-render before that.
+
+        ``notify=False`` skips ``on_page_changed``, for a jump the host makes
+        on its own (back to the first page after a period of inactivity)
+        rather than one a user asked for. The render, and the rewind when
+        its edit does not land, are the same either way.
+
+        Raises:
+            RuntimeError: The region has no host yet. Nothing moves; use
+                :meth:`set_page` to seek before the first render.
         """
+        if self._view is None:
+            raise RuntimeError(
+                "PaginatedRegion.show_page() re-renders the host, and this region has "
+                "none until the host's render calls controls(view).\n"
+                "  Fix: call set_page(index) to move the cursor before then; the first "
+                "render shows that page."
+            )
         previous = self._page
         self.set_page(index)
-        await _guard_hook(self.on_page_changed, self._page, owner=self)
-        if self._view is not None:
-            await self._rerender(previous_page=previous)
+        if notify:
+            await _guard_hook(self.on_page_changed, self._page, owner=self)
+        await self._rerender(previous_page=previous)
 
     async def _rerender(self, *, previous_page: Optional[int] = None) -> None:
         # Re-run the host's render path and ship the edit; shared with
         # Collapsible via _rerender_host.
-        await _rerender_host(self._view)
+        try:
+            await _rerender_host(self._view)
+        except Exception:
+            # The render failed before its edit, or Discord refused the edit.
+            self._rewind(previous_page)
+            raise
+        if getattr(self._view, "refresh_degraded", False):
+            # The host's edit never reached Discord. No second edit here,
+            # because the connection is still down.
+            self._rewind(previous_page)
+
+    def _rewind(self, previous_page: Optional[int]) -> None:
+        """Put the cursor back on the slice the region on screen still shows.
+
+        Left on the new page, the next press would page on from a position
+        the user never saw. The host rebuilds from this cursor on its next
+        render.
+        """
         if previous_page is None or self._page == previous_page:
             return
-        if getattr(self._view, "refresh_degraded", False):
-            # The host's edit never reached Discord, so the region on screen
-            # still shows the old slice. Put the cursor back, or the next
-            # press pages on from a position the reader never saw. The host
-            # rebuilds from this cursor on its next render; no second edit
-            # here, because the connection is still down.
-            self._from_end = None
-            self._page = previous_page
+        self._from_end = None
+        self._page = previous_page
 
 
 # // ========================================( Collapsible )======================================== // #
@@ -2454,7 +2484,7 @@ class Collapsible:
     independent.
 
     That state lives on the collapsible, which the host builds in
-    ``__init__`` -- so a ``pop`` that reconstructs the host brings it back
+    ``__init__``, so a ``pop`` that reconstructs the host brings it back
     collapsed. Name it in the host's ``get_nav_state`` to carry it::
 
         def get_nav_state(self):
@@ -2515,13 +2545,14 @@ class Collapsible:
             while expanded, so its callbacks stay fresh across rebuilds.
             Async sources load in the host's ``on_load`` and ``reveal`` reads
             the result synchronously.
-        summary: Optional zero-argument synchronous callable returning the
-            trigger's body text. When set, ``render`` emits the trigger as an
-            ``action_section`` (a Section carrying the text, with the trigger
-            button as its accessory) instead of a bare ``ActionRow(button)``,
+        summary: The trigger's body text, or a zero-argument synchronous
+            callable returning it (for text that changes between renders).
+            When set, ``render`` emits the trigger as an ``action_section``
+            (a Section carrying the text, with the trigger button as its
+            accessory) instead of a bare ``ActionRow(button)``,
             so a card-based disclosure fuses the trigger beside its summary.
-            Falls back to the bare button when the callable returns an empty
-            value. Default ``None`` keeps the bare button row.
+            Falls back to the bare button when the text is empty. Default
+            ``None`` keeps the bare button row.
         expanded_label: Trigger label while expanded. Defaults to ``label``
             (the trigger keeps its text); set it to ``"Done"`` / ``"Cancel"``
             for a relabel-on-open.
@@ -2537,10 +2568,10 @@ class Collapsible:
             collapsibles in one view need distinct keys.
 
     Raises:
-        TypeError: ``reveal`` or ``summary`` is not callable, is async, or
-            requires arguments (both run bare on every render); or a
-            non-bool ``expanded`` / ``trigger_first`` / non-ButtonStyle
-            style.
+        TypeError: ``reveal`` is not callable, ``summary`` is neither a str
+            nor callable, either is async, or either requires arguments (both
+            run bare on every render); or a non-bool ``expanded`` /
+            ``trigger_first`` / non-ButtonStyle style.
         ValueError: ``label``, ``expanded_label``, or ``key`` is empty.
     """
 
@@ -2549,7 +2580,7 @@ class Collapsible:
         *,
         label: str,
         reveal: Callable,
-        summary: Optional[Callable[[], str]] = None,
+        summary: Optional[Union[str, Callable[[], str]]] = None,
         expanded_label: Optional[str] = None,
         style: discord.ButtonStyle = discord.ButtonStyle.secondary,
         expanded_style: discord.ButtonStyle = discord.ButtonStyle.secondary,
@@ -2584,9 +2615,14 @@ class Collapsible:
                 f"  Fix: take no parameters and close over the host's data -- "
                 f"reveal() runs bare on every expanded render."
             )
+        if isinstance(summary, str):
+            text = summary
+            summary = lambda: text
         if summary is not None:
             if not callable(summary):
-                raise TypeError(f"summary must be callable or None, got {type(summary).__name__}")
+                raise TypeError(
+                    f"summary must be a str, a callable, or None, got {type(summary).__name__}"
+                )
             if is_async_callable(summary):
                 raise TypeError(
                     "summary must be synchronous; load async data in the host's "
@@ -2633,6 +2669,9 @@ class Collapsible:
         expanded, log toggle events, or run validation on every open/close.
         An override that needs the host's data or helpers reads them through
         :attr:`host` (set by the time the trigger can be clicked).
+
+        When the re-render does not land the flag flips back to match the
+        screen, and this hook is not called again.
         """
         return None
 
@@ -2703,37 +2742,48 @@ class Collapsible:
         # action_section. Fall back to the bare button row when no summary is
         # set or the callable yields nothing (e.g. data not loaded yet) -- an
         # empty Section has no text to render.
+        async def toggle(interaction):
+            # A second click of one double-click would close what the first opened.
+            await run_unless_repeat(trigger, lambda: self._toggle(interaction))
+
         if self._summary is not None:
             text = _require_sync_result(self._summary(), "Collapsible", "summary")
             if text:
-                return action_section(
+                section = action_section(
                     text,
                     label=label,
-                    callback=self._toggle,
+                    callback=toggle,
                     style=style,
                     emoji=emoji,
                     custom_id=custom_id,
                 )
-        return ActionRow(
-            StatefulButton(
-                label=label,
-                style=style,
-                emoji=emoji,
-                custom_id=custom_id,
-                callback=self._toggle,
-            )
+                trigger = section.accessory
+                return section
+        trigger = StatefulButton(
+            label=label,
+            style=style,
+            emoji=emoji,
+            custom_id=custom_id,
+            callback=toggle,
         )
+        return ActionRow(trigger)
 
     async def _toggle(self, interaction: discord.Interaction) -> None:
         previous = self._expanded
         self._expanded = not self._expanded
         await _guard_hook(self.on_toggle, self._expanded, owner=self)
-        await _rerender_host(self._view)
+        try:
+            await _rerender_host(self._view)
+        except Exception:
+            # The render failed before its edit, or Discord refused the edit,
+            # so the trigger on screen still shows the previous state.
+            self._expanded = previous
+            raise
         if getattr(self._view, "refresh_degraded", False):
             # The trigger on screen still shows the previous state, so flip
             # back to match it. Self-healing either way (one more click would
             # resynchronize a binary toggle), but leaving them disagreed makes
-            # the next click read as a no-op to the reader.
+            # the next click read as a no-op to the user.
             self._expanded = previous
 
 
@@ -2752,8 +2802,9 @@ def gallery(
     into a flat call.
 
     Args:
-        *media: Image references (up to 10). Each accepts either a URL
-            string (remote or ``attachment://`` form) or a
+        *media: Image references (up to 10). Each accepts a URL string
+            (remote or ``attachment://`` form), a
+            :class:`discord.UnfurledMediaItem`, or a
             :class:`discord.File` instance whose ``.uri`` is used.
             File-backed references require the same ``discord.File``
             objects to be passed via ``view.send(files=[...])``.
@@ -2835,8 +2886,9 @@ def file_attachment(
     V2 content.
 
     Args:
-        url: File reference. Accepts either a remote URL, the
-            ``attachment://<filename>`` form, or a
+        url: File reference. Accepts a remote URL, the
+            ``attachment://<filename>`` form, a
+            :class:`discord.UnfurledMediaItem`, or a
             :class:`discord.File` instance whose ``.uri`` is used. When
             a file-backed reference is supplied, the same
             ``discord.File`` must travel via ``view.send(files=[...])``.
@@ -3211,11 +3263,8 @@ def button_grid(
         buttons = []
         for c in range(cols):
             btn = cell_factory(r, c)
-            # Every cell is checked, not only the first. A factory that
-            # returns something else for one position -- ``None`` to leave a
-            # gap is the plausible one -- otherwise reached ActionRow and
-            # failed there on an attribute the caller never mentioned,
-            # naming no cell.
+            # Every cell, not only the first: a ``None`` left for a gap would
+            # otherwise fail inside ActionRow without naming the cell.
             if not isinstance(btn, discord.ui.Button):
                 raise TypeError(
                     f"cell_factory must return discord.ui.Button, got "

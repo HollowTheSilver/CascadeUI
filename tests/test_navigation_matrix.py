@@ -186,6 +186,21 @@ class TestMenuCategoryDestinationMatrix:
             )
 
     @pytest.mark.parametrize("menu_cls,dest_cls", MENU_PAIRS, ids=lambda c: c.__name__)
+    @pytest.mark.parametrize("make", ["instance", "string"])
+    def test_a_category_that_is_not_a_view_class_is_rejected_at_construction(
+        self, menu_cls, dest_cls, make
+    ):
+        # Every click pushes the category's view: an instance worked on the
+        # first click and failed on the second, naming push(), which the
+        # user never called.
+        view = _construct(dest_cls) if make == "instance" else "StatsView"
+        with pytest.raises(TypeError, match="which is not a view class"):
+            menu_cls(
+                interaction=_make_interaction(),
+                categories=[{"label": "Stats", "view": view}],
+            )
+
+    @pytest.mark.parametrize("menu_cls,dest_cls", MENU_PAIRS, ids=lambda c: c.__name__)
     async def test_menu_pushes_the_class_it_was_given(self, menu_cls, dest_cls):
         menu = menu_cls(
             interaction=_make_interaction(),

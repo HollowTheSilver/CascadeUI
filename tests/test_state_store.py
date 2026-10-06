@@ -3,10 +3,13 @@
 import asyncio
 import copy
 import logging
+import time
 from types import SimpleNamespace
 
 import pytest
 
+import cascadeui.state.store as store_module
+from cascadeui.state.middleware import UndoMiddleware
 from cascadeui.state.singleton import get_store
 from cascadeui.state.store import _CURRENT_REDUCER_MS, StateStore
 
@@ -169,6 +172,32 @@ class TestGetActiveView:
         assert store.get_active_view(persistence_key="lookup:push") is child
         assert "lookup:push" in store._live_persistence_keys()
 
+    async def test_a_view_a_push_is_still_bringing_in_is_not_returned(self):
+        """Mid-push the lookup answered with the arriving view, which the push
+        can still discard, while the view on screen was the one pushing."""
+        import asyncio
+
+        from helpers import RenderableLayoutView, make_interaction
+
+        store = get_store()
+        panel = self._panel_class()(interaction=make_interaction(), persistence_key="lookup:nest")
+        await panel.send()
+        child = await panel.push(RenderableLayoutView)
+        gate, entered = asyncio.Event(), asyncio.Event()
+
+        class _Loading(RenderableLayoutView):
+            async def on_load(self):
+                entered.set()
+                await gate.wait()
+
+        pushing = asyncio.create_task(child.push(_Loading, interaction=make_interaction()))
+        await asyncio.wait_for(entered.wait(), 1)
+        try:
+            assert store.get_active_view(persistence_key="lookup:nest") is child
+        finally:
+            gate.set()
+            await pushing
+
     async def test_a_sent_panel_is_found_by_its_key_and_not_by_its_id(self):
         from helpers import make_interaction
 
@@ -267,6 +296,132 @@ class TestLivePersistenceKeys:
         view.stop()
 
         assert "panel:stopped" not in store._live_persistence_keys()
+
+    async def test_a_sent_panel_protects_another_row_naming_its_message(self):
+        """Two rows can name one message (a key renamed between versions leaves
+        the old row behind). The send stamps the registration id after the view
+        registers, so the message index has to learn it at the stamp."""
+        from helpers import make_interaction
+
+        store = get_store()
+        panel = TestGetActiveView._panel_class()(
+            interaction=make_interaction(), persistence_key="panel:renamed"
+        )
+        await panel.send()
+        store.state["persistent_views"]["panel:old-name"] = {
+            "message_id": panel._registry_message_id
+        }
+
+        assert panel._registry_message_id is not None
+        assert "panel:old-name" in store._live_persistence_keys()
+
+
+class TestRegistryLookupIndex:
+    """The key and registration-message indexes behind ``get_active_view``
+    agree with the registry at every write, and the lookups read them instead
+    of walking every live view."""
+
+    class _NoWalk(dict):
+        """A live registry that refuses iteration, so a lookup that walks it raises."""
+
+        def _refuse(self, *args, **kwargs):
+            raise AssertionError("lookup walked the live view registry")
+
+        __iter__ = keys = values = items = _refuse
+
+    def test_registering_and_unregistering_maintain_both_indexes(self):
+        from helpers import RenderableLayoutView
+
+        store = get_store()
+        view = RenderableLayoutView(persistence_key="idx:both")
+        view._registry_message_id = "111"
+        store._register_view(view)
+
+        assert store._views_for_key("idx:both") == [view]
+        assert store._views_for_message("111") == [view]
+
+        store._unregister_view(view.id)
+        assert store._views_for_key("idx:both") == []
+        assert store._views_for_message("111") == []
+        # Emptied buckets are dropped, not left behind as empty lists.
+        assert "idx:both" not in store._views_by_key
+        assert "111" not in store._views_by_message
+
+    def test_an_id_stamped_after_registering_moves_between_buckets(self):
+        from helpers import RenderableLayoutView
+
+        store = get_store()
+        view = RenderableLayoutView()
+        store._register_view(view)
+
+        view._registry_message_id = "111"
+        assert store._views_for_message("111") == [view]
+
+        view._registry_message_id = "222"
+        assert store._views_for_message("111") == []
+        assert store._views_for_message("222") == [view]
+
+        view._registry_message_id = None
+        assert store._views_by_message == {}
+
+    def test_an_id_stamped_before_registering_is_indexed_at_registration(self):
+        from helpers import RenderableLayoutView
+
+        store = get_store()
+        view = RenderableLayoutView()
+        view._registry_message_id = "111"
+        # An unregistered view is not an answer, so the stamp alone indexes nothing.
+        assert store._views_by_message == {}
+
+        store._register_view(view)
+        assert store._views_for_message("111") == [view]
+
+    def test_re_registering_does_not_duplicate_an_entry(self):
+        from helpers import RenderableLayoutView
+
+        store = get_store()
+        view = RenderableLayoutView(persistence_key="idx:twice")
+        view._registry_message_id = "111"
+        store._register_view(view)
+        store._register_view(view)
+
+        assert store._views_by_key["idx:twice"] == [view.id]
+        assert store._views_by_message["111"] == [view.id]
+
+    def test_holders_are_newest_first(self):
+        from helpers import RenderableLayoutView
+
+        store = get_store()
+        older = RenderableLayoutView(persistence_key="idx:order")
+        newer = RenderableLayoutView(persistence_key="idx:order")
+        store._register_view(older)
+        store._register_view(newer)
+
+        assert store._views_for_key("idx:order") == [newer, older]
+
+    async def test_lookups_do_not_walk_the_live_registry(self):
+        """Every lookup behind get_active_view, the reattach skip, and the
+        prune skip answers from the indexes alone, however many views are live."""
+        from helpers import RenderableLayoutView
+
+        store = get_store()
+        cls = TestGetActiveView._panel_class()
+        panel = cls(persistence_key="idx:walk")
+        store._register_view(panel)
+        carrier = RenderableLayoutView()
+        carrier._registry_message_id = "555"
+        store._register_view(carrier)
+        for _ in range(50):
+            store._register_view(RenderableLayoutView())
+        store.state["persistent_views"]["idx:walk"] = {"message_id": None}
+        store.state["persistent_views"]["idx:pushed"] = {"message_id": "555"}
+
+        store._active_views = self._NoWalk(store._active_views)
+
+        assert store.get_active_view(persistence_key="idx:walk") is panel
+        assert store.get_active_view(persistence_key="idx:pushed") is carrier
+        assert store.get_active_view(persistence_key="idx:missing") is None
+        assert store._live_persistence_keys() == {"idx:walk", "idx:pushed"}
 
 
 class TestDestroyView:
@@ -372,6 +527,9 @@ class TestDestroyView:
                 await store._destroy_view("v-cancel")
             assert "v-cancel" not in store.state["views"]
             assert "v-cancel" not in store._active_views
+            # The committed removal is announced from a task; let it finish
+            # on this test's loop.
+            await store._flush_notifications()
         finally:
             store._middleware = saved_mw
 
@@ -578,6 +736,90 @@ class TestDispatch:
 
 class TestSubscribers:
     """Subscriber registration, notification, action filtering, and unsubscribe."""
+
+    async def test_a_selected_value_that_cannot_be_compared_is_notified(self, caplog):
+        # An array-like value compares elementwise and refuses bool(); the
+        # comparison raised out of the fan-out, so no other subscriber was
+        # told and no hook fired.
+        class ArrayLike:
+            def __eq__(self, other):
+                return self
+
+            def __bool__(self):
+                raise ValueError("the truth value of an array is ambiguous")
+
+            __hash__ = object.__hash__
+
+        store = get_store()
+
+        async def set_v(action, state):
+            return {**state, "application": {**state.get("application", {}), "v": 1}}
+
+        store._register_reducer("SET_V", set_v)
+        told, hooked = [], []
+        store.subscribe(
+            "array",
+            lambda state, action=None: told.append("array"),
+            action_filter={"SET_V"},
+            selector=lambda state: (ArrayLike(),),
+        )
+        store.subscribe(
+            "plain", lambda state, action=None: told.append("plain"), action_filter={"SET_V"}
+        )
+        store.on("SET_V", lambda action, *rest: hooked.append(1))
+        await store.dispatch("SET_V", {})
+        await store._flush_notifications()
+        told.clear()
+        hooked.clear()
+        with caplog.at_level("WARNING", logger="cascadeui"):
+            await store.dispatch("SET_V", {})
+            await store._flush_notifications()
+        assert sorted(told) == ["array", "plain"]
+        assert hooked == [1]
+        assert any(
+            "could not be compared" in r.getMessage()
+            for r in caplog.records
+            if r.name.startswith("cascadeui")
+        )
+
+    async def test_a_selector_that_raised_is_reported_again_when_it_cannot_be_compared(
+        self, caplog
+    ):
+        # Both reports shared one flag, so a selector that had raised once
+        # said nothing when its values later could not be compared.
+        class ArrayLike:
+            def __eq__(self, other):
+                return self
+
+            def __bool__(self):
+                raise ValueError("the truth value of an array is ambiguous")
+
+            __hash__ = object.__hash__
+
+        store = get_store()
+
+        async def set_v(action, state):
+            return {**state, "application": {**state.get("application", {}), "v": 1}}
+
+        store._register_reducer("SET_V", set_v)
+        selected = [0]
+
+        def selector(state):
+            selected[0] += 1
+            if selected[0] == 1:
+                raise LookupError("selector broke")
+            return (ArrayLike(),)
+
+        store.subscribe(
+            "s", lambda state, action=None: None, action_filter={"SET_V"}, selector=selector
+        )
+        with caplog.at_level("WARNING", logger="cascadeui"):
+            for _ in range(3):
+                await store.dispatch("SET_V", {})
+            await store._flush_notifications()
+        messages = [r.getMessage() for r in caplog.records if r.name.startswith("cascadeui")]
+        assert any("raised LookupError" in message for message in messages)
+        assert any("could not be compared" in message for message in messages)
 
     async def test_subscriber_receives_notification(self):
         store = get_store()
@@ -803,8 +1045,8 @@ class TestSelectorMustBeSynchronous:
 
     The change check runs inline in dispatch and cannot await, so an async
     selector returned a fresh coroutine every time. A coroutine never
-    equals the last one, so the subscriber was notified on every action --
-    the opposite of what passing a selector asks for -- and each unawaited
+    equals the last one, so the subscriber was notified on every action
+    (the opposite of what passing a selector asks for), and each unawaited
     coroutine warned from the user's own console.
     """
 
@@ -1175,6 +1417,117 @@ class TestInspectorPurgedStaleReducer:
 class TestPerfSampling:
     """Opt-in profiling records per-dispatch timings to a bounded ring buffer."""
 
+    @staticmethod
+    def _clock(monkeypatch):
+        """A clock that moves only when a test moves it, for exact timings."""
+        now = [0.0]
+        monkeypatch.setattr(store_module, "time", SimpleNamespace(perf_counter=lambda: now[0]))
+        return now
+
+    @staticmethod
+    def _sample(store, action_type):
+        return [s for s in store._perf_samples if s["action"] == action_type][-1]
+
+    async def test_reducer_ms_leaves_out_undos_commit_work(self, monkeypatch):
+        # Undo records its step as the reducer commits, and that work was
+        # timed as the reducer's, so a slow diff read as a slow reducer.
+        now = self._clock(monkeypatch)
+        store = get_store()
+        undo = UndoMiddleware()
+        store._add_middleware(undo)
+        await undo.initialize(store)
+        record = UndoMiddleware._record_commit
+
+        def slow_record(self, *args):
+            now[0] += 7.0
+            return record(self, *args)
+
+        monkeypatch.setattr(UndoMiddleware, "_record_commit", slow_record)
+
+        async def set_k(action, state):
+            return {**state, "application": {**state.get("application", {}), "k": 1}}
+
+        store._register_reducer("SET_K", set_k)
+        await store.dispatch("VIEW_CREATED", {"view_id": "a"})
+        store._undo_enabled_views["a"] = 20
+        store.clear_perf()
+        store.enable_perf()
+        try:
+            await store.dispatch("SET_K", {}, source_id="a")
+            sample = self._sample(store, "SET_K")
+            assert sample["reducer_ms"] == 0
+            assert sample["middleware_ms"] == 7000
+        finally:
+            store.disable_perf()
+
+    async def test_an_action_a_closed_batch_refused_reports_its_timing(self, monkeypatch):
+        # It is announced on the immediate path with its chain already run,
+        # and its sample read that path's untouched timers: all zero.
+        now = self._clock(monkeypatch)
+        store = get_store()
+        gate = asyncio.Event()
+        waiting = asyncio.Event()
+
+        async def hold_before(action, state, next_fn):
+            if action["payload"].get("hold"):
+                waiting.set()
+                await gate.wait()
+            return await next_fn(action, state)
+
+        async def slow(action, state):
+            now[0] += 3.0
+            return {**state, "application": {**state.get("application", {}), "s": 1}}
+
+        store._add_middleware(hold_before)
+        store._register_reducer("SLOW", slow)
+        store.clear_perf()
+        store.enable_perf()
+        try:
+            async with store.batch():
+                held = asyncio.ensure_future(store.dispatch("SLOW", {"hold": True}))
+                await asyncio.wait_for(waiting.wait(), 5)
+            gate.set()
+            await held
+            sample = self._sample(store, "SLOW")
+            assert sample["reducer_ms"] == 3000
+            assert sample["total_ms"] == 3000
+        finally:
+            gate.set()
+            store.disable_perf()
+
+    async def test_a_batched_dispatch_inside_another_times_nothing_into_it(self, monkeypatch):
+        # Its reducer wrote into the timing slot of the dispatch whose chain
+        # it ran inside, so an instant reducer read as a slow one.
+        now = self._clock(monkeypatch)
+        store = get_store()
+
+        async def saga(action, state, next_fn):
+            result = await next_fn(action, state)
+            if action["type"] == "OUTER":
+                async with store.batch():
+                    await store.dispatch("INNER", {})
+            return result
+
+        async def outer(action, state):
+            return {**state, "application": {**state.get("application", {}), "o": 1}}
+
+        async def inner(action, state):
+            now[0] += 5.0
+            return {**state, "application": {**state.get("application", {}), "i": 1}}
+
+        store._add_middleware(saga)
+        store._register_reducer("OUTER", outer)
+        store._register_reducer("INNER", inner)
+        store.clear_perf()
+        store.enable_perf()
+        try:
+            await store.dispatch("OUTER", {})
+            sample = self._sample(store, "OUTER")
+            assert sample["reducer_ms"] == 0
+            assert sample["middleware_ms"] == 5000
+        finally:
+            store.disable_perf()
+
     async def test_disabled_by_default(self):
         store = get_store()
         store.clear_perf()
@@ -1244,7 +1597,7 @@ class TestPerfSampling:
 
     async def test_edits_increment_from_refresh(self):
         """A subscriber that mutates the current dispatch's edit counter
-        via the contextvar -- the same path ``refresh()`` uses -- bumps
+        via the contextvar (the same path ``refresh()`` uses) bumps
         the sample's ``edits`` field after ``_flush_notifications()``.
         """
         store = get_store()
@@ -1350,14 +1703,14 @@ class TestPerfSampling:
             store.disable_perf()
             store._unregister_reducer("PERF_SLOW_REDUCER")
 
-    async def test_a_batched_reducer_binds_no_timing_slot(self):
+    async def test_a_batched_reducer_times_into_no_other_dispatchs_slot(self):
         """Reducer timing binds to its own dispatch, not to a shared stack top.
 
         A batched action owns no per-action sample; it accounts for itself
         under the batch's. Writing into the top of a shared stack put its
         reducer time on whichever unbatched dispatch was concurrently in
-        flight, so the slot is reached through a contextvar the dispatch
-        binds for itself and a batched action finds nothing bound.
+        flight, so the slot is reached through a contextvar each dispatch
+        binds for itself, and a batched action's is its own.
         """
         store = get_store()
         store.clear_perf()
@@ -1378,7 +1731,9 @@ class TestPerfSampling:
             store._unregister_reducer("PERF_SLOT_PROBE")
 
         assert bound[0] is not None, "an unbatched dispatch collects its own reducer time"
-        assert bound[1] is None, "a batched action has no slot of its own to write into"
+        assert bound[1] is not bound[0], "a batched action writes into no other dispatch's slot"
+        samples = [s for s in store._perf_samples if s["action"] == "PERF_SLOT_PROBE"]
+        assert len(samples) == 1, "a batched action records no sample of its own"
 
     async def test_notify_sample_per_subscriber(self):
         """Each subscriber touched by a dispatch produces exactly one
@@ -1420,7 +1775,12 @@ class TestPerfSampling:
         store.clear_perf()
 
         async def slow_sub(state, action):
-            await asyncio.sleep(0.02)
+            # Timed on the clock the samples use: before Python 3.13 the
+            # loop's clock on Windows moves in ~16 ms steps, so a plain 20 ms
+            # sleep can read as less.
+            start = time.perf_counter()
+            while time.perf_counter() - start < 0.02:
+                await asyncio.sleep(0.001)
 
         async def fast_sub(state, action):
             pass
@@ -1436,8 +1796,11 @@ class TestPerfSampling:
                 for s in store._notify_samples
                 if s["action"] == "PERF_NOTIFY_MIX"
             }
-            assert by_id["slow"] >= 15.0
-            assert by_id["fast"] < 5.0
+            assert by_id["slow"] >= 20.0
+            # The fast subscriber never yields, so no other subscriber runs
+            # inside its window, and its reading reaches 20 ms only if it took
+            # in time from outside that window, such as the slow one's.
+            assert by_id["fast"] < 20.0
         finally:
             store.disable_perf()
             store._unsubscribe("slow")

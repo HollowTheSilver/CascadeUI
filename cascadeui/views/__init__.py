@@ -9,6 +9,7 @@ from .layout import (
     count_components,
 )
 from .patterns import (
+    EntryList,
     FormField,
     FormLayoutView,
     FormSchema,
@@ -66,4 +67,6 @@ __all__ = [
     "WizardStep",
     "WizardSchema",
     "RoleCategory",
+    # Type aliases
+    "EntryList",
 ]

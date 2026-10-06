@@ -131,12 +131,17 @@ class PersistenceBackend(Protocol):
     # Lifecycle
 
     async def initialize(self) -> None:
-        """Open connections and create tables. Called once per backend
-        instance during :meth:`PersistenceMiddleware.initialize`."""
+        """Open connections and create tables. Called during
+        :meth:`PersistenceMiddleware.initialize`, and again after
+        :meth:`close` when a bot started again in the same process reopens
+        persistence, so a closed backend must be able to open again."""
         ...
 
     async def close(self) -> None:
-        """Close connections cleanly. Called on bot shutdown."""
+        """Close connections cleanly. Called when persistence closes: with the
+        bot when ``bot=`` was passed, otherwise when the caller runs
+        ``persistence_manager.close()``. Persistence waits up to ten seconds
+        for it, then logs a warning and closes without it."""
         ...
 
     # Key-value surface (Capability.KV)
@@ -188,7 +193,11 @@ class PersistenceBackend(Protocol):
         connection acquire + one transaction + ``executemany``). The
         persistence middleware calls ``row_upsert`` per row when a backend
         does not implement this method, so a backend may omit it. An empty
-        ``rows`` list is a no-op."""
+        ``rows`` list is a no-op.
+
+        The batch is all or nothing, including when it raises or is
+        cancelled part way, since the middleware then retries the whole
+        batch."""
         ...
 
     async def row_select(

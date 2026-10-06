@@ -125,7 +125,7 @@ dies with its last member.
 | Attribute | Default | Purpose |
 |-----------|---------|---------|
 | `timeout` | `180` | Seconds of inactivity before `on_timeout()` fires (`None` = no timeout) |
-| `exit_policy` | `"disable"` | Bare `exit()` behavior: `"disable"` (freeze components) or `"delete"` (delete message) |
+| `exit_policy` | `"disable"` | Bare `exit()` behavior, and the message a view sent again leaves: `"disable"` (freeze components) or `"delete"` (delete message) |
 
 | Method Hook | When it fires |
 |-------------|---------------|
@@ -148,10 +148,14 @@ dies with its last member.
 |-----------|---------|---------|
 | `auto_refresh_ephemeral` | `None` | Engages the 15-minute webhook handoff. `None` (default) derives from `timeout`: in-window (`<= 900`) declines, longer timeouts or `None` engage. Set `True`/`False` to pin the behavior. |
 | `reopen_failure_message` | `"Could not refresh this view..."` | Static text when ephemeral refresh fails |
+| `session_ended_message` | `"This session has ended."` | Static text when a modal is submitted after its view closed, or the refresh button finds no view to reopen; `None` sends nothing |
 
 | Method Hook | When it fires |
 |-------------|---------------|
-| `on_reopen_failure(interaction, error)` | Ephemeral refresh factory failed or returned `None` |
+| `build_refresh_button()` | Ephemeral refresh arming: builds the Continue button (default: from the `refresh_button_*` attributes) |
+| `build_reopen_view(interaction)` | Ephemeral refresh Continue pressed: builds the replacement view (default: the view's class with its constructor kwargs) |
+| `on_reopen_failure(interaction, error)` | `build_reopen_view` raised or returned `None` |
+| `on_session_ended(interaction)` | A modal submitted after the view closed, or `build_reopen_view` returned `None` (default: sends `session_ended_message`) |
 | `on_message_delete()` | External message deletion detected (a delete, bulk purge, deleted channel or thread, or an edit finding the message gone) |
 
 ### Interaction machinery
@@ -201,6 +205,7 @@ is skipped and `session_id` is `None`. A session dies when its last member exits
 |--------|---------|
 | `update_session(**data)` | Write to `shared_data`, dispatches `SESSION_UPDATED` |
 | `attach_child(child)` | Parent-local cleanup dependency -- children keep independent sessions |
+| `exit_children()` | Exit the attached children and keep the parent open |
 
 ### Session vs attachment
 
@@ -387,11 +392,12 @@ Every class attribute, grouped by pillar, with its default value:
     auto_defer_delay = 2.5
     ack_first = False  # advanced -- ack before the checks/callback
     serialize_interactions = True
-    edit_timeout = 60.0  # per-edit Discord HTTP ceiling; None = unbounded
+    edit_timeout = 60.0  # per-edit Discord HTTP ceiling; None = aiohttp's 5-minute default
     allowed_mentions = None  # None = defer to the client's rules
     refresh_cooldown_ms = None  # paces background re-renders; clicks are exempt
     auto_refresh_ephemeral = None  # derives from timeout; pin with True/False
     reopen_failure_message = "Could not refresh this view..."
+    session_ended_message = "This session has ended."  # None sends nothing
     enable_undo = False
     undo_limit = 20
     ```
