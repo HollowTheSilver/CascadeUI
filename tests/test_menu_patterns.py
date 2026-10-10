@@ -6,6 +6,7 @@ import discord
 import pytest
 from discord.ui import Container, TextDisplay
 from helpers import make_interaction as _make_interaction
+from helpers import owe_redraw
 
 from cascadeui.views import StatefulLayoutView, StatefulView
 from cascadeui.views.patterns import FormLayoutView, FormView, MenuLayoutView, MenuView
@@ -669,7 +670,7 @@ class TestMenuFallbackOutlivesThePush:
         await menu._category_buttons[0].original_callback(interaction)
         dest = menu._successor
         # What a push from it that failed leaves owed.
-        dest._reclaim_pending = True
+        owe_redraw(dest)
 
         content, _ = await dest._reclaim_content()
 

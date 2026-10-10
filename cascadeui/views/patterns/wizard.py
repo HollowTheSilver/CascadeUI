@@ -4,7 +4,7 @@
 import inspect
 import logging
 import math
-from typing import Any, Callable, ClassVar, Dict, List, Optional
+from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple
 
 import discord
 from discord import Interaction
@@ -358,22 +358,24 @@ class _BaseWizardMixin:
         """The custom_id of a nav button drawn for the current step."""
         return f"wizard_{name}:{self._current_step}"
 
-    def _drawn_for_this_step(self, interaction: Interaction, button) -> bool:
+    def _drawn_for_this_step(self, interaction: Interaction, name: str) -> bool:
         """Whether a nav click came from the step on screen now.
 
         A client sends the id it rendered, so a second click queued behind
         the first names the step the first click left; acting on it would
-        skip a step the user never saw, and its validator with it.
+        skip a step the user never saw, and its validator with it. Compared
+        with the id the current step draws rather than the button's, which
+        a step render still building has not updated yet.
         """
         clicked = (interaction.data or {}).get("custom_id")
-        return not isinstance(clicked, str) or clicked == button.custom_id
+        return not isinstance(clicked, str) or clicked == self._nav_id(name)
 
     async def _back_clicked(self, interaction: Interaction):
-        if self._drawn_for_this_step(interaction, self._back_btn):
+        if self._drawn_for_this_step(interaction, "back"):
             await self._go_back(interaction)
 
     async def _next_clicked(self, interaction: Interaction):
-        if self._drawn_for_this_step(interaction, self._next_btn):
+        if self._drawn_for_this_step(interaction, "next"):
             await self._go_next(interaction)
 
     async def _go_back(self, interaction: Interaction):
@@ -592,7 +594,7 @@ class WizardView(_BaseWizardMixin, StatefulView):
         self.add_item(self._next_btn)
 
     async def _reload_render(self) -> Optional[RenderOutcome]:
-        return await self._refresh_wizard()
+        return await self._render_wizard()
 
     async def _render_wizard(
         self, *, previous_step: Optional[int] = None
@@ -610,10 +612,10 @@ class WizardView(_BaseWizardMixin, StatefulView):
         """
         self._match_controls()
 
-        kwargs = await self._nav_edit_kwargs()
-        declined = self._declined_render()
+        with self._render_scope() as began:
+            kwargs = await self._nav_edit_kwargs()
+        declined = await self._declined_late(began, kwargs)
         if declined is not None:
-            # The view changed while this awaited: torn down, or armed.
             return declined
         outcome = await self.refresh(**kwargs)
         await self._rewind_step(previous_step)
@@ -789,39 +791,63 @@ class WizardLayoutView(_BaseWizardMixin, StatefulLayoutView):
 
         The entire rebuild runs inside the view's theme context so
         ``card()`` calls in both ``_build_progress_header`` and the
-        user's step builder inherit the view's accent colour.
+        user's step builder inherit the view's accent colour. The builder
+        runs before the tree is touched, so a close meanwhile freezes the
+        tree the last render left, not a half-built step.
+        """
+        self._apply_step_tree(*await self._build_step_content())
+
+    async def _build_step_content(self) -> Tuple[int, list]:
+        """Run the current step's builder, leaving the tree as it is.
+
+        Returns the step it built with the content, since a click can move
+        the cursor while the builder awaits.
         """
         from ...theming.context import theme_context
 
-        self._match_auto_exit("wizard_exit", extras=self._extra_items)
+        step = self._current_step
+        builder = self._steps[step].get("builder") if self._steps else None
+        if not builder:
+            return step, []
         with theme_context(self.get_theme()):
-            self.clear_items()
+            content = await await_maybe(builder())
+        return step, (content if isinstance(content, list) else [content])
 
-            visible = self._visible_step_indices()
-            if self.show_progress_bar and len(visible) > 1:
-                header = self._build_progress_header(visible)
-                if header is not None:
-                    self.add_item(header)
+    def _apply_step_tree(self, step: int, content: list) -> None:
+        """Lay the tree out for ``step``: progress header, ``content``, nav row, extras.
 
-            if self._steps:
-                step = self._steps[self._current_step]
-                builder = step.get("builder")
-                if builder:
-                    content = await await_maybe(builder())
-                    if isinstance(content, list):
-                        for item in content:
-                            self.add_item(item)
-                    else:
-                        self.add_item(content)
+        The cursor reads as ``step`` while it runs, so the nav buttons, the
+        progress header, and every hook they call name the step built, not
+        one a click moved to since.
+        """
+        from ...theming.context import theme_context
 
-            if self._nav_row is not None:
-                self.add_item(self._nav_row)
+        moved, self._current_step = self._current_step, step
+        try:
+            self._sync_wizard_nav()
+            self._match_auto_exit("wizard_exit", extras=self._extra_items)
+            with theme_context(self.get_theme()):
+                self.clear_items()
 
-            for extra in self._extra_items:
-                self.add_item(extra)
+                visible = self._visible_step_indices()
+                if self.show_progress_bar and len(visible) > 1:
+                    header = self._build_progress_header(visible)
+                    if header is not None:
+                        self.add_item(header)
 
-            # Restore the navigation back button if push() added one.
-            self._restore_navigation_artifacts()
+                for item in content:
+                    self.add_item(item)
+
+                if self._nav_row is not None:
+                    self.add_item(self._nav_row)
+
+                for extra in self._extra_items:
+                    self.add_item(extra)
+
+                # Restore the navigation back button if push() added one.
+                self._restore_navigation_artifacts()
+        finally:
+            self._current_step = moved
 
     async def _render_wizard(
         self, *, previous_step: Optional[int] = None
@@ -831,12 +857,12 @@ class WizardLayoutView(_BaseWizardMixin, StatefulLayoutView):
         ``previous_step`` is the cursor the caller moved away from, so a step
         change whose edit never reached Discord can put it back.
         """
-        self._sync_wizard_nav()
-        await self._rebuild_step_content()
-        declined = self._declined_render()
+        with self._render_scope() as began:
+            step, content = await self._build_step_content()
+        declined = await self._declined_late(began)
         if declined is not None:
-            # The view changed while this awaited: torn down, or armed.
             return declined
+        self._apply_step_tree(step, content)
         outcome = await self.refresh()
         await self._rewind_step(previous_step)
         return outcome
@@ -844,7 +870,6 @@ class WizardLayoutView(_BaseWizardMixin, StatefulLayoutView):
     async def _match_step_tree(self) -> None:
         # A V2 tree IS the content, so the restore rebuilds it or the next
         # refresh ships the step the cursor no longer names.
-        self._sync_wizard_nav()
         await self._rebuild_step_content()
 
     async def on_load(self) -> None:
@@ -862,5 +887,4 @@ class WizardLayoutView(_BaseWizardMixin, StatefulLayoutView):
         three's content under step one's buttons.
         """
         if self._steps:
-            self._sync_wizard_nav()
             await self._rebuild_step_content()

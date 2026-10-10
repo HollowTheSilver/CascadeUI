@@ -20,7 +20,7 @@ from discord.ui import (
     TextDisplay,
     Thumbnail,
 )
-from helpers import RenderableLayoutView, make_interaction
+from helpers import RenderableLayoutView, make_interaction, until
 
 from cascadeui import (
     Choice,
@@ -825,6 +825,113 @@ class TestDoubleClickOnAStatefulControl:
             if r.name.startswith("cascadeui")
         )
 
+    @pytest.mark.parametrize("half", [0, 1], ids=["confirm", "cancel"])
+    async def test_confirm_section_runs_a_double_clicked_answer_once(self, half):
+        """A confirm is one decision; the second click of a double-click made
+        it again, so a delete or a payment ran twice."""
+        view = self._host()
+        calls = []
+
+        async def answer(interaction):
+            calls.append(interaction)
+            await asyncio.sleep(0)
+
+        _, row = confirm_section("Sure?", on_confirm=answer, on_cancel=answer)
+        view.add_item(row)
+
+        await self._double(view, row.children[half])
+
+        assert len(calls) == 1
+
+    async def test_confirm_section_runs_a_later_click(self):
+        """Only the repeat is dropped: a click sent after the answer settled
+        is a new decision on a prompt that is still up."""
+        view = self._host()
+        calls = []
+
+        async def confirm(interaction):
+            calls.append(interaction)
+
+        _, row = confirm_section("Sure?", on_confirm=confirm, on_cancel=_noop)
+        view.add_item(row)
+
+        await view._scheduled_task(row.children[0], make_interaction())
+        await view._scheduled_task(row.children[0], make_interaction())
+
+        assert len(calls) == 2
+
+    @pytest.mark.parametrize("first", [0, 1], ids=["confirm_first", "cancel_first"])
+    async def test_confirm_section_takes_one_answer(self, first):
+        """Each button guarded its own clicks, so a Cancel sent from the
+        same render as a Confirm ran after the Confirm had already acted."""
+        view = self._host()
+        calls = []
+
+        async def confirm(interaction):
+            calls.append("confirm")
+            await asyncio.sleep(0)
+
+        async def cancel(interaction):
+            calls.append("cancel")
+            await asyncio.sleep(0)
+
+        _, row = confirm_section("Sure?", on_confirm=confirm, on_cancel=cancel)
+        view.add_item(row)
+        second = 1 - first
+
+        await asyncio.gather(
+            view._scheduled_task(row.children[first], make_interaction()),
+            view._scheduled_task(row.children[second], make_interaction()),
+        )
+
+        assert calls == [["confirm", "cancel"][first]]
+
+    async def test_a_dropped_answer_is_acknowledged(self):
+        """The dropped click runs none of the caller's code, so with
+        ``auto_defer`` off nothing else answers it."""
+        view = self._host()
+        view.auto_defer = False
+
+        async def confirm(interaction):
+            await interaction.response.defer()
+            await asyncio.sleep(0)
+
+        _, row = confirm_section("Sure?", on_confirm=confirm, on_cancel=_noop)
+        view.add_item(row)
+        dropped = make_interaction()
+
+        await asyncio.gather(
+            view._scheduled_task(row.children[0], make_interaction()),
+            view._scheduled_task(row.children[1], dropped),
+        )
+
+        dropped.response.defer.assert_awaited_once()
+
+    async def test_confirm_section_cooldowns_are_per_answer(self):
+        """``with_cooldown`` keys an unnamed control on its callback's name,
+        and both answers carried the library's wrapper name, so a cooldown on
+        Confirm refused the Cancel that followed."""
+        from cascadeui import with_cooldown
+
+        view = self._host()
+        calls = []
+
+        async def confirm(interaction):
+            calls.append("confirm")
+
+        async def cancel(interaction):
+            calls.append("cancel")
+
+        _, row = confirm_section("Sure?", on_confirm=confirm, on_cancel=cancel)
+        view.add_item(row)
+        for button in row.children:
+            with_cooldown(button, seconds=30)
+
+        await view._scheduled_task(row.children[0], make_interaction())
+        await view._scheduled_task(row.children[1], make_interaction())
+
+        assert calls == ["confirm", "cancel"]
+
     async def test_toggle_button_reports_the_new_state_once(self):
         view = self._host()
         seen = []
@@ -1145,7 +1252,6 @@ class _FakeHost:
         self.refresh_calls = 0
         self._finished = finished
         self._async_build = async_build
-        self.deferred = []
         self.answered = []
         self.responded = []
         self.opened_modal = None
@@ -1164,9 +1270,6 @@ class _FakeHost:
 
     async def refresh(self, **kwargs):
         self.refresh_calls += 1
-
-    async def _safe_defer(self, interaction):
-        self.deferred.append(interaction)
 
     async def _render_as_answer(self, interaction, render):
         self.answered.append(interaction)
@@ -1220,7 +1323,8 @@ class _TabHost:
     def is_finished(self):
         return self._finished
 
-    async def _refresh_tabs(self):
+    async def _refresh_tabs(self, *, lineage=False):
+        assert lineage, "a region's tab render joins the turn of the task that started it"
         self.tab_refreshes += 1
 
     # A real TabLayoutView also inherits reload(); _refresh_tabs must win.
@@ -1691,8 +1795,708 @@ class TestPaginatedRegionLabels:
         assert region._resolve_goto_label() == "Items"
 
 
+class _LoadingHost(RenderableLayoutView):
+    """A host whose load writes on both sides of an await; each build records what it saw."""
+
+    def __init__(self, *args, **kwargs):
+        self.a = self.b = 0
+        self.loading, self.release = asyncio.Event(), asyncio.Event()
+        self.composed = []
+        super().__init__(*args, **kwargs)
+        self._message = AsyncMock()
+
+    async def on_load(self):
+        self.a += 1
+        self.loading.set()
+        await self.release.wait()
+        self.b += 1
+
+    def build_ui(self):
+        self.composed.append((self.a, self.b))
+
+
+async def _render_during_a_load(host, render):
+    """Start ``render()`` while ``host.load()`` is halfway; return what was built before it ended."""
+    load = asyncio.create_task(host.load())
+    await asyncio.wait_for(host.loading.wait(), 2)
+    rendering = asyncio.create_task(render())
+    for _ in range(10):
+        await asyncio.sleep(0)
+    during = list(host.composed)
+    host.release.set()
+    await asyncio.wait_for(asyncio.gather(load, rendering), 2)
+    return during
+
+
 class TestPaginatedRegionNavigation:
     """Click callbacks mutate the index and rebuild + refresh the host."""
+
+    async def test_a_page_turn_waits_for_a_load_in_progress(self):
+        """A page turn built the host's tree beside its load, from half-loaded data."""
+        host = _LoadingHost(interaction=make_interaction(), user_id=1, guild_id=2)
+        region = PaginatedRegion(per_page=2, items=list(range(6)))
+        region.controls(host)
+        host.composed.clear()
+
+        during = await _render_during_a_load(host, lambda: region.show_page(1))
+
+        assert during == []
+        assert host.composed == [(1, 1)]
+
+    async def test_a_page_turn_gathered_from_the_hosts_own_load_does_not_wait_for_it(self):
+        """The load held the turn and awaited the page turn, which waited for
+        the turn, so neither finished."""
+
+        class _GatheringHost(RenderableLayoutView):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.region = PaginatedRegion(
+                    items=[TextDisplay(f"row {i}") for i in range(9)], per_page=3
+                )
+                self.jump = False
+
+            def build_ui(self):
+                self.clear_items()
+                for item in self.region.page_items:
+                    self.add_item(item)
+                for item in self.region.controls(self):
+                    self.add_item(item)
+
+            async def on_load(self):
+                self.build_ui()
+                if self.jump:
+                    await asyncio.gather(self.region.show_page(2))
+
+        host = _GatheringHost(interaction=make_interaction(), user_id=1, guild_id=2)
+        await host.send()
+        host.jump = True
+
+        await asyncio.wait_for(host.reload(), 2)
+
+        assert host.region.page == 2
+
+    @pytest.mark.parametrize("spawn", ["gather", "task"])
+    async def test_a_page_turn_from_a_state_renders_child_task_does_not_wait_for_it(self, spawn):
+        """The page turn waited for the state render to finish, and the render
+        was awaiting the page turn, so neither finished and the view stopped
+        rendering state changes."""
+
+        class _NotifiedHost(RenderableLayoutView):
+            subscribed_actions = {"JUMP"}
+
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.region = PaginatedRegion(
+                    items=[TextDisplay(f"row {i}") for i in range(9)], per_page=3
+                )
+
+            def build_ui(self):
+                self.clear_items()
+                for item in self.region.page_items:
+                    self.add_item(item)
+                for item in self.region.controls(self):
+                    self.add_item(item)
+
+            async def on_state_changed(self, state):
+                if spawn == "gather":
+                    await asyncio.gather(self.region.show_page(2))
+                else:
+                    await asyncio.create_task(self.region.show_page(2))
+
+        host = _NotifiedHost(interaction=make_interaction(), user_id=1, guild_id=2)
+        host.build_ui()
+        await host.send()
+
+        await asyncio.wait_for(host.dispatch("JUMP"), 2)
+
+        assert host.region.page == 2
+
+    @pytest.mark.parametrize("where", ["on_load", "on_state_changed"])
+    async def test_a_page_turn_gathered_in_a_tab_host_does_not_wait_for_it(self, where):
+        """A region in a tab, turned from the host's own load or state render
+        through gather(), waited for the turn that render held, so neither
+        finished."""
+        from cascadeui import TabLayoutView
+
+        class _TabHost(TabLayoutView):
+            subscribed_actions = {"JUMP"}
+
+            def __init__(self, **kwargs):
+                self.region = PaginatedRegion(
+                    items=[f"row {i}" for i in range(9)], per_page=3, key="r"
+                )
+                self.jump = False
+                super().__init__(tabs={"Main": self._main, "Other": self._main}, **kwargs)
+
+            async def _main(self):
+                rows = [TextDisplay(row) for row in self.region.page_items]
+                return [Container(*rows), *self.region.controls(self)]
+
+            async def on_load(self):
+                await super().on_load()
+                if where == "on_load" and self.jump:
+                    self.jump = False
+                    await asyncio.gather(self.region.show_page(2))
+
+            async def on_state_changed(self, state):
+                if where == "on_state_changed":
+                    await asyncio.gather(self.region.show_page(2))
+                await self.refresh()
+
+        host = _TabHost(interaction=make_interaction(), user_id=1, guild_id=2)
+        await host.send()
+        host.jump = True
+
+        if where == "on_load":
+            await asyncio.wait_for(host.reload(), 2)
+        else:
+            await asyncio.wait_for(host.dispatch("JUMP"), 2)
+
+        shown = [i.content for i in host.walk_children() if isinstance(i, TextDisplay)]
+        assert host.region.page == 2 and "row 6" in shown
+
+    async def test_a_page_turn_gathered_in_a_load_hosts_state_render_does_not_wait_for_it(self):
+        """A region on a host that renders in on_load, turned from its state
+        render through gather(), waited for that render to finish."""
+
+        class _LoadHost(RenderableLayoutView):
+            subscribed_actions = {"JUMP"}
+
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.region = PaginatedRegion(
+                    items=[f"row {i}" for i in range(9)], per_page=3, key="r"
+                )
+
+            async def on_load(self):
+                self.clear_items()
+                for row in self.region.page_items:
+                    self.add_item(TextDisplay(row))
+                for item in self.region.controls(self):
+                    self.add_item(item)
+
+            async def on_state_changed(self, state):
+                await asyncio.gather(self.region.show_page(2))
+
+        host = _LoadHost(interaction=make_interaction(), user_id=1, guild_id=2)
+        await host.send()
+
+        await asyncio.wait_for(host.dispatch("JUMP"), 2)
+
+        shown = [i.content for i in host.walk_children() if isinstance(i, TextDisplay)]
+        assert host.region.page == 2 and "row 6" in shown
+
+    @pytest.mark.parametrize("where", ["on_load", "on_state_changed"])
+    async def test_two_page_turns_gathered_from_one_render_build_one_at_a_time(self, where):
+        """Both turns joined the render and ran the host's async build_ui at
+        once on one tree, and one failed on a duplicate custom_id."""
+
+        class _TwoRegions(RenderableLayoutView):
+            subscribed_actions = {"JUMP"}
+
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.a = PaginatedRegion(items=list(range(9)), per_page=3, key="a")
+                self.b = PaginatedRegion(items=list(range(9)), per_page=3, key="b")
+                self.building = self.most = 0
+                self.jump = False
+                self.results = None
+                self._fill()
+
+            def _fill(self):
+                for region in (self.a, self.b):
+                    for i in region.page_items:
+                        self.add_item(TextDisplay(f"{region._key} {i}"))
+                    for item in region.controls(self):
+                        self.add_item(item)
+
+            async def build_ui(self):
+                self.building += 1
+                self.most = max(self.most, self.building)
+                try:
+                    self.clear_items()
+                    await asyncio.sleep(0)
+                    self._fill()
+                finally:
+                    self.building -= 1
+
+            async def _turn_both(self):
+                self.results = await asyncio.gather(
+                    self.a.show_page(1), self.b.show_page(1), return_exceptions=True
+                )
+
+            async def on_load(self):
+                if where == "on_load" and self.jump:
+                    self.jump = False
+                    await self._turn_both()
+
+            async def on_state_changed(self, state):
+                if where == "on_state_changed":
+                    await self._turn_both()
+
+        host = _TwoRegions(interaction=make_interaction(), user_id=1, guild_id=2)
+        await host.send()
+        host.jump = True
+
+        if where == "on_load":
+            await asyncio.wait_for(host.reload(), 2)
+        else:
+            await asyncio.wait_for(host.dispatch("JUMP"), 2)
+
+        assert host.results == [None, None]
+        assert host.most == 1
+        assert (host.a.page, host.b.page) == (1, 1)
+
+    async def test_a_page_turn_the_render_did_not_await_keeps_a_reload_out(self):
+        """A turn the state render started without awaiting kept building
+        after the render ended, beside a reload queued meanwhile."""
+        parked, release = asyncio.Event(), asyncio.Event()
+
+        class _Spawning(RenderableLayoutView):
+            subscribed_actions = {"JUMP"}
+
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.region = PaginatedRegion(items=list(range(9)), per_page=3, key="r")
+                self.building = self.most = 0
+                self.loading = False
+                self._fill()
+
+            def _fill(self):
+                for i in self.region.page_items:
+                    self.add_item(TextDisplay(f"row {i}"))
+                for item in self.region.controls(self):
+                    self.add_item(item)
+
+            def _enter(self):
+                self.building += 1
+                self.most = max(self.most, self.building)
+
+            async def build_ui(self):
+                self._enter()
+                try:
+                    self.clear_items()
+                    if not parked.is_set():
+                        parked.set()
+                        await release.wait()
+                    self._fill()
+                finally:
+                    self.building -= 1
+
+            async def on_load(self):
+                if not self.loading:
+                    return
+                self._enter()
+                try:
+                    self.clear_items()
+                    await asyncio.sleep(0)
+                    self._fill()
+                finally:
+                    self.building -= 1
+
+            async def on_state_changed(self, state):
+                self.spawned = asyncio.create_task(self.region.show_page(1))
+                await asyncio.wait_for(parked.wait(), 2)
+
+        host = _Spawning(interaction=make_interaction(), user_id=1, guild_id=2)
+        await host.send()
+        await asyncio.wait_for(host.dispatch("JUMP"), 2)
+        host.loading = True
+        reloading = asyncio.create_task(host.reload())
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert not reloading.done(), "the reload did not wait for the page turn"
+        release.set()
+        await asyncio.wait_for(asyncio.gather(host.spawned, reloading), 2)
+
+        assert host.most == 1
+
+    @pytest.mark.parametrize("nested", ["reload", "gathered_reload", "gathered_turn"])
+    async def test_a_page_turn_that_needs_the_turn_while_a_reload_waits_finishes(self, nested):
+        """A turn the state render started without awaiting outlived it, a
+        reload began waiting for it, and the turn's build then needed the
+        turn itself: by its own reload(), a reload() it gathered, or a second
+        region's page turn it gathered. The reload held the lock while it
+        waited, so neither ever finished and the panel stopped changing."""
+        parked, release = asyncio.Event(), asyncio.Event()
+
+        class _Host(RenderableLayoutView):
+            subscribed_actions = {"JUMP"}
+
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.a = PaginatedRegion(items=list(range(9)), per_page=3, key="a")
+                self.b = PaginatedRegion(items=list(range(9)), per_page=3, key="b")
+                self.spawned = None
+                self.follow = False
+                self.events = []
+                self._fill()
+
+            def _fill(self):
+                for region in (self.a, self.b):
+                    for i in region.page_items:
+                        self.add_item(TextDisplay(f"row {i}"))
+                    for item in region.controls(self):
+                        self.add_item(item)
+
+            async def on_load(self):
+                self.events.append(("load", asyncio.current_task().get_name()))
+
+            async def build_ui(self):
+                self.clear_items()
+                self._fill()
+                if self.follow:
+                    self.follow = False
+                    parked.set()
+                    await release.wait()
+                    if nested == "reload":
+                        await self.reload()
+                    elif nested == "gathered_reload":
+                        await asyncio.gather(self.reload())
+                    else:
+                        await asyncio.gather(self.b.show_page(2))
+                    self.events.append("turn built")
+
+            async def on_state_changed(self, state):
+                self.follow = True
+                self.spawned = asyncio.create_task(self.a.show_page(1))
+                await asyncio.wait_for(parked.wait(), 2)
+
+        host = _Host(interaction=make_interaction(), user_id=1, guild_id=2)
+        await host.send()
+        await asyncio.wait_for(host.dispatch("JUMP"), 2)
+        reloading = asyncio.create_task(host.reload(), name="taker")
+        for _ in range(20):
+            await asyncio.sleep(0)
+        release.set()
+        _, pending = await asyncio.wait({host.spawned, reloading}, timeout=3)
+        if pending:
+            for task in pending:
+                task.cancel()
+            await asyncio.wait(pending, timeout=2)
+
+        assert not pending, "the page turn and the reload waited on each other"
+        # The waiting reload loads only once the page turn's build is done.
+        assert host.events.index(("load", "taker")) > host.events.index("turn built")
+
+    async def test_a_page_turn_queued_behind_a_reload_builds_before_it(self):
+        """A load started a page turn without awaiting it, a reload queued
+        behind that load, and the page turn's build then queued behind the
+        reload for a reload of its own. The waiting reload took the turn as
+        though the page turn were idle and loaded while that build sat half
+        done."""
+        parked, release, finish_load = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        class _Host(RenderableLayoutView):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.a = PaginatedRegion(items=list(range(9)), per_page=3, key="a")
+                self.spawned = None
+                self.spawn = self.follow = False
+                self.events = []
+                self._fill()
+
+            def _fill(self):
+                for i in self.a.page_items:
+                    self.add_item(TextDisplay(f"row {i}"))
+                for item in self.a.controls(self):
+                    self.add_item(item)
+
+            async def on_load(self):
+                self.events.append(("load", asyncio.current_task().get_name()))
+                if self.spawn:
+                    self.spawn = False
+                    self.follow = True
+                    self.spawned = asyncio.create_task(self.a.show_page(1))
+                    await asyncio.wait_for(parked.wait(), 2)
+                    await finish_load.wait()
+
+            async def build_ui(self):
+                self.clear_items()
+                self._fill()
+                if self.follow:
+                    self.follow = False
+                    parked.set()
+                    await release.wait()
+                    await self.reload()
+                    self.events.append("turn built")
+
+        host = _Host(interaction=make_interaction(), user_id=1, guild_id=2)
+        await host.send()
+        host.spawn = True
+        first = asyncio.create_task(host.reload(), name="first")
+        await asyncio.wait_for(parked.wait(), 2)
+        taker = asyncio.create_task(host.reload(), name="taker")
+        for _ in range(10):
+            await asyncio.sleep(0)
+        release.set()
+        for _ in range(10):
+            await asyncio.sleep(0)
+        finish_load.set()
+        _, pending = await asyncio.wait({first, taker, host.spawned}, timeout=3)
+        if pending:
+            for task in pending:
+                task.cancel()
+            await asyncio.wait(pending, timeout=2)
+
+        assert not pending, "the page turn and the reload waited on each other"
+        assert host.events.index(("load", "taker")) > host.events.index("turn built")
+
+    async def test_two_page_turns_that_each_need_the_turn_both_finish(self):
+        """A load started two regions' page turns without awaiting them, and
+        each turn's build called reload() while the load still held the turn.
+        Each waiting turn counted the other as still building, so both waited
+        for the other to leave and the panel never changed again."""
+        from cascadeui.views import base as base_module
+
+        class _Host(RenderableLayoutView):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.regions = {
+                    key: PaginatedRegion(items=list(range(9)), per_page=3, key=key) for key in "ab"
+                }
+                self.spawned = []
+                self.spawn = False
+                self.reloads_owed = 0
+                self._fill()
+
+            def _fill(self):
+                for key, region in self.regions.items():
+                    for i in region.page_items:
+                        self.add_item(TextDisplay(f"{key} row {i}"))
+                    for item in region.controls(self):
+                        self.add_item(item)
+
+            async def build_ui(self):
+                self.clear_items()
+                self._fill()
+                if self.reloads_owed:
+                    self.reloads_owed -= 1
+                    await self.reload()
+
+            async def on_load(self):
+                if not self.spawn:
+                    return
+                self.spawn = False
+                self.reloads_owed = len(self.regions)
+                self.spawned = [asyncio.create_task(r.show_page(1)) for r in self.regions.values()]
+                # Hold the turn until both builds have queued for it.
+                await until(
+                    lambda: all(
+                        base_module._RELOAD_WAITING.get(task) is self for task in self.spawned
+                    ),
+                    timeout=2,
+                )
+
+        host = _Host(interaction=make_interaction(), user_id=1, guild_id=2)
+        await host.send()
+        host.spawn = True
+        await asyncio.wait_for(host.reload(), 2)
+        _, pending = await asyncio.wait(set(host.spawned), timeout=3)
+        if pending:
+            for task in pending:
+                task.cancel()
+            await asyncio.wait(pending, timeout=2)
+
+        assert not pending, "the two page turns waited on each other"
+        assert [region.page for region in host.regions.values()] == [1, 1]
+
+    async def test_a_page_turn_the_render_did_not_await_holds_the_next_render(self):
+        """A state render arriving while that turn built ran beside it, and
+        ran again only once the turn ended."""
+        parked, release = asyncio.Event(), asyncio.Event()
+
+        class _Spawning(RenderableLayoutView):
+            subscribed_actions = {"JUMP", "PING"}
+
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.region = PaginatedRegion(items=list(range(9)), per_page=3, key="r")
+                self.building = self.most = self.renders = 0
+                self.spawned = None
+                self._fill()
+
+            def _fill(self):
+                for i in self.region.page_items:
+                    self.add_item(TextDisplay(f"row {i}"))
+                for item in self.region.controls(self):
+                    self.add_item(item)
+
+            async def build_ui(self):
+                self.building += 1
+                self.most = max(self.most, self.building)
+                try:
+                    self.clear_items()
+                    if self.spawned is not None and not parked.is_set():
+                        parked.set()
+                        await release.wait()
+                    self._fill()
+                finally:
+                    self.building -= 1
+
+            async def on_state_changed(self, state):
+                self.renders += 1
+                if self.spawned is None:
+                    self.spawned = asyncio.create_task(self.region.show_page(1))
+                    await asyncio.wait_for(parked.wait(), 2)
+                    return
+                await self.build_ui()
+                await self.refresh()
+
+        host = _Spawning(interaction=make_interaction(), user_id=1, guild_id=2)
+        await host.send()
+        await asyncio.wait_for(host.dispatch("JUMP"), 2)
+        await asyncio.wait_for(host.dispatch("PING"), 2)
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert host.renders == 1, "a state render ran while the page turn built"
+        release.set()
+        await asyncio.wait_for(host.spawned, 2)
+        await until(lambda: host.renders == 2)
+
+        assert host.most == 1
+
+    async def test_a_page_turn_awaited_inside_another_ones_build_does_not_wait_for_it(self):
+        """Joined turns take turns, and one a joined build itself awaits runs
+        inside that build rather than waiting for it."""
+
+        class _Nested(RenderableLayoutView):
+            subscribed_actions = {"JUMP"}
+
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.a = PaginatedRegion(items=list(range(9)), per_page=3, key="a")
+                self.b = PaginatedRegion(items=list(range(9)), per_page=3, key="b")
+                self.follow = False
+
+            def build_ui(self):
+                self.clear_items()
+                for region in (self.a, self.b):
+                    for item in region.controls(self):
+                        self.add_item(item)
+
+            async def on_state_changed(self, state):
+                self.follow = True
+                await asyncio.gather(self.a.show_page(1))
+
+            async def on_page_changed_a(self):
+                if self.follow:
+                    self.follow = False
+                    await asyncio.gather(self.b.show_page(2))
+
+        host = _Nested(interaction=make_interaction(), user_id=1, guild_id=2)
+        host.build_ui()
+        await host.send()
+        original = host.build_ui
+
+        async def build_then_follow():
+            original()
+            await host.on_page_changed_a()
+
+        host.build_ui = build_then_follow
+
+        await asyncio.wait_for(host.dispatch("JUMP"), 2)
+
+        assert (host.a.page, host.b.page) == (1, 2)
+
+    @pytest.mark.parametrize("spawn", ["await", "gather"])
+    async def test_a_page_turn_inside_a_load_hosts_own_load_raises(self, spawn):
+        """A host that renders in on_load would have to load again to show the
+        page: a direct call raised reload()'s message naming neither the
+        region nor the fix, and one through gather() waited forever."""
+
+        class _LoadHost(RenderableLayoutView):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.region = PaginatedRegion(
+                    items=[f"row {i}" for i in range(9)], per_page=3, key="r"
+                )
+                self.jump = False
+
+            async def on_load(self):
+                self.clear_items()
+                for row in self.region.page_items:
+                    self.add_item(TextDisplay(row))
+                for item in self.region.controls(self):
+                    self.add_item(item)
+                if self.jump:
+                    self.jump = False
+                    turn = self.region.show_page(2)
+                    await (turn if spawn == "await" else asyncio.gather(turn))
+
+        host = _LoadHost(interaction=make_interaction(), user_id=1, guild_id=2)
+        await host.send()
+        host.jump = True
+
+        with pytest.raises(RuntimeError, match=r"inside the on_load\(\).*set_page\(\)"):
+            await asyncio.wait_for(host.reload(), 2)
+        assert host.region.page == 0
+
+    async def test_a_page_turn_queued_behind_a_load_skips_a_host_that_closed(self):
+        host = _LoadingHost(interaction=make_interaction(), user_id=1, guild_id=2)
+        region = PaginatedRegion(per_page=2, items=list(range(6)))
+        region.controls(host)
+        host.composed.clear()
+        load = asyncio.create_task(host.load())
+        await asyncio.wait_for(host.loading.wait(), 2)
+        turning = asyncio.create_task(region.show_page(1))
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        await host.exit(delete_message=False)
+        host.release.set()
+        await asyncio.wait_for(asyncio.gather(load, turning), 2)
+
+        assert host.composed == []
+
+    async def test_a_toggle_whose_build_outlasts_a_close_ships_it_disabled(self):
+        """The close froze the half-built tree while an async build awaited.
+        The finished tree goes out after it with the controls disabled, as a
+        tab or step render's does."""
+        building, release = asyncio.Event(), asyncio.Event()
+
+        class _Host(RenderableLayoutView):
+            slow = False
+
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.more = Collapsible(label="More", reveal=lambda: TextDisplay("details"))
+
+            async def build_ui(self):
+                self.clear_items()
+                self.add_item(TextDisplay("panel"))
+                if self.slow:
+                    building.set()
+                    await release.wait()
+                for item in self.more.render(self):
+                    self.add_item(item)
+
+        host = _Host(interaction=make_interaction(), user_id=1, guild_id=2)
+        await host.build_ui()
+        host._message = MagicMock(id=42)
+        host._message.edit = AsyncMock(return_value=host._message)
+        host.slow = True
+        toggling = asyncio.create_task(host.more._toggle(make_interaction()))
+        await asyncio.wait_for(building.wait(), 2)
+
+        await host.exit(delete_message=False)
+        shipped = []
+
+        def edit(**kwargs):
+            tree = list(kwargs["view"].walk_children())
+            shipped.append(
+                (
+                    [c.content for c in tree if isinstance(c, TextDisplay)],
+                    [b.disabled for b in tree if isinstance(b, discord.ui.Button)],
+                )
+            )
+            return host._message
+
+        host._message.edit.side_effect = edit
+        release.set()
+        await asyncio.wait_for(toggling, 2)
+
+        assert shipped == [(["panel", "details"], [True])]
 
     async def test_step_next_advances_and_rerenders(self):
         region = PaginatedRegion(per_page=2, items=list(range(6)))
@@ -2662,6 +3466,18 @@ class TestCollapsibleToggle:
         assert c.expanded is True
         c.collapse()
         assert c.expanded is False
+
+    async def test_a_toggle_waits_for_a_load_in_progress(self):
+        """A toggle built the host's tree beside its load, from half-loaded data."""
+        host = _LoadingHost(interaction=make_interaction(), user_id=1, guild_id=2)
+        c = Collapsible(label="Edit", reveal=_reveal_one)
+        c.render(host)
+        host.composed.clear()
+
+        during = await _render_during_a_load(host, lambda: c._toggle(make_interaction()))
+
+        assert during == []
+        assert host.composed == [(1, 1)]
 
     async def test_toggle_expands_and_rerenders(self):
         c = Collapsible(label="Edit", reveal=_reveal_one)

@@ -43,6 +43,7 @@ corresponding bookkeeping action (:data:`APPLICATION_SLOTS_PRUNED`,
 
 import asyncio
 import contextlib
+import contextvars
 import functools
 import inspect
 import json
@@ -60,7 +61,7 @@ from ..exceptions import (
 )
 from ..state.actions import ActionCreators
 from ..utils.hooks import await_maybe
-from ..utils.responses import DISCORD_CALL_ERRORS
+from ..utils.responses import DISCORD_CALL_ERRORS, _refused_by_closed_session
 from ..utils.tasks import _bounded_wait
 from .config import (
     NAMESPACE_APPLICATION,
@@ -96,6 +97,13 @@ _NON_PERSISTABLE_KWARGS: frozenset[str] = frozenset({"persistence_key", "theme",
 # It runs inside the bot's close, so a close that never returns would keep the
 # bot from ever exiting. Above the built-in SQL backends' own five-second wait.
 _BACKEND_CLOSE_SECONDS = 10.0
+
+# The call a library prune comes from (a reattach pass or the unreachable sweep),
+# read by prune_registry(). Both prune through that public method so a subclass
+# override still sees them.
+_PRUNE_SOURCE: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "_PRUNE_SOURCE", default=None
+)
 
 
 def _bot_closed(bot: Any) -> bool:
@@ -920,8 +928,8 @@ class PersistenceManager:
           background task; its failures are logged there, not reflected in
           this bucket.) Row stays on disk; the next pass retries it.
         - ``removed`` -- channel or message returned a definitive 404
-          (``discord.NotFound``). Row deleted from disk via :meth:`prune_registry`
-          and its bookkeeping action dispatched.
+          (``discord.NotFound``). Row deleted from disk, and ``REGISTRY_PRUNED``
+          dispatched with ``reason="gone"`` and ``source="reattach"``.
         - ``unreachable`` -- channel or message could not be fetched for a
           transient reason (``Forbidden``, ``HTTPException``, or a non-messageable
           channel), or the row was rewritten mid-pass (re-posted under its
@@ -1037,7 +1045,11 @@ class PersistenceManager:
         This is the read for post-boot reconciliation. ``removed`` is the case
         that needs it: only the pass that deletes a row can report it, so a
         consumer reading ``last_reattach_summary`` after a :meth:`reattach`
-        re-drive sees an empty list and reconciles nothing.
+        re-drive sees an empty list and reconciles nothing. The pass's own
+        deletion also dispatches ``REGISTRY_PRUNED`` with ``reason="gone"``,
+        so a subscriber registered before a pass ran hears of its removals
+        both ways: act on reattach removals from one of the two, or skip a
+        key already handled.
 
         Reattach passes only. A row deleted later, by the unreachable sweep or
         by :meth:`prune_registry`, keeps whatever outcome its last pass gave
@@ -1185,7 +1197,7 @@ class PersistenceManager:
                 reachable_keys.append(persistence_key)
                 return (row, view_cls, migrated, message)
             except Exception as exc:
-                if _bot_closed(bot):
+                if _bot_closed(bot) and _refused_by_closed_session(exc):
                     # A fetch through a closed client raises; the row stays
                     # pending for the next bot rather than reading as failed.
                     logger.debug(f"Left {persistence_key!r} for the next bot: its bot closed")
@@ -1230,7 +1242,7 @@ class PersistenceManager:
             )
             if confirmed:
                 try:
-                    await self.prune_registry(persistence_keys=confirmed)
+                    await self._prune_as("reattach", confirmed, "gone")
                     summary["removed"].extend(confirmed)
                 except Exception as exc:
                     logger.warning(
@@ -1725,7 +1737,7 @@ class PersistenceManager:
 
         except Exception as exc:
             # An on_bind that reaches Discord through a closed bot raises.
-            closed = _bot_closed(self._bot)
+            closed = _bot_closed(self._bot) and _refused_by_closed_session(exc)
             if closed:
                 logger.debug(f"Left {persistence_key!r} for the next bot: its bot closed")
             else:
@@ -1739,6 +1751,8 @@ class PersistenceManager:
                 # of which must go back before the next row is tried.
                 self._store._unsubscribe(view.id)
                 self._store._undo_enabled_views.pop(view.id, None)
+                # bot.add_view() may already route the message's clicks to it.
+                view.stop()
                 if state_registered:
                     # _destroy_view clears the registry entry only once state
                     # confirms the removal, and drops a session left memberless.
@@ -2037,7 +2051,36 @@ class PersistenceManager:
 
         ``reason`` labels the ``REGISTRY_PRUNED`` dispatch so a subscriber can
         tell why a row went. Left unset it defaults to ``"explicit"`` for a
-        targeted prune and ``"clear_all"`` for a full wipe."""
+        targeted prune and ``"clear_all"`` for a full wipe. The library's own
+        prunes pass ``"gone"`` when a reattach pass or :meth:`prune_unreachable`
+        deleted rows whose channel or message returned a 404, and
+        ``"unreachable"`` when :meth:`prune_unreachable` deleted rows that
+        stayed unreachable past its cutoff. The dispatch's ``source`` names
+        the call that pruned: ``"prune_registry"`` for a direct call,
+        ``"reattach"`` for a reattach pass, and ``"prune_unreachable"`` for
+        the sweep. The pass and the sweep both prune through this method, so
+        an override sees every prune the library makes."""
+        source = _PRUNE_SOURCE.get()
+        if source is not None:
+            # Cleared on read, so a prune that a REGISTRY_PRUNED hook makes
+            # during this dispatch reports "prune_registry", not this source.
+            _PRUNE_SOURCE.set(None)
+        return await self._prune_registry(
+            persistence_keys, reason, source=source or "prune_registry"
+        )
+
+    async def _prune_as(self, source: str, persistence_keys: list[str], reason: str) -> int:
+        """Prune through :meth:`prune_registry`, its dispatch naming ``source``."""
+        token = _PRUNE_SOURCE.set(source)
+        try:
+            return await self.prune_registry(persistence_keys=persistence_keys, reason=reason)
+        finally:
+            _PRUNE_SOURCE.reset(token)
+
+    async def _prune_registry(
+        self, persistence_keys: Optional[list[str]], reason: Optional[str], *, source: str
+    ) -> int:
+        """:meth:`prune_registry`, with the ``source`` its dispatch names."""
         backend = self.registry.backend
         if backend is None:
             return 0
@@ -2094,6 +2137,7 @@ class PersistenceManager:
                 deleted,
                 reason or ("explicit" if persistence_keys else "clear_all"),
                 keys=pruned,
+                source=source,
             ),
         )
         return deleted
@@ -2121,9 +2165,12 @@ class PersistenceManager:
         second look turns that into "unreachable then, and unreachable now",
         and guarantees a row that answers today cannot be deleted.
 
-        Returns ``{"pruned": [...], "recovered": [...], "kept": [...]}`` of
-        persistence keys. Deletions route through :meth:`prune_registry`, so
-        ``REGISTRY_PRUNED`` fires with ``reason="unreachable"``.
+        Returns ``{"pruned": [...], "gone": [...], "recovered": [...],
+        "kept": [...]}`` of persistence keys; ``gone`` lists the pruned keys
+        whose channel or message returned a 404. The deletions dispatch
+        ``REGISTRY_PRUNED`` with ``source="prune_unreachable"``: one with
+        ``reason="gone"`` for those, as a reattach pass reports them, and one
+        with ``reason="unreachable"`` for the rows that aged past the cutoff.
 
         A row whose key a live panel in this process holds is kept: the panel
         owns the key, so a failed fetch says nothing about whether its row
@@ -2146,7 +2193,7 @@ class PersistenceManager:
                 f"got {older_than_days}."
             )
 
-        summary: dict[str, list[str]] = {"pruned": [], "recovered": [], "kept": []}
+        summary: dict[str, list[str]] = {"pruned": [], "gone": [], "recovered": [], "kept": []}
         backend = self.registry.backend
         if backend is None:
             return summary
@@ -2181,6 +2228,7 @@ class PersistenceManager:
 
         cutoff = int(time.time()) - older_than_days * 86400
         kill: list[str] = []
+        gone: set[str] = set()
 
         # Bounded fan-out, the same shape the reattach pass uses for the same
         # two fetches: this walk holds the registry lock, and its candidate
@@ -2218,6 +2266,7 @@ class PersistenceManager:
             elif removed_scratch:
                 # A definitive 404. Age is irrelevant; the message is gone.
                 kill.append(key)
+                gone.add(key)
             elif row["first_unreachable_at"] <= cutoff:
                 kill.append(key)
             else:
@@ -2239,9 +2288,14 @@ class PersistenceManager:
             # never checked against the live row. Kept, not pruned: deleting
             # on an unread verdict is the blindness the re-read prevents.
             summary["kept"].extend(unverified)
-            if confirmed:
-                await self.prune_registry(persistence_keys=confirmed, reason="unreachable")
-                summary["pruned"].extend(confirmed)
+            deleted = [key for key in confirmed if key in gone]
+            aged = [key for key in confirmed if key not in gone]
+            if deleted:
+                await self._prune_as("prune_unreachable", deleted, "gone")
+            if aged:
+                await self._prune_as("prune_unreachable", aged, "unreachable")
+            summary["pruned"].extend(confirmed)
+            summary["gone"].extend(deleted)
 
         logger.info(
             f"prune_unreachable: {len(summary['pruned'])} pruned, "
@@ -2346,13 +2400,12 @@ class PersistenceManager:
     async def _reopen(self) -> bool:
         """Open the backends again after :meth:`close`; ``True`` when it did.
 
-        The middleware calls this when ``setup_middleware`` runs again (a bot
-        closed and started again in the same process), when the bot connects
-        again after its close, and when a close finds the bot started again
-        while it ran. It waits out a close still running, since a restart
-        command closes from its own task. State is still in memory, so
-        nothing is rehydrated and no migration runs; the sweepers are
-        restarted by the caller.
+        The middleware calls this when ``setup_middleware`` runs again (the
+        new bot a restart in the same process builds) and when a close finds
+        a restart began while it ran. It waits out a close still running,
+        since a restart command closes from its own task. State is still in
+        memory, so nothing is rehydrated and no migration runs; the sweepers
+        are restarted by the caller.
         """
         async with self._lifecycle_lock():
             if not (self._closed or self._close_started):

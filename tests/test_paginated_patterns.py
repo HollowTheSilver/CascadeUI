@@ -8,7 +8,9 @@ import discord
 import pytest
 from discord.ui import ActionRow, Button, Container, TextDisplay
 from helpers import make_interaction as _make_interaction
+from helpers import snapshot_edits as _snapshot_edits
 
+from cascadeui import RenderOutcome
 from cascadeui.views.patterns import PaginatedLayoutView, PaginatedView
 
 # // ========================================( Button style validation )======================================== // #
@@ -1003,3 +1005,161 @@ class TestPageCursorRewindsWhenTheEditNeverLanded:
             await view._make_step_callback(1)(_make_interaction())
 
         assert view.current_page == 2
+
+
+# // ========================================( A render that outlasts a close )======================================== // #
+
+
+class TestAPageRenderThatOutlastsAClose:
+    """A cursor page render whose fetch was still running when its view
+    closed shipped nothing after the close froze the page it left. The
+    fetched page goes out with the controls as the close left them."""
+
+    @pytest.mark.parametrize("version", ["v1", "v2"])
+    async def test_the_fetched_page_ships_after_the_close(self, version):
+        fetching, release = asyncio.Event(), asyncio.Event()
+
+        async def fetch(offset, limit):
+            if offset:
+                fetching.set()
+                await release.wait()
+            return list(range(offset, offset + limit))
+
+        if version == "v1":
+            view = PaginatedView.from_cursor(
+                fetch,
+                total=10,
+                per_page=5,
+                formatter=lambda chunk: discord.Embed(title=str(chunk)),
+                interaction=_make_interaction(),
+            )
+        else:
+            view = PaginatedLayoutView.from_cursor(
+                fetch,
+                total=10,
+                per_page=5,
+                formatter=lambda chunk: [TextDisplay(str(chunk))],
+                interaction=_make_interaction(),
+            )
+        await view.send()
+        turn = asyncio.create_task(view.set_page(1))
+        await asyncio.wait_for(fetching.wait(), 2)
+        await view.exit(delete_message=False)
+        shipped = _snapshot_edits(view)
+        release.set()
+        await asyncio.wait_for(turn, 2)
+
+        assert len(shipped) == 1
+        if version == "v1":
+            assert shipped[0]["embed"].title == "[5, 6, 7, 8, 9]"
+        else:
+            assert "[5, 6, 7, 8, 9]" in shipped[0]["texts"]
+            assert shipped[0]["buttons"] and all(shipped[0]["buttons"])
+
+    @pytest.mark.parametrize("version", ["v1", "v2"])
+    async def test_a_page_render_queued_behind_the_close_never_fetches(self, version):
+        """A cursor page render that waited for the turn while its view closed
+        would fetch its page from the closed view. Only the render already
+        fetching ships; the queued one stops before it fetches."""
+        fetching, release = asyncio.Event(), asyncio.Event()
+        offsets = []
+
+        async def fetch(offset, limit):
+            offsets.append(offset)
+            if offset and not release.is_set():
+                fetching.set()
+                await release.wait()
+            return list(range(offset, offset + limit))
+
+        if version == "v1":
+            view = PaginatedView.from_cursor(
+                fetch,
+                total=10,
+                per_page=5,
+                formatter=lambda chunk: discord.Embed(title=str(chunk)),
+                interaction=_make_interaction(),
+            )
+        else:
+            view = PaginatedLayoutView.from_cursor(
+                fetch,
+                total=10,
+                per_page=5,
+                formatter=lambda chunk: [TextDisplay(str(chunk))],
+                interaction=_make_interaction(),
+            )
+        await view.send()
+        turn = asyncio.create_task(view.set_page(1))
+        await asyncio.wait_for(fetching.wait(), 2)
+        queued = asyncio.create_task(view.refresh_pages())
+        await asyncio.sleep(0)
+        await view.exit(delete_message=False)
+        shipped = _snapshot_edits(view)
+        fetched_before_release = len(offsets)
+        release.set()
+        await asyncio.wait_for(asyncio.gather(turn, queued), 2)
+
+        assert offsets[fetched_before_release:] == []
+        assert len(shipped) == 1
+
+    async def test_a_v1_page_keeps_its_embed_when_a_newer_render_set_only_the_tree(self):
+        """Another task's refresh() covered the page's tree before the close,
+        and the late render then sent nothing, so the fetched page never
+        reached the frozen panel."""
+        fetching, release = asyncio.Event(), asyncio.Event()
+
+        async def fetch(offset, limit):
+            if offset:
+                fetching.set()
+                await release.wait()
+            return list(range(offset, offset + limit))
+
+        view = PaginatedView.from_cursor(
+            fetch,
+            total=10,
+            per_page=5,
+            formatter=lambda chunk: discord.Embed(title=str(chunk)),
+            interaction=_make_interaction(),
+        )
+        await view.send()
+        turn = asyncio.create_task(view.set_page(1))
+        await asyncio.wait_for(fetching.wait(), 2)
+        view.add_item(discord.ui.Button(label="Note", disabled=True, row=4))
+        assert await view.refresh() is RenderOutcome.RENDERED
+        await view.exit(delete_message=False)
+        shipped = _snapshot_edits(view)
+        release.set()
+        await asyncio.wait_for(turn, 2)
+
+        assert [edit["embed"].title for edit in shipped if edit["embed"]] == ["[5, 6, 7, 8, 9]"]
+
+    async def test_a_v1_reload_whose_load_outlasts_the_close_ships(self):
+        """reload() decided the late render ships once on_load returned, and
+        the page render it went through declined it again on finding the view
+        closed, so a V1 paginator kept the frozen panel and reported CLOSED."""
+        building, release = asyncio.Event(), asyncio.Event()
+
+        class _Loading(PaginatedView):
+            gate = False
+
+            async def on_load(self):
+                await super().on_load()
+                if self.gate:
+                    building.set()
+                    await release.wait()
+
+        view = await _Loading.from_data(
+            items=list(range(4)),
+            per_page=2,
+            formatter=lambda chunk: discord.Embed(title=str(chunk)),
+            interaction=_make_interaction(),
+        )
+        await view.send()
+        view.gate = True
+        reload = asyncio.create_task(view.reload())
+        await asyncio.wait_for(building.wait(), 2)
+        await view.exit(delete_message=False)
+        shipped = _snapshot_edits(view)
+        release.set()
+
+        assert await asyncio.wait_for(reload, 2) is RenderOutcome.RENDERED
+        assert [edit["embed"].title for edit in shipped] == ["[0, 1]"]

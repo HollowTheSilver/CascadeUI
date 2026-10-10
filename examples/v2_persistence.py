@@ -187,8 +187,9 @@ class RoleSelectorPanel(PersistentRolesLayoutView):
     async def on_bind(self, bot):
         """Inject runtime dependencies that cannot ride the persistence round-trip.
 
-        The library calls ``on_bind`` at the start of every ``send()``, and
-        again on every restart before ``on_restore``. A panel posted days
+        The library calls ``on_bind`` at the start of every ``send()`` whose
+        interaction or context carries the bot, and again on every restart
+        before ``on_restore``. A panel posted days
         ago has no live ``bot``, database pool, or service client as a
         constructor kwarg after a restart: those objects do not serialize.
         ``on_bind`` hands them back. Stash them on ``self`` here and
@@ -197,6 +198,7 @@ class RoleSelectorPanel(PersistentRolesLayoutView):
         and role clicks run with no view instance, so neither can. The bot
         stands in for a database pool or service client in a real app.
         """
+        await super().on_bind(bot)
         self.bot = bot
 
     async def on_restore(self, bot):

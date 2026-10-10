@@ -1494,8 +1494,7 @@ class TestRetirePreviousOnSend:
             renders.append(state)
 
         old.on_state_changed = on_state_changed
-        old.subscribed_actions = None
-        store.subscribe(old.id, old._handle_state_notification, None, old._build_selector())
+        old.set_class_attribute("subscribed_actions", None)
         old.attach_child(_Slow())
         task = asyncio.create_task(old.exit())
         await asyncio.wait_for(closing.wait(), 1)

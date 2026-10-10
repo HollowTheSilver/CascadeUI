@@ -858,11 +858,92 @@ class TestSubscribers:
         store.subscribe("temp-sub", handler)
         await store.dispatch("BEFORE", {})
         await store._flush_notifications()
-        store._unsubscribe("temp-sub")
+        store.unsubscribe("temp-sub")
         await store.dispatch("AFTER", {})
         await store._flush_notifications()
 
         assert received == ["BEFORE"]
+
+    def test_unsubscribe_of_an_unknown_id_does_nothing(self):
+        get_store().unsubscribe("never-subscribed")
+
+    async def test_unsubscribe_refuses_a_sent_views_id(self):
+        """A view's subscription marks it live: dropping it made exit() skip
+        the teardown, so the view never stopped and its clicks still routed."""
+        from helpers import RenderableLayoutView, make_interaction
+
+        store = get_store()
+        view = RenderableLayoutView(interaction=make_interaction())
+        await view.send()
+
+        with pytest.raises(ValueError, match=r"view\.exit\(\)"):
+            store.unsubscribe(view.id)
+        await view.exit()
+
+        assert view.is_finished()
+        assert view.id not in store._active_views
+
+    async def test_unsubscribe_refuses_an_unsent_views_id(self):
+        """Unsubscribed before its send, a view sent nothing and stayed
+        registered, holding an instance slot."""
+        from helpers import RenderableLayoutView, make_interaction
+
+        store = get_store()
+        view = RenderableLayoutView(interaction=make_interaction())
+
+        with pytest.raises(ValueError, match="view"):
+            store.unsubscribe(view.id)
+
+        assert await view.send() is not None
+
+    async def test_subscribe_refuses_a_views_id(self):
+        """Subscribing over a view's id replaced its callback, so the view
+        stopped rendering on state changes with nothing raised."""
+        from helpers import RenderableLayoutView, make_interaction
+
+        class Watcher(RenderableLayoutView):
+            subscribed_actions = {"PING_VIEW"}
+
+        store = get_store()
+        view = Watcher(interaction=make_interaction())
+        await view.send()
+        renders = []
+
+        async def on_state_changed(state):
+            renders.append(state)
+
+        view.on_state_changed = on_state_changed
+        with pytest.raises(ValueError, match="view"):
+            store.subscribe(view.id, lambda state, action: None)
+        await view.dispatch("PING_VIEW")
+        await store._flush_notifications()
+
+        assert len(renders) == 1
+
+    async def test_a_closed_views_id_can_be_subscribed(self):
+        """Liveness was read from every subscriber, so a subscription under a
+        closed view's id made the view live again: a second exit() tore it
+        down again and removed the subscriber."""
+        from helpers import RenderableLayoutView, make_interaction
+
+        store = get_store()
+        destroyed = []
+
+        async def record(action, state):
+            destroyed.append(action["payload"]["view_id"])
+
+        view = RenderableLayoutView(interaction=make_interaction())
+        await view.send()
+        await view.exit()
+        store.on("view_destroyed", record)
+
+        store.subscribe(view.id, lambda state, action: None)
+        await view.exit()
+
+        assert view._torn_down()
+        assert destroyed == []
+        assert view.id in store.subscribers
+        store.unsubscribe(view.id)
 
     async def test_subscriber_with_no_filter_gets_everything(self):
         store = get_store()
@@ -944,6 +1025,34 @@ class TestSelectors:
         await store.dispatch("SET_COUNTER", {"value": 5})
         await store._flush_notifications()
         assert len(received) == 1
+
+    async def test_a_replaced_subscription_compares_against_its_own_selector(self):
+        """Subscribing again under the same id kept the old selector's last
+        value, so the new selector's first change was compared with it and
+        skipped when the two happened to match."""
+        store = get_store()
+        heard = []
+
+        async def stats_reducer(action, state):
+            new = copy.deepcopy(state)
+            new["application"]["stats"] = dict(action["payload"])
+            return new
+
+        store._register_reducer("SET_STATS", stats_reducer)
+        stats = lambda state: state["application"].get("stats", {})
+        store.subscribe("watcher", lambda s, a: None, selector=lambda s: stats(s).get("count"))
+        await store.dispatch("SET_STATS", {"count": 7, "level": 1})
+        await store._flush_notifications()
+
+        store.subscribe(
+            "watcher",
+            lambda s, a: heard.append(a["type"]),
+            selector=lambda s: stats(s).get("level"),
+        )
+        await store.dispatch("SET_STATS", {"count": 7, "level": 7})
+        await store._flush_notifications()
+
+        assert heard == ["SET_STATS"]
 
     async def test_selector_notifies_on_change(self):
         """Subscriber with selector should be notified when selected value changes."""
@@ -1035,7 +1144,7 @@ class TestSelectors:
 
         # Force a value into the memo
         store._last_selected["memo-sub"] = 42
-        store._unsubscribe("memo-sub")
+        store.unsubscribe("memo-sub")
 
         assert "memo-sub" not in store._last_selected
 

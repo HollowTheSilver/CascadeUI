@@ -664,7 +664,7 @@ class _NavigationMixin:
             # The deferral keeps the click from failing; refresh() re-checks the
             # message match before its own fast path.
             if current_interaction is not None:
-                await self._safe_defer(current_interaction)
+                await self.safe_defer(current_interaction)
             if new_view._message is None:
                 new_view._message = target_message
             try:
@@ -738,7 +738,7 @@ class _NavigationMixin:
         # original-response endpoint. A fast path that ran streamed any file
         # the edit carries.
         _rewind_files(direct_kwargs)
-        await self._safe_defer(current_interaction)
+        await self.safe_defer(current_interaction)
         sent = {}
 
         async def edit_original():
@@ -815,6 +815,11 @@ class _NavigationMixin:
         self._away_for_navigation = True
         self._missed_while_away = False
         self._nav_edit_started = False
+        # The navigation takes a render number of its own, as a send does:
+        # renders asked for before it sit below the number, those asked for
+        # during it above, and a redraw it leaves owed is numbered at it.
+        self._render_seq += 1
+        self._nav_began_at = self._render_seq
         self._navigation_task = asyncio.current_task()
         self._navigation_settled.clear()
 
@@ -1254,9 +1259,13 @@ class _NavigationMixin:
             # baseline no longer claims the message shows this view.
             self._arm_after_rollback = False
             if reclaim:
-                self._last_tree_digest = None
-                self._reclaim_pending = True
-            if missed:
+                self._owe_redraw()
+            if reclaim and self._timed_out:
+                # An on_timeout() that keeps the view freezes nothing, so the
+                # redraw runs as for a live view; a freeze that begins first
+                # carries it instead.
+                self._deliver_later(self._reclaim_message(render=missed))
+            elif missed:
                 # Content held while it was away ships under the frozen controls.
                 self._deliver_later(self._replay_render())
             if not self._timed_out and not self._torn_down():
@@ -1265,8 +1274,7 @@ class _NavigationMixin:
                 self._resume_close(True, _MESSAGE_FREEZE)
             return
         if reclaim:
-            self._last_tree_digest = None
-            self._reclaim_pending = True
+            self._owe_redraw()
             self._deliver_later(self._reclaim_message(render=missed))
         elif missed:
             self._deliver_later(self._replay_render())
@@ -1282,6 +1290,16 @@ class _NavigationMixin:
             and not self._refresh_armed
         ):
             self._schedule_ephemeral_refresh()
+
+    def _owe_redraw(self) -> None:
+        """Owe the redraw a failed navigation leaves, numbered as that navigation began.
+
+        Recorded now, at the rollback, because a navigation queued behind
+        this one begins before the redraw runs and moves ``_nav_began_at``.
+        """
+        self._last_tree_digest = None
+        self._reclaim_pending = True
+        self._reclaim_began = self._nav_began_at
 
     def _discard_destination(self, new_view) -> None:
         """Take down a navigation destination that never reached the message.
@@ -1343,7 +1361,14 @@ class _NavigationMixin:
         then ships with its tree, since those renders can leave the message
         carrying the discarded view's embed. An armed view skips them and
         ships its tree as it stands, the refresh button, which is put back
-        after ``nav_rebuild`` in case the hook rebuilt the tree.
+        after ``nav_rebuild`` in case the hook rebuilt the tree. A hook that
+        raises leaves the tree as it was before the hook, which still ships.
+
+        The redraw puts back the screen from before the navigation, so any part
+        of the message set by a render asked for after the navigation began
+        (content the view's own code sent while it waited, or while the hook
+        ran) stays as that render left it. A cooldown from ``refresh_cooldown_ms`` does not
+        hold the redraw back.
 
         A close that begins first and freezes the message runs the hook
         itself, and the freeze carries the content; one undone runs this
@@ -1362,33 +1387,53 @@ class _NavigationMixin:
             self._reclaim_declined = True
             return
         self._reclaim_pending = False
-        try:
-            kwargs = {}
-            nav_rebuild = getattr(self, "nav_rebuild", None)
-            if nav_rebuild is not None:
-                frozen = list(self.children) if armed else None
+        newer = self._set_since_navigation()
+        kwargs = {}
+        nav_rebuild = getattr(self, "nav_rebuild", None)
+        # A V2 hook rebuilds the tree, the one part a V2 render sets, so it
+        # does not run once a newer render has set it.
+        if nav_rebuild is not None and not (self._is_layout() and "tree" in newer):
+            shown = list(self.children)
+            try:
                 result = await await_maybe(nav_rebuild(self))
-                if frozen is not None:
-                    self.clear_items()
-                    for item in frozen:
-                        self.add_item(item)
+            except Exception as e:
+                # The view's own tree as it was before the hook (which may have
+                # rebuilt part of it) still replaces the discarded view's.
+                self._put_children(shown)
+                self._log_reclaim_failure(e)
+            else:
+                if armed:
+                    self._put_children(shown)
                 if isinstance(result, dict):
-                    kwargs = result
-            if not kwargs and self._deferred_origin:
-                # A render deferred behind a reload ships it at that reload's
-                # release; one already shipped is skipped by refresh().
-                return
-            await self.refresh(**kwargs)
-        except Exception as e:
-            # DEBUG when the bot closed meanwhile (no session to send through)
-            # or a close tore the view down while its hook ran (the hook may read
-            # what the close cleared, such as the parent link).
-            closed = self._closed_session(e)
-            logger.log(
-                logging.DEBUG if closed or self._torn_down() else logging.ERROR,
-                f"Re-rendering {type(self).__name__} after a failed navigation raised: {e}",
-                exc_info=not closed,
+                    kwargs = self._without_parts(result, newer)
+        if not kwargs and self._deferred_origin:
+            # A render deferred behind a reload ships it at that reload's
+            # release; one already shipped is skipped by refresh().
+            return
+        try:
+            # Numbered as the navigation began, so refresh() leaves out content
+            # a newer render set, including one that landed while the hook ran.
+            # The cooldown is waived because its deferred re-render would ship
+            # without this content.
+            await self._render_late(
+                self.refresh(**kwargs), self._reclaim_began, waive_cooldown=True
             )
+        except Exception as e:
+            self._log_reclaim_failure(e)
+
+    def _log_reclaim_failure(self, error: Exception) -> None:
+        """Log a redraw after a failed navigation that raised.
+
+        DEBUG when the bot closed meanwhile (no session to send through) or a
+        close tore the view down while its hook ran (the hook may read what
+        the close cleared, such as the parent link).
+        """
+        closed = self._closed_session(error)
+        logger.log(
+            logging.DEBUG if closed or self._torn_down() else logging.ERROR,
+            f"Re-rendering {type(self).__name__} after a failed navigation raised: {error}",
+            exc_info=not closed,
+        )
 
     async def _clear_on_empty_back(self, interaction) -> None:
         """Acknowledge a Back press that has nowhere to go.
@@ -1683,7 +1728,8 @@ class _NavigationMixin:
 
         A view that handed its panel on (a ``push()`` or ``pop()`` from it,
         or an ephemeral panel's Continue button) handed its children to the
-        view that took its place, so on it this closes nothing.
+        view that took its place, so on it this closes nothing. A Continue
+        still running when this is called is waited out first.
 
         Args:
             delete_message: Passed to the ``exit()`` of each child still
@@ -1697,6 +1743,7 @@ class _NavigationMixin:
                 part in: from the new view's ``on_load()`` or a ``rebuild=``
                 or ``nav_rebuild`` hook.
         """
+        await self._wait_out_reopen("exit_children()")
         self._warn_if_handed_over("exit_children()")
         method = "A parent's exit_children()"
         self._refuse_cascade_into_own_navigation(method)

@@ -146,9 +146,9 @@ summary = await store.persistence_manager.reattach_persistent_views()
   raised. (`on_restore` runs later, after the bot is ready; its failures are
   logged there, not reflected in this bucket.) Row stays on disk; the next
   pass retries it.
-- `removed`: channel or message returned a definitive 404 (`discord.NotFound`)
-  while the bot was offline, re-confirmed against the live row. Row removed
-  via `prune_registry` (which dispatches `REGISTRY_PRUNED`).
+- `removed`: channel or message returned a definitive 404 (`discord.NotFound`),
+  re-confirmed against the live row. Row removed, and `REGISTRY_PRUNED`
+  dispatched with `reason="gone"` and `source="reattach"`.
 - `unreachable`: channel or message could not be fetched for a transient reason
   (`Forbidden`, `RateLimited`, `HTTPException`, a transport failure, or a
   non-messageable channel), or the row was re-posted under its key mid-pass
@@ -173,7 +173,7 @@ mgr.unreachable_since
 # {"tickets:panel": 1754300000}
 
 await mgr.prune_unreachable(older_than_days=30)
-# {"pruned": [...], "recovered": [...], "kept": [...]}
+# {"pruned": [...], "gone": [...], "recovered": [...], "kept": [...]}
 ```
 
 `prune_unreachable` re-checks every candidate against Discord before deleting
@@ -182,8 +182,10 @@ stamp was; a row returning a definitive 404 goes regardless of age; the rest
 are deleted only if the stamp predates the cutoff. A stamp on its own is one
 observation, and a host that simply has not restarted for a month carries a
 month-old stamp from a single failure -- the second look is what turns it into
-evidence. Deletions route through `prune_registry`, so `REGISTRY_PRUNED` fires
-with `reason="unreachable"`.
+evidence. The deletions dispatch `REGISTRY_PRUNED` with
+`source="prune_unreachable"`: one with `reason="gone"` for the rows whose channel
+or message no longer exists (listed in `gone` as well), and one with
+`reason="unreachable"` for the rows that aged out.
 
 A row whose key a live panel in this process holds is kept without a fetch: the
 panel owns the key, and a failed fetch says nothing about whether its row should
@@ -240,9 +242,13 @@ holds one pass: a [re-drive](#re-driving-reattach-after-a-runtime-cog-load)
 replaces it before `on_ready` runs, and it cannot re-report a removal, because
 the row the first pass deleted is no longer there to verdict. Reconcile only
 from `removed` (a definitive 404); a key in `unreachable` may still exist and
-should be left alone. The `keys` list on the `REGISTRY_PRUNED` action carries
-the same `removed` data for a consumer that subscribes before
-`setup_middleware`.
+should be left alone. The `keys` list on the `REGISTRY_PRUNED` action with
+`reason="gone"` carries the same `removed` data for a consumer that
+subscribes before `setup_middleware`. A removal made after a subscriber
+registered, at boot or by a re-drive, reaches it both ways, so act on
+reattach removals from one of the two: the action's `source` is
+`"reattach"` for those, and `"prune_unreachable"` or `"prune_registry"` for the
+deletions that come later.
 
 ### Re-driving reattach after a runtime cog load
 
@@ -319,9 +325,15 @@ that takes longer is logged and persistence closes without it, so the bot's
 
 ### Restarting in the same process
 
-discord.py cannot log a closed bot in again, so a restart in the same
-process builds a new bot object, and its `setup_hook` runs
-`setup_middleware()` again. That passes the new bot to the installed
+A dropped gateway connection does not close the bot: with the default
+`reconnect=True`, discord.py resumes it or connects again inside
+`connect()`, and every view stays live. It closes the bot itself only on a
+close code it cannot recover from, such as a rejected token or an invalid
+shard.
+
+A closed bot cannot log in or connect again, even after `clear()`, so a
+restart in the same process builds a new bot object, and its `setup_hook`
+runs `setup_middleware()` again. That passes the new bot to the installed
 middleware and reopens persistence, which closes with the new bot from then
 on. A change made while persistence is closed is held in memory and written
 when it reopens, and the first one logs a warning, since it is lost if the
@@ -1250,13 +1262,18 @@ Inject them in `on_bind(bot)` instead:
 ```python
 class LeaderboardPanel(PersistentLeaderboardLayoutView):
     async def on_bind(self, bot):
+        await super().on_bind(bot)
         self.db = bot.db
-        self.bot = bot
 
     async def on_load(self):
         # self.db is set -- on_bind ran first
         self.entries = await self.db.fetch_standings()
 ```
+
+Call `super().on_bind(bot)` first, since a pattern class binds its own
+dependencies there. The bot itself is stored on the view before the hook
+runs, and the leaderboard exposes it as `self.bot`, so an override has no
+need to assign it.
 
 The library calls `on_bind(bot)` automatically at two points: during `send()`
 (when the bot is derivable from the construction context) and during restore,
@@ -1269,6 +1286,10 @@ view = LeaderboardPanel(context=channel, persistence_key=f"board:{board_id}")
 await view.on_bind(bot)   # channel context: no derivable bot
 await view.send()
 ```
+
+Without that call the hook does not run, and its own dependencies stay
+unbound. A `PersistentLeaderboardLayoutView` still resolves avatars: with no
+bot bound, its `bot` reads the one `PersistenceMiddleware` holds.
 
 Keep `on_bind` idempotent; it may run more than once. A sync override
 (`def on_bind`) is also accepted.

@@ -10,7 +10,7 @@ import aiohttp
 import discord
 import pytest
 from helpers import make_interaction as _make_interaction
-from helpers import until
+from helpers import refused_by_closed_session, until
 
 from cascadeui.components.inputs import Modal, TextInput
 from cascadeui.state.singleton import get_store
@@ -2779,7 +2779,7 @@ class TestContentOfARenderDeferredDuringASend:
 
         async def edit(**kwargs):
             closed.append(True)
-            raise RuntimeError("Session is closed")
+            await refused_by_closed_session()
 
         second.edit = AsyncMock(side_effect=edit)
         view = self._gated()(context=self._context([first, second]))
@@ -2814,7 +2814,7 @@ class TestContentOfARenderDeferredDuringASend:
 
         async def edit(**kwargs):
             if closed:
-                raise RuntimeError("Session is closed")
+                await refused_by_closed_session()
             return first
 
         first.edit = AsyncMock(side_effect=edit)
@@ -2846,7 +2846,7 @@ class TestContentOfARenderDeferredDuringASend:
         async def edit(**kwargs):
             if closed and "embed" in kwargs:
                 tried.append(True)
-                raise RuntimeError("Session is closed")
+                await refused_by_closed_session()
             return first
 
         first.edit = AsyncMock(side_effect=edit)
@@ -3629,7 +3629,7 @@ class TestAutoDeferErrorHandling:
         )
 
     async def test_safe_defer_bounds_a_stalled_ack(self):
-        """``_safe_defer`` cancels a stalled defer at ``auto_defer_delay`` and
+        """``safe_defer`` cancels a stalled defer at ``auto_defer_delay`` and
         swallows the timeout, so a hung Discord ack endpoint cannot pin the
         interaction lock on the socket lifetime.
         """
@@ -3645,7 +3645,7 @@ class TestAutoDeferErrorHandling:
         interaction.response.defer = AsyncMock(side_effect=stall)
 
         before = time.monotonic()
-        await view._safe_defer(interaction)  # must return, not hang
+        await view.safe_defer(interaction)  # must return, not hang
         elapsed = time.monotonic() - before
 
         assert elapsed < 2.0  # bounded by auto_defer_delay, not the 60s stall
@@ -3665,7 +3665,7 @@ class TestAutoDeferErrorHandling:
         interaction = _make_interaction(is_done=False)
         interaction.response.defer = AsyncMock(side_effect=discord.NotFound(MagicMock(), ""))
 
-        await view._safe_defer(interaction)  # must not raise
+        await view.safe_defer(interaction)  # must not raise
 
     async def test_safe_defer_swallows_other_http_ack_failure(self):
         """Any non-NotFound HTTP ack failure (e.g. 40060 already-acked) is also
@@ -3683,7 +3683,7 @@ class TestAutoDeferErrorHandling:
             side_effect=discord.HTTPException(MagicMock(status=400), {"code": 40060})
         )
 
-        await view._safe_defer(interaction)  # must not raise
+        await view.safe_defer(interaction)  # must not raise
 
     async def test_callback_error_still_triggers_on_error(self):
         """When the callback raises, on_error is called even with auto-defer active."""
@@ -3912,7 +3912,7 @@ class TestSafeDeferSwallowsInteractionResponded:
 
     The auto-defer timer can ack inside this call's own await window, and
     on 3.10/3.11 ``wait_for`` widens that window enough to lose the race.
-    The slot ends up acked either way, which is all ``_safe_defer`` wanted,
+    The slot ends up acked either way, which is all ``safe_defer`` wanted,
     so its docstring promise that a failed ack is never propagated has to
     hold for this type too.
     """
@@ -3924,11 +3924,48 @@ class TestSafeDeferSwallowsInteractionResponded:
             side_effect=discord.InteractionResponded(MagicMock())
         )
 
-        await view._safe_defer(interaction)
+        await view.safe_defer(interaction)
 
     def test_interaction_responded_is_not_an_http_exception(self):
         """The reason the explicit clause is needed rather than inherited."""
         assert not issubclass(discord.InteractionResponded, discord.HTTPException)
+
+
+class TestSafeDeferRename:
+    """safe_defer() is the public name; the guides taught the private
+    _safe_defer(), which keeps working with a warning until it is removed."""
+
+    async def test_the_old_name_warns_and_still_defers(self):
+        view = StatefulView(interaction=_make_interaction())
+        interaction = _make_interaction(is_done=False)
+
+        with pytest.warns(DeprecationWarning, match=r"call safe_defer\(\) instead") as caught:
+            await view._safe_defer(interaction)
+
+        # Attributed to the caller's line, which Python's default filters decide by.
+        assert caught[0].filename == __file__
+        interaction.response.defer.assert_awaited_once()
+
+    async def test_an_override_of_the_old_name_runs_for_the_library_ack(self):
+        acked = []
+        with pytest.warns(DeprecationWarning, match=r"rename it safe_defer\(\)"):
+
+            class _Legacy(StatefulView):
+                ack_first = True
+
+                async def _safe_defer(self, interaction):
+                    acked.append(interaction)
+                    await super()._safe_defer(interaction)
+
+        view = _Legacy(interaction=_make_interaction())
+        view.owner_only = False
+        interaction = _make_interaction(is_done=False)
+
+        with pytest.warns(DeprecationWarning, match=r"call safe_defer\(\) instead"):
+            await view._scheduled_task(_make_item(AsyncMock()), interaction)
+
+        assert acked == [interaction]
+        interaction.response.defer.assert_awaited_once()
 
 
 class TestRespondersDegradeOnTransportFailure:

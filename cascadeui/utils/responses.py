@@ -137,6 +137,22 @@ def describe_discord_error(exc: BaseException) -> str:
     return f"status={getattr(exc, 'status', '?')} code={getattr(exc, 'code', '?')}"
 
 
+def _refused_by_closed_session(error: BaseException) -> bool:
+    """Whether ``error`` is aiohttp refusing a request on a closed session.
+
+    A request through a closed discord.py client fails with a
+    ``RuntimeError`` raised in aiohttp's own code, which is how that refusal
+    differs from a ``RuntimeError`` raised by user code while the bot closes.
+    """
+    if not isinstance(error, RuntimeError):
+        return False
+    tb = error.__traceback__
+    while tb is not None and tb.tb_next is not None:
+        tb = tb.tb_next
+    module = tb.tb_frame.f_globals.get("__name__", "") if tb is not None else ""
+    return module.split(".")[0] == "aiohttp"
+
+
 def elapsed_since(interaction: discord.Interaction) -> str:
     """Time since the interaction was created, for ack diagnostics.
 

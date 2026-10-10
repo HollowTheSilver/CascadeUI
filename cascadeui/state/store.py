@@ -414,6 +414,9 @@ class StateStore:
         self.subscribers: Dict[
             str, Tuple[SubscriberFn, Optional[Set[str]], Optional[SelectorFn]]
         ] = {}
+        # Ids subscribed by views. A view's subscription is what marks it live,
+        # so the public subscribe() and unsubscribe() refuse these ids.
+        self._view_subscriptions: Set[str] = set()
 
         # Memoized selector results for change detection
         self._last_selected: Dict[str, Any] = {}
@@ -1685,7 +1688,7 @@ class StateStore:
         return [
             view
             for view in views
-            if getattr(view, "_arriving_from", None) is None and view.id in self.subscribers
+            if getattr(view, "_arriving_from", None) is None and view.id in self._view_subscriptions
         ]
 
     def get_active_views(self) -> Mapping[str, Any]:
@@ -2085,7 +2088,12 @@ class StateStore:
             # Re-checked per view, not at snapshot time: one view's hook can
             # tear another down (a parent exits its attached children, a panel
             # exits its sibling), and the snapshot predates every hook and wait.
-            if view._torn_down() or view._message is None or not message_matches(view._message):
+            if view._message is None or not message_matches(view._message):
+                continue
+            # Marked even when another view's hook closed it first (the view a
+            # push handed this message to): the deletion is why it closed.
+            view._message_deleted = True
+            if view._torn_down():
                 continue
             try:
                 await await_maybe(view.on_message_delete())
@@ -2460,6 +2468,9 @@ class StateStore:
     ) -> None:
         """Register to receive state updates.
 
+        Subscribing again under the same id replaces the earlier registration.
+        Remove it with :meth:`unsubscribe`.
+
         Args:
             subscriber_id: Unique ID for this subscriber.
             callback: Callable receiving (state, action). Sync or async.
@@ -2468,7 +2479,56 @@ class StateStore:
             selector: Optional synchronous function that extracts a slice
                       of state. When set, the subscriber is only notified
                       when the selected value changes between dispatches.
+
+        Raises:
+            ValueError: ``subscriber_id`` is a view's id. Replacing a view's
+                subscription stops it rendering on state changes.
         """
+        if subscriber_id in self._view_subscriptions:
+            raise ValueError(
+                f"subscribe({subscriber_id!r}) names a view's subscription; replacing "
+                f"it stops the view rendering on state changes. Subscribe under an id "
+                f"of your own, or set the view's subscribed_actions to change what it "
+                f"renders on."
+            )
+        self._add_subscriber(subscriber_id, callback, action_filter, selector)
+
+    def unsubscribe(self, subscriber_id: str) -> None:
+        """Stop sending state updates to a subscriber added with :meth:`subscribe`.
+
+        An id that is not subscribed is ignored, so a cleanup path can call
+        this more than once.
+
+        Raises:
+            ValueError: ``subscriber_id`` is a view's id. A view leaves the
+                store when it closes; call its ``exit()`` instead.
+        """
+        if subscriber_id in self._view_subscriptions:
+            raise ValueError(
+                f"unsubscribe({subscriber_id!r}) names a view's subscription, which "
+                f"marks the view live: without it the view is never torn down. Call "
+                f"view.exit() to close the view."
+            )
+        self._unsubscribe(subscriber_id)
+
+    def _subscribe_view(
+        self,
+        view_id: str,
+        callback: SubscriberFn,
+        action_filter: Optional[set],
+        selector: Optional[SelectorFn],
+    ) -> None:
+        """Subscribe a view under its own id, which the public methods then refuse."""
+        self._add_subscriber(view_id, callback, action_filter, selector)
+        self._view_subscriptions.add(view_id)
+
+    def _add_subscriber(
+        self,
+        subscriber_id: str,
+        callback: SubscriberFn,
+        action_filter: Optional[set],
+        selector: Optional[SelectorFn],
+    ) -> None:
         if selector is not None:
             if not callable(selector):
                 raise TypeError(
@@ -2487,17 +2547,23 @@ class StateStore:
                     f"change check runs inline in dispatch and cannot await. Read the "
                     f"slice from the state argument, and do async work in the callback."
                 )
+        # A registration replacing another starts fresh: the old selector's
+        # last value says nothing about the new one's.
+        self._forget_selected(subscriber_id)
         self.subscribers[subscriber_id] = (callback, action_filter, selector)
 
     def _unsubscribe(self, subscriber_id: str) -> None:
-        """Stop receiving state updates. Internal plumbing.
+        """Remove a subscriber, a view's included.
 
-        Called from view teardown paths. User code that subscribed via
-        ``subscribe()`` should retain the ``subscriber_id`` and call
-        this from its own cleanup path through the view lifecycle.
+        View teardown calls this; user code calls :meth:`unsubscribe`.
         """
         if subscriber_id in self.subscribers:
             del self.subscribers[subscriber_id]
+        self._view_subscriptions.discard(subscriber_id)
+        self._forget_selected(subscriber_id)
+
+    def _forget_selected(self, subscriber_id: str) -> None:
+        """Drop what the change check remembers about a subscriber's selector."""
         self._last_selected.pop(subscriber_id, None)
         self._selector_failed.discard(subscriber_id)
         self._selector_uncomparable.discard(subscriber_id)

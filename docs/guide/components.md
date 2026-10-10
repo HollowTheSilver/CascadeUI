@@ -582,14 +582,11 @@ Creates a `Container`. Strings are auto-wrapped in `TextDisplay`. Pass
 Raises `ValueError` when a child is a `Container`. Discord forbids a Container inside a Container, so `card(heading, alert(...))` is never legal -- place the alert as a sibling of the card. `alert()`, `card()` and `stats_card()` are the builders that produce one.
 
 ```python
-from cascadeui import card, divider
-from discord.ui import TextDisplay
+from cascadeui import card
 
 self.add_item(card(
-    "## My Card",
-    TextDisplay("Card content."),
-    divider(),
-    TextDisplay("-# Footer"),
+    "## Card",
+    "A container with an accent stripe.",
     color=discord.Color.blurple(),
 ))
 ```
@@ -603,10 +600,10 @@ self.add_item(card(
 Converts a dict to a formatted `TextDisplay`:
 
 ```python
-from cascadeui import key_value
+from cascadeui import card, key_value
 
-self.add_item(key_value({"Status": "Online", "Users": "42"}))
-# Renders: **Status:** Online\n**Users:** 42
+self.add_item(card("## Key Value", key_value({"Region": "EU West", "Tier": "Gold", "Rank": 14})))
+# key_value renders: **Region:** EU West\n**Tier:** Gold\n**Rank:** 14
 ```
 
 <p align="center">
@@ -621,11 +618,11 @@ second argument raises `TypeError` at construction). Pass `disabled=True` to
 render the button greyed out and non-interactive:
 
 ```python
-from cascadeui import action_section
+from cascadeui import action_section, card
 
-self.add_item(action_section(
-    "Click to refresh the dashboard",
-    label="Refresh", callback=self.refresh_data, emoji="🔄",
+self.add_item(card(
+    "## Action Section",
+    action_section("Text on the left, a button on the right.", label="Open", callback=self.open),
 ))
 ```
 
@@ -640,11 +637,11 @@ button text (pass `("On", "Off")` to relabel), and `emoji` adds a button emoji.
 Pass `disabled=True` to render the button greyed out and non-interactive:
 
 ```python
-from cascadeui import toggle_section
+from cascadeui import card, toggle_section
 
-self.add_item(toggle_section(
-    "Notifications",
-    active=self.notify, callback=self.toggle_notify,
+self.add_item(card(
+    "## Toggle Section",
+    toggle_section("Notifications", active=self.notify, callback=self.toggle_notify),
 ))
 ```
 
@@ -685,12 +682,15 @@ family for the three Section accessory shapes: action (StatefulButton), image
 and no interaction fires.
 
 ```python
-from cascadeui import link_section
+from cascadeui import card, link_section
 
-self.add_item(link_section(
-    "Full documentation is on GitHub Pages.",
-    label="Open Docs",
-    url="https://hollowthesilver.github.io/CascadeUI/",
+self.add_item(card(
+    "## Link Section",
+    link_section(
+        "A section whose accessory is a link button.",
+        label="Docs",
+        url="https://hollowthesilver.github.io/CascadeUI/",
+    ),
 ))
 ```
 
@@ -803,9 +803,9 @@ Unicode block glyphs. `value` is clamped to `[0, max_value]` so callers do
 not need to guard against overshoots.
 
 ```python
-from cascadeui import progress_bar
+from cascadeui import card, progress_bar
 
-self.add_item(progress_bar(7, 10, width=10))  # [███████░░░] 70%
+self.add_item(card("## Progress Bar", progress_bar(7, 10)))  # [██████████████░░░░░░] 70%
 ```
 
 The same bar at three values:
@@ -880,14 +880,11 @@ and emoji:
 ```python
 from cascadeui import button_row
 
-self.add_item(button_row(
-    {
-        "Save": self._save,
-        "Reset": self._reset,
-        "Cancel": self._cancel,
-    },
-    style=discord.ButtonStyle.primary,
-))
+self.add_item(button_row({
+    "First": self._first,
+    "Second": self._second,
+    "Third": self._third,
+}))
 ```
 
 <p align="center">
@@ -1508,7 +1505,7 @@ content on every mutation:
 from cascadeui import emoji_grid
 
 grid = emoji_grid(3, 3, fill="⬜", row_labels="numeric", col_labels="alpha")
-grid[(0, 1)] = "❌"                    # Set a single cell
+grid[(0, 0)] = "❌"                    # Set a single cell
 grid[(1, 1)] = "⭕"
 grid.fill_rect((2, 2), (2, 2), "❌")   # Fill a rectangle
 grid.clear()                           # Reset every cell back to fill
@@ -1563,7 +1560,7 @@ immediate mode when external state drives the rendering.
 |---|---|---|
 | `None` | `None` | No labels |
 | `"alpha"` | `None` | A-Z row labels only |
-| `None` | `"numeric"` | 0-9 column header only |
+| `None` | `"numeric"` | 1-10 column header only |
 | `"alpha"` | `"numeric"` | Both, with corner character |
 
 Presets: `"alpha"` (regional indicators, max 26) and `"numeric"` (keycap
@@ -1588,7 +1585,7 @@ Packs buttons into `ActionRow` components:
 from cascadeui import button_grid
 
 rows = button_grid(3, 3, lambda r, c: StatefulButton(
-    label=self.board[r][c],
+    label=f"{r}{c}",  # A game board passes the cell's value here instead
     callback=self._make_move(r, c),
 ))
 for row in rows:
@@ -1672,20 +1669,31 @@ Pages one slice of a `StatefulLayoutView`'s tree while the host renders everythi
     A `PaginatedLayoutView` owns the whole message, so it needs a `formatter` to render each page -- there is no other render hook to call. A `PaginatedRegion` lives inside a host view whose `build_ui()` or `on_load()` already renders everything, so it only slices the item list and the host renders the slice alongside the rest of the layout.
 
 ```python
-from cascadeui import StatefulLayoutView, PaginatedRegion, action_section, card
+from cascadeui import PaginatedRegion, StatefulLayoutView, card, divider, key_value
 
-class TaskListView(StatefulLayoutView):
-    def __init__(self, tasks, **kwargs):
+class StandingsView(StatefulLayoutView):
+    def __init__(self, *, standings, **kwargs):
         super().__init__(**kwargs)
-        self.tasks = tasks
-        self.pager = PaginatedRegion(per_page=6)
+        self.region = PaginatedRegion(items=standings, per_page=5)
+        self.build_ui()
 
     def build_ui(self):
         self.clear_items()
-        self.pager.items = self.tasks
-        rows = [action_section(t.title, label="Open", callback=self._open(t))
-                for t in self.pager.page_items]
-        self.add_item(card("## Tasks", *rows, *self.pager.controls(self)))
+        # The header and footer belong to the view and stay put on every page.
+        self.add_item(card(
+            "## Season 4 Standings",
+            key_value({"Region": "EU West", "Bracket": "Ranked", "Updated": "2m ago"}),
+        ))
+        start = self.region.page * 5 + 1
+        rows = "\n".join(
+            f"**{start + i}.** {name} • {mmr} MMR • {record}"
+            for i, (name, mmr, record) in enumerate(self.region.page_items)
+        )
+        self.add_item(card(
+            f"### Ranks {start}\N{EN DASH}{start + 4}", rows, divider(), *self.region.controls(self),
+        ))
+        self.add_item(card("-# Header and footer belong to the view. Only the middle card pages."))
+        self.add_item(self.make_nav_row(back=False, exit_label="Close"))
 ```
 
 <p align="center">
@@ -1725,10 +1733,6 @@ class FilterView(StatefulLayoutView):
         await self.refresh()
 ```
 
-<p align="center">
-  <img src="../../assets/motion/collapsible.gif" alt="A collapsible expanding and collapsing its revealed region" width="520">
-</p>
-
 `render(self)` returns the trigger alone while collapsed, or the trigger plus the `reveal()` content while expanded (order via `trigger_first`). `reveal` and `summary` run bare on every render, so a callable that is async or requires arguments raises `TypeError` at construction. Close over the host's data instead. `summary` also takes a plain string, for text that never changes. The collapse policy is the caller's -- `collapse()` after a revealed action finishes, or leave it open for multi-step use. The trigger relabels and restyles between states via `expanded_label` / `expanded_style` / `expanded_emoji`, and two collapsibles in one view need distinct `key` values.
 
 `expand()` / `collapse()` set the state programmatically and `expanded` reads it; the `on_toggle(expanded)` hook fires after every open or close for async prefetch or logging.
@@ -1753,6 +1757,27 @@ def build_ui(self):
 ```
 
 When `summary` returns an empty value (data not loaded yet), the trigger falls back to the bare button rather than rendering an empty Section.
+
+A summary with a card as the revealed region:
+
+```python
+self.details = Collapsible(
+    label="Show Details",
+    expanded_label="Hide Details",
+    summary=lambda: "**Match 14** - Gold Tier",
+    reveal=lambda: [card(key_value({"Score": "12 - 9", "Duration": "24m", "MVP": "@player"}))],
+    key="match_14",
+)
+
+def build_ui(self):
+    self.clear_items()
+    for item in self.details.render(self):
+        self.add_item(item)
+```
+
+<p align="center">
+  <img src="../../assets/motion/collapsible.gif" alt="A collapsible expanding and collapsing its revealed region" width="520">
+</p>
 
 ---
 

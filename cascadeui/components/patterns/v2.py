@@ -1,6 +1,7 @@
 # // ========================================( Modules )======================================== // #
 
 
+import contextlib
 import inspect
 import logging
 from typing import (
@@ -44,6 +45,7 @@ from ...utils.hooks import (
 from ..base import (
     StatefulButton,
     StatefulSelect,
+    _answer_buttons,
     _describe_callback,
     refuse_wrong_arity,
     require_url,
@@ -728,7 +730,9 @@ def confirm_section(
     it directly to a view alongside other content. The TextDisplay holds
     the prompt text; the ActionRow holds the confirm and cancel buttons,
     green and red by default and restyled through the two style
-    parameters below.
+    parameters below. The prompt takes one answer: once one button's
+    callback runs, a click on either button sent before its result was on
+    screen is dropped.
 
     Args:
         text: Prompt text shown above the buttons (supports markdown).
@@ -776,25 +780,30 @@ def confirm_section(
         )
     """
     _check_button_styles("confirm_section", confirm_style=confirm_style, cancel_style=cancel_style)
-    return [
-        TextDisplay(_require_text(text, "confirm_section", "text")),
-        ActionRow(
-            StatefulButton(
-                label=confirm_label,
-                style=confirm_style,
-                emoji=confirm_emoji,
-                custom_id=_stamp_custom_id(custom_id, "confirm"),
-                callback=on_confirm,
-            ),
-            StatefulButton(
-                label=cancel_label,
-                style=cancel_style,
-                emoji=cancel_emoji,
-                custom_id=_stamp_custom_id(custom_id, "cancel"),
-                callback=on_cancel,
-            ),
+    confirm, cancel = _answer_buttons(
+        "confirm_section",
+        (
+            "on_confirm",
+            on_confirm,
+            {
+                "label": confirm_label,
+                "style": confirm_style,
+                "emoji": confirm_emoji,
+                "custom_id": _stamp_custom_id(custom_id, "confirm"),
+            },
         ),
-    ]
+        (
+            "on_cancel",
+            on_cancel,
+            {
+                "label": cancel_label,
+                "style": cancel_style,
+                "emoji": cancel_emoji,
+                "custom_id": _stamp_custom_id(custom_id, "cancel"),
+            },
+        ),
+    )
+    return [TextDisplay(_require_text(text, "confirm_section", "text")), ActionRow(confirm, cancel)]
 
 
 # // ========================================( Buttons & Rows )======================================== // #
@@ -1845,16 +1854,40 @@ async def _rerender_host(view) -> None:
         return
     build = getattr(view, "build_ui", None)
     if build is not None:
-        result = build()
-        if inspect.isawaitable(result):
-            await result
-        await view.refresh()
+        # Under the host's reload turn, as a tab or wizard step render runs:
+        # a build beside a reload in progress reads what its on_load has only
+        # half written.
+        turn = getattr(view, "_within_reload_turn", None)
+        reload_turn = (
+            turn("a region or collapsible render", lineage=True)
+            if turn
+            else contextlib.nullcontext()
+        )
+        async with reload_turn:
+            # The host can close while this waits for the turn.
+            declined = getattr(view, "_declined_render", None)
+            if declined is not None and declined() is not None:
+                return
+            scope = getattr(view, "_render_scope", None)
+            with scope() if scope else contextlib.nullcontext() as began:
+                result = build()
+                if inspect.isawaitable(result):
+                    await result
+                    # As in a tab or step render: a host that closed while the
+                    # build awaited still gets the finished tree, unless a
+                    # render asked for after the build began (a closing card)
+                    # has landed or stalled, since the finished tree would
+                    # cover it.
+                    late = getattr(view, "_declined_late", None)
+                    if late is not None and await late(began) is not None:
+                        return
+            await view.refresh()
         return
     refresh_tabs = getattr(view, "_refresh_tabs", None)
     if refresh_tabs is not None:
-        await refresh_tabs()
+        await refresh_tabs(lineage=True)
         return
-    reload = getattr(view, "reload", None)
+    reload = getattr(view, "_reload_for_composite", None) or getattr(view, "reload", None)
     if reload is not None:
         await reload()
         return
@@ -2426,9 +2459,20 @@ class PaginatedRegion:
         rather than one a user asked for. The render, and the rewind when
         its edit does not land, are the same either way.
 
+        The render waits for a reload or a state render the host is already
+        running in another task, unless it runs inside that one: in the
+        host's ``on_load()`` or ``on_state_changed()``, or in a task either of
+        them started, while that run lasts
+        (``asyncio.gather(region.show_page(n))``). A host without
+        ``build_ui`` or tabs renders by running ``on_load()`` again, so inside
+        that host's ``on_load()`` the call raises and the page goes back; call
+        :meth:`set_page` there instead, before the tree is built.
+
         Raises:
             RuntimeError: The region has no host yet. Nothing moves; use
-                :meth:`set_page` to seek before the first render.
+                :meth:`set_page` to seek before the first render. Also raised
+                inside the ``on_load()`` of a host that renders by running it,
+                with the page put back.
         """
         if self._view is None:
             raise RuntimeError(

@@ -337,14 +337,16 @@ class _BaseTabMixin:
         """
         await self._refresh_tabs()
 
-    async def _refresh_tabs(self, *, previous_tab: Optional[int] = None):
+    async def _refresh_tabs(self, *, previous_tab: Optional[int] = None, lineage: bool = False):
         """Render the active tab under the view's reload turn.
 
         A tab builder is awaited while the view's content is being rebuilt,
         so a reload running at the same time would interleave its own
-        rebuild and ship duplicated components.
+        rebuild and ship duplicated components. ``lineage`` joins a turn held
+        by the task that started this one, for a region or collapsible in a
+        tab turned from the host's own ``on_load()`` or ``on_state_changed()``.
         """
-        async with self._within_reload_turn("a tab render"):
+        async with self._within_reload_turn("a tab render", lineage=lineage):
             declined = self._declined_render()
             if declined is not None:
                 return declined
@@ -527,7 +529,7 @@ class TabView(_BaseTabMixin, StatefulView):
         return {"embed": await await_maybe(builder())}
 
     async def _reload_render(self) -> Optional[RenderOutcome]:
-        return await self._refresh_tabs()
+        return await self._render_tabs()
 
     async def _render_tabs(self, *, previous_tab: Optional[int] = None) -> Optional[RenderOutcome]:
         """Mutate tab button styles in place and rebuild active content.
@@ -540,13 +542,13 @@ class TabView(_BaseTabMixin, StatefulView):
 
         tab_name = self._tab_names[self._active_tab]
         builder = self._tabs[tab_name]
-        embed = await await_maybe(builder())
-        declined = self._declined_render()
+        with self._render_scope() as began:
+            content = {"embed": await await_maybe(builder())}
+        declined = await self._declined_late(began, content)
         if declined is not None:
-            # The view changed while this awaited: torn down, or armed.
             return declined
 
-        outcome = await self.refresh(embed=embed)
+        outcome = await self.refresh(**content)
         await self._rewind_tab(previous_tab)
         return outcome
 
@@ -638,38 +640,51 @@ class TabLayoutView(_BaseTabMixin, StatefulLayoutView):
         and ``_refresh_tabs`` runs it on a tab click; both need the same
         tree, so neither owns a private copy of this sequence. An instance
         override of ``tab_overflow_policy`` or ``auto_exit_button`` takes
-        effect here.
+        effect here. The builder runs before the tree is touched, so a close
+        meanwhile freezes the tree the last render left, not a tab row with
+        nothing under it.
         """
-        self._sync_tab_styles()
-        if self.tab_overflow_policy != self._tab_rows_policy:
-            self._lay_tab_rows()
-        self._match_auto_exit("tab_exit", extras=self._extra_items)
+        self._apply_tab_tree(*await self._build_tab_content())
 
-        # Clear and re-add in order: tab rows, content, extras.
-        self.clear_items()
-        for row in self._tab_rows:
-            self.add_item(row)
+    async def _build_tab_content(self) -> Tuple[int, list]:
+        """Run the active tab's builder, leaving the tree as it is.
 
-        tab_name = self._tab_names[self._active_tab]
-        builder = self._tabs[tab_name]
+        Returns the tab it built with the content, since a click can move
+        the cursor while the builder awaits.
+        """
+        index = self._active_tab
+        builder = self._tabs[self._tab_names[index]]
         # Tab builders run inside the view's theme context so card()
         # calls in user builders inherit the view's accent colour.
         from ...theming.context import theme_context
 
         with theme_context(self.get_theme()):
             content = await await_maybe(builder())
+        return index, (content if isinstance(content, list) else [content])
 
-        if isinstance(content, list):
+    def _apply_tab_tree(self, index: int, content: list) -> None:
+        """Lay the tree out for tab ``index``: tab rows, ``content``, extras.
+
+        The cursor reads as ``index`` while it runs, so the row and every
+        hook it calls name the tab built, not one a click moved to since.
+        """
+        moved, self._active_tab = self._active_tab, index
+        try:
+            self._sync_tab_styles()
+            if self.tab_overflow_policy != self._tab_rows_policy:
+                self._lay_tab_rows()
+            self._match_auto_exit("tab_exit", extras=self._extra_items)
+            self.clear_items()
+            for row in self._tab_rows:
+                self.add_item(row)
             for item in content:
                 self.add_item(item)
-        else:
-            self.add_item(content)
-
-        for extra in self._extra_items:
-            self.add_item(extra)
-
-        # Restore the navigation back button if push() added one.
-        self._restore_navigation_artifacts()
+            for extra in self._extra_items:
+                self.add_item(extra)
+            # Restore the navigation back button if push() added one.
+            self._restore_navigation_artifacts()
+        finally:
+            self._active_tab = moved
 
     async def on_load(self) -> None:
         """Build the active tab's content before the view is displayed.
@@ -691,11 +706,12 @@ class TabLayoutView(_BaseTabMixin, StatefulLayoutView):
         ``_build_extra_items()`` keep their identity across refreshes;
         only the tab content children are rebuilt.
         """
-        await self._compose_tab_tree()
-        declined = self._declined_render()
+        with self._render_scope() as began:
+            index, content = await self._build_tab_content()
+        declined = await self._declined_late(began)
         if declined is not None:
-            # The view changed while this awaited: torn down, or armed.
             return declined
+        self._apply_tab_tree(index, content)
         outcome = await self.refresh()
         await self._rewind_tab(previous_tab)
         return outcome

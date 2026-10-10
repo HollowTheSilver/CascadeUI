@@ -15,7 +15,7 @@ import pytest
 from discord.ui import ActionRow, Button, Container
 from discord.ui import File as UIFile
 from discord.ui import LayoutView, MediaGallery, Section, Separator, TextDisplay, Thumbnail
-from helpers import RenderableLayoutView
+from helpers import RenderableLayoutView, arm
 from helpers import make_interaction as _make_interaction
 from helpers import schedule_bounded_waits_as_before_312, until
 
@@ -1412,10 +1412,11 @@ class TestReloadSerialization:
 
         return Panel
 
-    async def test_a_reload_that_outlives_an_exit_leaves_the_frozen_panel_alone(self):
+    async def test_a_reload_that_outlives_an_exit_ships_its_tree_disabled(self):
         """A reload from a task the view does not own (a consumer's refresh
         loop) finished after exit() froze the panel and shipped live buttons
-        onto it."""
+        onto it. The tree it built goes out with the buttons the close
+        disabled, and a reload queued behind it never loads."""
         gate = asyncio.Event()
         view = self._gated_panel(gate, "initial", "reloaded")(interaction=_make_interaction())
         await view.send()
@@ -1424,14 +1425,136 @@ class TestReloadSerialization:
         queued = asyncio.create_task(view.reload())
         await asyncio.sleep(0)
         await view.exit()
-        edits = view._message.edit.await_count
+        shipped = []
+
+        def edit(**kwargs):
+            tree = list(kwargs["view"].walk_children())
+            texts = [c.content for c in tree if isinstance(c, TextDisplay)]
+            buttons = [(b.label, b.disabled) for b in tree if isinstance(b, Button)]
+            shipped.append((texts, buttons))
+            return view._message
+
+        view._message.edit.side_effect = edit
 
         gate.set()
         outcomes = await asyncio.wait_for(asyncio.gather(in_flight, queued), timeout=2)
 
-        assert outcomes == [RenderOutcome.NO_MESSAGE, RenderOutcome.NO_MESSAGE]
-        assert view._message.edit.await_count == edits
+        assert outcomes == [RenderOutcome.RENDERED, RenderOutcome.CLOSED]
+        assert shipped == [(["reloaded"], [("Go", True)])]
         assert view.loads == 2  # the queued reload never ran on_load on the dead view
+
+    async def test_a_closing_card_sent_before_the_exit_survives_a_reload(self):
+        """The guide's closing shape, a card through refresh() and then
+        exit(delete_message=False), lost its card to a reload still loading
+        at the close: the reload shipped its tree over the card."""
+        gate = asyncio.Event()
+        view = self._gated_panel(gate, "initial", "reloaded")(interaction=_make_interaction())
+        await view.send()
+        in_flight = asyncio.create_task(view.reload())
+        await asyncio.sleep(0)
+        view.clear_items()
+        view.add_item(TextDisplay("Goodbye"))
+        assert await view.refresh() is RenderOutcome.RENDERED
+        await view.exit(delete_message=False)
+        shipped = []
+
+        def edit(**kwargs):
+            tree = list(kwargs["view"].walk_children())
+            shipped.append([c.content for c in tree if isinstance(c, TextDisplay)])
+            return view._message
+
+        view._message.edit.side_effect = edit
+        gate.set()
+
+        assert await asyncio.wait_for(in_flight, 2) is RenderOutcome.CLOSED
+        assert shipped == []
+
+    async def test_a_reload_that_shows_its_own_loading_card_still_ships_after_a_close(self):
+        """The reload's own interim refresh() counted as a render asked for
+        after the reload began, so a close during the fetch left the panel
+        frozen on "Loading..." instead of the loaded data."""
+        shown, fetched = asyncio.Event(), asyncio.Event()
+
+        class Panel(RenderableLayoutView):
+            loading = False
+
+            async def on_load(self):
+                if not self.loading:
+                    return
+                self.clear_items()
+                self.add_item(TextDisplay("Loading..."))
+                await self.refresh()
+                shown.set()
+                await fetched.wait()
+                self.clear_items()
+                self.add_item(TextDisplay("New data"))
+
+        view = Panel(interaction=_make_interaction())
+        await view.send()
+        view.loading = True
+        in_flight = asyncio.create_task(view.reload())
+        await asyncio.wait_for(shown.wait(), 2)
+        await view.exit(delete_message=False)
+        shipped = []
+
+        def edit(**kwargs):
+            tree = list(kwargs["view"].walk_children())
+            shipped.append([c.content for c in tree if isinstance(c, TextDisplay)])
+            return view._message
+
+        view._message.edit.side_effect = edit
+        fetched.set()
+
+        assert await asyncio.wait_for(in_flight, 2) is RenderOutcome.RENDERED
+        assert shipped == [["New data"]]
+
+    async def test_a_reload_from_a_task_an_earlier_reload_started_takes_its_own_number(self):
+        """A task started inside a reload copied that reload's number and kept
+        it after the reload returned, so its own later reload counted a render
+        that landed in between as newer, and declined after a close."""
+        go, loading, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        spawned = []
+
+        class Panel(RenderableLayoutView):
+            phase = "first"
+
+            async def on_load(self):
+                if self.phase == "spawn":
+                    self.phase = "idle"
+                    spawned.append(asyncio.create_task(self._later()))
+                elif self.phase == "gated":
+                    loading.set()
+                    await release.wait()
+                self.clear_items()
+                self.add_item(TextDisplay(f"loaded {self.phase}"))
+
+            async def _later(self):
+                await go.wait()
+                self.phase = "gated"
+                return await self.reload()
+
+        view = Panel(interaction=_make_interaction())
+        await view.send()
+        view.phase = "spawn"
+        await view.reload()
+        view.clear_items()
+        view.add_item(TextDisplay("click render"))
+        assert await view.refresh() is RenderOutcome.RENDERED
+        go.set()
+        await asyncio.wait_for(loading.wait(), 2)
+        await view.exit(delete_message=False)
+        shipped = []
+
+        def edit(**kwargs):
+            tree = list(kwargs["view"].walk_children())
+            shipped.append([c.content for c in tree if isinstance(c, TextDisplay)])
+            return view._message
+
+        view._message.edit.side_effect = edit
+        release.set()
+
+        assert await asyncio.wait_for(spawned[0], 2) is RenderOutcome.RENDERED
+        assert shipped == [["loaded gated"]]
 
     async def test_a_reload_that_outlives_a_push_leaves_the_destination_alone(self):
         gate = asyncio.Event()
@@ -1448,7 +1571,7 @@ class TestReloadSerialization:
 
         gate.set()
 
-        assert await asyncio.wait_for(reload, timeout=2) is RenderOutcome.NO_MESSAGE
+        assert await asyncio.wait_for(reload, timeout=2) is RenderOutcome.CLOSED
         assert message.edit.await_count == edits
 
     async def test_a_reload_declined_during_a_failed_push_runs_after_the_rollback(self):
@@ -1574,7 +1697,7 @@ class TestLoad:
                 calls.append("on_load")
 
         view = self._sent(Loader)
-        view._refresh_armed = True
+        await arm(view)
 
         assert await view.load() is False
         assert calls == []
@@ -2452,6 +2575,175 @@ class TestRenderSeamsHoldTheReloadTurn:
         assert "load() on Loader has waited" in caplog.text
         assert "for load() to release" in caplog.text
 
+    async def test_a_long_wait_for_a_page_turn_still_building_is_logged(self, monkeypatch, caplog):
+        """A page turn a state render started without awaiting kept building
+        after the render ended, and a reload() waited for it with the lock
+        free. The warning was armed only for a held lock, so that wait was
+        silent however long it lasted."""
+        from cascadeui import PaginatedRegion
+        from cascadeui.views import base as base_module
+
+        monkeypatch.setattr(base_module, "_RELOAD_WAIT_WARN_SECONDS", 0.05)
+        parked, release = asyncio.Event(), asyncio.Event()
+
+        class Host(RenderableLayoutView):
+            subscribed_actions = {"JUMP"}
+
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.region = PaginatedRegion(items=list(range(9)), per_page=3, key="r")
+                self.spawned = None
+                self._fill()
+
+            def _fill(self):
+                for i in self.region.page_items:
+                    self.add_item(TextDisplay(f"row {i}"))
+                for item in self.region.controls(self):
+                    self.add_item(item)
+
+            async def build_ui(self):
+                self.clear_items()
+                if not parked.is_set():
+                    parked.set()
+                    await release.wait()
+                self._fill()
+
+            async def on_state_changed(self, state):
+                self.spawned = asyncio.create_task(self.region.show_page(1))
+                await asyncio.wait_for(parked.wait(), 2)
+
+        view = Host(interaction=_make_interaction(), user_id=1, guild_id=2)
+        await view.send()
+        try:
+            with caplog.at_level(logging.WARNING):
+                await asyncio.wait_for(view.dispatch("JUMP"), 2)
+                reloading = asyncio.create_task(view.reload())
+                await asyncio.sleep(0.15)
+                assert not reloading.done(), "the reload did not wait for the page turn"
+        finally:
+            release.set()
+        await asyncio.wait_for(asyncio.gather(view.spawned, reloading), 2)
+
+        assert "reload() on Host has waited" in caplog.text
+        assert "for a region or collapsible render to finish building" in caplog.text
+
+    async def test_a_long_wait_between_two_page_turns_is_logged(self, monkeypatch, caplog):
+        """Two regions' page turns gathered from one state render take turns
+        building, and the second waited for the first however long its build
+        hung, with nothing logged."""
+        from cascadeui import PaginatedRegion
+        from cascadeui.views import base as base_module
+
+        monkeypatch.setattr(base_module, "_RELOAD_WAIT_WARN_SECONDS", 0.05)
+        building, release = asyncio.Event(), asyncio.Event()
+
+        class Host(RenderableLayoutView):
+            subscribed_actions = {"JUMP"}
+
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.a = PaginatedRegion(items=list(range(9)), per_page=3, key="a")
+                self.b = PaginatedRegion(items=list(range(9)), per_page=3, key="b")
+                self.hang = False
+                self._fill()
+
+            def _fill(self):
+                for region in (self.a, self.b):
+                    for i in region.page_items:
+                        self.add_item(TextDisplay(f"row {i}"))
+                    for item in region.controls(self):
+                        self.add_item(item)
+
+            async def build_ui(self):
+                self.clear_items()
+                if self.hang:
+                    self.hang = False
+                    building.set()
+                    await release.wait()
+                self._fill()
+
+            async def on_state_changed(self, state):
+                self.hang = True
+                await asyncio.gather(self.a.show_page(1), self.b.show_page(1))
+
+        view = Host(interaction=_make_interaction(), user_id=1, guild_id=2)
+        await view.send()
+        try:
+            with caplog.at_level(logging.WARNING):
+                render = asyncio.create_task(view.dispatch("JUMP"))
+                await asyncio.wait_for(building.wait(), 2)
+                await asyncio.sleep(0.15)
+        finally:
+            release.set()
+        await asyncio.wait_for(render, 2)
+
+        assert "a region or collapsible render on Host has waited" in caplog.text
+        assert "for a region or collapsible render to finish building" in caplog.text
+
+    @pytest.mark.parametrize("waiter", ["reload", "page_turn"])
+    async def test_a_cancelled_wait_for_a_page_turn_logs_nothing_later(
+        self, monkeypatch, caplog, waiter
+    ):
+        """A wait for a page turn still building armed its warning and was
+        cancelled before handing the warning back to be cancelled, so the
+        warning fired afterwards for a wait that had already ended."""
+        from cascadeui import PaginatedRegion
+        from cascadeui.views import base as base_module
+
+        monkeypatch.setattr(base_module, "_RELOAD_WAIT_WARN_SECONDS", 0.05)
+        parked, release = asyncio.Event(), asyncio.Event()
+        keys = "r" if waiter == "reload" else "ab"
+
+        class Host(RenderableLayoutView):
+            subscribed_actions = {"JUMP"}
+
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.regions = [
+                    PaginatedRegion(items=list(range(9)), per_page=3, key=key) for key in keys
+                ]
+                self.spawned = []
+                self.hang = False
+                self._fill()
+
+            def _fill(self):
+                for region in self.regions:
+                    for i in region.page_items:
+                        self.add_item(TextDisplay(f"row {i}"))
+                    for item in region.controls(self):
+                        self.add_item(item)
+
+            async def build_ui(self):
+                self.clear_items()
+                if self.hang:
+                    self.hang = False
+                    parked.set()
+                    await release.wait()
+                self._fill()
+
+            async def on_state_changed(self, state):
+                self.hang = True
+                self.spawned = [asyncio.create_task(r.show_page(1)) for r in self.regions]
+                await asyncio.wait_for(parked.wait(), 2)
+                for _ in range(20):
+                    await asyncio.sleep(0)
+
+        view = Host(interaction=_make_interaction(), user_id=1, guild_id=2)
+        await view.send()
+        await asyncio.wait_for(view.dispatch("JUMP"), 2)
+        waiting = asyncio.create_task(view.reload()) if waiter == "reload" else view.spawned[1]
+        for _ in range(20):
+            await asyncio.sleep(0)
+        with caplog.at_level(logging.WARNING):
+            waiting.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await waiting
+            release.set()
+            await asyncio.wait_for(view.spawned[0], 2)
+            await asyncio.sleep(0.2)
+
+        assert "has waited" not in caplog.text
+
     async def test_a_refresh_baseline_digests_the_tree_its_edit_serializes(self, monkeypatch):
         """Before 3.12 the bound runs its coroutine as a task whose first step
         runs on a later loop iteration, so work queued ahead of it could
@@ -2658,7 +2950,8 @@ class TestReloadDisposition:
                 loads.append(1)
 
         view = self._sent_view(Loader)
-        view._refresh_armed = True
+        await arm(view)
+        view._last_tree_digest = None  # as an arming edit that did not land leaves it
 
         outcome = await view.reload()
 
@@ -2737,7 +3030,8 @@ class TestReloadDisposition:
         requeueing on the flag would respawn a successor after every dispatch
         until the token cliff."""
         view = self._sent_view()
-        view._refresh_armed = True
+        await arm(view)
+        view._last_tree_digest = None  # as an arming edit that did not land leaves it
         view._reload_pending = True  # latched before the view armed
 
         await view._deferred_refresh(0)
@@ -4883,6 +5177,195 @@ class TestRenderDigestWireCoverage:
         without_rule = self._digest_of(card(TextDisplay("a"), TextDisplay("b")))
 
         assert with_rule != without_rule
+
+
+class TestASelectPickRedraws:
+    """The client shows a select's pick until the message is edited, so a
+    render answering a pick ships even over an unchanged tree. A callback
+    that refused the pick twice for the same reason skipped the second
+    edit, and the refused pick stayed on screen."""
+
+    @staticmethod
+    async def _picker(kind):
+        view = RenderableLayoutView(interaction=_make_interaction())
+        await view.send()
+        outcomes = []
+
+        async def refuse(interaction):
+            outcomes.append(await view.refresh())
+
+        options = [discord.SelectOption(label=n, value=n) for n in ("saved", "a", "b")]
+        if kind == "stateful":
+            item = StatefulSelect(custom_id="pick", options=options, callback=refuse)
+        elif kind == "raw":
+            item = discord.ui.Select(custom_id="pick", options=options)
+            item.callback = refuse
+        else:
+            item = Button(custom_id="pick", label="Go")
+            item.callback = refuse
+        view.add_item(ActionRow(item))
+        return view, item, outcomes
+
+    @staticmethod
+    def _click(view, component_type):
+        interaction = _make_interaction(message=view._message)
+        interaction.data = {"component_type": component_type, "custom_id": "pick", "values": ["b"]}
+        return interaction
+
+    @pytest.mark.parametrize("kind", ["raw", "stateful"])
+    async def test_a_second_refused_pick_redraws(self, kind):
+        view, item, outcomes = await self._picker(kind)
+
+        await view._scheduled_task(item, self._click(view, 3))
+        await view._scheduled_task(item, self._click(view, 3))
+
+        assert outcomes == [RenderOutcome.RENDERED, RenderOutcome.RENDERED]
+
+    async def test_a_refused_pick_the_cooldown_defers_still_redraws(self):
+        """The deferred re-render runs on a task started inside the pick, so
+        it still answers the pick and must not be skipped."""
+        view, item, outcomes = await self._picker("raw")
+        view.refresh_cooldown_ms = 100
+        edits = []
+        view._message.edit.side_effect = lambda **kw: edits.append(kw) or view._message
+
+        await view._scheduled_task(item, self._click(view, 3))
+        await view._scheduled_task(item, self._click(view, 3))
+
+        assert outcomes == [RenderOutcome.RENDERED, RenderOutcome.DEFERRED]
+        await until(lambda: len(edits) == 2, timeout=2)
+
+    async def test_a_button_click_over_an_unchanged_tree_still_skips(self):
+        view, item, outcomes = await self._picker("button")
+
+        await view._scheduled_task(item, self._click(view, 2))
+        await view._scheduled_task(item, self._click(view, 2))
+
+        assert outcomes == [RenderOutcome.RENDERED, RenderOutcome.SKIPPED]
+
+    @staticmethod
+    async def _board(callback, **attrs):
+        """A sent view whose ``build_ui`` draws a board and one select."""
+
+        class Board(StatefulLayoutView):
+            def build_ui(self):
+                self.clear_items()
+                self.add_item(TextDisplay("board"))
+                options = [discord.SelectOption(label=n, value=n) for n in ("a", "b")]
+                self.add_item(
+                    ActionRow(StatefulSelect(custom_id="pick", options=options, callback=callback))
+                )
+
+        for name, value in attrs.items():
+            setattr(Board, name, value)
+        view = Board(interaction=_make_interaction())
+        view.build_ui()
+        await view.send()
+        return view, view.children[1].children[0]
+
+    async def test_a_task_the_pick_starts_skips_an_unchanged_tree(self):
+        """A pick is owed one redraw. A task its callback started (a ticker
+        the dropdown turns on) kept skipping the digest check for its life."""
+        outcomes, tickers = [], []
+
+        async def tick():
+            for _ in range(3):
+                outcomes.append(await view.refresh())
+
+        async def start(interaction):
+            tickers.append(asyncio.create_task(tick()))
+
+        view, select = await self._board(start)
+        await view._scheduled_task(select, self._click(view, 3))
+        await tickers[0]
+
+        assert outcomes == [RenderOutcome.RENDERED, RenderOutcome.SKIPPED, RenderOutcome.SKIPPED]
+
+    async def test_a_pick_its_callback_answers_is_drawn_once(self):
+        """A view rendering on every action re-rendered after the callback's
+        own answer, shipping the unchanged tree a second time."""
+
+        async def refuse(interaction):
+            view.build_ui()
+            await view.refresh()
+
+        view, select = await self._board(refuse, subscribed_actions=None)
+        before = view._message.edit.await_count
+        click = self._click(view, 3)
+
+        await view._scheduled_task(select, click)
+        await view.state_store._flush_notifications()
+
+        assert click.response.edit_message.await_count == 1
+        assert view._message.edit.await_count == before
+
+    async def test_a_pick_deferred_behind_a_reload_still_redraws(self):
+        """The pick's render waited for a reload another task held, and that
+        reload's render and the replay ran outside the pick and skipped."""
+        gate = asyncio.Event()
+
+        async def keep(interaction):
+            pass
+
+        view, select = await self._board(keep, subscribed_actions=None)
+
+        async def slow_load(self):
+            await gate.wait()
+            self.build_ui()
+
+        type(view).on_load = slow_load
+        reload_task = asyncio.create_task(view.reload())
+        await until(lambda: view._reload_lock.locked())
+        before = view._message.edit.await_count
+        click = self._click(view, 3)
+
+        await view._scheduled_task(select, click)
+        gate.set()
+        outcome = await reload_task
+        await view.state_store._flush_notifications()
+        await view.task_manager.wait_tasks(view.id)
+
+        assert outcome is RenderOutcome.RENDERED
+        assert click.response.edit_message.await_count == 0
+        assert view._message.edit.await_count == before + 1
+
+    async def test_a_render_in_flight_at_the_pick_leaves_it_owed(self):
+        """A render asked for before the pick can reach Discord before the user
+        picks, so its landing does not take the pick off the screen."""
+
+        async def keep(interaction):
+            pass
+
+        view, select = await self._board(keep)
+        gate = asyncio.Event()
+
+        async def slow_edit(**kwargs):
+            await gate.wait()
+            return view._message
+
+        view._message.edit = AsyncMock(side_effect=slow_edit)
+        view._last_tree_digest = None  # so the render in flight ships
+        in_flight = asyncio.create_task(view.refresh())
+        await until(lambda: view._message.edit.await_count == 1)
+
+        await view._scheduled_task(select, self._click(view, 3))
+        gate.set()
+
+        assert await in_flight is RenderOutcome.RENDERED
+        assert await view.refresh() is RenderOutcome.RENDERED
+
+    async def test_a_view_sent_again_owes_no_redraw(self):
+        """The new message shows no pick, so an unchanged render skips there."""
+
+        async def keep(interaction):
+            pass
+
+        view, select = await self._board(keep)
+        await view._scheduled_task(select, self._click(view, 3))
+        view.interaction = _make_interaction()
+        await view.send()
+
+        assert await view.refresh() is RenderOutcome.SKIPPED
 
 
 class _FakeResponse:
@@ -7388,6 +7871,317 @@ class TestDisplayLayoutView:
             DisplayLayoutView(interaction=interaction)
 
 
+class _StoringState:
+    """A connection state with discord.py's own view store and no HTTP."""
+
+    def __init__(self):
+        from discord.ui.view import ViewStore
+
+        self.allowed_mentions = None
+        self.http = MagicMock()
+        self.http.send_message = AsyncMock(return_value={})
+        self._view_store = ViewStore(self)
+        self._next_id = 9000
+
+    def create_message(self, *, channel, data):
+        self._next_id += 1
+        message = MagicMock(id=self._next_id, channel=channel, guild=None, flags=None)
+        message.edit = AsyncMock(return_value=message)
+        return message
+
+    def store_view(self, view, message_id=None):
+        self._view_store.add_view(view, message_id)
+
+
+class _StoringChannel(discord.abc.Messageable):
+    """A text channel whose sends go through discord.py's ``Messageable.send``,
+    so discord.py decides whether to store the view and time it out."""
+
+    id = 555
+
+    def __init__(self):
+        self._state = _StoringState()
+
+    async def _get_channel(self):
+        return self
+
+
+class _LocalAdapter:
+    """Answers interaction responses and followups as Discord would; nothing
+    leaves the process. ``during`` runs while a response is in flight, and
+    ``refuse_followups`` answers every followup with a server error."""
+
+    def __init__(self, *, during=None, refuse_followups=False):
+        self.next_message_id = 7000
+        self.during = during
+        self.refuse_followups = refuse_followups
+
+    async def create_interaction_response(self, *args, **kwargs):
+        if self.during is not None:
+            self.during()
+        self.next_message_id += 1
+        return {"interaction": {"id": "1", "response_message_id": str(self.next_message_id)}}
+
+    async def execute_webhook(self, *args, **kwargs):
+        if self.refuse_followups:
+            raise discord.HTTPException(MagicMock(status=500, reason="Server Error"), "boom")
+        self.next_message_id += 1
+        return {"id": str(self.next_message_id), "channel_id": "888"}
+
+
+class _ResponseParent:
+    """The parts of a ``discord.Interaction`` that ``InteractionResponse`` reads."""
+
+    def __init__(self, state):
+        self._state = state
+        self.id = 1
+        self.token = "t"
+        self._session = None
+        self.channel = None
+        self.message = None
+        self.type = discord.InteractionType.application_command
+
+
+def _responding_interaction(adapter=None, *, answered=False):
+    """An interaction whose response is discord.py's own ``InteractionResponse``,
+    so ``send_message`` stores the view as it does for a bot. With
+    ``answered`` the command was already deferred, and a send goes out
+    through discord.py's own followup ``Webhook``."""
+    from discord.webhook import async_ as webhook_async
+
+    state = _StoringState()
+    state.http.proxy = None
+    state.http.proxy_auth = None
+    state._get_client = lambda: None
+    webhook_async.async_context.set(adapter or _LocalAdapter())
+    interaction = _make_interaction()
+    interaction.response = discord.InteractionResponse(_ResponseParent(state))
+    if answered:
+        interaction.response._response_type = (
+            discord.InteractionResponseType.deferred_channel_message
+        )
+        interaction.followup = discord.Webhook.from_state(
+            data={"id": "1", "type": 3, "token": "t", "application_id": "1"}, state=state
+        )
+    return interaction
+
+
+class _CardWithButton(StatefulLayoutView):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.add_item(card("## hello"))
+        self.add_item(ActionRow(StatefulButton(label="go", custom_id="go")))
+
+
+class TestAViewWithNothingToClickTimesOut:
+    """discord.py starts a view's timeout only when it stores the view: every
+    view an interaction response sends, and otherwise only a view with
+    something to click. A card with nothing to click sent to a channel or as
+    a followup stayed registered, with its subscriber and instance slot,
+    until ``exit()``."""
+
+    async def test_a_card_with_nothing_to_click_times_out(self):
+        view = DisplayLayoutView(context=_StoringChannel(), container=card("## hi"), timeout=0.2)
+        await view.send()
+
+        assert view._view_store() is None
+        await until(view._torn_down, timeout=3)
+        assert view.id not in get_store()._active_views
+
+    async def test_a_card_sent_as_a_response_is_put_off_by_each_landed_edit(self):
+        """discord.py stores every view an interaction response sends, so it
+        timed a response-sent card from the send, and its edits (which store
+        only a view with a control) never put that off: a card kept current
+        by state renders closed while its edits were still landing."""
+        view = DisplayLayoutView(
+            interaction=_responding_interaction(), container=TextDisplay("one"), timeout=60
+        )
+        await view.send()
+        assert view._view_store() is not None
+        await asyncio.sleep(0.05)  # past the coarse clock of Windows before 3.13
+        before = time.monotonic()
+
+        view.clear_items()
+        view.add_item(TextDisplay("two"))
+        assert await view.refresh() == RenderOutcome.RENDERED
+
+        assert view._BaseView__timeout_expiry >= before + 60
+        await view.exit()
+
+    async def test_an_ephemeral_view_keeps_a_timeout_of_none(self):
+        """discord.py gives an ephemeral response's None a 900 s timeout, so
+        the view ended while its Continue button still showed, and sending it
+        again declined the handoff (900 is not past 900)."""
+        view = DisplayLayoutView(
+            interaction=_responding_interaction(), container=TextDisplay("one"), timeout=None
+        )
+        await view.send(ephemeral=True)
+
+        assert view.timeout is None
+        assert view._BaseView__timeout_expiry is None
+        await view.exit()
+
+    async def test_an_ephemeral_view_without_the_handoff_keeps_discord_pys_timeout(self):
+        """With the Continue handoff declined, nothing but its timeout ends an
+        ephemeral panel the user dismissed. Put back to None, the panel would
+        hold its instance slot until a restart and, with an ``instance_limit``
+        under "reject", lock its user out, so discord.py's 900 s stays."""
+
+        class _NoHandoff(DisplayLayoutView):
+            auto_refresh_ephemeral = False
+
+        view = _NoHandoff(
+            interaction=_responding_interaction(), container=TextDisplay("one"), timeout=None
+        )
+        await view.send(ephemeral=True)
+
+        assert view.timeout == 15 * 60
+        await view.exit()
+
+    async def test_an_ephemeral_resend_refused_at_the_followup_keeps_a_timeout_of_none(self):
+        """discord.py gives the view 900 s before a followup's request is
+        made, so a re-send that Discord refused left the live panel with a
+        timeout that ended it while its Continue button showed, and the next
+        send declined the handoff."""
+        view = _CardWithButton(interaction=_responding_interaction(), timeout=None)
+        await view.send(ephemeral=True)
+        view.interaction = _responding_interaction(
+            _LocalAdapter(refuse_followups=True), answered=True
+        )
+
+        with pytest.raises(discord.HTTPException):
+            await view.send(ephemeral=True)
+
+        assert view.timeout is None
+        assert view._refresh_handoff is True
+        await view.exit()
+
+    @pytest.mark.parametrize("ephemeral", [False, True], ids=["public", "ephemeral"])
+    async def test_a_timeout_set_while_the_post_is_in_flight_is_kept(self, ephemeral):
+        """The library put None back over any timeout that differed after the
+        post, so one assigned by other code while the post was in flight was
+        lost, on public sends too, and the view never timed out."""
+        adapter = _LocalAdapter(during=lambda: setattr(view, "timeout", 600))
+        view = DisplayLayoutView(
+            interaction=_responding_interaction(adapter), container=TextDisplay("one"), timeout=None
+        )
+
+        await view.send(ephemeral=ephemeral)
+
+        assert view.timeout == 600
+        await view.exit()
+
+    async def test_a_900_set_during_a_public_post_is_kept(self):
+        """discord.py gives 900 seconds only to an ephemeral view, so on a
+        public send a 900 came from other code. A view declaring
+        ``auto_refresh_ephemeral = True`` reads as handing off on any send,
+        and the restore put None back over it."""
+
+        class _Handoff(DisplayLayoutView):
+            auto_refresh_ephemeral = True
+
+        adapter = _LocalAdapter(during=lambda: setattr(view, "timeout", 15 * 60))
+        view = _Handoff(
+            interaction=_responding_interaction(adapter), container=TextDisplay("one"), timeout=None
+        )
+
+        await view.send()
+
+        assert view.timeout == 15 * 60
+        await view.exit()
+
+    async def test_a_timeout_discord_py_runs_cancels_the_library_timer(self):
+        """A card that gained a button is timed by discord.py from then on;
+        when that timer ends the view, the library's own timer was left
+        scheduled, holding the closed view until it fired."""
+        view = DisplayLayoutView(interaction=_make_interaction(), container=card("## hi"))
+        view.timeout = 60
+        await view.send()
+        timer = view._idle_timer
+
+        view._dispatch_timeout()  # what discord.py's timer does at its expiry
+
+        assert timer is not None and timer.cancelled()
+        await until(view._torn_down, timeout=3)
+
+    async def test_a_view_with_a_button_is_timed_by_discord_py(self):
+        view = _CardWithButton(context=_StoringChannel(), timeout=0.2)
+        await view.send()
+
+        assert view._view_store() is not None
+        await until(view._torn_down, timeout=3)
+
+    async def test_a_click_still_puts_off_the_timeout_of_a_view_with_a_button(self):
+        """The library's timer counts from the last edit, discord.py's from
+        the last click as well; run beside it, the library's timed the view
+        out under a user who had just clicked."""
+        view = _CardWithButton(context=_StoringChannel(), timeout=0.2)
+        await view.send()
+        # What a click does (_scheduled_task moves discord.py's expiry).
+        view._BaseView__timeout_expiry = time.monotonic() + 30
+
+        await asyncio.sleep(0.6)
+
+        assert not view.is_finished()
+        await view.exit()
+
+    async def test_the_library_stands_down_once_a_render_adds_a_button(self):
+        """A card that later gains a button is stored then, and discord.py's
+        timer, which a click puts off, takes over from the library's."""
+        from discord.ui.view import ViewStore
+
+        view = DisplayLayoutView(interaction=_make_interaction(), container=card("## hi"))
+        view.timeout = 0.2
+        await view.send()
+        assert view._idle_timer is not None
+        view.add_item(ActionRow(StatefulButton(label="go", custom_id="go")))
+        # The edit that ships the button stores the view, as Message.edit does.
+        ViewStore(MagicMock()).add_view(view, view.message.id)
+        view._BaseView__timeout_expiry = time.monotonic() + 30
+
+        await asyncio.sleep(0.6)
+
+        assert not view.is_finished()
+        await view.exit()
+
+    async def test_each_landed_edit_puts_the_timeout_off(self):
+        """discord.py restarts a stored view's timeout at every edit; a card
+        kept up to date by its edits stays live as long as they keep coming."""
+        view = DisplayLayoutView(interaction=_make_interaction(), container=TextDisplay("one"))
+        view.timeout = 60
+        await view.send()
+        view._last_landed -= 120  # the post landed two minutes ago
+
+        view.clear_items()
+        view.add_item(TextDisplay("two"))
+        assert await view.refresh() == RenderOutcome.RENDERED
+        view._time_out_unstored()
+
+        assert not view.is_finished()
+        await view.exit()
+
+    async def test_a_screen_with_nothing_to_click_pushed_onto_a_view_times_out(self):
+        source = RenderableLayoutView(interaction=_make_interaction())
+        await source.send()
+
+        screen = await source.push(DisplayLayoutView, container=card("## detail"), timeout=0.2)
+
+        assert screen._message is not None
+        await until(screen._torn_down, timeout=3)
+
+    async def test_exit_cancels_the_timer(self):
+        """Left scheduled, the loop holds a closed view until the timeout
+        would have elapsed, which can be a day."""
+        view = DisplayLayoutView(interaction=_make_interaction(), container=card("## hi"))
+        view.timeout = 86400
+        await view.send()
+        timer = view._idle_timer
+
+        await view.exit()
+
+        assert timer is not None and timer.cancelled()
+
+
 class TestRateLimitSchedulesARetry:
     """A rate-limit arms the backoff window; something must still ship the edit.
 
@@ -8133,7 +8927,8 @@ class TestReloadRespectsArmedRefresh:
         view._message.id = 999
         view._message.edit = AsyncMock()
         view._webhook_message = None
-        view._refresh_armed = True
+        await arm(view)
+        view._last_tree_digest = None  # as an arming edit that did not land leaves it
 
         await view.reload()
 
@@ -9340,7 +10135,7 @@ class TestRendersAfterTheCloseShipDisabledControls:
 
         outcome = await view.refresh()
 
-        assert outcome is RenderOutcome.NO_MESSAGE
+        assert outcome is RenderOutcome.CLOSED
         assert message.edit.await_count == edits
 
     async def test_a_link_button_stays_enabled(self):

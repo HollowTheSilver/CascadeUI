@@ -286,7 +286,7 @@ class _BasePaginatedMixin:
         if self._is_cursor_mode and self.pages:
             self._clamp_page()
         if self._is_cursor_mode and self.pages and self.pages[self.current_page] is None:
-            await self._ensure_page_loaded(self.current_page)
+            await self._load_current_page()
 
     def _clamp_page(self) -> None:
         """Pull ``current_page`` back into range for the current page list.
@@ -610,6 +610,23 @@ class _BasePaginatedMixin:
         self._touch_cache(page_idx)
         self._evict_if_needed()
 
+    async def _load_current_page(self) -> None:
+        """Load the page ``current_page`` names, following a turn made meanwhile.
+
+        A page turn queued behind this load moves the cursor before it waits,
+        so the page fetched first may no longer be the one to show, and a
+        render would show a page never loaded. On a closed view no later turn
+        loads anything, so the cursor goes back to the page this load fetched.
+        """
+        page = self.current_page
+        await self._ensure_page_loaded(page)
+        while self.current_page != page:
+            if self._torn_down():
+                self.current_page = page
+                return
+            page = self.current_page
+            await self._ensure_page_loaded(page)
+
     def _touch_cache(self, page_idx: int) -> None:
         """Mark ``page_idx`` as most-recently-used in the LRU tracker."""
         self._page_cache_order.pop(page_idx, None)
@@ -915,7 +932,7 @@ class PaginatedView(_BasePaginatedMixin, StatefulView):
         """
         if self.pages:
             self._clamp_page()
-            await self._ensure_page_loaded(self.current_page)
+            await self._load_current_page()
         self._match_controls()
         if self.pages and not {"content", "embed", "embeds"} & send_kwargs.keys():
             send_kwargs.update(self._extract_page(self.pages[self.current_page]))
@@ -956,7 +973,7 @@ class PaginatedView(_BasePaginatedMixin, StatefulView):
         return self._extract_page(self.pages[self.current_page])
 
     async def _reload_render(self) -> Optional[RenderOutcome]:
-        return await self._update_page()
+        return await self._render_page()
 
     async def _render_page(self, *, previous_page: Optional[int] = None) -> Optional[RenderOutcome]:
         """Mutate nav buttons in place and refresh the page content.
@@ -979,13 +996,13 @@ class PaginatedView(_BasePaginatedMixin, StatefulView):
 
         # Cursor mode: load the target page before extracting content. No-op
         # for eager mode and for cached cursor pages.
-        await self._ensure_page_loaded(self.current_page)
-        declined = self._declined_render()
+        with self._render_scope() as began:
+            await self._load_current_page()
+        page_kwargs = self._extract_page(self.pages[self.current_page])
+        declined = await self._declined_late(began, page_kwargs)
         if declined is not None:
-            # The view changed while this awaited: torn down, or armed.
             return declined
 
-        page_kwargs = self._extract_page(self.pages[self.current_page])
         self._match_controls()
         outcome = await self.refresh(**page_kwargs)
         self._rewind_page(previous_page)
@@ -1365,7 +1382,7 @@ class PaginatedLayoutView(_BasePaginatedMixin, StatefulLayoutView):
         self._restore_navigation_artifacts()
         self._tree_built_for = self._tree_inputs()
 
-    async def _render_page(self, *, previous_page: Optional[int] = None):
+    async def _render_page(self, *, previous_page: Optional[int] = None) -> Optional[RenderOutcome]:
         """Mutate nav in place, rebuild page content, preserve extra items.
 
         Removes only the current page-content children and re-adds new
@@ -1377,14 +1394,14 @@ class PaginatedLayoutView(_BasePaginatedMixin, StatefulLayoutView):
         callers leave it ``None``.
         """
         if not self.pages:
-            return
+            return None
 
         # Cursor mode: load the target page before reading its content.
         # No-op for eager mode and for cached cursor pages.
-        await self._ensure_page_loaded(self.current_page)
-        declined = self._declined_render()
+        with self._render_scope() as began:
+            await self._load_current_page()
+        declined = await self._declined_late(began)
         if declined is not None:
-            # The view changed while this awaited: torn down, or armed.
             return declined
 
         # A stale nav set (the page count crossed jump_threshold, or an
@@ -1393,8 +1410,9 @@ class PaginatedLayoutView(_BasePaginatedMixin, StatefulLayoutView):
         if not self._nav_is_stale():
             self._sync_nav_state()
         self._recompose_page_tree()
-        await self.refresh()
+        outcome = await self.refresh()
         self._rewind_page(previous_page)
+        return outcome
 
     def _match_page_tree(self) -> None:
         # A V2 tree IS the content, so the restore rebuilds it or the next

@@ -14,7 +14,7 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 from enum import Enum
 from types import SimpleNamespace
-from typing import Any, Awaitable, Callable, ClassVar, Dict, Optional, Set, Tuple
+from typing import AbstractSet, Any, Awaitable, Callable, ClassVar, Dict, Optional, Set, Tuple
 from urllib.parse import unquote, urlsplit
 
 import aiohttp
@@ -38,6 +38,7 @@ from ..utils.hooks import await_maybe, call_hook_safe, is_async_callable
 from ..utils.responses import (
     DISCORD_CALL_ERRORS,
     _note_stalled_render,
+    _refused_by_closed_session,
     _rewind_files,
     ack_backstop,
     describe_discord_error,
@@ -104,6 +105,18 @@ _RELOAD_WAITING: Dict[asyncio.Task, Any] = {}
 # walk cannot see a holder that awaits a child task instead of a lock.
 _RELOAD_WAIT_WARN_SECONDS = 30.0
 
+# Marks of the reload turns and state renders this task runs inside. A task
+# started inside one copies the set, so it can tell it runs inside that turn
+# or render.
+_RELOAD_LINEAGE: contextvars.ContextVar = contextvars.ContextVar(
+    "cascadeui_reload_lineage", default=frozenset()
+)
+
+# [view, number, task] of a render in progress that can outlast its view's close
+# (see _StatefulMixin._render_scope). A task started inside the render copies
+# the value.
+_LATE_RENDER: contextvars.ContextVar = contextvars.ContextVar("cascadeui_late_render", default=None)
+
 # Task -> the view whose close it is waiting to run. A close about to wait
 # follows holder -> waited-on view -> holder through it; reaching its own task
 # means the holder waits on it, so it leaves its request with the holder.
@@ -136,6 +149,14 @@ _NON_RECONSTRUCTIBLE_KWARGS = frozenset(
     }
 )
 
+# Methods the guides taught under a private name, as (old name, public name).
+# A subclass override of the old name is called through the public one until
+# the old name is removed.
+_RENAMED_METHODS = (
+    ("_build_refresh_button", "build_refresh_button"),
+    ("_safe_defer", "safe_defer"),
+)
+
 # Backoff for a 429 with no ``Retry-After``. discord.py retries ordinary rate
 # limits itself; the 429 it raises without one is its Cloudflare case (no
 # ``Via`` header, or a body that is not JSON): the whole bot blocked at the
@@ -158,11 +179,8 @@ _ACTING_INTERACTION_TYPES = (
     discord.InteractionType.modal_submit,
 )
 
-# A render made later than it was asked for: (view, the number of the render
-# it stands for, whether it is that render sent again, the task running it,
-# a cell holding True until it returns). See _late_render. One sent again (a
-# stalled answer, content held during a send) skips the cooldown, whose
-# deferred re-render runs from state and would drop the keywords it carries.
+# A render made later than it was asked for. Set by _render_late, whose
+# docstring lists the tuple's fields; read through _late_render.
 _RENDER_ORIGIN: contextvars.ContextVar = contextvars.ContextVar(
     "cascadeui_render_origin", default=None
 )
@@ -243,11 +261,19 @@ class RenderOutcome(str, Enum):
       nothing is scheduled to retry it. The definitively-dropped case also
       reports through :attr:`_StatefulMixin.refresh_degraded`; a stalled
       request is indeterminate, so only the disposition covers it.
-    - ``NO_MESSAGE``: no editable message remains. The view has not been
-      sent, the render runs inside the view's own ``send()`` (which ships
-      the tree), the message was deleted, an ephemeral's webhook token has
-      expired, or a reload found the view torn down (exited, timed out, or
-      navigated away from) by the time its turn came. Retrying cannot help.
+    - ``NO_MESSAGE``: no editable message remains, and not because the view
+      closed itself. The view has not been sent, the render runs inside the
+      view's own ``send()`` (which ships the tree), the message was deleted
+      out from under the view (a render after the teardown that deletion
+      starts reports it too), or an ephemeral's webhook token has expired.
+      Retrying cannot help.
+    - ``CLOSED``: the view closed itself (exited, timed out, navigated away
+      from, or released when its bot closed) and the render edited nothing:
+      a reload or a page, tab, or step render whose turn came after the
+      close, or a render after the close deleted the message or left the
+      view without one. ``refresh()`` on a closed view whose message is
+      still up ships the controls as the close left them and reports
+      ``RENDERED``.
     """
 
     RENDERED = "rendered"
@@ -255,6 +281,7 @@ class RenderOutcome(str, Enum):
     DEFERRED = "deferred"
     DROPPED = "dropped"
     NO_MESSAGE = "no_message"
+    CLOSED = "closed"
 
     def __str__(self) -> str:
         # str() of a str-mixin enum member differs across the supported
@@ -364,6 +391,10 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
     # Subclass config: slot names saved to disk, registered at class
     # definition (as ``access_slot(..., persistent=True)`` would).
     persistent_slots: ClassVar[tuple] = ()
+
+    # Action types that trigger on_state_changed. Empty means none but UNDO
+    # and REDO, which pass every filter; None means all.
+    subscribed_actions: Optional[AbstractSet[str]] = frozenset()
 
     # Subclass config: enable undo/redo support
     enable_undo: bool = False
@@ -975,36 +1006,29 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         cls._validate_class_attributes()
         _register_view_class(cls)
 
-        # The Continue button's builder was documented as the private
-        # _build_refresh_button(); an override of that name is called through
-        # the public one until the old name is removed. The override is found
-        # the way Python finds a method, so one on a plain mixin counts too; a
-        # view class above this one already had its own definition handled.
-        owner = next(
-            (
-                klass
-                for klass in cls.__mro__
-                if "build_refresh_button" in klass.__dict__
-                or "_build_refresh_button" in klass.__dict__
-            ),
-            None,
-        )
-        legacy = owner.__dict__.get("_build_refresh_button") if owner is not None else None
-        if (
-            legacy is not None
-            and owner is not _InteractionMixin
-            and (owner is cls or not issubclass(owner, _StatefulMixin))
-        ):
-            if "build_refresh_button" in owner.__dict__:
-                note = f"{owner.__qualname__}.build_refresh_button() is the one called"
-            else:
-                cls.build_refresh_button = legacy
-                note = "it is called through the new name until then"
-            warn_deprecated(
-                f"{owner.__qualname__} overrides _build_refresh_button(), which is "
-                f"deprecated and will be removed in {REMOVED_IN}: rename it "
-                f"build_refresh_button(); {note}."
+        # An override of a renamed method's old name is found the way Python
+        # finds a method, so one on a plain mixin counts too; a view class
+        # above this one already had its own definition handled.
+        for old, new in _RENAMED_METHODS:
+            owner = next(
+                (k for k in cls.__mro__ if new in k.__dict__ or old in k.__dict__),
+                None,
             )
+            legacy = owner.__dict__.get(old) if owner is not None else None
+            if (
+                legacy is not None
+                and owner is not _InteractionMixin
+                and (owner is cls or not issubclass(owner, _StatefulMixin))
+            ):
+                if new in owner.__dict__:
+                    note = f"{owner.__qualname__}.{new}() is the one called"
+                else:
+                    setattr(cls, new, legacy)
+                    note = "it is called through the new name until then"
+                warn_deprecated(
+                    f"{owner.__qualname__} overrides {old}(), which is deprecated and "
+                    f"will be removed in {REMOVED_IN}: rename it {new}(); {note}."
+                )
 
         # A selector runs inline in dispatch, where nothing awaits it, so an
         # async one returns a new coroutine every time and the view is
@@ -1250,11 +1274,19 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         # handle that can edit its embeds, until the 15-minute token expires.
         self._message = None
         self._webhook_message = None
+        # The message was deleted out from under the view, not by its own
+        # close: a render that finds the view closed by the teardown that
+        # followed still reports NO_MESSAGE (see _closed_outcome).
+        self._message_deleted = False
         self._ephemeral = False
         # When the Continue button arms (refresh_warning_seconds before the
         # send token's 900s window closes), so a re-schedule after a
         # rolled-back navigation sleeps only the time that remains.
         self._ephemeral_arm_deadline = None
+        # discord.py times only a view it stores; one it never stored (a card sent
+        # to a channel or as a followup) is timed out by the library (_note_landed).
+        self._idle_timer: Optional[asyncio.TimerHandle] = None
+        self._last_landed = 0.0
         # What auto_refresh_ephemeral=None resolved to (from timeout, or the
         # navigation source). An explicit declaration wins over it.
         self._refresh_handoff_resolved: Optional[bool] = None
@@ -1277,6 +1309,10 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         # message in a teardown edit (a failed navigation's nav_rebuild). A
         # late render asked for before it would ship its tree over it.
         self._redrawn_at: int = 0
+        # A redraw marked before the teardown edit carrying it lands: what its
+        # marks replaced and its number, and the edit's outcome while in flight.
+        self._redraw_marks: Optional[Tuple[Dict[str, int], int]] = None
+        self._redraw_landing: Optional[asyncio.Future] = None
         # V2: the mention rules of the newest render that changed the message,
         # its number, and what its tree showed. A V2 edit rebuilds mentions
         # from the whole tree, so every one carries these.
@@ -1325,6 +1361,8 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         self._attached_to = None
 
         self._refresh_armed: bool = False
+        # The top-level items the arming installed, which refresh() puts back.
+        self._armed_children: list = []
         # One warning per view: the seams that check it run on every edit.
         self._text_budget_warned: bool = False
         self._reopen_in_flight: bool = False
@@ -1372,6 +1410,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         self._reload_lock = asyncio.Lock()
         self._reload_task: Optional[asyncio.Task] = None
         self._reload_label: Optional[str] = None
+        self._reload_mark: Optional[object] = None
         # A render that could not run while another task held the reload
         # turn or was sending the view (a state notification, a refresh); the
         # turn's release, or the end of the send, replays it.
@@ -1433,6 +1472,11 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         # A failed navigation owes this view a redraw that has not run yet; a
         # freeze that begins first ships the content in its own edit.
         self._reclaim_pending = False
+        # The render number when the last push or pop from this view began,
+        # and the one the owed redraw is numbered at: renders asked for after
+        # that navigation began are newer than its redraw.
+        self._nav_began_at = 0
+        self._reclaim_began = 0
         # The redraw found a close under way and left it to that close; an
         # undone close runs it again.
         self._reclaim_declined = False
@@ -1450,6 +1494,14 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         self._render_task: Optional[asyncio.Task] = None
         self._render_idle = asyncio.Event()
         self._render_idle.set()
+        # That render's lineage mark, as _reload_mark is a reload turn's.
+        self._render_mark: Optional[object] = None
+        # Tasks running inside a reload turn or state render they joined by
+        # lineage, each with a mark per nested join. One the holder started
+        # and did not await can outlast it, so the next turn and state render
+        # wait for it.
+        self._joiners: Dict[asyncio.Task, list] = {}
+        self._joiner_left = asyncio.Event()
         # The task sending or closing this view, and whether it is a send. A
         # close that finds the turn held records itself: it waits out another
         # close, and a send carries it out.
@@ -1510,20 +1562,24 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             else:
                 self.session_id = f"{class_key}:user_{self.user_id}:{uuid.uuid4().hex[:8]}"
 
-        # Read through the MRO, so a base class's declaration is inherited, and
-        # copied per instance. Empty means none but UNDO and REDO, which pass
-        # every filter; None means all.
-        if not hasattr(type(self), "subscribed_actions"):
-            self.subscribed_actions: Optional[Set[str]] = set()
-        else:
-            declared = type(self).subscribed_actions
-            self.subscribed_actions = None if declared is None else set(declared)
+        # Copied per instance, so an override on one view leaves the class
+        # alone. Read past the base's own default, which sits ahead of a mixin
+        # listed after the view class in the MRO.
+        declared = next(
+            (
+                klass.__dict__["subscribed_actions"]
+                for klass in type(self).__mro__
+                if klass is not _StatefulMixin and "subscribed_actions" in klass.__dict__
+            ),
+            _StatefulMixin.subscribed_actions,
+        )
+        self.subscribed_actions = None if declared is None else set(declared)
 
         # Build selector from the view's state_selector method (if overridden)
         selector = self._build_selector()
 
         # Subscribe to state updates with action filter and selector
-        self.state_store.subscribe(
+        self.state_store._subscribe_view(
             self.id, self._handle_state_notification, self.subscribed_actions, selector
         )
 
@@ -1960,8 +2016,8 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
 
         Raises:
             RuntimeError: The view has closed, is closing, or is already being
-                sent, or the call comes from inside a push or pop the view
-                takes part in.
+                sent, or the call comes from inside its own Continue or a push
+                or pop the view takes part in.
             asyncio.CancelledError: The send was cancelled. Before Discord
                 accepted the message, the send is rolled back; after, the
                 step the cancel lands in is cut and the steps after it still
@@ -1970,9 +2026,15 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 A cut close of the message a re-send left finishes on its own.
                 A close requested during the send goes on after it returns.
         """
-        # A push or pop hands the view's message to another view, which would
+        # A push or pop hands the view's message to another view, and a
+        # Continue hands the panel to a replacement, either of which would
         # leave this send posting a view already torn down.
-        await self._wait_out_navigation("send()")
+        while True:
+            await self._wait_out_navigation("send()")
+            await self._wait_out_reopen("send()")
+            reopening = self._reopen_task not in (None, asyncio.current_task())
+            if self._navigation_in_flight() is None and not reopening:
+                break
         self._refuse_send()
         self._lifecycle_task = asyncio.current_task()
         self._lifecycle_sending = True
@@ -2196,6 +2258,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         # tree while it is serialized. Rollbacks release the turn first, since
         # their hooks may reload this view. A cancel once the message is posted
         # is held in ``cut`` until the rest of the send has run.
+        declared_timeout = self.timeout
         turn = contextlib.AsyncExitStack()
         try:
             await turn.enter_async_context(self._reload_turn("send()"))
@@ -2214,6 +2277,16 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     send_kwargs, ephemeral, send_defer_task, turn, cut=cut
                 )
             finally:
+                if (
+                    ephemeral
+                    and declared_timeout is None
+                    and self.timeout == 15 * 60.0
+                    and self._refresh_handoff
+                ):
+                    # discord.py replaces an ephemeral view's None with 900 s,
+                    # even for a followup that then fails, and that would end the
+                    # panel while its Continue button still shows.
+                    self.timeout = None
                 self._stand_down(send_defer_task)
                 # Cleared before the turn is released, so the release replays
                 # a render deferred during the send against the new message.
@@ -2229,6 +2302,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             # digest, which refresh() only trusts when it is passed no kwargs.
             self._has_rendered = True
             self._last_tree_digest = shipped_digest
+            self._note_landed()
 
             await self._post_send_step(
                 "recording its message in the state store",
@@ -2310,25 +2384,28 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         runtime dependencies here.
         """
 
-    async def _post_send_step(self, what: str, run: Callable[[], Any], cut: _HeldCancel) -> None:
+    async def _post_send_step(self, what: str, run: Callable[[], Any], cut: _HeldCancel) -> Any:
         """Run one step of a send whose message Discord has accepted, logging a failure.
 
         The message is live, so a raise would report a send that happened,
         and one failed step does not skip the rest: a middleware raising on
         the message's state row would otherwise leave a re-sent panel's
-        registration on the message the send then leaves open.
+        registration on the message the send then leaves open. Returns what
+        ``run`` returned, or ``None`` when it raised or a cancel cut it.
         """
         try:
             result = run()
             if inspect.isawaitable(result):
-                await _hold_cancel(result, cut)
+                result = await _hold_cancel(result, cut)
+            return result
         except Exception as e:
             logger.error(
                 f"{type(self).__name__} was sent, but {what} raised "
-                f"{type(e).__name__}: {e}. The message is posted, and the send goes "
-                f"on with its other steps.",
+                f"{type(e).__name__}: {e}. The message is posted, and the steps after "
+                f"this one still run.",
                 exc_info=e,
             )
+            return None
 
     async def _after_send(self, message) -> None:
         """Finish a send that posted ``message`` and was not closed or stopped meanwhile.
@@ -2345,6 +2422,13 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             raise RuntimeError(
                 f"{name}.send() was called while the view is already being sent. "
                 f"Fix: await the first send() before sending the view again."
+            )
+        if self._reopen_task is not None:
+            raise RuntimeError(
+                f"{name}.send() was called inside the view's own Continue, from "
+                f"build_reopen_view() or a hook of the replacement's send. The panel is "
+                f"being handed to the replacement. Fix: let the Continue send the "
+                f"replacement, and act on view.current_view once it has."
             )
         if self._successor is not None or self._discarded:
             raise RuntimeError(
@@ -2544,6 +2628,12 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         self._mention_rules = (send_kwargs.get("allowed_mentions"), posted_at, posted_shows)
 
         # -- Stage 6: message re-fetch for token-free editing --
+        self._message_deleted = False
+        # A new message comes with a new token, so an arming of the old one is over.
+        self._refresh_armed = False
+        self._armed_children = []
+        # And it shows no pick the old one's client was holding.
+        self._pick_owed = None
         # A channel discord.py cannot resolve has nothing to fetch through; the
         # view keeps the message it has.
         if (
@@ -2859,6 +2949,12 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 logger.debug(f"[viewstore-trace] clear_items trace failed: {e}")
         return result
 
+    def _put_children(self, children: list[Item]) -> None:
+        """Make ``children`` this view's top-level items, in order."""
+        self.clear_items()
+        for item in children:
+            self.add_item(item)
+
     @staticmethod
     def _fit_custom_id(anchor: str) -> str:
         """Bring a generated anchor under Discord's 100-character cap.
@@ -3062,10 +3158,54 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         interpreter. Callers bind the message the edit targets before the
         wrap (``functools.partial``): read inside it, the attribute could
         already be ``None`` from a concurrent refresh that found it deleted.
+        A landed edit restarts the timeout the library runs for a view
+        discord.py does not time (:meth:`_note_landed`).
         """
         digest = self._shipped_digest()
         await edit()
+        self._note_landed()
         return digest
+
+    def _note_landed(self) -> None:
+        """Record a post or edit that landed, and put the view's timeout off.
+
+        A view times out ``timeout`` seconds after its last click or landed
+        edit. discord.py runs the timer only for a view it stores (every
+        interaction response, and any other send or edit of a view with
+        something to click), and its edits restart it only while the view has
+        a control, so a stored view with none (a card sent as a command's
+        response, a screen whose buttons came off) has its expiry moved here,
+        as a click moves it. A view discord.py never stored (a card sent to a
+        channel or as a followup) would stay registered until ``exit()``, so
+        the library runs the timer itself; that timer stands down once
+        discord.py stores the view, and ``stop()`` and a timeout cancel it.
+        """
+        self._last_landed = now = time.monotonic()
+        if not self.timeout or self.is_finished():
+            return
+        if self._view_store() is not None:
+            self._BaseView__timeout_expiry = now + self.timeout
+        elif self._idle_timer is None:
+            self._idle_timer = asyncio.get_running_loop().call_later(
+                self.timeout, self._time_out_unstored
+            )
+
+    def _cancel_idle_timer(self) -> None:
+        """Cancel the library's timeout for a view discord.py never stored."""
+        if self._idle_timer is not None:
+            self._idle_timer.cancel()
+            self._idle_timer = None
+
+    def _time_out_unstored(self) -> None:
+        """Time out a view discord.py never stored, ``timeout`` seconds after its last edit."""
+        self._idle_timer = None
+        if self.is_finished() or not self.timeout or self._view_store() is not None:
+            return
+        left = self._last_landed + self.timeout - time.monotonic()
+        if left > 0:
+            self._idle_timer = asyncio.get_running_loop().call_later(left, self._time_out_unstored)
+            return
+        self._dispatch_timeout()
 
     def _release_render(self, rendering: Optional[asyncio.Future]) -> None:
         """Stop counting a render as in flight, once its last request is done."""
@@ -3291,7 +3431,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 frozen += 1
         return frozen
 
-    def _teardown_edit_target(self):
+    def _teardown_edit_target(self, *, owed: bool = False):
         """Pick what a teardown freeze edit ships: a view, or ``None`` to skip.
 
         Owns the freeze so each branch reads the tree at the right moment:
@@ -3314,7 +3454,8 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
            leaving live-looking controls up; any other view skips.
         3. A freeze that disabled something ships.
         4. A view that has rendered ships when its tree differs from the
-           last render. ``_has_rendered`` is the gate, not
+           last render, or when ``owed`` (a failed navigation's redraw has
+           content for the message). ``_has_rendered`` is the gate, not
            ``_last_tree_digest is not None``: the digest is also ``None``
            after a deliberate drop (a stalled edit, a transport failure).
         5. Any other view ships: a restored view whose teardown override
@@ -3358,7 +3499,8 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         if froze:
             return self
         if self._has_rendered:
-            return self if self._compute_tree_digest() != self._last_tree_digest else None
+            changed = owed or self._compute_tree_digest() != self._last_tree_digest
+            return self if changed else None
         return self
 
     def _restored_unrendered(self) -> bool:
@@ -3469,6 +3611,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
     def _time_out(self) -> None:
         """Time the view out: stop it and schedule ``on_timeout()``."""
         self._timed_out = True
+        self._cancel_idle_timer()
         super()._dispatch_timeout()
         self._redrive_dynamic_items()
 
@@ -3558,8 +3701,11 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         await self._wait_for_own_edits("Timing out")
         # _teardown_edit_target owns the freeze and decides what, if anything, ships.
         content, redrawn = await self._reclaim_content() if self._message else ({}, 0)
-        target = self._teardown_edit_target() if self._message else None
-        if target is not None:
+        owed = any(k in _CONTENT_EDIT_FIELDS for k in content)
+        target = self._teardown_edit_target(owed=owed) if self._message else None
+        if target is None:
+            self._take_back_redraw()
+        else:
             try:
                 await self._ship_freeze(target, content, redrawn)
             except discord.NotFound:
@@ -3696,10 +3842,11 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         state-driven render is legitimate work. The property these seams need
         is narrower: has the teardown that clears attributes and drops the
         registry entries already run? Every teardown path unsubscribes before
-        destroying the view, so the subscriber registry answers that directly
-        rather than by proxy.
+        destroying the view, so the view's own subscription answers that
+        directly rather than by proxy. It is read from the set only a view's
+        subscription enters, since code can subscribe under a closed view's id.
         """
-        return self.id not in self.state_store.subscribers
+        return self.id not in self.state_store._view_subscriptions
 
     def _still_registered(self) -> bool:
         """Whether the view is still in the active-view registry or in the state."""
@@ -3772,6 +3919,8 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         async with self._update_lock:
             self._render_task = asyncio.current_task()
             self._render_idle.clear()
+            self._render_mark = mark = object()
+            lineage = _RELOAD_LINEAGE.set(_RELOAD_LINEAGE.get() | {mark})
             try:
                 while True:
                     self._update_pending = False
@@ -3788,6 +3937,13 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                         break
             finally:
                 self._render_task = None
+                self._render_mark = None
+                try:
+                    _RELOAD_LINEAGE.reset(lineage)
+                except ValueError:
+                    # A render the garbage collector finalizes closes from
+                    # another context.
+                    pass
                 self._render_idle.set()
 
     def _may_render_now(self) -> bool:
@@ -3822,7 +3978,11 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             self._defer_render()
             return False
         holder = self._reload_task or self._sending_task
-        if (holder is not None and holder is not asyncio.current_task()) or self._turn_claims:
+        if (
+            (holder is not None and holder is not asyncio.current_task())
+            or self._turn_claims
+            or self._building_elsewhere()
+        ):
             self._defer_render()
             return False
         return True
@@ -4186,7 +4346,8 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
 
         Returns a :class:`RenderOutcome` naming what happened (rendered,
         skipped as unchanged, deferred to the throttle boundary, dropped in
-        transit, or no message to edit), or ``None`` when a subclass
+        transit, no message to edit, or the view closed while the reload
+        waited), or ``None`` when a subclass
         render override reports nothing. Callers that must know the edit
         landed (a one-shot notice, a stamp written after the render) check
         the outcome instead of assuming a returned ``reload()`` rendered.
@@ -4209,37 +4370,67 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         """
         self._warn_if_handed_over("reload()")
         async with self._reload_turn("reload()"):
-            if self._torn_down():
-                # Exited or navigated away from while this call waited: a
-                # render now would put live controls back on a frozen panel,
-                # or over the view the message has moved on to.
-                return RenderOutcome.NO_MESSAGE
-            # Inside the lock and ahead of the throttle gate, so the flag
-            # describes this run even when it returns at the gate.
-            self._refresh_degraded = False
-            # No acting waiver: the gate throttles the on_load fetch, and a
-            # waiver would let a refresh button query the data source unbounded.
-            if self._refresh_armed:
-                # The tree is the refresh button now; on_load would replace
-                # it, and the armed view takes no render that could put it back.
-                return await self.refresh()
+            return await self._reload_in_turn(kwargs)
 
-            now = time.monotonic()
-            wait = self._throttle_until() - now
-            if wait > 0:
-                if self._reload_pending:
-                    self._pending_reload_kwargs = _merge_reload_kwargs(
-                        self._pending_reload_kwargs, kwargs
-                    )
-                else:
-                    self._reload_pending = True
-                    self._pending_reload_kwargs = dict(kwargs)
-                self._queue_deferred_refresh(wait)
-                return RenderOutcome.DEFERRED
+    async def _reload_in_turn(self, kwargs: dict) -> Optional["RenderOutcome"]:
+        """The body of :meth:`reload`, run by a caller holding or joining the turn."""
+        if self._torn_down():
+            # Exited or navigated away from while this call waited: the
+            # close froze the tree as it stood, and on_load would read
+            # state the teardown cleared.
+            return self._closed_outcome()
+        # Inside the lock and ahead of the throttle gate, so the flag
+        # describes this run even when it returns at the gate.
+        self._refresh_degraded = False
+        # No acting waiver: the gate throttles the on_load fetch, and a
+        # waiver would let a refresh button query the data source unbounded.
+        if self._refresh_armed:
+            # The tree is the refresh button now; on_load would replace
+            # it, and the armed view takes no render that could put it back.
+            return await self.refresh()
+
+        now = time.monotonic()
+        wait = self._throttle_until() - now
+        if wait > 0:
+            if self._reload_pending:
+                self._pending_reload_kwargs = _merge_reload_kwargs(
+                    self._pending_reload_kwargs, kwargs
+                )
+            else:
+                self._reload_pending = True
+                self._pending_reload_kwargs = dict(kwargs)
+            self._queue_deferred_refresh(wait)
+            return RenderOutcome.DEFERRED
+        # A V1 pattern's render inside _reload_render shares this number.
+        with self._render_scope() as began:
             await self._run_on_load()
-            if self._torn_down():
-                return RenderOutcome.NO_MESSAGE
+            declined = await self._declined_late(began)
+            if declined is not None:
+                return declined
             return await self._reload_render()
+
+    async def _reload_for_composite(self) -> Optional["RenderOutcome"]:
+        """:meth:`reload` for a region or collapsible on a host that renders in ``on_load``.
+
+        Runs inside a state render the host is running when called from it
+        or from a task it started (``asyncio.gather(region.show_page(n))``
+        from ``on_state_changed()``), which ``reload()`` would wait for.
+        Inside the host's own ``on_load()``, the load in progress is the
+        render, so the call raises instead of loading again.
+        """
+        holder = self._reload_task
+        if holder is not None and (
+            holder is asyncio.current_task() or self._reload_mark in _RELOAD_LINEAGE.get()
+        ):
+            raise RuntimeError(
+                f"PaginatedRegion.show_page() was called inside the on_load() of its "
+                f"host {type(self).__name__} (or a task that on_load() started), and "
+                f"that host renders by running on_load(). Fix: call the region's "
+                f"set_page() before on_load() builds the tree; the load in progress "
+                f"renders that page."
+            )
+        async with self._within_reload_turn("a region or collapsible render", lineage=True):
+            return await self._reload_in_turn({})
 
     async def load(self) -> bool:
         """Re-run :meth:`on_load` without editing the message.
@@ -4335,12 +4526,22 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         self._turn_claims += 1
         acquired = False
         try:
-            # A state render takes no turn and rebuilds the tree as it goes, so
-            # one already running finishes first. None starts meanwhile: the
-            # render gate defers while this claim is open.
-            while self._render_task is not None and self._render_task is not current:
-                await self._render_idle.wait()
-            await self._reload_lock.acquire()
+            while True:
+                # A state render takes no turn and rebuilds the tree as it goes,
+                # so one already running finishes first. None starts meanwhile:
+                # the render gate defers while this claim is open.
+                while self._render_task is not None and self._render_task is not current:
+                    await self._render_idle.wait()
+                await self._reload_lock.acquire()
+                # A joiner the last holder started may still be building. It is
+                # waited for with the lock free, since its build may take the
+                # turn; while the lock is held no task can join anew. A joiner
+                # taking the turn skips the joiners queued for it, which would be
+                # waiting on it.
+                if not self._building_elsewhere(queued=current not in self._joiners):
+                    break
+                self._reload_lock.release()
+                watchdog = await self._wait_for_joiner(method, watchdog)
             acquired = True
         finally:
             self._turn_claims -= 1
@@ -4351,11 +4552,19 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 self._replay_if_owed()
         self._reload_task = current
         self._reload_label = method
+        self._reload_mark = mark = object()
+        lineage = _RELOAD_LINEAGE.set(_RELOAD_LINEAGE.get() | {mark})
         try:
             yield
         finally:
             self._reload_task = None
             self._reload_label = None
+            self._reload_mark = None
+            try:
+                _RELOAD_LINEAGE.reset(lineage)
+            except ValueError:
+                # An abandoned generator closes from another context.
+                pass
             self._reload_lock.release()
             self._replay_if_owed()
 
@@ -4515,11 +4724,28 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             self._mention_rules = rules
 
     async def _render_late(
-        self, render: Awaitable[Any], origin: int, *, resending: bool = False
+        self,
+        render: Awaitable[Any],
+        origin: int,
+        *,
+        resending: bool = False,
+        waive_cooldown: bool = False,
     ) -> None:
-        """Await ``render`` as the render numbered ``origin``, asked for earlier."""
+        """Await ``render`` as the render numbered ``origin``, asked for earlier.
+
+        With ``waive_cooldown`` the edit is not held back by a
+        ``refresh_cooldown_ms`` window, as an edit answering a click is not.
+        The origin is the tuple (view, the number of the render it stands for,
+        whether it is that render sent again, the task running it, a cell
+        holding True until it returns, whether it skips the cooldown). A render
+        sent again (a stalled answer, content held during a send) and a failed
+        navigation's redraw skip the cooldown, whose deferred re-render runs
+        from state and would drop the keywords they carry.
+        """
         running = [True]
-        token = _RENDER_ORIGIN.set((self, origin, resending, asyncio.current_task(), running))
+        token = _RENDER_ORIGIN.set(
+            (self, origin, resending, asyncio.current_task(), running, waive_cooldown)
+        )
         try:
             await render
         finally:
@@ -4612,27 +4838,126 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
     def _declined_render(self) -> Optional["RenderOutcome"]:
         """The disposition of a render this view no longer owes, or ``None``.
 
-        Checked by a render once it holds the reload turn, and again once it
-        has built, since the view can change while the render waits. A
-        torn-down view has nothing left to edit. An armed view's tree is its
-        refresh button, and a rebuild would replace it with nothing able to
-        bring it back. A view whose push or pop is in flight is neither: its
-        render builds, and ``refresh()`` holds the edit for a rollback to
-        ship, since replaying the state render would not re-run this one.
+        Checked by a render once it holds the reload turn, since the view can
+        change while the render waits for it. A torn-down view has nothing
+        left to build for: its close froze the tree as it stood. An armed
+        view's tree is its refresh button, and a rebuild would replace it
+        with nothing able to bring it back. A view whose push or pop is in
+        flight is neither: its render builds, and ``refresh()`` holds the
+        edit for a rollback to ship, since replaying the state render would
+        not re-run this one.
         """
         if self._torn_down():
-            return RenderOutcome.NO_MESSAGE
+            return self._closed_outcome()
         if self._refresh_armed:
             return RenderOutcome.SKIPPED
         return None
 
-    def _warn_long_reload_wait(self, method: str) -> None:
-        """Log a reload-turn wait that has lasted ``_RELOAD_WAIT_WARN_SECONDS``."""
+    @contextlib.contextmanager
+    def _render_scope(self):
+        """Number a render that can outlast a close, for :meth:`_declined_late`.
+
+        Yields ``[view, number, task]``: the number the render began under,
+        which a ``refresh()`` made by the render or a task it started (an
+        interim "Loading..." card) moves forward, since an edit of its own is
+        not one it would cover. A render running inside another on this view
+        in the same task (a V1 pattern's render inside ``reload()``) shares
+        the outer one's; a render in a task that only copied it, which can
+        outlive the outer render, takes a number of its own.
+        """
+        current = _LATE_RENDER.get()
+        task = asyncio.current_task()
+        if current is not None and current[0] is self and current[2] is task:
+            yield current
+            return
+        began = [self, self._render_seq, task]
+        token = _LATE_RENDER.set(began)
+        try:
+            yield began
+        finally:
+            try:
+                _LATE_RENDER.reset(token)
+            except ValueError:
+                # An abandoned coroutine closes from another context.
+                pass
+
+    async def _declined_late(
+        self, began: list, content: Optional[dict] = None
+    ) -> Optional["RenderOutcome"]:
+        """The disposition of a render whose build outlasted a close, or ``None``.
+
+        Checked once a render has built. One already building when its view
+        closed still ships, since the close froze whatever part of the tree
+        it found: ``refresh()`` sends the finished tree with the controls as
+        the close left them. Like every late render, it never covers another
+        edit asked for after it began, usually a closing card sent through
+        ``refresh()``. ``content`` holds the keywords the render sends with
+        the tree (a V1 embed). A keyword whose part a render numbered above
+        ``began[1]`` has set since, before or after the close, is dropped from
+        it in place, and the render declines only when the tree is covered
+        too and nothing is left to send.
+
+        ``began[1]`` starts at the number the render began under and moves
+        forward with each edit made by the render or by a task it started
+        (see :meth:`_render_scope`), since that edit already covered any
+        render asked for before it. ``began`` is what :meth:`_render_scope` yielded.
+        A failed navigation's redraw that a close carries counts once its edit
+        has landed, so a render deciding while that edit is in flight waits
+        for it.
+        """
+        if not (self._closed() or self._torn_down()):
+            return None
+        landing = self._redraw_landing
+        if landing is not None:
+            await asyncio.wait({landing})
+        content = content if content is not None else {}
+        for key in [k for k in content if k in _CONTENT_EDIT_FIELDS]:
+            if self._superseded_at[_CONTENT_EDIT_FIELDS[key]] > began[1]:
+                del content[key]
+        if self._superseded_at["tree"] > began[1] and not content:
+            return self._closed_outcome()
+        return None
+
+    def _closed_outcome(self) -> "RenderOutcome":
+        """The disposition of a render that found its view closed.
+
+        ``NO_MESSAGE`` when the message was deleted out from under the view,
+        whose teardown followed from that, so a render reports the deletion
+        however far that teardown had got; ``CLOSED`` for a close the view
+        made itself.
+        """
+        return RenderOutcome.NO_MESSAGE if self._message_deleted else RenderOutcome.CLOSED
+
+    def _without_message(self) -> "RenderOutcome":
+        """The disposition of a render that found no message to edit.
+
+        A closed view's (see :meth:`_closed_outcome`) when its close deleted
+        the message or left it without one, as a restart's release does;
+        else ``NO_MESSAGE``: not sent yet, or deleted out from under it.
+        """
+        if self._torn_down() or self._message_closed >= _MESSAGE_DELETE:
+            return self._closed_outcome()
+        return RenderOutcome.NO_MESSAGE
+
+    def _warn_long_reload_wait(self, method: str, joiner: bool = False) -> None:
+        """Log a reload-turn wait that has lasted ``_RELOAD_WAIT_WARN_SECONDS``.
+
+        With ``joiner`` the wait is for a page turn or toggle still building
+        on the view, which ends when that build returns.
+        """
+        name = type(self).__name__
+        if joiner:
+            logger.warning(
+                f"{method} on {name} has waited {_RELOAD_WAIT_WARN_SECONDS:g}s for a "
+                f"region or collapsible render to finish building. It goes on until "
+                f"that render's build returns."
+            )
+            return
         holder = self._reload_label or (
             "on_state_changed()" if self._render_task is not None else "another reload"
         )
         logger.warning(
-            f"{method} on {type(self).__name__} has waited {_RELOAD_WAIT_WARN_SECONDS:g}s "
+            f"{method} on {name} has waited {_RELOAD_WAIT_WARN_SECONDS:g}s "
             f"for {holder} to release the view's reload turn. If that run is waiting on "
             f"this call (it awaits asyncio.gather() or a task it created, and that task "
             f"is the one waiting here), the wait never ends. Keep on_load and "
@@ -4658,19 +4983,97 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         """
 
     @contextlib.asynccontextmanager
-    async def _within_reload_turn(self, method: str):
+    async def _within_reload_turn(self, method: str, *, lineage: bool = False):
         """Take this view's reload turn, or run inside the one this task holds.
 
         For a load a notification drives: the notification can fire inline
         from inside this view's own reload (its ``on_load`` dispatched), and
         that reload is already the serialized run, so taking the turn again
-        would raise rather than wait.
+        would raise rather than wait. With ``lineage``, a task the holder
+        started while holding the turn runs inside it as well: the holder
+        may be awaiting it (``asyncio.gather()`` from ``on_load()``), and
+        waiting for the turn would then never end. The same holds for a task
+        a state render started, since a turn taker waits for that render.
         """
-        if self._reload_task is not None and self._reload_task is asyncio.current_task():
+        current = asyncio.current_task()
+        holder = self._reload_task
+        if holder is current and holder is not None:
             yield
+            return
+        render = self._render_task
+        marks = _RELOAD_LINEAGE.get()
+        if lineage and (
+            (holder is not None and self._reload_mark in marks)
+            or (render is not None and render is not current and self._render_mark in marks)
+        ):
+            # Two joiners would build one tree at once (two regions turned
+            # through one gather()), so they take turns. A task one of them
+            # started carries its mark and runs inside it, as it does inside
+            # the holder.
+            watchdog = None
+            try:
+                while self._building_elsewhere():
+                    watchdog = await self._wait_for_joiner(method, watchdog)
+            finally:
+                if watchdog is not None:
+                    watchdog.cancel()
+            joined = object()
+            self._joiners.setdefault(current, []).append(joined)
+            lineage_token = _RELOAD_LINEAGE.set(_RELOAD_LINEAGE.get() | {joined})
+            try:
+                yield
+            finally:
+                try:
+                    _RELOAD_LINEAGE.reset(lineage_token)
+                except ValueError:
+                    # An abandoned generator closes from another context.
+                    pass
+                stack = self._joiners[current]
+                stack.remove(joined)
+                if not stack:
+                    del self._joiners[current]
+                self._joiner_left.set()
+                self._replay_if_owed()
             return
         async with self._reload_turn(method):
             yield
+
+    async def _wait_for_joiner(self, method: str, watchdog):
+        """Wait for a joiner to leave its section, and return the wait's watchdog.
+
+        The watchdog is armed on the first wait, so a joiner whose build
+        never ends is logged once ``_RELOAD_WAIT_WARN_SECONDS`` have passed;
+        the caller cancels it, and a wait cut off here cancels it itself.
+        """
+        if watchdog is None:
+            watchdog = asyncio.get_running_loop().call_later(
+                _RELOAD_WAIT_WARN_SECONDS, self._warn_long_reload_wait, method, True
+            )
+        self._joiner_left.clear()
+        try:
+            await self._joiner_left.wait()
+        except BaseException:
+            watchdog.cancel()
+            raise
+        return watchdog
+
+    def _building_elsewhere(self, *, queued: bool = False) -> bool:
+        """Whether another task is building inside a turn or render it joined.
+
+        One whose section this task runs inside (it started this task) is the
+        caller's own. One queued for this view's turn counts only with
+        ``queued``: its build is suspended part way, which matters to a turn
+        taker about to build, while a joiner waiting on it could wait forever
+        (the holder that task queues behind may be awaiting that joiner).
+        """
+        current = asyncio.current_task()
+        marks = _RELOAD_LINEAGE.get()
+        for task, stack in self._joiners.items():
+            if task is current or (not queued and _RELOAD_WAITING.get(task) is self):
+                continue
+            if not any(mark in marks for mark in stack):
+                return True
+        return False
 
     def _reload_wait_cycle(self, current) -> Optional[list]:
         """The views ``current`` would wait through to reach its own lock, or ``None``.
@@ -4701,7 +5104,11 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         whose ``on_load`` rebuilds the component tree that ``refresh()`` then
         ships. A V1 pattern whose content is an embed overrides this to route
         through its embed-carrying render, so ``reload()`` updates the embed
-        instead of shipping an edit with no kwargs.
+        instead of shipping an edit with no kwargs. An override calls its
+        render body rather than the wrapper that takes the reload turn:
+        ``reload()`` already holds the turn and has decided whether a render
+        that outlasted a close still ships, and the wrapper's own check
+        would decline it.
 
         Returns the :class:`RenderOutcome` of the edit it shipped, so
         ``reload()`` can relay it. An override returns the outcome of its
@@ -4889,13 +5296,42 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         """
         return self._refresh_degraded
 
+    def _redrew_after_pick(self, seq: int) -> None:
+        """Settle a select pick's owed redraw once a render asked for after it lands."""
+        if self._pick_owed is not None and seq > self._pick_owed:
+            self._pick_owed = None
+
     def _mark_render(self, kwargs: dict, seq: int) -> None:
-        """Record that render ``seq`` reached the message, or stalled and will be sent again."""
+        """Record that render ``seq`` reached the message.
+
+        Also called for a render that stalled and will be sent again, and for
+        an owed redraw a teardown edit is about to carry.
+        """
         for field in {
             "tree",
             *(_CONTENT_EDIT_FIELDS[k] for k in kwargs if k in _CONTENT_EDIT_FIELDS),
         }:
             self._superseded_at[field] = max(self._superseded_at[field], seq)
+
+    def _set_since_navigation(self) -> set:
+        """The message parts set by renders asked for after the owed redraw's navigation began.
+
+        An owed redraw puts back the screen from before that navigation, so
+        it leaves these parts as the newer render did. A part counts once
+        that render reached it or stalled on it, and while a held render is
+        waiting to set it; a held render ships the tree as well.
+        """
+        began = self._reclaim_began
+        parts = {part for part, at in self._superseded_at.items() if at > began}
+        held = {part for part, (_, at) in self._held.items() if at > began}
+        if held:
+            parts |= held | {"tree"}
+        return parts
+
+    @staticmethod
+    def _without_parts(content: Dict[str, Any], parts: set) -> Dict[str, Any]:
+        """``content`` without the keywords that set one of ``parts``."""
+        return {k: v for k, v in content.items() if _CONTENT_EDIT_FIELDS.get(k) not in parts}
 
     def _left_message(self, bound: Any) -> bool:
         """Whether a send posted meanwhile, moving the view off ``bound``."""
@@ -4964,8 +5400,9 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         ``RENDERED`` (shipped), ``SKIPPED`` (render-hash match, nothing
         owed), ``DEFERRED`` (a throttle or rate-limit window holds it and a
         scheduled task re-renders at the boundary), ``DROPPED`` (attempted
-        and not known to have landed, nothing scheduled), or ``NO_MESSAGE``
-        (no editable message remains). Callers that only repaint can ignore
+        and not known to have landed, nothing scheduled), ``NO_MESSAGE`` (no
+        editable message remains), or ``CLOSED`` (the view's close deleted the
+        message or left it without one). Callers that only repaint can ignore
         it; callers that must know the edit landed read it instead of
         inferring from a normal return.
 
@@ -4987,6 +5424,12 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         stripped them. Inside a cooldown or rate-limit window it ships when
         the window ends; one Discord itself refuses with a 429 is dropped
         with a warning. When the close deleted the message it sends nothing.
+
+        When the caller has rebuilt the tree of an ephemeral view armed for
+        its refresh handoff, the call puts the Continue button back in place
+        of that tree and drops every keyword it passed, so the message stays
+        as the arming left it. A stopped view is left out: its final render
+        ships as described above.
 
         Calls landing inside an active cooldown window (from
         ``refresh_cooldown_ms`` or a prior 429) are deferred via a single
@@ -5011,6 +5454,10 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         # Edits are ordered by when they were asked for, so a render made
         # later keeps the number of the one it stands for.
         seq = self._render_seq if late is None else late[1]
+        began = _LATE_RENDER.get()
+        if began is not None and began[0] is self:
+            # A render's own edit is not one it would cover (_declined_late).
+            began[1] = max(began[1], seq)
         if late is not None:
             # A part of the message a newer render set stays as it left it.
             for key in [k for k in kwargs if k in _CONTENT_EDIT_FIELDS]:
@@ -5031,7 +5478,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
 
         # The view's own close deleted the message.
         if self._message_closed >= _MESSAGE_DELETE:
-            return RenderOutcome.NO_MESSAGE
+            return self._closed_outcome()
 
         # During a send, another task's render replays against the new
         # message and the send's own renders ship with it. A message a
@@ -5042,7 +5489,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 self._render_after_turn = True
                 self._hold_for_replay(kwargs, seq, resending)
                 return RenderOutcome.DEFERRED
-            return RenderOutcome.NO_MESSAGE
+            return self._without_message()
 
         if self.is_finished():
             # A render after the close (a modal submitted late, a caller's own
@@ -5054,6 +5501,12 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 self._disable_items(self)
             if self._torn_down():
                 self._closed_render_kwargs = dict(kwargs)
+
+        # Ships the armed tree, not the caller's, so the button survives; the
+        # render goes on in case the arming's own edit never landed.
+        if self._refresh_armed and not self.is_finished() and self.children != self._armed_children:
+            self._put_children(self._armed_children)
+            kwargs.clear()
 
         # Whether this edit answers a click (or a modal opened from one) on
         # this view's own message. Resolved before the gate, which it
@@ -5068,7 +5521,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         )
 
         # An edit answering a click waives the cooldown but never a 429 window.
-        answering = acting or resending
+        answering = acting or resending or (late is not None and late[5])
         now = time.monotonic()
         wait = self._throttle_until(acting=answering) - now
         if wait > 0:
@@ -5097,8 +5550,11 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             self._sync_back_buttons()
 
             # Skipped when the tree matches the last render. Not with kwargs:
-            # embed or content live outside the tree the digest covers.
-            if not kwargs and self._last_tree_digest is not None:
+            # embed or content live outside the tree the digest covers. Not
+            # while a select pick waits for a redraw either (see _pick_owed):
+            # a callback that refused it and redrew the same tree would
+            # leave it on screen.
+            if not kwargs and self._pick_owed is None and self._last_tree_digest is not None:
                 current_digest = self._compute_tree_digest()
                 if current_digest == self._last_tree_digest:
                     skipped = True
@@ -5140,6 +5596,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                         timeout=fast_path_timeout,
                     )
                     self._has_rendered = True
+                    self._redrew_after_pick(seq)
                     self._last_tree_digest = shipped_digest
                     if perf_on:
                         store._record_edit()
@@ -5199,6 +5656,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                         self._edit_and_digest(functools.partial(target.edit, view=self, **kwargs))
                     )
                     self._has_rendered = True
+                    self._redrew_after_pick(seq)
                     self._last_tree_digest = shipped_digest
                     if perf_on:
                         store._record_edit()
@@ -5241,12 +5699,13 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 return RenderOutcome.DROPPED
             message = self._message
             if message is None:
-                return RenderOutcome.NO_MESSAGE
+                return self._without_message()
             try:
                 shipped_digest = await self._bounded(
                     self._edit_and_digest(functools.partial(message.edit, view=self, **kwargs))
                 )
                 self._has_rendered = True
+                self._redrew_after_pick(seq)
                 self._last_tree_digest = shipped_digest
                 if perf_on:
                     store._record_edit()
@@ -5264,11 +5723,12 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 if self._message_closed >= _MESSAGE_DELETE:
                     # The view's own close deleted it while this edit was in
                     # flight: not a deletion the hook reports.
-                    return RenderOutcome.NO_MESSAGE
+                    return self._closed_outcome()
                 # Deleted out from under the view. Null the ref so later
                 # refreshes stop at the top-of-method guard; the hook and the
                 # teardown run on their own task, outside this render's turn.
                 self._message = None
+                self._message_deleted = True
                 self._schedule_message_gone_teardown()
                 return RenderOutcome.NO_MESSAGE
             except asyncio.TimeoutError as e:
@@ -5504,28 +5964,52 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         that hook, or runs in its place for a view its own timeout stopped,
         carries the content instead, or a V1 message keeps the discarded
         view's embed. Gathered before the freeze, so a hook that rebuilds the
-        tree is frozen with it, and numbered as a render asked for now (or
-        as the late render it runs in), so content held from before it does
+        tree is frozen with it, and numbered as the navigation began (or as
+        the late render it runs in), so a render asked for before then does
         not ship over it afterwards. The number comes back only when the
         hook changed what the tree shows; the edit that carries the redraw
-        records it in ``_redrawn_at`` once it lands.
+        records it in ``_redrawn_at`` once it lands. A part set by a render
+        asked for after the navigation began, before or while the hook ran,
+        is left out, since the redraw puts back the screen from before the
+        navigation. A V2 hook, which rebuilds the whole tree, does not run
+        once such a render has set the tree.
         """
         if not self._reclaim_pending:
             return {}, 0
         self._reclaim_pending = False
         nav_rebuild = getattr(self, "nav_rebuild", None)
-        if nav_rebuild is None:
+        newer = self._set_since_navigation()
+        if nav_rebuild is None or (self._is_layout() and "tree" in newer):
             return {}, 0
         shown, redrawn = self._shown_digest(), 0
+        children = list(self.children)
         try:
             result = await await_maybe(nav_rebuild(self))
-            at = self._number_for_now()
+        except Exception as e:
+            # The view's own tree as it was before the hook (which may have
+            # rebuilt part of it) is frozen in place of the discarded view's.
+            self._put_children(children)
+            logger.error(
+                f"nav_rebuild for {type(self).__name__}'s teardown edit raised: {e}",
+                exc_info=True,
+            )
+            return {}, 0
+        try:
+            # The screen from before the navigation, unless this runs in a
+            # late render, which the redraw then shares a number with.
+            late = self._late_render()
+            at = late[1] if late is not None else self._reclaim_began
             if self._shown_digest() != shown:
                 redrawn = at
             if not isinstance(result, dict):
+                if redrawn:
+                    # A V2 hook that rebuilt the tree in place is a render too.
+                    self._mark_redraw({}, at)
                 return {}, redrawn
+            # Read again: a render can land while the hook awaits.
+            result = self._without_parts(result, self._set_since_navigation())
             self._reject_non_portable_edit_kwargs(result)
-            self._mark_render(result, at)
+            self._mark_redraw(result, at)
             # A file the hook returned may have gone out with an earlier edit.
             content = dict(result)
             _rewind_files(content)
@@ -5552,8 +6036,55 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             at = self._number_for_now()
             if _newer_render(at, self._mention_rules[1], False):
                 self._mention_rules = (content.get("allowed_mentions"), at, self._shown_digest())
-        await self._bounded(self._message.edit(**kwargs))
+        await self._carry_redraw(self._bounded(self._message.edit(**kwargs)))
         self._redrawn_at = max(self._redrawn_at, redrawn)
+
+    def _mark_redraw(self, kwargs: dict, at: int) -> None:
+        """Mark an owed redraw before the teardown edit that carries it is sent.
+
+        Marked now, so content held from before it does not ship over it
+        while that edit is in flight. What it covered is kept, for
+        :meth:`_take_back_redraw` to restore if the edit does not land.
+        """
+        fields = {"tree", *(_CONTENT_EDIT_FIELDS[k] for k in kwargs if k in _CONTENT_EDIT_FIELDS)}
+        self._redraw_marks = ({field: self._superseded_at[field] for field in fields}, at)
+        self._mark_render(kwargs, at)
+
+    def _take_back_redraw(self) -> None:
+        """Undo an owed redraw's marks: nothing carried it to the message.
+
+        A mark a newer render has moved since stays.
+        """
+        marks, self._redraw_marks = self._redraw_marks, None
+        if marks is None:
+            return
+        before, at = marks
+        for field, value in before.items():
+            if self._superseded_at[field] == at:
+                self._superseded_at[field] = value
+
+    async def _carry_redraw(self, edit: Awaitable[Any]) -> Any:
+        """Await a teardown edit that carries an owed redraw.
+
+        A late render deciding whether the redraw covered it waits for the
+        outcome (:meth:`_declined_late`), and an edit that does not land
+        takes the redraw's marks back.
+        """
+        if self._redraw_marks is None:
+            return await edit
+        landing = self._redraw_landing = asyncio.get_running_loop().create_future()
+        landed = False
+        try:
+            result = await edit
+            landed = True
+            self._redraw_marks = None
+            return result
+        finally:
+            if not landed:
+                self._take_back_redraw()
+            landing.set_result(None)
+            if self._redraw_landing is landing:
+                self._redraw_landing = None
 
     def _freeze_edit_kwargs(self, view=None) -> Dict[str, Any]:
         """Edit kwargs for a teardown edit that ships the frozen tree.
@@ -5901,7 +6432,13 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 # armed flag then drops every notification that could put it
                 # back -- the user would be left with a stale panel and no
                 # recovery path once the webhook token expires.
-                await self.refresh()
+                try:
+                    await self.refresh()
+                except discord.HTTPException as e:
+                    if e.status < 500:
+                        raise
+                    self._retry_arming(e)
+                    return
                 if self.refresh_degraded:
                     # A transport drop retries while the token can carry an
                     # edit (a 429 re-queues through _handle_rate_limit). Past
@@ -5958,6 +6495,8 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
     def message(self, value):
         """Set the message associated with this view."""
         self._message = value
+        if value is not None:
+            self._message_deleted = False
 
         # Update state with new message info
         if value:
@@ -6540,6 +7079,11 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             if scope_key is not None and scope_key != owner_key:
                 view_type = self._instance_root_class or type(self)._class_session_key()
                 existing = self.state_store._get_active_views(view_type, scope_key)
+                # A Continue's replacement registers its participants while
+                # the view it replaces still holds them, as with the owner.
+                replacing_id = getattr(self, "_replacing_view_id", None)
+                if replacing_id is not None:
+                    existing = [v for v in existing if v.id != replacing_id]
                 if len(existing) >= limit:
                     error = InstanceLimitError(type(self).__name__, limit, blocked_user_id=user_id)
                     # Temporarily swap the bound interaction so the default
@@ -6620,9 +7164,11 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         forgetting the repair. discord.py's own timeout dispatch bypasses
         this method entirely (it invokes the cancel callback directly, not
         ``stop()``), so :meth:`_dispatch_timeout` carries its own explicit
-        repair.
+        repair. The library's own timeout for a view discord.py never stored
+        is cancelled here, as discord.py cancels its timer.
         """
         super().stop()
+        self._cancel_idle_timer()
         self._redrive_dynamic_items()
 
     def _reregister_dispatch(self) -> None:
@@ -6684,8 +7230,13 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         return client is not None and client.is_closed() is True
 
     def _closed_session(self, error: BaseException) -> bool:
-        """Whether ``error`` is a request refused because this view's bot has closed."""
-        return isinstance(error, RuntimeError) and self._client_closed()
+        """Whether ``error`` is a request refused because this view's bot has closed.
+
+        aiohttp refuses a request on a closed session with a ``RuntimeError``
+        raised in its own code, so one raised by a hook (``nav_rebuild``,
+        ``on_state_changed``) while the bot closes is still reported as an error.
+        """
+        return _refused_by_closed_session(error) and self._client_closed()
 
     def _release_for_restart(self) -> None:
         """Take this view out of the process, as a process restart would.
@@ -6793,15 +7344,23 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             )
             raise
 
-    async def _close_left_message(self, message, ephemeral: bool, shown) -> None:
-        """Close the message a re-send left by ``exit_policy``, logging a failure."""
+    async def _close_left_message(
+        self, message, ephemeral: bool, shown, *, freeze: bool = False
+    ) -> None:
+        """Close the message a re-send left by ``exit_policy``, logging a failure.
+
+        ``freeze`` freezes it whatever the policy: the message a Continue
+        could not delete, which a second delete would only try again.
+        """
         name = type(self).__name__
         try:
             # An edit of the old message still in flight would land after the
             # close and show live controls again; the render releases the
             # routing it re-creates itself (_release_left_message).
-            await self._wait_for_own_edits("Re-sending")
-            await self._close_other_message(message, shown)
+            await self._wait_for_own_edits(
+                "Freezing the message left by" if freeze else "Re-sending"
+            )
+            await self._close_other_message(message, shown, freeze=freeze)
         except discord.NotFound:
             pass
         except (*DISCORD_CALL_ERRORS, asyncio.TimeoutError) as e:
@@ -6815,22 +7374,23 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                 else describe_discord_error(e)
             )
             logger.warning(
-                f"{name} was sent again, but closing the message it left did not reach "
+                f"{name} moved to a new message, but closing the one it left did not reach "
                 f"Discord ({cause}); that message keeps controls that no longer answer."
             )
-        except RuntimeError:
-            if not self._client_closed():
+        except RuntimeError as e:
+            if not self._closed_session(e):
                 raise
             logger.debug(f"{name} left its earlier message as it was: its bot closed.")
 
-    async def _close_other_message(self, message, components) -> None:
+    async def _close_other_message(self, message, components, *, freeze: bool = False) -> None:
         """Delete a message this view no longer owns, or freeze it, as ``exit_policy`` says.
 
-        The message a re-send left, or a persistent panel's from an earlier
-        run. A frozen V2 message shows ``components``, what it already
-        showed, rebuilt into a stopped copy so the edit registers nothing.
+        The message a re-send or a Continue left, or a persistent panel's from
+        an earlier run. ``freeze`` freezes it whatever the policy. A frozen V2
+        message shows ``components``, what it already showed, rebuilt into a
+        stopped copy so the edit registers nothing.
         """
-        if self.exit_policy == "delete":
+        if self.exit_policy == "delete" and not freeze:
             await self._bounded(message.delete())
         elif not self._is_layout():
             await self._bounded(message.edit(view=None))
@@ -7210,16 +7770,23 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             if delete_message:
                 await self._bounded(self._message.delete())
             elif self._is_layout():
-                # V2 messages ARE their components -- edit(view=None) would
-                # produce an empty message (error 50006). Freeze instead.
-                # _teardown_edit_target owns the freeze and picks what ships.
+                # V2 messages are their components: edit(view=None) would send an
+                # empty message (50006), so _teardown_edit_target freezes instead
+                # and picks what ships. A deletion while the redraw hook awaits
+                # takes the message.
                 content, redrawn = await self._reclaim_content()
-                target = self._teardown_edit_target()
+                owed = any(k in _CONTENT_EDIT_FIELDS for k in content)
+                target = self._teardown_edit_target(owed=owed) if self._message else None
                 if target is not None:
                     await self._ship_freeze(target, content, redrawn)
+                else:
+                    self._take_back_redraw()
             else:
                 content, _ = await self._reclaim_content()
-                await self._bounded(self._message.edit(view=None, **content))
+                if not self._message:
+                    self._take_back_redraw()
+                    return
+                await self._carry_redraw(self._bounded(self._message.edit(view=None, **content)))
         except discord.NotFound:
             # Expected lifecycle: user dismissed the ephemeral, an
             # admin deleted the message, or the channel was deleted.

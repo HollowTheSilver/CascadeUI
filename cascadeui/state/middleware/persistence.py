@@ -391,8 +391,9 @@ class PersistenceMiddleware:
 
         Invoked by :func:`~cascadeui.setup.setup_middleware` after the
         middleware is installed into the dispatch chain. The pipeline runs
-        once. A later call reopens persistence if it has closed (a bot
-        started again in the same process), writes the changes held while
+        once. A later call reopens persistence if it has closed (the new bot
+        a restart in the same process builds calls it again from its
+        ``setup_hook``), writes the changes held while
         it was closed, restarts the sweepers, and closes persistence with
         the bot again.
 
@@ -415,8 +416,8 @@ class PersistenceMiddleware:
             # A manager= install ran its own pipeline, but the sweepers are
             # the middleware's to start.
             if self._manager is not None:
-                # A bot closed and started again in the same process runs
-                # setup_hook again, after its close shut persistence.
+                # A restart in the same process runs setup_hook again, on the
+                # new bot it builds, after the old bot's close shut persistence.
                 await self._reopen_with_bot(store)
             return
 
@@ -511,22 +512,21 @@ class PersistenceMiddleware:
         The persistent panels a closed bot's views held are reattached through
         the bot now running, as a process restart reattaches them at boot.
         Reached from a ``setup_middleware()`` run again (the ``setup_hook`` of
-        the bot a restart in the same process builds), from the bot's
-        ``connect()`` when it runs again after the bot's close, and from a
-        close that finds a restart began while it ran.
+        the bot a restart in the same process builds) and from a close that
+        finds a restart began while it ran.
 
         Nothing reopens while a close of the bot is still running, or once
         the bot is closed: a close that began first (SIGTERM while
-        ``setup_hook`` runs, a shutdown during a reconnect's backoff) would
-        leave it open with nothing to close it. A close still running from
-        before a restart reopens persistence itself when it finishes and
-        finds the bot running again (see :meth:`_close_with_bot`). Waiting
-        for it here instead would hang a close that waits for the bot to be
-        ready, which happens only after this returns. After a close a SIGTERM
-        started, the process ends instead of reopening.
+        ``setup_hook`` runs) would leave it open with nothing to close it. A
+        close still running from before a restart reopens persistence itself
+        when it finishes and finds the bot running again (see
+        :meth:`_close_with_bot`). Waiting for it here instead would hang a
+        close that waits for the bot to be ready, which happens only after
+        this returns. After a close a SIGTERM started, the process ends
+        instead of reopening.
         """
         # Wired first: a new bot object adopted while an old close still runs
-        # has to close persistence with it, and connect() through it.
+        # has to close persistence, and its connect() waits for the old close.
         self._close_with_bot()
         if any(not f.done() for f in self._bot_closes):
             return
@@ -1237,7 +1237,7 @@ class PersistenceMiddleware:
         await self.flush_all()
 
     def _close_with_bot(self) -> None:
-        """Close persistence when the bot closes, and open it when the bot connects.
+        """Close persistence when the bot closes.
 
         discord.py has no shutdown event, so without this a stopped bot loses
         the application writes still batched, and a SQLite backend's worker
@@ -1246,12 +1246,14 @@ class PersistenceMiddleware:
         persistence closes after it, even when it raises. Closing twice is
         harmless, so a bot that also closes persistence itself is unaffected.
 
-        ``connect()`` is wrapped too. It reopens persistence a close shut
-        when the same bot connects again, which runs no ``setup_hook``. And a
-        close from another task (SIGTERM, a shutdown command) still has
-        persistence to close when ``connect()`` returns and the program
-        moves on to ending, so ``connect()`` waits for it. A bot replaced by
-        another (see :meth:`_adopt`) no longer closes it.
+        ``connect()`` is wrapped too: a close from another task (SIGTERM, a
+        shutdown command) still has persistence to close when ``connect()``
+        returns and the program moves on to ending, so ``connect()`` waits
+        for it. It opens nothing. By default discord.py closes a bot only on a
+        gateway close code it cannot recover from, and a bot it closed cannot
+        connect again, so persistence reopens for the new bot a restart
+        builds (see :meth:`_reopen_with_bot`). A bot replaced by another (see
+        :meth:`_adopt`) no longer closes it.
         """
         manager = self._manager
         bot = getattr(manager, "_bot", None)
@@ -1298,23 +1300,9 @@ class PersistenceMiddleware:
             bot.close = close
 
         connects = bot.connect
-        if getattr(connects, "_cascadeui_opens", None) is not manager:
+        if getattr(connects, "_cascadeui_connects", None) is not manager:
 
             async def connect(*args, **kwargs):
-                if manager._bot is bot and (
-                    self._closed or manager._closed or manager._close_started
-                ):
-                    try:
-                        await self._reopen_with_bot(self._store)
-                    except Exception as exc:
-                        # A database that is down must not stop the bot
-                        # reconnecting; the changes it misses are held.
-                        logger.error(
-                            f"Could not reopen persistence before {type(bot).__name__} "
-                            f"connects: {exc}. Connecting anyway; changes are held until "
-                            "persistence reopens, and lost if the process exits first.",
-                            exc_info=True,
-                        )
                 try:
                     return await connects(*args, **kwargs)
                 finally:
@@ -1322,7 +1310,7 @@ class PersistenceMiddleware:
                     if closing:
                         await asyncio.shield(asyncio.gather(*closing))
 
-            connect._cascadeui_opens = manager
+            connect._cascadeui_connects = manager
             bot.connect = connect
 
     def _close_on_sigterm(self) -> None:

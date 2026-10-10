@@ -287,7 +287,7 @@ class TestOnMessageGoneHook:
         await until(lambda: view._message.edit.await_count == 1)
         await view.exit(delete_message=True)
 
-        assert await asyncio.wait_for(render, timeout=5) == "no_message"
+        assert await asyncio.wait_for(render, timeout=5) == "closed"
         view.on_message_gone.assert_not_awaited()
         assert view._message_gone_task is None
 
@@ -885,3 +885,121 @@ class TestCleanupDoesNotWaitOnOneSend:
             gate.set()
             await sending
             await asyncio.wait_for(cleanup, 1)
+
+
+# // ========================================( What a Render Reports After a Close )======================================== // #
+
+
+class TestARenderTellsADeletionFromAClose:
+    """A render that found its view torn down reported NO_MESSAGE for every
+    close, so a caller could not tell a message deleted out from under the
+    view from a close the view made itself, except by reading is_finished()
+    before the deletion's teardown task had run."""
+
+    _interaction = staticmethod(TestAMessageTheViewHasLeft._interaction)
+    _panel = staticmethod(TestAMessageTheViewHasLeft._panel)
+
+    async def test_a_reload_after_the_view_exits_reports_closed(self):
+        interaction, _ = self._interaction(1)
+        view = self._panel(interaction)
+        await view.send()
+        await view.exit(delete_message=False)
+
+        assert await view.reload() == "closed"
+
+    async def test_a_reload_after_a_gateway_deletion_reports_no_message(self):
+        interaction, _ = self._interaction(1)
+        view = self._panel(interaction)
+        await view.send()
+        await view.state_store._clean_up_deleted(lambda message: message.id == 1)
+
+        assert view._torn_down()
+        assert await view.reload() == "no_message"
+
+    async def test_a_render_after_a_404_and_its_teardown_reports_no_message(self):
+        interaction, message = self._interaction(1)
+        view = self._panel(interaction)
+        await view.send()
+        message.edit = AsyncMock(side_effect=TestAMessageTheViewHasLeft._not_found())
+        view._last_tree_digest = None
+
+        assert await view.refresh() == "no_message"
+        await until(view._torn_down)
+        assert await view.reload() == "no_message"
+        assert await view.refresh() == "no_message"
+
+    async def test_a_view_sent_again_after_a_deletion_reports_its_own_close(self):
+        first, _ = self._interaction(1)
+        second, _ = self._interaction(2)
+
+        class _Reposts(RenderableLayoutView):
+            async def on_message_delete(self):
+                self.interaction = second
+                await self.send()
+
+        view = self._panel(first, _Reposts)
+        await view.send()
+        await view.state_store._clean_up_deleted(lambda message: message.id == 1)
+        assert not view._torn_down()
+        await view.exit(delete_message=False)
+
+        assert await view.reload() == "closed"
+
+    async def test_a_view_given_a_new_message_reports_its_own_close(self):
+        first, _ = self._interaction(1)
+        _, replacement = self._interaction(2)
+
+        class _KeepsTheView(RenderableLayoutView):
+            async def on_message_delete(self):
+                self.message = replacement
+
+        view = self._panel(first, _KeepsTheView)
+        await view.send()
+        await view.state_store._clean_up_deleted(lambda message: message.id == 1)
+        await view.exit(delete_message=False)
+
+        assert await view.reload() == "closed"
+
+    async def test_a_hook_that_clears_the_message_through_the_setter_keeps_the_deletion(self):
+        """The setter cleared the mark even when given None, so an
+        on_message_delete() that wrote self.message = None reported CLOSED."""
+        interaction, _ = self._interaction(1)
+
+        class _ClearsThroughTheSetter(RenderableLayoutView):
+            async def on_message_delete(self):
+                self.message = None
+                await self.exit(delete_message=False)
+
+        view = self._panel(interaction, _ClearsThroughTheSetter)
+        await view.send()
+        await view.state_store._clean_up_deleted(lambda message: message.id == 1)
+
+        assert view._torn_down()
+        assert await view.reload() == "no_message"
+
+    async def test_the_view_a_push_handed_a_deleted_message_reports_no_message(self):
+        """The source's hook closed the push's destination before the
+        destination's own turn, which skipped it as torn down without marking
+        the deletion, so its renders reported CLOSED."""
+        interaction, _ = self._interaction(1)
+        loading = asyncio.Event()
+
+        class _Destination(RenderableLayoutView):
+            async def on_load(self):
+                await loading.wait()
+
+        source = self._panel(interaction)
+        await source.send()
+        push = asyncio.create_task(source.push(_Destination))
+        await until(lambda: source._away_for_navigation)
+        cleanup = asyncio.create_task(
+            source.state_store._clean_up_deleted(lambda message: message.id == 1)
+        )
+        for _ in range(5):
+            await asyncio.sleep(0)
+        loading.set()
+        destination = await asyncio.wait_for(push, 2)
+        await asyncio.wait_for(cleanup, 2)
+
+        assert destination._torn_down()
+        assert await destination.reload() == "no_message"

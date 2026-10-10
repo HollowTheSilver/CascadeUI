@@ -231,7 +231,7 @@ complete list with defaults.
 | `allowed_mentions` | `None` | Mention rules for this view's own message, on send and on every re-render. `None` defers to the bot's client-level rules |
 | `enable_undo` | `False` | Track undo/redo history for this view |
 | `undo_limit` | `20` | Max undo snapshots |
-| `refresh_cooldown_ms` | `None` | Proactive cooldown in milliseconds on **background** re-renders; those arriving during the window schedule one deferred edit and re-read store state at fire time. Edits answering a click on the view's own message are exempt -- for per-user spam control on one control, use `with_cooldown` |
+| `refresh_cooldown_ms` | `None` | Proactive cooldown in milliseconds on **background** re-renders; those arriving during the window schedule one deferred edit and re-read store state at fire time. Edits answering a click on the view's own message, and the redraw after a failed push or pop, are exempt. For per-user spam control on a single button or select, use `with_cooldown` |
 | `edit_timeout` | `60.0` | Max seconds any single Discord edit (refresh, exit, navigation) may stall before being cancelled; `None` disables the bound |
 
 ### The three-tier precedence model
@@ -555,12 +555,12 @@ The auto-defer timer fires at 2.5 seconds, pre-acks the click, and
 disqualifies the fast path; subsequent refreshes route through the
 channel endpoint anyway.
 
-For callbacks that match this profile, `await self._safe_defer(interaction)`
+For callbacks that match this profile, `await self.safe_defer(interaction)`
 at the start of the callback is the right pattern:
 
 ```python
 async def slow_callback(self, interaction: discord.Interaction):
-    await self._safe_defer(interaction)        # ack the click immediately
+    await self.safe_defer(interaction)        # ack the click immediately
     data = await fetch_from_database(...)       # 1-2 seconds of work
     await self.dispatch("DATA_LOADED", {"data": data})
     # on_state_changed fires; refresh ships via the channel endpoint.
@@ -575,17 +575,17 @@ the auto-defer timer would have produced), so the visible result is
 identical to a slow callback under default behavior -- the difference
 is removing the 2.5-second window where Discord's UI sits in limbo.
 
-The `_safe_defer` helper guards against double-deferring (it checks
+The `safe_defer` helper guards against double-deferring (it checks
 `is_done()` before issuing the actual defer), so it is safe to call
 in any code path that genuinely needs to ack early. The cost is
-unconditional, however: every call to `_safe_defer` flips
+unconditional, however: every call to `safe_defer` flips
 `is_done()` to True, which disqualifies the acting-view fast path on
 every subsequent `refresh()` for that interaction. Calling it
 unnecessarily on a fast callback trades the one-call fast path for
 the two-call channel path with no upside.
 
 The rule of thumb: callbacks whose work routinely runs longer than
-about a second and a half should call `_safe_defer` at the top;
+about a second and a half should call `safe_defer` at the top;
 callbacks that typically complete well under a second should not.
 The threshold is approximate -- it depends on Discord round-trip
 latency, which varies with backend load and the bot's own

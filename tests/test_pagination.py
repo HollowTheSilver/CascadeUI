@@ -1385,11 +1385,11 @@ class TestFromCursor:
         ],
         ids=["v1", "v2"],
     )
-    async def test_page_turns_that_outlive_an_exit_leave_the_frozen_panel_alone(
-        self, cls, formatter
-    ):
+    async def test_page_turns_that_outlive_an_exit_never_ship_live_controls(self, cls, formatter):
         """A page turn whose fetch was running when exit() froze the panel, and
-        one queued behind it, both shipped live controls onto it afterwards."""
+        one queued behind it, both shipped live controls onto it afterwards.
+        The running turn's page goes out with the controls as the close left
+        them, and the queued one never fetches for the closed view."""
         gate = asyncio.Event()
         fetches = []
 
@@ -1413,13 +1413,77 @@ class TestFromCursor:
         queued = asyncio.create_task(view.set_page(2))
         await asyncio.sleep(0)
         await view.exit()
-        edits = message.edit.await_count
+        shipped = []
+
+        def edit(**kwargs):
+            tree = list(kwargs["view"].walk_children())
+            texts = [c.content for c in tree if isinstance(c, TextDisplay)]
+            buttons = [b.disabled for b in tree if isinstance(b, discord.ui.Button)]
+            shipped.append((kwargs.get("content"), texts, buttons))
+            return message
+
+        message.edit.side_effect = edit
 
         gate.set()
         await asyncio.wait_for(asyncio.gather(in_flight, queued), timeout=2)
 
-        assert message.edit.await_count == edits
+        assert len(shipped) == 1
+        content, texts, buttons = shipped[0]
+        if cls is PaginatedView:
+            assert content == "page 1"
+            assert buttons == []  # a V1 exit strips the controls
+        else:
+            assert texts == ["page 1"]
+            assert buttons and all(buttons)
         assert fetches == [0, 1]  # the queued turn never fetched for the dead view
+
+    @pytest.mark.parametrize(
+        "cls, formatter",
+        [
+            (PaginatedView, lambda rows: rows[0]),
+            (PaginatedLayoutView, lambda rows: TextDisplay(rows[0])),
+        ],
+        ids=["v1", "v2"],
+    )
+    async def test_a_page_turn_overtaken_by_another_shows_no_unloaded_page(self, cls, formatter):
+        """The second turn moves the cursor before it waits, and the first then
+        rendered the page it named without loading it: V2 showed the
+        "Loading..." card, V1 kept the old page's text under the new
+        indicator, until the second turn rendered."""
+        gate = asyncio.Event()
+
+        async def fetch(offset, limit):
+            if offset:
+                await gate.wait()
+            return [f"page {offset}"]
+
+        view = cls.from_cursor(
+            fetch,
+            total=3,
+            per_page=1,
+            formatter=formatter,
+            interaction=_make_interaction(),
+        )
+        await view.send()
+        message = view._message
+        shipped = []
+
+        def edit(**kwargs):
+            tree = list(kwargs["view"].walk_children())
+            texts = [c.content for c in tree if isinstance(c, TextDisplay)]
+            shipped.append(kwargs.get("content") if cls is PaginatedView else texts)
+            return message
+
+        message.edit.side_effect = edit
+        first = asyncio.create_task(view.set_page(1))
+        await asyncio.sleep(0)
+        second = asyncio.create_task(view.set_page(2))
+        await asyncio.sleep(0)
+        gate.set()
+        await asyncio.wait_for(asyncio.gather(first, second), timeout=2)
+
+        expected = "page 2" if cls is PaginatedView else ["page 2"]
+        assert shipped and all(edit == expected for edit in shipped)
 
 
 # // ========================================( Send Kwargs Propagation )======================================== // #

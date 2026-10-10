@@ -171,7 +171,10 @@ class ActionCreators:
 
     @staticmethod
     def registry_pruned(
-        deleted: int, reason: str, keys: Optional[List[str]] = None
+        deleted: int,
+        reason: str,
+        keys: Optional[List[str]] = None,
+        source: Optional[str] = None,
     ) -> ActionPayload:
         """Create a REGISTRY_PRUNED action payload.
 
@@ -179,10 +182,16 @@ class ActionCreators:
         cascadeui_persistent_views namespace. ``deleted`` is the row count removed,
         ``keys`` is the list of ``persistence_key`` values actually pruned (so
         a subscriber can reconcile its own records surgically), and ``reason``
-        is a short tag (``"explicit"`` for a targeted prune, ``"clear_all"``
-        for a full wipe) indicating what motivated the prune.
+        is a short tag naming what motivated the prune: ``"explicit"`` for a
+        targeted prune, ``"clear_all"`` for a full wipe, ``"gone"`` when a
+        reattach pass or the unreachable sweep deleted rows whose channel or
+        message returned a 404, and ``"unreachable"`` when the sweep deleted
+        rows that stayed unreachable past its cutoff. ``source`` names the
+        call that pruned: ``"reattach"``, ``"prune_unreachable"``, or
+        ``"prune_registry"``, so a subscriber that takes a reattach pass's
+        deletions from ``total_reattach_summary`` can skip them here.
         """
-        return {"deleted": deleted, "keys": keys or [], "reason": reason}
+        return {"deleted": deleted, "keys": keys or [], "reason": reason, "source": source}
 
     @staticmethod
     def scoped_update(
