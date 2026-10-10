@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import discord
 import pytest
-from helpers import make_interaction, until
+from helpers import make_interaction, refused_by_closed_session, until
 
 from cascadeui import setup_middleware
 from cascadeui.exceptions import (
@@ -407,8 +407,15 @@ class TestPruneRegistryKeys:
     def test_action_creator_includes_keys(self):
         from cascadeui.state.actions import ActionCreators
 
-        payload = ActionCreators.registry_pruned(2, "explicit", keys=["a", "b"])
-        assert payload == {"deleted": 2, "keys": ["a", "b"], "reason": "explicit"}
+        payload = ActionCreators.registry_pruned(
+            2, "explicit", keys=["a", "b"], source="prune_registry"
+        )
+        assert payload == {
+            "deleted": 2,
+            "keys": ["a", "b"],
+            "reason": "explicit",
+            "source": "prune_registry",
+        }
         # Backward-compatible default when no keys are supplied.
         assert ActionCreators.registry_pruned(0, "clear_all")["keys"] == []
 
@@ -455,6 +462,7 @@ class TestPruneRegistryKeys:
         assert captured[0]["keys"] == ["panel:a"]
         assert captured[0]["deleted"] == 1
         assert captured[0]["reason"] == "explicit"
+        assert captured[0]["source"] == "prune_registry"
 
     async def test_all_absent_keys_report_empty(self):
         # Pruning only keys that are not on disk reports zero deleted and an
@@ -1193,6 +1201,38 @@ class TestTotalReattachSummary:
         mgr._bot = MagicMock()
         return mgr
 
+    @pytest.mark.parametrize("own_error", [True, False], ids=["own error", "closed session"])
+    async def test_a_row_failing_as_its_bot_closes_is_failed_only_for_its_own_error(
+        self, own_error, caplog
+    ):
+        """Any error once the bot had closed left the row pending at DEBUG, so a
+        kwargs migrator's own bug said nothing until a later restore."""
+        from cascadeui.views.persistent import PersistentLayoutView, _persistent_view_classes
+
+        class _ClosingPanel(PersistentLayoutView):
+            pass
+
+        class_name = next(k for k, v in _persistent_view_classes.items() if v is _ClosingPanel)
+        mgr = self._mgr()
+        mgr._bot.is_closed.return_value = True
+        mgr._registry_rows = [
+            {"persistence_key": "closing", "view_class": class_name, "channel_id": 1}
+        ]
+
+        async def migrate(row, view_cls, summary):
+            if own_error:
+                raise RuntimeError("the migrator's own error")
+            await refused_by_closed_session()
+
+        mgr._migrate_init_kwargs = migrate
+
+        with caplog.at_level("ERROR", logger="cascadeui"):
+            summary = await mgr.reattach_persistent_views()
+
+        errors = [r for r in caplog.records if r.name.startswith("cascadeui")]
+        assert summary["failed"] == (["closing"] if own_error else [])
+        assert len(errors) == (1 if own_error else 0)
+
     async def test_a_removal_from_an_earlier_pass_survives_a_re_drive(self):
         from cascadeui.views.persistent import PersistentLayoutView, _persistent_view_classes
 
@@ -1231,6 +1271,118 @@ class TestTotalReattachSummary:
         assert second["removed"] == []
         assert mgr.last_reattach_summary["removed"] == []
         assert mgr.total_reattach_summary["removed"] == ["gone"]
+
+    async def test_a_pass_reports_its_removals_with_reason_gone(self):
+        """A pass's deletion said "explicit", the reason an operator's
+        targeted prune gets, so a subscriber could not tell the two apart."""
+        from cascadeui.views.persistent import PersistentLayoutView, _persistent_view_classes
+
+        class _GonePanel(PersistentLayoutView):
+            pass
+
+        row = {
+            "persistence_key": "panel:gone",
+            "view_class": next(k for k, v in _persistent_view_classes.items() if v is _GonePanel),
+            "custom_id": None,
+            "message_id": 2,
+            "channel_id": 1,
+            "guild_id": None,
+            "user_id": None,
+            "session_id": None,
+            "init_kwargs": "{}",
+            "kwargs_schema_version": 1,
+            "schema_version": 1,
+            "created_at": 1,
+            "updated_at": 1,
+        }
+        backend = InMemoryBackend()
+        await backend.initialize()
+        await backend.row_upsert(TABLE_PERSISTENT_VIEWS, row, ["persistence_key"])
+        store = get_store()
+        mgr = PersistenceManager(store=store, registry=RegistryPersistence(backend=backend))
+        mgr._bot = MagicMock()
+        mgr._registry_rows = [row]
+
+        async def _fetch(row, removed, unreachable):
+            removed.append(row["persistence_key"])
+            return None
+
+        mgr._fetch_restore_message = _fetch
+        pruned = []
+
+        async def _on_pruned(action, state):
+            pruned.append(action["payload"])
+
+        store.on("registry_pruned", _on_pruned)
+        try:
+            summary = await mgr.reattach_persistent_views()
+        finally:
+            store.off("registry_pruned", _on_pruned)
+
+        assert summary["removed"] == ["panel:gone"]
+        assert pruned == [
+            {"deleted": 1, "keys": ["panel:gone"], "reason": "gone", "source": "reattach"}
+        ]
+
+    async def test_a_prune_registry_override_sees_a_pass_removal(self):
+        """A pass pruned through a private method, so a manager subclass whose
+        ``prune_registry`` override mirrors deletions into its own records
+        missed every row a pass removed."""
+        from cascadeui.views.persistent import PersistentLayoutView, _persistent_view_classes
+
+        class _MirroredPanel(PersistentLayoutView):
+            pass
+
+        seen = []
+
+        class _Mirroring(PersistenceManager):
+            async def prune_registry(self, **kwargs):
+                seen.append(kwargs)
+                return await super().prune_registry(**kwargs)
+
+        row = {
+            "persistence_key": "panel:mirrored",
+            "view_class": next(
+                k for k, v in _persistent_view_classes.items() if v is _MirroredPanel
+            ),
+            "custom_id": None,
+            "message_id": 2,
+            "channel_id": 1,
+            "guild_id": None,
+            "user_id": None,
+            "session_id": None,
+            "init_kwargs": "{}",
+            "kwargs_schema_version": 1,
+            "schema_version": 1,
+            "created_at": 1,
+            "updated_at": 1,
+        }
+        backend = InMemoryBackend()
+        await backend.initialize()
+        await backend.row_upsert(TABLE_PERSISTENT_VIEWS, row, ["persistence_key"])
+        store = get_store()
+        mgr = _Mirroring(store=store, registry=RegistryPersistence(backend=backend))
+        mgr._bot = MagicMock()
+        mgr._registry_rows = [row]
+
+        async def _fetch(row, removed, unreachable):
+            removed.append(row["persistence_key"])
+            return None
+
+        mgr._fetch_restore_message = _fetch
+        sources = []
+
+        async def _on_pruned(action, state):
+            sources.append(action["payload"]["source"])
+
+        store.on("registry_pruned", _on_pruned)
+        try:
+            await mgr.reattach_persistent_views()
+        finally:
+            store.off("registry_pruned", _on_pruned)
+
+        assert seen == [{"persistence_keys": ["panel:mirrored"], "reason": "gone"}]
+        assert sources == ["reattach"]
 
     async def test_a_key_appears_under_its_most_recent_outcome_only(self):
         mgr = self._mgr()
@@ -1633,6 +1785,41 @@ class TestReattachOnBind:
         )
         assert outcome == "restored"
         assert captured["view"].db == "POOL"
+
+    async def test_a_bind_that_raises_takes_the_view_out_of_routing(self):
+        """bot.add_view() had handed the message's clicks to the view before
+        on_bind raised, and the rollback never stopped it, so every click ran
+        its callback on a torn-down view that rendered nothing."""
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        class _BadBindPanel(PersistentLayoutView):
+            def on_bind(self, bot):
+                self.db = bot.db  # the bot has no pool yet
+
+        self._stub_seams(_BadBindPanel)
+        mgr = await self._row("panel:badbind", _BadBindPanel)
+
+        class _Msg:
+            id = 1
+
+        captured = {}
+
+        class _FakeBot:
+            def add_view(self, view, message_id):
+                captured["view"] = view
+
+        mgr._bot = _FakeBot()
+        outcome = await mgr._reattach_one(
+            row=mgr._registry_rows[0],
+            view_cls=_BadBindPanel,
+            init_kwargs={"persistence_key": "panel:badbind"},
+            message=_Msg(),
+            class_name=_BadBindPanel.__qualname__,
+            restored_views=[],
+        )
+
+        assert outcome == "failed"
+        assert captured["view"].is_finished()
 
 
 class TestReattachBaselineDigest:
@@ -3623,18 +3810,82 @@ class TestPruneUnreachable:
             "first_unreachable_at": stamp,
         }
 
-    async def _mgr(self, rows, bot=True):
+    async def _mgr(self, rows, bot=True, cls=PersistenceManager):
         backend = InMemoryBackend()
         await backend.initialize()
         for r in rows:
             await backend.row_upsert(TABLE_PERSISTENT_VIEWS, r, ["persistence_key"])
-        mgr = PersistenceManager(
+        mgr = cls(
             store=get_store(),
             registry=RegistryPersistence(backend=backend),
             bot=MagicMock() if bot else None,
         )
         mgr._registry_rows = [dict(r) for r in rows]
         return mgr, backend
+
+    async def test_a_prune_registry_override_sees_the_sweep_prunes(self):
+        """The sweep pruned through a private method, so a manager subclass
+        whose ``prune_registry`` override mirrors deletions missed them."""
+        seen = []
+
+        class _Mirroring(PersistenceManager):
+            async def prune_registry(self, **kwargs):
+                seen.append(kwargs)
+                return await super().prune_registry(**kwargs)
+
+        now = int(time.time())
+        mgr, _ = await self._mgr(
+            [self._row("old", now - 40 * 86400), self._row("gone", now - 40 * 86400)],
+            cls=_Mirroring,
+        )
+
+        async def _fetch(row, removed, unreachable):
+            target = removed if row["persistence_key"] == "gone" else unreachable
+            target.append(row["persistence_key"])
+            return None
+
+        mgr._fetch_restore_message = _fetch
+        sources = []
+
+        async def record(action, state):
+            sources.append(action["payload"]["source"])
+
+        get_store().on("registry_pruned", record)
+
+        await mgr.prune_unreachable(older_than_days=30)
+
+        assert sorted(seen, key=lambda kw: kw["reason"]) == [
+            {"persistence_keys": ["gone"], "reason": "gone"},
+            {"persistence_keys": ["old"], "reason": "unreachable"},
+        ]
+        assert sources == ["prune_unreachable", "prune_unreachable"]
+
+    async def test_a_prune_a_hook_makes_during_the_sweep_names_itself(self):
+        """A REGISTRY_PRUNED hook runs inside the sweep's prune, so a prune it
+        makes there would otherwise read the sweep's source."""
+        now = int(time.time())
+        mgr, backend = await self._mgr(
+            [self._row("gone", now - 40 * 86400), self._row("extra", None)]
+        )
+
+        async def _fetch(row, removed, unreachable):
+            removed.append(row["persistence_key"])
+            return None
+
+        mgr._fetch_restore_message = _fetch
+        sources = []
+
+        async def record(action, state):
+            payload = action["payload"]
+            sources.append((payload["keys"], payload["source"]))
+            if payload["keys"] == ["gone"]:
+                await mgr.prune_registry(persistence_keys=["extra"])
+
+        get_store().on("registry_pruned", record)
+
+        await mgr.prune_unreachable(older_than_days=30)
+
+        assert sources == [(["gone"], "prune_unreachable"), (["extra"], "prune_registry")]
 
     async def test_it_classifies_every_candidate(self):
         now = int(time.time())
@@ -3658,12 +3909,26 @@ class TestPruneUnreachable:
             return None
 
         mgr._fetch_restore_message = _fetch
+        pruned = []
+
+        async def record(action, state):
+            payload = action["payload"]
+            pruned.append((payload["reason"], payload["keys"], payload["source"]))
+
+        get_store().on("registry_pruned", record)
 
         result = await mgr.prune_unreachable(older_than_days=30)
 
         assert sorted(result["pruned"]) == ["gone", "old"]
+        assert result["gone"] == ["gone"]
         assert result["recovered"] == ["recovers"]
         assert result["kept"] == ["young"]
+        # A deleted message is reported as a reattach pass reports it, apart
+        # from the row that only aged out, and the sweep names itself.
+        assert sorted(pruned) == [
+            ("gone", ["gone"], "prune_unreachable"),
+            ("unreachable", ["old"], "prune_unreachable"),
+        ]
         left = sorted(
             r["persistence_key"] for r in await backend.row_select(TABLE_PERSISTENT_VIEWS)
         )
@@ -3762,6 +4027,7 @@ class TestPruneUnreachable:
         mgr = PersistenceManager(store=get_store(), bot=MagicMock())
         assert await mgr.prune_unreachable(older_than_days=1) == {
             "pruned": [],
+            "gone": [],
             "recovered": [],
             "kept": [],
         }
@@ -3789,7 +4055,7 @@ class TestPruneUnreachable:
 
         result = await mgr.prune_unreachable(older_than_days=30)
 
-        assert result == {"pruned": [], "recovered": [], "kept": ["live"]}
+        assert result == {"pruned": [], "gone": [], "recovered": [], "kept": ["live"]}
         assert fetched == []
         assert await backend.row_select(TABLE_PERSISTENT_VIEWS, {"persistence_key": "live"})
 

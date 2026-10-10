@@ -62,11 +62,10 @@ async def setup_middleware(*middlewares: Any, store: Optional[Any] = None) -> No
 
     A repeat call that passes a new instance of a class already installed
     initializes the installed one, and the new instance is not used.
-    ``setup_hook`` runs on every login, so a bot closed and started again
-    in the same process makes exactly that call, and the installed
-    ``PersistenceMiddleware`` reopens the persistence the bot's close shut.
-    When the restart built a new bot object too, the installed instance
-    takes that bot from the new one.
+    discord.py cannot log a closed bot in again, so a restart in the same
+    process builds a new bot, and its ``setup_hook`` makes exactly that
+    call: the installed ``PersistenceMiddleware`` takes the new bot from
+    the new instance and reopens the persistence the old bot's close shut.
 
     Parameters
     ----------

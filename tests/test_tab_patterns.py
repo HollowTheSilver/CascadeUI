@@ -9,7 +9,10 @@ import discord
 import pytest
 from discord.ui import Container, TextDisplay
 from helpers import make_interaction as _make_interaction
+from helpers import owe_redraw
+from helpers import snapshot_edits as _snapshot_edits
 
+from cascadeui import RenderOutcome, StatefulButton
 from cascadeui.state.singleton import get_store
 from cascadeui.views.patterns import TabLayoutView
 from cascadeui.views.patterns.tabs import TabView
@@ -552,6 +555,31 @@ class TestTabViewInitialRender:
 class TestRefreshContent:
     """refresh_content() re-renders in place: V1 ships the embed, V2 the tree."""
 
+    @pytest.mark.parametrize("delete", [False, True], ids=["freeze", "delete"])
+    async def test_a_reload_whose_tab_finishes_after_the_view_exits(self, delete):
+        """A render that found its view closed reported NO_MESSAGE, the
+        outcome of a message deleted out from under the view. One that was
+        already building ships the finished tab, unless the close deleted
+        the message."""
+        building, release = asyncio.Event(), asyncio.Event()
+        builds = []
+
+        async def tab_a():
+            builds.append(True)
+            if len(builds) > 1:
+                building.set()
+                await release.wait()
+            return discord.Embed(title="A")
+
+        view = TabView(interaction=_make_interaction(), tabs={"A": tab_a})
+        await view.send()
+        reload = asyncio.create_task(view.reload())
+        await asyncio.wait_for(building.wait(), 2)
+        await view.exit(delete_message=delete)
+        release.set()
+
+        assert await asyncio.wait_for(reload, 2) == ("closed" if delete else "rendered")
+
     async def test_v1_ships_the_embed(self):
         async def embed_builder():
             return discord.Embed(title="V1 content")
@@ -638,11 +666,11 @@ class TestRefreshContent:
         ],
         ids=["v1", "v2"],
     )
-    async def test_tab_renders_that_outlive_an_exit_leave_the_frozen_panel_alone(
-        self, cls, content
-    ):
+    async def test_tab_renders_that_outlive_an_exit_leave_no_live_controls(self, cls, content):
         """A render whose builder was running when exit() froze the panel, and
-        one queued behind it, both shipped live controls onto it afterwards."""
+        one queued behind it, both shipped live controls onto it afterwards.
+        The one already building ships its finished tree with the controls
+        the close left, and the queued one never builds."""
         gate = asyncio.Event()
         builds = {"n": 0}
 
@@ -663,12 +691,13 @@ class TestRefreshContent:
         queued = asyncio.create_task(view.refresh_content())
         await asyncio.sleep(0)
         await view.exit()
-        edits = message.edit.await_count
+        shipped = _snapshot_edits(view)
 
         gate.set()
         await asyncio.wait_for(asyncio.gather(in_flight, queued), timeout=2)
 
-        assert message.edit.await_count == edits
+        assert len(shipped) == 1
+        assert all(shipped[0]["buttons"])  # disabled, or stripped by a V1 exit
         assert builds["n"] == 2  # the queued render never built on the dead view
 
     async def test_a_tab_render_leaves_an_armed_view_on_its_refresh_button(self):
@@ -885,3 +914,477 @@ class TestTabCursorRewindsWhenTheEditNeverLanded:
         message.edit.assert_not_awaited()
         shown = [c.content for c in view.walk_children() if isinstance(c, TextDisplay)]
         assert "x" in shown
+
+
+# // ========================================( A render that outlasts a close )======================================== // #
+
+
+class TestATabRenderThatOutlastsAClose:
+    """A tab render already building when its view closed shipped nothing,
+    while the close had frozen the tab buttons with no content under them.
+    The finished tab goes out with the controls as the close left them,
+    unless a render asked for after it began has landed or stalled, before
+    or after the close."""
+
+    @staticmethod
+    async def _closed_mid_build(version, after_close=None, before_close=None):
+        building, release = asyncio.Event(), asyncio.Event()
+        slow = []
+
+        async def tab_a():
+            if slow:
+                building.set()
+                await release.wait()
+            if version == "v1":
+                return discord.Embed(title="A")
+            return [Container(TextDisplay("A body"))]
+
+        cls = TabView if version == "v1" else TabLayoutView
+        view = cls(interaction=_make_interaction(), tabs={"A": tab_a, "B": tab_a})
+        await view.send()
+        slow.append(True)
+        render = asyncio.create_task(view.refresh_content())
+        await asyncio.wait_for(building.wait(), 2)
+        if before_close is not None:
+            await before_close(view)
+        await view.exit(delete_message=False)
+        shipped = _snapshot_edits(view)
+        if after_close is not None:
+            await after_close(view)
+        release.set()
+        await asyncio.wait_for(render, 2)
+        return shipped
+
+    @pytest.mark.parametrize("version", ["v1", "v2"])
+    async def test_the_finished_tab_ships_after_the_close(self, version):
+        shipped = await self._closed_mid_build(version)
+
+        assert len(shipped) == 1
+        if version == "v1":
+            assert shipped[0]["embed"].title == "A"
+            assert shipped[0]["buttons"] == []  # an exit strips a V1 panel's controls
+        else:
+            assert "A body" in shipped[0]["texts"]
+            assert shipped[0]["buttons"] and all(shipped[0]["buttons"])
+
+    async def test_a_final_card_sent_after_the_close_is_not_covered(self):
+        async def goodbye(view):
+            view.clear_items()
+            view.add_item(TextDisplay("Goodbye"))
+            await view.refresh()
+
+        shipped = await self._closed_mid_build("v2", after_close=goodbye)
+
+        assert [edit["texts"] for edit in shipped] == [["Goodbye"]]
+
+    async def test_a_render_that_landed_before_the_close_is_not_covered(self):
+        """A refresh() from another task reached the message after the tab
+        began building and before the close. The finished tab is older than
+        that edit, so it does not ship over it."""
+
+        async def other_task_render(view):
+            view.add_item(TextDisplay("Notice"))
+            assert await view.refresh() is RenderOutcome.RENDERED
+
+        shipped = await self._closed_mid_build("v2", before_close=other_task_render)
+
+        assert shipped == []
+
+    async def test_a_v1_tab_keeps_its_embed_when_a_newer_render_set_only_the_tree(self):
+        """A bare refresh() from another task covered the tab's tree, and the
+        late render then sent nothing at all, so the tab's embed never reached
+        the frozen panel."""
+
+        async def tree_only(view):
+            view._tab_buttons[1].label = "B (new)"
+            assert await view.refresh() is RenderOutcome.RENDERED
+
+        shipped = await self._closed_mid_build("v1", before_close=tree_only)
+
+        assert [edit["embed"].title for edit in shipped if edit["embed"]] == ["A"]
+
+    @pytest.mark.parametrize("lands", [True, False])
+    @pytest.mark.parametrize("decides", ["after_the_freeze", "while_the_freeze_is_in_flight"])
+    async def test_a_late_tab_yields_to_a_carried_redraw_only_once_it_lands(self, decides, lands):
+        """The redraw a close carried for a failed navigation was marked
+        before its edit was sent, so a tab render finishing after the close
+        declined even when that edit failed, and the panel kept neither."""
+        building, release = asyncio.Event(), asyncio.Event()
+        freezing, freeze_result = asyncio.Event(), asyncio.Event()
+        slow = []
+
+        async def tab_a():
+            if slow:
+                building.set()
+                await release.wait()
+            return discord.Embed(title="A")
+
+        view = TabView(interaction=_make_interaction(), tabs={"A": tab_a, "B": tab_a})
+        await view.send()
+        view.nav_rebuild = lambda v: {"embed": discord.Embed(title="Redraw")}
+        landed_embeds = []
+
+        async def edit(**kwargs):
+            if kwargs.get("embed") is not None and kwargs["embed"].title == "Redraw":
+                freezing.set()
+                await freeze_result.wait()
+                if not lands:
+                    raise discord.HTTPException(MagicMock(status=500, reason="err"), "down")
+            if kwargs.get("embed") is not None:
+                landed_embeds.append(kwargs["embed"].title)
+            return view._message
+
+        view._message.edit = AsyncMock(side_effect=edit)
+        slow.append(True)
+        render = asyncio.create_task(view.refresh_content())
+        await asyncio.wait_for(building.wait(), 2)
+        owe_redraw(view)
+        closing = asyncio.create_task(view.exit(delete_message=False))
+        await asyncio.wait_for(freezing.wait(), 2)
+        if decides == "while_the_freeze_is_in_flight":
+            release.set()
+            for _ in range(20):
+                await asyncio.sleep(0)
+            assert not render.done(), "the render decided before the redraw's edit settled"
+            freeze_result.set()
+        else:
+            freeze_result.set()
+            await asyncio.wait_for(closing, 2)
+            release.set()
+        await asyncio.wait_for(asyncio.gather(render, closing), 2)
+
+        assert landed_embeds == (["Redraw"] if lands else ["A"])
+
+    @pytest.mark.parametrize("close", ["exit", "on_timeout"])
+    async def test_a_redraw_no_freeze_carried_does_not_hold_back_a_late_tab(self, close):
+        """A close with nothing to freeze sent no edit, yet the redraw it had
+        gathered stayed marked, and a tab render finishing after it sent
+        nothing."""
+        building, release = asyncio.Event(), asyncio.Event()
+        slow = []
+
+        async def tab_a():
+            if slow:
+                building.set()
+                await release.wait()
+            return [Container(TextDisplay("A body"))]
+
+        view = TabLayoutView(interaction=_make_interaction(), tabs={"A": tab_a, "B": tab_a})
+        await view.send()
+
+        def redraw(v):
+            v.clear_items()
+            v.add_item(TextDisplay("Redraw"))
+
+        view.nav_rebuild = redraw
+        view._teardown_edit_target = lambda **_: None
+        slow.append(True)
+        render = asyncio.create_task(view.refresh_content())
+        await asyncio.wait_for(building.wait(), 2)
+        owe_redraw(view)
+        await getattr(view, close)()
+        shipped = _snapshot_edits(view)
+        release.set()
+        await asyncio.wait_for(render, 2)
+
+        assert any("A body" in edit["texts"] for edit in shipped)
+
+    async def test_a_v1_tab_does_not_cover_an_embed_a_newer_render_set(self):
+        async def newer_embed(view):
+            assert await view.refresh(embed=discord.Embed(title="Notice")) is RenderOutcome.RENDERED
+
+        shipped = await self._closed_mid_build("v1", before_close=newer_embed)
+
+        assert not [edit for edit in shipped if edit["embed"] is not None]
+
+    async def test_a_closing_card_sent_before_the_close_is_not_covered(self):
+        """The guide's closing shape: a card through refresh(), then
+        exit(delete_message=False). The tab render that was building shipped
+        over the card once it finished."""
+
+        async def card(view):
+            view.clear_items()
+            view.add_item(TextDisplay("Goodbye"))
+            await view.refresh()
+
+        shipped = await self._closed_mid_build("v2", before_close=card)
+
+        assert shipped == []
+
+    async def test_a_click_render_sent_again_after_the_close_is_not_covered(self):
+        """A click's render, asked for while the tab was building, stalled
+        before the close and goes out again after it. The tab render began
+        first, so it does not ship over the click's edit."""
+        building, release = asyncio.Event(), asyncio.Event()
+        slow = []
+
+        async def tab_a():
+            if slow:
+                building.set()
+                await release.wait()
+            return discord.Embed(title="A")
+
+        async def stall(**kwargs):
+            await asyncio.sleep(60)
+
+        async def place(interaction):
+            await view.refresh(embed=discord.Embed(title="Order placed"))
+            await view.exit()
+
+        class _Tabs(TabView):
+            auto_defer_delay = 1.5
+
+        view = _Tabs(interaction=_make_interaction(), tabs={"A": tab_a, "B": tab_a})
+        await view.send()
+        button = StatefulButton(label="Place", custom_id="place", callback=place)
+        view.add_item(button)
+        slow.append(True)
+        render = asyncio.create_task(view.refresh_content())
+        await asyncio.wait_for(building.wait(), 2)
+        shipped = _snapshot_edits(view)
+        click = _make_interaction(message=MagicMock(id=view._message.id))
+        click.type = discord.InteractionType.component
+        click.response.edit_message = AsyncMock(side_effect=stall)
+
+        await view._scheduled_task(button, click)
+        release.set()
+        await asyncio.wait_for(render, 2)
+
+        assert [e["embed"].title for e in shipped if e["embed"] is not None] == ["Order placed"]
+
+    async def test_a_v1_reload_whose_load_outlasts_the_close_ships(self):
+        """reload() decided the late render ships once on_load returned, and
+        the tab render it went through declined it again on finding the view
+        closed, so a V1 tab view kept the frozen panel and reported CLOSED."""
+        building, release = asyncio.Event(), asyncio.Event()
+
+        class _Loading(TabView):
+            gate = False
+
+            async def on_load(self):
+                await super().on_load()
+                if self.gate:
+                    building.set()
+                    await release.wait()
+
+        async def tab_a():
+            return discord.Embed(title="A")
+
+        view = _Loading(interaction=_make_interaction(), tabs={"A": tab_a, "B": tab_a})
+        await view.send()
+        view.gate = True
+        reload = asyncio.create_task(view.reload())
+        await asyncio.wait_for(building.wait(), 2)
+        await view.exit(delete_message=False)
+        shipped = _snapshot_edits(view)
+        release.set()
+
+        assert await asyncio.wait_for(reload, 2) is RenderOutcome.RENDERED
+        assert [edit["embed"].title for edit in shipped] == ["A"]
+
+    async def test_a_v1_reload_keeps_a_card_sent_while_it_loaded(self):
+        """A card went out while the reload's on_load ran, and the view closed
+        while the tab's builder ran. The tab render took its own number after
+        on_load, missed the card, and shipped over it."""
+        loading, load_go, building, build_go = (asyncio.Event() for _ in range(4))
+        gate = []
+
+        async def tab_a():
+            if gate:
+                building.set()
+                await build_go.wait()
+            return discord.Embed(title="A")
+
+        class _Loading(TabView):
+            async def on_load(self):
+                await super().on_load()
+                if gate:
+                    loading.set()
+                    await load_go.wait()
+
+        view = _Loading(interaction=_make_interaction(), tabs={"A": tab_a, "B": tab_a})
+        await view.send()
+        shipped = _snapshot_edits(view)
+        gate.append(True)
+        reload = asyncio.create_task(view.reload())
+        await asyncio.wait_for(loading.wait(), 2)
+        await view.refresh(embed=discord.Embed(title="Goodbye"))
+        load_go.set()
+        await asyncio.wait_for(building.wait(), 2)
+        await view.exit(delete_message=False)
+        build_go.set()
+
+        assert await asyncio.wait_for(reload, 2) is RenderOutcome.CLOSED
+        assert [e["embed"].title for e in shipped if e["embed"] is not None] == ["Goodbye"]
+
+    async def test_a_v1_tab_finishing_while_the_exit_closes_a_child_keeps_the_card(self):
+        """An exit closes its attached views before it tears this one down. A
+        tab render finishing in between counted the view as open and shipped
+        over the closing card."""
+        building, release, child_closing = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        slow = []
+
+        async def tab_a():
+            if slow:
+                building.set()
+                await release.wait()
+            return discord.Embed(title="A")
+
+        view = TabView(interaction=_make_interaction(), tabs={"A": tab_a, "B": tab_a})
+        await view.send()
+        child = TabView(interaction=_make_interaction(), tabs={"A": tab_a}, parent=view)
+        await child.send()
+
+        async def slow_close(*args, **kwargs):
+            child_closing.set()
+            await asyncio.sleep(0.05)
+
+        child._message.edit = AsyncMock(side_effect=slow_close)
+        child._message.delete = AsyncMock(side_effect=slow_close)
+        shipped = _snapshot_edits(view)
+        slow.append(True)
+        render = asyncio.create_task(view.refresh_content())
+        await asyncio.wait_for(building.wait(), 2)
+        await view.refresh(embed=discord.Embed(title="Goodbye"))
+        closing = asyncio.create_task(view.exit(delete_message=False))
+        await asyncio.wait_for(child_closing.wait(), 2)
+        release.set()
+        await asyncio.wait_for(asyncio.gather(render, closing), 3)
+
+        assert [e["embed"].title for e in shipped if e["embed"] is not None] == ["Goodbye"]
+
+    async def test_a_v2_tab_finishing_while_the_exit_closes_a_child_keeps_the_card(self):
+        """A V2 tab render built into the live tree while it waited for its
+        builder, so one that then declined had already put its content under
+        the closing card, and the exit froze both."""
+        building, release, child_closing = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        slow = []
+
+        async def tab_a():
+            if slow:
+                building.set()
+                await release.wait()
+            return [Container(TextDisplay("Tab body"))]
+
+        view = TabLayoutView(interaction=_make_interaction(), tabs={"A": tab_a, "B": tab_a})
+        await view.send()
+        child = TabLayoutView(interaction=_make_interaction(), tabs={"A": tab_a}, parent=view)
+        await child.send()
+
+        async def slow_close(*args, **kwargs):
+            child_closing.set()
+            await asyncio.sleep(0.05)
+
+        child._message.edit = AsyncMock(side_effect=slow_close)
+        child._message.delete = AsyncMock(side_effect=slow_close)
+        shipped = _snapshot_edits(view)
+        slow.append(True)
+        render = asyncio.create_task(view.refresh_content())
+        await asyncio.wait_for(building.wait(), 2)
+        view.clear_items()
+        view.add_item(TextDisplay("Goodbye"))
+        await view.refresh()
+        closing = asyncio.create_task(view.exit(delete_message=False))
+        await asyncio.wait_for(child_closing.wait(), 2)
+        release.set()
+        await asyncio.wait_for(asyncio.gather(render, closing), 3)
+
+        assert all(edit["texts"] == ["Goodbye"] for edit in shipped)
+
+    async def test_a_close_during_a_tab_build_freezes_the_tab_on_screen(self):
+        """The render cleared the tree to its tab row before awaiting the
+        builder, so a close meanwhile froze the tab row with nothing under it."""
+        building, release = asyncio.Event(), asyncio.Event()
+
+        async def tab_a():
+            return [Container(TextDisplay("A body"))]
+
+        async def tab_b():
+            building.set()
+            await release.wait()
+            return [Container(TextDisplay("B body"))]
+
+        view = TabLayoutView(interaction=_make_interaction(), tabs={"A": tab_a, "B": tab_b})
+        await view.send()
+        shipped = _snapshot_edits(view)
+        switch = asyncio.create_task(view.switch_tab("B"))
+        await asyncio.wait_for(building.wait(), 2)
+        await view.on_timeout()
+        release.set()
+        await asyncio.wait_for(switch, 2)
+
+        assert [edit["texts"] for edit in shipped] == [["A body"], ["B body"]]
+
+    async def test_a_redraw_rebuilt_in_place_by_the_close_is_not_covered(self):
+        """A V2 nav_rebuild that rebuilds the tree in place and returns None
+        did not count as a render, so the tab already building shipped over
+        the redraw the close carried. The owed redraw is set directly; in a
+        bot, a push whose edit outcome is unknown owes it."""
+
+        def redraw(view):
+            view.clear_items()
+            view.add_item(TextDisplay("Redraw"))
+
+        async def owe_the_redraw(view):
+            view.nav_rebuild = redraw
+            owe_redraw(view)
+
+        shipped = await self._closed_mid_build("v2", before_close=owe_the_redraw)
+
+        assert shipped == []
+
+
+class TestATabRenderShowsTheTabItBuilt:
+    """A tab click moved the cursor while another render's builder awaited,
+    and that render then styled the row for the clicked tab over the body
+    it had built: a live panel showed the mismatch for one edit, and a
+    panel that closed meanwhile kept it."""
+
+    @pytest.mark.parametrize("mode", ["reload", "refresh_content", "close"])
+    async def test_every_edit_highlights_the_tab_it_shows(self, mode):
+        building, release = asyncio.Event(), asyncio.Event()
+        slow = []
+
+        async def tab_a():
+            if slow:
+                building.set()
+                await release.wait()
+            return [Container(TextDisplay("A body"))]
+
+        async def tab_b():
+            return [Container(TextDisplay("B body"))]
+
+        view = TabLayoutView(interaction=_make_interaction(), tabs={"A": tab_a, "B": tab_b})
+        await view.send()
+        shipped = []
+
+        def edit(**kwargs):
+            tree = list(kwargs["view"].walk_children())
+            active = [
+                b.label
+                for b in tree
+                if isinstance(b, discord.ui.Button)
+                and b.style == view.active_tab_style
+                and b.label in ("A", "B")
+            ]
+            body = [c.content for c in tree if isinstance(c, TextDisplay)]
+            shipped.append((active, body))
+            return view._message
+
+        view._message.edit = AsyncMock(side_effect=edit)
+        slow.append(True)
+        first = asyncio.create_task(view.reload() if mode == "reload" else view.refresh_content())
+        await asyncio.wait_for(building.wait(), 2)
+        click = asyncio.create_task(view._make_switch_callback(1)(_make_interaction()))
+        for _ in range(10):
+            await asyncio.sleep(0)
+        running = [first, click]
+        if mode == "close":
+            running.append(asyncio.create_task(view.on_timeout()))
+            for _ in range(10):
+                await asyncio.sleep(0)
+        release.set()
+        await asyncio.wait_for(asyncio.gather(*running), 3)
+
+        assert shipped, "no edit was sent"
+        assert all(active == [body[0][0]] for active, body in shipped), shipped

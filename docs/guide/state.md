@@ -149,7 +149,13 @@ store.subscribe("my-listener", my_callback)
 # Specific action types only
 store.subscribe("my-listener", my_callback,
     action_filter={"SCORE_UPDATED", "GAME_ENDED"})
+
+# From your own cleanup, such as a cog's cog_unload
+store.unsubscribe("my-listener")
 ```
+
+A subscriber lives until it is removed, so pair each `subscribe()` with an
+`unsubscribe()` in the code that tears down whatever subscribed.
 
 ### Selectors
 
@@ -176,7 +182,9 @@ Select what the view displays and nothing more. A theme resolved through
 fields still repaints when the theme changes elsewhere. See
 [Dynamic Themes](theming.md#dynamic-themes).
 
-Views unsubscribe automatically on exit or timeout.
+Views unsubscribe automatically on exit or timeout. `subscribe()` and
+`unsubscribe()` refuse a view's id, since a view's subscription is what keeps
+it rendering; close a view with `exit()`.
 
 !!! warning "Read the `state` argument, not the store"
     A selector must be a pure function of its `state` argument. A view

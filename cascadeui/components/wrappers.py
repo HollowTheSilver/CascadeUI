@@ -9,7 +9,7 @@ import discord
 from discord import ButtonStyle, Interaction
 
 from ..utils.hooks import await_maybe
-from ..utils.responses import DISCORD_CALL_ERRORS, describe_discord_error
+from ..utils.responses import DISCORD_CALL_ERRORS, describe_discord_error, trailing_ack
 from .types import EmojiInput
 
 logger = logging.getLogger(__name__)
@@ -214,7 +214,8 @@ def with_confirmation(
     ``cancelled_message`` and the optional ``on_cancel`` callback is called.
     Both terminal paths call ``stop()`` on the inner confirmation View so
     the timeout task is cancelled immediately instead of lingering until
-    the natural expiry.
+    the natural expiry. The prompt takes one answer: a click on either
+    button sent before the first answer landed is acknowledged and dropped.
 
     The original callback (and ``on_cancel``) receive the confirmation
     button's interaction with the response already consumed.
@@ -241,8 +242,24 @@ def with_confirmation(
 
     async def confirmation_callback(interaction: Interaction) -> None:
         confirmation_view = _ConfirmationView(timeout=timeout)
+        # The prompt takes one answer. Its view has no click lock and stops
+        # only after the answer runs, so a click sent before the first
+        # answer landed (a double-click, or Cancel right after Confirm)
+        # would otherwise run too.
+        answered = False
+
+        async def _first_answer(click: Interaction) -> bool:
+            nonlocal answered
+            if not answered:
+                answered = True
+                return True
+            logger.debug("with_confirmation dropped a click on a prompt already answered")
+            await trailing_ack(click, owner="with_confirmation", log=logger)
+            return False
 
         async def _on_confirm(confirm_interaction: Interaction) -> None:
+            if not await _first_answer(confirm_interaction):
+                return
             try:
                 try:
                     await confirm_interaction.response.edit_message(
@@ -257,6 +274,8 @@ def with_confirmation(
                 confirmation_view.stop()
 
         async def _on_cancel(cancel_interaction: Interaction) -> None:
+            if not await _first_answer(cancel_interaction):
+                return
             try:
                 try:
                     await cancel_interaction.response.edit_message(

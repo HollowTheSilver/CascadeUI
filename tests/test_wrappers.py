@@ -1,5 +1,6 @@
 """Tests for component wrappers: with_loading_state, with_cooldown, with_confirmation."""
 
+import asyncio
 import logging
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -387,6 +388,58 @@ class TestWithConfirmation:
 
         component.view.respond.assert_awaited_once()
         interaction.response.send_message.assert_not_called()
+
+    @staticmethod
+    async def _prompt(original=None, on_cancel=None):
+        component = _make_button(callback=original or AsyncMock())
+        with_confirmation(component, on_cancel=on_cancel)
+        interaction = make_interaction()
+        await component.callback(interaction)
+        inner_view = interaction.response.send_message.call_args[1]["view"]
+        buttons = {c.label: c for c in inner_view.children}
+        return inner_view, buttons
+
+    async def test_a_double_clicked_confirm_runs_the_action_once(self):
+        """The prompt view has no click lock and stops only after the action,
+        so the second click of a double-click ran the action again."""
+        calls = []
+
+        async def original(interaction):
+            calls.append(interaction)
+            await asyncio.sleep(0)
+
+        inner_view, buttons = await self._prompt(original)
+        second = make_interaction()
+
+        await asyncio.gather(
+            inner_view._scheduled_task(buttons["Yes"], make_interaction()),
+            inner_view._scheduled_task(buttons["Yes"], second),
+        )
+
+        assert len(calls) == 1
+        second.response.defer.assert_awaited_once()
+
+    async def test_a_cancel_after_a_confirm_is_dropped(self):
+        """A prompt takes one answer: a Cancel sent before the Confirm landed
+        ran on_cancel after the action and rewrote the prompt to cancelled."""
+        calls, cancels = [], []
+
+        async def original(interaction):
+            calls.append(interaction)
+            await asyncio.sleep(0)
+
+        async def on_cancel(interaction):
+            cancels.append(interaction)
+
+        inner_view, buttons = await self._prompt(original, on_cancel)
+
+        await asyncio.gather(
+            inner_view._scheduled_task(buttons["Yes"], make_interaction()),
+            inner_view._scheduled_task(buttons["No"], make_interaction()),
+        )
+
+        assert len(calls) == 1
+        assert cancels == []
 
     async def test_confirm_stops_inner_view(self):
         """Confirm branch must call stop() so the timeout task doesn't leak."""

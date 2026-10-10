@@ -34,6 +34,12 @@ Registers a subscriber for state change notifications. Views auto-subscribe duri
 - `action_filter` (set[str], optional): Only notify for these action types
 - `selector` (callable, optional): Synchronous function `(state) -> value` that extracts a slice. Subscriber is only notified when the selected value changes. A selector that raises degrades to notifying on every action, and is reported once.
 
+Subscribing again under the same id replaces the earlier registration. A view's id raises `ValueError`: replacing a view's subscription would stop it rendering.
+
+#### `unsubscribe(subscriber_id)`
+
+Removes a subscriber added with `subscribe()`. An id that is not subscribed is ignored, so a cleanup path can call it more than once. A view's id raises `ValueError`: a view leaves the store when it closes, so call its `exit()` instead.
+
 #### `state`
 
 Public attribute holding the current state dict. Read-only by convention; mutate state through `dispatch()`, not by assignment.

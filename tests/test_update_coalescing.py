@@ -10,6 +10,7 @@ async gap between build_ui() and message.edit().
 """
 
 import asyncio
+import contextvars
 from unittest.mock import AsyncMock, MagicMock
 
 import discord
@@ -201,6 +202,26 @@ class TestUpdateCoalescing:
 
         assert view._update_pending is False
         assert not view._update_lock.locked()
+
+    async def test_a_render_closed_from_another_context_raises_nothing(self):
+        """A pending render the garbage collector finalizes closes in a context
+        other than the one it began in, and the reset of its lineage mark
+        raised ValueError there."""
+        store = StateStore()
+        release = asyncio.Event()
+
+        class _Waiting(StatefulView):
+            async def on_state_changed(self, state):
+                await release.wait()
+
+        view = _make_view(store, cls=_Waiting)
+        render = view._render_from_state()
+        contextvars.copy_context().run(render.send, None)
+
+        render.close()
+
+        assert view._render_task is None
+        assert view._render_idle.is_set()
 
 
 # // ========================================( ViewStore Preservation )======================================== // #

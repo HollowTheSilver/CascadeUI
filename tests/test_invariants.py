@@ -317,3 +317,48 @@ class TestTheLibraryBoundsWithoutWaitFor:
         )
 
         assert found == [7, 8, 9, 10, 11, 12]
+
+
+# // ========================================( Renamed methods )======================================== // #
+
+
+def _old_name_uses(source: str, old_names) -> list:
+    """Lines reading a renamed method's old name as an attribute."""
+    return sorted(
+        node.lineno
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Attribute) and node.attr in old_names
+    )
+
+
+class TestTheLibraryUsesNoDeprecatedName:
+    """A library call to a renamed method's old name has two costs: the
+    warning names the user's code, since it is attributed to the first frame
+    outside the library, and the call bypasses an override of the new name.
+    The old names come from the same table the class-definition mapping
+    reads, so a rename added there is covered here."""
+
+    def test_no_library_module_reads_an_old_name(self):
+        from cascadeui.views.base import _RENAMED_METHODS
+
+        old_names = {old for old, _ in _RENAMED_METHODS}
+        offenders = [
+            f"{_rel(path)}:{line}"
+            for path in _python_sources()
+            for line in _old_name_uses(path.read_text(encoding="utf-8"), old_names)
+        ]
+
+        assert not offenders, f"These use a deprecated method name: {offenders}"
+
+    def test_the_check_finds_calls_and_skips_definitions(self):
+        found = _old_name_uses(
+            "class V:\n"
+            "    async def _safe_defer(self, i):\n"
+            "        name = '_safe_defer'\n"
+            "    async def f(self, i):\n"
+            "        await self._safe_defer(i)\n"
+            "        return super()._build_refresh_button()\n",
+            {"_safe_defer", "_build_refresh_button"},
+        )
+
+        assert found == [5, 6]

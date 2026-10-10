@@ -211,7 +211,12 @@ prune that does take a live panel's row logs a warning.
 
 `prune_registry` also takes `reason=`, which labels the `REGISTRY_PRUNED`
 dispatch so a subscriber can tell why a row went. Left unset it is
-`"explicit"` for a targeted prune and `"clear_all"` for a full wipe.
+`"explicit"` for a targeted prune and `"clear_all"` for a full wipe. The
+library's own prunes pass `"gone"` when a reattach pass or the unreachable
+sweep deleted rows whose channel or message returned a 404, and
+`"unreachable"` when the sweep deleted rows that stayed unreachable past its
+cutoff. The dispatch's `source` names the call that pruned: `"prune_registry"`,
+`"reattach"`, or `"prune_unreachable"`.
 
 ### `async close()` and `async flush_all()`
 
@@ -253,10 +258,15 @@ the latest summary reports nothing removed and a reconcile keyed on it clears
 nothing. A key moves between buckets as
 later passes re-verdict it, and appears in exactly one.
 
-Both cover reattach passes only. A row deleted afterwards, by the unreachable
-sweep or by `prune_registry`, keeps the outcome its last pass gave it; those
-deletions arrive as `REGISTRY_PRUNED`, which a subscriber registered after
-startup receives. The two together cover every registration that goes away.
+Both cover reattach passes only. A pass's own deletions dispatch
+`REGISTRY_PRUNED` too, with `reason="gone"`, so a subscriber registered
+before a pass ran hears of its removals both ways: act on reattach removals
+from one of the two, for instance by skipping a `REGISTRY_PRUNED` whose
+`source` is `"reattach"`. A row deleted afterwards,
+by the unreachable sweep or by `prune_registry`, keeps the outcome its last
+pass gave it; those deletions arrive as `REGISTRY_PRUNED`, which a subscriber
+registered after startup receives. The two together cover every registration
+that goes away.
 
 ### `unreachable_since`
 
@@ -272,7 +282,7 @@ re-checking each one against Discord.
 
 ```python
 result = await mgr.prune_unreachable(older_than_days=30)
-# {"pruned": [...], "recovered": [...], "kept": [...]}
+# {"pruned": [...], "gone": [...], "recovered": [...], "kept": [...]}
 ```
 
 A candidate that fetches successfully is kept and its stamp cleared
@@ -282,7 +292,9 @@ stamp predates the cutoff, and reported as `kept` otherwise. A row rewritten
 mid-pass, or one whose pre-delete re-read failed at the backend, is `kept`
 too: neither verdict describes the row as it stands. A row whose key a live
 panel in this process holds is `kept` without a fetch. Deletions route
-through `prune_registry` with `reason="unreachable"`. The call never runs
+through `prune_registry`: rows whose channel or message returned a 404 (also
+listed in `gone`) with `reason="gone"`, as a reattach pass reports them, and
+the rows that aged past the cutoff with `reason="unreachable"`. The call never runs
 alongside a reattach pass: whichever starts second waits. Calling either one
 from a hook that runs inside the other, such as a `REGISTRY_PRUNED` hook
 registered with `store.on()`, raises `RuntimeError` instead of waiting on

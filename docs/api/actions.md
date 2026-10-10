@@ -308,12 +308,16 @@ key, whose successor owns the registration now.
 
 ### `REGISTRY_PRUNED`
 
-Dispatched by `PersistenceManager.prune_registry()` after deleting rows from the
-`cascadeui_persistent_views` registry (reattach pruning a message deleted while the
-bot was offline, or an explicit clear). A built-in reducer drops each pruned key
+Dispatched when the persistence manager prunes rows from the
+`cascadeui_persistent_views` registry: a reattach pass removing the row of a
+panel whose channel or message no longer exists, the unreachable sweep, or a
+direct `prune_registry()` call. A built-in reducer drops each pruned key
 from `state["persistent_views"]`, so the store's registry mirror matches the rows
 left on disk; re-registering a pruned key afterwards is a clean first registration
 rather than a duplicate-key cleanup against a stale entry.
+
+The payload carries `deleted` (the row count), `keys` (the keys removed), `reason`
+(why they went), and `source` (the call that pruned).
 
 During startup reattach, `REGISTRY_PRUNED` fires synchronously inside `setup_middleware`.
 Under the canonical setup order (cogs loaded before `setup_middleware`), a subscription wired
@@ -329,7 +333,8 @@ covers every reattach pass rather than the latest one; see the
 |-----|------|-------------|
 | `deleted` | `int` | Number of rows removed |
 | `keys` | `list[str]` | The `persistence_key`s actually pruned; a key passed in but absent on disk is not listed |
-| `reason` | `str` | Why the rows went: `"explicit"` for a targeted prune, `"clear_all"` for a full wipe, `"unreachable"` when `prune_unreachable` deleted them. `prune_registry(reason=)` passes any caller-supplied string through, so treat the value as open rather than a closed set |
+| `reason` | `str` | Why the rows went: `"explicit"` for a targeted prune, `"clear_all"` for a full wipe, `"gone"` when a reattach pass or `prune_unreachable` deleted rows whose channel or message returned a 404, `"unreachable"` when `prune_unreachable` deleted rows that stayed unreachable past its cutoff. `prune_registry(reason=)` passes any caller-supplied string through, so treat the value as open rather than a closed set |
+| `source` | `str` | The call that pruned: `"reattach"` for a reattach pass, `"prune_unreachable"` for the unreachable sweep, `"prune_registry"` for a direct call |
 
 **State change:** Deletes `state["persistent_views"][key]` for every key in `keys`. The `keys` list also lets a subscriber clear exactly the affected external records without sweeping its whole domain against the registry.
 

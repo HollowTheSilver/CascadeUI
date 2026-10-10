@@ -77,11 +77,26 @@ parameter:
                     "description": "Configure DM, mention, and event alerts",
                     "view": NotificationsView,
                 },
+                {
+                    "label": "Locale",
+                    "emoji": "\N{GLOBE WITH MERIDIANS}",
+                    "description": "Set language and timezone preferences",
+                    "view": LocaleView,
+                },
+                {
+                    "label": "Server",
+                    "emoji": "\N{HOUSE BUILDING}",
+                    "description": "Per-server display and layout options",
+                    "view": GuildPrefsView,
+                },
             ]
             super().__init__(*args, categories=categories, **kwargs)
 
         def build_header(self):
-            return [card("## Settings", key_value(self._get_summary()))]
+            return [card(
+                "## \N{GEAR}\N{VARIATION SELECTOR-16} Server Settings",
+                key_value(self._get_summary()),
+            )]
     ```
 
 === "V1"
@@ -224,26 +239,41 @@ Fields are passed as a list of dicts to the `fields` constructor parameter:
 ```python
 fields = [
     {
-        "id": "name",
-        "label": "Character Name",
+        "id": "username",
+        "label": "Username",
         "type": "text",
         "required": True,
-        "placeholder": "Enter a name...",
+        "placeholder": "3-20 chars, alphanumeric + underscores",
         "validators": [min_length(3), max_length(20)],
+        "group": "Account",
     },
+    {"id": "email", "label": "Email", "required": True,
+     "placeholder": "you@example.com", "group": "Account"},
+    {"id": "password", "label": "Password", "required": True, "secret": True,
+     "placeholder": "8+ chars, letters and digits", "group": "Account"},
     {
-        "id": "class",
-        "label": "Class",
+        "id": "age",
+        "label": "Age",
+        "type": "integer",
+        "required": True,
+        "placeholder": "13-120",
+        "min_value": 13,
+        "max_value": 120,
+        "group": "Profile",
+    },
+    {"id": "bio", "label": "Bio", "style": discord.TextStyle.paragraph,
+     "placeholder": "Tell us about yourself (optional)", "group": "Profile"},
+    {
+        "id": "country",
+        "label": "Country",
         "type": "select",
+        "required": True,
+        "placeholder": "Select your country...",
         "options": [
-            {"label": "Warrior", "value": "warrior"},
-            {"label": "Mage", "value": "mage"},
+            {"label": "United States", "value": "us"},
+            {"label": "Japan", "value": "jp"},
         ],
-    },
-    {
-        "id": "pvp",
-        "label": "Enable PvP",
-        "type": "boolean",
+        "group": "Location",
     },
 ]
 ```
@@ -445,16 +475,27 @@ Multi-step form with back/next navigation and per-step validation.
 Steps are passed as a list of dicts to the `steps` constructor parameter:
 
 ```python
-class SetupWizard(WizardLayoutView):
+class CharacterCreator(WizardLayoutView):
+    show_progress_bar = True
+    back_button_label = "Previous"
+    back_button_emoji = "⬅️"
+    next_button_label = "Continue"
+    next_button_emoji = "➡️"
+    next_button_style = discord.ButtonStyle.primary
     finish_button_label = "Create Character"
     finish_button_emoji = "🎲"
 
     def __init__(self, *args, **kwargs):
         steps = [
-            {"name": "Welcome", "builder": self.build_welcome},
-            {"name": "Config", "builder": self.build_config,
-             "validator": self.validate_config},
-            {"name": "Confirm", "builder": self.build_confirm},
+            {"name": "Identity", "builder": self.build_identity,
+             "validator": self.validate_identity},
+            {"name": "Class", "builder": self.build_class,
+             "validator": self.validate_class},
+            {"name": "Abilities", "builder": self.build_abilities},
+            {"name": "Background", "builder": self.build_background},
+            {"name": "Destiny", "builder": self.build_destiny,
+             "condition": lambda v: v.heroic_destiny},
+            {"name": "Review", "builder": self.build_review},
         ]
         super().__init__(*args, steps=steps, **kwargs)
 ```
@@ -682,14 +723,15 @@ class DashboardView(TabLayoutView):
 
     def __init__(self, *args, **kwargs):
         tabs = {
-            "Overview": self.build_overview,
-            "Settings": self.build_settings,
-            "History": self.build_history,
+            "📊 Overview": self.build_overview,
+            "🧩 Modules": self.build_modules,
+            "⚙️ Controls": self.build_controls,
+            "ℹ️ About": self.build_about,
         }
         super().__init__(*args, tabs=tabs, **kwargs)
 
     async def build_overview(self):
-        return [card("## Dashboard", key_value(self.stats))]
+        return [card(f"## {self.guild.name}", key_value(self.stats))]
 ```
 
 ### Customization
@@ -791,17 +833,41 @@ differ by version:
 Auto-paginate a list of items:
 
 ```python
-def format_users(chunk):
-    return discord.Embed(description="\n".join(u.name for u in chunk))
+import discord
+from cascadeui import PaginatedLayoutView, card, divider
 
-view = await PaginatedView.from_data(
-    items=all_users,
-    per_page=10,
-    formatter=format_users,
+RARITY_COLORS = {
+    "Common": discord.Color.light_grey(),
+    "Uncommon": discord.Color.green(),
+    "Rare": discord.Color.blue(),
+    "Legendary": discord.Color.gold(),
+}
+
+def format_page(items):
+    lines = [f"**{item['name']}** ` {item['rarity']} ` - {item['value']}g" for item in items]
+    total = sum(item["value"] for item in items)
+    return [card(
+        "## Inventory",
+        "\n".join(lines),
+        divider(),
+        f"-# {len(items)} items | Page value: {total:,}g",
+        # The list is sorted by rarity, so the last item is the rarest on the page.
+        color=RARITY_COLORS[items[-1]["rarity"]],
+    )]
+
+class InventoryView(PaginatedLayoutView):
+    auto_exit_button = True
+
+view = await InventoryView.from_data(
+    items=inventory,
+    per_page=4,
+    formatter=format_page,
     context=ctx,
 )
 await view.send()
 ```
+
+A V1 formatter returns what a V1 page accepts, a `discord.Embed` for example.
 
 The formatter can be sync or async. Views created via `from_data()`
 support `refresh_data(items)` -- re-paginates with new data using the
@@ -1139,10 +1205,14 @@ entries = [
 view = ServerLeaderboard(
     context=context,
     entries=entries,
-    title=f"Leaderboard -- {context.guild.name}",
+    title=f"Leaderboard - {context.guild.name}",
 )
 await view.send(ephemeral=True)
 ```
+
+The recording above is `examples/v2_leaderboard.py`, which builds on this shape:
+two-line rows with avatars (`entry_layout = "sections"`), an Overview card
+from `build_header`, and a footer line from `build_footer`.
 
 ### Override hooks
 
@@ -1371,9 +1441,10 @@ the bot arrives through `on_bind` rather than a `bot=` kwarg: the library
 injects it automatically on the initial send (from the interaction) and
 on every restart, so the default `get_avatar_url` resolves avatars in
 both cases. A panel posted from a bare channel context (no interaction)
-has no bot on its first render and falls back to the two-line
-`TextDisplay`; call `await view.on_bind(bot)` before `send()` if that
-first render must show avatars.
+takes the bot `PersistenceMiddleware` was given. Without one it has no
+bot on its first render and falls back to the two-line `TextDisplay`;
+call `await view.on_bind(bot)` before `send()` if that first render must
+show avatars.
 
 Pair with `persistent_slots = ("...",)` on the subclass (or
 `SlotPolicy(persistent=True)` at setup) to persist the underlying
@@ -1411,10 +1482,23 @@ from cascadeui import PersistentRolesLayoutView, RoleCategory
 class ServerRoles(PersistentRolesLayoutView):
     categories = [
         RoleCategory(
-            name="Colors",
-            roles={"Red": 111, "Blue": 222, "Green": 333},
+            name="Color Roles",
+            roles={"Red": 101, "Blue": 102, "Green": 103, "Purple": 104},
             exclusive=True,
             color=discord.Color.red(),
+        ),
+        RoleCategory(
+            name="Gaming Roles",
+            icon="🎮",
+            roles={"Minecraft": 201, "Valorant": 202, "League": 203},
+            color=discord.Color.dark_teal(),
+        ),
+        RoleCategory(
+            name="Pronoun Roles",
+            roles={"He/Him": 301, "She/Her": 302, "They/Them": 303, "Neopronoun": 304},
+            exclusive=True,
+            required=True,
+            color=discord.Color.blurple(),
         ),
     ]
     title = "Server Roles"

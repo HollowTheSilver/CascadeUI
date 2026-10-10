@@ -322,7 +322,7 @@ class TestCompositeHostSeams:
 class TestGotoModalHookIsGuarded:
     """The goto-modal fires ``on_page_changed`` after moving the cursor.
 
-    ``_safe_defer`` has already acked by that point, so a raising override
+    ``safe_defer`` has already acked by that point, so a raising override
     would leave the user looking at a page that silently never turned: the
     cursor advances and ``_update_page`` never runs. The three sibling
     call sites in the same file were already guarded.
@@ -814,6 +814,35 @@ class TestInstanceOverridesApply:
         view.set_class_attribute("subscribed_actions", {"B"})
 
         assert view.state_store.subscribers[view.id][1] == {"B"}
+
+    def test_a_subscription_override_works_without_a_class_declaration(self):
+        """The base class did not declare the attribute, so the override was
+        refused as an unknown name on a class that kept the default."""
+
+        class _Plain(StatefulView):
+            pass
+
+        view = _Plain(interaction=_make_interaction())
+
+        view.set_class_attribute("subscribed_actions", {"B"})
+
+        assert view.state_store.subscribers[view.id][1] == {"B"}
+        assert _Plain.subscribed_actions == set()
+
+    def test_a_mixin_listed_after_the_view_class_sets_the_subscription(self):
+        """The base class's declared default sits ahead of such a mixin in the
+        MRO, so the mixin's actions were dropped and the view stopped
+        rendering on them, with nothing raised."""
+
+        class _ScoreActions:
+            subscribed_actions = {"SCORE_CHANGED"}
+
+        class _Board(StatefulView, _ScoreActions):
+            pass
+
+        view = _Board(interaction=_make_interaction())
+
+        assert view.state_store.subscribers[view.id][1] == {"SCORE_CHANGED"}
 
     async def test_an_override_on_an_exited_view_leaves_the_store_alone(self):
         """A subscription override on an exited view raised ``KeyError`` (its

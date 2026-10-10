@@ -331,6 +331,35 @@ class TestCleanupPaths:
         await view.replace(_TargetView)
         assert view.id not in store._active_views
 
+    async def test_a_closed_view_whose_id_code_subscribed_holds_no_slot(self):
+        """A view whose removal a middleware refused stays registered, and code
+        subscribing under its id made it count as live, so it held the slot
+        and the user's next panel was refused."""
+
+        class _OneEach(StatefulView):
+            instance_limit = 1
+            instance_scope = "user_guild"
+            instance_policy = "reject"
+
+        store = get_store()
+        refusing = [True]
+
+        async def refuse(action, state, next_fn):
+            if action["type"] == "VIEW_DESTROYED" and refusing[0]:
+                raise RuntimeError("audit store down")
+            return await next_fn(action, state)
+
+        store._add_middleware(refuse)
+        first = _OneEach(interaction=_make_interaction())
+        await first.send()
+        await first.exit()
+        assert first.id in store._active_views
+        refusing[0] = False
+        store.subscribe(first.id, lambda state, action: None)
+
+        second = _OneEach(interaction=_make_interaction())
+        assert await second.send() is not None
+
 
 # // ========================================( Missing Identity )======================================== // #
 

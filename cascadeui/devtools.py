@@ -46,7 +46,7 @@ def _live_views(store) -> dict:
     return {
         view_id: view
         for view_id, view in store.get_active_views().items()
-        if view_id in store.subscribers
+        if view_id in store._view_subscriptions
     }
 
 
@@ -258,7 +258,7 @@ class InspectorView(TabLayoutView):
 
     async def _refresh(self, interaction):
         # No pre-defer, which would cost the one-request fast path; the action
-        # buttons and select handlers below ack first with _safe_defer.
+        # buttons and select handlers below ack first with safe_defer.
         await self._refresh_tabs()
 
     def _truncate(self, items, max_len=200):
@@ -401,13 +401,13 @@ class InspectorView(TabLayoutView):
         is alive) and drops every other entry, mirroring the read-side
         ``_filtered_components`` / ``_filtered_modals`` filters above.
         """
-        await self._safe_defer(interaction)
+        await self.safe_defer(interaction)
         await self.dispatch("INSPECTOR_PURGED_STALE", {"inspector_id": self.id})
         await self._refresh_tabs()
 
     async def _flush_to_disk(self, interaction):
         """Force an immediate persistence write."""
-        await self._safe_defer(interaction)
+        await self.safe_defer(interaction)
         manager = getattr(self.state_store, "persistence_manager", None)
         if manager is not None:
             await manager.flush_all()
@@ -525,11 +525,11 @@ class InspectorView(TabLayoutView):
         raw = interaction.data.get("values", [None])[0]
         index_map = getattr(self, "_view_index_map", {})
         self._selected_view_id = index_map.get(raw) if raw is not None else None
-        await self._safe_defer(interaction)
+        await self.safe_defer(interaction)
 
     async def _exit_selected_view(self, interaction):
         """Exit the view chosen in the select menu."""
-        await self._safe_defer(interaction)
+        await self.safe_defer(interaction)
         view_id = getattr(self, "_selected_view_id", None)
         if not view_id:
             return await self._refresh_tabs()
@@ -550,7 +550,7 @@ class InspectorView(TabLayoutView):
 
     async def _exit_all_views(self, interaction):
         """Exit all views except the inspector."""
-        await self._safe_defer(interaction)
+        await self.safe_defer(interaction)
         active = self._filtered_active_views()
         views = self._filtered_views()
         exited = 0
@@ -654,11 +654,11 @@ class InspectorView(TabLayoutView):
         raw = interaction.data.get("values", [None])[0]
         index_map = getattr(self, "_session_index_map", {})
         self._selected_session_id = index_map.get(raw) if raw is not None else None
-        await self._safe_defer(interaction)
+        await self.safe_defer(interaction)
 
     async def _clear_selected_session(self, interaction):
         """Exit all views in the selected session and remove the session."""
-        await self._safe_defer(interaction)
+        await self.safe_defer(interaction)
         session_id = getattr(self, "_selected_session_id", None)
         if not session_id:
             return await self._refresh_tabs()

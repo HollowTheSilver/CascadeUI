@@ -523,10 +523,23 @@ class _BaseLeaderboardMixin:
     def bot(self) -> Optional[discord.Client]:
         """The ``discord.Client`` from the ``bot=`` kwarg (or ``on_bind``), or ``None``.
 
-        Read-only. ``get_avatar_url`` and ``resolve_avatar_urls`` overrides read
-        this to resolve avatars instead of reaching into ``_bot``.
+        ``get_avatar_url`` and ``resolve_avatar_urls`` overrides read this to
+        resolve avatars instead of reaching into ``_bot``. Assigning it takes
+        the same check as the ``bot=`` kwarg.
         """
         return getattr(self, "_bot", None)
+
+    @bot.setter
+    def bot(self, bot: Optional[discord.Client]) -> None:
+        self._bot = self._checked_bot(bot)
+
+    @staticmethod
+    def _checked_bot(bot: Optional[discord.Client]) -> Optional[discord.Client]:
+        # Checked at the bot= argument and the bot setter, so a wrong bot fails
+        # there rather than as an AttributeError inside the avatar gather.
+        if bot is not None and not isinstance(bot, discord.Client):
+            raise TypeError(f"bot must be a discord.Client (or subclass), got {type(bot).__name__}")
+        return bot
 
     @property
     def ranked_entries(self) -> List[Tuple[int, dict]]:
@@ -927,12 +940,12 @@ class LeaderboardLayoutView(_BaseLeaderboardMixin, PaginatedLayoutView):
     def __init__(
         self, *args, entries=None, title=_UNSET, subtitle=_UNSET, banner=_UNSET, bot=None, **kwargs
     ):
-        # Checked here, so a wrong bot fails at construction rather than as an
-        # AttributeError inside the avatar gather. A live reference, it is left
-        # out of the persistence round-trip (_NON_PERSISTABLE_KWARGS).
-        if bot is not None and not isinstance(bot, discord.Client):
-            raise TypeError(f"bot must be a discord.Client (or subclass), got {type(bot).__name__}")
-        self._bot = bot
+        # Written to _bot directly: a subclass may replace the bot property
+        # with its own client (a read-only property or a class attribute),
+        # and assigning through it would raise or hide that client. A live
+        # reference, it is left out of the persistence round-trip
+        # (_NON_PERSISTABLE_KWARGS).
+        self._bot = self._checked_bot(bot)
         # ``title`` / ``subtitle`` / ``banner`` share the sentinel shape:
         # passing ``None`` explicitly suppresses that masthead piece,
         # while omitting the kwarg falls back to the class default.
@@ -1224,13 +1237,30 @@ class PersistentLeaderboardLayoutView(_PersistentMixin, LeaderboardLayoutView):
     owner_only = False
     exit_policy = "disable"
 
+    @LeaderboardLayoutView.bot.getter
+    def bot(self) -> Optional[discord.Client]:
+        """The bot this panel was bound to, else the one ``PersistenceMiddleware`` holds.
+
+        A panel sent through a channel finds no bot to bind, so it resolves
+        avatars through the bot persistence holds at the time it renders.
+        """
+        bot = getattr(self, "_bot", None)
+        if bot is None:
+            held = getattr(getattr(self.state_store, "persistence_manager", None), "_bot", None)
+            if isinstance(held, discord.Client):
+                return held
+        return bot
+
     async def on_bind(self, bot):
         """Capture the bot so the default ``get_avatar_url`` can resolve avatars.
 
         The persistent variant cannot carry ``bot`` through the constructor
         round-trip (it is stripped as non-serializable via
-        ``_NON_PERSISTABLE_KWARGS``), so the library injects it here at both
-        the initial send and every restart, before ``on_restore`` renders.
+        ``_NON_PERSISTABLE_KWARGS``). The library stores the bot itself before
+        calling this hook, at a send whose interaction or context carries one
+        and at every restart, so the capture here serves a manual
+        ``await view.on_bind(bot)``. A channel send that carries no bot reads
+        the one ``PersistenceMiddleware`` holds.
         """
         await super().on_bind(bot)
         self._bot = bot

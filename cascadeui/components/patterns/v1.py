@@ -8,7 +8,7 @@ from discord import ButtonStyle, Interaction
 
 from ...utils.hooks import await_maybe
 from ...utils.responses import trailing_ack
-from ..base import StatefulButton, require_value_callback
+from ..base import StatefulButton, _answer_buttons, require_value_callback
 from ..v1_composition import CompositeComponent, register_component
 
 # // ========================================( Classes )======================================== // #
@@ -18,7 +18,9 @@ class ConfirmationButtons(CompositeComponent):
     """A yes/no button pair for confirmations.
 
     ``on_confirm`` and ``on_cancel`` each take ``(interaction)``, sync or
-    async. The buttons pass no second value.
+    async. The buttons pass no second value. The prompt takes one answer:
+    once one button's callback runs, a click on either button sent before
+    its result was on screen is dropped.
 
     Raises:
         TypeError: A callback cannot be called with ``(interaction)``.
@@ -35,12 +37,10 @@ class ConfirmationButtons(CompositeComponent):
     ) -> None:
         super().__init__()
 
-        self.confirm_button = StatefulButton(
-            label=confirm_label, style=confirm_style, callback=on_confirm
-        )
-
-        self.cancel_button = StatefulButton(
-            label=cancel_label, style=cancel_style, callback=on_cancel
+        self.confirm_button, self.cancel_button = _answer_buttons(
+            "ConfirmationButtons",
+            ("on_confirm", on_confirm, {"label": confirm_label, "style": confirm_style}),
+            ("on_cancel", on_cancel, {"label": cancel_label, "style": cancel_style}),
         )
 
         self.add_component(self.confirm_button)

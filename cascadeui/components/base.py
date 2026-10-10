@@ -96,7 +96,7 @@ def refuse_wrong_arity(fn, arity: int, message: str) -> None:
         raise TypeError(message)
 
 
-async def run_unless_repeat(item, run) -> bool:
+async def run_unless_repeat(item, run, *, key: Optional[str] = None) -> bool:
     """Run ``run()`` for a click, unless the click repeats one on the same render.
 
     A toggle's click asks for the state its render showed, flipped. Two
@@ -107,9 +107,10 @@ async def run_unless_repeat(item, run) -> bool:
     previous click finished was sent before that result was on screen.
     Returns whether ``run()`` ran.
 
-    The count is kept on the view under the item's ``custom_id``, which is
-    how Discord routes a click: a control rebuilt under the same id is a
-    new object, and the second click of a double-click reaches it.
+    The count is kept on the view under ``key``, the item's ``custom_id``
+    by default, which is how Discord routes a click: a control rebuilt
+    under the same id is a new object, and the second click of a
+    double-click reaches it. Controls that pass one ``key`` share a count.
     """
     view = item.view
     if getattr(view, "_arrived_after", None) is None:
@@ -118,7 +119,8 @@ async def run_unless_repeat(item, run) -> bool:
     if view._click_marks is None:
         view._click_marks = {}
     marks = view._click_marks
-    key = item.custom_id
+    if key is None:
+        key = item.custom_id
     if not view._arrived_after(marks.get(key, 0)):
         view._log_dropped_click(item, "the second click of a double-click")
         return False
@@ -128,6 +130,53 @@ async def run_unless_repeat(item, run) -> bool:
     finally:
         marks[key] = view._clicks_received
     return True
+
+
+def _answer_buttons(owner: str, *answers: tuple) -> List["StatefulButton"]:
+    """Build the buttons that answer one prompt, which takes one answer.
+
+    Each entry is ``(param, callback, button_kwargs)``. Once one button's
+    callback runs, a click on any of them sent before its result was on
+    screen is dropped through :func:`run_unless_repeat`, under the first
+    button's ``custom_id``. ``callback`` takes ``(interaction)`` and is
+    checked here, because the button is handed a wrapper whose one-argument
+    signature would pass any callback. A button with no callback is a
+    plain one.
+    """
+    buttons = []
+    for param, callback, button_kwargs in answers:
+        if callback is None:
+            buttons.append(StatefulButton(**button_kwargs))
+            continue
+        refuse_wrong_arity(
+            callback,
+            1,
+            f"{owner}: {param} {_describe_callback(callback)} cannot be called with "
+            f"(interaction); these buttons pass no second value.\n"
+            f"  Fix: accept a single positional argument and close over any extra data.",
+        )
+        buttons.append(_answer_button(callback, button_kwargs))
+    # Read at click time rather than captured: generated ids compare what a
+    # callback's closure holds, and another button would differ every render.
+    for button in buttons:
+        button._cascadeui_prompt = buttons[0]
+    return buttons
+
+
+def _answer_button(callback, button_kwargs: dict) -> "StatefulButton":
+    async def answer(interaction):
+        await run_unless_repeat(
+            button,
+            lambda: await_maybe(callback(interaction)),
+            key=button._cascadeui_prompt.custom_id,
+        )
+
+    # Generated ids and with_cooldown's default key name the callback, so
+    # they name the caller's. The module stays the library's: a dropped
+    # click is answered as a library control's.
+    answer.__qualname__ = getattr(callback, "__qualname__", None) or answer.__qualname__
+    button = StatefulButton(callback=answer, **button_kwargs)
+    return button
 
 
 def require_value_callback(fn, owner: str, param: str, value_name: str) -> None:
@@ -237,10 +286,19 @@ class StatefulComponent:
                 and getattr(view, "user_id", None) is not None
                 and interaction.user.id != view.user_id
             ):
+                refuse = getattr(view, "on_unauthorized", None)
+                if refuse is None:
+                    # A plain discord.py view: refused as its interaction_check
+                    # refuses, with the click left unanswered.
+                    logger.debug(
+                        f"Dropped a click on {component_id}: the control's owner_only "
+                        f"refused user {interaction.user.id}"
+                    )
+                    return
                 view._log_dropped_click(
                     component, f"the control's owner_only refused user {interaction.user.id}"
                 )
-                await await_maybe(view.on_unauthorized(interaction))
+                await await_maybe(refuse(interaction))
                 return
 
             # Read by refresh()'s acting-view fast path; the finally resets it
@@ -257,6 +315,10 @@ class StatefulComponent:
 
                 # Skip dispatch if the callback destroyed the view (exit, push, etc.)
                 if view.is_finished():
+                    return
+                # A plain discord.py view has no store to report the click to.
+                dispatch = getattr(view, "dispatch", None)
+                if dispatch is None:
                     return
 
                 # Read the component's value after the callback so a component
@@ -278,7 +340,7 @@ class StatefulComponent:
                     user_id=interaction.user.id,
                     value=value,
                 )
-                await view.dispatch("COMPONENT_INTERACTION", payload)
+                await dispatch("COMPONENT_INTERACTION", payload)
             finally:
                 _CURRENT_INTERACTION.reset(token)
 

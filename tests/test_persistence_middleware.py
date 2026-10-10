@@ -24,11 +24,13 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import aiohttp
 import discord
 import pytest
 from discord.ext import commands
+from discord.gateway import DiscordWebSocket
 from discord.ui import ActionRow, TextDisplay
-from helpers import RenderableLayoutView, make_interaction, until
+from helpers import RenderableLayoutView, make_interaction, refused_by_closed_session, until
 
 from cascadeui.components.base import (
     DynamicPersistentButton,
@@ -2375,6 +2377,77 @@ def _real_bot(cls=commands.Bot):
     return cls(command_prefix="!", intents=discord.Intents.none())
 
 
+class _ReachedNetwork(Exception):
+    """Raised where a test bot would have opened a network connection."""
+
+
+def _refuse_network(monkeypatch):
+    """Fail every connection aiohttp opens, and return the URLs it tried."""
+    tried = []
+
+    async def connect(self, req, *args, **kwargs):
+        tried.append(str(req.url))
+        raise _ReachedNetwork(str(req.url))
+
+    monkeypatch.setattr(aiohttp.BaseConnector, "connect", connect)
+    return tried
+
+
+async def _log_in_offline(bot, monkeypatch):
+    """Open the bot's HTTP session as ``login()`` does, answering its one request here."""
+    request = bot.http.request
+    answered = []
+
+    async def answer_the_first(route, **kwargs):
+        if answered:
+            return await request(route, **kwargs)
+        answered.append(route)
+        return {"id": "1", "username": "test", "discriminator": "0", "avatar": None}
+
+    monkeypatch.setattr(bot.http, "request", answer_the_first)
+    await bot.http.static_login("token")
+
+
+class _ClosingSocket:
+    """A gateway socket Discord closes with ``code``, reported as aiohttp reports it."""
+
+    def __init__(self, code):
+        self.close_code = code
+        self.closed = False
+
+    async def receive(self, timeout=None):
+        return aiohttp.WSMessage(aiohttp.WSMsgType.CLOSE, self.close_code, "")
+
+    async def close(self, *, code=1000, message=b""):
+        self.closed = True
+        return True
+
+
+def _gateway_closes_with(monkeypatch, *codes, on_connection=None):
+    """Answer the bot's next connections with sockets Discord closes with ``codes``, in order.
+
+    discord.py's own ``poll_event`` reads each close, so resuming or giving up
+    is its decision. Once the returned list is empty, a connection goes
+    through discord.py's own ``from_client``. ``on_connection`` runs at each.
+    """
+    codes = list(codes)
+    from_client = DiscordWebSocket.from_client
+
+    async def next_connection(cls, client, *, shard_id=None, **kwargs):
+        if on_connection is not None:
+            on_connection()
+        if not codes:
+            return await from_client(client, shard_id=shard_id, **kwargs)
+        ws = cls(_ClosingSocket(codes.pop(0)), loop=client.loop)
+        ws.gateway = cls.DEFAULT_GATEWAY
+        ws.shard_id = shard_id
+        ws._max_heartbeat_timeout = 60.0
+        return ws
+
+    monkeypatch.setattr(DiscordWebSocket, "from_client", classmethod(next_connection))
+    return codes
+
+
 async def _set_slot(action, state):
     payload = action["payload"]
     application = {**state.get("application", {}), payload["slot"]: payload["value"]}
@@ -3527,11 +3600,11 @@ class TestPersistenceClosesOnSigterm:
         assert await self._saved(db) == [{"k": {"value": 2}}]
 
 
-class TestPersistenceFollowsTheBotsConnection:
-    """discord.py closes the client itself on some gateway drops, and a bot
-    reconnects through ``clear()`` and ``connect()`` without running
-    ``setup_hook``; a close from another task still has persistence to close
-    when ``connect()`` returns."""
+class TestPersistenceAndTheBotsConnect:
+    """``connect()`` waits for a close another task started, so persistence
+    has closed by the time the program moves on to ending, and it never
+    reopens persistence: a bot discord.py closed cannot connect again (see
+    ``TestWhenDiscordPyClosesTheBot``)."""
 
     class _OfflineBot(commands.Bot):
         """A bot whose connect() stands in for the gateway: it returns once the bot closes."""
@@ -3539,26 +3612,6 @@ class TestPersistenceFollowsTheBotsConnection:
         async def connect(self, *, reconnect=True):
             while not self.is_closed():
                 await asyncio.sleep(0.005)
-
-    async def test_a_bot_that_reconnects_without_setup_hook_reopens_persistence(self):
-        backend = _RecordingBackend()
-        bot = _real_bot(self._OfflineBot)
-        middleware = PersistenceMiddleware(backend=backend, bot=bot)
-        async with bot:
-            await setup_middleware(middleware)
-            # What connect() does itself on a close code it cannot resume from.
-            await bot.close()
-            assert middleware._manager._closed
-
-            bot.clear()
-            connecting = asyncio.ensure_future(bot.connect())
-            await _until(lambda: not middleware._manager._closed)
-            await _route_batched_write(middleware)
-            await middleware.flush_all()
-            rows = await backend.row_select(TABLE_APPLICATION_SLOTS)
-            assert [json.loads(row["payload"]) for row in rows] == [{"theme": "dark"}]
-            await bot.close()
-            await connecting
 
     async def test_connect_returns_after_a_close_from_another_task_finishes(self):
         """The program ends when connect() returns, and asyncio.run then cut
@@ -3612,77 +3665,36 @@ class TestPersistenceFollowsTheBotsConnection:
             assert middleware._manager._closed
             assert backend.opened == 1
 
-    async def test_a_close_already_running_when_the_bot_reconnects_still_closes_persistence(self):
-        """A shutdown during a reconnect's backoff, in a bot whose close()
-        closes a pool of its own first: the reconnect reopened persistence
-        under it, and the close then skipped it as belonging to a restart."""
-
-        class _PoolBot(self._OfflineBot):
-            async def close(self):
-                await asyncio.sleep(0.05)
-                await super().close()
-
+    async def test_connecting_a_bot_discord_py_closed_leaves_persistence_closed(
+        self, monkeypatch, caplog
+    ):
+        """A retry loop calling clear() and connect() after discord.py closed
+        the bot reopened persistence and tried to restore each stored panel
+        through the closed client, logging an error for each, before
+        discord.py's connect() failed."""
+        tried = _refuse_network(monkeypatch)
         backend = _RecordingBackend()
-        bot = _real_bot(_PoolBot)
-        middleware = PersistenceMiddleware(backend=backend, bot=bot)
+        bot = _real_bot()
         async with bot:
-            await setup_middleware(middleware)
-            await bot.close()
-            bot.clear()
-            shutdown = asyncio.ensure_future(bot.close())
-            await asyncio.sleep(0.01)
-
-            await bot.connect()
-            await shutdown
-
-            assert bot.is_closed()
-            assert middleware._manager._closed and backend.closed
-            assert backend.opened == 1
-
-    async def test_a_bot_reconnects_when_persistence_cannot_reopen(self, caplog):
-        """A database still restarting made connect() raise before it reached
-        the gateway, so a reconnect loop that catches discord errors ended."""
-
-        class _Restarting(_RecordingBackend):
-            async def initialize(self):
-                await super().initialize()
-                if self.opened > 1:
-                    raise OSError("connection refused")
-
-        bot = _real_bot(self._OfflineBot)
-        middleware = PersistenceMiddleware(backend=_Restarting(), bot=bot)
-        async with bot:
-            await setup_middleware(middleware)
-            await bot.close()
-            bot.clear()
-            asyncio.get_running_loop().call_later(0.05, lambda: asyncio.ensure_future(bot.close()))
-
-            with caplog.at_level("ERROR", logger="cascadeui"):
+            await _log_in_offline(bot, monkeypatch)
+            await setup_middleware(PersistenceMiddleware(backend=backend, bot=bot))
+            panel = TestARestartReleasesTheViewsLeftBehind._Panel(
+                interaction=make_interaction(user_id=1, guild_id=9), persistence_key="p"
+            )
+            await TestARestartReleasesTheViewsLeftBehind._sent(panel, bot, 222)
+            _gateway_closes_with(monkeypatch, 4004)
+            with pytest.raises(discord.ConnectionClosed):
                 await bot.connect()
-
-            assert middleware._manager._closed
-            assert any("Could not reopen persistence" in r.getMessage() for r in caplog.records)
-
-    async def test_a_bot_reconnected_after_sigterm_ends_the_process(self, monkeypatch):
-        """A reconnect after the SIGTERM close ran on until the process manager
-        killed it, and lost what it had batched by then."""
-        signals = TestPersistenceClosesOnSigterm._signals(monkeypatch)
-        bot = _real_bot(self._OfflineBot)
-        middleware = PersistenceMiddleware(backend=_RecordingBackend(), bot=bot)
-        async with bot:
-            await setup_middleware(middleware)
-            signals.handler()
-            await middleware._sigterm_close
+            assert panel.is_finished() and backend.closed
             bot.clear()
 
-            connecting = asyncio.ensure_future(bot.connect())
-            await _until(lambda: signals.raised)
+            with caplog.at_level("WARNING", logger="cascadeui"):
+                with pytest.raises(Exception):
+                    await bot.connect()
 
-            assert signals.raised == [signal.SIGTERM]
-            assert middleware._manager._closed
-            assert signals.disposition is signal.SIG_DFL
-            await bot.close()
-            await connecting
+            assert backend.opened == 1 and backend.closed
+            assert [r.getMessage() for r in caplog.records if r.name.startswith("cascadeui")] == []
+        assert tried == []
 
     async def test_a_change_held_since_the_sigterm_is_written_before_the_end(self, monkeypatch):
         signals = TestPersistenceClosesOnSigterm._signals(monkeypatch)
@@ -3919,6 +3931,87 @@ class TestPersistenceFollowsTheBotsConnection:
 # // ========================================( Views a restart leaves behind )======================================== // #
 
 
+class TestWhenDiscordPyClosesTheBot:
+    """A bot's views are released when it closes, and persistence reopens only
+    for a new bot, because of three things discord.py does, checked here
+    against discord.py itself: a gateway drop it can resume leaves the bot
+    open, a close code it cannot recover from closes it, and a bot it has
+    closed can neither connect nor log in again. A failure here means
+    discord.py changed one of them, and the release at close and the restore
+    in a new bot's ``setup_hook`` need another look."""
+
+    @pytest.mark.parametrize("code", [1000, 1006, 4000, 4009])
+    async def test_a_drop_it_resumes_leaves_the_bot_and_its_views_open(self, code, monkeypatch):
+        tried = _refuse_network(monkeypatch)
+        store = get_store()
+        bot = _real_bot()
+        seen = []
+        async with bot:
+            await _log_in_offline(bot, monkeypatch)
+            view = RenderableLayoutView(interaction=make_interaction(user_id=1, guild_id=9))
+            await TestARestartReleasesTheViewsLeftBehind._sent(view, bot, 111)
+            _gateway_closes_with(
+                monkeypatch,
+                code,
+                4004,
+                on_connection=lambda: seen.append((bot.is_closed(), view.is_finished())),
+            )
+
+            with pytest.raises(discord.ConnectionClosed) as closed:
+                await bot.connect()
+
+            # The second connection is the reconnect after the drop. 4004
+            # (authentication failed) then ends the run: the control.
+            assert seen == [(False, False), (False, False)]
+            assert closed.value.code == 4004
+            assert bot.is_closed() and view.is_finished()
+            assert view.id not in store._active_views
+        assert tried == []
+
+    async def test_a_bot_it_closed_cannot_connect_again(self, monkeypatch):
+        """clear() resets the bot's state, not the HTTP session its close shut:
+        discord.py 2.7 raises AttributeError on the missing session."""
+        tried = _refuse_network(monkeypatch)
+        bot = _real_bot()
+        async with bot:
+            await _log_in_offline(bot, monkeypatch)
+            codes = _gateway_closes_with(monkeypatch)
+            # The control: an open bot's connection reaches the gateway.
+            with pytest.raises(_ReachedNetwork):
+                await bot.connect()
+            codes.append(4004)
+            with pytest.raises(discord.ConnectionClosed):
+                await bot.connect()
+            assert bot.is_closed()
+            bot.clear()
+
+            with pytest.raises(Exception) as again:
+                await bot.connect()
+
+        assert len(tried) == 1, f"a closed bot reached the gateway again: {tried}"
+        assert not isinstance(again.value, _ReachedNetwork)
+
+    async def test_a_bot_it_closed_cannot_log_in_again(self, monkeypatch):
+        """The login builds a session on the connector the close shut."""
+        from discord.http import Route
+
+        tried = _refuse_network(monkeypatch)
+        bot = _real_bot()
+        async with bot:
+            await _log_in_offline(bot, monkeypatch)
+            # The control: an open bot's request reaches Discord.
+            with pytest.raises(_ReachedNetwork):
+                await bot.http.request(Route("GET", "/users/@me"))
+            await bot.close()
+            bot.clear()
+
+            with pytest.raises(Exception) as again:
+                await bot.login("token")
+
+        assert len(tried) == 1, f"a closed bot reached Discord again: {tried}"
+        assert not isinstance(again.value, _ReachedNetwork)
+
+
 class TestARestartReleasesTheViewsLeftBehind:
     """discord.py cannot log a closed bot in again, so a restart in the same
     process builds a new bot object. Every view the old bot left answered
@@ -3956,13 +4049,16 @@ class TestARestartReleasesTheViewsLeftBehind:
     class _SlowBindPanel(_Panel):
         bound: list = []
         reaches_discord = False
+        raises_its_own = False
 
         async def on_bind(self, bot):
             type(self).bound.append(self.persistence_key)
             await asyncio.sleep(0.02)
+            if type(self).raises_its_own and bot.is_closed():
+                raise RuntimeError("the panel's own error")
             if type(self).reaches_discord and bot.is_closed():
                 # As a bind that fetches through the bot does.
-                raise RuntimeError("Session is closed")
+                await refused_by_closed_session()
 
     @staticmethod
     async def _sent(view, bot, message_id, *, stored=True):
@@ -4051,7 +4147,7 @@ class TestARestartReleasesTheViewsLeftBehind:
         await asyncio.sleep(0.4)
         assert not left.timed_out
         assert left.id not in get_store().subscribers
-        assert await left.refresh() == "no_message"
+        assert await left.refresh() == "closed"
 
     async def test_a_released_view_leaves_nothing_holding_it(self):
         # Its timer and its Continue-button arming stayed pending, each holding
@@ -4307,7 +4403,7 @@ class TestARestartReleasesTheViewsLeftBehind:
             async def fetch_message(message_id):
                 fetching.set()
                 await release.wait()
-                raise RuntimeError("Session is closed")
+                await refused_by_closed_session()
 
             message.channel.fetch_message = fetch_message
             view.interaction.original_response.return_value = message
@@ -4614,7 +4710,7 @@ class TestARestartReleasesTheViewsLeftBehind:
             booted = store.get_active_view(persistence_key="p")
             assert booted.interaction is None
             # The edit the push ends with goes through the closed client.
-            booted._message.edit = AsyncMock(side_effect=RuntimeError("Session is closed"))
+            booted._message.edit = AsyncMock(side_effect=refused_by_closed_session)
             pushing = asyncio.ensure_future(booted.push(_Slow))
             await until(lambda: booted._away_for_navigation)
         try:
@@ -4668,7 +4764,7 @@ class TestARestartReleasesTheViewsLeftBehind:
         # released, so the next bot skipped it.
         async def fetch(manager, row, removed, unreachable):
             if manager._bot.is_closed():
-                raise RuntimeError("Session is closed")
+                await refused_by_closed_session()
             return await self._fetch(manager, row, removed, unreachable)
 
         store = get_store()
@@ -4749,6 +4845,41 @@ class TestARestartReleasesTheViewsLeftBehind:
             for i in range(2):
                 restored = store.get_active_view(persistence_key=f"p{i}")
                 assert restored is not None and restored._client() is third
+
+    async def test_a_bind_that_raises_its_own_error_as_its_bot_closes_is_reported(
+        self, monkeypatch, caplog
+    ):
+        # Any error once the bot had closed was logged at DEBUG as the close's
+        # doing, so the panel's own bug said nothing until a later restore.
+        async def fetch(manager, row, removed, unreachable):
+            return await self._fetch(manager, row, removed, unreachable)
+
+        store = get_store()
+        backend = _RecordingBackend()
+        monkeypatch.setattr(PersistenceManager, "_fetch_restore_message", fetch)
+        monkeypatch.setattr(self._SlowBindPanel, "bound", [])
+        monkeypatch.setattr(self._SlowBindPanel, "raises_its_own", True)
+        first, second = _real_bot(), _real_bot()
+        async with first:
+            await setup_middleware(PersistenceMiddleware(backend=backend, bot=first))
+            panel = self._SlowBindPanel(
+                interaction=make_interaction(user_id=1, guild_id=9), persistence_key="p0"
+            )
+            await self._sent(panel, first, 200)
+        self._SlowBindPanel.bound.clear()
+        async with second:
+            booting = asyncio.ensure_future(
+                setup_middleware(PersistenceMiddleware(backend=backend, bot=second))
+            )
+            await until(lambda: self._SlowBindPanel.bound)
+            with caplog.at_level("ERROR", logger="cascadeui"):
+                await second.close()
+                await asyncio.wait_for(booting, 5)
+            errors = [r for r in caplog.records if r.name.startswith("cascadeui")]
+            assert ["Failed to restore persistent view 'p0'" in r.getMessage() for r in errors] == [
+                True
+            ]
+            assert store.persistence_manager.last_reattach_summary["failed"] == ["p0"]
 
     async def test_rows_written_back_after_the_close_leave_before_the_next_bot_restores(
         self, monkeypatch
@@ -4852,11 +4983,11 @@ class TestARestartReleasesTheViewsLeftBehind:
                         await gate.wait()
                         return left
                     if old.is_closed():
-                        raise RuntimeError("Session is closed")
+                        await refused_by_closed_session()
                     return left
 
                 left.edit = AsyncMock(side_effect=edit)
-                left.delete = AsyncMock(side_effect=RuntimeError("Session is closed"))
+                left.delete = AsyncMock(side_effect=refused_by_closed_session)
                 view.go.label = "changed"
                 render = asyncio.ensure_future(view.refresh())
                 await asyncio.wait_for(in_edit.wait(), 2)
@@ -4961,7 +5092,7 @@ class TestARestartReleasesTheViewsLeftBehind:
             started.append(row["persistence_key"])
             await gate.wait()
             if manager._bot.is_closed():
-                raise RuntimeError("Session is closed")
+                await refused_by_closed_session()
             return await self._fetch(manager, row, removed, unreachable)
 
         store = get_store()

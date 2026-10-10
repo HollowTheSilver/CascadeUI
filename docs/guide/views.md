@@ -122,9 +122,11 @@ don't warrant a dedicated class.
 A posted-and-forgotten display card (an announcement or receipt with no
 interactive components) needs no explicit teardown: when there is nothing to
 disable, the timeout and `exit()` skip the cosmetic freeze edit, so the view
-cleans up its state on timeout without a wasted request. To tear it down
-immediately while leaving the message on screen, call
-`exit(delete_message=False)`; it is the teardown seam, unlike discord.py's
+cleans up its state on timeout without a wasted request. With nothing to
+click, the timeout counts from the card's last edit, so a card your code keeps
+current stays up; one that should outlive its timeout between edits sets
+`timeout=None`. To tear it down immediately while leaving the message on
+screen, call `exit(delete_message=False)`; it is the teardown seam, unlike discord.py's
 `stop()`, which cancels the timeout but leaves the view in the active-view
 registry.
 
@@ -193,7 +195,10 @@ super().__init__(*args, timeout=None, **kwargs)  # Never timeout
     `super().on_timeout()` nor calls `exit()` leaves the view subscribed and
     registered with its instance-limit slot still claimed. Either one tears
     it down; composing a closing card and then calling
-    `exit(delete_message=False)` is the common shape.
+    `exit(delete_message=False)` is the common shape. Send the card through
+    `refresh()` or a dispatch that renders it: an edit made with
+    `message.edit()` bypasses the library, so a render still loading when the
+    view closes can land over it.
 
     A closing render works from either direction. Dispatching drives the
     normal subscriber path, and `build_ui()` followed by `refresh()` edits the
@@ -212,9 +217,12 @@ super().__init__(*args, timeout=None, **kwargs)  # Never timeout
 
 !!! note "Ephemeral timeout derivation"
     `send(ephemeral=True)` derives the refresh-handoff behavior from the
-    declared `timeout`. Neither declaration is rewritten: `timeout` stays as
-    the author set it, and `auto_refresh_ephemeral` keeps reading whatever the
-    class or the caller set -- the derived answer is tracked internally.
+    declared `timeout` and keeps the derived answer internally, so
+    `auto_refresh_ephemeral` still reads whatever the class or the caller set.
+    discord.py gives an ephemeral view declared `timeout=None` a 900-second
+    timeout. With the handoff engaged the library puts `None` back, so the
+    panel lives until `exit()` or a restart and its Continue button works
+    whenever the user returns.
 
     - Left at the `None` default, the refresh handoff engages when
       `timeout is None or timeout > 900`: the view intends to outlive the
@@ -224,8 +232,15 @@ super().__init__(*args, timeout=None, **kwargs)  # Never timeout
     - An explicit `auto_refresh_ephemeral = True` or `False` overrides the
       derivation entirely.
 
-    The derivation is centralized in `_send_pipeline` -- every view that
-    routes through `send()` (patterns included) inherits the policy.
+    Dismissing an ephemeral message sends the bot no event, so a panel declared
+    `timeout=None` with the handoff engaged stays registered after the user
+    dismisses it, until `exit()` or a restart. On a class with an
+    `instance_limit`, under `instance_policy = "reject"` or once participants
+    have registered, that refuses the user's next open until then. Give such a
+    panel a long finite `timeout`, such as `86400`, instead.
+
+    The derivation lives in `send()`, so every view sent through it
+    (patterns included) inherits the policy.
 
 !!! tip "Long-lived non-ephemeral views"
     After `send()`, both view classes re-fetch the message as a plain `Message`
@@ -1219,13 +1234,13 @@ await self.open_modal(interaction, modal)
 
 !!! warning "Patterns deliberately do not pre-defer"
     Library patterns (`PaginatedView`, `TabView`, `WizardView`, `FormView`,
-    and their V2 counterparts) do **not** call `_safe_defer()` inside their
+    and their V2 counterparts) do **not** call `safe_defer()` inside their
     component callbacks, even though the helper is available. Pre-deferring
     inside a callback that rebuilds state and calls `refresh()` starves
     the acting-view fast path. The post-callback defer in
     `_scheduled_task` acks the interaction after the callback returns.
     When writing your own patterns, follow the same shape: no defer, just
-    rebuild and `refresh()`. Use `_safe_defer()` only when you explicitly
+    rebuild and `refresh()`. Use `safe_defer()` only when you explicitly
     want the slow path (e.g. long async work before refreshing).
 
 See [Opening Modals from Callbacks](#opening-modals-from-callbacks) for details.
@@ -1302,7 +1317,10 @@ from `timeout`: short-lived ephemerals (`timeout <= 900`) decline the handoff
 and expire naturally; longer timeouts (or `None`) engage it. Shortly before the
 wall, the library replaces the view's children with a "Continue Session"
 button. Clicking it uses a fresh interaction token to send a replacement
-ephemeral with another full 15-minute window.
+ephemeral with another full 15-minute window. Once the button is up, state
+changes no longer render, and a `refresh()` from your own code (in the callback
+of a modal submitted late, for example) puts the button back in place of
+whatever that code rebuilt.
 
 Pin the behavior explicitly on short display ephemerals if you want to skip
 the derivation:
@@ -1552,8 +1570,8 @@ registry row). The `on_message_delete()` hook fires and, by default, calls
 The third row is why a bot that trims its intents still retires deleted panels:
 `refresh()` nulls the message, and a task of its own then calls
 `on_message_gone()` and tears the view down through `on_message_delete()`, unless
-the hook sent the view again. Without the message intents, a panel that is
-never edited again keeps its view until its next edit, its timeout, or a restart.
+the hook sent the view again. Without the message intents, a deleted panel
+keeps its view until its next edit, its timeout, or a restart.
 A plain `discord.Client`, unlike `commands.Bot`, has no listeners the library can
 add, so only the third row reaches its views.
 

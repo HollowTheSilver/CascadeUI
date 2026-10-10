@@ -475,8 +475,13 @@ class _PersistentMixin:
         and when it is restored. Default is a no-op::
 
             async def on_bind(self, bot):
+                await super().on_bind(bot)
                 self.db = bot.db
-                self.bot = bot
+
+        Call ``super().on_bind(bot)`` first: a pattern class binds its own
+        dependencies there. The library stores the bot on the view before
+        the hook runs at send and at restore, and the leaderboard pattern
+        exposes it as its ``bot`` property.
 
         The library calls ``on_bind(bot)`` automatically at two points: during
         ``send()`` (when ``bot`` is derivable from the construction context)
@@ -509,6 +514,9 @@ class _PersistentMixin:
         bot = getattr(self.interaction, "client", None) or getattr(self.context, "bot", None)
         if bot is None:
             return
+        # Stored before the hook, as the restore stores it, so an override
+        # that skips super() still leaves the view its client.
+        self._bot = bot
         result = self.on_bind(bot)
         if inspect.isawaitable(result):
             await result

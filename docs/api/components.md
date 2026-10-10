@@ -679,7 +679,7 @@ link_section(
 
 ### `confirm_section(text, *, on_confirm, on_cancel, confirm_label="Confirm", cancel_label="Cancel", confirm_emoji="✅", cancel_emoji="❌", confirm_style=ButtonStyle.success, cancel_style=ButtonStyle.danger, custom_id=None)`
 
-A confirm/cancel prompt. Returns a `[TextDisplay, ActionRow]` list rather than a single component: the prompt text plus the paired button row. Splat it into `card(...)` or add it directly to a view. Both callbacks take the interaction alone; one that demands a second argument raises `TypeError` at construction. Pass `custom_id=` inside a `PersistentLayoutView`, where auto-generated ids do not survive a restart.
+A confirm/cancel prompt. Returns a `[TextDisplay, ActionRow]` list rather than a single component: the prompt text plus the paired button row. Splat it into `card(...)` or add it directly to a view. Both callbacks take the interaction alone; one that demands a second argument raises `TypeError` at construction. The prompt takes one answer: once one button's callback runs, a click on either button sent before its result was on screen is dropped. Pass `custom_id=` inside a `PersistentLayoutView`, where auto-generated ids do not survive a restart.
 
 The style defaults suit a constructive prompt. A destructive one wants them swapped (`confirm_style=ButtonStyle.danger, cancel_style=ButtonStyle.secondary`), or the button that deletes renders green beside a red one that does nothing.
 
@@ -895,7 +895,7 @@ Override hook. Called after the page index updates, before the refresh. Default 
 
 #### `await show_page(index, *, notify=True)`
 
-Jumps to a zero-based page index, fires `on_page_changed`, and re-renders the host: the async counterpart to a nav-button click, for a programmatic jump (a search hit, a "find me" button, landing on the page holding a row the user just created). Raises `RuntimeError`, moving nothing, when the region is not attached yet, since `controls(view)` is what gives it a host to re-render; seek with `set_page()` before then. `notify=False` skips `on_page_changed`, for a jump the host makes on its own rather than one a user asked for: a return to the first page after inactivity, run by the timer that `on_page_changed` re-arms, would otherwise cancel itself. When the edit does not land, the cursor goes back to the page on screen either way.
+Jumps to a zero-based page index, fires `on_page_changed`, and re-renders the host: the async counterpart to a nav-button click, for a programmatic jump (a search hit, a "find me" button, landing on the page holding a row the user just created). Raises `RuntimeError`, moving nothing, when the region is not attached yet, since `controls(view)` is what gives it a host to re-render; seek with `set_page()` before then. `notify=False` skips `on_page_changed`, for a jump the host makes on its own rather than one a user asked for: a return to the first page after inactivity, run by the timer that `on_page_changed` re-arms, would otherwise cancel itself. When the edit does not land, the cursor goes back to the page on screen either way. The render waits for a reload or a state render the host is already running in another task, unless it runs inside that one: in the host's `on_load()` or `on_state_changed()`, or in a task either of them started, while that run lasts, such as `asyncio.gather(region.show_page(n))`. A host with neither `build_ui` nor tabs renders by running `on_load()` again, so inside its `on_load()` the call raises `RuntimeError` and the page goes back; call `set_page()` before the tree is built there instead.
 
 #### `set_page(index)`, `page`, `page_count`
 
@@ -918,7 +918,7 @@ def build_ui(self):
         self.add_item(item)
 ```
 
-`render(view)` returns `[trigger]` collapsed, or the trigger plus `reveal()` (ordered by `trigger_first`) expanded. A click flips the state, fires `on_toggle`, and re-runs the host's render path (the same `build_ui`/`reload` seam `PaginatedRegion` uses). The second click of a double-click is dropped rather than closing what the first opened. The trigger relabels/restyles via `expanded_label` / `expanded_style` / `expanded_emoji`. Two collapsibles in one view need distinct `key=` values.
+`render(view)` returns `[trigger]` collapsed, or the trigger plus `reveal()` (ordered by `trigger_first`) expanded. A click flips the state, fires `on_toggle`, and re-runs the host's render path (the same `build_ui`/`reload` seam `PaginatedRegion` uses). As with `show_page()`, that render waits for a reload or a state render the host is already running, and renders nothing when the host closed while it waited. The second click of a double-click is dropped rather than closing what the first opened. The trigger relabels/restyles via `expanded_label` / `expanded_style` / `expanded_emoji`. Two collapsibles in one view need distinct `key=` values.
 
 By default the trigger is a bare `ActionRow(button)`. Pass `summary` (the text, or a zero-argument synchronous callable read on every render, like `reveal`, when the text changes) to fuse the trigger into an `action_section` instead: a Section carrying the summary text with the trigger button as its accessory. This is the shape a card-based disclosure wants, where the Edit button sits beside its summary line rather than in a row of its own. The whole disclosure then splats into one `card(...)`:
 
@@ -957,7 +957,7 @@ ConfirmationButtons(on_confirm=async_fn, on_cancel=async_fn)
 buttons.add_to_view(view)
 ```
 
-Both callbacks take the interaction alone; one that demands a second argument raises `TypeError` at construction.
+Both callbacks take the interaction alone; one that demands a second argument raises `TypeError` at construction. The prompt takes one answer: once one button's callback runs, a click on either button sent before its result was on screen is dropped.
 
 ### `PaginationControls`
 
@@ -996,7 +996,7 @@ Shows a loading indicator while the callback runs. The component is disabled and
 
 ### `with_confirmation(component, title="Confirm Action", message="Are you sure?", ...)`
 
-Adds an ephemeral yes/no prompt before the callback runs. Additional parameters:
+Adds an ephemeral yes/no prompt before the callback runs. The prompt takes one answer: a click sent before the first answer landed, on either button, is dropped. Additional parameters:
 
 - `color` -- embed color (default: yellow)
 - `confirm_label` / `cancel_label` -- button labels

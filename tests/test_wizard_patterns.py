@@ -9,7 +9,9 @@ import discord
 import pytest
 from discord.ui import ActionRow, Container, TextDisplay
 from helpers import make_interaction as _make_interaction
+from helpers import snapshot_edits as _snapshot_edits
 
+from cascadeui import RenderOutcome
 from cascadeui.components.base import StatefulButton
 from cascadeui.views.patterns import WizardLayoutView, WizardView
 from cascadeui.views.patterns.types import WizardStep
@@ -288,6 +290,58 @@ class TestWizardNavClicksAreBoundToTheirStep:
         await view._next_btn.original_callback(second)
 
         assert calls == [1]
+
+    async def test_a_double_click_does_not_skip_a_step_while_its_builder_awaits(self):
+        """Unserialized clicks: the second Next arrived while the first
+        click's step builder awaited. The guard compared the click with the
+        Next button's id, which that render only updates once the builder
+        returns, so the second click passed, skipped a step, and ran its
+        validator on inputs the user never saw."""
+        building, release = asyncio.Event(), asyncio.Event()
+        validated = []
+
+        def builder(n):
+            async def build():
+                if n == 1 and not release.is_set():
+                    building.set()
+                    await release.wait()
+                return [Container(TextDisplay(f"Step {n} body"))]
+
+            return build
+
+        def validator(n):
+            def check():
+                validated.append(n)
+                return True, None
+
+            return check
+
+        class _Wizard(WizardLayoutView):
+            serialize_interactions = False
+
+        view = _Wizard(
+            interaction=_make_interaction(),
+            steps=[
+                {"name": str(n), "builder": builder(n), "validator": validator(n)} for n in range(3)
+            ],
+        )
+        await view.send()
+
+        def click():
+            interaction = _make_interaction()
+            interaction.data = {"custom_id": "wizard_next:0"}
+            return interaction
+
+        first = asyncio.create_task(view._scheduled_task(view._next_btn, click()))
+        await asyncio.wait_for(building.wait(), 2)
+        second = asyncio.create_task(view._scheduled_task(view._next_btn, click()))
+        for _ in range(30):
+            await asyncio.sleep(0)
+        release.set()
+        await asyncio.wait_for(asyncio.gather(first, second), 3)
+
+        assert validated == [0]
+        assert view.current_step == 1
 
     async def test_go_next_called_from_another_button_still_advances(self):
         view = self._wizard()
@@ -1332,11 +1386,11 @@ class TestWizardRefreshContent:
         ],
         ids=["v1", "v2"],
     )
-    async def test_step_renders_that_outlive_an_exit_leave_the_frozen_panel_alone(
-        self, cls, content
-    ):
+    async def test_step_renders_that_outlive_an_exit_leave_no_live_controls(self, cls, content):
         """A render whose builder was running when exit() froze the panel, and
-        one queued behind it, both shipped live controls onto it afterwards."""
+        one queued behind it, both shipped live controls onto it afterwards.
+        The one already building ships its finished tree with the controls
+        the close left, and the queued one never builds."""
         gate = asyncio.Event()
         builds = {"n": 0}
 
@@ -1360,12 +1414,13 @@ class TestWizardRefreshContent:
         queued = asyncio.create_task(view.refresh_content())
         await asyncio.sleep(0)
         await view.exit()
-        edits = message.edit.await_count
+        shipped = _snapshot_edits(view)
 
         gate.set()
         await asyncio.wait_for(asyncio.gather(in_flight, queued), timeout=2)
 
-        assert message.edit.await_count == edits
+        assert len(shipped) == 1
+        assert all(shipped[0]["buttons"])  # disabled, or stripped by a V1 exit
         assert builds["n"] == 2  # the queued render never built on the dead view
 
 
@@ -1508,3 +1563,210 @@ class TestStepIndicatorLabelMustBeSynchronous:
             step_indicator_label = staticmethod(lambda current, total: f"{current} of {total}")
 
         assert _Good.step_indicator_label(2, 5) == "2 of 5"
+
+
+# // ========================================( A render that outlasts a close )======================================== // #
+
+
+class TestAStepRenderThatOutlastsAClose:
+    """A step render already building when its view closed shipped
+    nothing after the close froze the half-built step. The finished step
+    goes out with the controls as the close left them."""
+
+    @pytest.mark.parametrize("version", ["v1", "v2"])
+    async def test_the_finished_step_ships_after_the_close(self, version):
+        building, release = asyncio.Event(), asyncio.Event()
+        slow = []
+
+        async def step():
+            if slow:
+                building.set()
+                await release.wait()
+            if version == "v1":
+                return discord.Embed(title="Step")
+            return [Container(TextDisplay("Step body"))]
+
+        cls = WizardView if version == "v1" else WizardLayoutView
+        view = cls(
+            interaction=_make_interaction(),
+            steps=[{"name": "One", "builder": step}, {"name": "Two", "builder": step}],
+        )
+        await view.send()
+        slow.append(True)
+        render = asyncio.create_task(view.refresh_content())
+        await asyncio.wait_for(building.wait(), 2)
+        await view.exit(delete_message=False)
+        shipped = _snapshot_edits(view)
+        release.set()
+        await asyncio.wait_for(render, 2)
+
+        assert len(shipped) == 1
+        if version == "v1":
+            assert shipped[0]["embed"].title == "Step"
+            assert shipped[0]["buttons"] == []  # an exit strips a V1 panel's controls
+        else:
+            assert "Step body" in shipped[0]["texts"]
+            assert shipped[0]["buttons"] and all(shipped[0]["buttons"])
+
+    async def test_a_v2_step_finishing_after_a_closing_card_does_not_build_under_it(self):
+        """A V2 step render built into the live tree while it waited for its
+        builder, so one that then declined had put its content under the
+        closing card, and an exit closing an attached view froze both."""
+        building, release, child_closing = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        slow = []
+
+        async def step():
+            if slow:
+                building.set()
+                await release.wait()
+            return [Container(TextDisplay("Step body"))]
+
+        steps = [{"name": "One", "builder": step}, {"name": "Two", "builder": step}]
+        view = WizardLayoutView(interaction=_make_interaction(), steps=steps)
+        await view.send()
+        child = WizardLayoutView(interaction=_make_interaction(), steps=steps, parent=view)
+        await child.send()
+
+        async def slow_close(*args, **kwargs):
+            child_closing.set()
+            await asyncio.sleep(0.05)
+
+        child._message.edit = AsyncMock(side_effect=slow_close)
+        child._message.delete = AsyncMock(side_effect=slow_close)
+        shipped = _snapshot_edits(view)
+        slow.append(True)
+        render = asyncio.create_task(view.refresh_content())
+        await asyncio.wait_for(building.wait(), 2)
+        view.clear_items()
+        view.add_item(TextDisplay("Goodbye"))
+        await view.refresh()
+        closing = asyncio.create_task(view.exit(delete_message=False))
+        await asyncio.wait_for(child_closing.wait(), 2)
+        release.set()
+        await asyncio.wait_for(asyncio.gather(render, closing), 3)
+
+        assert all(edit["texts"] == ["Goodbye"] for edit in shipped)
+
+    async def test_a_v1_step_keeps_its_embed_when_a_newer_render_set_only_the_tree(self):
+        """Another task's refresh() covered the step's tree before the close,
+        and the late render then sent nothing, so the step's embed never
+        reached the frozen panel."""
+        building, release = asyncio.Event(), asyncio.Event()
+        slow = []
+
+        async def step():
+            if slow:
+                building.set()
+                await release.wait()
+            return discord.Embed(title="Step")
+
+        view = WizardView(
+            interaction=_make_interaction(),
+            steps=[{"name": "One", "builder": step}, {"name": "Two", "builder": step}],
+        )
+        await view.send()
+        slow.append(True)
+        render = asyncio.create_task(view.refresh_content())
+        await asyncio.wait_for(building.wait(), 2)
+        view.add_item(discord.ui.Button(label="Note", disabled=True, row=4))
+        assert await view.refresh() is RenderOutcome.RENDERED
+        await view.exit(delete_message=False)
+        shipped = _snapshot_edits(view)
+        release.set()
+        await asyncio.wait_for(render, 2)
+
+        assert [edit["embed"].title for edit in shipped if edit["embed"]] == ["Step"]
+
+    async def test_a_v1_reload_whose_load_outlasts_the_close_ships(self):
+        """reload() decided the late render ships once on_load returned, and
+        the step render it went through declined it again on finding the view
+        closed, so a V1 wizard kept the frozen panel and reported CLOSED."""
+        building, release = asyncio.Event(), asyncio.Event()
+
+        class _Loading(WizardView):
+            gate = False
+
+            async def on_load(self):
+                await super().on_load()
+                if self.gate:
+                    building.set()
+                    await release.wait()
+
+        steps = [
+            {"name": "One", "builder": lambda: discord.Embed(title="one")},
+            {"name": "Two", "builder": lambda: discord.Embed(title="two")},
+        ]
+        view = _Loading(interaction=_make_interaction(), steps=steps)
+        await view.send()
+        view.gate = True
+        reload = asyncio.create_task(view.reload())
+        await asyncio.wait_for(building.wait(), 2)
+        await view.exit(delete_message=False)
+        shipped = _snapshot_edits(view)
+        release.set()
+
+        assert await asyncio.wait_for(reload, 2) is RenderOutcome.RENDERED
+        assert [edit["embed"].title for edit in shipped] == ["one"]
+
+
+class TestAStepRenderShowsTheStepItBuilt:
+    """A Next click moved the cursor while another render's builder
+    awaited, and that render then labelled the nav row and the progress
+    bar for the new step over the body it had built: a live panel showed
+    the mismatch for one edit, and a panel that closed meanwhile kept it."""
+
+    @pytest.mark.parametrize("mode", ["reload", "refresh_content", "close"])
+    async def test_every_edit_labels_the_step_it_shows(self, mode):
+        building, release = asyncio.Event(), asyncio.Event()
+        slow = []
+
+        def builder(n):
+            async def build():
+                if n == 1 and slow:
+                    building.set()
+                    await release.wait()
+                return [Container(TextDisplay(f"Step {n} body"))]
+
+            return build
+
+        view = WizardLayoutView(
+            interaction=_make_interaction(),
+            steps=[{"name": str(n), "builder": builder(n)} for n in (1, 2, 3)],
+        )
+        await view.send()
+        shipped = []
+
+        def edit(**kwargs):
+            tree = list(kwargs["view"].walk_children())
+            indicator = [
+                b.label
+                for b in tree
+                if isinstance(b, discord.ui.Button) and b.custom_id == "wizard_indicator"
+            ]
+            texts = [c.content for c in tree if isinstance(c, TextDisplay)]
+            shipped.append((indicator, texts))
+            return view._message
+
+        view._message.edit = AsyncMock(side_effect=edit)
+        slow.append(True)
+        first = asyncio.create_task(view.reload() if mode == "reload" else view.refresh_content())
+        await asyncio.wait_for(building.wait(), 2)
+        click = _make_interaction()
+        click.data = {"custom_id": view._next_btn.custom_id}
+        moving = asyncio.create_task(view._next_clicked(click))
+        for _ in range(10):
+            await asyncio.sleep(0)
+        running = [first, moving]
+        if mode == "close":
+            running.append(asyncio.create_task(view.on_timeout()))
+            for _ in range(10):
+                await asyncio.sleep(0)
+        release.set()
+        await asyncio.wait_for(asyncio.gather(*running), 3)
+
+        assert shipped, "no edit was sent"
+        percent = {1: "33%", 2: "67%"}
+        for indicator, texts in shipped:
+            step = next(int(t.split()[1]) for t in texts if t.endswith(" body"))
+            assert indicator == [f"Step {step}/3"], shipped
+            assert any(t.endswith(percent[step]) for t in texts), shipped

@@ -143,6 +143,28 @@ class TestLeaderboardBotProperty:
         view = LeaderboardLayoutView(interaction=interaction)
         assert view.bot is None
 
+    def test_a_subclass_property_supplies_the_client(self):
+        """__init__ assigned through the setter, so a subclass that supplies
+        its client with a read-only property raised AttributeError when built."""
+        client = MagicMock(spec=discord.Client)
+
+        class _Board(LeaderboardLayoutView):
+            @property
+            def bot(self):
+                return client
+
+        assert _Board(interaction=_make_interaction()).bot is client
+
+    def test_a_subclass_class_attribute_supplies_the_client(self):
+        """__init__ assigned through the setter, which stored None on the
+        instance over a class attribute naming the client."""
+        client = MagicMock(spec=discord.Client)
+
+        class _Board(LeaderboardLayoutView):
+            bot = client
+
+        assert _Board(interaction=_make_interaction()).bot is client
+
 
 class TestLeaderboardLayoutViewRendering:
     """Component tree construction via paginated pages."""
@@ -361,6 +383,118 @@ class TestDefaultAvatarResolution:
         await view.on_bind(bot)
         assert view._bot is bot
         assert await view.get_avatar_url(111, {}) == "https://cdn.example/avatar.png"
+
+    async def test_an_on_bind_that_skips_super_still_has_the_bot_after_send(self):
+        """The send called on_bind without storing the bot, so an override that
+        skipped super() left the board without avatars until a restart, whose
+        reattach stores the bot before the hook."""
+        bot = self._bot_with_user()
+        bot.db = object()
+
+        class Board(PersistentLeaderboardLayoutView):
+            async def on_bind(self, bot):
+                self.db = bot.db
+
+        interaction = _make_interaction()
+        interaction.client = bot
+        view = Board(interaction=interaction, persistence_key="test-bind-skips-super")
+        await view.send()
+
+        assert view.bot is bot
+        assert view.db is bot.db
+
+    async def test_a_bare_channel_send_takes_the_bot_persistence_holds(self):
+        """A send that found no bot on its context returned before storing
+        one, so an override that skipped super() posted without avatars even
+        after the documented manual on_bind call."""
+        bot = self._bot_with_user()
+
+        class Board(PersistentLeaderboardLayoutView):
+            async def on_bind(self, bot):
+                pass
+
+        view = Board(context=self._bare_channel(), persistence_key="test-bind-bare-channel")
+        self._hold_bot(view, bot)
+        await view.on_bind(bot)
+        await view.send()
+
+        assert view.bot is bot
+
+    async def test_a_bare_channel_send_keeps_a_bot_passed_to_the_view(self):
+        """The fallback only fills a view with no bot: an explicit ``bot=``
+        is not replaced by the client persistence holds."""
+        explicit = self._bot_with_user()
+        held = self._bot_with_user()
+        view = PersistentLeaderboardLayoutView(
+            context=self._bare_channel(), persistence_key="test-bind-explicit", bot=explicit
+        )
+        self._hold_bot(view, held)
+        await view.send()
+
+        assert view.bot is explicit
+
+    async def test_a_bare_channel_panel_reads_the_bot_persistence_holds_now(self):
+        """Read when the panel renders, not stored at send: a restart in the
+        same process adopts its new bot after the panel went out, and a
+        stored copy kept resolving through the closed one."""
+        old, new = self._bot_with_user(), self._bot_with_user()
+        view = PersistentLeaderboardLayoutView(
+            context=self._bare_channel(), persistence_key="test-bind-live"
+        )
+        self._hold_bot(view, old)
+        await view.send()
+        view.state_store.persistence_manager._bot = new
+
+        assert view.bot is new
+
+    def test_a_leaderboard_that_is_not_persistent_reads_no_held_bot(self):
+        """Without a bot a leaderboard renders entries as stacked text, so a
+        fallback here would change every unbound board's layout."""
+        view = LeaderboardLayoutView(interaction=_make_interaction())
+        self._hold_bot(view, self._bot_with_user())
+
+        assert view.bot is None
+
+    @staticmethod
+    def _bare_channel():
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.id = 7
+        channel.guild = MagicMock(id=9)
+        message = MagicMock(id=555, channel=channel)
+        message.edit = AsyncMock(return_value=message)
+        channel.send = AsyncMock(return_value=message)
+        return channel
+
+    @staticmethod
+    def _hold_bot(view, bot):
+        from cascadeui.persistence import PersistenceManager
+
+        manager = PersistenceManager(store=view.state_store)
+        manager._bot = bot
+        view.state_store.persistence_manager = manager
+
+    async def test_an_on_bind_that_assigns_self_bot_sends(self):
+        """The on_bind example assigned self.bot, which raised AttributeError
+        on the leaderboard's read-only property at send and at restore."""
+        bot = self._bot_with_user()
+
+        class Board(PersistentLeaderboardLayoutView):
+            async def on_bind(self, bot):
+                self.bot = bot
+
+        interaction = _make_interaction()
+        interaction.client = bot
+        view = Board(interaction=interaction, persistence_key="test-bind-assigns-bot")
+        await view.send()
+
+        assert view.bot is bot
+
+    def test_assigning_a_bot_that_is_not_a_client_raises(self):
+        view = LeaderboardLayoutView(interaction=_make_interaction())
+
+        with pytest.raises(TypeError, match="bot must be a discord.Client"):
+            view.bot = "not a client"
+        assert view.bot is None
 
 
 class TestAvatarBackfill:

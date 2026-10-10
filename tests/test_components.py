@@ -1,5 +1,6 @@
 """Tests for component creation and callback wrapping."""
 
+import asyncio
 import functools
 import inspect
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -43,6 +44,50 @@ class TestStatefulComponent:
     def test_button_passes_style_through(self):
         btn = StatefulButton(label="Danger", style=discord.ButtonStyle.danger)
         assert btn.style == discord.ButtonStyle.danger
+
+    @pytest.mark.parametrize("version", ["v1", "v2"])
+    async def test_a_button_in_a_plain_discord_view_works_as_a_plain_one(self, version):
+        """The click ran the callback and then raised AttributeError on every
+        click, reporting state to a view with no store behind it."""
+        ran = []
+
+        async def go(interaction):
+            ran.append(interaction)
+
+        button = StatefulButton(label="Go", custom_id="go", callback=go)
+        if version == "v1":
+            view = discord.ui.View()
+            view.add_item(button)
+        else:
+            view = discord.ui.LayoutView()
+            view.add_item(ActionRow(button))
+
+        await button.callback(_make_interaction())
+
+        assert len(ran) == 1
+
+    @pytest.mark.parametrize("version", ["v1", "v2"])
+    async def test_owner_only_on_a_plain_discord_view_refuses_without_raising(self, version):
+        """The refusal called hooks a plain view does not have, so another
+        user's click raised AttributeError inside the button."""
+        ran = []
+
+        async def go(interaction):
+            ran.append(interaction.user.id)
+
+        button = StatefulButton(label="Go", custom_id="go", callback=go, owner_only=True)
+        if version == "v1":
+            view = discord.ui.View()
+            view.add_item(button)
+        else:
+            view = discord.ui.LayoutView()
+            view.add_item(ActionRow(button))
+        view.user_id = 100
+
+        await button.callback(_make_interaction(user_id=200))
+        await button.callback(_make_interaction(user_id=100))
+
+        assert ran == [100]
 
 
 class TestCallbackArityRefusal:
@@ -440,6 +485,59 @@ class TestV1CompositeAck:
         button = next(b for b in view.children if getattr(b, "label", None) == "B")
 
         await button.callback(self._raced_interaction())
+
+
+class TestV1ConfirmationButtonsDoubleClick:
+    """The V1 sibling of confirm_section: a double-click answered twice."""
+
+    @pytest.mark.parametrize("label", ["Yes", "No"])
+    async def test_a_double_clicked_answer_runs_once(self, label):
+        from helpers import make_interaction
+
+        from cascadeui import ConfirmationButtons, StatefulView
+
+        calls = []
+
+        async def answer(interaction):
+            calls.append(interaction)
+            await asyncio.sleep(0)
+
+        view = StatefulView(interaction=make_interaction())
+        ConfirmationButtons(on_confirm=answer, on_cancel=answer).add_to_view(view)
+        button = next(b for b in view.children if getattr(b, "label", None) == label)
+
+        await asyncio.gather(
+            view._scheduled_task(button, make_interaction()),
+            view._scheduled_task(button, make_interaction()),
+        )
+
+        assert len(calls) == 1
+
+    async def test_the_prompt_takes_one_answer(self):
+        """A No sent from the same render as a Yes ran after the Yes acted."""
+        from helpers import make_interaction
+
+        from cascadeui import ConfirmationButtons, StatefulView
+
+        calls = []
+
+        async def yes(interaction):
+            calls.append("yes")
+            await asyncio.sleep(0)
+
+        async def no(interaction):
+            calls.append("no")
+
+        view = StatefulView(interaction=make_interaction())
+        prompt = ConfirmationButtons(on_confirm=yes, on_cancel=no)
+        prompt.add_to_view(view)
+
+        await asyncio.gather(
+            view._scheduled_task(prompt.confirm_button, make_interaction()),
+            view._scheduled_task(prompt.cancel_button, make_interaction()),
+        )
+
+        assert calls == ["yes"]
 
 
 class TestV1CompositeCallbackArity:
@@ -970,6 +1068,16 @@ class TestBuilderCustomIdAndDisabled:
 
         _, row = confirm_section("Sure?", on_confirm=self._cb, on_cancel=self._cb, custom_id="wipe")
         assert [b.custom_id for b in row.children] == ["wipe_confirm", "wipe_cancel"]
+
+    @pytest.mark.parametrize("param", ["on_confirm", "on_cancel"])
+    def test_confirm_section_refuses_a_two_parameter_callback(self, param):
+        """Refused where the prompt is built, naming the parameter, not on
+        the first click."""
+        from cascadeui.components.patterns.v2 import confirm_section
+
+        callbacks = {"on_confirm": self._cb, "on_cancel": self._cb, param: self._cb_value}
+        with pytest.raises(TypeError, match=rf"confirm_section: {param} .*\(interaction\)"):
+            confirm_section("Sure?", **callbacks)
 
     def test_tab_nav_suffixes_per_tab(self):
         from cascadeui.components.patterns.v2 import tab_nav

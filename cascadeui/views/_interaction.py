@@ -32,6 +32,26 @@ logger = logging.getLogger(__name__)
 # The arrival number of the click being handled, or None outside a click.
 _CLICK_ORDER: ContextVar[Optional[int]] = ContextVar("cascadeui_click_order", default=None)
 
+_SELECT_COMPONENT_TYPES = frozenset(
+    t.value
+    for t in (
+        discord.ComponentType.string_select,
+        discord.ComponentType.user_select,
+        discord.ComponentType.role_select,
+        discord.ComponentType.mentionable_select,
+        discord.ComponentType.channel_select,
+    )
+)
+
+
+def _picked_message_id(interaction: Interaction) -> Optional[int]:
+    """The id of the message ``interaction`` picked a select option on, or None."""
+    data = getattr(interaction, "data", None)
+    if not isinstance(data, dict) or data.get("component_type") not in _SELECT_COMPONENT_TYPES:
+        return None
+    return getattr(interaction.message, "id", None)
+
+
 # A defer acknowledges an interaction without answering the user.
 _DEFERRED_RESPONSES = frozenset(
     {
@@ -73,7 +93,7 @@ class _InteractionMixin:
 
     Houses the auto-defer safety net, the serialized-callback wrapper,
     interaction response helpers (``respond``, ``open_modal``,
-    ``_safe_defer``), and the ephemeral refresh handoff. None of these
+    ``safe_defer``), and the ephemeral refresh handoff. None of these
     methods touch navigation, session, or instance-limit state directly;
     all cross-concern access goes through attributes on the composed
     ``_StatefulMixin``.
@@ -88,6 +108,10 @@ class _InteractionMixin:
     # custom_id -> _clicks_received when that control's last click settled
     # (see components.base.run_unless_repeat); created on first use.
     _click_marks: Optional[dict] = None
+    # The render number when a select pick on this view's message arrived. The
+    # client shows the pick until the message is edited, so refresh() ships even
+    # an unchanged tree until a render asked for after the pick lands.
+    _pick_owed: Optional[int] = None
 
     # // ==================( Auto-Defer Safety Net )================== // #
 
@@ -131,7 +155,7 @@ class _InteractionMixin:
                 # Before the checks and the callback, so a callback that blocks
                 # the loop still has its ack in flight.
                 if self.ack_first:
-                    await self._safe_defer(interaction)
+                    await self.safe_defer(interaction)
 
                 # Armed before the access checks: an interaction_check that
                 # fetches a member runs on the 3s clock too, and Discord drops an
@@ -226,6 +250,9 @@ class _InteractionMixin:
 
     async def _run_click_callback(self, item: Item, interaction: Interaction) -> None:
         with _collect_stalled_renders() as stalled:
+            message = self._message
+            if message is not None and _picked_message_id(interaction) == message.id:
+                self._pick_owed = self._render_seq
             try:
                 await item.callback(interaction)
             finally:
@@ -399,7 +426,7 @@ class _InteractionMixin:
         successor = self._last_successor()
         if successor is self or successor._closed():
             await self._call_hook_safe(self.on_session_ended, interaction)
-        await self._safe_defer(interaction)
+        await self.safe_defer(interaction)
         return True
 
     async def _render_as_answer(self, interaction: Interaction, render) -> None:
@@ -427,8 +454,14 @@ class _InteractionMixin:
             await trailing_ack(interaction, owner=type(self).__name__, log=logger)
             await ship_stalled_renders(stalled)
 
-    async def _safe_defer(self, interaction: Interaction) -> None:
+    async def safe_defer(self, interaction: Interaction) -> None:
         """Defer the interaction if it hasn't been acknowledged yet.
+
+        Call it at the top of a callback whose work routinely runs past a
+        second and a half, so the click is answered at once. A callback
+        that rebuilds and calls ``refresh()`` quickly should not: the
+        defer takes the response slot, and the edit then goes through the
+        channel instead of answering the click in one request.
 
         Mirrors how ``respond()`` absorbs the ``is_done()`` check for
         send operations. Prevents double-defer when auto-defer or
@@ -474,6 +507,18 @@ class _InteractionMixin:
                 logger.debug(
                     f"Ack defer failed in {type(self).__name__}: " f"{describe_discord_error(e)}"
                 )
+
+    async def _safe_defer(self, interaction: Interaction) -> None:
+        """Deprecated name of :meth:`safe_defer`, to be removed.
+
+        Runs the library's defer, so an override of the old name that
+        starts from ``super()._safe_defer()`` keeps working.
+        """
+        warn_deprecated(
+            f"_safe_defer() is deprecated and will be removed in {REMOVED_IN}: "
+            f"call safe_defer() instead."
+        )
+        await _InteractionMixin.safe_defer(self, interaction)
 
     # // ==================( Ephemeral Refresh )================== // #
 
@@ -688,11 +733,10 @@ class _InteractionMixin:
             self._install_refresh_button(button)
             self._check_placement()
         except Exception:
-            self.clear_items()
-            for item in previous:
-                self.add_item(item)
+            self._put_children(previous)
             self._warn_refresh_button_failed()
             return
+        self._armed_children = list(self.children)
         self._refresh_armed = True
         try:
             # The cooldown is cleared: an armed view has no background renders
@@ -716,13 +760,18 @@ class _InteractionMixin:
                     f"({self.refresh_button_emoji!r}); retrying without emoji"
                 )
                 try:
-                    self.clear_items()
+                    # Built before the tree is cleared, so a render from another
+                    # task during the build still finds the armed tree.
                     button = await await_maybe(self.build_refresh_button())
                     button.emoji = None
+                    self.clear_items()
                     self._install_refresh_button(button)
+                    self._armed_children = list(self.children)
                     await self.refresh()
                 except Exception as retry_err:
                     logger.warning(f"Refresh button retry failed: {retry_err}")
+            elif e.status >= 500:
+                self._retry_arming(e)
             else:
                 # By the T+810s arming point the webhook token is at or near
                 # the 900s cliff, so an arming-edit failure is the expected
@@ -733,6 +782,17 @@ class _InteractionMixin:
                 f"Could not arm the ephemeral refresh button in {type(self).__name__}",
                 exc_info=True,
             )
+
+    def _retry_arming(self, error: discord.HTTPException) -> None:
+        """Queue the arming edit again after a server error.
+
+        discord.py has already retried the 5xx itself by then, and the token
+        can still carry an edit, so the arming tries again as it does after a
+        transport drop. Callers pass only a 5xx; past the cliff the edit
+        answers 401, which ends the chain.
+        """
+        logger.debug(f"Arming edit hit a server error in {type(self).__name__}; retrying: {error}")
+        self._queue_deferred_refresh(_ARMING_RETRY_SECONDS)
 
     def build_reopen_view(self, interaction: Interaction):
         """Build the view the Continue button sends in place of this one.
@@ -805,6 +865,10 @@ class _InteractionMixin:
         finally:
             self._reopen_task = None
             self._reopen_settled.set()
+            # A Continue that handed nothing on (cut off, refused, failed)
+            # leaves the button working for the next click.
+            if self._successor is None:
+                self._reopen_in_flight = False
 
     async def _wait_out_reopen(self, method: str) -> None:
         """Wait for a Continue on this view running in another task.
@@ -919,11 +983,18 @@ class _InteractionMixin:
         # Carry the interaction into the new view's send() so the response
         # is the new ephemeral message.  send() will register and dispatch.
         new_view.interaction = interaction
+        cancelled = False
         try:
             sent = await new_view.send(ephemeral=True)
+        except asyncio.CancelledError:
+            # A send cancelled after Discord accepted the message still leaves
+            # the replacement live, so the panel is handed over before the
+            # cancel goes on; one cancelled before that was rolled back.
+            if new_view._torn_down():
+                raise
+            sent, cancelled = new_view._message, True
         except Exception as e:
             logger.error(f"Failed to send refreshed ephemeral: {e}")
-            self._reopen_in_flight = False
             return
         if sent is None:
             # Refused (its on_pre_send(), an instance or participant limit) or
@@ -933,42 +1004,87 @@ class _InteractionMixin:
                 f"Ephemeral reopen of {type(self).__name__} left no live replacement; "
                 f"the current view stays."
             )
-            self._reopen_in_flight = False
             return
 
-        # After send() (the new row exists) and before exit() (the old one
-        # still does).
-        await self._carry_undo_stacks_to(new_view)
+        # The old message is this view's to delete, so the view lets go of it
+        # for good: the gateway can report the deletion before the call
+        # returns, and a render's edit can come back 404, and through
+        # on_message_delete() either would close the replacement.
+        from .base import _MESSAGE_DELETE, _HeldCancel
 
-        # Carry participants onto the replacement so a multi-user ephemeral
-        # keeps its membership across the reopen (mirrors _navigate_to's carry).
-        # Runs after send() so new_view is registered; the membership guard
-        # keeps it idempotent against any the replacement already auto-claimed.
-        self._carry_participants_to(new_view)
+        message = self._message
+        if message:
+            shown = self._shown_components()
+            self._message = None
+            self._message_closed = max(self._message_closed, _MESSAGE_DELETE)
 
-        # Without it, the exit() below would close children that outlive the
-        # reopen.
-        self._carry_attachments_to(new_view)
-
-        # A message already gone is unbound, so exit() does not edit it again.
-        if self._message:
-            try:
-                await self._bounded(self._message.delete())
-                self._message = None
-            except discord.NotFound:
-                self._message = None
-            except (*DISCORD_CALL_ERRORS, asyncio.TimeoutError):
-                pass
-
-        # Undo steps taken here since the stacks were copied reach the
-        # replacement, as they reach a push's destination at its commit.
-        self._settle_undo_carry(new_view)
-        # Linked before the exit, so an undo step or a batch settling while it
-        # runs follows the panel to the replacement. The exit is the library's
-        # own, which the handed-over warning leaves alone.
-        self._successor = new_view
-        self._library_exits += 1
+        # The replacement is live, so the hand-over always finishes: a step that
+        # raises is logged and the next one runs, and a cancel waits for the
+        # end, as the steps after a send's post do.
+        cut = _HeldCancel()
         try:
-            await self.exit(delete_message=False)
+            # The replacement takes the panel before anything is awaited, since
+            # it can be clicked, closed, or pushed from already. None of these
+            # suspends.
+            await new_view._post_send_step(
+                "carrying the participants over", lambda: self._carry_participants_to(new_view), cut
+            )
+            await new_view._post_send_step(
+                "carrying the attached views over",
+                lambda: self._carry_attachments_to(new_view),
+                cut,
+            )
+            self._successor = new_view
+            # Calls on this view waiting for the Continue go on, and find the
+            # panel handed on; what is left is this view's own close.
+            self._reopen_task = None
+            self._reopen_settled.set()
+
+            # After send() (the new row exists) and before exit() (the old one
+            # still does).
+            await new_view._post_send_step(
+                "carrying the undo history over", lambda: self._carry_undo_stacks_to(new_view), cut
+            )
+            gone = True
+            if message:
+                gone = await new_view._post_send_step(
+                    "deleting the message it replaced",
+                    lambda: self._delete_replaced_message(message),
+                    cut,
+                )
+            await new_view._post_send_step(
+                "carrying undo steps taken since", lambda: self._settle_undo_carry(new_view), cut
+            )
+
+            # The library's own exit, which the handed-over warning leaves alone.
+            self._library_exits += 1
+            try:
+                await new_view._post_send_step(
+                    "closing the view it replaced", lambda: self.exit(delete_message=False), cut
+                )
+            finally:
+                self._library_exits -= 1
+            if not gone:
+                await new_view._post_send_step(
+                    "freezing the message it replaced",
+                    lambda: self._close_left_message(message, True, shown, freeze=True),
+                    cut,
+                )
         finally:
-            self._library_exits -= 1
+            cut.release()
+        if cut or cancelled:
+            raise asyncio.CancelledError()
+
+    async def _delete_replaced_message(self, message) -> bool:
+        """Delete the message a Continue replaced, and say whether it is gone."""
+        try:
+            await self._bounded(message.delete())
+        except discord.NotFound:
+            pass
+        except (*DISCORD_CALL_ERRORS, asyncio.TimeoutError):
+            return False
+        except RuntimeError as e:
+            if not self._closed_session(e):
+                raise
+            return False
+        return True

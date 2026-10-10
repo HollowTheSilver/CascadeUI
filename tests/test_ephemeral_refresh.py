@@ -9,6 +9,7 @@ Covers the v2.2.0 fixes:
 """
 
 import asyncio
+import contextlib
 import importlib
 import logging
 import sys
@@ -21,14 +22,15 @@ import aiohttp
 import discord
 import pytest
 from discord.ui import ActionRow, Button, TextDisplay
-from helpers import RenderableLayoutView
+from helpers import RenderableLayoutView, arm
 from helpers import make_interaction as _make_interaction
-from helpers import refresh_timers, until, wait_for_timer
+from helpers import refresh_timers, refused_by_closed_session, until, wait_for_timer
 
-from cascadeui import InstanceLimitError
+from cascadeui import InstanceLimitError, RenderOutcome
 from cascadeui.components.base import StatefulButton
 from cascadeui.state.actions import ActionCreators
 from cascadeui.state.singleton import get_store
+from cascadeui.testing import stub_client
 from cascadeui.views.layout import StatefulLayoutView
 from cascadeui.views.view import StatefulView
 
@@ -360,8 +362,8 @@ class TestArmRefreshButton:
         view.build_ui()
         view._message = MagicMock()
         view._message.edit = AsyncMock()
-        view._refresh_armed = True
-        view._install_refresh_button(view.build_refresh_button())
+        await arm(view)
+        view._last_tree_digest = None  # as an arming edit that did not land leaves it
         armed_tree = list(view.children)
         rebuilds.clear()
 
@@ -370,6 +372,179 @@ class TestArmRefreshButton:
         assert rebuilds == []  # build_ui must not run
         assert list(view.children) == armed_tree
         view._message.edit.assert_awaited_once()
+
+    @pytest.mark.parametrize("version", ["v1", "v2"])
+    async def test_a_callers_render_keeps_the_continue_button(self, version):
+        """A render from the caller's own code (a modal submitted late, a
+        rebuild then refresh) replaced the Continue button with a panel that
+        stops working when the token expires, and the armed view renders
+        nothing after that could put the button back."""
+        base = StatefulLayoutView if version == "v2" else StatefulView
+
+        class _View(base):
+            auto_refresh_ephemeral = True
+
+            def build_ui(self):
+                self.clear_items()
+                save = StatefulButton(label="Save", custom_id="save")
+                self.add_item(ActionRow(save) if version == "v2" else save)
+
+        view = _View(interaction=_make_interaction())
+        view.build_ui()
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+        await view._arm_refresh_button()
+        armed_tree = list(view.children)
+        view._message.edit.reset_mock()
+
+        view.build_ui()
+        outcome = await view.refresh()
+
+        assert outcome == RenderOutcome.SKIPPED
+        assert list(view.children) == armed_tree
+        view._message.edit.assert_not_awaited()
+
+    @pytest.mark.parametrize("version", ["v1", "v2"])
+    async def test_a_final_card_after_the_close_ships(self, version):
+        """A closed view's controls are already gone, and its own final card
+        was swapped for the Continue button and never sent."""
+        base = StatefulLayoutView if version == "v2" else StatefulView
+
+        class _View(base):
+            auto_refresh_ephemeral = True
+
+        view = _View(interaction=_make_interaction())
+        view.add_item(TextDisplay("panel") if version == "v2" else Button(label="x", custom_id="x"))
+        view._message = MagicMock()
+        view._message.edit = AsyncMock()
+        await arm(view)
+        await view.exit()
+        view._message.edit.reset_mock()
+        card = discord.Embed(title="Session closed")
+        if version == "v2":
+            view.clear_items()
+            view.add_item(TextDisplay("Session closed"))
+            outcome = await view.refresh()
+        else:
+            outcome = await view.refresh(embed=card)
+
+        assert outcome == RenderOutcome.RENDERED
+        sent = view._message.edit.await_args.kwargs
+        if version == "v2":
+            assert [c.content for c in sent["view"].children] == ["Session closed"]
+        else:
+            assert sent["embed"] is card
+
+    async def test_a_view_sent_again_is_not_armed(self):
+        """A view armed on one message and sent again stayed armed, so every
+        render of the new panel put the old message's Continue button back."""
+
+        class _View(StatefulLayoutView):
+            auto_refresh_ephemeral = True
+            count = 0
+
+            async def on_load(self):
+                self.build_ui()
+
+            def build_ui(self):
+                self.clear_items()
+                self.add_item(TextDisplay(f"count {self.count}"))
+                self.add_item(
+                    ActionRow(StatefulButton(label="+1", custom_id="inc", callback=self.inc))
+                )
+
+            async def inc(self, interaction):
+                self.count += 1
+                self.build_ui()
+                await self.refresh()
+
+        view = _View(interaction=_make_interaction())
+        view.build_ui()
+        view._message = MagicMock(id=1)
+        view._message.edit = AsyncMock(return_value=view._message)
+        view._message.delete = AsyncMock()
+        await arm(view)
+        view.interaction = _make_interaction()
+        posted = await view.send()
+        click = _make_interaction(message=MagicMock(id=posted.id))
+
+        await view._scheduled_task(view.children[1].children[0], click)
+
+        assert view._refresh_armed is False
+        assert view.children[0].content == "count 1"
+        click.response.edit_message.assert_awaited_once()
+
+    async def test_the_emoji_retry_keeps_the_button_while_it_builds(self):
+        """The retry cleared the tree before its build awaited, so a render
+        in that window put the rejected button back and the retry then added
+        its own beside it."""
+        building = asyncio.Event()
+        gate = asyncio.Event()
+
+        class _View(StatefulLayoutView):
+            auto_refresh_ephemeral = True
+            refresh_button_emoji = "\N{CLOCKWISE RIGHTWARDS AND LEFTWARDS OPEN CIRCLE ARROWS}"
+            builds = 0
+
+            async def build_refresh_button(self):
+                self.builds += 1
+                if self.builds == 2:
+                    building.set()
+                    await gate.wait()
+                return super().build_refresh_button()
+
+        view = _View()
+        view.add_item(TextDisplay("panel"))
+        view._message = MagicMock()
+        sent = []
+
+        async def edit(**kwargs):
+            emojis = [b.emoji for row in kwargs["view"].children for b in row.children]
+            sent.append(emojis)
+            if any(emojis):
+                raise _make_emoji_error()
+            return view._message
+
+        view._message.edit = edit
+        arming = asyncio.create_task(view._arm_refresh_button())
+        await building.wait()
+        armed_tree = list(view.children)
+        with contextlib.suppress(discord.HTTPException):
+            await view.refresh()  # another task's render while the retry builds
+        gate.set()
+        await arming
+
+        assert len(armed_tree) == 1
+        assert len(view.children) == 1
+        assert sent[-1] == [None]
+
+    async def test_a_render_after_a_failed_arming_ships_the_continue_button(self):
+        """The arming edit never landed, and a caller's render that could
+        have sent the button was turned into nothing."""
+
+        class _View(StatefulLayoutView):
+            auto_refresh_ephemeral = True
+
+            def build_ui(self):
+                self.clear_items()
+                self.add_item(TextDisplay("panel"))
+                self.add_item(ActionRow(StatefulButton(label="go", custom_id="go")))
+
+        view = _View(interaction=_make_interaction())
+        view.build_ui()
+        view._message = MagicMock()
+        view._message.edit = AsyncMock(side_effect=[view._message, _http_error(503), view._message])
+        await view.refresh()
+        view._queue_deferred_refresh = lambda wait: None
+        await view._arm_refresh_button()
+
+        view.build_ui()
+        outcome = await view.refresh()
+
+        assert outcome == RenderOutcome.RENDERED
+        shipped = view._message.edit.await_args.kwargs["view"]
+        labels = [b.label for row in shipped.children for b in getattr(row, "children", [])]
+        assert labels == [view.refresh_button_label]
 
     async def test_arm_retries_without_emoji_on_50035(self):
         """If Discord rejects the button emoji with error 50035, the
@@ -1613,7 +1788,7 @@ class TestReopenHandsThePanelOn:
         await old.current_view.exit()
         assert new._torn_down()
 
-    @pytest.mark.parametrize("close", ["exit", "on_timeout"])
+    @pytest.mark.parametrize("close", ["exit", "on_timeout", "exit_children"])
     async def test_a_close_during_the_continue_leaves_the_replacement_whole(self, close):
         """A close from another task landing while the replacement was sent
         closed this view and its attached view, and the replacement went live
@@ -1650,6 +1825,588 @@ class TestReopenHandsThePanelOn:
         assert new is not old and not new.is_finished()
         assert not child.is_finished()
         assert child in new._attached_children
+
+    async def test_a_send_during_the_continue_waits_and_finds_the_panel_handed_on(self):
+        """A send() from code while the replacement was built went ahead: the
+        old view posted a message the Continue then deleted, and send()
+        returned it as if a live panel had come of it."""
+        loading = None
+
+        class _Panel(RenderableLayoutView):
+            timeout = None
+            auto_refresh_ephemeral = True
+
+            async def on_load(self):
+                if loading is not None:
+                    await loading.wait()
+
+        old = _Panel(interaction=_make_interaction(user_id=1, guild_id=100))
+        await old.send(ephemeral=True)
+        loading = asyncio.Event()
+        continuing = asyncio.create_task(
+            old._reopen_ephemeral(_make_interaction(user_id=1, guild_id=100))
+        )
+        for _ in range(20):
+            await asyncio.sleep(0)
+        old.interaction = _make_interaction(user_id=1, guild_id=100)
+        sending = asyncio.create_task(old.send(ephemeral=True))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert not sending.done(), "the send did not wait for the Continue"
+        loading.set()
+        await asyncio.wait_for(continuing, 5)
+
+        with pytest.raises(RuntimeError, match="handed its panel on"):
+            await asyncio.wait_for(sending, 5)
+        old.interaction.response.send_message.assert_not_called()
+        assert not old.current_view.is_finished()
+
+    async def test_a_send_from_inside_the_continue_is_refused(self):
+        """The old view sent from its own Continue (the replacement's on_load)
+        posted a second panel that the hand-over then closed."""
+        refusals = []
+
+        class _Panel(RenderableLayoutView):
+            timeout = None
+            auto_refresh_ephemeral = True
+            replacing = None
+
+            async def on_load(self):
+                if self.replacing is not None and self is not self.replacing:
+                    try:
+                        await self.replacing.send(ephemeral=True)
+                    except RuntimeError as e:
+                        refusals.append(str(e))
+
+        old = _Panel(interaction=_make_interaction(user_id=1, guild_id=100))
+        await old.send(ephemeral=True)
+        _Panel.replacing = old
+
+        await old._reopen_ephemeral(_make_interaction(user_id=1, guild_id=100))
+
+        assert len(refusals) == 1 and "inside the view's own Continue" in refusals[0]
+        assert not old.current_view.is_finished()
+
+    async def test_a_continue_cancelled_before_its_replacement_posts_can_be_clicked_again(self):
+        """A cancel before Discord accepted the replacement rolled it back and
+        left the old view's Continue answering every later click as a repeat."""
+        cancel_in_load = None
+
+        class _Panel(RenderableLayoutView):
+            timeout = None
+            auto_refresh_ephemeral = True
+
+            async def on_load(self):
+                nonlocal cancel_in_load
+                if cancel_in_load is not None:
+                    task, cancel_in_load = cancel_in_load, None
+                    task.cancel()
+                    await asyncio.sleep(0)
+
+        old = _Panel(interaction=_make_interaction(user_id=1, guild_id=100))
+        await old.send(ephemeral=True)
+        continuing = asyncio.create_task(
+            old._reopen_ephemeral(_make_interaction(user_id=1, guild_id=100))
+        )
+        cancel_in_load = continuing
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(continuing, 5)
+        assert old.current_view is old and not old._torn_down()
+
+        await old._reopen_ephemeral(_make_interaction(user_id=1, guild_id=100))
+
+        assert old.current_view is not old and old._torn_down()
+
+    async def test_a_continue_cancelled_after_its_replacement_posts_hands_the_panel_on(self):
+        """A cancel after Discord accepted the replacement went through before
+        the hand-over: two live panels, and the old one's Continue still sent
+        another."""
+        cancel_after_post = None
+
+        class _Panel(RenderableLayoutView):
+            timeout = None
+            auto_refresh_ephemeral = True
+
+            async def _update_message_state(self, message):
+                await super()._update_message_state(message)
+                nonlocal cancel_after_post
+                if cancel_after_post is not None:
+                    task, cancel_after_post = cancel_after_post, None
+                    task.cancel()
+                    await asyncio.sleep(0)
+
+        old = _Panel(interaction=_make_interaction(user_id=1, guild_id=100))
+        await old.send(ephemeral=True)
+        message = old._message
+        continuing = asyncio.create_task(
+            old._reopen_ephemeral(_make_interaction(user_id=1, guild_id=100))
+        )
+        cancel_after_post = continuing
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(continuing, 5)
+
+        new = old.current_view
+        assert new is not old and not new._torn_down()
+        assert old._torn_down()
+        message.delete.assert_awaited_once()
+
+    async def test_the_gateway_reporting_the_old_message_deleted_leaves_the_replacement_live(self):
+        """Discord can report the deletion of the old message before the
+        Continue's delete call returns. The listener ran the old view's
+        on_message_delete(), whose close followed the hand-over and froze the
+        replacement."""
+        deletions = []
+
+        class _Panel(RenderableLayoutView):
+            timeout = None
+            auto_refresh_ephemeral = True
+
+            async def on_message_delete(self):
+                deletions.append(self)
+                await super().on_message_delete()
+
+        old = _Panel(interaction=_make_interaction(user_id=1, guild_id=100))
+        await old.send(ephemeral=True)
+        # Every mocked message shares one id, so the old one gets its own and
+        # the deletion can match only the old view.
+        old._message.id = 4242
+        listeners = []
+
+        async def reported_before_it_returns():
+            deleted = get_store()._clean_up_deleted(lambda m: m.id == 4242)
+            listeners.append(asyncio.ensure_future(deleted))
+            for _ in range(3):
+                await asyncio.sleep(0)
+
+        old._message.delete = AsyncMock(side_effect=reported_before_it_returns)
+
+        await old._reopen_ephemeral(_make_interaction(user_id=1, guild_id=100))
+        await asyncio.wait_for(asyncio.gather(*listeners), 5)
+
+        new = old.current_view
+        assert new is not old and not new._torn_down()
+        assert deletions == []
+
+    async def test_a_render_finding_the_old_message_deleted_leaves_the_replacement_live(self):
+        """A render of the old view whose edit came back 404 while the Continue
+        deleted the message called on_message_gone() and on_message_delete(),
+        and that close followed the hand-over to the replacement."""
+        hooks = []
+
+        class _Panel(RenderableLayoutView):
+            timeout = None
+            auto_refresh_ephemeral = True
+
+            async def on_message_gone(self):
+                hooks.append("gone")
+
+            async def on_message_delete(self):
+                hooks.append("delete")
+                await super().on_message_delete()
+
+        old = _Panel(interaction=_make_interaction(user_id=1, guild_id=100))
+        await old.send(ephemeral=True)
+        message = old._message
+        edit_started, edit_lands, delete_lands = (asyncio.Event() for _ in range(3))
+
+        async def edit_finds_it_deleted(**kwargs):
+            edit_started.set()
+            await edit_lands.wait()
+            raise discord.NotFound(MagicMock(status=404), "Unknown Message")
+
+        async def delete_in_flight():
+            await delete_lands.wait()
+
+        message.edit = AsyncMock(side_effect=edit_finds_it_deleted)
+        message.delete = AsyncMock(side_effect=delete_in_flight)
+        old._last_tree_digest = None
+        render = asyncio.create_task(old.refresh())
+        await asyncio.wait_for(edit_started.wait(), 5)
+        continuing = asyncio.create_task(
+            old._reopen_ephemeral(_make_interaction(user_id=1, guild_id=100))
+        )
+        await until(lambda: message.delete.await_count == 1)
+        try:
+            edit_lands.set()
+            await asyncio.wait_for(render, 5)
+            for _ in range(20):
+                await asyncio.sleep(0)
+        finally:
+            delete_lands.set()
+        await asyncio.wait_for(continuing, 5)
+        if old._message_gone_task is not None:
+            await asyncio.wait_for(old._message_gone_task, 5)
+
+        new = old.current_view
+        assert new is not old and not new._torn_down()
+        assert hooks == []
+
+    async def test_a_deletion_reported_after_a_failed_delete_leaves_the_replacement_live(self):
+        """A delete Discord carried out but whose reply was lost gave the
+        message back to the old view before its exit. The deletion the
+        gateway reported while an exit() override awaited then ran the old
+        view's on_message_delete(), whose close followed the hand-over and
+        froze the replacement."""
+        deletions = []
+        reported = asyncio.Event()
+
+        class _Panel(RenderableLayoutView):
+            timeout = None
+            auto_refresh_ephemeral = True
+
+            async def on_message_delete(self):
+                deletions.append(self)
+                await super().on_message_delete()
+
+            async def exit(self, delete_message=None):
+                if self is old:
+                    # Work done before closing, such as a record written.
+                    await asyncio.wait_for(reported.wait(), 5)
+                return await super().exit(delete_message=delete_message)
+
+        old = _Panel(interaction=_make_interaction(user_id=1, guild_id=100))
+        await old.send(ephemeral=True)
+        old._message.id = 4242
+        listeners = []
+
+        async def report_deletion():
+            await get_store()._clean_up_deleted(lambda m: m.id == 4242)
+            reported.set()
+
+        async def deleted_but_the_reply_lost():
+            listeners.append(asyncio.ensure_future(report_deletion()))
+            raise aiohttp.ServerDisconnectedError()
+
+        old._message.delete = AsyncMock(side_effect=deleted_but_the_reply_lost)
+
+        await old._reopen_ephemeral(_make_interaction(user_id=1, guild_id=100))
+        await asyncio.wait_for(asyncio.gather(*listeners), 5)
+
+        new = old.current_view
+        assert new is not old and not new._torn_down()
+        assert deletions == []
+
+    async def test_a_render_finding_the_message_gone_after_a_failed_delete_runs_no_hook(self):
+        """A render of the old view in flight while a delete was carried out
+        but its reply lost: the message went back to the old view, so the
+        render's 404 called on_message_gone()."""
+        hooks = []
+
+        class _Panel(RenderableLayoutView):
+            timeout = None
+            auto_refresh_ephemeral = True
+
+            async def on_message_gone(self):
+                hooks.append("gone")
+
+            async def on_message_delete(self):
+                hooks.append("delete")
+                await super().on_message_delete()
+
+        old = _Panel(interaction=_make_interaction(user_id=1, guild_id=100))
+        await old.send(ephemeral=True)
+        message = old._message
+        edit_started, edit_lands = asyncio.Event(), asyncio.Event()
+
+        async def edit_finds_it_deleted(**kwargs):
+            edit_started.set()
+            await edit_lands.wait()
+            raise discord.NotFound(MagicMock(status=404), "Unknown Message")
+
+        async def deleted_but_the_reply_lost():
+            edit_lands.set()
+            raise aiohttp.ServerDisconnectedError()
+
+        message.edit = AsyncMock(side_effect=edit_finds_it_deleted)
+        message.delete = AsyncMock(side_effect=deleted_but_the_reply_lost)
+        old._last_tree_digest = None
+        render = asyncio.create_task(old.refresh())
+        await asyncio.wait_for(edit_started.wait(), 5)
+
+        await old._reopen_ephemeral(_make_interaction(user_id=1, guild_id=100))
+        await asyncio.wait_for(render, 5)
+        if old._message_gone_task is not None:
+            await asyncio.wait_for(old._message_gone_task, 5)
+
+        new = old.current_view
+        assert new is not old and not new._torn_down()
+        assert hooks == []
+
+    async def test_a_bot_closing_during_the_delete_leaves_the_old_view_released(self, caplog):
+        """The bot closed while the delete was in flight and the delete then
+        failed: the old view, released by the close, got its message back,
+        and its exit edited it through the closed client, logging an error."""
+        bot = stub_client()
+
+        class _Panel(RenderableLayoutView):
+            timeout = None
+            auto_refresh_ephemeral = True
+
+        interaction = _make_interaction(user_id=1, guild_id=100)
+        interaction.client = bot
+        old = _Panel(interaction=interaction)
+        await old.send(ephemeral=True)
+        message = old._message
+        closed = False
+
+        async def refused_once_closed(**kwargs):
+            if closed:
+                await refused_by_closed_session()
+
+        async def cut_off_by_the_close():
+            nonlocal closed
+            bot._closing_task = asyncio.get_running_loop().create_future()
+            closed = True
+            get_store()._release_views_of(bot)
+            raise aiohttp.ServerDisconnectedError()
+
+        message.edit = AsyncMock(side_effect=refused_once_closed)
+        message.delete = AsyncMock(side_effect=cut_off_by_the_close)
+        click = _make_interaction(user_id=1, guild_id=100)
+        click.client = bot
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui"):
+            await old._reopen_ephemeral(click)
+
+        assert closed, "the delete never ran"
+        assert old._message is None
+        ours = [r for r in caplog.records if r.name.startswith("cascadeui")]
+        assert [r.getMessage() for r in ours if r.levelno >= logging.WARNING] == []
+
+    async def test_a_step_raising_after_the_replacement_is_live_still_hands_the_panel_on(
+        self, caplog
+    ):
+        """A middleware raising on the undo history's carry stopped the
+        Continue after its replacement went live: two live panels, the old
+        message never deleted, and the old Continue button dropping every
+        later click."""
+        from cascadeui.state.middleware import UndoMiddleware
+
+        store = get_store()
+        undo = UndoMiddleware()
+        await undo.initialize(store)
+        store._add_middleware(undo)
+        failing = False
+
+        async def audit(action, state, next_fn):
+            result = await next_fn(action, state)
+            payload = action.get("payload") or {}
+            if failing and action["type"] == "VIEW_UPDATED" and "undo_stack" in payload:
+                raise RuntimeError("audit write failed")
+            return result
+
+        store._add_middleware(audit)
+
+        class _Panel(RenderableLayoutView):
+            timeout = None
+            auto_refresh_ephemeral = True
+            enable_undo = True
+
+        old = _Panel(interaction=_make_interaction(user_id=1, guild_id=100))
+        await old.send(ephemeral=True)
+        await old.dispatch_scoped({"count": 1}, scope="user")
+        message = old._message
+        failing = True
+
+        with caplog.at_level(logging.ERROR, logger="cascadeui"):
+            await old._reopen_ephemeral(_make_interaction(user_id=1, guild_id=100))
+
+        new = old.current_view
+        assert new is not old and not new._torn_down()
+        assert old._torn_down()
+        message.delete.assert_awaited_once()
+        assert any(
+            "carrying the undo history over raised RuntimeError" in r.getMessage()
+            for r in caplog.records
+        )
+
+    async def test_a_view_attached_during_the_delete_moves_to_the_replacement(self):
+        """A view sent with parent= while the old message was deleted attached
+        to the old view after its children had been carried, and that view's
+        exit then closed it."""
+
+        class _Panel(RenderableLayoutView):
+            timeout = None
+            auto_refresh_ephemeral = True
+
+        old = _Panel(interaction=_make_interaction(user_id=1, guild_id=100))
+        await old.send(ephemeral=True)
+        children = []
+
+        async def a_child_sent_meanwhile():
+            child = RenderableLayoutView(
+                interaction=_make_interaction(user_id=1, guild_id=100), parent=old
+            )
+            await child.send(ephemeral=True)
+            children.append(child)
+
+        old._message.delete = AsyncMock(side_effect=a_child_sent_meanwhile)
+
+        await old._reopen_ephemeral(_make_interaction(user_id=1, guild_id=100))
+
+        new = old.current_view
+        (child,) = children
+        assert not child._torn_down()
+        assert child in new._attached_children
+
+    async def test_a_continue_keeps_auto_registered_participants_under_an_instance_limit(self):
+        """The replacement registers the view's other users while the old view
+        still holds them, and the per-user instance limit counted the old
+        view, so the replacement was refused on every Continue."""
+        limited = []
+
+        class _Shared(RenderableLayoutView):
+            timeout = None
+            auto_refresh_ephemeral = True
+            instance_limit = 1
+            instance_scope = "user_guild"
+            auto_register_participants = True
+
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.allowed_users = {1, 2}
+
+            async def on_instance_limit(self, error):
+                limited.append(error.blocked_user_id)
+
+        old = _Shared(interaction=_make_interaction(user_id=1, guild_id=100))
+        await old.send(ephemeral=True)
+        assert 2 in old.participants
+
+        await old._reopen_ephemeral(_make_interaction(user_id=1, guild_id=100))
+
+        new = old.current_view
+        assert new is not old and not new._torn_down()
+        assert limited == []
+        assert 2 in new.participants
+
+    async def test_the_replacement_holds_the_panel_while_the_old_message_is_deleted(self):
+        """The replacement, live during the delete, took the old view's place,
+        attached views, and participants only after it: a child reading
+        self.parent got the old view, and a push from the replacement left
+        the participants behind."""
+        replacements = []
+        seen = {}
+
+        class _Panel(RenderableLayoutView):
+            timeout = None
+            auto_refresh_ephemeral = True
+
+            def build_reopen_view(self, interaction):
+                view = super().build_reopen_view(interaction)
+                replacements.append(view)
+                return view
+
+        old = _Panel(interaction=_make_interaction(user_id=1, guild_id=100))
+        await old.send(ephemeral=True)
+        await old.register_participant(2)
+        child = RenderableLayoutView(
+            interaction=_make_interaction(user_id=1, guild_id=100), parent=old
+        )
+        await child.send(ephemeral=True)
+
+        async def look_meanwhile():
+            seen.update(
+                current=old.current_view,
+                parent=child.parent,
+                participants=set(replacements[0].participants),
+            )
+
+        old._message.delete = AsyncMock(side_effect=look_meanwhile)
+
+        await old._reopen_ephemeral(_make_interaction(user_id=1, guild_id=100))
+
+        (new,) = replacements
+        assert seen["current"] is new
+        assert seen["parent"] is new
+        assert 2 in seen["participants"]
+
+    async def test_a_replacement_closed_during_the_delete_closes_the_views_it_took(self):
+        """An Exit on the replacement while the old message was deleted closed
+        it before the attached views moved to it; they then moved onto the
+        closed view and stayed live."""
+        replacements = []
+
+        class _Panel(RenderableLayoutView):
+            timeout = None
+            auto_refresh_ephemeral = True
+
+            def build_reopen_view(self, interaction):
+                view = super().build_reopen_view(interaction)
+                replacements.append(view)
+                return view
+
+        old = _Panel(interaction=_make_interaction(user_id=1, guild_id=100))
+        await old.send(ephemeral=True)
+        child = RenderableLayoutView(
+            interaction=_make_interaction(user_id=1, guild_id=100), parent=old
+        )
+        await child.send(ephemeral=True)
+
+        async def the_replacement_closes_meanwhile():
+            await replacements[0].exit()
+
+        old._message.delete = AsyncMock(side_effect=the_replacement_closes_meanwhile)
+
+        await old._reopen_ephemeral(_make_interaction(user_id=1, guild_id=100))
+
+        assert replacements[0]._torn_down()
+        assert child._torn_down()
+
+    async def test_an_exit_override_closing_children_from_a_task_does_not_hang(self):
+        """exit_children() waits for a Continue running on the view, and the
+        Continue ran the old view's exit() inside that wait, so an override
+        closing the children from a task of its own waited on itself and the
+        click never finished."""
+
+        class _Panel(RenderableLayoutView):
+            timeout = None
+            auto_refresh_ephemeral = True
+
+            async def exit(self, delete_message=None):
+                await asyncio.gather(self.exit_children())
+                return await super().exit(delete_message=delete_message)
+
+        old = _Panel(interaction=_make_interaction(user_id=1, guild_id=100))
+        await old.send(ephemeral=True)
+
+        await asyncio.wait_for(old._reopen_ephemeral(_make_interaction(user_id=1, guild_id=100)), 5)
+
+        assert old._torn_down()
+
+    async def test_a_bot_closed_before_the_delete_logs_no_error(self, caplog):
+        """The delete refused by a client that had closed was logged as an
+        error, though closing the bot is not a failure."""
+        bot = stub_client()
+
+        class _Panel(RenderableLayoutView):
+            timeout = None
+            auto_refresh_ephemeral = True
+
+        interaction = _make_interaction(user_id=1, guild_id=100)
+        interaction.client = bot
+        old = _Panel(interaction=interaction)
+        await old.send(ephemeral=True)
+        message = old._message
+
+        async def refused_by_the_closed_client(**kwargs):
+            await refused_by_closed_session()
+
+        async def the_bot_closed_first():
+            bot._closing_task = asyncio.get_running_loop().create_future()
+            await refused_by_closed_session()
+
+        message.edit = AsyncMock(side_effect=refused_by_the_closed_client)
+        message.delete = AsyncMock(side_effect=the_bot_closed_first)
+        click = _make_interaction(user_id=1, guild_id=100)
+        click.client = bot
+
+        with caplog.at_level(logging.DEBUG, logger="cascadeui"):
+            await old._reopen_ephemeral(click)
+
+        assert message.delete.await_count == 1
+        ours = [r for r in caplog.records if r.name.startswith("cascadeui")]
+        assert [r.getMessage() for r in ours if r.levelno >= logging.ERROR] == []
 
     async def test_a_push_from_code_during_the_continue_waits_and_refuses(self):
         """A push() from code landing while the replacement was sent committed
@@ -1864,9 +2621,10 @@ class TestReopenHandsThePanelOn:
 
 
 class TestReopenLinkSurvivesARaisingExit:
-    async def test_the_link_holds_when_the_old_views_exit_raises(self):
+    async def test_the_link_holds_when_the_old_views_exit_raises(self, caplog):
         """The link was set after the old view's exit(), so an override that
-        raised left code holding the old view no way to reach the live one."""
+        raised left code holding the old view no way to reach the live one.
+        The raise is logged, since the replacement is already live."""
 
         class _Panel(RenderableLayoutView):
             timeout = None
@@ -1882,11 +2640,15 @@ class TestReopenLinkSurvivesARaisingExit:
         await old.send(ephemeral=True)
         old.fail_exit = True
 
-        with pytest.raises(RuntimeError, match="exit failed"):
+        with caplog.at_level(logging.ERROR, logger="cascadeui"):
             await old._reopen_ephemeral(_make_interaction(user_id=1, guild_id=100))
 
         new = old.current_view
         assert new is not old and not new.is_finished()
+        assert any(
+            "closing the view it replaced raised RuntimeError: exit failed" in r.getMessage()
+            for r in caplog.records
+        )
 
 
 class TestReopenFactoryReturningTheViewItself:
@@ -2039,8 +2801,8 @@ class TestReopenShowsTheDataOnScreen:
 
 
 class TestReopenCleanupOfOldMessage:
-    """The old panel is deleted when the token still allows it; otherwise the
-    teardown freezes it through the same single edit every teardown uses."""
+    """The old panel is deleted when the token still allows it; otherwise it
+    is closed once, as a view sent again closes the message it left."""
 
     class _Refreshable(StatefulLayoutView):
         auto_refresh_ephemeral = True
@@ -2094,6 +2856,60 @@ class TestReopenCleanupOfOldMessage:
         shipped = message.edit.await_args.kwargs["view"]
         buttons = [i for i in shipped.walk_children() if isinstance(i, discord.ui.Button)]
         assert buttons and all(b.disabled for b in buttons)
+
+    async def test_a_failed_delete_freezes_under_a_delete_exit_policy(self):
+        """Under exit_policy = "delete" a failed delete was sent again, which
+        after a server error repeats discord.py's retries and, failing again,
+        left the old Continue button looking live."""
+        old, message = self._old_and_new(
+            delete_side_effect=discord.HTTPException(MagicMock(status=503), "unavailable")
+        )
+        old.set_class_attribute("exit_policy", "delete")
+
+        await old._reopen_ephemeral(_make_interaction())
+
+        message.delete.assert_awaited_once()
+        message.edit.assert_awaited_once()
+        shipped = message.edit.await_args.kwargs["view"]
+        buttons = [i for i in shipped.walk_children() if isinstance(i, discord.ui.Button)]
+        assert buttons and all(b.disabled for b in buttons)
+
+    async def test_a_failed_delete_leaves_the_old_view_without_its_message(self):
+        """The old view lets go of its message before the delete and does not
+        take it back when the delete fails: the message is frozen once, and a
+        later render of the old view reports it closed."""
+        old, message = self._old_and_new(
+            delete_side_effect=discord.HTTPException(MagicMock(status=500), "unavailable")
+        )
+
+        await old._reopen_ephemeral(_make_interaction())
+        old.add_item(ActionRow(StatefulButton(label="Late", custom_id="late")))
+
+        assert old._message is None
+        assert await old.refresh() is RenderOutcome.CLOSED
+        message.edit.assert_awaited_once()
+
+    async def test_a_continue_cut_off_during_the_delete_still_hands_the_panel_on(self):
+        """A Continue cancelled while its delete is in flight finishes the
+        hand-over before the cancel goes through, since the replacement is
+        live: the old view closes, and the old message is frozen."""
+        old, message = self._old_and_new()
+        deleting = asyncio.Event()
+
+        async def delete_in_flight():
+            deleting.set()
+            await asyncio.Event().wait()
+
+        message.delete = AsyncMock(side_effect=delete_in_flight)
+        continuing = asyncio.create_task(old._reopen_ephemeral(_make_interaction()))
+        await asyncio.wait_for(deleting.wait(), 5)
+        continuing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await continuing
+
+        assert old.current_view is not old
+        assert old.is_finished()
+        message.edit.assert_awaited_once()
 
 
 # // ========================================( Refresh Timer )======================================== // #
@@ -3080,7 +3896,8 @@ class TestArmingRetriesWhileTheTokenLives:
         view = _View(interaction=_make_interaction())
         view._message = MagicMock()
         view._message.edit = AsyncMock(side_effect=aiohttp.ClientOSError(104, "reset"))
-        view._refresh_armed = True
+        await arm(view)
+        view._last_tree_digest = None  # as an arming edit that did not land leaves it
 
         queued = []
         view._queue_deferred_refresh = lambda wait: queued.append(wait)
@@ -3096,7 +3913,8 @@ class TestArmingRetriesWhileTheTokenLives:
         view = _View(interaction=_make_interaction())
         view._message = MagicMock()
         view._message.edit = AsyncMock()
-        view._refresh_armed = True
+        await arm(view)
+        view._last_tree_digest = None  # as an arming edit that did not land leaves it
 
         queued = []
         view._queue_deferred_refresh = lambda wait: queued.append(wait)
@@ -3117,7 +3935,8 @@ class TestArmingRetriesWhileTheTokenLives:
         view._message.edit = AsyncMock(
             side_effect=discord.HTTPException(MagicMock(status=401), "expired")
         )
-        view._refresh_armed = True
+        await arm(view)
+        view._last_tree_digest = None  # as an arming edit that did not land leaves it
 
         queued = []
         view._queue_deferred_refresh = lambda wait: queued.append(wait)
@@ -3125,6 +3944,50 @@ class TestArmingRetriesWhileTheTokenLives:
         await view._deferred_refresh(0)
 
         assert queued == [], "a dead token must not spin a retry loop"
+
+    @pytest.mark.parametrize("seam", ["arming", "retry"])
+    async def test_a_server_error_queues_another_attempt(self, seam):
+        """A 5xx carries no retry-after either, and ended the chain at the
+        first one: logged at DEBUG, with the panel left frozen."""
+
+        class _View(RenderableLayoutView):
+            auto_refresh_ephemeral = True
+
+        view = _View(interaction=_make_interaction())
+        view._message = MagicMock()
+        view._message.edit = AsyncMock(side_effect=_http_error(503))
+        queued = []
+        view._queue_deferred_refresh = lambda wait: queued.append(wait)
+
+        if seam == "arming":
+            await view._arm_refresh_button()
+        else:
+            await arm(view)
+            view._last_tree_digest = None  # as an arming edit that did not land leaves it
+            await view._deferred_refresh(0)
+
+        assert queued == [5.0]
+
+    @pytest.mark.parametrize("seam", ["arming", "retry"])
+    async def test_a_client_error_on_the_arming_edit_ends_the_chain(self, seam):
+        class _View(RenderableLayoutView):
+            auto_refresh_ephemeral = True
+
+        view = _View(interaction=_make_interaction())
+        view._message = MagicMock()
+        view._message.edit = AsyncMock(side_effect=_http_error(403))
+        queued = []
+        view._queue_deferred_refresh = lambda wait: queued.append(wait)
+
+        if seam == "arming":
+            await view._arm_refresh_button()
+        else:
+            await arm(view)
+            view._last_tree_digest = None  # as an arming edit that did not land leaves it
+            with pytest.raises(discord.HTTPException):
+                await view._deferred_refresh(0)
+
+        assert queued == []
 
 
 class _ArmedSource(RenderableLayoutView):

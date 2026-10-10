@@ -87,7 +87,7 @@ async def my_slow_callback(self, interaction):
     await interaction.followup.send(f"Done: {result}", ephemeral=True)
 ```
 
-Route an explicit acknowledgement through `self._safe_defer(interaction)`
+Route an explicit acknowledgement through `self.safe_defer(interaction)`
 rather than a bare `interaction.response.defer()`. The auto-defer timer is
 armed outside the interaction lock, so it can take the slot between your
 `is_done()` check and your call. Under `serialize_interactions`, a click that
@@ -225,6 +225,16 @@ convenience of not having to click the in-panel button.
 affected. Downstream logic that reads `_active_views`, session scope
 keys, subscribers, or `_attached_children` sees consistent, correct data.
 
+**Sub-limitation: a dismissed panel stays registered.** Discord sends the bot
+no event when a user dismisses an ephemeral message, so the library cannot
+tell a dismissed panel from one the user will come back to. A panel declared
+`timeout=None` with the handoff engaged stays registered and subscribed until
+`exit()` or a restart. On a class with an `instance_limit` it keeps its place
+in that count, so under `instance_policy = "reject"`, or once participants
+have registered, the user's next open is refused until then. Give a panel
+that must free its slot a long finite `timeout`, such as `86400`. See the
+ephemeral note under [Timeout](views.md#timeout).
+
 ---
 
 ## Burst-Click Toast Under `serialize_interactions = True`
@@ -319,7 +329,7 @@ known, so that second send may repeat an update already on screen.
 - For callbacks where heavy work plus refresh routinely exceeds a
   second, follow the slow-callback pattern in
   [`concepts.md`](concepts.md#exception-callbacks-that-genuinely-take-more-than-two-seconds)
-  (`await self._safe_defer(interaction)` at the top of the
+  (`await self.safe_defer(interaction)` at the top of the
   callback). The click acks immediately and the refresh routes
   through the channel endpoint deliberately.
 - `ack_first = True` -- the view-wide form of the same trade. Every
@@ -463,7 +473,7 @@ A render can be asked for while the view is busy: during another task's
 `reload()`, while its message is being sent, or while a `push()` or `pop()`
 from it is in flight. CascadeUI holds the render and runs it once the view is
 free, and treats its edits as made when the render was asked for, so a held
-render never covers an edit made in the meantime. Three cases follow from that
+render never covers an edit made in the meantime. Four cases follow from that
 rule.
 
 ### Refreshes Handed to Other Tasks
@@ -481,10 +491,12 @@ so it cannot sort these out itself. Await
 
 When a push or pop's edit stalls, whether the new screen reached the message
 cannot be known, so CascadeUI redraws the view it left with that view's
-[`nav_rebuild`](../api/views.md#nav_rebuild) content. A close that lands first carries the redraw, and a state
-render asked for before the redraw is then skipped as older. Two shapes lose
-part of that render: a `nav_rebuild` that rebuilds only part of a V2 tree (a
-change the render made elsewhere is dropped), and a late V2 render that passes
+[`nav_rebuild`](../api/views.md#nav_rebuild) content, the screen from before
+the push. A close that lands first sends the redraw in its own freeze edit, and a
+state render asked for before the push began that is still running at that point
+is skipped as older. Two shapes lose part of that render: a `nav_rebuild` that
+rebuilds only part of a V2 tree (a change the render made elsewhere is dropped),
+and a late V2 render that passes
 `attachments=`, which ships its file together with its older tree, since a V2
 edit cannot carry a file without the tree. A `nav_rebuild` that rebuilds the
 whole tree avoids the first.
@@ -496,6 +508,18 @@ A state change that arrives while another task's
 message without the change, since the panel is closing anyway. Making the close
 wait would run your `on_load()` and `on_state_changed()` inside the close,
 where they can hang it or raise out of it.
+
+### A Closing Card That Bypasses the Library
+
+A render still loading when its view closes (a
+[`reload()`](../api/views.md#reload), the render of a tab, step, or page, or a
+`PaginatedRegion` page turn or `Collapsible` toggle) ships what it built once it
+finishes, with the controls as the close left them, so the panel does not stay
+frozen half built. It never covers another edit asked for after it began, so a
+closing card sent through [`refresh()`](../api/views.md#refresh), before or
+after `exit()`, stays on screen. An edit made with `message.edit()` or
+`interaction.response.edit_message()` bypasses the library: the late render
+cannot see it and can land over it. Send a closing card through `refresh()`.
 
 ---
 

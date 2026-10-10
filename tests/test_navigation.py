@@ -10,9 +10,9 @@ import aiohttp
 import discord
 import pytest
 from discord.ui import ActionRow
-from helpers import RenderableLayoutView
+from helpers import RenderableLayoutView, arm
 from helpers import make_interaction as _make_interaction
-from helpers import until
+from helpers import owe_redraw, refused_by_closed_session, until
 
 from cascadeui.components.base import StatefulButton
 from cascadeui.state.actions import ActionCreators
@@ -1927,7 +1927,7 @@ class TestNavigationEditFailureContainment:
 
     async def test_pop_survives_dead_ack_10062(self):
         """The reported incident: a Back/pop whose ack and edit both 10062.
-        The deferred-path ack routes through _safe_defer, which must absorb
+        The deferred-path ack routes through safe_defer, which must absorb
         the dead interaction rather than propagate it."""
 
         class _Root(StatefulView):
@@ -4060,7 +4060,8 @@ class TestSourceAcrossNavigation:
         replayed a render the source missed. The close's freeze carries what
         nav_rebuild names; the redraw, left running by the close, ran the hook
         again, or had already taken the request and left the freeze without
-        the content, or shipped an embed asked for before the redraw over it."""
+        the content. An embed asked for during the push ends on the message,
+        since the redraw stands for the screen from before it."""
         from cascadeui import RenderOutcome
 
         loading, gate = asyncio.Event(), asyncio.Event()
@@ -4113,7 +4114,7 @@ class TestSourceAcrossNavigation:
 
         assert source.is_finished()
         assert len(rebuilds) == 1, f"nav_rebuild ran {len(rebuilds)} times"
-        assert [t for t in shipped if t][-1:] == ["restored"], shipped
+        assert [t for t in shipped if t][-1:] == ["X"], shipped
 
     async def test_content_asked_during_a_stalled_push_survives_a_close_during_the_redraw(self):
         """A push stalled, the rollback's redraw replayed a render the source
@@ -4237,11 +4238,13 @@ class TestSourceAcrossNavigation:
         assert len(rebuilds) == 1, f"nav_rebuild ran {len(rebuilds)} times"
         assert shipped[-1] == ("_Panel", "restored"), shipped
 
-    async def test_a_v2_redraw_ships_the_tree_its_rebuild_hook_builds(self):
+    async def test_a_v2_redraw_leaves_a_state_render_asked_during_the_push(self):
         """A push stalled, the source had missed a state change while away,
         and its replayed state render shipped a tree. The redraw then ran
         nav_rebuild, which built a different tree, and skipped its own
-        refresh because a tree had already shipped since the rollback."""
+        refresh because a tree had already shipped since the rollback,
+        leaving the view's tree unlike the message. The state render was
+        asked for after the push began, so its tree stays, in both."""
         loading, gate = asyncio.Event(), asyncio.Event()
 
         class _Panel(RenderableLayoutView):
@@ -4278,7 +4281,8 @@ class TestSourceAcrossNavigation:
             gate.set()
 
         assert not source.is_finished()
-        assert shipped[-1:] == ["nr"], f"the rebuilt tree never shipped: {shipped}"
+        assert shipped[-1:] == ["st"], shipped
+        assert source.children[0].content == "st"
 
     async def test_a_redraw_a_closed_bot_cannot_send_is_not_an_error(self, caplog):
         """A push stalled, and the bot closed before the source's redraw ran.
@@ -4301,7 +4305,7 @@ class TestSourceAcrossNavigation:
                 raise asyncio.TimeoutError()
             if closed:
                 tried.append(True)
-                raise RuntimeError("Session is closed")
+                await refused_by_closed_session()
             return message
 
         message.edit = AsyncMock(side_effect=edit)
@@ -4325,16 +4329,21 @@ class TestSourceAcrossNavigation:
         ]
         assert not errors, errors
 
-    async def test_a_rebuild_hook_that_raises_after_the_bot_closed_is_still_an_error(self, caplog):
+    @pytest.mark.parametrize("error", [AttributeError, RuntimeError])
+    async def test_a_rebuild_hook_that_raises_after_the_bot_closed_is_still_an_error(
+        self, caplog, error
+    ):
         """A push stalled, the bot closed, and the source's redraw ran a
-        nav_rebuild that raised an AttributeError of its own. Because the bot
-        had closed, the redraw logged that error at DEBUG without a
-        traceback, as though it were the closed session refusing an edit."""
+        nav_rebuild that raised an error of its own. Because the bot had
+        closed, the redraw logged that error at DEBUG without a traceback, as
+        though it were the closed session refusing an edit. A RuntimeError the
+        hook raised was read that way because the check looked at the error's
+        type, not at where it was raised."""
         loading, gate = asyncio.Event(), asyncio.Event()
         closed = []
 
         def nav_rebuild(view):
-            raise AttributeError("'NoneType' object has no attribute 'label'")
+            raise error("'NoneType' object has no attribute 'label'")
 
         class _Panel(RenderableLayoutView):
             pass
@@ -4443,27 +4452,37 @@ class TestSourceAcrossNavigation:
 
         assert not source._torn_down(), "the rollback closed a view its on_timeout() kept"
 
+    @pytest.mark.parametrize("asked", ["before", "during"])
     @pytest.mark.parametrize("freeze_fails", [False, True], ids=["landed", "failed"])
-    async def test_a_state_render_finishing_after_a_freeze_keeps_the_redraw_it_carried(
-        self, freeze_fails
+    async def test_a_state_render_finishing_after_a_freeze_ends_by_when_it_was_asked(
+        self, freeze_fails, asked
     ):
-        """A push stalled, so the source owed a redraw, and a state change
+        """A push stalled, so the source owed a redraw, and a state render
         reached it while it was away. An exit landed while the redraw's state
-        render waited, and its freeze carried nav_rebuild's tree. The state
-        render, asked for before that redraw, then shipped its tree over it.
-        When the freeze edit fails, the redraw never reached the message, and
-        the state render still ships."""
+        render waited, and its freeze carried nav_rebuild's tree. The redraw
+        stands for the screen from before the push: a state change asked for
+        before the push (deferred behind the view's own load) stays under it,
+        and one asked for during the push ships over it. When the freeze edit
+        fails, the redraw never reached the message, and the state render
+        ships either way."""
         loading, gate = asyncio.Event(), asyncio.Event()
         in_state, state_gate = asyncio.Event(), asyncio.Event()
+        in_load, load_gate = asyncio.Event(), asyncio.Event()
         shown = []
 
         class _Source(RenderableLayoutView):
             state_text = None
             gate_state = False
+            gate_load = False
 
             def __init__(self, **kwargs):
                 super().__init__(**kwargs)
                 self._build("src")
+
+            async def on_load(self):
+                if self.gate_load:
+                    in_load.set()
+                    await load_gate.wait()
 
             def _build(self, text):
                 self.clear_items()
@@ -4507,11 +4526,25 @@ class TestSourceAcrossNavigation:
         message.edit = AsyncMock(side_effect=edit)
         source = _Source(context=self._by_context(message))
         await source.send()
+        load = None
         try:
+            if asked == "before":
+                source.gate_load = True
+                load = asyncio.create_task(source.load())
+                await asyncio.wait_for(in_load.wait(), 2)
+                source.state_text = "st"
+                await source._render_from_state()
             push = asyncio.create_task(source.push(sub))
             await asyncio.wait_for(loading.wait(), 2)
-            source.state_text = "st"
-            await source._render_from_state()
+            if asked == "before":
+                # The load's release replays the deferred render, which the
+                # away source records with the number it was asked under.
+                load_gate.set()
+                await asyncio.wait_for(load, 2)
+                await until(lambda: source._missed_while_away, timeout=2)
+            else:
+                source.state_text = "st"
+                await source._render_from_state()
             source.gate_state = True
             gate.set()
             await asyncio.wait_for(in_state.wait(), 2)
@@ -4522,8 +4555,10 @@ class TestSourceAcrossNavigation:
         finally:
             gate.set()
             state_gate.set()
+            load_gate.set()
 
-        expected = ("st", False) if freeze_fails else ("nr", False)
+        covered = asked == "before" and not freeze_fails
+        expected = ("nr", False) if covered else ("st", False)
         assert failed == ([True] if freeze_fails else []), "the freeze edit was not the one failed"
         assert shown and shown[-1] == expected, f"the message ends wrong: {shown}"
 
@@ -4772,6 +4807,722 @@ class TestSourceAcrossNavigation:
         ]
         assert not errors, errors
 
+    @staticmethod
+    def _two_part_panel():
+        from discord.ui import TextDisplay
+
+        class _Panel(StatefulLayoutView):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.add_item(TextDisplay("panel"))
+                self.add_item(ActionRow(StatefulButton(label="go", custom_id="go")))
+
+        return _Panel
+
+    @staticmethod
+    def _recording(message, sub):
+        """Edits of ``message``: the destination's stall, the rest recorded."""
+        from discord.ui import Button, TextDisplay
+
+        shipped = []
+
+        async def edit(**kwargs):
+            sent = kwargs.get("view")
+            if isinstance(sent, sub):
+                raise asyncio.TimeoutError()
+            tree = list(sent.walk_children()) if sent is not None else []
+            shipped.append(
+                (
+                    [c.content for c in tree if isinstance(c, TextDisplay)],
+                    [b.disabled for b in tree if isinstance(b, Button)],
+                )
+            )
+            return message
+
+        message.edit = AsyncMock(side_effect=edit)
+        return shipped
+
+    async def test_a_redraw_whose_hook_raises_puts_the_source_back(self, caplog):
+        """A push stalled and the source's nav_rebuild raised partway through
+        rebuilding the tree. The redraw sent nothing, so the message kept the
+        discarded destination's screen, whose buttons answered nothing, while
+        the source stayed live on no message."""
+        from discord.ui import TextDisplay
+
+        loading, gate = asyncio.Event(), asyncio.Event()
+        _Panel = self._two_part_panel()
+
+        def nav_rebuild(view):
+            view.clear_items()
+            view.add_item(TextDisplay("half built"))
+            raise KeyError("template")
+
+        _Panel.nav_rebuild = staticmethod(nav_rebuild)
+        sub = self._loading_destination(RenderableLayoutView, loading, gate)
+        message = MagicMock(id=1000, channel=MagicMock(id=888))
+        shipped = self._recording(message, sub)
+        source = _Panel(context=self._by_context(message))
+        await source.send()
+        before = list(source.children)
+        try:
+            push = asyncio.create_task(source.push(sub))
+            await asyncio.wait_for(loading.wait(), 2)
+            gate.set()
+            await push
+            await source.task_manager.wait_tasks(source.id)
+        finally:
+            gate.set()
+
+        assert not source.is_finished()
+        assert source.children == before
+        assert shipped[-1:] == [(["panel"], [False])], shipped
+        errors = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name.startswith("cascadeui") and r.levelno >= logging.ERROR
+        ]
+        assert any("template" in m for m in errors), errors
+
+    async def test_a_redraw_whose_hook_raises_after_a_close_shows_the_closed_source(self):
+        """A push stalled, and while the source's redraw awaited its
+        nav_rebuild, user code stopped the source and its parent's exit
+        closed it, leaving the message as it was. The hook then failed on
+        the parent link the close had cleared, and the message kept the
+        discarded destination's screen, whose buttons answered nothing."""
+        loading, gate = asyncio.Event(), asyncio.Event()
+        in_hook, hook_gate = asyncio.Event(), asyncio.Event()
+        _Panel = self._two_part_panel()
+
+        async def nav_rebuild(view):
+            in_hook.set()
+            await hook_gate.wait()
+            return {"content": view.parent.label}
+
+        _Panel.nav_rebuild = staticmethod(nav_rebuild)
+        sub = self._loading_destination(RenderableLayoutView, loading, gate)
+        parent_message = MagicMock(id=2000, channel=MagicMock(id=888))
+        parent_message.edit = AsyncMock(return_value=parent_message)
+        parent = RenderableLayoutView(context=self._by_context(parent_message))
+        await parent.send()
+        message = MagicMock(id=1000, channel=MagicMock(id=888))
+        shipped = self._recording(message, sub)
+        source = _Panel(context=self._by_context(message), parent=parent)
+        await source.send()
+        try:
+            push = asyncio.create_task(source.push(sub))
+            await asyncio.wait_for(loading.wait(), 2)
+            gate.set()
+            await push
+            await asyncio.wait_for(in_hook.wait(), 2)
+            source.stop()
+            await parent.exit()
+            assert source._torn_down()
+            hook_gate.set()
+            await until(lambda: shipped, timeout=2)
+        finally:
+            gate.set()
+            hook_gate.set()
+
+        assert shipped == [(["panel"], [True])], shipped
+
+    @pytest.mark.parametrize("shape", ["live", "kept_timeout", "default_timeout"])
+    @pytest.mark.parametrize("layout", [False, True], ids=["v1", "v2"])
+    async def test_content_sent_during_a_stalled_push_stays_over_the_redraw(self, layout, shape):
+        """The view's own code sent a card while a push from it was stalled
+        (on a live view, from an on_timeout() that keeps it, or beside the
+        default timeout), and the push then failed. The redraw it owed put
+        the screen from before the push back over the card, or dropped the
+        card from the freeze that carried it."""
+        from discord.ui import TextDisplay
+
+        loading, gate = asyncio.Event(), asyncio.Event()
+        base = StatefulLayoutView if layout else StatefulView
+
+        class _Source(base):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.show("Panel")
+
+            def show(self, text):
+                self.clear_items()
+                if layout:
+                    self.add_item(TextDisplay(text))
+                    self.add_item(ActionRow(StatefulButton(label="go", custom_id="go")))
+                else:
+                    self.add_item(StatefulButton(label="go", custom_id="go"))
+
+            async def send_card(self):
+                if layout:
+                    self.show("Timed out")
+                    await self.refresh()
+                else:
+                    await self.refresh(embed=discord.Embed(title="Timed out"))
+
+            @staticmethod
+            def nav_rebuild(view):
+                if layout:
+                    view.show("Panel")
+                    return None
+                return {"embed": discord.Embed(title="Panel")}
+
+        if shape == "kept_timeout":
+
+            async def on_timeout(view):
+                await view.send_card()
+
+            _Source.on_timeout = on_timeout
+        sub = self._loading_destination(
+            RenderableLayoutView if layout else StatefulView, loading, gate
+        )
+        message = MagicMock(id=1000, channel=MagicMock(id=888))
+        shown = []
+
+        async def edit(**kwargs):
+            sent = kwargs.get("view")
+            if isinstance(sent, sub):
+                raise asyncio.TimeoutError()
+            if layout and sent is not None:
+                shown.extend(c.content for c in sent.walk_children() if isinstance(c, TextDisplay))
+            elif kwargs.get("embed") is not None:
+                shown.append(kwargs["embed"].title)
+            return message
+
+        message.edit = AsyncMock(side_effect=edit)
+        source = _Source(context=self._by_context(message))
+        if layout:
+            await source.send()
+        else:
+            await source.send(embed=discord.Embed(title="Panel"))
+        try:
+            push = asyncio.create_task(source.push(sub))
+            await asyncio.wait_for(loading.wait(), 2)
+            if shape != "kept_timeout":
+                await source.send_card()
+            if shape != "live":
+                source._dispatch_timeout()
+                for _ in range(5):
+                    await asyncio.sleep(0)
+            gate.set()
+            await push
+            for _ in range(3):
+                await source.task_manager.wait_tasks(source.id)
+                for _ in range(20):
+                    await asyncio.sleep(0)
+        finally:
+            gate.set()
+
+        assert shown[-1:] == ["Timed out"], shown
+
+    async def test_an_exit_after_content_sent_during_a_stalled_push_keeps_it(self):
+        """A V1 view sent an embed while its push was stalled, and the push
+        failed. The rollback shipped the embed, and an exit that began while
+        it was in flight carried the redraw the stall owed: the freeze put
+        nav_rebuild's embed, the screen from before the push, over it."""
+        loading, gate = asyncio.Event(), asyncio.Event()
+        card_sending, card_gate = asyncio.Event(), asyncio.Event()
+
+        class _Source(StatefulView):
+            nav_rebuild = staticmethod(lambda view: {"embed": discord.Embed(title="Panel")})
+
+        sub = self._loading_destination(StatefulView, loading, gate)
+        message = MagicMock(id=1000, channel=MagicMock(id=888))
+        shown = []
+
+        async def edit(**kwargs):
+            if isinstance(kwargs.get("view"), sub):
+                raise asyncio.TimeoutError()
+            embed = kwargs.get("embed")
+            if embed is not None and embed.title == "Card":
+                card_sending.set()
+                await card_gate.wait()
+            shown.append(embed.title if embed is not None else None)
+            return message
+
+        message.edit = AsyncMock(side_effect=edit)
+        source = _Source(context=self._by_context(message))
+        await source.send(embed=discord.Embed(title="Panel"))
+        try:
+            push = asyncio.create_task(source.push(sub))
+            await asyncio.wait_for(loading.wait(), 2)
+            await source.refresh(embed=discord.Embed(title="Card"))
+            gate.set()
+            await push
+            await asyncio.wait_for(card_sending.wait(), 2)
+            closing = asyncio.create_task(source.exit(delete_message=False))
+            await until(lambda: source._closing, timeout=2)
+            card_gate.set()
+            assert await asyncio.wait_for(closing, 5) is True
+            await asyncio.wait_for(source.task_manager.wait_tasks(source.id), 2)
+        finally:
+            gate.set()
+            card_gate.set()
+
+        assert [title for title in shown if title][-1:] == ["Card"], shown
+
+    @pytest.mark.parametrize("shape", ["live", "timeout", "exit"])
+    async def test_content_sent_while_the_redraw_hook_runs_stays(self, shape):
+        """A push stalled, so the source owed a redraw, and its nav_rebuild
+        awaited. An embed sent while the hook ran (by the view's own code,
+        or by content held during the push that the rollback shipped)
+        landed first, and the redraw then put the screen from before the
+        push over it: what was newer had been read before the hook ran."""
+        loading, gate = asyncio.Event(), asyncio.Event()
+        hook_in, hook_gate = asyncio.Event(), asyncio.Event()
+        note_sending, note_gate = asyncio.Event(), asyncio.Event()
+        card_sending, card_gate = asyncio.Event(), asyncio.Event()
+
+        async def nav_rebuild(view):
+            hook_in.set()
+            await hook_gate.wait()
+            return {"embed": discord.Embed(title="Panel")}
+
+        class _Source(StatefulView):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.add_item(StatefulButton(label="go", custom_id="go"))
+
+        _Source.nav_rebuild = staticmethod(nav_rebuild)
+        sub = self._loading_destination(StatefulView, loading, gate)
+        message = MagicMock(id=1000, channel=MagicMock(id=888))
+        shown = []
+
+        async def edit(**kwargs):
+            if isinstance(kwargs.get("view"), sub):
+                raise asyncio.TimeoutError()
+            if kwargs.get("content") == "note":
+                note_sending.set()
+                await note_gate.wait()
+            embed = kwargs.get("embed")
+            if shape == "exit" and embed is not None and embed.title == "Card":
+                card_sending.set()
+                await card_gate.wait()
+            shown.append(embed.title if embed is not None else None)
+            return message
+
+        message.edit = AsyncMock(side_effect=edit)
+        source = _Source(context=self._by_context(message))
+        await source.send(embed=discord.Embed(title="Panel"))
+        card = discord.Embed(title="Card")
+        closing = None
+        try:
+            push = asyncio.create_task(source.push(sub))
+            await asyncio.wait_for(loading.wait(), 2)
+            if shape == "exit":
+                await source.refresh(content="note")
+                await source.refresh(embed=card)
+            elif shape == "timeout":
+                source._dispatch_timeout()
+                for _ in range(5):
+                    await asyncio.sleep(0)
+            gate.set()
+            await push
+            if shape == "exit":
+                # The rollback ships the held note, an exit begins while it
+                # is in flight, and Card lands while the exit's hook awaits.
+                await asyncio.wait_for(note_sending.wait(), 2)
+                closing = asyncio.create_task(source.exit(delete_message=False))
+                await until(lambda: source._closing, timeout=2)
+                note_gate.set()
+                await asyncio.wait_for(hook_in.wait(), 2)
+                await asyncio.wait_for(card_sending.wait(), 2)
+                card_gate.set()
+                await until(lambda: "Card" in shown, timeout=2)
+            else:
+                await asyncio.wait_for(hook_in.wait(), 2)
+                await source.refresh(embed=card)
+            hook_gate.set()
+            if closing is not None:
+                assert await asyncio.wait_for(closing, 5) is True
+            await asyncio.wait_for(source.task_manager.wait_tasks(source.id), 2)
+        finally:
+            gate.set()
+            hook_gate.set()
+            note_gate.set()
+            card_gate.set()
+
+        assert [title for title in shown if title][-1:] == ["Card"], shown
+
+    @pytest.mark.parametrize("layout", [False, True], ids=["v1", "v2"])
+    async def test_a_second_push_does_not_move_the_point_the_first_redraw_dates_from(self, layout):
+        """Content was sent during a push whose edit stalled, and a second
+        push waiting behind it began before the first push's redraw ran. The
+        redraw then judged what was newer from the second push's start and
+        took a fresh number, so it shipped the screen from before the first
+        push over the content; a V2 nav_rebuild rebuilt the tree the held
+        content was waiting to ship."""
+        import aiohttp
+        from discord.ui import TextDisplay
+
+        loading1, gate1 = asyncio.Event(), asyncio.Event()
+        loading2, gate2 = asyncio.Event(), asyncio.Event()
+        base = StatefulLayoutView if layout else StatefulView
+        destination = RenderableLayoutView if layout else StatefulView
+        first = self._loading_destination(destination, loading1, gate1)
+        second = self._loading_destination(destination, loading2, gate2)
+
+        class _Source(base):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.show("Panel")
+
+            def show(self, text):
+                self.clear_items()
+                if layout:
+                    self.add_item(TextDisplay(text))
+                    self.add_item(ActionRow(StatefulButton(label="go", custom_id="go")))
+                else:
+                    self.add_item(StatefulButton(label="go", custom_id="go"))
+
+            @staticmethod
+            def nav_rebuild(view):
+                if layout:
+                    view.show("Panel")
+                    return None
+                return {"embed": discord.Embed(title="Panel")}
+
+        message = MagicMock(id=1000, channel=MagicMock(id=888))
+        shown = []
+
+        async def edit(**kwargs):
+            sent = kwargs.get("view")
+            if isinstance(sent, first):
+                raise asyncio.TimeoutError()
+            if isinstance(sent, second):
+                raise aiohttp.ClientConnectionError("down")
+            if layout and sent is not None:
+                shown.extend(c.content for c in sent.walk_children() if isinstance(c, TextDisplay))
+            elif kwargs.get("embed") is not None:
+                shown.append(kwargs["embed"].title)
+            return message
+
+        message.edit = AsyncMock(side_effect=edit)
+        source = _Source(context=self._by_context(message))
+        if layout:
+            await source.send()
+        else:
+            await source.send(embed=discord.Embed(title="Panel"))
+        try:
+            push1 = asyncio.create_task(source.push(first))
+            await asyncio.wait_for(loading1.wait(), 2)
+            if layout:
+                source.show("Card")
+                await source.refresh()
+            else:
+                await source.refresh(embed=discord.Embed(title="Card"))
+            push2 = asyncio.create_task(source.push(second))
+            for _ in range(5):
+                await asyncio.sleep(0)
+            gate1.set()
+            await asyncio.wait_for(push1, 3)
+            await asyncio.wait_for(loading2.wait(), 2)
+            gate2.set()
+            await asyncio.wait_for(push2, 3)
+            await asyncio.wait_for(source.task_manager.wait_tasks(source.id), 2)
+        finally:
+            gate1.set()
+            gate2.set()
+
+        assert [title for title in shown if title][-1:] == ["Card"], shown
+
+    async def test_a_send_queued_behind_a_stalled_push_keeps_its_own_content(self):
+        """The view was sent again while a push from it was in flight, and
+        the push's edit stalled. The redraw owed to the old message ran
+        during the send and landed on the new one, putting the screen from
+        before the push over the content the send posted."""
+        loading, gate = asyncio.Event(), asyncio.Event()
+        sub = self._loading_destination(StatefulView, loading, gate)
+
+        class _Source(StatefulView):
+            nav_rebuild = staticmethod(lambda view: {"embed": discord.Embed(title="Panel")})
+
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.add_item(StatefulButton(label="go", custom_id="go"))
+
+        shown = {}
+
+        def make_message(message_id):
+            message = MagicMock(id=message_id, channel=MagicMock(id=888))
+
+            async def edit(**kwargs):
+                if isinstance(kwargs.get("view"), sub):
+                    raise asyncio.TimeoutError()
+                embed = kwargs.get("embed")
+                if embed is not None:
+                    shown.setdefault(message_id, []).append(embed.title)
+                return message
+
+            message.edit = AsyncMock(side_effect=edit)
+            message.delete = AsyncMock()
+            return message
+
+        old, new = make_message(1001), make_message(1002)
+        posts = []
+
+        async def post(**kwargs):
+            target = new if posts else old
+            if posts:
+                # A real post is a round trip; other tasks run meanwhile.
+                await asyncio.sleep(0.05)
+            posts.append(target)
+            embed = kwargs.get("embed")
+            if embed is not None:
+                shown.setdefault(target.id, []).append(embed.title)
+            return target
+
+        context = self._by_context(old)
+        context.send = AsyncMock(side_effect=post)
+        source = _Source(context=context)
+        await source.send(embed=discord.Embed(title="Panel"))
+        try:
+            push = asyncio.create_task(source.push(sub))
+            await asyncio.wait_for(loading.wait(), 2)
+            resend = asyncio.create_task(source.send(embed=discord.Embed(title="Fresh")))
+            for _ in range(5):
+                await asyncio.sleep(0)
+            gate.set()
+            await asyncio.wait_for(push, 3)
+            assert await asyncio.wait_for(resend, 3) is new
+            await asyncio.wait_for(source.task_manager.wait_tasks(source.id), 2)
+        finally:
+            gate.set()
+
+        assert shown[1002][-1:] == ["Fresh"], shown
+
+    async def test_a_timeout_freeze_with_nothing_left_to_disable_still_ships_the_redraw(self):
+        """The view's timer ran out during a push whose edit stalled, and a
+        bare refresh landed while the freeze's nav_rebuild awaited: it
+        disabled the controls and stamped what the message shows. The freeze
+        then found nothing to change, sent nothing, and dropped the redraw's
+        embed, so the message could keep the discarded view's."""
+        loading, gate = asyncio.Event(), asyncio.Event()
+        hook_in, hook_gate = asyncio.Event(), asyncio.Event()
+        sub = self._loading_destination(StatefulView, loading, gate)
+
+        async def nav_rebuild(view):
+            hook_in.set()
+            await hook_gate.wait()
+            return {"embed": discord.Embed(title="Panel")}
+
+        class _Source(StatefulView):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.add_item(StatefulButton(label="go", custom_id="go"))
+
+        _Source.nav_rebuild = staticmethod(nav_rebuild)
+        message = MagicMock(id=1000, channel=MagicMock(id=888))
+        on_screen = []
+
+        async def edit(**kwargs):
+            if isinstance(kwargs.get("view"), sub):
+                # A stalled request Discord may still have applied.
+                on_screen.append("Destination")
+                raise asyncio.TimeoutError()
+            if kwargs.get("embed") is not None:
+                on_screen.append(kwargs["embed"].title)
+            return message
+
+        message.edit = AsyncMock(side_effect=edit)
+        source = _Source(context=self._by_context(message))
+        await source.send(embed=discord.Embed(title="Panel"))
+        try:
+            push = asyncio.create_task(
+                source.push(sub, rebuild=lambda v: {"embed": discord.Embed(title="Destination")})
+            )
+            await asyncio.wait_for(loading.wait(), 2)
+            source._dispatch_timeout()
+            for _ in range(5):
+                await asyncio.sleep(0)
+            gate.set()
+            await push
+            await asyncio.wait_for(hook_in.wait(), 2)
+            await source.refresh()
+            hook_gate.set()
+            # The timeout's close holds the view's turn through its freeze edit.
+            await until(lambda: source._torn_down() and source._lifecycle_task is None, timeout=2)
+        finally:
+            gate.set()
+            hook_gate.set()
+
+        assert on_screen[-1:] == ["Panel"], on_screen
+
+    async def test_a_v2_exit_with_nothing_left_to_disable_still_ships_the_redraw_file(self):
+        """A V2 exit carried a failed push's redraw whose nav_rebuild returned
+        a file, and a bare refresh landed while the hook awaited: it disabled
+        the controls of the stopped view and stamped what the message shows.
+        The freeze then found nothing to change and dropped the file."""
+        from discord.ui import TextDisplay
+
+        loading, gate = asyncio.Event(), asyncio.Event()
+        hook_in, hook_gate = asyncio.Event(), asyncio.Event()
+        sub = self._loading_destination(RenderableLayoutView, loading, gate)
+
+        async def nav_rebuild(view):
+            hook_in.set()
+            await hook_gate.wait()
+            return {"attachments": [discord.File(io.BytesIO(b"x"), filename="panel.png")]}
+
+        class _Source(StatefulLayoutView):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.add_item(TextDisplay("Panel"))
+                self.add_item(ActionRow(StatefulButton(label="go", custom_id="go")))
+
+        _Source.nav_rebuild = staticmethod(nav_rebuild)
+        message = MagicMock(id=1000, channel=MagicMock(id=888))
+        files = []
+
+        async def edit(**kwargs):
+            if isinstance(kwargs.get("view"), sub):
+                raise asyncio.TimeoutError()
+            files.append([f.filename for f in kwargs.get("attachments") or []])
+            return message
+
+        message.edit = AsyncMock(side_effect=edit)
+        source = _Source(context=self._by_context(message))
+        await source.send()
+        try:
+            push = asyncio.create_task(source.push(sub))
+            await asyncio.wait_for(loading.wait(), 2)
+            closing = asyncio.create_task(source.exit())
+            for _ in range(5):
+                await asyncio.sleep(0)
+            gate.set()
+            await asyncio.wait_for(push, 3)
+            await asyncio.wait_for(hook_in.wait(), 2)
+            await source.refresh()
+            hook_gate.set()
+            await asyncio.wait_for(closing, 3)
+        finally:
+            gate.set()
+            hook_gate.set()
+
+        assert files[-1:] == [["panel.png"]], files
+
+    async def test_a_timeout_freeze_owing_a_redraw_still_refuses_a_broken_tree(self):
+        """A timeout freeze owed a failed push's redraw, and the view's tree
+        was one Discord rejects (two buttons sharing a custom_id). The freeze
+        logged that it skipped the edit, then shipped that tree anyway to
+        carry the redraw's embed."""
+        loading, gate = asyncio.Event(), asyncio.Event()
+        sub = self._loading_destination(StatefulView, loading, gate)
+
+        class _Source(StatefulView):
+            nav_rebuild = staticmethod(lambda view: {"embed": discord.Embed(title="Panel")})
+
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.add_item(StatefulButton(label="go", custom_id="go"))
+
+        message = MagicMock(id=1000, channel=MagicMock(id=888))
+        shipped = []
+
+        async def edit(**kwargs):
+            sent = kwargs.get("view")
+            if isinstance(sent, sub):
+                raise asyncio.TimeoutError()
+            if sent is not None:
+                shipped.append([item.custom_id for item in sent.children])
+            return message
+
+        message.edit = AsyncMock(side_effect=edit)
+        source = _Source(context=self._by_context(message))
+        await source.send(embed=discord.Embed(title="Panel"))
+        try:
+            push = asyncio.create_task(source.push(sub))
+            await asyncio.wait_for(loading.wait(), 2)
+            source.add_item(StatefulButton(label="again", custom_id="go"))
+            source._dispatch_timeout()
+            for _ in range(5):
+                await asyncio.sleep(0)
+            gate.set()
+            await push
+            await until(lambda: source._torn_down() and source._lifecycle_task is None, timeout=2)
+        finally:
+            gate.set()
+
+        assert ["go", "go"] not in shipped, shipped
+
+    async def test_a_redraw_inside_a_cooldown_keeps_its_content(self):
+        """A refresh just before a push started a refresh_cooldown_ms window,
+        and the push's edit stalled. The redraw fell inside the window, so it
+        was deferred to a re-render from state, which carries no keywords,
+        and the redraw's embed never shipped."""
+
+        class _Source(StatefulView):
+            refresh_cooldown_ms = 2000
+            nav_rebuild = staticmethod(lambda view: {"embed": discord.Embed(title="Panel")})
+
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.add_item(StatefulButton(label="go", custom_id="go"))
+
+        class _Destination(StatefulView):
+            pass
+
+        message = MagicMock(id=1000, channel=MagicMock(id=888))
+        shown = []
+
+        async def edit(**kwargs):
+            if isinstance(kwargs.get("view"), _Destination):
+                raise asyncio.TimeoutError()
+            embed = kwargs.get("embed")
+            shown.append(embed.title if embed is not None else None)
+            return message
+
+        message.edit = AsyncMock(side_effect=edit)
+        source = _Source(context=self._by_context(message))
+        await source.send(embed=discord.Embed(title="Start"))
+        source.children[0].label = "go!"
+        await source.refresh()
+        shown.clear()
+        await asyncio.wait_for(source.push(_Destination), 3)
+        await asyncio.wait_for(source.task_manager.wait_tasks(source.id), 5)
+
+        assert "Panel" in shown, shown
+
+    @pytest.mark.parametrize("keeps", [True, False], ids=["kept", "default"])
+    async def test_a_timeout_during_a_stalled_push_redraws_the_source_once(self, keeps):
+        """The source's timer fired while a push from it was in flight, and
+        the push stalled. The redraw the stall owed was left to the timeout's
+        freeze, so an on_timeout() that kept the view and froze nothing left
+        the message on the discarded destination's screen, whose buttons
+        answered nothing. The default on_timeout() still freezes the panel in
+        one edit."""
+        loading, gate = asyncio.Event(), asyncio.Event()
+        _Panel = self._two_part_panel()
+        kept = []
+        if keeps:
+
+            async def on_timeout(view):
+                kept.append(True)
+
+            _Panel.on_timeout = on_timeout
+        sub = self._loading_destination(RenderableLayoutView, loading, gate)
+        message = MagicMock(id=1000, channel=MagicMock(id=888))
+        shipped = self._recording(message, sub)
+        source = _Panel(context=self._by_context(message))
+        await source.send()
+        try:
+            push = asyncio.create_task(source.push(sub))
+            await asyncio.wait_for(loading.wait(), 2)
+            source._dispatch_timeout()
+            gate.set()
+            await push
+            try:
+                await until(lambda: shipped, timeout=2)
+            except asyncio.TimeoutError:
+                pass
+            await source.task_manager.wait_tasks(source.id)
+            for _ in range(20):
+                await asyncio.sleep(0)
+        finally:
+            gate.set()
+
+        assert kept == ([True] if keeps else [])
+        assert shipped == [(["panel"], [True])], shipped
+        assert source._torn_down() is not keeps
+
     async def test_a_throttled_render_that_comes_due_during_a_failed_push_lands_after(self):
         from cascadeui import RenderOutcome
 
@@ -4875,7 +5626,7 @@ class TestSourceAcrossNavigation:
         message.edit = AsyncMock()
 
         source.add_item(ActionRow(StatefulButton(label="late", custom_id="late")))
-        assert await source.refresh() is RenderOutcome.NO_MESSAGE
+        assert await source.refresh() is RenderOutcome.CLOSED
         await source.exit(delete_message=False)
 
         message.edit.assert_not_called()
@@ -5587,8 +6338,7 @@ class TestNavigationTransaction:
         source = _Source(interaction=_make_interaction(user_id=1, guild_id=100))
         source.build_ui()
         await source.send()
-        source._refresh_armed = True
-        source._install_refresh_button(source.build_refresh_button())
+        await arm(source)
         armed = list(source.children)
         source._message.edit = AsyncMock(return_value=source._message)
         nav = _make_interaction(user_id=1, guild_id=100, is_done=True)
@@ -5615,7 +6365,7 @@ class TestNavigationTransaction:
         source._webhook_message = None
         source._message.edit = AsyncMock(return_value=source._message)
         # What a push that failed with an unknown outcome leaves owed.
-        source._reclaim_pending = True
+        owe_redraw(source)
 
         with caplog.at_level(logging.ERROR, logger="cascadeui"):
             await source.exit(delete_message=False)
@@ -5624,6 +6374,80 @@ class TestNavigationTransaction:
         assert source._message.edit.await_count == 1, "the exit shipped no teardown edit"
         assert source._message.edit.await_args.kwargs == {"view": None}
         assert any("teardown edit raised" in r.getMessage() for r in caplog.records)
+
+    async def test_an_exit_owed_a_redraw_whose_hook_raises_partway_freezes_the_whole_tree(
+        self, caplog
+    ):
+        """The hook cleared the tree and raised after adding one item, and the
+        exit froze that half-built tree in place of the panel."""
+        from discord.ui import Button, TextDisplay
+
+        def broken(view):
+            view.clear_items()
+            view.add_item(TextDisplay("half built"))
+            raise RuntimeError("template missing")
+
+        class _Source(StatefulLayoutView):
+            nav_rebuild = staticmethod(broken)
+
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.add_item(TextDisplay("panel"))
+                self.add_item(ActionRow(StatefulButton(label="go", custom_id="go")))
+
+        source = _Source(interaction=_make_interaction(user_id=1, guild_id=100))
+        await source.send()
+        source._message.edit = AsyncMock(return_value=source._message)
+        # What a push that failed with an unknown outcome leaves owed.
+        owe_redraw(source)
+
+        with caplog.at_level(logging.ERROR, logger="cascadeui"):
+            await source.exit(delete_message=False)
+
+        frozen = list(source._message.edit.await_args.kwargs["view"].walk_children())
+        assert [c.content for c in frozen if isinstance(c, TextDisplay)] == ["panel"]
+        assert [b.disabled for b in frozen if isinstance(b, Button)] == [True]
+        assert any("teardown edit raised" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.parametrize("layout", [False, True], ids=["v1", "v2"])
+    async def test_an_exit_whose_redraw_outlives_the_message_logs_no_error(self, caplog, layout):
+        """The message was deleted while an exit's owed redraw awaited its
+        nav_rebuild, and the exit then edited the message it no longer had:
+        'Error cleaning up message' at ERROR, for an expected end."""
+
+        async def nav_rebuild(view):
+            await asyncio.sleep(0)
+            view._message = None  # what on_message_delete() does first
+            await asyncio.sleep(0)
+            return None if layout else {"embed": discord.Embed(title="NR")}
+
+        if layout:
+            source = RenderableLayoutView(interaction=_make_interaction(user_id=1, guild_id=100))
+            # A control for the freeze to disable, so it has an edit to send.
+            source.add_item(ActionRow(StatefulButton(label="go", custom_id="go")))
+            await source.send()
+        else:
+            source = StatefulView(interaction=_make_interaction(user_id=1, guild_id=100))
+            source.add_item(StatefulButton(label="go", custom_id="go"))
+            await source.send(embed=discord.Embed(title="S0"))
+        source.nav_rebuild = nav_rebuild
+        message = source._message
+        message.edit = AsyncMock(return_value=message)
+        # What a push that failed with an unknown outcome leaves owed.
+        owe_redraw(source)
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui"):
+            await asyncio.wait_for(source.exit(delete_message=False), 3)
+
+        assert source._torn_down()
+        assert message.edit.await_count == 0
+        assert source._redraw_marks is None
+        errors = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name.startswith("cascadeui") and r.levelno >= logging.ERROR
+        ]
+        assert not errors, errors
 
     async def test_an_exit_owed_a_redraw_by_a_hook_that_returns_nothing_logs_nothing(self, caplog):
         """A nav_rebuild that rebuilds the tree and returns None was read as
@@ -5643,7 +6467,7 @@ class TestNavigationTransaction:
         source.build_ui()
         await source.send()
         source._message.edit = AsyncMock(return_value=source._message)
-        source._reclaim_pending = True
+        owe_redraw(source)
 
         with caplog.at_level(logging.ERROR, logger="cascadeui"):
             await source.exit(delete_message=False)
@@ -5672,7 +6496,7 @@ class TestNavigationTransaction:
         await source.send()
         source._webhook_message = None
         source._message.edit = AsyncMock(side_effect=edit)
-        source._reclaim_pending = True
+        owe_redraw(source)
 
         await source.exit(delete_message=False)
 
@@ -6429,9 +7253,8 @@ class TestEditsAroundNavigation:
             return source._message
 
         source._message.edit = AsyncMock(side_effect=channel_edit)
-        source._refresh_armed = True
-        source.clear_items()
-        source.add_item(TextDisplay("refresh button"))
+        await arm(source)
+        source._last_tree_digest = None  # as an arming edit that did not land leaves it
         gate = asyncio.Event()
         nav = _make_interaction(user_id=1, guild_id=100, is_done=True)
 
@@ -6466,9 +7289,7 @@ class TestEditsAroundNavigation:
             return source._message
 
         source._message.edit = AsyncMock(side_effect=channel_edit)
-        source._refresh_armed = True
-        source.clear_items()
-        source.add_item(TextDisplay("refresh button"))
+        await arm(source)
         in_flight, release = asyncio.Event(), asyncio.Event()
         nav = _make_interaction(user_id=1, guild_id=100, is_done=True)
 

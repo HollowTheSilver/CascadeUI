@@ -114,7 +114,7 @@ class TestInspectorFiltering:
 
         store._active_views[view.id] = view
         store._active_views["other_id"] = "other_view_instance"
-        store.subscribers["other_id"] = (lambda *args: None, None, None)
+        store._subscribe_view("other_id", lambda *args: None, None, None)
 
         filtered = view._filtered_active_views()
         assert view.id not in filtered
@@ -146,6 +146,28 @@ class TestInspectorFiltering:
         await store._flush_notifications()
         assert view.id not in store._active_views
         assert view.id not in store.state["views"]
+
+    async def test_a_ghost_whose_id_code_subscribed_is_still_a_ghost(self):
+        # Liveness read every subscriber, so a subscription under the ghost's
+        # id listed it as live, with an Exit that did nothing.
+        store = get_store()
+        refusing = [True]
+
+        async def refuse(action, state, next_fn):
+            if action["type"] == "VIEW_DESTROYED" and refusing[0]:
+                raise RuntimeError("audit store down")
+            return await next_fn(action, state)
+
+        store._add_middleware(refuse)
+        view = RenderableLayoutView(interaction=_make_interaction(user_id=1, guild_id=9))
+        await view.send()
+        await view.exit()
+        refusing[0] = False
+        store.subscribe(view.id, lambda state, action: None)
+
+        inspector = InspectorView(interaction=_make_interaction())
+        assert view.id in store._active_views
+        assert view.id not in inspector._filtered_active_views()
 
     @staticmethod
     async def _live_view_and_inspector():
@@ -404,7 +426,7 @@ class TestConfigTab:
 class TestInspectorPreDeferDiscipline:
     """Light, refresh-only inspector callbacks do NOT pre-defer -- they ride
     the acting-view fast path. The genuinely-slow callbacks keep ack-first
-    _safe_defer because their work can exceed the 3s interaction window."""
+    safe_defer because their work can exceed the 3s interaction window."""
 
     def _view(self):
         view = InspectorView(interaction=_make_interaction())
@@ -440,7 +462,7 @@ class TestInspectorPreDeferDiscipline:
         view._refresh_tabs.assert_awaited_once()
 
     async def test_slow_callback_keeps_predefer(self):
-        """Contrast: exit-all (N view exits) acks first via _safe_defer."""
+        """Contrast: exit-all (N view exits) acks first via safe_defer."""
         view = self._view()
         interaction = _make_interaction()
         await view._exit_all_views(interaction)

@@ -3,6 +3,7 @@
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
+import aiohttp
 import discord
 from discord.ui import TextDisplay
 
@@ -114,6 +115,31 @@ async def until(condition, timeout=5, interval=0):
     await asyncio.wait_for(poll(), timeout)
 
 
+async def refused_by_closed_session(*args, **kwargs):
+    """Raise the ``RuntimeError`` aiohttp raises for a request on a closed session.
+
+    A bot's requests after its close fail this way, raised in aiohttp's own
+    code, which is how the library tells the refusal from a hook's own
+    ``RuntimeError``. Takes and ignores any arguments, so it can stand in
+    for an edit or delete. No request leaves the process.
+    """
+    session = aiohttp.ClientSession()
+    await session.close()
+    await session.request("GET", "http://127.0.0.1:9/")
+
+
+def owe_redraw(view):
+    """Leave ``view`` owing the redraw a push or pop with an unknown outcome leaves.
+
+    Takes the render number the navigation takes as it begins, so renders
+    asked for before it are older than the redraw and renders asked for since
+    are newer.
+    """
+    view._render_seq += 1
+    view._nav_began_at = view._reclaim_began = view._render_seq
+    view._reclaim_pending = True
+
+
 def refresh_timers(view):
     """The view's refresh-handoff timers still waiting for their deadline."""
     return list(view.task_manager._timers.get(view.id, ()))
@@ -123,3 +149,46 @@ async def wait_for_timer(view, timer, timeout=30):
     """Wait until ``timer`` fires, then for the arming it starts, if any."""
     await until(lambda: timer not in refresh_timers(view), timeout=timeout)
     await asyncio.wait_for(view.task_manager.wait_tasks(view.id), timeout)
+
+
+async def arm(view):
+    """Arm ``view``'s Continue button through the library's own arming.
+
+    The arming edit lands on a stand-in, so the view's own edit mock records
+    only what follows. As in a bot, the landed edit stamps the render
+    baseline; a test that needs the armed tree to ship again clears it, as
+    an arming edit that did not land does.
+    """
+    message = view._message
+    edit = message.edit
+    message.edit = AsyncMock(return_value=message)
+    try:
+        await view._arm_refresh_button()
+    finally:
+        message.edit = edit
+    assert view._refresh_armed, "the arming declined; check the view's state"
+
+
+def snapshot_edits(view):
+    """Record what each edit of ``view``'s message showed when it was sent.
+
+    The mock keeps the view object itself, which a build still running goes
+    on changing, so a later read of ``await_args`` would see the tree as it
+    is now rather than as it went out.
+    """
+    shipped = []
+
+    def edit(**kwargs):
+        sent = kwargs.get("view")
+        tree = list(sent.walk_children()) if sent is not None else []
+        shipped.append(
+            {
+                "embed": kwargs.get("embed"),
+                "texts": [c.content for c in tree if isinstance(c, TextDisplay)],
+                "buttons": [b.disabled for b in tree if isinstance(b, discord.ui.Button)],
+            }
+        )
+        return view._message
+
+    view._message.edit = AsyncMock(side_effect=edit)
+    return shipped
