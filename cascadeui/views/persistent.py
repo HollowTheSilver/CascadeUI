@@ -10,6 +10,7 @@ from typing import ClassVar, Dict
 import discord
 
 from ..state.actions import ActionCreators
+from ..utils.responses import DISCORD_CALL_ERRORS
 from .base import _class_path
 from .layout import StatefulLayoutView
 from .view import StatefulView
@@ -24,6 +25,10 @@ logger = logging.getLogger(__name__)
 # every persistent class. Rows record the same key in view_class, so a pinned
 # class keeps reattaching after it moves.
 _persistent_view_classes: Dict[str, type] = {}
+
+# Owns the close of a message an earlier run's panel left under a key, which
+# outlives the send that started it.
+_EARLIER_MESSAGE_TASK_OWNER = "persistent_earlier_message"
 
 
 # // ========================================( Mixin )======================================== // #
@@ -270,34 +275,63 @@ class _PersistentMixin:
                         )
 
             # If the old view wasn't alive (e.g. from a previous bot session that
-            # wasn't restored), fall back to message-only cleanup.
+            # wasn't restored), fall back to message-only cleanup. It runs on a
+            # task of its own: this panel needs nothing from it, so the send
+            # does not wait up to three Discord calls for it, and a cancel of
+            # the send cannot leave the old message open.
             if not old_view_exited:
-                old_msg_id = existing["message_id"]
-                old_ch_id = existing["channel_id"]
-                bot = getattr(self.context, "bot", None) or getattr(
-                    self.interaction, "client", None
+                self.task_manager.create_task(
+                    _EARLIER_MESSAGE_TASK_OWNER, self._close_earlier_runs_message(dict(existing))
                 )
-                if bot:
-                    try:
-                        old_channel = bot.get_channel(int(old_ch_id))
-                        if old_channel and isinstance(old_channel, discord.abc.Messageable):
-                            old_message = await old_channel.fetch_message(int(old_msg_id))
-                            await self._cleanup_orphan_message(old_message)
-                            logger.info(
-                                f"Cleaned up previous message {old_msg_id} for "
-                                f"persistence_key '{self.persistence_key}'"
-                            )
-                    except (
-                        discord.NotFound,
-                        discord.Forbidden,
-                        discord.HTTPException,
-                        asyncio.TimeoutError,
-                    ):
-                        pass  # Old message already gone, nothing to clean up
-                    except Exception as e:
-                        logger.debug(
-                            f"Could not clean up previous message for '{self.persistence_key}': {e}"
-                        )
+
+    async def _close_earlier_runs_message(self, entry) -> None:
+        """Close the message an earlier run's panel left under this key.
+
+        The registry entry now names this panel, so a message this method
+        cannot close is tracked by nothing, and its buttons stay on screen
+        answering nothing.
+        A failure to fetch or close it is logged at WARNING naming the
+        message, except a 404, which means it is gone.
+        """
+        bot = self._given_client()
+        if not bot:
+            return
+        old_msg_id = entry["message_id"]
+        old_ch_id = entry["channel_id"]
+        try:
+            old_channel = bot.get_channel(int(old_ch_id))
+            if old_channel is None:
+                old_channel = await self._bounded(bot.fetch_channel(int(old_ch_id)))
+            if not isinstance(old_channel, discord.abc.Messageable):
+                return
+            old_message = await self._bounded(old_channel.fetch_message(int(old_msg_id)))
+            await self._cleanup_orphan_message(old_message)
+            logger.info(
+                f"Cleaned up previous message {old_msg_id} for "
+                f"persistence_key '{self.persistence_key}'"
+            )
+        except discord.NotFound:
+            pass  # The message or its channel is gone; nothing to close.
+        except Exception as e:
+            if self._closed_session(e):
+                logger.debug(
+                    f"Left the previous message for '{self.persistence_key}': its bot closed."
+                )
+                return
+            if isinstance(e, asyncio.TimeoutError) and not str(e):
+                reason = (
+                    "no answer"
+                    if self.edit_timeout is None
+                    else f"no answer within {self.edit_timeout}s"
+                )
+            else:
+                reason = f"{type(e).__name__}: {e}"
+            logger.warning(
+                f"Could not close previous message {old_msg_id} in channel {old_ch_id} "
+                f"for persistence_key '{self.persistence_key}' ({reason}); "
+                f"its buttons stay on screen and answer nothing.",
+                exc_info=not isinstance(e, DISCORD_CALL_ERRORS),
+            )
 
     async def send(self, *args, ephemeral: bool = False, **kwargs):
         """Send the view and register it for persistence.
@@ -479,17 +513,19 @@ class _PersistentMixin:
                 self.db = bot.db
 
         Call ``super().on_bind(bot)`` first: a pattern class binds its own
-        dependencies there. The library stores the bot on the view before
-        the hook runs at send and at restore, and the leaderboard pattern
-        exposes it as its ``bot`` property.
+        dependencies there. When the library calls the hook, it stores the
+        bot on the view first, and the leaderboard pattern exposes it as its
+        ``bot`` property.
 
         The library calls ``on_bind(bot)`` automatically at two points: during
-        ``send()`` (when ``bot`` is derivable from the construction context)
-        and during restore on restart, before :meth:`on_restore`. A view
-        posted with a bare channel context carries no ``.bot``, so ``send()``
-        cannot derive it -- such a view calls ``await view.on_bind(bot)``
-        itself before ``send()``. The hook stays idempotent so the occasional
-        double call is harmless. A sync override is also accepted.
+        ``send()`` and during restore on restart, before :meth:`on_restore`.
+        At send, ``bot`` is the interaction's client, the command context's
+        bot, or the client the channel belongs to. A view whose send resolves
+        no client is left unbound, and code that reads what the hook sets
+        before ``send()`` needs the view bound earlier; in both cases call
+        ``await view.on_bind(bot)`` before ``send()``. Keep the hook
+        idempotent: a caller that binds before ``send()`` sees it run twice.
+        A sync override is also accepted.
 
         ``on_bind`` is for attribute assignment, not UI side effects: the
         view is not displayed yet when it runs (the first render and
@@ -503,15 +539,15 @@ class _PersistentMixin:
         return None
 
     async def _bind_from_context(self):
-        """Call ``on_bind`` with the bot when the context can resolve it.
+        """Call ``on_bind`` with the bot when the view can resolve it.
 
         Runs first thing inside :meth:`send`, before ``on_pre_send`` and the
         render pipeline, so the view's dependencies are in place for
-        ``on_load`` and the first render.
-        A channel-context send resolves no bot and is left to the caller's own
-        ``on_bind`` call.
+        ``on_load`` and the first render. The bot is the interaction's
+        client, a command context's bot, one already bound, or the client a
+        channel belongs to; a view that resolves none is not bound.
         """
-        bot = getattr(self.interaction, "client", None) or getattr(self.context, "bot", None)
+        bot = self._given_client()
         if bot is None:
             return
         # Stored before the hook, as the restore stores it, so an override
@@ -522,11 +558,17 @@ class _PersistentMixin:
             await result
 
     async def on_restore(self, bot):
-        """Called after the view is reconstructed on bot restart.
+        """Called after the view is restored onto its message.
+
+        A restore runs at startup, after a ``reattach()`` call, and when the
+        unreachable sweep finds the panel's message again, so this can run
+        while the bot is up as well as after a restart.
 
         Override this to perform post-restore setup like fetching fresh data
         or updating the embed. The view's ``_message`` is already set when
-        this is called, and any attributes ``on_bind`` injects are set.
+        this is called, and any attributes ``on_bind`` injects are set. A
+        panel that should not stay can call :meth:`exit` here, which closes it
+        and retires its registration.
 
         Runs after ``bot.wait_until_ready()`` (on a background task, off the
         ``setup_hook`` critical path), so the gateway cache (``get_user``,

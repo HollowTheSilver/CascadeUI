@@ -5,6 +5,7 @@ import asyncio
 import logging
 from typing import Optional
 
+import aiohttp
 import discord
 
 from ..state.actions import ActionCreators
@@ -759,32 +760,33 @@ class _NavigationMixin:
                 new_view._message = sent["message"]
             new_view._redrive_dynamic_items()
             return _NAV_LANDED
-        except DISCORD_CALL_ERRORS:
-            # Above the timeout clause: aiohttp's connect timeouts are both
-            # ClientError and asyncio.TimeoutError, and a request that never
-            # left the host belongs here. An expired token, a rate-limited ack,
-            # or a transport failure edits through the channel via refresh().
-            if new_view._message:
-                try:
-                    result = await new_view.refresh(**edit_kwargs)
-                except discord.HTTPException as e:
-                    # refresh() already absorbs NotFound, 429, and an expired
-                    # ephemeral's 401; remaining HTTP errors mean the channel
-                    # endpoint also failed on a message still worth retrying.
-                    logger.warning(
-                        f"Navigation channel-endpoint fallback failed in "
-                        f"{type(self).__name__}: status={getattr(e, 'status', '?')} "
-                        f"code={getattr(e, 'code', '?')}; rolling back to source."
-                    )
-                    return _NAV_FAILED
-                return self._refresh_outcome(new_view, result, "Navigation channel-endpoint edit")
-            return _NAV_FAILED
-        except asyncio.TimeoutError:
-            logger.warning(
-                f"Navigation edit stalled past {self.edit_timeout}s in "
-                f"{type(self).__name__}; rolling back to source."
-            )
-            return _NAV_UNKNOWN
+        except DISCORD_CALL_ERRORS as e:
+            # edit_timeout or aiohttp's total timeout ran out, and Discord may
+            # have applied the edit. aiohttp's connect timeouts are also
+            # ClientError: those never left the host and fall through.
+            if isinstance(e, asyncio.TimeoutError) and not isinstance(e, aiohttp.ClientError):
+                logger.warning(
+                    f"Navigation edit timed out in {type(self).__name__}; rolling back to source."
+                )
+                return _NAV_UNKNOWN
+
+        # Any other failure (an expired token, a rate-limited ack, a dropped
+        # connection): edit through the channel via refresh().
+        if new_view._message:
+            try:
+                result = await new_view.refresh(**edit_kwargs)
+            except discord.HTTPException as e:
+                # refresh() already absorbs NotFound, 429, and an expired
+                # ephemeral's 401; remaining HTTP errors mean the channel
+                # endpoint also failed on a message still worth retrying.
+                logger.warning(
+                    f"Navigation channel-endpoint fallback failed in "
+                    f"{type(self).__name__}: status={getattr(e, 'status', '?')} "
+                    f"code={getattr(e, 'code', '?')}; rolling back to source."
+                )
+                return _NAV_FAILED
+            return self._refresh_outcome(new_view, result, "Navigation channel-endpoint edit")
+        return _NAV_FAILED
 
     def _refresh_outcome(self, new_view, result, where: str) -> str:
         """Read a navigation edit made through ``refresh()`` as an outcome.

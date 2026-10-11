@@ -516,7 +516,11 @@ Every `on_load()` run on one view happens one at a time: the send's, a push or p
 
 Calling `reload()` from inside the view's own `on_load`, or from a `rebuild=` or [`nav_rebuild`](#nav_rebuild) hook on a navigation to it, raises `RuntimeError`. So does a reload that would wait forever: two views whose `on_load` awaits the other's `reload()` or `load()` hang each other when both start at once, and the second to queue raises instead, naming the views. The check follows direct awaits only; a cycle through `asyncio.gather()` or a task the `on_load` created still hangs, and logs a warning once the wait passes 30 seconds. Keep `on_load` to loading its own view's data, and reload another view after this reload returns. The same applies to `on_state_changed()`: one that awaits a separate task reloading its own view, such as `asyncio.gather(self.reload())`, waits on a reload that is waiting for it. Await `self.reload()` directly there, which runs inside the render.
 
-Returns a `RenderOutcome`: `RENDERED` (the edit reached Discord), `SKIPPED` (the tree matches the last shipped render; never while a select pick on the view's own message waits for its redraw, since the client shows the pick until the message is edited), `DEFERRED` (nothing shipped yet; the render runs later, at the throttle boundary, once a send in progress has created the message, or when a failed navigation hands the view back), `DROPPED` (attempted, not known to have landed, nothing scheduled), `NO_MESSAGE` (no editable message remains, and not because the view closed itself: not sent yet, deleted out from under it, or an expired ephemeral token, so retrying cannot help), or `CLOSED` (nothing was edited because the view closed itself through an exit, timeout, navigation, or restart: the close came before the reload's turn, or during its `on_load()` with a newer render already on the message, or it deleted the message). `None` when a subclass render override reports nothing. Members compare equal to their string values, so `outcome == "deferred"` works. `refresh()` returns the same type.
+Returns a `RenderOutcome`: `RENDERED` (the edit reached Discord), `SKIPPED` (the tree matches the last render the view shipped, which is not always what is on screen, since an edit Discord applied late can leave an older render there until the next click or change; never returned while a select pick on the view's own message waits for its redraw, since the client shows the pick until the message is edited), `DEFERRED` (nothing shipped yet; the render runs later, at the throttle boundary, once a send in progress has created the message, or when a failed navigation hands the view back), `DROPPED` (attempted, not known to have landed, nothing scheduled), `NO_MESSAGE` (no editable message remains, and not because the view closed itself: not sent yet, deleted out from under it, or an expired ephemeral token, so retrying cannot help), or `CLOSED` (nothing was edited because the view closed itself through an exit, timeout, navigation, or restart: the close came before the reload's turn, or during its `on_load()` with a newer render already on the message, or it deleted the message). `None` when a subclass render override reports nothing. Members compare equal to their string values, so `outcome == "deferred"` works. `refresh()` returns the same type.
+
+A click or modal submission that a skipped render leaves unanswered, and that the library would otherwise acknowledge, is answered with the view's current render once its callback returns. That costs no extra request and corrects a screen showing an older render than the view holds. It needs `serialize_interactions`, and a `DynamicPersistentButton` click keeps its plain acknowledgement. A modal submission that arrives while a click on the view is still being handled gets the plain acknowledgement too, since that click may be rebuilding the tree. A V1 view's embed or content is part of that answer only through its `nav_rebuild`.
+
+`DEFERRED` does not say whether `on_load()` ran. A reload that finds a throttle window open defers `on_load()` along with the edit; whatever holds the render after `on_load()` returns (a send or navigation in progress, a window that opened meanwhile, a rate limit) holds only the edit of data already loaded. Work that depends on what `on_load()` loaded belongs in `on_load()` itself, which runs in both cases: at once, or at the window boundary. On an ephemeral view armed for its refresh handoff, `on_load()` does not run, and the outcome is the refresh button's render.
 
 ```python
 async def on_refresh(self, interaction):
@@ -994,7 +998,7 @@ failing later inside the page build.
 
 #### Persistent Variant
 
-`PersistentLeaderboardLayoutView` composes `_PersistentMixin` with `LeaderboardLayoutView` for admin-posted permanent panels. Defaults: `owner_only = False`, `exit_policy = "disable"`, `timeout = None`. Requires `persistence_key=` at construction. `on_restore` calls `reload()` after a bot restart to re-fetch entries, recompose the tree, and edit the message, which re-stores the panel's components so clicks route immediately. An override that does not call `super().on_restore(bot)` skips that refresh.
+`PersistentLeaderboardLayoutView` composes `_PersistentMixin` with `LeaderboardLayoutView` for admin-posted permanent panels. Defaults: `owner_only = False`, `exit_policy = "disable"`, `timeout = None`. Requires `persistence_key=` at construction. Each time the panel is restored, `on_restore` calls `reload()` to re-fetch entries, recompose the tree, and edit the message, which re-stores the panel's components so clicks route immediately. An override that does not call `super().on_restore(bot)` skips that refresh.
 
 See [`docs/guide/patterns.md`](../guide/patterns.md#leaderboardlayoutview-persistentleaderboardlayoutview) for cardinality model, customization tiers, and section-mode rendering details.
 
@@ -1184,7 +1188,7 @@ The five `format_*` hooks compose inside the synchronous `build_ui` and are refu
 
 #### Persistent Variant
 
-`PersistentRolesLayoutView` composes `_PersistentMixin` with `RolesLayoutView`. Defaults: `owner_only = False`, `exit_policy = "disable"`, `timeout = None`. Requires `persistence_key=` at construction. Role buttons survive restart independent of view re-attachment because each is a globally-registered `DynamicPersistentButton` subclass. The default `on_restore` re-renders the message from the current `categories` on every restart so source-code edits propagate to the displayed message; unchanged panels pay zero API cost via the render-hash short-circuit in `refresh()`. An override that does not call `super().on_restore(bot)` skips that re-render, so the pre-restart panel stays on screen.
+`PersistentRolesLayoutView` composes `_PersistentMixin` with `RolesLayoutView`. Defaults: `owner_only = False`, `exit_policy = "disable"`, `timeout = None`. Requires `persistence_key=` at construction. Role buttons survive restart independent of view re-attachment because each is a globally-registered `DynamicPersistentButton` subclass. The default `on_restore` re-renders the message from the current `categories` each time the panel is restored, so source-code edits propagate to the displayed message. Each restore costs one edit per panel, changed or not: a restored view has no render-hash baseline, so the restore's `refresh()` always ships. An override that does not call `super().on_restore(bot)` skips that re-render, so the message keeps its last render.
 
 See [`docs/guide/patterns.md`](../guide/patterns.md#roleslayoutview-persistentroleslayoutview) for detailed cardinality behavior, customization tiers, and examples.
 
@@ -1208,11 +1212,11 @@ Same requirements and behavior as `PersistentView` -- `persistence_key` required
 
 ##### `on_bind(bot)` *(override)*
 
-Inject non-serializable runtime dependencies (a database pool, the bot, a service client) from `bot`. The library calls it during `send()` when the bot is derivable from the construction context, and during restore before `on_restore`. Shared by every persistent view through `_PersistentMixin`. See [Runtime dependencies via `on_bind`](../guide/persistence.md#runtime-dependencies-via-on_bind).
+Inject non-serializable runtime dependencies (a database pool, the bot, a service client) from `bot`. The library calls it during `send()` with the client the view resolves (the interaction's client, the command context's bot, or the channel's client), and during restore before `on_restore`. Shared by every persistent view through `_PersistentMixin`. See [Runtime dependencies via `on_bind`](../guide/persistence.md#runtime-dependencies-via-on_bind).
 
 ##### `on_restore(bot)` *(override)*
 
-Called after the view is restored on bot restart, once `bot.wait_until_ready()` resolves so the gateway cache (`get_user`, members, channels) is warm. A render here resolves real values instead of cold defaults. Interaction routing registers earlier, during reattach, so the view is clickable before this render runs.
+Called after the view is restored onto its message: at startup, after a `reattach()` call, and when the unreachable sweep finds the panel's message again, so it can run while the bot is up. It runs once `bot.wait_until_ready()` resolves so the gateway cache (`get_user`, members, channels) is warm. A render here resolves real values instead of cold defaults. Interaction routing registers earlier, during reattach, so the view is clickable before this render runs. Calling `exit()` here closes the panel and retires its registration.
 
 ---
 
@@ -1269,7 +1273,7 @@ PersistentView(
 
 ##### `on_restore(bot)` *(override)*
 
-Called after the view is restored on bot restart, once `bot.wait_until_ready()` resolves so the gateway cache (`get_user`, members, channels) is warm. A render here resolves real values instead of cold defaults. Interaction routing registers earlier, during reattach, so the view is clickable before this render runs.
+Called after the view is restored onto its message: at startup, after a `reattach()` call, and when the unreachable sweep finds the panel's message again, so it can run while the bot is up. It runs once `bot.wait_until_ready()` resolves so the gateway cache (`get_user`, members, channels) is warm. A render here resolves real values instead of cold defaults. Interaction routing registers earlier, during reattach, so the view is clickable before this render runs. Calling `exit()` here closes the panel and retires its registration.
 
 ---
 
@@ -1443,7 +1447,7 @@ result = await safe_execute(fetch_profile(user_id), fallback={})
 
 ### `DISCORD_CALL_ERRORS`
 
-The exceptions a Discord API call raises when the call itself fails, as a tuple for an `except` clause: `discord.HTTPException`, `discord.RateLimited`, and `aiohttp.ClientError`. The library catches with it wherever a failed call must not stop the work around it. The last two are siblings of `HTTPException`, not subclasses, so `except discord.HTTPException` lets a rate limit (raised when the client sets `max_ratelimit_timeout`) or a dropped connection escape.
+The exceptions a Discord API call raises when the call itself fails, as a tuple for an `except` clause: `discord.HTTPException`, `discord.RateLimited`, `aiohttp.ClientError`, and `asyncio.TimeoutError`. The library catches with it wherever a failed call must not stop the work around it. The last three are siblings of `HTTPException`, not subclasses, so `except discord.HTTPException` lets a rate limit (raised when the client sets `max_ratelimit_timeout`), a dropped connection, or a request Discord never answered escape. The timeout is aiohttp's: discord.py sets none of its own, so a request with no reply ends after aiohttp's five-minute default.
 
 ```python
 from cascadeui import DISCORD_CALL_ERRORS
@@ -1454,7 +1458,7 @@ except DISCORD_CALL_ERRORS as e:
     logger.debug(f"Trial notice not delivered: {e}")
 ```
 
-A programming error inside the same block (a `NameError`, an `AttributeError`) still raises, which a bare `except Exception` would log as though the network had failed. `discord.InteractionResponded` is not in the tuple: it means the response slot is already used, which a caller answers with a followup (`respond_safe` does) rather than tolerates.
+A programming error inside the same block (a `NameError`, an `AttributeError`) still raises, which a bare `except Exception` would log as though the network had failed. An `asyncio.wait_for` or `asyncio.timeout()` expiry inside the block is caught with the rest, so a block that handles its own timeout differently catches `asyncio.TimeoutError` in a clause above this one. `discord.InteractionResponded` is not in the tuple: it means the response slot is already used, which a caller answers with a followup (`respond_safe` does) rather than tolerates.
 
 ---
 

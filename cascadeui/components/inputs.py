@@ -14,8 +14,10 @@ from ..state.store import _CURRENT_INTERACTION
 from ..utils.hooks import await_maybe
 from ..utils.responses import (
     _collect_replies,
+    _collect_skipped_answers,
     _collect_stalled_renders,
     ack_backstop,
+    answer_with_skipped_render,
     respond_safe,
     ship_stalled_renders,
     trailing_ack,
@@ -866,7 +868,7 @@ class Modal(discord.ui.Modal, StatefulComponent):
                     wrapped.value = discord_input.value
                     self.values_by_input[wrapped] = discord_input.value
 
-            with _collect_stalled_renders() as stalled:
+            with _collect_stalled_renders() as stalled, _collect_skipped_answers() as skipped:
                 # Dispatch state update
                 if self.view_id:
                     from ..state.singleton import get_store
@@ -896,6 +898,10 @@ class Modal(discord.ui.Modal, StatefulComponent):
                 finally:
                     if acting is not None:
                         _CURRENT_INTERACTION.reset(acting)
+                # A re-render the callback skipped as unchanged answers the
+                # submission, unless a click holds the view; inside the block,
+                # so a stalled answer is sent again.
+                await answer_with_skipped_render(skipped, interaction, take_lock=True)
 
             # The closed-view notice, unless the callback replied or deferred
             # the submission itself (the prelude to a raw followup, which

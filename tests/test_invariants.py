@@ -136,15 +136,61 @@ def _narrow_discord_handlers():
     return offenders
 
 
+_TIMEOUT_TAILS = {"TimeoutError"}
+_WIDE_TAILS = {"DISCORD_CALL_ERRORS", "_TRANSPORT_ERRORS"}
+
+
+def _tails(handler: ast.ExceptHandler) -> set:
+    return {_tail(n) for n in _handler_names(handler)}
+
+
+def _shadowed_timeout_handlers():
+    """``except TimeoutError`` clauses below a ``DISCORD_CALL_ERRORS`` or
+    ``_TRANSPORT_ERRORS`` clause of the same ``try``, which takes every timeout first.
+    """
+    offenders = []
+    for path in _python_sources():
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Try):
+                continue
+            wide_above = False
+            for handler in node.handlers:
+                tails = _tails(handler)
+                if wide_above and tails & _TIMEOUT_TAILS:
+                    offenders.append(f"{_rel(path)}:{handler.lineno}")
+                wide_above = wide_above or bool(tails & _WIDE_TAILS)
+    return offenders
+
+
+def _transport_handlers_missing_the_timeout():
+    """``except aiohttp.ClientError`` clauses whose ``try`` lets aiohttp's total timeout out."""
+    offenders = []
+    for path in _python_sources():
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Try) or _has_catch_all(node):
+                continue
+            covered = set().union(*(_tails(h) for h in node.handlers))
+            if covered & (_TIMEOUT_TAILS | _WIDE_TAILS):
+                continue
+            for handler in node.handlers:
+                if "ClientError" in _tails(handler):
+                    offenders.append(f"{_rel(path)}:{handler.lineno}")
+    return offenders
+
+
 class TestDiscordCallErrorsIsTheOnlyCatchTuple:
-    """A Discord call fails in three sibling ways, not one.
+    """A Discord call fails in four sibling ways, not one.
 
     ``RateLimited`` is a sibling of ``HTTPException`` rather than a
-    subclass, and ``aiohttp.ClientError`` is a third sibling carrying no
-    HTTP status at all -- a request that never reached Discord raises from
-    the transport. Each of the three has escaped a handler that named only
-    the others, so the shared tuple exists to be the one place the set is
-    written down.
+    subclass. ``aiohttp.ClientError`` is a third sibling carrying no HTTP
+    status at all: a request that never reached Discord raises from the
+    transport. aiohttp's total timeout is a fourth, a plain
+    ``asyncio.TimeoutError`` that is not a ``ClientError``, and discord.py sets
+    no timeout of its own, so aiohttp's 300 s default applies. Each has
+    escaped a handler that named only the others, so the shared tuple
+    exists to be the one place the set is written down.
 
     A narrow ``except discord.HTTPException`` stays legitimate in two
     shapes. It may read ``.code`` or ``.status``, discriminating on a field
@@ -165,7 +211,9 @@ class TestDiscordCallErrorsIsTheOnlyCatchTuple:
             f"{offenders}"
         )
 
-    def test_the_shared_tuple_still_carries_all_three_siblings(self):
+    def test_the_shared_tuple_carries_every_sibling(self):
+        import asyncio
+
         import aiohttp
         import discord
 
@@ -174,10 +222,39 @@ class TestDiscordCallErrorsIsTheOnlyCatchTuple:
         assert discord.HTTPException in DISCORD_CALL_ERRORS
         assert discord.RateLimited in DISCORD_CALL_ERRORS
         assert aiohttp.ClientError in DISCORD_CALL_ERRORS
-        # None of the three subclasses another, which is why naming one is
-        # never enough.
+        assert asyncio.TimeoutError in DISCORD_CALL_ERRORS
+        # None subclasses another, which is why naming one is never enough.
         assert not issubclass(discord.RateLimited, discord.HTTPException)
         assert not issubclass(aiohttp.ClientError, discord.HTTPException)
+        assert not issubclass(asyncio.TimeoutError, aiohttp.ClientError)
+
+    def test_a_transport_clause_also_catches_the_total_timeout(self):
+        """``except aiohttp.ClientError`` alone lets the total timeout out.
+
+        Catch ``_TRANSPORT_ERRORS`` (or the whole tuple) instead, or give the
+        same ``try`` a ``TimeoutError`` clause of its own.
+        """
+        offenders = _transport_handlers_missing_the_timeout()
+
+        assert not offenders, (
+            "These catch aiohttp.ClientError without the total timeout, a plain "
+            f"TimeoutError, in the same try: {offenders}"
+        )
+
+    def test_no_timeout_clause_sits_below_the_tuple(self):
+        """The library's own bounds raise the same ``asyncio.TimeoutError``.
+
+        A ``try`` that answers a bound differently (a stall that may have
+        reached Discord, as opposed to a request that never left) puts its
+        ``TimeoutError`` clause first, or splits on ``isinstance`` inside one
+        clause. Below the tuple it is never reached.
+        """
+        offenders = _shadowed_timeout_handlers()
+
+        assert not offenders, (
+            "These TimeoutError clauses sit below a clause catching "
+            f"DISCORD_CALL_ERRORS, which already takes every timeout: {offenders}"
+        )
 
 
 # // ========================================( Collected view exits )======================================== // #

@@ -11,7 +11,7 @@ from ...components.base import DynamicPersistentButton
 from ...components.patterns.v2 import card, divider
 from ...components.types import EmojiInput
 from ...utils.hooks import await_maybe, is_async_callable
-from ...utils.responses import DISCORD_CALL_ERRORS, respond_safe
+from ...utils.responses import DISCORD_CALL_ERRORS, describe_discord_error, respond_safe
 from ...utils.strings import slugify
 from ..layout import StatefulLayoutView
 from ..persistent import _PersistentMixin
@@ -395,49 +395,47 @@ class _BaseRolesMixin:
             )
             return
         is_present = role in member.roles
+        if is_present and category.required:
+            current_in_category = [r for r in member.roles if r.id in category_role_ids]
+            if len(current_in_category) <= 1:
+                await await_maybe(cls.on_role_required_block(interaction, member, role, category))
+                return
 
+        # Only the role change is caught: a hook that fails after it landed is
+        # not a failed toggle, and on_role_error would tell the member it was.
+        roles_removed: List[discord.Role] = []
         try:
             if is_present:
-                # Removal path
-                if category.required:
-                    current_in_category = [r for r in member.roles if r.id in category_role_ids]
-                    if len(current_in_category) <= 1:
-                        await await_maybe(
-                            cls.on_role_required_block(interaction, member, role, category)
-                        )
-                        return
-
                 await member.remove_roles(role, reason="Role panel toggle")
-                await await_maybe(cls.on_role_removed(interaction, member, role, category))
             else:
-                # Assignment path
-                roles_removed: List[discord.Role] = []
                 if category.exclusive:
                     roles_removed = [
                         r for r in member.roles if r.id in category_role_ids and r.id != role.id
                     ]
                     if roles_removed:
                         await member.remove_roles(*roles_removed, reason="Role panel swap")
-
                 await member.add_roles(role, reason="Role panel toggle")
-
-                if roles_removed:
-                    await await_maybe(
-                        cls.on_role_swap(interaction, member, role, roles_removed, category)
-                    )
-                else:
-                    await await_maybe(cls.on_role_assigned(interaction, member, role, category))
         except discord.Forbidden as exc:
             logger.warning(
                 f"Missing permission to toggle role {role.name!r} for " f"{member}: {exc}"
             )
             await await_maybe(cls.on_role_error(interaction, exc))
+            return
         except DISCORD_CALL_ERRORS as exc:
-            # RateLimited and aiohttp's transport errors are not HTTPException
-            # subclasses, so the tuple names them; one escaping here would skip
-            # on_role_error and leave the click with a silent acknowledgement.
-            logger.warning(f"HTTP error toggling role {role.name!r}: {exc}")
+            # RateLimited, aiohttp's transport errors, and its total timeout are
+            # not HTTPException subclasses, so the tuple names them; one escaping
+            # here would skip on_role_error and leave the click with a silent
+            # acknowledgement.
+            logger.warning(f"Could not toggle role {role.name!r}: {describe_discord_error(exc)}")
             await await_maybe(cls.on_role_error(interaction, exc))
+            return
+
+        if is_present:
+            await await_maybe(cls.on_role_removed(interaction, member, role, category))
+        elif roles_removed:
+            await await_maybe(cls.on_role_swap(interaction, member, role, roles_removed, category))
+        else:
+            await await_maybe(cls.on_role_assigned(interaction, member, role, category))
 
     # === Event hooks (classmethods; override for custom behavior) ===
 
@@ -504,9 +502,14 @@ class _BaseRolesMixin:
     ) -> None:
         """Called when role mutation fails. Default: ephemeral role_error_message.
 
-        Receives either an ``Exception`` (discord.Forbidden,
-        discord.HTTPException) or a string describing the failure.
+        Receives either an ``Exception`` (any of ``DISCORD_CALL_ERRORS``:
+        ``discord.Forbidden`` and the other ``HTTPException`` types,
+        ``discord.RateLimited``, a transport error, or a timeout) or a string
+        describing the failure. The default names an error that carries no
+        text (a timeout) by its type.
         """
+        if isinstance(error, BaseException) and not str(error):
+            error = type(error).__name__
         message = cls.role_error_message.format(error=error)
         await respond_safe(interaction, message, ephemeral=True)
 
@@ -616,7 +619,7 @@ class PersistentRolesLayoutView(_PersistentMixin, RolesLayoutView):
     exit_policy = "disable"
 
     async def on_restore(self, bot):
-        """Re-render the message from the current ``categories`` on every restart.
+        """Re-render the message from the current ``categories`` on every restore.
 
         Treats the class's ``categories`` attribute as the source of
         truth across restart boundaries. Source-code edits to role IDs,
@@ -624,11 +627,9 @@ class PersistentRolesLayoutView(_PersistentMixin, RolesLayoutView):
         displayed message on the next bot start instead of remaining
         frozen at the values that were live when ``send()`` first ran.
 
-        The restore always ships one edit per panel: a freshly restored
-        view has no render-hash baseline, so this first ``refresh()`` never
-        short-circuits. Source-code edits to the configuration therefore
-        reach the displayed message at a cost of one ``PATCH`` per persistent
-        role panel per restart.
+        The restore always ships one edit per panel, changed or not: a freshly
+        restored view has no render-hash baseline, so this first ``refresh()``
+        never short-circuits.
         """
         self._build_ui_sync()
         await self.refresh()

@@ -187,11 +187,11 @@ class RoleSelectorPanel(PersistentRolesLayoutView):
     async def on_bind(self, bot):
         """Inject runtime dependencies that cannot ride the persistence round-trip.
 
-        The library calls ``on_bind`` at the start of every ``send()`` whose
-        interaction or context carries the bot, and again on every restart
-        before ``on_restore``. A panel posted days
-        ago has no live ``bot``, database pool, or service client as a
-        constructor kwarg after a restart: those objects do not serialize.
+        The library calls ``on_bind`` at the start of every ``send()``, with
+        the bot the interaction, command, or channel belongs to, and again on
+        every restart before ``on_restore``. A panel posted days ago has no
+        live ``bot``, database pool, or service client as a constructor
+        kwarg after a restart: those objects do not serialize.
         ``on_bind`` hands them back. Stash them on ``self`` here and
         ``on_load``, ``on_restore``, and later renders can reach them. The
         panel's first ``build_ui`` runs at construction, before this hook,
@@ -437,9 +437,8 @@ class V2PersistenceExample(commands.Cog, name="v2_persistence_example"):
         new_panel = RoleSelectorPanel(context=channel, persistence_key=key)
         # Left on, the send would freeze the old panel before the delete below.
         new_panel.set_class_attribute("retire_previous_on_send", False)
-        # A bare channel carries no bot for the library to bind, so the
-        # command binds it before the send.
-        await new_panel.on_bind(self.bot)
+        # The send binds the bot the channel belongs to, so on_bind runs as
+        # it does for a panel sent from a command.
         try:
             posted = await new_panel.send()
         except DISCORD_CALL_ERRORS:

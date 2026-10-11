@@ -1241,8 +1241,8 @@ class PersistentLeaderboardLayoutView(_PersistentMixin, LeaderboardLayoutView):
     def bot(self) -> Optional[discord.Client]:
         """The bot this panel was bound to, else the one ``PersistenceMiddleware`` holds.
 
-        A panel sent through a channel finds no bot to bind, so it resolves
-        avatars through the bot persistence holds at the time it renders.
+        A panel left unbound at send uses the bot persistence holds at the
+        time it renders, so avatars still resolve.
         """
         bot = getattr(self, "_bot", None)
         if bot is None:
@@ -1257,16 +1257,16 @@ class PersistentLeaderboardLayoutView(_PersistentMixin, LeaderboardLayoutView):
         The persistent variant cannot carry ``bot`` through the constructor
         round-trip (it is stripped as non-serializable via
         ``_NON_PERSISTABLE_KWARGS``). The library stores the bot itself before
-        calling this hook, at a send whose interaction or context carries one
-        and at every restart, so the capture here serves a manual
-        ``await view.on_bind(bot)``. A channel send that carries no bot reads
-        the one ``PersistenceMiddleware`` holds.
+        calling this hook, at a send and at every restore, so the capture here
+        serves a manual ``await view.on_bind(bot)``. A panel whose send
+        resolves no client reads the one ``PersistenceMiddleware`` holds
+        through :attr:`bot`.
         """
         await super().on_bind(bot)
         self._bot = bot
 
     async def on_restore(self, bot):
-        """Re-render the board from live data on every restart.
+        """Re-render the board from live data on every restore.
 
         Reattach registered the lazily-built ``"No pages."`` placeholder
         tree, because ``on_load`` had not run yet, so the real ranking

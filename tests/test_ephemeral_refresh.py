@@ -3847,8 +3847,8 @@ class TestRefreshAbsorbsExpiredEphemeralToken:
     async def test_ephemeral_401_is_absorbed(self):
         view = RenderableLayoutView()
         view._ephemeral = True
-        view._message = AsyncMock()
-        view._message.edit.side_effect = _http_error(401)
+        view._message = MagicMock()
+        view._message.edit = AsyncMock(side_effect=_http_error(401))
         view._last_tree_digest = None
 
         await view.refresh()
@@ -3859,8 +3859,8 @@ class TestRefreshAbsorbsExpiredEphemeralToken:
         """The guard is scoped to ephemerals. A 401 elsewhere is a real error."""
         view = RenderableLayoutView()
         view._ephemeral = False
-        view._message = AsyncMock()
-        view._message.edit.side_effect = _http_error(401)
+        view._message = MagicMock()
+        view._message.edit = AsyncMock(side_effect=_http_error(401))
         view._last_tree_digest = None
 
         with pytest.raises(discord.HTTPException):
@@ -3870,8 +3870,8 @@ class TestRefreshAbsorbsExpiredEphemeralToken:
         """Only token expiry is absorbed, not every failure on an ephemeral."""
         view = RenderableLayoutView()
         view._ephemeral = True
-        view._message = AsyncMock()
-        view._message.edit.side_effect = _http_error(500)
+        view._message = MagicMock()
+        view._message.edit = AsyncMock(side_effect=_http_error(500))
         view._last_tree_digest = None
 
         with pytest.raises(discord.HTTPException):

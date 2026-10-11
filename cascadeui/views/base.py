@@ -37,6 +37,7 @@ from ..utils.deprecation import REMOVED_IN, warn_deprecated
 from ..utils.hooks import await_maybe, call_hook_safe, is_async_callable
 from ..utils.responses import (
     DISCORD_CALL_ERRORS,
+    _note_skipped_answer,
     _note_stalled_render,
     _refused_by_closed_session,
     _rewind_files,
@@ -51,7 +52,7 @@ from ..utils.tasks import (
     get_task_manager,
 )
 from ._custom_ids import item_signature
-from ._interaction import _ARMING_RETRY_SECONDS, _InteractionMixin
+from ._interaction import _ANSWERING_WITH_RENDER, _ARMING_RETRY_SECONDS, _InteractionMixin
 from ._navigation import _NAVIGATION_TURN, _NavigationMixin
 
 logger = logging.getLogger(__name__)
@@ -129,6 +130,10 @@ _CLOSE_WAIT_SECONDS = 30.0
 # How long a send holds a cancel landing after Discord accepted its message
 # while it finishes, so a step that never returns cannot keep the cancel.
 _CANCEL_HOLD_SECONDS = 5.0
+
+# After a stalled one-request edit logs at INFO, the view's stalls log at DEBUG
+# for this many seconds, so a long-lived panel still reports a later slowdown.
+_STALL_INFO_SECONDS = 3600.0
 
 # How far a close takes the view's message, in increasing order: a later
 # close owes only the part an earlier teardown left undone.
@@ -255,7 +260,9 @@ class RenderOutcome(str, Enum):
     - ``DEFERRED``: no edit has shipped yet; the render runs later, when the
       active cooldown or rate-limit window closes, once a send in progress
       has created the message, or when a failed navigation hands the view
-      back.
+      back. From :meth:`_StatefulMixin.reload` it does not say whether
+      ``on_load`` ran: the throttle may have deferred the whole reload
+      before ``on_load`` ran, or ``on_load`` ran and only its edit is held.
     - ``DROPPED``: the edit was attempted and is not known to have landed (a
       transport failure, or a request stalled past ``edit_timeout``), and
       nothing is scheduled to retry it. The definitively-dropped case also
@@ -1297,6 +1304,9 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         # True once any tree has landed on Discord; never reset, unlike the
         # digest above. Read by _teardown_edit_target.
         self._has_rendered: bool = False
+        # When a stalled one-request edit last logged at INFO; the stalls
+        # within _STALL_INFO_SECONDS after it log at DEBUG.
+        self._stall_reported_at: Optional[float] = None
         # Numbers each refresh() as it begins, and records the newest render
         # that reached the message or stalled, for the tree and for content
         # carried in keywords (see _ship_stalled_render).
@@ -2644,9 +2654,8 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             self._webhook_message = message
             try:
                 self._message = await message.channel.fetch_message(message.id)
-            except (*DISCORD_CALL_ERRORS, asyncio.TimeoutError):
+            except DISCORD_CALL_ERRORS:
                 # The send already succeeded: the view keeps the message it has.
-                # aiohttp's total timeout raises a bare TimeoutError.
                 self._message = message
             except asyncio.CancelledError:
                 # Cancelled after Discord accepted the send: the view keeps the
@@ -4345,12 +4354,20 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         with nothing logged, once both start at the same time.
 
         Returns a :class:`RenderOutcome` naming what happened (rendered,
-        skipped as unchanged, deferred to the throttle boundary, dropped in
-        transit, no message to edit, or the view closed while the reload
-        waited), or ``None`` when a subclass
-        render override reports nothing. Callers that must know the edit
-        landed (a one-shot notice, a stamp written after the render) check
-        the outcome instead of assuming a returned ``reload()`` rendered.
+        skipped as unchanged, deferred, dropped in transit, no message to
+        edit, or the view closed while the reload waited), or ``None`` when a
+        subclass render override reports nothing. Callers that must know the
+        edit landed (a one-shot notice, a stamp written after the render)
+        check the outcome instead of assuming a returned ``reload()``
+        rendered. ``DEFERRED`` does not say whether ``on_load`` ran: a
+        reload that finds a throttle window open defers ``on_load`` with the
+        edit, while whatever holds the render after ``on_load`` returns (a
+        send or navigation in progress, a window that opened meanwhile, a
+        rate limit) holds only the edit of data already loaded. Work that
+        depends on what ``on_load`` loaded belongs in ``on_load`` itself,
+        which runs in both cases: at once, or at the window boundary. On an
+        ephemeral view armed for its refresh handoff, ``on_load`` does not
+        run, and the outcome is that of the refresh button's render.
 
         Respects the refresh throttle at the reload layer: a reload landing
         inside an active cooldown (``refresh_cooldown_ms`` or a 429 backoff)
@@ -5553,10 +5570,22 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             # embed or content live outside the tree the digest covers. Not
             # while a select pick waits for a redraw either (see _pick_owed):
             # a callback that refused it and redrew the same tree would
-            # leave it on screen.
-            if not kwargs and self._pick_owed is None and self._last_tree_digest is not None:
+            # leave it on screen. A skip that could have answered the click
+            # leaves the reply to the callback (a modal after a dispatch
+            # needs it); the click and modal handlers that collect skips
+            # answer with this render if nothing else did and the view
+            # serializes its clicks. _redraw_for_click sends that answer.
+            slot_open = acting and not interaction.response.is_done()
+            if (
+                not kwargs
+                and not (slot_open and _ANSWERING_WITH_RENDER.get())
+                and self._pick_owed is None
+                and self._last_tree_digest is not None
+            ):
                 current_digest = self._compute_tree_digest()
                 if current_digest == self._last_tree_digest:
+                    if slot_open:
+                        _note_skipped_answer(self, seq)
                     skipped = True
                     return RenderOutcome.SKIPPED
 
@@ -5584,8 +5613,8 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             # token, so an ephemeral view qualifies too. The bound sits below
             # auto_defer_delay because the ack rides it, and discord.py marks
             # the response done only after the await, so a cancelled attempt
-            # leaves the interaction unanswered for the timer to ack.
-            slot_open = acting and not interaction.response.is_done()
+            # leaves the interaction unanswered for the timer to ack. Nothing
+            # is awaited between the skip's read of slot_open and here.
             if slot_open:
                 fast_path_timeout = max(0.5, self.auto_defer_delay - 1.0)
                 try:
@@ -5609,10 +5638,19 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
                     if isinstance(e, aiohttp.ClientError):
                         self._note_transport_failure(e, where="Refresh")
                         return RenderOutcome.DROPPED
-                    logger.debug(
+                    now = time.monotonic()
+                    first = (
+                        self._stall_reported_at is None
+                        or now - self._stall_reported_at >= _STALL_INFO_SECONDS
+                    )
+                    if first:
+                        self._stall_reported_at = now
+                    logger.log(
+                        logging.INFO if first else logging.DEBUG,
                         f"Acting-view fast path exceeded {fast_path_timeout:.2f}s "
-                        f"in {type(self).__name__}; fall-through skipped, "
-                        f"auto-defer timer handles ack"
+                        f"in {type(self).__name__}; the interaction is acknowledged and "
+                        f"the render sent again"
+                        + (" (stalls on this view in the next hour log at DEBUG)" if first else ""),
                     )
                     # No second attempt: on top of the cancelled one it spends
                     # the timer's ack budget (an ephemeral's webhook edit can
@@ -6124,17 +6162,9 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             return explicit
         if self.allowed_mentions is not None:
             return self.allowed_mentions
-        # ``_bot`` covers the restored persistent view, which has neither an
-        # interaction nor a context and would otherwise lose the client's
-        # rules on every post-restart refresh.
-        client = (
-            getattr(self.interaction, "client", None)
-            or getattr(self.context, "bot", None)
-            or getattr(self, "_bot", None)
-        )
-        rules = getattr(client, "allowed_mentions", None)
-        # Type-checked rather than truthiness-checked: the attribute is
-        # read off whatever object the caller handed in as a client, and
+        rules = getattr(self._given_client(), "allowed_mentions", None)
+        # Type-checked rather than truthiness-checked: the interaction,
+        # context, and ``_bot`` tiers return whatever the caller supplied, and
         # only a real AllowedMentions is safe to put on the wire.
         return rules if isinstance(rules, discord.AllowedMentions) else None
 
@@ -7220,6 +7250,22 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         source = getattr(self, "_arriving_from", None)
         return source._client() if source is not None else None
 
+    def _given_client(self):
+        """The client the view was given, else the one it was sent through.
+
+        The interaction's client, a command context's bot, and the bot stored
+        on the view (``_bot``: a bound or restored persistent view's, or a
+        leaderboard's ``bot=``) come first; a view sent through a channel may
+        have none of them, and :meth:`_client` then finds its client through
+        the channel.
+        """
+        return (
+            getattr(self.interaction, "client", None)
+            or getattr(self.context, "bot", None)
+            or getattr(self, "_bot", None)
+            or self._client()
+        )
+
     def _client_closed(self) -> bool:
         """Whether the client this view was sent through has closed.
 
@@ -7363,7 +7409,7 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
             await self._close_other_message(message, shown, freeze=freeze)
         except discord.NotFound:
             pass
-        except (*DISCORD_CALL_ERRORS, asyncio.TimeoutError) as e:
+        except DISCORD_CALL_ERRORS as e:
             if ephemeral and getattr(e, "status", None) == 401:
                 # The old ephemeral's webhook token has expired.
                 logger.debug(f"{name} could not close the ephemeral message it was sent from.")
@@ -7420,24 +7466,18 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         Session" button is the concrete case. Both mechanisms corrupt the
         same shared dict, and a fix for one is not a fix for the other.
 
-        No-op, at debug, when none of the four bot-resolution tiers below
-        yields a real ``discord.Client`` (a view with no interaction, no
-        bot-bearing context, no restored ``_bot``, and no persistence
-        manager) -- matching the no-op ``PersistenceManager`` already
-        documents on the same shape. Silent here would leave a repair the
-        rest of the codebase believes is in place quietly not running, and
-        the resulting symptom is indistinguishable from the original defect.
+        The bot is the view's client (:meth:`_given_client`), else the one
+        the persistence manager holds. No-op, at debug, when neither is a
+        real ``discord.Client``, matching the no-op ``PersistenceManager``
+        already documents on the same shape. Silent here would leave a
+        repair the rest of the codebase believes is in place quietly not
+        running, and the resulting symptom is indistinguishable from the
+        original defect.
         """
         if not _dynamic_button_classes:
             return
-        # ``_bot`` covers a restored persistent view, which has no interaction
-        # or context; the persistence manager's bot covers a view sent through
-        # a bare channel context, which has no ``.bot``.
-        bot = (
-            getattr(self.interaction, "client", None)
-            or getattr(self.context, "bot", None)
-            or getattr(self, "_bot", None)
-            or getattr(getattr(self.state_store, "persistence_manager", None), "_bot", None)
+        bot = self._given_client() or getattr(
+            getattr(self.state_store, "persistence_manager", None), "_bot", None
         )
         # Type-checked, not truthiness-checked: ``context``/``_bot`` are read
         # off whatever the caller supplied, and only a real Client exposes
@@ -7447,10 +7487,10 @@ class _StatefulMixin(_InteractionMixin, _NavigationMixin):
         else:
             logger.debug(
                 f"{type(self).__name__} could not resolve a discord.Client to "
-                f"re-drive the dynamic-item registry (interaction, context, "
-                f"_bot, and the persistence manager each named no client, or "
-                f"named something that isn't one); a DynamicPersistentButton "
-                f"this view carried may stay unrouteable for other messages."
+                f"re-drive the dynamic-item registry (the view and the "
+                f"persistence manager each named no client, or named something "
+                f"that isn't one); a DynamicPersistentButton this view carried "
+                f"may stay unrouteable for other messages."
             )
 
     @_in_teardown_scope

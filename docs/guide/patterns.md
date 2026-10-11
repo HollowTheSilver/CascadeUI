@@ -1415,8 +1415,8 @@ what was last loaded rather than re-reading the source.
 `LeaderboardLayoutView` for admin-posted permanent panels. Defaults:
 `owner_only = False`, `exit_policy = "disable"`, `timeout = None`.
 Requires `persistence_key=`. `on_restore` calls `reload()` to re-fetch
-entries, recompose the tree, and edit the message after a bot restart, so
-the restored panel's controls route clicks immediately.
+entries, recompose the tree, and edit the message each time the panel is
+restored, so its controls route clicks immediately.
 
 ```python
 from cascadeui import PersistentLeaderboardLayoutView, get_store
@@ -1438,13 +1438,9 @@ class ServerStatsBoard(PersistentLeaderboardLayoutView):
 
 Section-mode avatar resolution works the same as on the base class, but
 the bot arrives through `on_bind` rather than a `bot=` kwarg: the library
-injects it automatically on the initial send (from the interaction) and
-on every restart, so the default `get_avatar_url` resolves avatars in
-both cases. A panel posted from a bare channel context (no interaction)
-takes the bot `PersistenceMiddleware` was given. Without one it has no
-bot on its first render and falls back to the two-line `TextDisplay`;
-call `await view.on_bind(bot)` before `send()` if that first render must
-show avatars.
+injects it automatically on the initial send (from the interaction, the
+command context, or the channel the panel is posted to) and on every
+restart, so the default `get_avatar_url` resolves avatars in both cases.
 
 Pair with `persistent_slots = ("...",)` on the subclass (or
 `SlotPolicy(persistent=True)` at setup) to persist the underlying
@@ -1568,7 +1564,7 @@ override `format_category_hint(category)` at Tier 2.
   removal is rejected.
 - `swap_message` -- sent after an exclusive-mode swap.
 - `role_error_message` -- sent on role mutation failure (forbidden,
-  HTTP error).
+  HTTP error, transport failure or timeout).
 
 Each template is checked at class definition against its placeholders --
 a typo (`{roel}`) or an unbalanced brace raises `ValueError` naming the
@@ -1600,7 +1596,7 @@ from inside the click that renders it.
 | `on_role_removed(interaction, member, role, category)` | Called after a role is removed. Default: reads `removed_message`. |
 | `on_role_swap(interaction, member, role_added, roles_removed, category)` | Called after an exclusive-mode swap. Default: reads `swap_message` with `{removed}` formatted as a comma-joined list of removed role names. |
 | `on_role_required_block(interaction, member, role, category)` | Called when a required-category last-role removal is rejected. Default: reads `required_message`. |
-| `on_role_error(interaction, error)` | Called on role mutation failure (`discord.Forbidden`, `discord.RateLimited`, `discord.HTTPException`, a transport failure, or role-not-found string). Default: reads `role_error_message`. |
+| `on_role_error(interaction, error)` | Called when the role change itself fails (`discord.Forbidden`, `discord.RateLimited`, `discord.HTTPException`, a transport failure or timeout, or a role-not-found string); an error from another role hook propagates instead. Default: reads `role_error_message`, naming a timeout by its type. |
 
 The five `format_*` hooks compose the role card inside the synchronous `build_ui`, so they must be plain `def`s; an `async def` override is refused at class definition. The `on_role_*` hooks respond after the role mutation and accept either `def` or `async def`.
 
@@ -1662,12 +1658,12 @@ continue routing correctly because each button is a
 `DynamicPersistentButton` subclass registered globally at module
 import -- the panel survives restart independent of view
 re-attachment. The default `on_restore` re-renders the message
-from the current `categories` on every restart, so source-code
-edits to role IDs, category names, or button labels propagate to
-the displayed message on the next bot start. Unchanged panels
-pay zero Discord API cost: `refresh()`'s render-hash short-circuit
-skips the `PATCH` when the rebuilt tree matches what the message
-already shows.
+from the current `categories` each time the panel is restored, so
+source-code edits to role IDs, category names, or button labels
+propagate to the displayed message on the next bot start. Each
+restore costs one `PATCH` per panel, changed or not: a restored
+view has no render-hash baseline, so the restore's `refresh()`
+always ships.
 
 ### Category name uniqueness
 

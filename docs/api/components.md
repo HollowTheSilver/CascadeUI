@@ -1074,7 +1074,7 @@ class BoardView(StatefulLayoutView):
 
 The decorated function is a method: it takes `self` and dispatches through the view it belongs to. When `component_id` is omitted, the function's `__name__` is used.
 
-The `build_ui()` line is load-bearing. `refresh()` sends the tree the view already holds and composes nothing, so mutating state and calling only `refresh()` ships the pre-mutation render. Worse, an unchanged tree hashes the same, so the render-hash skip suppresses the edit and the click produces no visible result at all. The dispatch also happens *before* the body runs, so a view driving its render from `on_state_changed` rebuilds from the old state; compose in the body as above rather than relying on the dispatch.
+The `build_ui()` line is load-bearing. `refresh()` sends the tree the view already holds and composes nothing, so mutating state and calling only `refresh()` ships the pre-mutation render, and the click produces no visible result at all. The dispatch also happens *before* the body runs, so a view driving its render from `on_state_changed` rebuilds from the old state; compose in the body as above rather than relying on the dispatch.
 
 ### `register_component(name, component_class)` / `get_component(name)`
 

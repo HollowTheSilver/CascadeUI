@@ -5304,6 +5304,24 @@ class TestARestartReleasesTheViewsLeftBehind:
 
         assert not [r for r in caplog.records if r.name.startswith("cascadeui")]
 
+    async def test_a_restored_key_no_view_holds_is_restored_after_a_restart(self):
+        """A screen a restored panel pushed that times out without returning to
+        the panel (one with its own on_timeout()) keeps the panel's row with
+        nothing holding its key. A process restart restores that row; a restart
+        in the same process skipped it while the key stayed marked restored."""
+        store = get_store()
+        mgr = PersistenceManager(store=store, bot=MagicMock())
+        mgr._restored_keys = {"orphan"}
+        store.persistence_manager = mgr
+        store._restore_owed = False
+        client = MagicMock(spec=discord.Client)
+        client.is_closed.return_value = True
+
+        store._release_views_of(client)
+
+        assert mgr._restored_keys == set()
+        assert store._restore_owed is True
+
 
 # // ========================================( State identity short-circuit )======================================== // #
 

@@ -150,10 +150,10 @@ summary = await store.persistence_manager.reattach_persistent_views()
   re-confirmed against the live row. Row removed, and `REGISTRY_PRUNED`
   dispatched with `reason="gone"` and `source="reattach"`.
 - `unreachable`: channel or message could not be fetched for a transient reason
-  (`Forbidden`, `RateLimited`, `HTTPException`, a transport failure, or a
-  non-messageable channel), or the row was re-posted under its key mid-pass
-  and now points at a message the pass never fetched. The row is left on
-  disk so a clean restart retries; nothing is pruned. Do not reconcile external
+  (`Forbidden`, `RateLimited`, `HTTPException`, a transport failure or
+  timeout, or a non-messageable channel), or the row was re-posted under its
+  key mid-pass and now points at a message the pass never fetched. The row is
+  left on disk so a clean restart retries; nothing is pruned. Do not reconcile external
   records from this bucket: the panel may still exist.
 
 ### Rows that stay unreachable
@@ -163,8 +163,8 @@ from deleting a live panel, and it has a cost: a channel the bot will never
 see again is re-fetched at every boot, forever. Nothing in a `Forbidden`
 distinguishes "not right now" from "not ever".
 
-So the first failed fetch stamps the row with `first_unreachable_at`, and the
-stamp clears the moment a fetch succeeds. It records the *first* failure, not
+So the first failed fetch stamps the row with `first_unreachable_at`, and a
+later pass whose fetch succeeds clears it. It records the *first* failure, not
 the latest, so the age keeps growing across boots rather than resetting.
 
 ```python
@@ -177,19 +177,35 @@ await mgr.prune_unreachable(older_than_days=30)
 ```
 
 `prune_unreachable` re-checks every candidate against Discord before deleting
-anything. A row that answers is kept and its stamp cleared, however old that
-stamp was; a row returning a definitive 404 goes regardless of age; the rest
-are deleted only if the stamp predates the cutoff. A stamp on its own is one
+anything. A row whose message answers is kept, however old its stamp, and its
+panel is restored as a `reattach()` pass restores it, so it routes clicks again
+without a restart. The sweep first replaces the old stamp with the time of
+that check, and the restore clears it once the panel is back. A row whose
+restore does not bring its panel back (its class is not
+imported, its construction fails, or a cancel or an error cuts the restore
+off) keeps the new stamp, so the next sweep tries it again and its age counts
+from then; a sweep that finishes reports it as `kept`. A row returning a
+definitive 404 goes regardless of age. The rest are deleted only if the stamp predates
+the cutoff and the re-check is refused (a 403, or a channel that cannot hold
+messages). Any other failure, such as no answer, a rate limit, or a server
+error, says nothing about the message, so that row waits for the next sweep.
+A stamp on its own is one
 observation, and a host that simply has not restarted for a month carries a
 month-old stamp from a single failure -- the second look is what turns it into
 evidence. The deletions dispatch `REGISTRY_PRUNED` with
 `source="prune_unreachable"`: one with `reason="gone"` for the rows whose channel
 or message no longer exists (listed in `gone` as well), and one with
-`reason="unreachable"` for the rows that aged out.
+`reason="unreachable"` for the rows that aged out. A `REGISTRY_PRUNED` hook
+that calls `prune_unreachable()` or `reattach()` has to start the call on a
+task of its own and not await it. The pass that dispatched the action waits
+for the hook to return: a direct call raises `RuntimeError`, and awaiting the
+task leaves the two waiting on each other for good, with a warning logged
+after a minute (see
+[`prune_unreachable`](../api/persistence.md#prune_unreachable-older_than_days)).
 
 A row whose key a live panel in this process holds is kept without a fetch: the
 panel owns the key, and a failed fetch says nothing about whether its row should
-go. It raises `ValueError` for a negative or non-integer cutoff and `RuntimeError`
+go. `prune_unreachable` raises `ValueError` for a negative or non-integer cutoff and `RuntimeError`
 when the middleware was built without `bot=`, since there is nothing to
 re-verify against. `/cascadeui unreachable` lists the backlog with ages, and
 takes an optional `prune_older_than_days` to run the same prune from Discord.
@@ -215,9 +231,11 @@ refused because an automatic run would then delete a row on a single failed
 fetch. Several processes sharing one registry each run their own prune, with no
 coordination between them.
 
-The clear is keyed on the *fetch* succeeding, not on the view reconstructing.
-A row whose class raises during construction lands in `failed`, but its
-message was reachable, so its stamp clears and it is never a prune candidate.
+In a reattach pass the clear is keyed on the *fetch* succeeding, not on the
+view reconstructing. A row whose class raises during construction lands in
+`failed`, but its message was reachable, so its stamp clears and it is never a
+prune candidate. The sweep's own restore is the exception: there the stamp
+clears only for a panel that comes back.
 
 The middleware runs `reattach_persistent_views()` inside `setup_middleware`,
 after cogs are loaded but before `on_ready` fires. A `REGISTRY_PRUNED`
@@ -244,11 +262,15 @@ the row the first pass deleted is no longer there to verdict. Reconcile only
 from `removed` (a definitive 404); a key in `unreachable` may still exist and
 should be left alone. The `keys` list on the `REGISTRY_PRUNED` action with
 `reason="gone"` carries the same `removed` data for a consumer that
-subscribes before `setup_middleware`. A removal made after a subscriber
-registered, at boot or by a re-drive, reaches it both ways, so act on
+subscribes before `setup_middleware`, and the action's `messages` names the
+message each removed row was on, so a key reused across posts can be checked
+against the message your own record stores before you clear it. A removal made after
+a subscriber registered, at boot or by a re-drive, reaches it both ways, so act on
 reattach removals from one of the two: the action's `source` is
 `"reattach"` for those, and `"prune_unreachable"` or `"prune_registry"` for the
-deletions that come later.
+deletions that come later. The restore the unreachable sweep runs for a panel
+it finds reachable again uses the message the sweep just fetched, so it
+deletes nothing: every deletion during a sweep carries `"prune_unreachable"`.
 
 ### Re-driving reattach after a runtime cog load
 
@@ -1122,6 +1144,11 @@ drives the reattach pipeline during startup:
    a channel render one at a time (message edits rate-bucket per channel);
    panels in distinct channels render concurrently.
 
+The same restore runs while the bot is up, after a `reattach()` call and when
+the unreachable sweep finds a panel's message again, so `on_restore` is not a
+startup-only hook. A panel that should not stay can call `exit()` from it,
+which closes the panel and retires its row.
+
 ### Retiring a registration
 
 `exit()` on the instance that owns the registration removes the panel's
@@ -1271,27 +1298,29 @@ class LeaderboardPanel(PersistentLeaderboardLayoutView):
 ```
 
 Call `super().on_bind(bot)` first, since a pattern class binds its own
-dependencies there. The bot itself is stored on the view before the hook
-runs, and the leaderboard exposes it as `self.bot`, so an override has no
-need to assign it.
+dependencies there. When the library calls the hook, it stores the bot on
+the view first, and the leaderboard exposes it as `self.bot`, so an override
+has no need to assign it.
 
 The library calls `on_bind(bot)` automatically at two points: during `send()`
-(when the bot is derivable from the construction context) and during restore,
-before `on_restore`. A view posted with a bare channel context carries no
-`.bot`, so `send()` cannot derive it. That view calls `on_bind` itself before
-`send()`:
+and during restore, before `on_restore`. At send, `bot` is the interaction's
+client, the command context's bot, or the client the channel belongs to, so a
+panel posted to a channel needs no bind of its own, unless code before
+`send()` reads what `on_bind` sets:
 
 ```python
 view = LeaderboardPanel(context=channel, persistence_key=f"board:{board_id}")
-await view.on_bind(bot)   # channel context: no derivable bot
-await view.send()
+await view.send()   # on_bind runs with the client the channel belongs to
 ```
 
-Without that call the hook does not run, and its own dependencies stay
-unbound. A `PersistentLeaderboardLayoutView` still resolves avatars: with no
-bot bound, its `bot` reads the one `PersistenceMiddleware` holds.
+A view whose send resolves no client is left unbound, and code that reads
+what `on_bind` sets before `send()` needs the view bound earlier; in both
+cases call `await view.on_bind(bot)` before `send()`. With no bot bound, a
+`PersistentLeaderboardLayoutView` resolves avatars through the one
+`PersistenceMiddleware` holds.
 
-Keep `on_bind` idempotent; it may run more than once. A sync override
+Keep `on_bind` idempotent: it may run more than once, and a manual call before
+`send()` is followed by the library's own call during the send. A sync override
 (`def on_bind`) is also accepted.
 
 !!! warning "Set attributes, not UI side effects"
@@ -1335,7 +1364,7 @@ next step are skipped with a WARNING and left on disk for later recovery.
 | Scenario | Outcome |
 |----------|---------|
 | Message or channel returns a definitive 404 (`discord.NotFound`) | Row removed, reattach summary logs as `removed` |
-| Message or channel transiently unreachable (`Forbidden`, `RateLimited`, `HTTPException`, a transport failure, or non-messageable) | Row kept, reattach summary logs as `unreachable` |
+| Message or channel transiently unreachable (`Forbidden`, `RateLimited`, `HTTPException`, a transport failure or timeout, or non-messageable) | Row kept, reattach summary logs as `unreachable` |
 | View class not imported, or no class registers under the stored name (a moved or renamed class with no `session_class_key` pin) | Row kept, reattach summary logs as `skipped` |
 | Kwargs migrator raises or returns non-dict | Row kept, reattach summary logs as `failed` |
 | Construction raises during reattach | Row kept, reattach summary logs as `failed` |
@@ -1368,9 +1397,13 @@ Re-sending a panel under a key another panel holds retires the old one during
 the send: a live instance is exited (its `exit_policy` decides whether the
 message is frozen or deleted), and so is a view it pushed onto that message; a
 message left from before a restart is frozen or deleted by the new panel's
-`exit_policy` the same way. That suits a plain re-post.
+`exit_policy` the same way, on a task of its own so the send does not wait
+for it. When that close fails, a WARNING names the message and channel left
+on screen.
+Retiring the old panel during the send suits a plain re-post.
 It does not suit a swap that has to confirm the new panel before the old one
-comes down, because by the time `send()` returns the old panel is already gone.
+comes down: by the time `send()` returns, the old panel has been exited, or the
+close of its message has already started.
 
 Set `retire_previous_on_send = False` to retire the predecessor yourself:
 

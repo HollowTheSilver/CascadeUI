@@ -245,8 +245,9 @@ cut off that way raises `RuntimeError` when it exits and commits nothing; on
 
 ### `last_reattach_summary` and `total_reattach_summary`
 
-`last_reattach_summary` is the summary the most recent reattach pass returned
-(`None` before the first), and `total_reattach_summary` is a read-only
+`last_reattach_summary` is the summary of the most recent reattach pass
+(`None` before the first), including the restore the unreachable sweep runs
+for rows it finds reachable again, and `total_reattach_summary` is a read-only
 `dict[str, list[str]]` covering every pass, with each `persistence_key` under
 the outcome its most recent pass gave it. Both carry the same five buckets:
 `restored`, `skipped`, `failed`, `removed`, `unreachable`.
@@ -262,18 +263,21 @@ Both cover reattach passes only. A pass's own deletions dispatch
 `REGISTRY_PRUNED` too, with `reason="gone"`, so a subscriber registered
 before a pass ran hears of its removals both ways: act on reattach removals
 from one of the two, for instance by skipping a `REGISTRY_PRUNED` whose
-`source` is `"reattach"`. A row deleted afterwards,
-by the unreachable sweep or by `prune_registry`, keeps the outcome its last
-pass gave it; those deletions arrive as `REGISTRY_PRUNED`, which a subscriber
-registered after startup receives. The two together cover every registration
+`source` is `"reattach"`. The restore the unreachable sweep runs for a panel
+it finds reachable again uses the message the sweep just fetched, so it
+deletes nothing. A row deleted afterwards, by the unreachable sweep or by
+`prune_registry`, keeps the outcome its last pass gave it; those deletions
+arrive as `REGISTRY_PRUNED`, which a subscriber registered after startup
+receives. The two together cover every registration
 that goes away.
 
 ### `unreachable_since`
 
 Read-only `dict[str, int]` of `persistence_key` to the epoch second at which
-a registry row was first found unreachable. A row absent from the mapping is
-either reachable or has never been observed otherwise. Reflects this process's
-view; `prune_unreachable` reads disk.
+a registry row was first found unreachable, or at which the unreachable sweep
+last found its message but could not restore its panel. A row absent from the
+mapping is either reachable or has never been observed otherwise. Reflects
+this process's view; `prune_unreachable` reads disk.
 
 ### `prune_unreachable(*, older_than_days)`
 
@@ -285,12 +289,19 @@ result = await mgr.prune_unreachable(older_than_days=30)
 # {"pruned": [...], "gone": [...], "recovered": [...], "kept": [...]}
 ```
 
-A candidate that fetches successfully is kept and its stamp cleared
-(`recovered`), whatever its age. A definitive `discord.NotFound` is deleted
+A candidate that fetches successfully is kept and its panel restored as a
+`reattach()` pass restores it, whatever its age; once the panel is restored its
+stamp clears (`recovered`). One whose restore fails or is cut off is stamped
+again with the time of the check and reported as `kept`, so the
+next sweep tries it again and its age counts from then.
+A definitive `discord.NotFound` is deleted
 regardless of age. Everything still unreachable is deleted only when its
 stamp predates the cutoff, and reported as `kept` otherwise. A row rewritten
 mid-pass, or one whose pre-delete re-read failed at the backend, is `kept`
-too: neither verdict describes the row as it stands. A row whose key a live
+too: neither verdict describes the row as it stands. So is a row whose
+re-check got no verdict on the message (no answer, a rate limit, a server
+error): only a 403, or a channel that cannot hold messages, counts as still
+unreachable. A row whose key a live
 panel in this process holds is `kept` without a fetch. Deletions route
 through `prune_registry`: rows whose channel or message returned a 404 (also
 listed in `gone`) with `reason="gone"`, as a reattach pass reports them, and
@@ -298,7 +309,11 @@ the rows that aged past the cutoff with `reason="unreachable"`. The call never r
 alongside a reattach pass: whichever starts second waits. Calling either one
 from a hook that runs inside the other, such as a `REGISTRY_PRUNED` hook
 registered with `store.on()`, raises `RuntimeError` instead of waiting on
-itself forever; schedule the call with `asyncio.create_task(...)` from there.
+itself forever. Start the call on a task of its own from there and do not
+await that task from the hook: awaiting it, directly or through
+`asyncio.gather`, waits for a walk that cannot finish until the hook returns.
+The two then wait on each other for good, with a warning logged after a
+minute.
 
 `PersistenceMiddleware(prune_unreachable_after_days=N)` runs this call
 automatically, first once the gateway is ready and then daily.
