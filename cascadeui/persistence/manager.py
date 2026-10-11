@@ -98,6 +98,10 @@ _NON_PERSISTABLE_KWARGS: frozenset[str] = frozenset({"persistence_key", "theme",
 # bot from ever exiting. Above the built-in SQL backends' own five-second wait.
 _BACKEND_CLOSE_SECONDS = 10.0
 
+# How long a reattach() or prune_unreachable() waits for a walk already running
+# before it warns. A sweep over a large backlog runs for a while legitimately.
+_REGISTRY_WALK_WAIT_WARN_SECONDS = 60.0
+
 # The call a library prune comes from (a reattach pass or the unreachable sweep),
 # read by prune_registry(). Both prune through that public method so a subclass
 # override still sees them.
@@ -931,8 +935,9 @@ class PersistenceManager:
           (``discord.NotFound``). Row deleted from disk, and ``REGISTRY_PRUNED``
           dispatched with ``reason="gone"`` and ``source="reattach"``.
         - ``unreachable`` -- channel or message could not be fetched for a
-          transient reason (``Forbidden``, ``HTTPException``, or a non-messageable
-          channel), or the row was rewritten mid-pass (re-posted under its
+          transient reason (``Forbidden``, any other error in
+          ``DISCORD_CALL_ERRORS``, a channel type discord.py cannot read, or a
+          non-messageable channel), or the row was rewritten mid-pass (re-posted under its
           stable key while this pass held a 404 verdict against the message it
           replaced) and points at a message this pass never fetched. The row is
           left on disk so a clean restart retries; nothing is pruned, and a
@@ -949,11 +954,28 @@ class PersistenceManager:
         :attr:`total_reattach_summary` carries every pass, which is what a
         reconcile running after a re-drive needs.
         """
-        summary = await self._serialized_walk("reattach_persistent_views", self._reattach_pass)
+        return await self._serialized_walk("reattach_persistent_views", self._reattach_pass)
+
+    def _finish_reattach_pass(
+        self, summary: dict[str, list[str]], restored_views: list, bot: Any
+    ) -> None:
+        """Schedule the repaint of the views a pass restored, and record its outcomes."""
+        # on_restore reads the bot cache, cold during setup_hook, so each render
+        # waits for the gateway; the views already route clicks. A bot that
+        # closed during the pass never becomes ready.
+        if restored_views and not _bot_closed(bot):
+            task = asyncio.create_task(self._run_post_ready_restore(restored_views))
+            task.add_done_callback(self._on_post_ready_restore_done)
+            self._post_ready_restore_tasks.add(task)
+
+        # Remember what this pass restored so a later reattach() skips it,
+        # but not a panel its bot's close released during the pass.
+        self._restored_keys.update(
+            key for key in summary["restored"] if self._store._holds_persistence_key(key)
+        )
         for outcome, keys in summary.items():
             for key in keys:
                 self._reattach_outcomes[key] = outcome
-        return summary
 
     @staticmethod
     def _mirror_entries(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -1051,12 +1073,15 @@ class PersistenceManager:
         both ways: act on reattach removals from one of the two, or skip a
         key already handled.
 
-        Reattach passes only. A row deleted later, by the unreachable sweep or
-        by :meth:`prune_registry`, keeps whatever outcome its last pass gave
-        it; those deletions arrive as ``REGISTRY_PRUNED``, which a subscriber
-        registered after startup does receive. Between them the two cover every
-        registration that goes away: this property for the boot passes a late
-        subscriber missed, the action for everything after.
+        Reattach passes only, the one the unreachable sweep runs for the rows
+        it finds reachable again included; that one restores onto the
+        messages the sweep just fetched, so it deletes nothing. A row deleted
+        later, by the unreachable sweep or by :meth:`prune_registry`, keeps
+        whatever outcome its last pass gave it; those deletions arrive as
+        ``REGISTRY_PRUNED``, which a subscriber registered after startup does
+        receive. Between them the two cover every registration that goes away:
+        this property for the boot passes a late subscriber missed, the action
+        for everything after.
         """
         totals: dict[str, list[str]] = {
             "restored": [],
@@ -1075,7 +1100,10 @@ class PersistenceManager:
         Both walks dispatch ``REGISTRY_PRUNED`` while they hold the lock, and
         store hooks run inline, so a hook that starts another walk in the
         same task would wait forever on its own caller. It raises instead,
-        naming the fix; a walk started from any other task simply waits.
+        naming the fix; a walk started from any other task simply waits. A
+        task the running walk awaits (``asyncio.gather``, or ``wait_for``
+        before Python 3.12) looks like any other task here, so a long wait
+        logs a warning after a minute that names this cause.
         """
         current = asyncio.current_task()
         if current is not None and self._registry_walk_owner is current:
@@ -1083,17 +1111,47 @@ class PersistenceManager:
                 f"{name}() was called from inside a running reattach pass or "
                 f"prune_unreachable() in the same task (a REGISTRY_PRUNED hook, "
                 f"for example), where it would wait forever for the walk that "
-                f"called it. Schedule it on its own task instead: "
-                f"asyncio.create_task(...)."
+                f"called it. Start it on a task of its own and do not await that "
+                f"task from inside the walk."
             )
-        async with self._loop_lock("registry_walk"):
-            self._registry_walk_owner = current
-            try:
-                return await walk()
-            finally:
-                self._registry_walk_owner = None
+        lock = self._loop_lock("registry_walk")
+        watchdog = None
+        if lock.locked():
+            watchdog = asyncio.get_running_loop().call_later(
+                _REGISTRY_WALK_WAIT_WARN_SECONDS, self._warn_long_walk_wait, name
+            )
+        try:
+            async with lock:
+                if watchdog is not None:
+                    watchdog.cancel()
+                self._registry_walk_owner = current
+                try:
+                    return await walk()
+                finally:
+                    self._registry_walk_owner = None
+        finally:
+            if watchdog is not None:
+                watchdog.cancel()
 
-    async def _reattach_pass(self) -> dict[str, list[str]]:
+    @staticmethod
+    def _warn_long_walk_wait(name: str) -> None:
+        logger.warning(
+            f"{name}() has waited {_REGISTRY_WALK_WAIT_WARN_SECONDS:.0f}s for a reattach pass "
+            f"or prune_unreachable() already running. If that walk awaits this call "
+            f"through a task it started (asyncio.gather, or wait_for before Python "
+            f"3.12), the two wait on each other: start the call without awaiting it."
+        )
+
+    async def _reattach_pass(
+        self, prefetched: Optional[dict[str, tuple]] = None
+    ) -> dict[str, list[str]]:
+        """One reattach pass over the pending rows.
+
+        With ``prefetched`` (persistence key -> the ``(channel, message)`` a
+        fetch just returned), only those rows are restored, onto those
+        messages, with no fetch of their own: nothing in the pass can find
+        a 404, so it deletes nothing.
+        """
         summary: dict[str, list[str]] = {
             "restored": [],
             "skipped": [],
@@ -1132,6 +1190,7 @@ class PersistenceManager:
             for r in self._registry_rows
             if r.get("persistence_key") not in self._restored_keys
             and r.get("persistence_key") not in live_keys
+            and (prefetched is None or r.get("persistence_key") in prefetched)
         ]
         if not rows:
             return summary
@@ -1188,8 +1247,13 @@ class PersistenceManager:
                     # Summary list already populated by _migrate_init_kwargs.
                     return None
 
-                async with sem:
-                    fetched = await self._fetch_restore_message(row, removed_keys, unreachable_keys)
+                if prefetched is not None:
+                    fetched = prefetched[persistence_key]
+                else:
+                    async with sem:
+                        fetched = await self._fetch_restore_message(
+                            row, removed_keys, unreachable_keys
+                        )
                 if fetched is None:
                     # Already appended to removed_keys or unreachable_keys.
                     return None
@@ -1209,74 +1273,84 @@ class PersistenceManager:
                 summary["failed"].append(persistence_key)
                 return None
 
-        prepared = await asyncio.gather(*(_prepare(row) for row in rows))
-
-        # Phase 2 (serial): construct + register each prepared view. Store
-        # mutation (add_view, _register_view) must stay serial -- concurrent
-        # dispatches would race the shared registries.
         restored_views: list = []
-        for item in prepared:
-            if item is None:
-                continue
-            if _bot_closed(bot):
-                break
-            row, view_cls, init_kwargs, message = item
-            # A send under the key while the fetches ran made its own panel;
-            # a second one here would share the message it took.
-            if self._store._holds_persistence_key(row["persistence_key"]):
-                continue
-            outcome = await self._reattach_one(
-                row, view_cls, init_kwargs, message, row["view_class"], restored_views
-            )
-            if outcome is not None:
-                summary[outcome].append(row["persistence_key"])
+        try:
+            prepared = await asyncio.gather(*(_prepare(row) for row in rows))
 
-        # Rows whose channel or message disappeared while offline are pruned.
-        # Nothing here may escape the pass: phase 2 already registered views,
-        # and an abort would skip their post-ready repaint and raise out of
-        # setup_middleware.
-        if removed_keys:
-            verdicted = {r.get("persistence_key"): r for r in rows}
-            confirmed, rewritten, unverified = await self._confirm_unchanged(
-                removed_keys, verdicted
-            )
-            if confirmed:
-                try:
-                    await self._prune_as("reattach", confirmed, "gone")
-                    summary["removed"].extend(confirmed)
-                except Exception as exc:
-                    logger.warning(
-                        f"Pruning {len(confirmed)} gone row(s) failed mid-reattach: {exc}. "
-                        f"The rows stay on disk and the next pass re-verdicts them."
-                    )
-                    summary["failed"].extend(confirmed)
-            # A rewritten row names a message this pass never fetched: reported
-            # unreachable and kept for the next pass, with no stamp, since
-            # nothing about the new message failed.
-            summary["unreachable"].extend(rewritten)
-            summary["failed"].extend(unverified)
-        # Transiently unreachable rows are NOT pruned -- they stay on disk so a
-        # clean restart retries the fetch. Reported separately so a consumer
-        # does not mistake a momentary glitch for a definitive deletion.
-        if unreachable_keys:
-            summary["unreachable"].extend(unreachable_keys)
-            await self._write_unreachable_stamps(unreachable_keys, int(time.time()))
-        if reachable_keys:
-            await self._write_unreachable_stamps(reachable_keys, None)
+            # Phase 2 (serial): construct + register each prepared view. Store
+            # mutation (add_view, _register_view) must stay serial -- concurrent
+            # dispatches would race the shared registries.
+            for item in prepared:
+                if item is None:
+                    continue
+                if _bot_closed(bot):
+                    break
+                row, view_cls, init_kwargs, message = item
+                # A send under the key while the fetches ran made its own panel;
+                # a second one here would share the message it took.
+                if self._store._holds_persistence_key(row["persistence_key"]):
+                    continue
+                outcome = await self._reattach_one(
+                    row, view_cls, init_kwargs, message, row["view_class"], restored_views
+                )
+                if outcome is not None:
+                    summary[outcome].append(row["persistence_key"])
 
-        # on_restore reads the bot cache, cold during setup_hook, so each render
-        # waits for the gateway; the views already route clicks. A bot that
-        # closed during the pass never becomes ready.
-        if restored_views and not _bot_closed(bot):
-            task = asyncio.create_task(self._run_post_ready_restore(restored_views))
-            task.add_done_callback(self._on_post_ready_restore_done)
-            self._post_ready_restore_tasks.add(task)
-
-        # Remember what this pass restored so a later reattach() skips it,
-        # but not a panel its bot's close released during the pass.
-        self._restored_keys.update(
-            key for key in summary["restored"] if self._store._holds_persistence_key(key)
-        )
+            # Rows whose channel or message disappeared while offline are pruned.
+            # Nothing here may escape the pass: phase 2 already registered views,
+            # and an error here would raise out of setup_middleware.
+            if removed_keys:
+                verdicted = {r.get("persistence_key"): r for r in rows}
+                confirmed, rewritten, unverified = await self._confirm_unchanged(
+                    removed_keys, verdicted
+                )
+                if confirmed:
+                    try:
+                        await self._prune_as("reattach", confirmed, "gone")
+                        summary["removed"].extend(confirmed)
+                    except (Exception, asyncio.CancelledError) as exc:
+                        # Rows deleted before the failure have left the mirror.
+                        left = {r.get("persistence_key") for r in self._registry_rows}
+                        summary["removed"].extend(k for k in confirmed if k not in left)
+                        if isinstance(exc, asyncio.CancelledError):
+                            raise
+                        kept = [k for k in confirmed if k in left]
+                        if kept:
+                            logger.warning(
+                                f"Pruning {len(kept)} of {len(confirmed)} gone row(s) failed "
+                                f"mid-reattach: {exc}. Those rows stay on disk and the next "
+                                f"pass re-verdicts them."
+                            )
+                        else:
+                            logger.warning(
+                                f"The {len(confirmed)} gone row(s) pruned mid-reattach were "
+                                f"deleted, but announcing them failed: {exc}"
+                            )
+                        summary["failed"].extend(kept)
+                # A rewritten row names a message this pass never fetched: reported
+                # unreachable and kept for the next pass, with no stamp, since
+                # nothing about the new message failed.
+                summary["unreachable"].extend(rewritten)
+                summary["failed"].extend(unverified)
+            # Transiently unreachable rows are NOT pruned -- they stay on disk so a
+            # clean restart retries the fetch. Reported separately so a consumer
+            # does not mistake a momentary glitch for a definitive deletion.
+            if unreachable_keys:
+                summary["unreachable"].extend(unreachable_keys)
+                await self._write_unreachable_stamps(unreachable_keys, int(time.time()))
+            if prefetched is not None:
+                # The sweep's restore: the sweep stamped these rows when their
+                # messages answered, and a stamp clears only for a panel that
+                # came back.
+                restored = set(summary["restored"])
+                reachable_keys = [key for key in reachable_keys if key in restored]
+            if reachable_keys:
+                await self._write_unreachable_stamps(reachable_keys, None)
+        finally:
+            # On every exit, a cancel included: the views restored so far stay
+            # live and route clicks, so their repaint is scheduled and their
+            # outcomes recorded.
+            self._finish_reattach_pass(summary, restored_views, bot)
 
         # One aggregate summary (counts, not the full key lists) so a bot with
         # hundreds of persistent views does not flood startup; per-view detail
@@ -1296,16 +1370,17 @@ class PersistenceManager:
             )
             logger.warning(
                 f"{sum(missing_classes.values())} persistent view row(s) still have "
-                f"no imported class after a reattach() pass; their messages stay dead "
-                f"until a class registers under the stored name. Unresolved: "
+                f"no imported class on a reattach pass after the first; their messages "
+                f"stay dead until a class registers under the stored name. Unresolved: "
                 f"{unresolved}. A moved or renamed class re-registers by setting "
                 f"session_class_key to the stored name. Keys at DEBUG on this logger."
             )
         if summary["unreachable"]:
             logger.warning(
                 f"{len(summary['unreachable'])} persistent view(s) could not be reached "
-                f"(missing permissions, a channel that is gone, or a row re-posted "
-                f"mid-pass); the rows are kept and retried next restart. Keys at DEBUG "
+                f"(missing permissions, no answer from Discord, a rate limit or server "
+                f"error, or a row re-posted mid-pass); the rows are kept and retried "
+                f"next restart. Keys at DEBUG "
                 f"on this logger."
             )
         return summary
@@ -1398,21 +1473,37 @@ class PersistenceManager:
         row: dict[str, Any],
         removed_keys: list[str],
         unreachable_keys: list[str],
+        unanswered_keys: Optional[list[str]] = None,
     ) -> Optional[tuple[Any, Any]]:
         """Fetch the target channel and message for a registry row.
 
         Returns ``None`` when the channel or message cannot be fetched. A
         definitive ``discord.NotFound`` appends to ``removed_keys`` and the row
-        is pruned. A transient failure (``Forbidden``, ``HTTPException``, or a
-        non-messageable channel) appends to ``unreachable_keys`` instead, which
-        leaves the row on disk so a clean restart can retry it. A momentary
-        permission change or 5xx during the startup mass-fetch must not delete a
-        still-existing panel."""
+        is pruned. A transient failure (any other error in ``DISCORD_CALL_ERRORS``,
+        ``Forbidden`` included, a channel type the installed discord.py cannot
+        read, or a non-messageable channel) appends to
+        ``unreachable_keys`` instead, which leaves the row on disk so a clean
+        restart can retry it. A momentary permission change or 5xx during the
+        startup mass-fetch must not delete a still-existing panel.
+
+        With ``unanswered_keys``, a failure that says nothing about the
+        message (no answer from Discord, a rate limit, a server error, a
+        channel type the installed discord.py cannot read) goes there
+        instead; only ``Forbidden`` and a channel that cannot hold messages
+        stay in ``unreachable_keys``."""
         import discord
 
         persistence_key = row["persistence_key"]
         channel_id = row["channel_id"]
         message_id = row["message_id"]
+
+        def file_unreachable(exc: Optional[BaseException]) -> None:
+            # ``exc`` is None for a channel that cannot hold messages.
+            said_nothing = exc is not None and not isinstance(exc, discord.Forbidden)
+            if said_nothing and unanswered_keys is not None:
+                unanswered_keys.append(persistence_key)
+            else:
+                unreachable_keys.append(persistence_key)
 
         try:
             channel = self._bot.get_channel(int(channel_id))
@@ -1427,15 +1518,16 @@ class PersistenceManager:
             discord.InvalidData,
             *DISCORD_CALL_ERRORS,
         ) as exc:
-            # InvalidData, RateLimited, and aiohttp's transport errors are not
-            # HTTPException subclasses: uncaught they would log the row as failed,
-            # with a traceback and no unreachable stamp. Transport errors are
-            # likeliest at boot, before the host has its connection.
+            # InvalidData, RateLimited, aiohttp's transport errors, and its total
+            # timeout are not HTTPException subclasses: uncaught they would log
+            # the row as failed, with a traceback and no unreachable stamp.
+            # Transport errors are likeliest at boot, before the host has its
+            # connection.
             logger.debug(
                 f"Could not reach channel {channel_id} for {persistence_key!r} "
                 f"({type(exc).__name__}); leaving the entry for the next restart."
             )
-            unreachable_keys.append(persistence_key)
+            file_unreachable(exc)
             return None
 
         if not isinstance(channel, discord.abc.Messageable):
@@ -1443,7 +1535,7 @@ class PersistenceManager:
                 f"Channel {channel_id} for {persistence_key!r} is not messageable "
                 f"({type(channel).__name__}); leaving the entry for the next restart."
             )
-            unreachable_keys.append(persistence_key)
+            file_unreachable(None)
             return None
 
         try:
@@ -1457,7 +1549,7 @@ class PersistenceManager:
                 f"Could not reach message {message_id} for {persistence_key!r} "
                 f"({type(exc).__name__}); leaving the entry for the next restart."
             )
-            unreachable_keys.append(persistence_key)
+            file_unreachable(exc)
             return None
 
         return channel, message
@@ -1539,12 +1631,17 @@ class PersistenceManager:
             confirmed.append(key)
         return confirmed, rewritten, unverified
 
-    async def _write_unreachable_stamps(self, keys: list[str], stamp: Optional[int]) -> None:
+    async def _write_unreachable_stamps(
+        self, keys: list[str], stamp: Optional[int], *, start_over: bool = False
+    ) -> None:
         """Set or clear ``first_unreachable_at`` on registry rows.
 
         ``stamp=None`` clears. Setting preserves an existing value, because
         the column records the FIRST failure: refreshing it on every boot
         would reset the age of exactly the rows that have earned one.
+        ``start_over`` replaces it, so the age counts from ``stamp``: the
+        sweep's re-check found the row's message, and the restore clears the
+        stamp only for a panel it brings back.
 
         Each row is read back from disk and written whole. A partial upsert
         is not an option: ``InMemoryBackend`` replaces the stored row, so a
@@ -1562,11 +1659,16 @@ class PersistenceManager:
 
         mirror = {r.get("persistence_key"): r for r in self._registry_rows}
 
+        def written(current: Optional[int]) -> bool:
+            if start_over and stamp is not None:
+                return current == stamp
+            return (stamp is None) == (current is None)
+
         for key in keys:
             cached = mirror.get(key)
             if cached is not None:
                 # Cheap agreement check first: the common boot writes nothing.
-                if (stamp is None) == (cached.get("first_unreachable_at") is None):
+                if written(cached.get("first_unreachable_at")):
                     continue
             try:
                 found = await backend.row_select(TABLE_PERSISTENT_VIEWS, {"persistence_key": key})
@@ -1588,7 +1690,7 @@ class PersistenceManager:
                     )
                     continue
 
-                if (stamp is None) == (current.get("first_unreachable_at") is None):
+                if written(current.get("first_unreachable_at")):
                     continue
 
                 if Capability.RAW_SQL in backend.capabilities:
@@ -1655,9 +1757,10 @@ class PersistenceManager:
         """
         persistence_key = row["persistence_key"]
         view = None
-        # Set once SESSION_CREATED and VIEW_CREATED landed, so a later failure's
-        # rollback knows to dispatch VIEW_DESTROYED.
-        state_registered = False
+        # Set once the view is in the store's active-view index. From then a failure's
+        # rollback goes through _destroy_view, since a raise or cancel inside
+        # _register_state can leave SESSION_CREATED or VIEW_CREATED committed.
+        registered = False
         try:
             # The middleware drops these at write too; a row an older release
             # wrote can still carry them.
@@ -1706,23 +1809,29 @@ class PersistenceManager:
             # the order used by _send_pipeline -- subscribers and instance
             # limit checks see a consistent state row at every step.
             self._store._register_view(view)
+            registered = True
 
             # One BATCH_COMPLETE per restored view instead of three notification
             # cycles, sourced from the view as _send_pipeline's batch is.
             async with self._store.batch(source_id=view.id):
-                await view._register_state()
-                state_registered = True
-                await view._update_message_state(message)
-                # Stamped before the hook so the view can reach the client
-                # even when the override does not store it. A restored view
-                # has no interaction and no context, so this is the only
-                # route to the bot's own allowed_mentions on later refreshes.
-                view._bot = self._bot
-                # on_bind runs here so runtime deps are available before the
-                # deferred on_restore render. Supports sync or async overrides.
-                bind_result = view.on_bind(self._bot)
-                if inspect.isawaitable(bind_result):
-                    await bind_result
+                try:
+                    await view._register_state()
+                    await view._update_message_state(message)
+                    # Stamped before the hook so the view can reach the client
+                    # even when the override does not store it. A restored view
+                    # has no interaction and no context, so this is the only
+                    # route to the bot's own allowed_mentions on later refreshes.
+                    view._bot = self._bot
+                    # on_bind runs here so runtime deps are available before the
+                    # deferred on_restore render. Supports sync or async overrides.
+                    bind_result = view.on_bind(self._bot)
+                    if inspect.isawaitable(bind_result):
+                        await bind_result
+                except BaseException:
+                    # Before the batch closes: it announces what committed, and
+                    # a view that rendered it would edit the panel's message.
+                    self._store._unsubscribe(view.id)
+                    raise
 
             # on_restore is deferred to _run_post_ready_restore (after
             # wait_until_ready) so its gateway-cache reads land warm.
@@ -1735,10 +1844,16 @@ class PersistenceManager:
             logger.debug(f"Reattached persistent view {persistence_key!r} ({class_name})")
             return "restored"
 
-        except Exception as exc:
+        except BaseException as exc:
+            # A cancel (the manager closing during an unreachable sweep's
+            # restore) rolls the view back too, then propagates; the row
+            # stays pending.
+            failed = isinstance(exc, Exception)
             # An on_bind that reaches Discord through a closed bot raises.
-            closed = _bot_closed(self._bot) and _refused_by_closed_session(exc)
-            if closed:
+            closed = failed and _bot_closed(self._bot) and _refused_by_closed_session(exc)
+            if not failed:
+                logger.debug(f"Restore of {persistence_key!r} was cut off; rolling it back")
+            elif closed:
                 logger.debug(f"Left {persistence_key!r} for the next bot: its bot closed")
             else:
                 logger.error(
@@ -1746,20 +1861,24 @@ class PersistenceManager:
                     exc_info=True,
                 )
             if view is not None:
-                # Mirror the v2 rollback: __init__ already installed a
-                # subscriber + registry entry + undo-tracking row, all
-                # of which must go back before the next row is tried.
+                # __init__ subscribed the view and added its undo row, and
+                # _register_view filed it in the active-view index: all of it
+                # goes back before the next row is tried.
                 self._store._unsubscribe(view.id)
                 self._store._undo_enabled_views.pop(view.id, None)
+                # Work on_bind started under the view's id would outlive it.
+                view.task_manager._cancel_for_teardown(view.id, keep_caller=True)
                 # bot.add_view() may already route the message's clicks to it.
                 view.stop()
-                if state_registered:
+                if registered:
                     # _destroy_view clears the registry entry only once state
-                    # confirms the removal, and drops a session left memberless.
+                    # confirms the removal, and drops a session left memberless,
+                    # including one whose VIEW_CREATED never committed.
                     await self._store._destroy_view(view.id)
                 else:
-                    # State never registered; just drop the active entry.
                     self._store._unregister_view(view.id)
+            if not failed:
+                raise
             return None if closed else "failed"
 
     def register_hook(self, name: str, callback: Callable[..., Any]) -> None:
@@ -2085,28 +2204,65 @@ class PersistenceManager:
         if backend is None:
             return 0
 
-        deleted = 0
-        # Collect the keys actually removed (row_delete reported a row) so a
-        # subscriber can reconcile its own records surgically, instead of
-        # sweeping its whole domain against the registry. A key passed in but
-        # absent on disk is not reported.
-        pruned: list[str] = []
-        if persistence_keys is None:
-            # Clear all: row_select + row_delete per row. Callers who
-            # hit this path are rare (test cleanup, admin tooling).
-            rows = await backend.row_select(TABLE_PERSISTENT_VIEWS)
-            for r in rows:
-                if await backend.row_delete(
-                    TABLE_PERSISTENT_VIEWS, {"persistence_key": r["persistence_key"]}
-                ):
-                    pruned.append(r["persistence_key"])
-                    deleted += 1
-        else:
-            for sk in persistence_keys:
-                if await backend.row_delete(TABLE_PERSISTENT_VIEWS, {"persistence_key": sk}):
-                    pruned.append(sk)
-                    deleted += 1
+        # The keys actually removed (row_delete reported a row), each with the
+        # message and channel its row named, so a subscriber can reconcile its
+        # own records surgically instead of sweeping its whole domain against
+        # the registry. A key passed in but absent on disk is not reported.
+        pruned: dict[str, dict[str, Optional[str]]] = {}
+        try:
+            if persistence_keys is None:
+                # Clear all: row_select + row_delete per row. Callers who
+                # hit this path are rare (test cleanup, admin tooling).
+                rows = await backend.row_select(TABLE_PERSISTENT_VIEWS)
+                for r in rows:
+                    key = r["persistence_key"]
+                    if await backend.row_delete(TABLE_PERSISTENT_VIEWS, {"persistence_key": key}):
+                        pruned[key] = self._pruned_message(r)
+            else:
+                for sk in persistence_keys:
+                    # Read from disk: the store's copies already describe a
+                    # registration whose flush may not have written it yet.
+                    found = await backend.row_select(
+                        TABLE_PERSISTENT_VIEWS, {"persistence_key": sk}
+                    )
+                    if await backend.row_delete(TABLE_PERSISTENT_VIEWS, {"persistence_key": sk}):
+                        pruned[sk] = self._pruned_message(found[0] if found else {})
+        except (Exception, asyncio.CancelledError):
+            # The rows deleted before the failure are gone from disk, so they
+            # leave the mirrors and are announced before the error goes on.
+            if pruned:
+                try:
+                    await self._record_pruned(pruned, reason, persistence_keys, source)
+                except Exception as exc:
+                    logger.warning(
+                        f"Could not announce {len(pruned)} registry row(s) pruned before "
+                        f"the prune failed: {exc}",
+                        exc_info=exc,
+                    )
+            raise
+        await self._record_pruned(pruned, reason, persistence_keys, source)
+        return len(pruned)
 
+    @staticmethod
+    def _pruned_message(row: dict) -> dict[str, Optional[str]]:
+        """The message and channel a registry row read from disk names.
+
+        Ids are strings, as the store's mirror holds them; a missing one is
+        ``None``.
+        """
+        return {
+            field: None if row.get(field) is None else str(row[field])
+            for field in ("message_id", "channel_id")
+        }
+
+    async def _record_pruned(
+        self,
+        pruned: dict[str, dict[str, Optional[str]]],
+        reason: Optional[str],
+        persistence_keys: Optional[list[str]],
+        source: str,
+    ) -> None:
+        """Drop pruned rows from both mirrors and dispatch ``REGISTRY_PRUNED``."""
         # Drop the pruned rows from this process's mirror. Without it a later
         # reattach() re-drive walks rows whose messages are already gone and
         # spends one HTTP fetch per dead row per pass, which is the same cost
@@ -2134,30 +2290,37 @@ class PersistenceManager:
         await self._store.dispatch(
             "REGISTRY_PRUNED",
             ActionCreators.registry_pruned(
-                deleted,
+                len(pruned),
                 reason or ("explicit" if persistence_keys else "clear_all"),
-                keys=pruned,
+                keys=list(pruned),
                 source=source,
+                messages=pruned,
             ),
         )
-        return deleted
 
     async def prune_unreachable(self, *, older_than_days: int) -> dict[str, list[str]]:
         """Delete registry rows that have stayed unreachable past a cutoff.
 
         Candidates are rows carrying a ``first_unreachable_at`` stamp, set
         when a reattach pass cannot fetch the row's channel or message for a
-        non-definitive reason and cleared the moment a fetch succeeds. Every
-        candidate is re-verified against Discord before anything is deleted:
+        non-definitive reason and cleared when a reattach pass fetches it.
+        Every candidate is re-verified against Discord before anything is
+        deleted:
 
-        - the fetch succeeds: the row is kept and its stamp cleared
-          (``recovered``);
+        - the fetch succeeds: the row is kept, its stamp replaced with the
+          time of this check, and its panel restored as a :meth:`reattach`
+          pass restores it, which clears the stamp (``recovered``). A row
+          whose restore fails or is cut off keeps the new stamp (``kept``),
+          so the next sweep tries it again and its age counts from now;
         - ``discord.NotFound``: deleted whatever its age (``pruned``), the
           same definitive verdict a reattach pass already prunes on;
         - still unreachable: deleted only when the stamp predates the cutoff
           (``pruned``), kept otherwise (``kept``). A row rewritten mid-pass,
           or one whose pre-delete re-read failed at the backend, is kept too:
-          neither verdict describes the row as it stands.
+          neither verdict describes the row as it stands. So is a row whose
+          re-check got no verdict on the message (no answer, a rate limit, a
+          server error): only ``Forbidden``, or a channel that cannot hold
+          messages, counts as still unreachable.
 
         Re-verifying is what makes this safe to run. A stamp records one
         observation, so a host that simply has not rebooted for a month
@@ -2229,6 +2392,8 @@ class PersistenceManager:
         cutoff = int(time.time()) - older_than_days * 86400
         kill: list[str] = []
         gone: set[str] = set()
+        # The messages fetched below belong to this client.
+        bot = self._bot
 
         # Bounded fan-out, the same shape the reattach pass uses for the same
         # two fetches: this walk holds the registry lock, and its candidate
@@ -2238,31 +2403,42 @@ class PersistenceManager:
 
         async def _verify(row: dict[str, Any]) -> tuple[Optional[Any], list[str], bool]:
             removed_scratch: list[str] = []
+            unanswered: list[str] = []
             try:
                 async with sem:
-                    fetched = await self._fetch_restore_message(row, removed_scratch, [])
+                    fetched = await self._fetch_restore_message(
+                        row, removed_scratch, [], unanswered
+                    )
             except Exception as exc:
                 # Reported as unverified, not as a failed fetch: an aged row
                 # whose re-check never produced an answer would otherwise fall
                 # through to the cutoff below and be deleted on no evidence.
+                if _bot_closed(bot) and _refused_by_closed_session(exc):
+                    logger.debug(
+                        f"Left {row.get('persistence_key')!r} for the next bot: its bot closed"
+                    )
+                    return None, [], False
                 logger.warning(
                     f"Re-verifying {row.get('persistence_key')!r} for the unreachable "
                     f"sweep failed; keeping the row: {exc}",
                     exc_info=exc,
                 )
                 return None, [], False
-            return fetched, removed_scratch, True
+            # A re-check Discord never answered, or answered with a rate limit
+            # or a server error, says nothing about the message, so the row is
+            # kept like an unverified one.
+            return fetched, removed_scratch, not unanswered
 
         verified = await asyncio.gather(*(_verify(row) for row in candidates))
 
-        recovered: list[str] = []
+        # Persistence key -> the (channel, message) the re-check fetched.
+        recovered: dict[str, tuple] = {}
         for row, (fetched, removed_scratch, checked) in zip(candidates, verified):
             key = row.get("persistence_key")
             if not checked:
                 summary["kept"].append(key)
             elif fetched is not None:
-                summary["recovered"].append(key)
-                recovered.append(key)
+                recovered[key] = fetched
             elif removed_scratch:
                 # A definitive 404. Age is irrelevant; the message is gone.
                 kill.append(key)
@@ -2273,34 +2449,87 @@ class PersistenceManager:
                 summary["kept"].append(key)
 
         if recovered:
-            # One write for the batch: a recovered row's stamp is cleared so
-            # its next unreachable spell starts its own age window.
-            await self._write_unreachable_stamps(recovered, None)
+            # These messages answered, so the old age no longer describes their
+            # rows: a new one starts now, before anything below can be cut off.
+            # The restore clears it for each panel it brings back.
+            await self._write_unreachable_stamps(list(recovered), int(time.time()), start_over=True)
 
+        # Raised once the recovered panels are restored, so a failed deletion
+        # does not leave them dead until the next sweep.
+        prune_error: Optional[Exception] = None
         if kill:
-            # Re-read before deleting -- see _confirm_unchanged for why. The
-            # reattach pass guards this same shape on its own 404s; this is
-            # the second destructive caller and needs the identical guard.
-            verdicted = {r["persistence_key"]: r for r in candidates}
-            confirmed, rewritten, unverified = await self._confirm_unchanged(kill, verdicted)
-            summary["kept"].extend(rewritten)
-            # Unverified means the re-read itself failed, so the verdict was
-            # never checked against the live row. Kept, not pruned: deleting
-            # on an unread verdict is the blindness the re-read prevents.
-            summary["kept"].extend(unverified)
-            deleted = [key for key in confirmed if key in gone]
-            aged = [key for key in confirmed if key not in gone]
-            if deleted:
-                await self._prune_as("prune_unreachable", deleted, "gone")
-            if aged:
-                await self._prune_as("prune_unreachable", aged, "unreachable")
-            summary["pruned"].extend(confirmed)
-            summary["gone"].extend(deleted)
+            try:
+                # Re-read before deleting -- see _confirm_unchanged for why. The
+                # reattach pass guards this same shape on its own 404s; this is
+                # the second destructive caller and needs the identical guard.
+                verdicted = {r["persistence_key"]: r for r in candidates}
+                confirmed, rewritten, unverified = await self._confirm_unchanged(kill, verdicted)
+                summary["kept"].extend(rewritten)
+                # Unverified means the re-read itself failed, so the verdict was
+                # never checked against the live row. Kept, not pruned: deleting
+                # on an unread verdict is the blindness the re-read prevents.
+                summary["kept"].extend(unverified)
+                deleted = [key for key in confirmed if key in gone]
+                aged = [key for key in confirmed if key not in gone]
+                if deleted:
+                    await self._prune_as("prune_unreachable", deleted, "gone")
+                if aged:
+                    await self._prune_as("prune_unreachable", aged, "unreachable")
+                summary["pruned"].extend(confirmed)
+                summary["gone"].extend(deleted)
+            except Exception as exc:
+                prune_error = exc
+
+        restored: set[str] = set()
+        if recovered and (self._bot is not bot or _bot_closed(bot)):
+            # Messages fetched through a client that has closed would carry its
+            # closed session into every edit. The rows stay for the next bot.
+            logger.debug(
+                f"Left {len(recovered)} recovered panel(s) for the next bot: "
+                f"the bot closed during the sweep"
+            )
+        elif recovered:
+            # The message answers again, so its panel comes back now instead of
+            # at the next restart, onto the message just fetched: the restore
+            # fetches nothing, so it prunes nothing, and every deletion in a
+            # sweep is the sweep's own. Inside this walk, which already holds
+            # the lock a reattach() re-drive would wait on.
+            try:
+                restore = await self._reattach_pass(prefetched=recovered)
+            except asyncio.CancelledError:
+                if prune_error is not None:
+                    logger.warning(
+                        f"prune_unreachable() was cancelled after a deletion failed: {prune_error}",
+                        exc_info=prune_error,
+                    )
+                raise
+            except Exception as exc:
+                logger.warning(
+                    f"Restoring {len(recovered)} recovered panel(s) failed: {exc}. "
+                    f"The next sweep, reattach(), or a restart restores them.",
+                    exc_info=exc,
+                )
+            else:
+                restored = set(restore["restored"])
+                # A row the restore never took up (a panel in this process
+                # holds its key, this process never read the row, or the
+                # bot closed first) is not the sweep's to restore, and its
+                # message answered.
+                tried = restored | set(restore["skipped"]) | set(restore["failed"])
+                untried = [key for key in recovered if key not in tried]
+                if untried:
+                    await self._write_unreachable_stamps(untried, None)
+        # A row whose panel did not come back keeps the new stamp, so the next
+        # sweep tries the restore again.
+        summary["recovered"].extend(key for key in recovered if key in restored)
+        summary["kept"].extend(key for key in recovered if key not in restored)
+        if prune_error is not None:
+            raise prune_error
 
         logger.info(
             f"prune_unreachable: {len(summary['pruned'])} pruned, "
-            f"{len(summary['recovered'])} recovered, {len(summary['kept'])} still within "
-            f"the {older_than_days}d cutoff."
+            f"{len(summary['recovered'])} recovered, {len(summary['kept'])} kept (inside "
+            f"the {older_than_days}d cutoff, or not confirmed unreachable)."
         )
         logger.debug(f"prune_unreachable keys: {summary}")
         return summary
@@ -2356,8 +2585,9 @@ class PersistenceManager:
     async def _close_now(self) -> None:
         self._close_started = True
         # Cancel the sweepers first. Each sleeps between runs and a cancelled
-        # prune loses nothing: it drains no buffer, and a partial prune leaves
-        # rows the next boot re-seeds the store from.
+        # sweep loses nothing: it drains no buffer, a partial prune leaves rows
+        # the next boot re-seeds the store from, and a restore it cuts off rolls
+        # its view back.
         for field in ("_ttl_sweeper_task", "_unreachable_sweeper_task"):
             task = getattr(self, field)
             if task is None:

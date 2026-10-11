@@ -2039,6 +2039,14 @@ class StateStore:
             named = {getattr(view, "session_id", None) for view in self._active_views.values()}
             sessions = {view.session_id for view in released} - named
             self._drop_released(ids, empty_sessions=sessions)
+        if manager is not None:
+            # A restored key no view holds any more (a pushed screen that timed
+            # out without returning to its panel keeps the panel's row) is
+            # restored again too, as a process restart would restore it.
+            stale = {k for k in manager._restored_keys if not self._holds_persistence_key(k)}
+            if stale:
+                manager._restored_keys -= stale
+                self._restore_owed = True
 
     def _drop_released(self, view_ids=None, empty_sessions=()) -> None:
         """Remove from the state the views a bot's close released, or ``view_ids``.

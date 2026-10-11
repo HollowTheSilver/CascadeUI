@@ -149,6 +149,23 @@ class TestRejectPolicy:
         assert captured[0].view_type == "_RejectView"
         assert captured[0].limit == 1
 
+    async def test_a_notice_discord_never_answered_does_not_raise(self, caplog):
+        """aiohttp's total timeout raises a plain TimeoutError, which the
+        default hook's catch missed, so it reached the command."""
+        import asyncio
+        import logging
+
+        view = StatefulView(interaction=_make_interaction())
+        view.interaction = None
+        view.context = MagicMock()
+        view.context.send = AsyncMock(side_effect=asyncio.TimeoutError())
+
+        with caplog.at_level(logging.DEBUG, logger="cascadeui"):
+            await view.on_instance_limit(InstanceLimitError("StatefulView", 1))
+
+        view.context.send.assert_awaited_once()
+        assert "Could not send instance limit response" in caplog.text
+
 
 # // ========================================( Scope Isolation )======================================== // #
 

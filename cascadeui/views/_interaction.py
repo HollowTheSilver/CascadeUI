@@ -17,8 +17,10 @@ from ..utils.deprecation import REMOVED_IN, warn_deprecated
 from ..utils.hooks import await_maybe
 from ..utils.responses import (
     DISCORD_CALL_ERRORS,
+    _collect_skipped_answers,
     _collect_stalled_renders,
     ack_backstop,
+    answer_with_skipped_render,
     describe_discord_error,
     open_modal_safe,
     respond_safe,
@@ -31,6 +33,12 @@ logger = logging.getLogger(__name__)
 
 # The arrival number of the click being handled, or None outside a click.
 _CLICK_ORDER: ContextVar[Optional[int]] = ContextVar("cascadeui_click_order", default=None)
+
+# True while _redraw_for_click renders, so refresh() ships an unchanged tree
+# as the interaction's answer instead of skipping it.
+_ANSWERING_WITH_RENDER: ContextVar[bool] = ContextVar(
+    "cascadeui_answering_with_render", default=False
+)
 
 _SELECT_COMPONENT_TYPES = frozenset(
     t.value
@@ -140,7 +148,10 @@ class _InteractionMixin:
         4. **Stale-click drop** -- a click is numbered on arrival, waits out a
            push or pop in flight, and is acknowledged and dropped without
            running its callback when the view has closed or navigated away,
-           or the item is disabled.
+           or the item is disabled. Under ``serialize_interactions``, a click
+           on a disabled item of an open view whose reply is still owed is
+           answered with the view's current render, which corrects a screen
+           showing an older one.
         """
         # Numbered on arrival, before the lock, so a callback can tell a click
         # queued behind another from one sent after it finished.
@@ -161,8 +172,12 @@ class _InteractionMixin:
                 # fetches a member runs on the 3s clock too, and Discord drops an
                 # interaction left unacked (10062). A deferred interaction can
                 # still be refused: on_unauthorized replies through a followup.
+                # A click on a control already disabled is answered by the
+                # library whatever auto_defer says, and may wait for the lock
+                # first, so it gets the timer too.
                 defer_task = None
-                if self.auto_defer and not interaction.response.is_done():
+                disabled = getattr(item, "disabled", False) is True
+                if (self.auto_defer or disabled) and not interaction.response.is_done():
                     defer_task = asyncio.create_task(self._auto_defer_timer(interaction))
 
                 try:
@@ -180,15 +195,16 @@ class _InteractionMixin:
                     # the parent twice), so it is dropped and answered by the
                     # trailing ack, once a navigation in flight has decided.
                     await self._wait_out_navigation("A click")
-                    # Discord offers no click on a disabled component, so one that
-                    # reaches a disabled item was sent from an older render where
-                    # it was enabled, and is dropped the same way.
-                    if self._closed() or getattr(item, "disabled", False) is True:
+                    if self._closed():
                         self._log_dropped_click(item, self._drop_reason())
                         dropped = True
                         return
 
-                    if self.timeout:
+                    if (
+                        self.timeout
+                        and not disabled
+                        and getattr(item, "disabled", False) is not True
+                    ):
                         self._BaseView__timeout_expiry = time.monotonic() + self.timeout  # type: ignore
 
                     if self.serialize_interactions:
@@ -198,13 +214,21 @@ class _InteractionMixin:
                             # from elsewhere while it waited: once those have
                             # decided, it is dropped like a later click. A send in
                             # flight is not waited out, so a button that opens a
-                            # modal still opens it while the panel is re-sent.
+                            # modal still opens it while the panel is re-sent. A
+                            # click that arrived on a disabled control came from
+                            # an older screen, re-enabled since or not.
                             await self._wait_out_navigation("A click")
-                            if self._closed() or getattr(item, "disabled", False) is True:
-                                self._log_dropped_click(item, self._drop_reason())
-                                dropped = True
+                            if (
+                                self._closed()
+                                or disabled
+                                or getattr(item, "disabled", False) is True
+                            ):
+                                dropped = await self._drop_click(item, interaction)
                                 return
                             await self._run_click_callback(item, interaction)
+                    elif disabled or getattr(item, "disabled", False) is True:
+                        dropped = await self._drop_click(item, interaction)
+                        return
                     else:
                         await self._run_click_callback(item, interaction)
                 finally:
@@ -223,7 +247,66 @@ class _InteractionMixin:
             _CLICK_ORDER.reset(order)
 
     def _drop_reason(self) -> str:
-        return "the view has closed" if self._closed() else "the control is disabled on screen"
+        if self._closed():
+            return "the view has closed"
+        return "the control is disabled in the view's current render"
+
+    async def _drop_click(self, item: Item, interaction: Interaction) -> bool:
+        """Drop a click without running its callback, and return True (the caller's ``dropped``).
+
+        Discord offers no click on a disabled component, so a click that
+        reaches an item the view holds disabled came from a screen that does
+        not show the view's current render: the click raced the render that
+        disabled it, or a slower edit landed after a newer one and put an
+        older render back. While the click's reply is still owed, the current
+        render is sent as that reply, which costs the same one request as
+        the bare acknowledgement and puts the screen right. A closed view's
+        message is left as its close set it. Without ``serialize_interactions``
+        the render is not sent, since nothing orders it with the next click's
+        edit. A render that fails is logged and the trailing acknowledgement
+        answers instead.
+        """
+        self._log_dropped_click(item, self._drop_reason())
+        if (
+            not self._closed()
+            and self.serialize_interactions
+            and not interaction.response.is_done()
+        ):
+            try:
+                await self._run_click_callback(item, interaction, run=self._redraw_for_click)
+            except Exception:
+                logger.warning(
+                    f"Could not answer the interaction with the render of {type(self).__name__}",
+                    exc_info=True,
+                )
+        return True
+
+    async def _redraw_for_click(self, interaction: Interaction) -> None:
+        """Send the view's current render as the answer to ``interaction``.
+
+        A V1 view's content lives outside the tree, so its ``nav_rebuild``
+        names it, as for the redraw after a failed navigation.
+        """
+        kwargs = {}
+        nav_rebuild = getattr(self, "nav_rebuild", None)
+        if nav_rebuild is not None and not self._is_layout():
+            try:
+                result = await await_maybe(nav_rebuild(self))
+            except Exception as e:
+                logger.warning(
+                    f"nav_rebuild for {type(self).__name__} raised while redrawing as a "
+                    f"click's answer; the components are sent alone: {e}"
+                )
+            else:
+                if isinstance(result, dict):
+                    kwargs = result
+        token = _CURRENT_INTERACTION.set(interaction)
+        answering = _ANSWERING_WITH_RENDER.set(True)
+        try:
+            await self.refresh(**kwargs)
+        finally:
+            _ANSWERING_WITH_RENDER.reset(answering)
+            _CURRENT_INTERACTION.reset(token)
 
     def _log_dropped_click(self, item, reason: str) -> None:
         """Record a click the library answers without running its callback."""
@@ -234,7 +317,7 @@ class _InteractionMixin:
         """Acknowledge a click whose control is no longer on this view's message.
 
         It was sent from a render the view has since replaced, so nothing
-        runs, as for a click on a control disabled on screen, and the answer
+        runs, as for a click on a control the view holds disabled, and the answer
         keeps Discord from showing "This interaction failed". It waits
         ``auto_defer_delay`` first and answers only if nothing else has:
         discord.py dispatches ``on_interaction`` after this, and a bot's own
@@ -248,13 +331,22 @@ class _InteractionMixin:
 
         self.task_manager.create_task(_STALE_CLICK_TASK_OWNER, answer_if_unanswered())
 
-    async def _run_click_callback(self, item: Item, interaction: Interaction) -> None:
-        with _collect_stalled_renders() as stalled:
+    async def _run_click_callback(self, item: Item, interaction: Interaction, run=None) -> None:
+        """Run the click's callback, or ``run(interaction)`` in its place.
+
+        A render the callback abandoned to keep the ack in time is sent again
+        once the interaction is acknowledged. A click the callback left
+        unanswered after skipping an unchanged render is answered with that
+        render, where the library would otherwise defer it.
+        """
+        with _collect_stalled_renders() as stalled, _collect_skipped_answers() as skipped:
             message = self._message
             if message is not None and _picked_message_id(interaction) == message.id:
                 self._pick_owed = self._render_seq
             try:
-                await item.callback(interaction)
+                await (run or item.callback)(interaction)
+                if skipped and (self.auto_defer or _library_control(item)):
+                    await answer_with_skipped_render(skipped, interaction)
             finally:
                 # Inside the interaction lock, so the next queued click renders
                 # after it, and after a raise too, as a render that landed would.
@@ -438,15 +530,19 @@ class _InteractionMixin:
         an endpoint that is not ordered with later clicks. Binding the
         submission lets ``refresh()`` answer it with the edit in one
         request, as it does a click. The backstop acks a render too slow for
-        that, the trailing ack answers one that shipped no edit, and an edit
-        abandoned to keep the ack in time is sent again once it is in.
+        that. A render skipped as unchanged is sent as the answer once the
+        render returns, on a view that serializes its clicks and that no
+        click holds at that moment; the trailing ack answers one that shipped
+        nothing, and an edit abandoned to keep the ack in time is sent again
+        once it is in.
         """
         backstop = asyncio.create_task(self._auto_defer_timer(interaction))
         token = _CURRENT_INTERACTION.set(interaction)
         stalled: dict = {}
         try:
-            with _collect_stalled_renders() as stalled:
+            with _collect_stalled_renders() as stalled, _collect_skipped_answers() as skipped:
                 await render()
+                await answer_with_skipped_render(skipped, interaction, take_lock=True)
         finally:
             _CURRENT_INTERACTION.reset(token)
             if not backstop.done():
@@ -1081,7 +1177,7 @@ class _InteractionMixin:
             await self._bounded(message.delete())
         except discord.NotFound:
             pass
-        except (*DISCORD_CALL_ERRORS, asyncio.TimeoutError):
+        except DISCORD_CALL_ERRORS:
             return False
         except RuntimeError as e:
             if not self._closed_session(e):

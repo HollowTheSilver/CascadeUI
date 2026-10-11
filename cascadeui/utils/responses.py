@@ -12,11 +12,18 @@ import discord
 
 logger = logging.getLogger(__name__)
 
+# A request Discord gave no answer to: the connection failed (``aiohttp.ClientError``,
+# not ``OSError``, since ``ServerDisconnectedError`` is not an ``OSError``), or aiohttp's
+# total timeout ran out, which raises a plain ``asyncio.TimeoutError`` that discord.py
+# passes on. aiohttp's connect and read timeouts are ``ClientError`` as well.
+_TRANSPORT_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError)
+
 # Every way a Discord call reports that it did not land (see the API reference).
-# ``aiohttp.ClientError``, not ``OSError``: ``ServerDisconnectedError`` is no
-# ``OSError``, and from Python 3.11 ``asyncio.TimeoutError`` is one, which would
-# swallow the ack-deadline timeouts. ``InteractionResponded`` is caught on its own.
-DISCORD_CALL_ERRORS = (discord.HTTPException, discord.RateLimited, aiohttp.ClientError)
+# The library's own bounds raise ``asyncio.TimeoutError`` too, so a ``try`` that
+# answers a bound differently catches it before this tuple; the invariant tests
+# refuse a timeout clause the tuple would shadow. ``InteractionResponded`` is
+# caught on its own.
+DISCORD_CALL_ERRORS = (discord.HTTPException, discord.RateLimited, *_TRANSPORT_ERRORS)
 
 # Discord drops an interaction left unacknowledged this long after creation.
 ACK_DEADLINE_SECONDS = 3.0
@@ -29,6 +36,10 @@ _REPLIES: ContextVar[Optional[set]] = ContextVar("cascadeui_replies", default=No
 # Views whose one-request answer stalled inside a _collect_stalled_renders()
 # block, keyed by id() to the keywords and number of each stalled refresh.
 _STALLED: ContextVar[Optional[dict]] = ContextVar("cascadeui_stalled_renders", default=None)
+
+# Views, keyed by id(), whose render skipped an unchanged tree inside a
+# _collect_skipped_answers() block while it could have answered the interaction.
+_SKIPPED_ANSWERS: ContextVar[Optional[dict]] = ContextVar("cascadeui_skipped_answers", default=None)
 
 # // ========================================( Functions )======================================== // #
 
@@ -118,6 +129,79 @@ async def ship_stalled_renders(stalled: dict) -> None:
                 )
 
 
+@contextlib.contextmanager
+def _collect_skipped_answers():
+    """Yield a mapping gathering each view whose answering render was skipped in the block."""
+    skipped: dict = {}
+    token = _SKIPPED_ANSWERS.set(skipped)
+    try:
+        yield skipped
+    finally:
+        _SKIPPED_ANSWERS.reset(token)
+
+
+def _note_skipped_answer(view, seq: int) -> None:
+    # Keeps the first skip's render number: once a render of the view reaches
+    # the message or stalls after that skip, the screen is already covered.
+    skipped = _SKIPPED_ANSWERS.get()
+    if skipped is not None:
+        skipped.setdefault(id(view), (view, seq))
+
+
+async def answer_with_skipped_render(
+    skipped: dict, interaction: discord.Interaction, *, take_lock: bool = False
+) -> None:
+    """Answer ``interaction`` with the current render of a view that skipped it.
+
+    A render whose tree matches the view's last one is skipped, which leaves
+    the interaction's reply to the code that handles it: a modal or a reply
+    after a dispatch keeps the response slot. When that code has finished
+    and nothing answered, the reply is the view's current render instead of
+    a bare acknowledgement. It costs the same one request, and it corrects a
+    screen showing an older render than the view holds, which an edit
+    abandoned at its bound leaves when Discord applies it after a newer one.
+
+    Three views are passed over. One that has closed keeps the screen its
+    close left. One rendered again after the skip already reached the
+    message, or stalled and is sent again, so a second answering request
+    would spend the acknowledgement's time on a tree already sent. And one
+    with ``serialize_interactions`` off, where nothing orders the answer
+    with the next click's edit and a late answer would put an older render
+    back.
+
+    A modal submission runs outside the view's interaction lock, so its
+    caller passes ``take_lock``: the answer is sent holding the lock, and
+    skipped while a click holds it, since that click may be rebuilding the
+    tree the answer would carry.
+
+    Never raises, so a failed answer leaves the trailing acknowledgement to
+    answer instead.
+    """
+    # A copy: a task the callback started can note another view meanwhile.
+    for view, seq in list(skipped.values()):
+        if not take_lock:
+            await _answer_with_render(view, seq, interaction)
+        elif not view._interaction_lock.locked():
+            # A free lock is taken at once, so no click starts between the
+            # check and the answer; a click just handed the lock goes first.
+            async with view._interaction_lock:
+                await _answer_with_render(view, seq, interaction)
+
+
+async def _answer_with_render(view, seq: int, interaction: discord.Interaction) -> None:
+    if interaction.response.is_done():
+        return
+    if view._closed() or not view.serialize_interactions or view._superseded_at["tree"] > seq:
+        return
+    try:
+        await view._redraw_for_click(interaction)
+    except Exception:
+        logger.warning(
+            f"Could not answer the interaction with the render of {type(view).__name__}",
+            exc_info=True,
+        )
+
+
 def describe_discord_error(exc: BaseException) -> str:
     """Name the cause of a failed Discord call in one clause.
 
@@ -134,6 +218,8 @@ def describe_discord_error(exc: BaseException) -> str:
         return "interaction already acknowledged"
     if isinstance(exc, aiohttp.ClientError):
         return f"transport failure before Discord answered ({type(exc).__name__}: {exc})"
+    if isinstance(exc, asyncio.TimeoutError):
+        return "timed out before Discord answered (TimeoutError)"
     return f"status={getattr(exc, 'status', '?')} code={getattr(exc, 'code', '?')}"
 
 
@@ -397,11 +483,12 @@ async def open_modal_safe(
             return True
         except discord.InteractionResponded:
             pass
-        except aiohttp.ClientError as e:
-            # Never reached Discord, so a fallback would travel the same broken
-            # connection. Reported, not raised, over a click that needs repeating.
+        except _TRANSPORT_ERRORS as e:
+            # Discord never answered: the modal may be open, and a fallback would
+            # meet the same failure. Logged, not raised: the click only needs
+            # repeating.
             logger.warning(
-                f"Modal {modal.title!r} did not reach Discord: " f"{describe_discord_error(e)}"
+                f"Modal {modal.title!r} got no answer from Discord: " f"{describe_discord_error(e)}"
             )
             return False
         except discord.HTTPException as e:
@@ -410,8 +497,10 @@ async def open_modal_safe(
     msg = fallback_message or "Could not open the dialog. Please try again."
     try:
         await interaction.followup.send(msg, ephemeral=True)
-    except aiohttp.ClientError as e:
-        logger.warning(f"Modal fallback notice did not reach Discord: {describe_discord_error(e)}")
+    except _TRANSPORT_ERRORS as e:
+        logger.warning(
+            f"Modal fallback notice got no answer from Discord: {describe_discord_error(e)}"
+        )
     return False
 
 
@@ -457,11 +546,11 @@ async def respond_safe(
             # An ack backstop outside the interaction lock can take the slot
             # between is_done() and the send; the followup delivers the reply.
             pass
-        except aiohttp.ClientError as e:
+        except _TRANSPORT_ERRORS as e:
             # Whether it landed is unknown: not retried, since a second copy is
             # worse than a missing notice, and not raised, since the reply may
             # already be showing.
-            logger.warning(f"Reply did not reach Discord: {describe_discord_error(e)}")
+            logger.warning(f"Reply got no answer from Discord: {describe_discord_error(e)}")
             return
         except discord.HTTPException as e:
             if getattr(e, "code", None) != 40060:
@@ -485,10 +574,10 @@ async def respond_safe(
         # below needs a handle on.
         message = await interaction.followup.send(content, ephemeral=ephemeral, wait=True, **kwargs)
         _note_reply(interaction)
-    except aiohttp.ClientError as e:
-        # Same contract as the response path above: a notice that never left
-        # the host is logged, not raised into the caller's callback.
-        logger.warning(f"Followup reply did not reach Discord: {describe_discord_error(e)}")
+    except _TRANSPORT_ERRORS as e:
+        # Same contract as the response path above: a notice Discord never
+        # answered is logged, not raised into the caller's callback.
+        logger.warning(f"Followup reply got no answer from Discord: {describe_discord_error(e)}")
         return
 
     async def _delete_later() -> None:

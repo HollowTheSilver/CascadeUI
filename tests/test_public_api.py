@@ -167,6 +167,7 @@ _INTERNAL_NAMES = frozenset(
         # Ack and hook plumbing the library drives itself (respond_safe IS
         # exported; these are not)
         "ack_backstop",
+        "answer_with_skipped_render",
         "ship_stalled_renders",
         # The deprecation helper library code calls when it retires a name
         "REMOVED_IN",

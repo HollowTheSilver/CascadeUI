@@ -282,8 +282,9 @@ class TestAckFirst:
 
 class TestLibraryControlsAreAnswered:
     """With ``auto_defer`` off, a click on a control the library built is still
-    answered when nothing else did: no code of the user's is there to answer a
-    page turn, a tab, or wizard navigation whose render sent nothing."""
+    answered: no code of the user's is there to answer it. A render the library
+    ships answers it in one request; one that sends nothing (a dropdown re-pick,
+    a wizard click from an earlier step) gets the library's own ack."""
 
     async def test_a_click_on_the_active_tab_is_answered(self):
         from discord.ui import Container, TextDisplay
@@ -311,8 +312,10 @@ class TestLibraryControlsAreAnswered:
 
         await view._scheduled_task(tab, interaction)
 
-        interaction.response.edit_message.assert_not_awaited()
-        interaction.response.defer.assert_awaited_once()
+        # The tab on screen is sent again as the answer, the one request the
+        # click is owed, which puts back a screen a late edit changed.
+        interaction.response.edit_message.assert_awaited_once()
+        interaction.response.defer.assert_not_awaited()
 
     async def test_a_repick_of_the_selected_dropdown_option_is_answered(self):
         from discord.ui import ActionRow  # noqa: F401
@@ -428,10 +431,169 @@ class TestClicksOnADisabledItemAreDropped:
         assert calls == []
         interaction.response.defer.assert_awaited()
         assert any(
-            "Dropped a click" in r.getMessage() and "disabled on screen" in r.getMessage()
+            "Dropped a click" in r.getMessage()
+            and "disabled in the view's current render" in r.getMessage()
             for r in caplog.records
             if r.name.startswith("cascadeui")
         )
+
+    async def test_a_click_already_answered_sends_no_render(self):
+        """The current render answers a dropped click only while its reply is
+        owed. Once the click is answered (the backstop acked it while it waited
+        for the lock), sending the render would be a second request, an edit on
+        the channel's bucket. A V1 page edit carries its embed, and the digest
+        skip never applies to an edit with keywords, so only the reply-owed
+        check keeps this edit from shipping."""
+        from cascadeui.views.patterns import PaginatedView
+
+        view = PaginatedView(
+            pages=[discord.Embed(title=f"Page {i + 1}") for i in range(5)],
+            interaction=_make_interaction(),
+        )
+        view.owner_only = False
+        view._message = MagicMock(id=111)
+        view._message.edit = AsyncMock(return_value=view._message)
+        assert view._first_btn.disabled
+        interaction = _make_interaction(is_done=True, message=view._message)
+
+        await view._scheduled_task(view._first_btn, interaction)
+
+        interaction.response.edit_message.assert_not_awaited()
+        view._message.edit.assert_not_awaited()
+
+    async def test_a_click_queued_while_the_view_closes_leaves_its_last_screen(self):
+        """A click that waited for the lock while the view closed is dropped
+        without the current render: sent as its answer, a V1 page would cover
+        the embed the close left on screen."""
+        from cascadeui.views.patterns import PaginatedView
+
+        view = PaginatedView(
+            pages=[discord.Embed(title=f"Page {i + 1}") for i in range(5)],
+            interaction=_make_interaction(),
+        )
+        view.owner_only = False
+        view._message = MagicMock(id=111)
+        view._message.edit = AsyncMock(return_value=view._message)
+        click = _make_interaction(message=view._message)
+
+        async with view._interaction_lock:
+            queued = asyncio.create_task(view._scheduled_task(view._first_btn, click))
+            for _ in range(5):
+                await asyncio.sleep(0)
+            await view.exit()
+        await queued
+
+        click.response.edit_message.assert_not_awaited()
+
+    @staticmethod
+    def _paged(**attrs):
+        """A V1 paginator on page 1, whose first-page button is disabled."""
+        from cascadeui.views.patterns import PaginatedView
+
+        view = PaginatedView(
+            pages=[discord.Embed(title=f"Page {i + 1}") for i in range(5)],
+            interaction=_make_interaction(),
+        )
+        view.owner_only = False
+        for name, value in attrs.items():
+            setattr(view, name, value)
+        view._message = MagicMock(id=111)
+        view._message.edit = AsyncMock(return_value=view._message)
+        assert view._first_btn.disabled
+        return view
+
+    async def test_an_unserialized_view_answers_a_disabled_click_without_a_render(self):
+        """Without serialize_interactions nothing orders an answering render
+        with the next click's edit, so the render could land after that edit
+        and put an older one back."""
+        view = self._paged(serialize_interactions=False)
+        click = _make_interaction(is_done=False, message=view._message)
+
+        await view._scheduled_task(view._first_btn, click)
+
+        click.response.edit_message.assert_not_awaited()
+        click.response.defer.assert_awaited_once()
+
+    async def test_each_click_of_a_burst_on_a_disabled_control_answers_with_the_render(self):
+        """A click queued behind another answers for itself: leaving the render
+        to the later click would leave the screen uncorrected whenever that
+        click did not end in a render."""
+        view = self._paged()
+        first = _make_interaction(is_done=False, message=view._message)
+        second = _make_interaction(is_done=False, message=view._message)
+
+        async with view._interaction_lock:
+            queued = [
+                asyncio.create_task(view._scheduled_task(view._first_btn, click))
+                for click in (first, second)
+            ]
+            for _ in range(5):
+                await asyncio.sleep(0)
+        await asyncio.gather(*queued)
+
+        first.response.edit_message.assert_awaited_once()
+        second.response.edit_message.assert_awaited_once()
+
+    async def test_a_redraw_that_raises_leaves_the_click_acknowledged(self, caplog):
+        """The render answering a dropped click is the library's own work, so a
+        failure in it is logged and the click acknowledged; it never reaches
+        on_error, which would send an error card for a click the view drops."""
+        caplog.set_level(logging.WARNING, logger="cascadeui")
+        view = self._paged()
+        view.refresh = AsyncMock(side_effect=RuntimeError("render failed"))
+        view.on_error = AsyncMock()
+        click = _make_interaction(is_done=False, message=view._message)
+
+        await view._scheduled_task(view._first_btn, click)
+
+        view.on_error.assert_not_awaited()
+        click.response.defer.assert_awaited_once()
+        assert any(
+            "Could not answer the interaction" in r.getMessage()
+            for r in caplog.records
+            if r.name.startswith("cascadeui")
+        )
+
+    async def test_a_dropped_click_leaves_the_timeout_alone(self):
+        """A click that arrived on a disabled control is dropped even when the
+        control is enabled again while its checks run, so it does not count as
+        activity on the view."""
+        calls = []
+        view, button = self._view_with_button(calls)
+        view.timeout = 600
+        button.disabled = True
+
+        async def check(interaction):
+            button.disabled = False
+            return True
+
+        view.interaction_check = check
+        expiry = time.monotonic() + 5
+        view._BaseView__timeout_expiry = expiry
+
+        await view._scheduled_task(button, _make_interaction(is_done=False))
+
+        assert calls == []
+        assert view._BaseView__timeout_expiry == expiry
+
+    async def test_a_click_on_a_control_disabled_when_it_arrived_stays_dropped(self):
+        """A click that arrived on a disabled control came from a screen that
+        showed it disabled, so a callback that re-enabled the control while
+        the click waited does not make the click fresh. Running it would run
+        the user's callback on a click the screen offered as unavailable."""
+        calls = []
+        view, button = self._view_with_button(calls)
+        button.disabled = True
+        click = _make_interaction(is_done=False)
+
+        async with view._interaction_lock:
+            queued = asyncio.create_task(view._scheduled_task(button, click))
+            for _ in range(5):
+                await asyncio.sleep(0)
+            button.disabled = False
+        await queued
+
+        assert calls == []
 
     async def test_a_click_on_a_closed_view_is_logged_when_dropped(self, caplog):
         caplog.set_level(logging.DEBUG, logger="cascadeui")
@@ -510,6 +672,25 @@ class TestClicksOnADisabledItemAreDropped:
         assert calls == []
         interaction.response.defer.assert_awaited()
 
+    async def test_a_disabled_click_waiting_for_the_lock_is_answered_without_auto_defer(self):
+        """The library answers a click on a control already disabled, and with
+        serialization on it waits for the lock first. Without the timer, a
+        lock held past Discord's three seconds failed the click, since no
+        code of the user's could answer it."""
+        calls = []
+        view, button = self._view_with_button(calls)
+        view.auto_defer = False
+        view.auto_defer_delay = 0.05
+        button.disabled = True
+        interaction = _make_interaction(is_done=False)
+
+        async with view._interaction_lock:
+            queued = asyncio.create_task(view._scheduled_task(button, interaction))
+            await until(lambda: interaction.response.defer.await_count, timeout=2)
+        await queued
+
+        assert calls == []
+
     @pytest.mark.parametrize("auto_defer", [True, False])
     async def test_a_click_queued_behind_one_that_disabled_the_item_is_dropped(
         self, auto_defer, caplog
@@ -535,7 +716,8 @@ class TestClicksOnADisabledItemAreDropped:
         assert calls == [first]
         second.response.defer.assert_awaited()
         assert any(
-            "Dropped a click" in r.getMessage() and "disabled on screen" in r.getMessage()
+            "Dropped a click" in r.getMessage()
+            and "disabled in the view's current render" in r.getMessage()
             for r in caplog.records
             if r.name.startswith("cascadeui")
         )
@@ -3968,16 +4150,27 @@ class TestSafeDeferRename:
         interaction.response.defer.assert_awaited_once()
 
 
+# A request Discord never answered: the connection failed, or aiohttp's total
+# timeout ran out (discord.py sets none, so aiohttp's 300 s default applies),
+# which raises a plain TimeoutError that is not an aiohttp.ClientError.
+_UNANSWERED = pytest.mark.parametrize(
+    "error",
+    [aiohttp.ClientOSError(104, "reset"), asyncio.TimeoutError()],
+    ids=["reset", "total-timeout"],
+)
+
+
 class TestRespondersDegradeOnTransportFailure:
-    """A reply that never left the host must not become an error card.
+    """A reply Discord never answered must not become an error card.
 
     These run inside component callbacks, where an escaping exception
     reaches ``on_error``. A dropped notice is the cheaper failure.
     """
 
-    async def test_respond_safe_swallows_and_does_not_retry_on_followup(self, caplog):
+    @_UNANSWERED
+    async def test_respond_safe_swallows_and_does_not_retry_on_followup(self, caplog, error):
         interaction = _make_interaction()
-        interaction.response.send_message.side_effect = aiohttp.ClientOSError(104, "reset")
+        interaction.response.send_message.side_effect = error
 
         with caplog.at_level(logging.WARNING):
             await respond_safe(interaction, "hello")
@@ -3985,27 +4178,41 @@ class TestRespondersDegradeOnTransportFailure:
         # Not retried: whether the first send landed is unknowable here, and a
         # duplicate reply is worse than a missing transient notice.
         interaction.followup.send.assert_not_called()
-        assert "did not reach Discord" in caplog.text
+        assert "got no answer from Discord" in caplog.text
 
-    async def test_respond_safe_swallows_a_failing_followup(self, caplog):
+    @_UNANSWERED
+    async def test_respond_safe_swallows_a_failing_followup(self, caplog, error):
         interaction = _make_interaction()
         interaction.response.is_done.return_value = True
-        interaction.followup.send.side_effect = aiohttp.ClientOSError(104, "reset")
+        interaction.followup.send.side_effect = error
 
         with caplog.at_level(logging.WARNING):
             await respond_safe(interaction, "hello")
 
-        assert "did not reach Discord" in caplog.text
+        assert "got no answer from Discord" in caplog.text
 
-    async def test_open_modal_safe_reports_non_delivery(self, caplog):
+    @_UNANSWERED
+    async def test_open_modal_safe_reports_non_delivery(self, caplog, error):
         interaction = _make_interaction()
-        interaction.response.send_modal.side_effect = aiohttp.ClientOSError(104, "reset")
+        interaction.response.send_modal.side_effect = error
         modal = Modal(title="T", inputs=[TextInput(label="x")])
 
         with caplog.at_level(logging.WARNING):
             opened = await open_modal_safe(interaction, modal)
 
         assert opened is False
-        # The fallback notice would travel the same broken connection.
+        # The fallback notice would travel the same connection.
         interaction.followup.send.assert_not_called()
-        assert "did not reach Discord" in caplog.text
+        assert "got no answer from Discord" in caplog.text
+
+    @_UNANSWERED
+    async def test_open_modal_safe_swallows_a_failing_fallback_notice(self, caplog, error):
+        interaction = _make_interaction(is_done=True)
+        interaction.followup.send.side_effect = error
+        modal = Modal(title="T", inputs=[TextInput(label="x")])
+
+        with caplog.at_level(logging.WARNING):
+            opened = await open_modal_safe(interaction, modal)
+
+        assert opened is False
+        assert "got no answer from Discord" in caplog.text

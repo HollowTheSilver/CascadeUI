@@ -23,6 +23,138 @@ preserved below for historical reference but are not the supported baseline.
 
 ---
 
+## [3.14.2] - 2026-10-11
+
+### Added
+
+- **`REGISTRY_PRUNED` names the message each pruned row was on.** Its payload
+  carries `messages`, each pruned key mapped to the `message_id` and
+  `channel_id` its row named, so a bot that keeps its panel's message id can
+  tell whether a pruned row was its current panel or an earlier post under the
+  same key.
+
+### Changed
+
+- **A stalled click edit logs at INFO, at most once an hour per view.** A
+  click's one-request edit that outlasts `auto_defer_delay - 1.0` seconds was
+  logged only at DEBUG, so a bot logging at INFO showed nothing when its panels
+  stalled. A stall now logs at INFO, and the view's stalls in the hour after it
+  at DEBUG.
+- **`send()` calls `on_bind` for a persistent view posted through a channel.**
+  It bound only a view whose interaction or command context carried the bot, so
+  a panel posted with `context=channel` needed `await view.on_bind(bot)` before
+  its send. It now binds the client the channel belongs to, so that call can go,
+  unless code before `send()` reads what `on_bind` sets. Code that keeps it
+  sees the hook run twice, which an idempotent `on_bind` already allows.
+- **`DISCORD_CALL_ERRORS` includes `asyncio.TimeoutError`.** discord.py sets no
+  timeout of its own, so a request Discord never answers ends after aiohttp's
+  five-minute default as a plain `asyncio.TimeoutError`, which is not an
+  `aiohttp.ClientError`. Code that catches the tuple now catches that timeout,
+  and with it any `asyncio.wait_for` or `asyncio.timeout()` expiry inside the
+  same `try`; a block that handles its own timeout differently catches
+  `asyncio.TimeoutError` in a clause above the tuple.
+- **`reattach()` or `prune_unreachable()` logs a warning after waiting a
+  minute for a walk already running.** A hook inside one that awaited the
+  other through a task of its own (`asyncio.gather`, or `wait_for` before
+  Python 3.12) waited forever with nothing logged, which during the boot pass
+  kept the bot from becoming ready. The two still wait on each other; the
+  warning names the cause.
+
+### Fixed
+
+- **A panel no longer stays stuck on a page after a slow page turn.** A page
+  turn whose edit outlasted its time bound was given up on, but Discord could
+  still apply it after a later page turn, leaving one page on screen while the
+  view held another. A press leading to the page the view already held rebuilt
+  the render it had sent and skipped the edit, and from 3.14.0 a press on a
+  control the view held disabled was dropped, so when every button left on
+  screen did one or the other the panel stayed stuck. A click or modal
+  submission that a skipped render leaves unanswered, and a click on a control
+  the view holds disabled, each got a bare defer. Both are now answered with
+  the view's current render, which costs no extra request and puts the screen
+  right. This needs `serialize_interactions` (the default). A
+  `DynamicPersistentButton` click keeps its plain acknowledgement, as does a
+  modal submission that arrives while a click on the view is still being
+  handled.
+- **A view posted through a channel finds its bot.** A channel carries no
+  `.bot`, so three steps that looked for one found no client for a view sent
+  with `context=channel`: a bot that sets `Client(allowed_mentions=...)` had
+  those rules on the post and lost them on every later edit of a V2 view; a
+  persistent panel posted again left an earlier run's message live instead of
+  closing it by `exit_policy`; and with no persistence installed, a
+  `DynamicPersistentButton` class such a view carried could stop routing on
+  other messages once the view stopped. These steps now read the client off the
+  channel, as discord.py's own send does.
+- **A request Discord never answers is handled like a dropped connection.**
+  aiohttp's total timeout escaped the library's handlers: `respond()` raised it
+  into the calling callback, `open_modal()` raised it instead of returning
+  `False`, the default `on_instance_limit` raised it out of a command's
+  `send()`, a role panel click skipped `on_role_error`, and a restore logged
+  the panel as failed, with a traceback, instead of unreachable. Each now
+  treats it as it treats a dropped connection. A role panel's default error
+  notice names the timeout, which carries no text of its own.
+- **The unreachable sweep restores a panel it finds reachable again.** A row
+  that `prune_unreachable()` or the daily sweep (`prune_unreachable_after_days`)
+  found reachable again had its stamp cleared, but its panel stayed dead until
+  the next restart or a `reattach()` call. The sweep now restores it in the
+  same pass, and `recovered` lists only the rows it restored. A row whose
+  restore fails is listed under `kept` with a new stamp, so the next sweep
+  tries it again and its age counts from that check. A panel the sweep
+  restores runs `on_restore` while the bot is up, as after a `reattach()` call.
+- **The unreachable sweep keeps a row whose re-check says nothing about its
+  message.** A re-check that failed on a dropped connection, a rate limit, a
+  server error, or a channel type the installed discord.py cannot read counted
+  as still unreachable, so an aged row was deleted on a failure that says
+  nothing about its message. Such a row now waits for the next sweep. A
+  re-check that failed because the bot was closing logs at DEBUG, as a restore
+  does, instead of a WARNING with a traceback per row.
+- **A panel whose restore fails during its registration leaves nothing
+  behind.** A middleware that raised while a restored panel registered left a
+  view row and a session naming it in the store, which the inspector listed as
+  a ghost. When `on_bind` raised, a panel subscribed to every action rendered
+  onto its message before it was discarded, and work `on_bind` had started
+  kept running. The restore now rolls all of it back, and does the same when it
+  is cancelled. A reattach pass cut off by a cancel (`asyncio.wait_for` around
+  `reattach()`, for example) left the panels it had already restored live but
+  never repainted or recorded, so a later `reattach()` skipped them; it now
+  repaints and records them before the cancel ends it.
+- **A restart in the same process restores a panel whose row outlived its
+  view.** A screen pushed from a restored panel that timed out without
+  returning to it (one with its own `on_timeout()`) kept the panel's row with
+  nothing holding its key, and a restart in the same process skipped that row
+  until the process itself restarted.
+- **A persistent panel posted again reports an earlier run's message it could
+  not close.** A failure to close the message an earlier run's panel left under
+  the key (a 403, a server error, no answer from Discord) was taken for the
+  message being gone and passed over in silence, while its buttons stayed on
+  screen answering nothing. It now logs a WARNING naming the message and
+  channel; only a 404, or a bot that has closed, stays quiet. The message is closed on a task of its
+  own, each request bounded by `edit_timeout`, so `send()` no longer waits for
+  it (a request Discord never answered held it for five minutes) and a cancel
+  of the send no longer leaves it open. A channel the client has not cached is
+  fetched instead of skipped.
+- **A `prune_registry()` that fails part way reports the rows it deleted.** The
+  rows deleted before a failing delete stayed in the store's mirror of the
+  registry and no `REGISTRY_PRUNED` named them. They are now dropped from
+  memory and announced before the error is raised, and a reattach pass whose
+  prune fails part way lists them under `removed` instead of `failed`.
+- **A role panel no longer reports a failed toggle when only a hook failed.**
+  A Discord error raised by `on_role_assigned`, `on_role_removed`,
+  `on_role_swap`, or `on_role_required_block` reached `on_role_error`, which
+  told the member the change had failed: after the role had changed, or, from
+  `on_role_required_block`, when no change was made. Only the role change
+  itself is caught now, and a hook's own error propagates like any other.
+- **The `reload()` reference no longer describes `DEFERRED` as the throttle
+  alone.**
+  A send, a navigation, or a rate limit can hold the edit after `on_load()` has
+  run, so the value does not say whether it ran; the reference now says so.
+- **The `PersistentRolesLayoutView` reference and guide no longer say an
+  unchanged panel's restore costs no API call.** A restored view has no
+  render-hash baseline, so the default `on_restore` ships one edit per panel on
+  every restore.
+
+---
+
 ## [3.14.1] - 2026-10-10
 
 ### Added

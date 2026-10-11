@@ -26,7 +26,12 @@ from cascadeui.components.types import MAX_MESSAGE_CHARACTERS
 from cascadeui.state.singleton import get_store
 from cascadeui.state.store import _CURRENT_INTERACTION
 from cascadeui.views._placement import validate_placement
-from cascadeui.views.base import RenderOutcome, _StatefulMixin, _view_class_registry
+from cascadeui.views.base import (
+    _STALL_INFO_SECONDS,
+    RenderOutcome,
+    _StatefulMixin,
+    _view_class_registry,
+)
 from cascadeui.views.layout import (
     DisplayLayoutView,
     StatefulLayoutView,
@@ -6029,6 +6034,216 @@ class TestActingViewFastPath:
         interaction.response.edit_message.assert_awaited_once_with(view=view)
         view._message.edit.assert_not_called()
 
+    def _clicked(self, callback, **class_attrs):
+        """A primed view whose last render is its current tree, and its button."""
+
+        def build(v):
+            v.clear_items()
+            v.add_item(ActionRow(StatefulButton(label="Go", custom_id="go", callback=callback)))
+
+        view = self._make_view(build, **class_attrs)
+        self._prime(view)
+        view._last_tree_digest = view._compute_tree_digest()
+        button = next(c for c in view.walk_children() if getattr(c, "custom_id", None) == "go")
+        return view, button
+
+    async def test_an_unchanged_render_leaves_the_click_to_a_modal(self):
+        """A render that answered the click whenever it could, unchanged or
+        not, would take the response slot from a modal the callback opens
+        after a dispatch, and the modal would fall back to a notice."""
+        from cascadeui import Modal, TextInput
+
+        async def edit(interaction):
+            await view.refresh()
+            view.opened = await view.open_modal(
+                interaction, Modal(title="Edit", inputs=[TextInput(label="Name")])
+            )
+
+        view, button = self._clicked(edit)
+        interaction = self._make_acting_interaction()
+
+        await view._scheduled_task(button, interaction)
+
+        assert view.opened is True
+        interaction.response.send_modal.assert_awaited_once()
+        interaction.response.edit_message.assert_not_awaited()
+
+    async def test_an_unchanged_render_leaves_the_click_to_a_reply(self):
+        async def save(interaction):
+            await view.refresh()
+            await interaction.response.send_message("Saved", ephemeral=True)
+
+        view, button = self._clicked(save)
+        view.on_error = AsyncMock()
+        interaction = self._make_acting_interaction()
+
+        await view._scheduled_task(button, interaction)
+
+        view.on_error.assert_not_awaited()
+        interaction.response.send_message.assert_awaited_once()
+        interaction.response.edit_message.assert_not_awaited()
+
+    async def test_an_unchanged_render_answers_a_click_left_unanswered(self):
+        """The reply costs one request either way, and the render corrects the
+        older screen an abandoned edit leaves when Discord applies it late."""
+
+        async def go(interaction):
+            assert await view.refresh() is RenderOutcome.SKIPPED
+
+        view, button = self._clicked(go)
+        interaction = self._make_acting_interaction()
+
+        await view._scheduled_task(button, interaction)
+
+        interaction.response.edit_message.assert_awaited_once()
+        interaction.response.defer.assert_not_awaited()
+
+    async def test_a_click_the_callback_answers_itself_gets_no_render(self):
+        """With auto_defer off, a click on the user's own control is the
+        callback's to answer, so a skipped render does not answer it."""
+
+        async def go(interaction):
+            await view.refresh()
+
+        view, button = self._clicked(go, auto_defer=False)
+        interaction = self._make_acting_interaction()
+
+        await view._scheduled_task(button, interaction)
+
+        interaction.response.edit_message.assert_not_awaited()
+
+    async def test_a_view_the_callback_closed_gets_no_render(self):
+        """The close's own edit is the last screen; the answer stays a defer."""
+
+        async def done(interaction):
+            await view.refresh()
+            await view.exit()
+
+        view, button = self._clicked(done)
+        interaction = self._make_acting_interaction()
+
+        await view._scheduled_task(button, interaction)
+
+        interaction.response.edit_message.assert_not_awaited()
+        interaction.response.defer.assert_awaited_once()
+
+    async def test_a_render_after_the_skip_leaves_no_second_answer(self):
+        """After the skip is noted, a changed render falls through to the
+        channel when its one-request edit fails; answering with the render
+        again would send a second answering request for a tree already sent."""
+        from discord.ui import TextDisplay
+
+        async def go(interaction):
+            await view.refresh()
+            view.add_item(TextDisplay("moved"))
+            await view.refresh()
+
+        view, button = self._clicked(go)
+        interaction = self._make_acting_interaction()
+        interaction.response.edit_message = AsyncMock(
+            side_effect=discord.HTTPException(MagicMock(status=503, reason="x"), "unavailable")
+        )
+
+        await view._scheduled_task(button, interaction)
+
+        assert interaction.response.edit_message.await_count == 1
+        view._message.edit.assert_awaited_once()
+
+    async def test_an_unserialized_view_gets_no_render_as_its_answer(self):
+        """Without serialize_interactions nothing orders an answering render
+        with the next click's edit, so the render could land after that edit
+        and put an older one back."""
+
+        async def go(interaction):
+            await view.refresh()
+
+        view, button = self._clicked(go, serialize_interactions=False)
+        interaction = self._make_acting_interaction()
+
+        await view._scheduled_task(button, interaction)
+
+        interaction.response.edit_message.assert_not_awaited()
+        interaction.response.defer.assert_awaited_once()
+
+    async def test_a_click_with_another_queued_behind_still_answers_with_its_render(self):
+        """The click behind may not end in a render (here it opens a modal), so
+        leaving the answer to it would leave the older screen in place."""
+        from cascadeui import Modal, TextInput
+
+        gate = asyncio.Event()
+        calls = []
+
+        async def go(interaction):
+            calls.append(interaction)
+            await view.refresh()
+            if len(calls) == 1:
+                await gate.wait()
+            else:
+                await view.open_modal(
+                    interaction, Modal(title="Edit", inputs=[TextInput(label="Name")])
+                )
+
+        view, button = self._clicked(go)
+        first, second = self._make_acting_interaction(), self._make_acting_interaction()
+
+        running = asyncio.create_task(view._scheduled_task(button, first))
+        await until(lambda: calls)
+        queued = asyncio.create_task(view._scheduled_task(button, second))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        gate.set()
+        await asyncio.gather(running, queued)
+
+        first.response.edit_message.assert_awaited_once()
+        second.response.send_modal.assert_awaited_once()
+
+    def _library_modal(self):
+        view, _ = self._clicked(AsyncMock())
+        interaction = self._make_acting_interaction()
+        interaction.type = discord.InteractionType.modal_submit
+        return view, interaction
+
+    async def test_a_library_modal_answers_with_an_unchanged_render(self):
+        view, interaction = self._library_modal()
+
+        await view._render_as_answer(interaction, view.refresh)
+
+        interaction.response.edit_message.assert_awaited_once()
+
+    async def test_a_library_modal_leaves_the_answer_while_a_click_holds_the_view(self):
+        """A submission runs outside the view's interaction lock, so the click
+        holding it may be mid-rebuild, and the answer would carry a half-built
+        tree."""
+        view, interaction = self._library_modal()
+
+        # Bounded: an answer that waited for the lock would wait on this test.
+        async with view._interaction_lock:
+            await asyncio.wait_for(view._render_as_answer(interaction, view.refresh), timeout=5)
+
+        interaction.response.edit_message.assert_not_awaited()
+        interaction.response.defer.assert_awaited_once()
+
+    async def test_answering_survives_a_view_noted_meanwhile(self):
+        """A task the callback started can skip another view's render on the
+        same message while an answer is in flight. An answer walking the live
+        mapping would raise into on_error after the click was answered."""
+        from cascadeui.utils.responses import answer_with_skipped_render
+
+        view = self._make_view(self._build_simple)
+        other = self._make_view(self._build_simple)
+        self._prime(view)
+        self._prime(other)
+        skipped = {id(view): (view, view._superseded_at["tree"])}
+
+        async def redraw(interaction):
+            skipped[id(other)] = (other, other._superseded_at["tree"])
+
+        view._redraw_for_click = redraw
+
+        await answer_with_skipped_render(skipped, self._make_acting_interaction())
+
+        assert id(other) in skipped
+
     async def test_cross_view_message_mismatch_falls_through(self):
         """Interaction bound but its ``message.id`` does not match the
         view's message -> the subscriber is a cross-view listener, not
@@ -6234,6 +6449,43 @@ class TestActingViewFastPath:
 
         interaction.response.edit_message.assert_awaited_once()
         assert order == ["defer", "edit"]
+
+    async def test_the_first_stall_on_each_view_logs_at_info(self, caplog):
+        """At DEBUG a bot logging at INFO saw none of its stalls, so a panel
+        left on an older page by a late edit showed nothing in its logs."""
+
+        async def _stall_forever(*args, **kwargs):
+            await asyncio.sleep(60)
+
+        async def stall(view):
+            interaction = self._make_acting_interaction()
+            interaction.response.edit_message = AsyncMock(side_effect=_stall_forever)
+            token = _CURRENT_INTERACTION.set(interaction)
+            try:
+                assert await view.refresh() is RenderOutcome.DROPPED
+            finally:
+                _CURRENT_INTERACTION.reset(token)
+
+        view = self._make_view(self._build_simple, auto_defer_delay=1.5)
+        other = type(view)(interaction=_make_interaction())
+        self._prime(view)
+        self._prime(other)
+
+        with caplog.at_level(logging.DEBUG, logger="cascadeui"):
+            await stall(view)
+            await stall(view)
+            await stall(other)
+            # A long-lived panel reported its first stall and nothing more at
+            # INFO until the next deploy; an hour on, it reports again.
+            view._stall_reported_at -= _STALL_INFO_SECONDS
+            await stall(view)
+
+        levels = [
+            r.levelno
+            for r in caplog.records
+            if r.name.startswith("cascadeui") and "fast path exceeded" in r.getMessage()
+        ]
+        assert levels == [logging.INFO, logging.DEBUG, logging.INFO, logging.INFO]
 
     async def test_a_stalled_render_ships_when_the_callback_raises_after_it(self):
         """The re-send ran after the callback, so a raise after the stall
@@ -7756,11 +8008,12 @@ class TestEditTimeout:
     """``edit_timeout`` bounds every live-view and teardown edit through
     ``_bounded``.
 
-    discord.py issues HTTP edits with no total timeout, so a connection
-    that stalls without a response would pin the awaiting code -- and, on
-    the interaction-locked refresh/navigation paths, the view itself. The
-    ceiling cancels the stalled request and the view recovers on the next
-    interaction. ``edit_timeout = None`` restores unbounded awaits.
+    discord.py sets no timeout of its own, so a connection that stalls
+    without a response is bounded only by aiohttp's five-minute total and
+    pins the awaiting code that long, and on the interaction-locked refresh
+    and navigation paths the view itself. The ceiling cancels the
+    stalled request and the view recovers on the next interaction.
+    ``edit_timeout = None`` leaves only aiohttp's bound.
     """
 
     def _make_view(self, **class_attrs):
@@ -8886,6 +9139,25 @@ class TestClientAllowedMentionsFallback:
         await view.refresh()
 
         assert "allowed_mentions" not in view._message.edit.await_args.kwargs
+
+    async def test_a_view_sent_to_a_channel_keeps_the_client_rules_on_its_edits(self):
+        """A channel carries no ``.bot``, so the rules are read off the client
+        its connection state names, the client discord.py's own send used."""
+        client = self._client(discord.AllowedMentions.none())
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.id = 7
+        channel.guild = MagicMock(id=9)
+        channel._state._get_client = lambda: client
+        message = MagicMock(id=555, channel=channel)
+        message.edit = AsyncMock(return_value=message)
+        channel.send = AsyncMock(return_value=message)
+        view = RenderableLayoutView(context=channel)
+        await view.send()
+        view.add_item(TextDisplay("<@42> moved up"))
+
+        assert await view.refresh() is RenderOutcome.RENDERED
+
+        assert message.edit.await_args.kwargs["allowed_mentions"].to_dict() == {"parse": []}
 
     def test_a_mock_client_attribute_is_not_put_on_the_wire(self):
         """A bare Mock auto-creates any attribute, so the resolution is

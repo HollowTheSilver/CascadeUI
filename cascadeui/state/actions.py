@@ -175,13 +175,16 @@ class ActionCreators:
         reason: str,
         keys: Optional[List[str]] = None,
         source: Optional[str] = None,
+        messages: Optional[Dict[str, Dict[str, Optional[str]]]] = None,
     ) -> ActionPayload:
         """Create a REGISTRY_PRUNED action payload.
 
         Fires after the persistence manager deletes rows from the
         cascadeui_persistent_views namespace. ``deleted`` is the row count removed,
         ``keys`` is the list of ``persistence_key`` values actually pruned (so
-        a subscriber can reconcile its own records surgically), and ``reason``
+        a subscriber can reconcile its own records surgically), ``messages``
+        maps each of those keys to the ``message_id`` and ``channel_id`` its
+        row named (strings, ``None`` where unknown), and ``reason``
         is a short tag naming what motivated the prune: ``"explicit"`` for a
         targeted prune, ``"clear_all"`` for a full wipe, ``"gone"`` when a
         reattach pass or the unreachable sweep deleted rows whose channel or
@@ -191,7 +194,13 @@ class ActionCreators:
         ``"prune_registry"``, so a subscriber that takes a reattach pass's
         deletions from ``total_reattach_summary`` can skip them here.
         """
-        return {"deleted": deleted, "keys": keys or [], "reason": reason, "source": source}
+        return {
+            "deleted": deleted,
+            "keys": keys or [],
+            "reason": reason,
+            "source": source,
+            "messages": messages or {},
+        }
 
     @staticmethod
     def scoped_update(

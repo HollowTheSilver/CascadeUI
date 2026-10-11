@@ -2083,6 +2083,71 @@ class TestModalRerenderAnswersTheSubmission:
         assert submit.response.edit_message.call_args.kwargs["content"] == "Hello Kael"
         submit.response.defer.assert_not_awaited()
 
+    async def test_an_unchanged_rerender_leaves_the_submission_to_a_reply(self):
+        """A re-render whose tree matches the last one would take the response
+        slot if it answered the submission, and the callback's own reply after
+        it would raise."""
+
+        async def on_submitted(interaction, values):
+            await view.refresh()
+            await interaction.response.send_message("Saved", ephemeral=True)
+
+        view, modal, submit = await self._opened(on_submitted)
+
+        await modal.submit(submit, {"Name": "Kael"})
+
+        submit.response.send_message.assert_awaited_once()
+        submit.response.edit_message.assert_not_awaited()
+
+    async def test_an_unchanged_rerender_answers_a_submission_left_unanswered(self):
+        async def on_submitted(interaction, values):
+            await view.refresh()
+
+        view, modal, submit = await self._opened(on_submitted)
+
+        await modal.submit(submit, {"Name": "Kael"})
+
+        submit.response.edit_message.assert_awaited_once()
+        submit.response.defer.assert_not_awaited()
+
+    async def test_a_submission_leaves_the_answer_while_a_click_holds_the_view(self):
+        """A submission runs outside the view's interaction lock, so the click
+        holding it may be mid-rebuild, and the answer would carry a half-built
+        tree."""
+
+        async def on_submitted(interaction, values):
+            await view.refresh()
+
+        view, modal, submit = await self._opened(on_submitted)
+
+        # Bounded: an answer that waited for the lock would wait on this test.
+        async with view._interaction_lock:
+            await asyncio.wait_for(modal.submit(submit, {"Name": "Kael"}), timeout=5)
+
+        submit.response.edit_message.assert_not_awaited()
+        submit.response.defer.assert_awaited_once()
+
+    async def test_a_stalled_answer_to_a_submission_is_sent_again(self):
+        """An answer run after the block that collects stalled renders would
+        drop a stalled one, and the screen it meant to correct would stay."""
+
+        async def hang(*args, **kwargs):
+            await asyncio.sleep(10)
+
+        async def on_submitted(interaction, values):
+            await view.refresh()
+
+        view, modal, submit = await self._opened(on_submitted)
+        # The one-request bound is max(0.5, auto_defer_delay - 1.0).
+        view.auto_defer_delay = 0.6
+        submit.response.edit_message = AsyncMock(side_effect=hang)
+        view._message.edit = AsyncMock(return_value=view._message)
+
+        await modal.submit(submit, {"Name": "Kael"})
+
+        submit.response.edit_message.assert_awaited_once()
+        view._message.edit.assert_awaited_once()
+
     async def test_a_state_rerender_leaves_the_answer_to_the_callback(self):
         """The render MODAL_SUBMITTED drives runs before the callback. Answering
         with it made the callback's own first reply or defer raise

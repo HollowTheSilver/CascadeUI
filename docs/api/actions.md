@@ -317,7 +317,8 @@ left on disk; re-registering a pruned key afterwards is a clean first registrati
 rather than a duplicate-key cleanup against a stale entry.
 
 The payload carries `deleted` (the row count), `keys` (the keys removed), `reason`
-(why they went), and `source` (the call that pruned).
+(why they went), `source` (the call that pruned), and `messages` (the message and
+channel each removed row named).
 
 During startup reattach, `REGISTRY_PRUNED` fires synchronously inside `setup_middleware`.
 Under the canonical setup order (cogs loaded before `setup_middleware`), a subscription wired
@@ -335,6 +336,7 @@ covers every reattach pass rather than the latest one; see the
 | `keys` | `list[str]` | The `persistence_key`s actually pruned; a key passed in but absent on disk is not listed |
 | `reason` | `str` | Why the rows went: `"explicit"` for a targeted prune, `"clear_all"` for a full wipe, `"gone"` when a reattach pass or `prune_unreachable` deleted rows whose channel or message returned a 404, `"unreachable"` when `prune_unreachable` deleted rows that stayed unreachable past its cutoff. `prune_registry(reason=)` passes any caller-supplied string through, so treat the value as open rather than a closed set |
 | `source` | `str` | The call that pruned: `"reattach"` for a reattach pass, `"prune_unreachable"` for the unreachable sweep, `"prune_registry"` for a direct call |
+| `messages` | `dict[str, dict]` | Each key in `keys` mapped to `{"message_id": ..., "channel_id": ...}`, the message its row named when read just before the delete, as strings (`None` for an id that row did not have, or when no row was there to read). Compare it with a message id kept in your own records before acting on a key reused across posts |
 
 **State change:** Deletes `state["persistent_views"][key]` for every key in `keys`. The `keys` list also lets a subscriber clear exactly the affected external records without sweeping its whole domain against the registry.
 

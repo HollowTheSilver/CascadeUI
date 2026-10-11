@@ -7,6 +7,7 @@ import types
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
 
+import aiohttp
 import discord
 import pytest
 
@@ -700,6 +701,43 @@ class TestExitDynamicItemRepair:
         await new_view._register_persistent(fake_message)
 
         bot.add_dynamic_items.assert_not_called()
+
+    async def test_a_view_sent_to_a_channel_repairs_with_the_channel_client(self, clean_registry):
+        """A channel carries no ``.bot``, and without persistence installed no
+        manager holds one, so the client is read off the channel's connection
+        state."""
+        from cascadeui.components.base import DynamicPersistentButton
+        from cascadeui.views.layout import StatefulLayoutView
+
+        class _ChannelButton(
+            DynamicPersistentButton,
+            template=r"channelpanel:(?P<n>[0-9]+)",
+        ):
+            def __init__(self, *, n: int):
+                super().__init__(
+                    discord.ui.Button(
+                        label="x",
+                        custom_id=f"channelpanel:{n}",
+                        style=discord.ButtonStyle.primary,
+                    )
+                )
+
+        bot = MagicMock(spec=discord.Client)
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.guild = MagicMock(id=9)
+        channel._state._get_client = lambda: bot
+        panel = StatefulLayoutView(context=channel)
+        panel.add_item(discord.ui.ActionRow(_ChannelButton(n=1)))
+        store = panel.state_store
+        saved_manager = getattr(store, "persistence_manager", None)
+        store.persistence_manager = None
+        try:
+            panel._redrive_dynamic_items()
+        finally:
+            store.persistence_manager = saved_manager
+
+        bot.add_dynamic_items.assert_called_once()
+        assert _ChannelButton in bot.add_dynamic_items.call_args.args
 
     async def test_unresolvable_bot_logs_debug_instead_of_failing_silently(
         self, clean_registry, caplog
@@ -2430,7 +2468,7 @@ class TestPanelSentAgain:
         # cleanup would run if it took the message for one.
         channel = MagicMock(spec=discord.TextChannel)
         channel.fetch_message = AsyncMock(return_value=old)
-        again.client = MagicMock()
+        again.client = MagicMock(spec=discord.Client)
         again.client.get_channel = MagicMock(return_value=channel)
         panel.interaction = again
 
@@ -2602,10 +2640,11 @@ class TestPolicyFollowsTheMessage:
         orphan.components = [_component_factory(p) for p in panel.to_components()]
         channel = MagicMock(spec=discord.TextChannel)
         channel.fetch_message = AsyncMock(return_value=orphan)
-        first.client = MagicMock()
+        first.client = MagicMock(spec=discord.Client)
         first.client.get_channel = MagicMock(return_value=channel)
 
         await panel.send()
+        await self._earlier_message_closed(panel)
 
         if policy == "delete":
             orphan.delete.assert_awaited_once()
@@ -2614,6 +2653,208 @@ class TestPolicyFollowsTheMessage:
             orphan.delete.assert_not_awaited()
             frozen = orphan.edit.await_args.kwargs["view"]
             assert frozen.is_finished()
+
+    async def test_an_earlier_runs_message_closes_when_the_panel_is_posted_to_a_channel(self):
+        # A channel carries no ``.bot``, so the earlier run's message stayed
+        # live: the client is the one the channel's connection state names.
+        from discord.components import _component_factory
+
+        from cascadeui.state.actions import ActionCreators
+
+        bot = MagicMock(spec=discord.Client)
+        posted = MagicMock(id=300)
+        posted.edit = AsyncMock(return_value=posted)
+        home = MagicMock(spec=discord.TextChannel)
+        home.id = 888
+        home.guild = MagicMock(id=9)
+        home._state._get_client = lambda: bot
+        home.send = AsyncMock(return_value=posted)
+        posted.channel = home
+        panel = self._panel_class()(persistence_key="policy:channel_orphan", context=home)
+        await panel.state_store.dispatch(
+            "PERSISTENT_VIEW_REGISTERED",
+            ActionCreators.persistent_view_registered(
+                persistence_key="policy:channel_orphan",
+                class_name="earlier",
+                message_id="999",
+                channel_id="888",
+                guild_id=None,
+                user_id=None,
+            ),
+        )
+        orphan = MagicMock(id=999)
+        orphan.edit = AsyncMock()
+        orphan.delete = AsyncMock()
+        orphan.components = [_component_factory(p) for p in panel.to_components()]
+        home.fetch_message = AsyncMock(return_value=orphan)
+        bot.get_channel = MagicMock(return_value=home)
+
+        await panel.send()
+        await self._earlier_message_closed(panel)
+
+        home.fetch_message.assert_awaited_once_with(999)
+        assert orphan.edit.await_args.kwargs["view"].is_finished()
+
+    @staticmethod
+    async def _earlier_message_closed(view):
+        """Wait for the close of the earlier run's message, which runs on a task."""
+        from cascadeui.views.persistent import _EARLIER_MESSAGE_TASK_OWNER
+
+        await asyncio.gather(*view.task_manager._live(_EARLIER_MESSAGE_TASK_OWNER))
+
+    async def test_the_send_does_not_wait_for_an_earlier_runs_message_to_close(self):
+        """The close of the earlier run's message ran inside the send, which
+        held the panel's turn while Discord answered (Exit, push, and pop
+        waited on it), and a cancel of the send left the message open."""
+        from discord.components import _component_factory
+
+        panel, channel = await self._over_an_earlier_runs_message("policy:slow_close")
+        orphan = MagicMock(id=999)
+        orphan.edit = AsyncMock()
+        orphan.delete = AsyncMock()
+        orphan.components = [_component_factory(p) for p in panel.to_components()]
+        answer = asyncio.Event()
+
+        async def slow_fetch(message_id):
+            await answer.wait()
+            return orphan
+
+        channel.fetch_message = slow_fetch
+
+        await asyncio.wait_for(panel.send(), timeout=1)
+        orphan.edit.assert_not_awaited()
+
+        answer.set()
+        await self._earlier_message_closed(panel)
+        assert orphan.edit.await_args.kwargs["view"].is_finished()
+
+    async def _over_an_earlier_runs_message(self, key, **attrs):
+        """A panel about to be sent over an earlier run's registration of ``key``."""
+        from helpers import make_interaction
+
+        from cascadeui.state.actions import ActionCreators
+
+        interaction = make_interaction()
+        interaction.original_response.return_value.id = 300
+        panel = self._panel_class(**attrs)(persistence_key=key, interaction=interaction)
+        await panel.state_store.dispatch(
+            "PERSISTENT_VIEW_REGISTERED",
+            ActionCreators.persistent_view_registered(
+                persistence_key=key,
+                class_name="earlier",
+                message_id="999",
+                channel_id="888",
+                guild_id=None,
+                user_id=None,
+            ),
+        )
+        channel = MagicMock(spec=discord.TextChannel)
+        interaction.client = MagicMock(spec=discord.Client)
+        interaction.client.get_channel = MagicMock(return_value=channel)
+        return panel, channel
+
+    @staticmethod
+    def _library_warnings(caplog):
+        return [
+            r
+            for r in caplog.records
+            if r.name.startswith("cascadeui") and r.levelno >= logging.WARNING
+        ]
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            lambda: discord.Forbidden(MagicMock(status=403, reason="Forbidden"), "no access"),
+            lambda: discord.HTTPException(MagicMock(status=503, reason="Unavailable"), "busy"),
+            lambda: aiohttp.ClientConnectionError("reset"),
+            lambda: asyncio.TimeoutError(),
+        ],
+        ids=["forbidden", "server_error", "transport", "no_answer"],
+    )
+    async def test_an_earlier_runs_message_left_open_is_logged(self, failure, caplog):
+        # Every failure was read as "already gone" and passed over in silence,
+        # while the message kept buttons nothing answers.
+        panel, channel = await self._over_an_earlier_runs_message("policy:left_open")
+        channel.fetch_message = AsyncMock(side_effect=failure())
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui"):
+            await panel.send()
+            await self._earlier_message_closed(panel)
+
+        messages = [r.getMessage() for r in self._library_warnings(caplog)]
+        assert any("999" in m and "888" in m for m in messages), messages
+        if isinstance(failure(), asyncio.TimeoutError):
+            # A timeout carries no text, so the line names the bound instead.
+            assert any("no answer within" in m for m in messages), messages
+
+    async def test_an_earlier_runs_message_that_got_no_answer_names_no_bound_when_unbounded(
+        self, caplog
+    ):
+        """With ``edit_timeout = None`` the warning read "no answer within Nones"."""
+        panel, channel = await self._over_an_earlier_runs_message(
+            "policy:unbounded", edit_timeout=None
+        )
+        channel.fetch_message = AsyncMock(side_effect=asyncio.TimeoutError())
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui"):
+            await panel.send()
+            await self._earlier_message_closed(panel)
+
+        messages = [r.getMessage() for r in self._library_warnings(caplog)]
+        assert any("999" in m and "(no answer)" in m for m in messages), messages
+        assert not any("None" in m for m in messages), messages
+
+    async def test_an_earlier_runs_message_already_gone_logs_nothing(self, caplog):
+        panel, channel = await self._over_an_earlier_runs_message("policy:gone")
+        channel.fetch_message = AsyncMock(
+            side_effect=discord.NotFound(MagicMock(status=404, reason="Not Found"), "gone")
+        )
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui"):
+            await panel.send()
+            await self._earlier_message_closed(panel)
+
+        channel.fetch_message.assert_awaited_once_with(999)
+        assert not self._library_warnings(caplog)
+
+    async def test_a_fetch_of_an_earlier_runs_message_is_bounded(self, caplog):
+        # The fetch had no bound, so a request Discord never answered held
+        # send() for aiohttp's five-minute default.
+        panel, channel = await self._over_an_earlier_runs_message("policy:hung", edit_timeout=0.05)
+        never = asyncio.Event()
+
+        async def hang(message_id):
+            await never.wait()
+
+        channel.fetch_message = hang
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui"):
+            await asyncio.wait_for(panel.send(), timeout=5)
+            await asyncio.wait_for(self._earlier_message_closed(panel), timeout=5)
+
+        messages = [r.getMessage() for r in self._library_warnings(caplog)]
+        assert any("999" in m for m in messages), messages
+
+    async def test_an_earlier_runs_message_in_an_uncached_channel_closes(self):
+        # Only the client's cache was read, so a channel it had not seen left
+        # the message live with nothing logged.
+        from discord.components import _component_factory
+
+        panel, channel = await self._over_an_earlier_runs_message("policy:uncached")
+        orphan = MagicMock(id=999)
+        orphan.edit = AsyncMock()
+        orphan.delete = AsyncMock()
+        orphan.components = [_component_factory(p) for p in panel.to_components()]
+        channel.fetch_message = AsyncMock(return_value=orphan)
+        client = panel.interaction.client
+        client.get_channel = MagicMock(return_value=None)
+        client.fetch_channel = AsyncMock(return_value=channel)
+
+        await panel.send()
+        await self._earlier_message_closed(panel)
+
+        client.fetch_channel.assert_awaited_once_with(888)
+        assert orphan.edit.await_args.kwargs["view"].is_finished()
 
     async def test_a_panel_sent_again_moves_its_registration_before_closing_the_old_message(
         self,

@@ -890,8 +890,10 @@ class TestRoleErrorsRouteThroughTheHook:
             discord.RateLimited(retry_after=1.0),
             aiohttp.ClientOSError(104, "reset"),
             aiohttp.ConnectionTimeoutError("connect"),
+            # aiohttp's total timeout: a plain TimeoutError, no ClientError.
+            asyncio.TimeoutError(),
         ],
-        ids=["http", "ratelimited", "reset", "connect-timeout"],
+        ids=["http", "ratelimited", "reset", "connect-timeout", "total-timeout"],
     )
     async def test_every_failure_shape_reaches_on_role_error(self, error):
         _RoleErrorProbeView.seen = []
@@ -915,3 +917,96 @@ class TestRoleErrorsRouteThroughTheHook:
         assert _RoleErrorProbeView.seen == [
             type(error).__name__
         ], "the hook must see it, not the user"
+
+
+class _RoleHookFailsProbeView(RolesLayoutView):
+    """Role hooks that raise: a confirmation after the role change landed, and
+    the required-category block, where no change is made."""
+
+    categories = [
+        RoleCategory(name="ProbeHookFails", roles={"Green": 456}),
+        RoleCategory(name="ProbeHookRequired", roles={"Red": 789}, required=True),
+    ]
+    seen: list = []
+    failure: BaseException = None
+
+    @classmethod
+    async def on_role_assigned(cls, interaction, member, role, category):
+        raise cls.failure
+
+    @classmethod
+    async def on_role_required_block(cls, interaction, member, role, category):
+        raise cls.failure
+
+    @classmethod
+    async def on_role_error(cls, interaction, exc):
+        cls.seen.append(type(exc).__name__)
+
+
+class TestARoleHookFailureIsNotAFailedToggle:
+    """The change and the hook that reports it are separate steps.
+
+    A Discord error from the hook reached ``on_role_error``, which told the
+    member the toggle failed, after the role had changed or, from
+    ``on_role_required_block``, when no change was made.
+    """
+
+    def _member(self, roles):
+        member = MagicMock()
+        member.roles = roles
+        member.add_roles = AsyncMock()
+        member.remove_roles = AsyncMock()
+        return member
+
+    def _interaction(self, role, member):
+        interaction = MagicMock()
+        interaction.guild.get_role.return_value = role
+        interaction.user = member
+        return interaction
+
+    @pytest.mark.parametrize(
+        "failure",
+        [discord.HTTPException(MagicMock(status=500), "boom"), asyncio.TimeoutError()],
+        ids=["http", "timeout"],
+    )
+    async def test_a_failing_assigned_hook_is_not_reported_as_a_failed_toggle(self, failure):
+        _RoleHookFailsProbeView.seen = []
+        _RoleHookFailsProbeView.failure = failure
+        role = MagicMock(id=456)
+        role.name = "Green"
+        member = self._member([])
+
+        with pytest.raises(type(failure)):
+            await _RoleHookFailsProbeView._handle_role_click(
+                self._interaction(role, member), _RoleHookFailsProbeView.categories[0], 456
+            )
+
+        member.add_roles.assert_awaited_once()
+        assert _RoleHookFailsProbeView.seen == []
+
+    async def test_a_failing_required_block_hook_is_not_reported_as_a_failed_toggle(self):
+        _RoleHookFailsProbeView.seen = []
+        _RoleHookFailsProbeView.failure = asyncio.TimeoutError()
+        role = MagicMock(id=789)
+        role.name = "Red"
+        member = self._member([role])
+
+        with pytest.raises(asyncio.TimeoutError):
+            await _RoleHookFailsProbeView._handle_role_click(
+                self._interaction(role, member), _RoleHookFailsProbeView.categories[1], 789
+            )
+
+        member.remove_roles.assert_not_awaited()
+        assert _RoleHookFailsProbeView.seen == []
+
+    async def test_the_default_error_notice_names_a_timeout(self):
+        """A timeout carries no text, so the notice read "Could not update
+        roles: " with nothing after it."""
+        interaction = MagicMock()
+        interaction.response.is_done.return_value = False
+        interaction.response.send_message = AsyncMock()
+
+        await RolesLayoutView.on_role_error(interaction, asyncio.TimeoutError())
+
+        sent = interaction.response.send_message.await_args.args[0]
+        assert sent == "Could not update roles: TimeoutError"

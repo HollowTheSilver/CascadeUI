@@ -234,6 +234,44 @@ class TestButtonStates:
 class TestNavigation:
     """First, last, prev, next button callbacks navigate to correct pages."""
 
+    @pytest.mark.parametrize("layout", [False, True], ids=["v1", "v2"])
+    async def test_a_page_turn_that_lands_late_is_put_right_by_the_next_press(self, layout):
+        """A press whose edit outlasted its bound was abandoned, the next press
+        rendered page 1, and Discord then applied the abandoned request: the
+        screen showed page 5 while the view held page 1. The First and Previous
+        buttons left on screen were ones the view held disabled, so each press
+        was dropped with a bare ack and the panel stayed on page 5."""
+        if layout:
+            view = PaginatedLayoutView(
+                pages=[[TextDisplay(f"Page {i + 1}")] for i in range(5)],
+                interaction=_make_interaction(),
+            )
+        else:
+            view = PaginatedView(pages=_make_embeds(5), interaction=_make_interaction())
+        view.owner_only = False
+        view.auto_defer_delay = 0.6  # bounds the one-request edit at 0.5s
+        view._message = MagicMock(id=111)
+        view._message.edit = AsyncMock(return_value=view._message)
+
+        async def outlasts_the_bound(**kwargs):
+            await asyncio.sleep(2)
+
+        slow = _make_interaction(message=view._message)
+        slow.response.edit_message = AsyncMock(side_effect=outlasts_the_bound)
+        await view._scheduled_task(view._last_btn, slow)
+        await view._scheduled_task(view._first_btn, _make_interaction(message=view._message))
+        assert view.current_page == 0 and view._first_btn.disabled
+        # Discord applies the abandoned request here: page 5 is on screen.
+
+        press = _make_interaction(message=view._message)
+        await view._scheduled_task(view._first_btn, press)
+
+        press.response.edit_message.assert_awaited_once()
+        sent = press.response.edit_message.call_args.kwargs
+        assert sent["view"] is view and view.current_page == 0
+        if not layout:
+            assert sent["embed"].title == "Page 1"
+
     async def test_first_button_goes_to_page_zero(self):
         """Clicking first button sets current_page to 0."""
         pages = _make_embeds(10)
@@ -411,8 +449,9 @@ class TestGotoModal:
         view._message.edit.assert_not_awaited()
 
     async def test_goto_to_the_page_on_screen_still_answers_the_submission(self):
-        """Nothing changes, so no edit ships to carry the answer, and Discord
-        shows an error on a modal it never hears back about."""
+        """Discord shows an error on a modal it never hears back about. The
+        page the view holds is sent again as the answer, which also puts back
+        a screen a late edit left on another page."""
         view = await PaginatedLayoutView.from_data(
             items=[f"item {i}" for i in range(10)],
             per_page=1,
@@ -425,8 +464,8 @@ class TestGotoModal:
 
         submit = await self._submit_from_the_message(view, "1")
 
-        submit.response.edit_message.assert_not_awaited()
-        submit.response.defer.assert_awaited_once()
+        submit.response.edit_message.assert_awaited_once()
+        submit.response.defer.assert_not_awaited()
 
     async def test_a_page_whose_answer_stalls_is_sent_once_the_submission_is_answered(self):
         """Answering with the page abandons the edit when Discord is slow to

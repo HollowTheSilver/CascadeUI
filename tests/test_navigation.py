@@ -3346,9 +3346,9 @@ class TestNavigationConnectTimeoutTakesTheTransportPath:
     """A connect timeout is a transport failure that also answers as a timeout.
 
     aiohttp's connect and socket timeouts inherit from both ``ClientError``
-    and ``asyncio.TimeoutError``, and discord.py builds its session with no
-    total timeout, so aiohttp's 30s ``sock_connect`` fires below the 60s
-    ``edit_timeout``. Ordering the timeout clause first would route a request
+    and ``asyncio.TimeoutError``. discord.py builds its session with no
+    ``timeout=``, so aiohttp's 30s ``sock_connect`` fires below the 60s
+    ``edit_timeout``. Reading every timeout as a stall would route a request
     that never left the host past the branch that re-routes it to the channel
     endpoint.
     """
@@ -3362,7 +3362,8 @@ class TestNavigationConnectTimeoutTakesTheTransportPath:
         )
         await source.send()
 
-        # is_done() True forces the deferred path, where the two clauses sit.
+        # is_done() True forces the deferred path, whose one clause splits a
+        # connect timeout from a stall.
         nav = _make_interaction(user_id=5, guild_id=6, is_done=True)
         nav.edit_original_response = AsyncMock(
             side_effect=aiohttp.ConnectionTimeoutError("connect timed out")

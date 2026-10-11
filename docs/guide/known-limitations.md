@@ -269,7 +269,9 @@ error.
 - `serialize_interactions = False` -- skips the lock entirely on
   views where parallel rebuilds are safe (read-only displays, views
   that mutate independent state slices). Race-prone views (game
-  boards, shared lists) should keep the lock.
+  boards, shared lists) should keep the lock. Without it, a click that
+  changes nothing is acknowledged rather than answered with the current
+  render, since nothing would order that answer with the next click's edit.
 - `ack_first = True` -- acknowledges before the access checks and
   the callback run, so a queued click is acked no matter how long it
   waited on the lock. The cost is the acting-view fast path: every
@@ -320,6 +322,12 @@ the design exists to prevent. Once the interaction is acknowledged,
 nothing races that clock, so the render is sent again through the
 view's message. Whether Discord applied the abandoned edit cannot be
 known, so that second send may repeat an update already on screen.
+Discord can also apply it after a later click's edit, putting the older
+render back on screen. With `serialize_interactions` on, the next click
+corrects the screen when its callback renders the view or the click lands on
+a control the current render disables: a render that changes the tree ships
+as usual, and a click left unanswered because its render changed nothing, or
+one on a disabled control, is answered with the current render.
 
 **Mitigations** (per-view, all class-attribute overrides):
 
@@ -376,9 +384,11 @@ than as a stalled edit. Those set `refresh_degraded`; a genuine
 `edit_timeout` cancellation does not. See
 [Transport Failures Degrade Quietly](#transport-failures-degrade-quietly).
 
-**On observing this at scale.** Run `/cascadeui perf` against real
-user load. If `notify_ms` p95 routinely exceeds
-`(auto_defer_delay - 1.0) * 1000` ms, the fast path is being
+**On observing this at scale.** A stall logs at INFO (*"Acting-view
+fast path exceeded ..."*, from `cascadeui.views.base`) at most once an hour
+per view, and the stalls in between at DEBUG.
+Run `/cascadeui perf` against real user load. If `notify_ms` p95
+routinely exceeds `(auto_defer_delay - 1.0) * 1000` ms, the fast path is being
 cancelled often enough to be visible -- tune toward whatever
 threshold the data implies.
 
@@ -388,14 +398,16 @@ threshold the data implies.
 
 A request can fail before Discord ever sees it: a reset connection, a
 dropped keep-alive, a DNS blip. These raise from aiohttp rather than
-discord.py, so they carry no HTTP status and are not `HTTPException`.
-CascadeUI treats them as a third sibling alongside `HTTPException` and
-`RateLimited` (the three are exported together as `DISCORD_CALL_ERRORS`,
-for an override that wants the same tolerance), and the response is always
-the same shape: **log a warning naming the cause, and carry on**. The
-alternative is raising out of a component callback, where the exception
-reaches `on_error` and renders a failure card over content that is perfectly
-fine.
+discord.py, so they carry no HTTP status and are not `HTTPException`. A
+request Discord never answers also fails with no status once aiohttp's
+five-minute total timeout runs out, as a plain `asyncio.TimeoutError`, which
+is not an `aiohttp.ClientError`. CascadeUI treats both as siblings of
+`HTTPException` and `RateLimited` (the four are exported together as
+`DISCORD_CALL_ERRORS`, for an override that wants the same tolerance), and
+the response is always the same shape: **log a warning naming the cause, and
+carry on**. The alternative is raising out of a component callback, where
+the exception reaches `on_error` and renders a failure card over content
+that is perfectly fine.
 
 What that means per surface:
 
@@ -403,9 +415,9 @@ What that means per surface:
 |---|---|
 | `refresh()` | The edit is dropped and the render baseline is cleared, so the next state change re-ships the tree unconditionally. |
 | `send()`'s post-send message re-fetch | The message stays; `send()` returns it rather than reporting a live message as a failed send. |
-| `push()` / `pop()` | The channel endpoint is tried before giving up. If that fails too, the navigation rolls back and the source view stays live and clickable. |
+| `push()` / `pop()` | A failed request is tried again through the channel endpoint, and the navigation rolls back if that fails too. A request that timed out may have landed, so the navigation rolls back without a second try. Either way the source view stays live and clickable. |
 | `respond()` / `respond_safe()` | The reply is dropped. It is **not** retried on the followup path: whether the first send landed is unknowable from here, and a duplicate reply is worse than a missing transient notice. |
-| `open_modal()` | Returns `False`. The fallback notice is skipped, since it would travel the same broken connection. |
+| `open_modal()` | Returns `False`. The fallback notice is skipped, since the modal may be open and a fallback would meet the same failure. |
 
 **The cost is one missed update or one missed notice.** Nothing is
 left half-applied: state changes are already committed before the edit

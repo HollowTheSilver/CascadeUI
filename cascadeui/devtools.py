@@ -1704,7 +1704,8 @@ class DevToolsCog(commands.Cog, name="cascadeui_devtools"):
         await ctx.send(
             f"\U0001f9f9 Pruned {len(result['pruned'])}, "
             f"recovered {len(result['recovered'])}, "
-            f"kept {len(result['kept'])} within the {prune_older_than_days}d cutoff.",
+            f"kept {len(result['kept'])} (inside the {prune_older_than_days}d cutoff, "
+            f"or not confirmed unreachable).",
             ephemeral=True,
         )
 

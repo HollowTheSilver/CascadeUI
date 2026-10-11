@@ -17,6 +17,7 @@ import logging
 import time
 from unittest.mock import AsyncMock, MagicMock
 
+import aiohttp
 import discord
 import pytest
 from helpers import make_interaction, refused_by_closed_session, until
@@ -407,14 +408,19 @@ class TestPruneRegistryKeys:
     def test_action_creator_includes_keys(self):
         from cascadeui.state.actions import ActionCreators
 
+        messages = {
+            "a": {"message_id": "10", "channel_id": "20"},
+            "b": {"message_id": None, "channel_id": None},
+        }
         payload = ActionCreators.registry_pruned(
-            2, "explicit", keys=["a", "b"], source="prune_registry"
+            2, "explicit", keys=["a", "b"], source="prune_registry", messages=messages
         )
         assert payload == {
             "deleted": 2,
             "keys": ["a", "b"],
             "reason": "explicit",
             "source": "prune_registry",
+            "messages": messages,
         }
         # Backward-compatible default when no keys are supplied.
         assert ActionCreators.registry_pruned(0, "clear_all")["keys"] == []
@@ -486,6 +492,123 @@ class TestPruneRegistryKeys:
         assert deleted == 0
         assert captured[0]["keys"] == []
         assert captured[0]["deleted"] == 0
+
+    async def _two_rows(self):
+        """A manager over two stored rows, the store's mirror seeded from them."""
+        be = InMemoryBackend()
+        await be.initialize()
+        for key, message_id in (("panel:a", 11), ("panel:b", 12)):
+            await be.row_upsert(
+                TABLE_PERSISTENT_VIEWS,
+                {
+                    "persistence_key": key,
+                    "view_class": "MyPanel",
+                    "custom_id": None,
+                    "message_id": message_id,
+                    "channel_id": 2,
+                    "guild_id": None,
+                    "user_id": None,
+                    "session_id": None,
+                    "init_kwargs": "{}",
+                    "kwargs_schema_version": 1,
+                    "schema_version": 1,
+                    "created_at": 1,
+                    "updated_at": 1,
+                },
+                ["persistence_key"],
+            )
+        store = get_store()
+        mgr = PersistenceManager(store=store, registry=RegistryPersistence(backend=be))
+        await mgr.rehydrate()
+        captured = []
+
+        async def _on_pruned(action, state):
+            captured.append(action["payload"])
+
+        store.on("registry_pruned", _on_pruned)
+        return be, store, mgr, captured
+
+    @pytest.mark.parametrize("keys", [["panel:a", "panel:b"], None], ids=["by_key", "clear_all"])
+    async def test_registry_pruned_names_the_message_each_row_was_on(self, keys):
+        """A consumer that keeps its panel's message id could only ask whether a
+        key was its own, never whether the pruned row named its message."""
+        be, store, mgr, captured = await self._two_rows()
+
+        await mgr.prune_registry(persistence_keys=keys)
+
+        assert captured[0]["messages"] == {
+            "panel:a": {"message_id": "11", "channel_id": "2"},
+            "panel:b": {"message_id": "12", "channel_id": "2"},
+        }
+
+    async def test_registry_pruned_names_the_message_the_deleted_row_named(self):
+        """The store's copy already named the message a re-send had registered
+        and not yet written, so the payload described the live panel instead
+        of the row the prune deleted."""
+        from cascadeui.state.actions import ActionCreators
+
+        be, store, mgr, captured = await self._two_rows()
+        await store.dispatch(
+            "PERSISTENT_VIEW_REGISTERED",
+            ActionCreators.persistent_view_registered(
+                persistence_key="panel:a",
+                class_name="MyPanel",
+                message_id="222",
+                channel_id="2",
+                guild_id=None,
+                user_id=None,
+            ),
+        )
+
+        await mgr.prune_registry(persistence_keys=["panel:a"])
+
+        assert captured[0]["messages"] == {"panel:a": {"message_id": "11", "channel_id": "2"}}
+
+    async def test_a_prune_closed_while_it_waits_raises_nothing(self):
+        """The handler for a failing delete also caught GeneratorExit and then
+        awaited the announcement, so closing a suspended prune raised
+        RuntimeError."""
+        be, store, mgr, captured = await self._two_rows()
+        gate = asyncio.get_running_loop().create_future()
+        delete = be.row_delete
+
+        async def _held_on_b(table, key_values):
+            if key_values["persistence_key"] == "panel:b":
+                await gate
+            return await delete(table, key_values)
+
+        async def _announcement_suspends(action, state):
+            await asyncio.sleep(0)
+
+        be.row_delete = _held_on_b
+        store.on("registry_pruned", _announcement_suspends)
+        prune = mgr.prune_registry(persistence_keys=["panel:a", "panel:b"])
+        assert prune.send(None) is gate
+
+        prune.close()
+
+    async def test_a_prune_that_fails_part_way_reports_what_it_deleted(self):
+        """The rows deleted before a failing delete stayed in both mirrors and
+        no REGISTRY_PRUNED named them, though they were gone from disk."""
+        be, store, mgr, captured = await self._two_rows()
+        delete = be.row_delete
+
+        async def _fails_on_b(table, key_values):
+            if key_values["persistence_key"] == "panel:b":
+                raise RuntimeError("backend down")
+            return await delete(table, key_values)
+
+        be.row_delete = _fails_on_b
+
+        with pytest.raises(RuntimeError, match="backend down"):
+            await mgr.prune_registry(persistence_keys=["panel:a", "panel:b"])
+
+        assert [p["keys"] for p in captured] == [["panel:a"]]
+        assert captured[0]["deleted"] == 1
+        assert set(store.state["persistent_views"]) == {"panel:b"}
+        assert [r["persistence_key"] for r in mgr._registry_rows] == ["panel:b"]
+        on_disk = await be.row_select(TABLE_PERSISTENT_VIEWS)
+        assert [r["persistence_key"] for r in on_disk] == ["panel:b"]
 
     async def _mgr_holding(self, key):
         be = InMemoryBackend()
@@ -929,6 +1052,43 @@ class TestReattachUnreachable:
         assert removed == ["panel:z"]  # definitive 404: pruned
         assert unreachable == []
 
+    async def test_a_channel_fetch_timeout_is_unreachable(self):
+        """aiohttp's total timeout raises a plain TimeoutError, which the
+        catch missed: the row was logged as failed, with a traceback."""
+        from unittest.mock import AsyncMock
+
+        bot = MagicMock()
+        bot.get_channel.return_value = None
+        bot.fetch_channel = AsyncMock(side_effect=asyncio.TimeoutError())
+        mgr = self._mgr_with_bot(bot)
+
+        removed, unreachable = [], []
+        row = {"persistence_key": "panel:t", "channel_id": 1, "message_id": 2}
+        result = await mgr._fetch_restore_message(row, removed, unreachable)
+
+        assert result is None
+        assert removed == []
+        assert unreachable == ["panel:t"]
+
+    async def test_a_message_fetch_timeout_is_unreachable(self):
+        from unittest.mock import AsyncMock
+
+        import discord
+
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.fetch_message = AsyncMock(side_effect=asyncio.TimeoutError())
+        bot = MagicMock()
+        bot.get_channel.return_value = channel
+        mgr = self._mgr_with_bot(bot)
+
+        removed, unreachable = [], []
+        row = {"persistence_key": "panel:u", "channel_id": 1, "message_id": 2}
+        result = await mgr._fetch_restore_message(row, removed, unreachable)
+
+        assert result is None
+        assert removed == []
+        assert unreachable == ["panel:u"]
+
 
 class TestReattachIdempotent:
     """reattach() re-drives the reattach, skipping keys already restored on a
@@ -1321,8 +1481,128 @@ class TestTotalReattachSummary:
 
         assert summary["removed"] == ["panel:gone"]
         assert pruned == [
-            {"deleted": 1, "keys": ["panel:gone"], "reason": "gone", "source": "reattach"}
+            {
+                "deleted": 1,
+                "keys": ["panel:gone"],
+                "reason": "gone",
+                "source": "reattach",
+                # The row the pass read at boot names it.
+                "messages": {"panel:gone": {"message_id": "2", "channel_id": "1"}},
+            }
         ]
+
+    @pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
+    async def test_a_pass_whose_prune_fails_part_way_reports_the_rows_it_removed(self, failure):
+        """A pass whose prune failed on its second row reported both rows
+        failed and kept on disk, though the first was already deleted; a cancel
+        there left the first out of every summary."""
+        from cascadeui.views.persistent import PersistentLayoutView, _persistent_view_classes
+
+        class _PartlyGonePanel(PersistentLayoutView):
+            pass
+
+        class_name = next(k for k, v in _persistent_view_classes.items() if v is _PartlyGonePanel)
+        backend = InMemoryBackend()
+        await backend.initialize()
+        rows = []
+        for key in ("panel:first", "panel:second"):
+            row = {
+                "persistence_key": key,
+                "view_class": class_name,
+                "custom_id": None,
+                "message_id": 2,
+                "channel_id": 1,
+                "guild_id": None,
+                "user_id": None,
+                "session_id": None,
+                "init_kwargs": "{}",
+                "kwargs_schema_version": 1,
+                "schema_version": 1,
+                "created_at": 1,
+                "updated_at": 1,
+            }
+            await backend.row_upsert(TABLE_PERSISTENT_VIEWS, row, ["persistence_key"])
+            rows.append(row)
+        mgr = PersistenceManager(store=get_store(), registry=RegistryPersistence(backend=backend))
+        mgr._bot = MagicMock()
+        mgr._registry_rows = [dict(r) for r in rows]
+        delete = backend.row_delete
+
+        async def _fails_on_second(table, key_values):
+            if key_values["persistence_key"] == "panel:second":
+                raise failure("backend down")
+            return await delete(table, key_values)
+
+        async def _fetch(row, removed, unreachable):
+            removed.append(row["persistence_key"])
+            return None
+
+        backend.row_delete = _fails_on_second
+        mgr._fetch_restore_message = _fetch
+
+        if failure is asyncio.CancelledError:
+            with pytest.raises(asyncio.CancelledError):
+                await mgr.reattach_persistent_views()
+        else:
+            summary = await mgr.reattach_persistent_views()
+            assert summary["failed"] == ["panel:second"]
+
+        assert mgr.last_reattach_summary["removed"] == ["panel:first"]
+        assert mgr.total_reattach_summary["removed"] == ["panel:first"]
+
+    async def test_a_pass_whose_prune_announcement_fails_says_the_rows_went(self, caplog):
+        """A prune whose rows were all deleted but whose REGISTRY_PRUNED
+        dispatch raised logged that those rows stayed on disk."""
+        from cascadeui.views.persistent import PersistentLayoutView, _persistent_view_classes
+
+        class _AnnouncedPanel(PersistentLayoutView):
+            pass
+
+        class _RefusePruned:
+            async def __call__(self, action, state, next_fn):
+                if action["type"] == "REGISTRY_PRUNED":
+                    raise RuntimeError("middleware down")
+                return await next_fn(action, state)
+
+        class_name = next(k for k, v in _persistent_view_classes.items() if v is _AnnouncedPanel)
+        backend = InMemoryBackend()
+        await backend.initialize()
+        row = {
+            "persistence_key": "panel:announced",
+            "view_class": class_name,
+            "custom_id": None,
+            "message_id": 2,
+            "channel_id": 1,
+            "guild_id": None,
+            "user_id": None,
+            "session_id": None,
+            "init_kwargs": "{}",
+            "kwargs_schema_version": 1,
+            "schema_version": 1,
+            "created_at": 1,
+            "updated_at": 1,
+        }
+        await backend.row_upsert(TABLE_PERSISTENT_VIEWS, row, ["persistence_key"])
+        store = get_store()
+        store._add_middleware(_RefusePruned())
+        mgr = PersistenceManager(store=store, registry=RegistryPersistence(backend=backend))
+        mgr._bot = MagicMock()
+        mgr._registry_rows = [dict(row)]
+
+        async def _fetch(row, removed, unreachable):
+            removed.append(row["persistence_key"])
+            return None
+
+        mgr._fetch_restore_message = _fetch
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui"):
+            summary = await mgr.reattach_persistent_views()
+
+        assert summary["removed"] == ["panel:announced"]
+        assert await backend.row_select(TABLE_PERSISTENT_VIEWS) == []
+        messages = [r.getMessage() for r in caplog.records if r.name.startswith("cascadeui")]
+        assert not any("stay on disk" in m for m in messages), messages
+        assert any("announcing them failed" in m for m in messages), messages
 
     async def test_a_prune_registry_override_sees_a_pass_removal(self):
         """A pass pruned through a private method, so a manager subclass whose
@@ -1384,7 +1664,9 @@ class TestTotalReattachSummary:
         assert seen == [{"persistence_keys": ["panel:mirrored"], "reason": "gone"}]
         assert sources == ["reattach"]
 
-    async def test_a_key_appears_under_its_most_recent_outcome_only(self):
+    async def test_a_key_appears_under_its_most_recent_outcome_only(self, monkeypatch):
+        from cascadeui.views import persistent
+
         mgr = self._mgr()
         row = {"persistence_key": "late", "view_class": "Unregistered", "channel_id": 1}
         mgr._registry_rows = [dict(row, message_id=2)]
@@ -1392,16 +1674,19 @@ class TestTotalReattachSummary:
         await mgr.reattach_persistent_views()
         assert mgr.total_reattach_summary["skipped"] == ["late"]
 
-        # The class imports and the next pass restores it.
-        mgr._reattach_pass = AsyncMock(
-            return_value={
-                "restored": ["late"],
-                "skipped": [],
-                "failed": [],
-                "removed": [],
-                "unreachable": [],
-            }
-        )
+        # The class imports and the next pass restores it. The pass itself
+        # runs: it is what records its outcomes, a cancelled one included.
+        monkeypatch.setitem(persistent._persistent_view_classes, "Unregistered", MagicMock())
+
+        async def _fetch(row, removed, unreachable, unanswered=None):
+            return (MagicMock(), MagicMock(id=2))
+
+        async def _reattach_one(row, view_cls, init_kwargs, message, class_name, restored_views):
+            return "restored"
+
+        mgr._migrate_init_kwargs = AsyncMock(return_value={})
+        mgr._fetch_restore_message = _fetch
+        mgr._reattach_one = _reattach_one
         await mgr.reattach()
 
         totals = mgr.total_reattach_summary
@@ -1752,6 +2037,41 @@ class TestReattachOnBind:
         # dependency on_bind injected still available.
         await mgr._run_post_ready_restore(restored_views)
         assert order == ["bind", "restore"]
+
+    async def test_an_exit_from_on_restore_closes_the_panel_and_retires_its_row(self):
+        """A panel that finds in ``on_restore`` it should not stay closes there,
+        mid-process included (``reattach()``, the unreachable sweep)."""
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        class _StalePanel(PersistentLayoutView):
+            async def on_restore(self, bot):
+                await self.exit()
+
+        mgr = await self._row("panel:stale", _StalePanel)
+        message = MagicMock(id=1)
+        message.channel = MagicMock(id=2)
+        message.edit = AsyncMock()
+        message.delete = AsyncMock()
+        mgr._bot = MagicMock()
+        mgr._bot.wait_until_ready = AsyncMock()
+        restored_views = []
+        outcome = await mgr._reattach_one(
+            row=mgr._registry_rows[0],
+            view_cls=_StalePanel,
+            init_kwargs={"persistence_key": "panel:stale"},
+            message=message,
+            class_name=_StalePanel.__qualname__,
+            restored_views=restored_views,
+        )
+        assert outcome == "restored"
+        assert "panel:stale" in get_store().state["persistent_views"]
+
+        await mgr._run_post_ready_restore(restored_views)
+
+        view = restored_views[0]
+        assert view.is_finished()
+        assert view._torn_down()
+        assert "panel:stale" not in get_store().state["persistent_views"]
 
     async def test_async_on_bind_is_awaited(self):
         from cascadeui.views.persistent import PersistentLayoutView
@@ -2351,6 +2671,85 @@ class TestSendTimeBind:
         await view._bind_from_context()
         assert view.db == "POOL"
 
+    @staticmethod
+    def _channel(client):
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.id = 7
+        channel.guild = MagicMock(id=9)
+        channel._state._get_client = lambda: client
+        message = MagicMock(id=555, channel=channel)
+        message.edit = AsyncMock(return_value=message)
+        channel.send = AsyncMock(return_value=message)
+        return channel
+
+    @staticmethod
+    def _panel_class(bound, *, raises=False):
+        from discord.ui import ActionRow
+
+        from cascadeui import StatefulButton
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        class _Panel(PersistentLayoutView):
+            def __init__(self, **kw):
+                super().__init__(**kw)
+                self.add_item(ActionRow(StatefulButton(label="Go", custom_id="chan_go")))
+
+            async def on_bind(self, bot):
+                bound.append(bot)
+                if raises:
+                    raise RuntimeError("pool unavailable")
+
+        return _Panel
+
+    async def test_a_channel_send_binds_the_client_the_channel_names(self):
+        """A channel carries no ``.bot``, so its panel was posted unbound and
+        the caller had to call ``on_bind`` itself first."""
+        client = MagicMock(spec=discord.Client)
+        bound = []
+        view = self._panel_class(bound)(context=self._channel(client), persistence_key="chan:bind")
+
+        assert await view.send() is not None
+
+        assert bound == [client]
+        assert view._bot is client
+
+    async def test_a_channel_bind_that_raises_posts_nothing(self):
+        client = MagicMock(spec=discord.Client)
+        channel = self._channel(client)
+        view = self._panel_class([], raises=True)(context=channel, persistence_key="chan:raise")
+
+        with pytest.raises(RuntimeError, match="pool unavailable"):
+            await view.send()
+
+        channel.send.assert_not_awaited()
+        assert view._torn_down()
+        assert "chan:raise" not in view.state_store.state.get("persistent_views", {})
+
+    async def test_a_channel_bound_panel_is_released_with_its_client(self):
+        """The bind stores the channel's client on the panel, so a restart in
+        the same process has to release the panel with that client, or it
+        stays live holding a closed one."""
+        client = MagicMock(spec=discord.Client)
+        client.is_closed.return_value = False
+        view = self._panel_class([])(context=self._channel(client), persistence_key="chan:rel")
+        await view.send()
+        client.is_closed.return_value = True
+
+        view.state_store._release_views_of(client)
+
+        assert view.is_finished()
+        assert view.id not in view.state_store.get_active_views()
+
+    async def test_a_channel_that_names_no_client_is_not_bound(self):
+        bound = []
+        channel = self._channel(None)
+        view = self._panel_class(bound)(context=channel, persistence_key="chan:none")
+
+        assert await view.send() is not None
+
+        assert bound == []
+        channel.send.assert_awaited_once()
+
 
 class TestNonSerializableKwargError:
     """A non-JSON constructor kwarg declines the row with a directed error."""
@@ -2476,6 +2875,147 @@ class TestReattachBatching:
             assert notification_actions == ["BATCH_COMPLETE"]
         finally:
             store._unsubscribe("test_catch_all")
+
+
+class TestReattachRollback:
+    """A restore that fails or is cut off inside its registration leaves
+    nothing behind: no view row, no session naming the view, and no render
+    from the view it discards."""
+
+    @staticmethod
+    async def _restore_args(view_cls, key):
+        from cascadeui.views.persistent import _persistent_view_classes
+
+        name = next(k for k, v in _persistent_view_classes.items() if v is view_cls)
+        backend = InMemoryBackend()
+        await backend.initialize()
+        bot = MagicMock()
+        bot.is_closed.return_value = False
+        mgr = PersistenceManager(
+            store=get_store(), registry=RegistryPersistence(backend=backend), bot=bot
+        )
+        message = MagicMock(id=555)
+        message.channel = MagicMock(id=7)
+        message.edit = AsyncMock(return_value=message)
+        row = {
+            "persistence_key": key,
+            "view_class": name,
+            "message_id": 555,
+            "channel_id": 7,
+            "guild_id": 9,
+            "user_id": 4,
+            "session_id": f"s:{key}",
+        }
+        return mgr, (row, view_cls, {}, message, name, [])
+
+    @staticmethod
+    def _left_behind(session_id):
+        state = get_store().state
+        rows = [r for r in state["views"].values() if r.get("session_id") == session_id]
+        return rows, session_id in state["sessions"]
+
+    async def test_a_registration_that_raises_leaves_no_view_row(self):
+        """The rollback dropped only the active-view entry when the raise came
+        from inside the registration, so the committed row and the session
+        naming it stayed: a ghost in the inspector."""
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        class _Panel(PersistentLayoutView):
+            pass
+
+        store = get_store()
+
+        async def audit(action, state, next_fn):
+            result = await next_fn(action, state)
+            if action["type"] == "VIEW_CREATED":
+                raise RuntimeError("audit log down")
+            return result
+
+        mgr, args = await self._restore_args(_Panel, "panel:raised")
+        store._middleware.append(audit)
+        try:
+            assert await mgr._reattach_one(*args) == "failed"
+        finally:
+            store._middleware.remove(audit)
+
+        assert self._left_behind("s:panel:raised") == ([], False)
+
+    async def test_a_failed_bind_cancels_the_work_it_started(self):
+        """A loop on_bind started under the view's id would run on against a
+        view the rollback discarded."""
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        started = []
+
+        class _Ticking(PersistentLayoutView):
+            async def on_bind(self, bot):
+                started.append(self.task_manager.create_task(self.id, asyncio.Event().wait()))
+                raise RuntimeError("pool unavailable")
+
+        mgr, args = await self._restore_args(_Ticking, "panel:ticking")
+
+        assert await mgr._reattach_one(*args) == "failed"
+
+        (ticker,) = started
+        await until(ticker.done)
+        assert ticker.cancelled()
+
+    async def test_a_registration_cut_off_before_its_row_leaves_no_session(self):
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        class _Panel(PersistentLayoutView):
+            pass
+
+        store = get_store()
+        reached = asyncio.Event()
+
+        async def hold(action, state, next_fn):
+            if action["type"] == "VIEW_CREATED":
+                reached.set()
+                await asyncio.Event().wait()
+            return await next_fn(action, state)
+
+        mgr, args = await self._restore_args(_Panel, "panel:cut")
+        store._middleware.append(hold)
+        try:
+            task = asyncio.create_task(mgr._reattach_one(*args))
+            await until(reached.is_set)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            store._middleware.remove(hold)
+
+        assert self._left_behind("s:panel:cut") == ([], False)
+
+    async def test_a_failed_bind_does_not_render_the_view_it_discards(self):
+        """The registration batch announced what committed to the view before
+        the rollback unsubscribed it, so a view listening to every action
+        edited the panel's message on its way out."""
+        from discord.ui import ActionRow, TextDisplay
+
+        from cascadeui import StatefulButton
+        from cascadeui.views.persistent import PersistentLayoutView
+
+        class _Listening(PersistentLayoutView):
+            subscribed_actions = None
+
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.add_item(TextDisplay("board"))
+                self.add_item(ActionRow(StatefulButton(label="Go", custom_id="rb_go")))
+
+            async def on_bind(self, bot):
+                raise RuntimeError("pool unavailable")
+
+        mgr, args = await self._restore_args(_Listening, "panel:bind")
+        message = args[3]
+
+        assert await mgr._reattach_one(*args) == "failed"
+        await get_store()._flush_notifications()
+
+        message.edit.assert_not_awaited()
+        assert self._left_behind("s:panel:bind") == ([], False)
 
 
 class TestPostReadyRestore:
@@ -3448,7 +3988,7 @@ class TestReattachLogLevels:
         warnings = [r for r in caplog.records if r.levelname == "WARNING"]
         assert len(warnings) == 1
         assert "12 persistent view row(s)" in warnings[0].message
-        assert "reattach()" in warnings[0].message
+        assert "a reattach pass after the first" in warnings[0].message
 
     async def test_the_warning_names_the_unresolved_class(self, caplog):
         """The stored string is the fix, so counting rows is not enough.
@@ -3823,6 +4363,16 @@ class TestPruneUnreachable:
         mgr._registry_rows = [dict(r) for r in rows]
         return mgr, backend
 
+    @staticmethod
+    def _restorable_class():
+        """The stored name of a registered persistent class, so a restore can run."""
+        from cascadeui.views.persistent import PersistentLayoutView, _persistent_view_classes
+
+        class _Restorable(PersistentLayoutView):
+            pass
+
+        return next(k for k, v in _persistent_view_classes.items() if v is _Restorable)
+
     async def test_a_prune_registry_override_sees_the_sweep_prunes(self):
         """The sweep pruned through a private method, so a manager subclass
         whose ``prune_registry`` override mirrors deletions missed them."""
@@ -3839,7 +4389,7 @@ class TestPruneUnreachable:
             cls=_Mirroring,
         )
 
-        async def _fetch(row, removed, unreachable):
+        async def _fetch(row, removed, unreachable, unanswered=None):
             target = removed if row["persistence_key"] == "gone" else unreachable
             target.append(row["persistence_key"])
             return None
@@ -3868,7 +4418,7 @@ class TestPruneUnreachable:
             [self._row("gone", now - 40 * 86400), self._row("extra", None)]
         )
 
-        async def _fetch(row, removed, unreachable):
+        async def _fetch(row, removed, unreachable, unanswered=None):
             removed.append(row["persistence_key"])
             return None
 
@@ -3893,12 +4443,12 @@ class TestPruneUnreachable:
             [
                 self._row("old", now - 40 * 86400),
                 self._row("young", now - 86400),
-                self._row("recovers", now - 40 * 86400),
+                dict(self._row("recovers", now - 40 * 86400), view_class=self._restorable_class()),
                 self._row("gone", now - 40 * 86400),
             ]
         )
 
-        async def _fetch(row, removed, unreachable):
+        async def _fetch(row, removed, unreachable, unanswered=None):
             key = row["persistence_key"]
             if key == "recovers":
                 return (MagicMock(), MagicMock())
@@ -3909,6 +4459,7 @@ class TestPruneUnreachable:
             return None
 
         mgr._fetch_restore_message = _fetch
+        mgr._reattach_one = AsyncMock(return_value="restored")
         pruned = []
 
         async def record(action, state):
@@ -3934,14 +4485,179 @@ class TestPruneUnreachable:
         )
         assert left == ["recovers", "young"]
 
-    async def test_a_row_that_answers_now_is_never_pruned(self):
-        """The whole point of re-verifying: age alone must not delete."""
-        mgr, backend = await self._mgr([self._row("live", 0)])  # stamp from the epoch
+    async def test_a_panel_found_reachable_again_is_restored(self):
+        """The sweep cleared a recovered row's stamp and left its panel dead
+        until the next restart, though its message had just answered."""
+        from cascadeui.views.persistent import PersistentLayoutView, _persistent_view_classes
 
-        async def _fetch(row, removed, unreachable):
+        class _SweptPanel(PersistentLayoutView):
+            pass
+
+        class_name = next(k for k, v in _persistent_view_classes.items() if v is _SweptPanel)
+        now = int(time.time())
+        mgr, _ = await self._mgr(
+            [
+                dict(self._row("recovers", now - 86400), view_class=class_name),
+                dict(self._row("down", now - 86400), view_class=class_name),
+            ]
+        )
+        fetches = []
+        restored = []
+
+        async def _fetch(row, removed, unreachable, unanswered=None):
+            fetches.append(row["persistence_key"])
+            if row["persistence_key"] == "recovers":
+                return (MagicMock(), MagicMock())
+            unreachable.append(row["persistence_key"])
+            return None
+
+        async def _reattach_one(row, view_cls, init_kwargs, message, class_name, restored_views):
+            restored.append(row["persistence_key"])
+            return "restored"
+
+        mgr._fetch_restore_message = _fetch
+        mgr._reattach_one = _reattach_one
+
+        result = await mgr.prune_unreachable(older_than_days=30)
+
+        assert result["recovered"] == ["recovers"]
+        assert restored == ["recovers"]
+        # The restore uses the message the sweep fetched, so no row is fetched
+        # twice, and with no fetch of its own it has nothing to prune.
+        assert sorted(fetches) == ["down", "recovers"]
+        totals = mgr.total_reattach_summary
+        assert totals["restored"] == ["recovers"]
+        # A row still down is left to the sweep alone.
+        assert "down" not in {key for keys in totals.values() for key in keys}
+
+    async def test_a_failed_restore_still_returns_the_sweep_result(self, caplog):
+        """The restore runs after the sweep's deletions, so a backend failure
+        in it must not raise out of a sweep that has already pruned rows."""
+        now = int(time.time())
+        mgr, backend = await self._mgr(
+            [self._row("recovers", now - 86400), self._row("old", now - 40 * 86400)]
+        )
+
+        async def _fetch(row, removed, unreachable, unanswered=None):
+            if row["persistence_key"] == "recovers":
+                return (MagicMock(), MagicMock())
+            unreachable.append(row["persistence_key"])
+            return None
+
+        mgr._fetch_restore_message = _fetch
+        mgr._reattach_pass = AsyncMock(side_effect=RuntimeError("backend down"))
+
+        with caplog.at_level(logging.WARNING, logger="cascadeui"):
+            result = await mgr.prune_unreachable(older_than_days=30)
+
+        # Not restored, so kept for the next sweep.
+        assert result["recovered"] == []
+        assert result["kept"] == ["recovers"]
+        assert result["pruned"] == ["old"]
+        assert "Restoring 1 recovered panel(s) failed" in caplog.text
+        found = await backend.row_select(TABLE_PERSISTENT_VIEWS, {"persistence_key": "recovers"})
+        # Its message answered, so the age starts over at this sweep.
+        assert found[0]["first_unreachable_at"] >= now
+
+    @pytest.mark.parametrize("outcome", ["failed", "class_missing"])
+    async def test_a_panel_its_restore_does_not_bring_back_is_tried_again(self, outcome):
+        """A row whose own restore failed lost its stamp and was reported
+        recovered, so no later sweep tried it, though the guide says one does.
+        Keeping the old stamp instead would let one refused re-check after a
+        failed restore delete a 40-day-old row whose message had just answered."""
+        now = int(time.time())
+        view_class = self._restorable_class() if outcome == "failed" else "not.Imported"
+        mgr, backend = await self._mgr(
+            [dict(self._row("recovers", now - 40 * 86400), view_class=view_class)]
+        )
+        refused = False
+
+        async def _fetch(row, removed, unreachable, unanswered=None):
+            if refused:
+                unreachable.append(row["persistence_key"])
+                return None
             return (MagicMock(), MagicMock())
 
         mgr._fetch_restore_message = _fetch
+        mgr._reattach_one = AsyncMock(return_value="failed")
+
+        first = await mgr.prune_unreachable(older_than_days=30)
+        second = await mgr.prune_unreachable(older_than_days=30)
+        refused = True
+        third = await mgr.prune_unreachable(older_than_days=30)
+
+        for result in (first, second):
+            assert result["recovered"] == []
+            assert result["kept"] == ["recovers"]
+        found = await backend.row_select(TABLE_PERSISTENT_VIEWS, {"persistence_key": "recovers"})
+        assert found[0]["first_unreachable_at"] >= now
+        if outcome == "failed":
+            assert mgr._reattach_one.await_count == 2
+        # The age counts from the check that found the message, not the old stamp.
+        assert third["pruned"] == []
+        assert third["kept"] == ["recovers"]
+
+    @pytest.mark.parametrize("why", ["held_by_a_live_panel", "never_read_by_this_process"])
+    async def test_a_row_the_restore_does_not_take_up_is_left_unstamped(self, why):
+        """A recovered row the restore never tried (a panel posted under its key
+        during the sweep, or a row this process never read) was stamped again,
+        so a live panel's row aged as unreachable until the next restart."""
+        now = int(time.time())
+        mgr, backend = await self._mgr(
+            [dict(self._row("K", now - 40 * 86400), view_class=self._restorable_class())]
+        )
+        if why == "never_read_by_this_process":
+            mgr._registry_rows = []
+
+        async def _fetch(row, removed, unreachable, unanswered=None):
+            if why == "held_by_a_live_panel":
+                # A panel posted under the key while the sweep fetched.
+                mgr._store._live_persistence_keys = lambda: {"K"}
+            return (MagicMock(), MagicMock())
+
+        mgr._fetch_restore_message = _fetch
+        mgr._reattach_one = AsyncMock(return_value="restored")
+
+        result = await mgr.prune_unreachable(older_than_days=30)
+
+        mgr._reattach_one.assert_not_awaited()
+        assert result["recovered"] == []
+        assert result["kept"] == ["K"]
+        found = await backend.row_select(TABLE_PERSISTENT_VIEWS, {"persistence_key": "K"})
+        assert found[0]["first_unreachable_at"] is None
+
+    async def test_a_cancel_during_the_restore_leaves_the_new_stamp(self):
+        """The new stamp was written after the restore, so a cancel during it
+        kept the old age on a row whose message had just answered."""
+        now = int(time.time())
+        mgr, backend = await self._mgr(
+            [dict(self._row("K", now - 40 * 86400), view_class=self._restorable_class())]
+        )
+
+        async def _fetch(row, removed, unreachable, unanswered=None):
+            return (MagicMock(), MagicMock())
+
+        mgr._fetch_restore_message = _fetch
+        mgr._reattach_pass = AsyncMock(side_effect=asyncio.CancelledError)
+
+        with pytest.raises(asyncio.CancelledError):
+            await mgr.prune_unreachable(older_than_days=30)
+
+        found = await backend.row_select(TABLE_PERSISTENT_VIEWS, {"persistence_key": "K"})
+        assert found[0]["first_unreachable_at"] >= now
+
+    async def test_a_row_that_answers_now_is_never_pruned(self):
+        """The whole point of re-verifying: age alone must not delete."""
+        # Stamped at the epoch.
+        mgr, backend = await self._mgr(
+            [dict(self._row("live", 0), view_class=self._restorable_class())]
+        )
+
+        async def _fetch(row, removed, unreachable, unanswered=None):
+            return (MagicMock(), MagicMock())
+
+        mgr._fetch_restore_message = _fetch
+        mgr._reattach_one = AsyncMock(return_value="restored")
 
         result = await mgr.prune_unreachable(older_than_days=0)
 
@@ -3959,7 +4675,7 @@ class TestPruneUnreachable:
         live = 0
         peak = 0
 
-        async def _fetch(row, removed, unreachable):
+        async def _fetch(row, removed, unreachable, unanswered=None):
             nonlocal live, peak
             live += 1
             peak = max(peak, live)
@@ -3982,7 +4698,7 @@ class TestPruneUnreachable:
             [self._row("raises", now - 40 * 86400), self._row("gone", now - 40 * 86400)]
         )
 
-        async def _fetch(row, removed, unreachable):
+        async def _fetch(row, removed, unreachable, unanswered=None):
             if row["persistence_key"] == "raises":
                 raise RuntimeError("gateway said no")
             removed.append(row["persistence_key"])
@@ -3997,11 +4713,293 @@ class TestPruneUnreachable:
         left = [r["persistence_key"] for r in await backend.row_select(TABLE_PERSISTENT_VIEWS)]
         assert left == ["raises"]
 
+    @staticmethod
+    def _channel_failing_with(exc):
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.fetch_message = AsyncMock(side_effect=exc)
+        return channel
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            asyncio.TimeoutError(),
+            aiohttp.ServerDisconnectedError(),
+            discord.RateLimited(5.0),
+            discord.HTTPException(MagicMock(status=503, reason="Unavailable"), "unavailable"),
+        ],
+        ids=["timeout", "disconnect", "rate_limited", "server_error"],
+    )
+    async def test_a_recheck_discord_never_answers_keeps_an_aged_row(self, exc):
+        """No answer, a rate limit, or Discord's own failure says nothing about
+        the message, so an aged row is kept for the next sweep, not deleted."""
+        stamp = int(time.time()) - 40 * 86400
+        mgr, backend = await self._mgr([self._row("aged", stamp)])
+        mgr._bot.get_channel.return_value = self._channel_failing_with(exc)
+
+        result = await mgr.prune_unreachable(older_than_days=30)
+
+        assert result["pruned"] == []
+        assert result["kept"] == ["aged"]
+        found = await backend.row_select(TABLE_PERSISTENT_VIEWS, {"persistence_key": "aged"})
+        assert found[0]["first_unreachable_at"] == stamp
+
+    @pytest.mark.parametrize(
+        "exc",
+        [aiohttp.ServerDisconnectedError(), discord.InvalidData("Unknown channel type 99")],
+        ids=["disconnect", "unknown_channel_type"],
+    )
+    async def test_a_channel_discord_never_answers_for_keeps_an_aged_row(self, exc):
+        """A dropped connection says nothing about the message, and neither does
+        a channel type the installed discord.py cannot read, so neither one
+        deletes a row."""
+        mgr, backend = await self._mgr([self._row("aged", int(time.time()) - 40 * 86400)])
+        mgr._bot.get_channel.return_value = None
+        mgr._bot.fetch_channel = AsyncMock(side_effect=exc)
+
+        result = await mgr.prune_unreachable(older_than_days=30)
+
+        assert result["pruned"] == []
+        assert await backend.row_select(TABLE_PERSISTENT_VIEWS, {"persistence_key": "aged"})
+
+    async def test_a_refused_recheck_still_prunes_an_aged_row(self):
+        """Forbidden is Discord's answer about the message, so the cutoff applies."""
+        mgr, backend = await self._mgr([self._row("aged", int(time.time()) - 40 * 86400)])
+        mgr._bot.get_channel.return_value = self._channel_failing_with(
+            discord.Forbidden(MagicMock(status=403, reason="Forbidden"), "Missing Access")
+        )
+
+        result = await mgr.prune_unreachable(older_than_days=30)
+
+        assert result["pruned"] == ["aged"]
+        assert await backend.row_select(TABLE_PERSISTENT_VIEWS) == []
+
+    async def test_a_failed_prune_still_restores_the_recovered_panels(self):
+        """A deletion that raised before the restore would leave the panels the
+        sweep found reachable again dead until the next sweep."""
+        mgr, restored = await self._failed_prune()
+
+        with pytest.raises(RuntimeError, match="backend down"):
+            await mgr.prune_unreachable(older_than_days=30)
+
+        assert restored == ["recovers"]
+
+    async def test_a_failed_prune_is_logged_when_the_restore_is_cancelled(self, caplog):
+        """The deletion's error waits for the restore, and a cancel there
+        replaces it; without a log line it would vanish."""
+        caplog.set_level(logging.WARNING, logger="cascadeui")
+        mgr, _ = await self._failed_prune(cancel=True)
+
+        with pytest.raises(asyncio.CancelledError):
+            await mgr.prune_unreachable(older_than_days=30)
+
+        assert any("after a deletion failed" in r.getMessage() for r in caplog.records)
+
+    async def _failed_prune(self, cancel=False):
+        now = int(time.time())
+        mgr, backend = await self._mgr(
+            [self._row("recovers", now - 86400), self._row("old", now - 40 * 86400)]
+        )
+
+        async def _fetch(row, removed, unreachable, unanswered=None):
+            if row["persistence_key"] == "recovers":
+                return (MagicMock(), MagicMock())
+            unreachable.append(row["persistence_key"])
+            return None
+
+        restored = []
+
+        async def _reattach_pass(prefetched=None):
+            restored.extend(prefetched)
+            if cancel:
+                raise asyncio.CancelledError
+            return {b: [] for b in ("restored", "skipped", "failed", "removed", "unreachable")}
+
+        mgr._fetch_restore_message = _fetch
+        mgr._reattach_pass = _reattach_pass
+        backend.row_delete = AsyncMock(side_effect=RuntimeError("backend down"))
+        return mgr, restored
+
+    async def test_a_cancel_during_the_restore_rolls_its_view_back(self):
+        """The manager's close cancels the sweeper, which can be mid-restore.
+        Left alone, the view it had registered would stay live, routing clicks
+        without what on_bind sets up, with its row never marked restored."""
+        from cascadeui.views.persistent import PersistentLayoutView, _persistent_view_classes
+
+        binding = asyncio.Event()
+        bound = []
+
+        class _CutPanel(PersistentLayoutView):
+            async def on_bind(self, bot):
+                bound.append(self)
+                binding.set()
+                await asyncio.Event().wait()
+
+        class_name = next(k for k, v in _persistent_view_classes.items() if v is _CutPanel)
+        mgr, _ = await self._mgr(
+            [dict(self._row("cut", int(time.time()) - 86400), view_class=class_name)]
+        )
+
+        async def _fetch(row, removed, unreachable, unanswered=None):
+            return (MagicMock(), MagicMock(id=1))
+
+        mgr._fetch_restore_message = _fetch
+        sweep = asyncio.create_task(mgr.prune_unreachable(older_than_days=30))
+        await until(binding.is_set)
+        sweep.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await sweep
+
+        (view,) = bound
+        store = get_store()
+        assert view.is_finished()
+        assert view.id not in store.get_active_views()
+        assert not store._holds_persistence_key("cut")
+        assert "cut" not in mgr._restored_keys
+        assert "cut" in mgr.unreachable_since
+
+    async def test_a_cancel_finishes_the_panels_restored_before_it(self):
+        """The view in flight rolls back, and one restored before it stays
+        live. Unless the pass finishes it, that view's repaint is never
+        scheduled and neither the summary nor a later reattach() knows of it."""
+        from cascadeui.views.persistent import PersistentLayoutView, _persistent_view_classes
+
+        binding = asyncio.Event()
+        repainted = []
+
+        class _SweptPanel(PersistentLayoutView):
+            async def on_bind(self, bot):
+                if self._persistence_key == "second":
+                    binding.set()
+                    await asyncio.Event().wait()
+
+            async def on_restore(self, bot):
+                repainted.append(self._persistence_key)
+
+        class_name = next(k for k, v in _persistent_view_classes.items() if v is _SweptPanel)
+        stamp = int(time.time()) - 86400
+        mgr, _ = await self._mgr(
+            [
+                dict(self._row("first", stamp), view_class=class_name, message_id=1),
+                dict(self._row("second", stamp), view_class=class_name, message_id=2),
+            ]
+        )
+        mgr._bot.is_closed.return_value = False
+        mgr._bot.wait_until_ready = AsyncMock()
+
+        async def _fetch(row, removed, unreachable, unanswered=None):
+            return (MagicMock(), MagicMock(id=row["message_id"]))
+
+        mgr._fetch_restore_message = _fetch
+        sweep = asyncio.create_task(mgr.prune_unreachable(older_than_days=30))
+        await until(binding.is_set)
+        sweep.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await sweep
+
+        await until(lambda: repainted)
+        assert repainted == ["first"]
+        assert mgr._restored_keys == {"first"}
+        assert mgr.total_reattach_summary["restored"] == ["first"]
+        assert not get_store()._holds_persistence_key("second")
+        # The restore never reached it, so its stamp stays for the next sweep.
+        assert "second" in mgr.unreachable_since
+
+    async def test_a_cancel_after_the_restores_still_finishes_the_pass(self):
+        """The cancel lands while the pass prunes a gone row, after the live
+        panel is restored. Finishing the pass only at its end would leave the
+        restored panel live but never repainted or recorded, and a later
+        reattach() skips a key a live view holds."""
+        from cascadeui.views.persistent import PersistentLayoutView, _persistent_view_classes
+
+        repainted = []
+
+        class _TailPanel(PersistentLayoutView):
+            async def on_restore(self, bot):
+                repainted.append(self._persistence_key)
+
+        class_name = next(k for k, v in _persistent_view_classes.items() if v is _TailPanel)
+        mgr, _ = await self._mgr(
+            [
+                dict(self._row("live", None), view_class=class_name, message_id=1),
+                dict(self._row("gone", None), view_class=class_name, message_id=2),
+            ]
+        )
+        mgr._bot.is_closed.return_value = False
+        mgr._bot.wait_until_ready = AsyncMock()
+
+        async def _fetch(row, removed, unreachable, unanswered=None):
+            if row["persistence_key"] == "gone":
+                removed.append("gone")
+                return None
+            return (MagicMock(), MagicMock(id=row["message_id"]))
+
+        pruning = asyncio.Event()
+
+        async def hold(action, state):
+            pruning.set()
+            await asyncio.Event().wait()
+
+        mgr._fetch_restore_message = _fetch
+        get_store().on("REGISTRY_PRUNED", hold)
+        task = asyncio.create_task(mgr.reattach_persistent_views())
+        await until(pruning.is_set)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        await until(lambda: repainted)
+        assert repainted == ["live"]
+        assert mgr._restored_keys == {"live"}
+        assert mgr.total_reattach_summary["restored"] == ["live"]
+
+    async def test_a_recheck_its_closed_bot_refuses_is_not_a_warning(self, caplog):
+        """A bot closing during the sweep fails every queued re-check. The
+        reattach pass leaves those rows for the next bot at DEBUG; logging one
+        WARNING traceback per row would bury the close in noise."""
+        mgr, backend = await self._mgr([self._row("a", int(time.time()) - 40 * 86400)])
+        mgr._bot.is_closed.return_value = True
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.fetch_message = refused_by_closed_session
+        mgr._bot.get_channel.return_value = channel
+
+        with caplog.at_level(logging.DEBUG, logger="cascadeui"):
+            result = await mgr.prune_unreachable(older_than_days=30)
+
+        assert result["kept"] == ["a"]
+        assert await backend.row_select(TABLE_PERSISTENT_VIEWS)
+        records = [r for r in caplog.records if r.name.startswith("cascadeui")]
+        assert not [r for r in records if r.levelno >= logging.WARNING]
+        assert any("for the next bot" in r.getMessage() for r in records)
+
+    @pytest.mark.parametrize("change", ["closed", "replaced"])
+    async def test_no_restore_onto_messages_a_closed_bot_fetched(self, change):
+        """A message fetched through a client that has closed carries its
+        closed session into every edit the restored panel would make."""
+        mgr, _ = await self._mgr([self._row("recovers", int(time.time()) - 86400)])
+        bot = mgr._bot
+
+        async def _fetch(row, removed, unreachable, unanswered=None):
+            if change == "closed":
+                bot.is_closed.return_value = True
+            else:
+                mgr._bot = MagicMock()
+            return (MagicMock(), MagicMock())
+
+        mgr._fetch_restore_message = _fetch
+        mgr._reattach_pass = AsyncMock()
+
+        result = await mgr.prune_unreachable(older_than_days=30)
+
+        # Left for the next bot with its stamp, so not recovered yet.
+        assert result["kept"] == ["recovers"]
+        assert result["recovered"] == []
+        mgr._reattach_pass.assert_not_awaited()
+
     async def test_pruning_drops_the_row_from_the_in_memory_mirror(self):
         now = int(time.time())
         mgr, _ = await self._mgr([self._row("old", now - 40 * 86400)])
 
-        async def _fetch(row, removed, unreachable):
+        async def _fetch(row, removed, unreachable, unanswered=None):
             unreachable.append(row["persistence_key"])
             return None
 
@@ -4046,7 +5044,7 @@ class TestPruneUnreachable:
         store._register_view(_LivePanel(persistence_key="live"))
         fetched = []
 
-        async def _fetch(row, removed, unreachable):
+        async def _fetch(row, removed, unreachable, unanswered=None):
             fetched.append(row["persistence_key"])
             unreachable.append(row["persistence_key"])
             return None
@@ -4071,7 +5069,7 @@ class TestPruneUnreachable:
         get_store()._register_view(view)
         view.stop()
 
-        async def _fetch(row, removed, unreachable):
+        async def _fetch(row, removed, unreachable, unanswered=None):
             unreachable.append(row["persistence_key"])
             return None
 
@@ -4110,6 +5108,47 @@ class TestUnreachableSweeper:
         with pytest.raises(RuntimeError, match="in the same task"):
             await asyncio.wait_for(mgr._serialized_walk("reattach_persistent_views", _nested), 2)
         assert not mgr._loop_lock("registry_walk").locked()
+
+    async def test_a_long_wait_for_a_running_walk_warns(self, caplog, monkeypatch):
+        """A walk awaiting a task that starts another walk (asyncio.gather from
+        a hook) cannot be told from any other waiter, so the waiter warns
+        after a minute; the boot still hangs, but not in silence."""
+        from cascadeui.persistence import manager as manager_module
+
+        monkeypatch.setattr(manager_module, "_REGISTRY_WALK_WAIT_WARN_SECONDS", 0.05)
+        mgr = PersistenceManager(
+            store=get_store(),
+            registry=RegistryPersistence(backend=InMemoryBackend()),
+            bot=MagicMock(),
+        )
+        caplog.set_level(logging.WARNING, logger="cascadeui")
+
+        async def _walk():
+            return "done"
+
+        lock = mgr._loop_lock("registry_walk")
+        async with lock:
+            waiting = asyncio.create_task(mgr._serialized_walk("reattach", _walk))
+            await until(lambda: any("has waited" in r.getMessage() for r in caplog.records))
+        assert await waiting == "done"
+
+    async def test_a_walk_that_starts_at_once_does_not_warn(self, caplog, monkeypatch):
+        from cascadeui.persistence import manager as manager_module
+
+        monkeypatch.setattr(manager_module, "_REGISTRY_WALK_WAIT_WARN_SECONDS", 0.05)
+        mgr = PersistenceManager(
+            store=get_store(),
+            registry=RegistryPersistence(backend=InMemoryBackend()),
+            bot=MagicMock(),
+        )
+        caplog.set_level(logging.WARNING, logger="cascadeui")
+
+        async def _walk():
+            await asyncio.sleep(0.1)
+            return "done"
+
+        assert await mgr._serialized_walk("reattach", _walk) == "done"
+        assert not any("has waited" in r.getMessage() for r in caplog.records)
 
     @pytest.mark.parametrize("bad", [0, -1, True, "30", 1.5])
     def test_a_bad_cutoff_is_refused_at_construction(self, bad):
@@ -4525,7 +5564,7 @@ class TestPruneDoesNotDeleteARePostedPanel:
         )
         mgr._registry_rows = [dict(old)]
 
-        async def _fetch(row, removed, unreachable):
+        async def _fetch(row, removed, unreachable, unanswered=None):
             # An admin re-posts the panel while this fetch is in flight.
             await backend.row_upsert(
                 TABLE_PERSISTENT_VIEWS, self._row("panel", 999, None), ["persistence_key"]
@@ -4555,7 +5594,7 @@ class TestPruneDoesNotDeleteARePostedPanel:
         )
         mgr._registry_rows = [dict(old)]
 
-        async def _fetch(row, removed, unreachable):
+        async def _fetch(row, removed, unreachable, unanswered=None):
             unreachable.append(row["persistence_key"])
             return None
 
